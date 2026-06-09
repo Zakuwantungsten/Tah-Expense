@@ -1,0 +1,8 @@
+PySide6>=6.6.0
+motor>=3.3.0
+pymongo>=4.6.0
+bcrypt>=4.1.0
+rapidfuzz>=3.6.0
+python-dotenv>=1.0.0
+qasync>=0.27.0
+openpyxl>=3.1.0

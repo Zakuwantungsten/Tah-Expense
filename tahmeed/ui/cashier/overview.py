@@ -1,0 +1,778 @@
+"""
+CashierOverview — summary dashboard (Overview tab).
+
+Layout (scrollable content):
+  ┌─ Welcome banner ─────────────────────────────────────────────┐
+  ├─ TODAY  · 4 stat cards ──────────────────────────────────────┤
+  ├─ THIS MONTH · 4 stat cards ──────────────────────────────────┤
+  ├─ Receipt status bar ─────────────────────────────────────────┤
+  ├─ Recent activity table (last 8 rows) ────────────────────────┤
+  └─ Quick actions ──────────────────────────────────────────────┘
+"""
+
+import asyncio
+from datetime import date, datetime
+
+from PySide6.QtCore import Qt, QByteArray, QSize, Signal
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import (
+    QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
+)
+
+from tahmeed.models.user import User
+from tahmeed.services.cashier_service import get_overview_stats
+
+# ---------------------------------------------------------------------------
+# Palette
+# ---------------------------------------------------------------------------
+_BG        = "#f1f5f9"
+_CARD_BG   = "#ffffff"
+_BORDER    = "#e2e8f0"
+_DARK      = "#0f172a"
+_MUTED     = "#64748b"
+_SECTION   = "#94a3b8"
+_GREEN     = "#22c55e"
+_BLUE      = "#3b82f6"
+_AMBER     = "#f59e0b"
+_PURPLE    = "#a78bfa"
+_RED       = "#ef4444"
+_TEAL_DARK = "#0e2e2b"
+
+# ---------------------------------------------------------------------------
+# SVG icon set
+# ---------------------------------------------------------------------------
+_SVGS: dict[str, bytes] = {
+    "list": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#22c55e" stroke-width="1.8" stroke-linecap="round">'
+        b'<rect x="4" y="2" width="16" height="20" rx="2"/>'
+        b'<line x1="8" y1="7" x2="16" y2="7"/>'
+        b'<line x1="8" y1="11" x2="16" y2="11"/>'
+        b'<line x1="8" y1="15" x2="12" y2="15"/>'
+        b'</svg>'
+    ),
+    "money": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#22c55e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        b'<rect x="2" y="6" width="20" height="12" rx="2"/>'
+        b'<circle cx="12" cy="12" r="3"/>'
+        b'<line x1="2" y1="10" x2="5" y2="10"/>'
+        b'<line x1="2" y1="14" x2="5" y2="14"/>'
+        b'<line x1="19" y1="10" x2="22" y2="10"/>'
+        b'<line x1="19" y1="14" x2="22" y2="14"/>'
+        b'</svg>'
+    ),
+    "dollar": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#3b82f6" stroke-width="1.8" stroke-linecap="round">'
+        b'<line x1="12" y1="2" x2="12" y2="22"/>'
+        b'<path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/>'
+        b'</svg>'
+    ),
+    "receipt": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#f59e0b" stroke-width="1.8" stroke-linecap="round">'
+        b'<path d="M4 2l2 2 2-2 2 2 2-2 2 2 2-2v18l-2-2-2 2-2-2-2 2-2-2-2 2V2z"/>'
+        b'<line x1="8" y1="9" x2="16" y2="9"/>'
+        b'<line x1="8" y1="13" x2="14" y2="13"/>'
+        b'</svg>'
+    ),
+    "calendar": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#60a5fa" stroke-width="1.8" stroke-linecap="round">'
+        b'<rect x="3" y="4" width="18" height="18" rx="2"/>'
+        b'<line x1="3" y1="9" x2="21" y2="9"/>'
+        b'<line x1="8" y1="2" x2="8" y2="6"/>'
+        b'<line x1="16" y1="2" x2="16" y2="6"/>'
+        b'</svg>'
+    ),
+    "money_blue": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#60a5fa" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        b'<rect x="2" y="6" width="20" height="12" rx="2"/>'
+        b'<circle cx="12" cy="12" r="3"/>'
+        b'<line x1="2" y1="10" x2="5" y2="10"/>'
+        b'<line x1="2" y1="14" x2="5" y2="14"/>'
+        b'<line x1="19" y1="10" x2="22" y2="10"/>'
+        b'<line x1="19" y1="14" x2="22" y2="14"/>'
+        b'</svg>'
+    ),
+    "clock": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#a78bfa" stroke-width="1.8" stroke-linecap="round">'
+        b'<circle cx="12" cy="12" r="9"/>'
+        b'<polyline points="12,6 12,12 16,14"/>'
+        b'</svg>'
+    ),
+    "check": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+        b'<path d="M22 11.08V12a10 10 0 11-5.93-9.14"/>'
+        b'<polyline points="22,4 12,14.01 9,11.01"/>'
+        b'</svg>'
+    ),
+    "alert": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#ef4444" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        b'<path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>'
+        b'<line x1="12" y1="9" x2="12" y2="13"/>'
+        b'<line x1="12" y1="17" x2="12.01" y2="17" stroke-width="2.5"/>'
+        b'</svg>'
+    ),
+    "refresh": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round">'
+        b'<path d="M3 12a9 9 0 109-9 9.75 9.75 0 00-6.74 2.74L3 8"/>'
+        b'<path d="M3 3v5h5"/>'
+        b'</svg>'
+    ),
+    "table_go": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        b'<rect x="3" y="3" width="7" height="7" rx="1.5" fill="#4ade80"/>'
+        b'<rect x="14" y="3" width="7" height="7" rx="1.5" fill="#4ade80"/>'
+        b'<rect x="3" y="14" width="7" height="7" rx="1.5" fill="#4ade80"/>'
+        b'<rect x="14" y="14" width="7" height="7" rx="1.5" fill="#4ade80"/>'
+        b'</svg>'
+    ),
+    "form_go": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#4ade80" stroke-width="1.8" stroke-linecap="round">'
+        b'<rect x="4" y="2" width="16" height="20" rx="2"/>'
+        b'<line x1="7" y1="8" x2="17" y2="8"/>'
+        b'<line x1="7" y1="12" x2="17" y2="12"/>'
+        b'<line x1="7" y1="16" x2="13" y2="16"/>'
+        b'</svg>'
+    ),
+    "browse_go": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#4ade80" stroke-width="1.8" stroke-linecap="round">'
+        b'<circle cx="11" cy="11" r="7"/>'
+        b'<line x1="16.5" y1="16.5" x2="21" y2="21" stroke-width="2.2"/>'
+        b'</svg>'
+    ),
+    "export_go": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#4ade80" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        b'<path d="M12 3v13"/>'
+        b'<polyline points="17,8 12,3 7,8"/>'
+        b'<path d="M5 20h14"/>'
+        b'</svg>'
+    ),
+    "import_go": (
+        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+        b' stroke="#4ade80" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        b'<path d="M12 16V3"/>'
+        b'<polyline points="7,11 12,16 17,11"/>'
+        b'<path d="M5 20h14"/>'
+        b'</svg>'
+    ),
+}
+
+
+def _icon(key: str, size: int = 20) -> QIcon:
+    renderer = QSvgRenderer(QByteArray(_SVGS[key]))
+    px = QPixmap(size, size)
+    px.fill(Qt.transparent)
+    p = QPainter(px)
+    renderer.render(p)
+    p.end()
+    return QIcon(px)
+
+
+def _fmt_tzs(v: float) -> str:
+    return f"{v:,.0f}"
+
+
+def _fmt_usd(v: float) -> str:
+    return f"{v:,.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Stat card
+# ---------------------------------------------------------------------------
+
+class _StatCard(QFrame):
+    def __init__(
+        self,
+        icon_key: str,
+        value: str,
+        label: str,
+        accent: str,
+        subtitle: str = "",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("StatCard")
+        self.setStyleSheet(f"""
+            QFrame#StatCard {{
+                background: {_CARD_BG};
+                border: 1px solid {_BORDER};
+                border-radius: 10px;
+            }}
+        """)
+        self.setMinimumHeight(108)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(4)
+
+        # icon + label row
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        top.setContentsMargins(0, 0, 0, 0)
+
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(28, 28)
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setStyleSheet(
+            f"background: transparent; border-radius: 0px;"
+        )
+        icon_lbl.setPixmap(_icon(icon_key, 22).pixmap(QSize(22, 22)))
+
+        lbl = QLabel(label)
+        lbl.setStyleSheet(
+            f"color: {_MUTED}; font-size: 11px; font-weight: 500; background: transparent;"
+        )
+
+        top.addWidget(icon_lbl)
+        top.addWidget(lbl)
+        top.addStretch()
+
+        # value
+        self._val_lbl = QLabel(value)
+        self._val_lbl.setStyleSheet(
+            f"color: {_DARK}; font-size: 22px; font-weight: 700;"
+            f" background: transparent; letter-spacing: -0.5px;"
+        )
+
+        lay.addLayout(top)
+        lay.addWidget(self._val_lbl)
+
+        if subtitle:
+            sub = QLabel(subtitle)
+            sub.setStyleSheet(
+                f"color: {accent}; font-size: 10px; font-weight: 500; background: transparent;"
+            )
+            lay.addWidget(sub)
+        else:
+            lay.addStretch()
+
+        # left accent stripe
+        stripe = QFrame(self)
+        stripe.setGeometry(0, 10, 3, 88)
+        stripe.setStyleSheet(
+            f"background: {accent}; border-radius: 2px;"
+        )
+
+    def set_value(self, v: str) -> None:
+        self._val_lbl.setText(v)
+
+
+# ---------------------------------------------------------------------------
+# Section header
+# ---------------------------------------------------------------------------
+
+def _section_header(title: str) -> QWidget:
+    w = QWidget()
+    w.setStyleSheet("background: transparent;")
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 8, 0, 2)
+    h.setSpacing(10)
+
+    lbl = QLabel(title.upper())
+    lbl.setStyleSheet(
+        f"color: {_SECTION}; font-size: 10px; font-weight: 700;"
+        f" letter-spacing: 1.2px; background: transparent;"
+    )
+
+    line = QFrame()
+    line.setFrameShape(QFrame.HLine)
+    line.setStyleSheet(f"color: {_BORDER};")
+    line.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    h.addWidget(lbl)
+    h.addWidget(line)
+    return w
+
+
+# ---------------------------------------------------------------------------
+# Receipt status bar
+# ---------------------------------------------------------------------------
+
+class _ReceiptBar(QWidget):
+    def __init__(self, received: int, pending: int, missing: int, parent=None):
+        super().__init__(parent)
+        self._received = received
+        self._pending  = pending
+        self._missing  = missing
+        self._build()
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        total = self._received + self._pending + self._missing or 1
+
+        # bar
+        bar = QWidget()
+        bar.setFixedHeight(10)
+        bar.setStyleSheet("background: transparent;")
+        bar_lay = QHBoxLayout(bar)
+        bar_lay.setContentsMargins(0, 0, 0, 0)
+        bar_lay.setSpacing(2)
+
+        def _seg(color: str, count: int) -> QFrame:
+            f = QFrame()
+            f.setFixedHeight(10)
+            ratio = count / total
+            f.setMinimumWidth(max(4, int(ratio * 500)))
+            f.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            f.setStyleSheet(f"background: {color}; border-radius: 5px;")
+            return f
+
+        if self._received:
+            bar_lay.addWidget(_seg(_GREEN, self._received))
+        if self._pending:
+            bar_lay.addWidget(_seg(_AMBER, self._pending))
+        if self._missing:
+            bar_lay.addWidget(_seg(_RED, self._missing))
+
+        lay.addWidget(bar)
+
+        # legend
+        legend = QHBoxLayout()
+        legend.setSpacing(20)
+        legend.setContentsMargins(0, 0, 0, 0)
+
+        def _dot_label(color: str, text: str) -> QWidget:
+            w = QWidget()
+            w.setStyleSheet("background: transparent;")
+            wl = QHBoxLayout(w)
+            wl.setContentsMargins(0, 0, 0, 0)
+            wl.setSpacing(5)
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color: {color}; font-size: 10px; background: transparent;")
+            lbl = QLabel(text)
+            lbl.setStyleSheet(f"color: {_MUTED}; font-size: 11px; background: transparent;")
+            wl.addWidget(dot)
+            wl.addWidget(lbl)
+            return w
+
+        legend.addWidget(_dot_label(_GREEN, f"Received  {self._received}"))
+        legend.addWidget(_dot_label(_AMBER, f"Pending  {self._pending}"))
+        legend.addWidget(_dot_label(_RED,   f"Missing  {self._missing}"))
+        legend.addStretch()
+
+        lay.addLayout(legend)
+
+    def update_data(self, received: int, pending: int, missing: int) -> None:
+        self._received = received
+        self._pending  = pending
+        self._missing  = missing
+        # rebuild
+        old = self.layout()
+        while old.count():
+            item = old.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._build()
+
+
+# ---------------------------------------------------------------------------
+# Recent activity row
+# ---------------------------------------------------------------------------
+
+def _activity_header() -> QWidget:
+    w = QWidget()
+    w.setStyleSheet(f"background: {_TEAL_DARK}; border-radius: 6px 6px 0 0;")
+    h = QHBoxLayout(w)
+    h.setContentsMargins(14, 8, 14, 8)
+    h.setSpacing(0)
+
+    def _col(text: str, flex: int, align=Qt.AlignLeft) -> QLabel:
+        l = QLabel(text)
+        l.setStyleSheet(
+            "color: #94a3b8; font-size: 10px; font-weight: 700;"
+            " letter-spacing: 0.8px; background: transparent;"
+        )
+        l.setAlignment(align)
+        l.setSizePolicy(QSizePolicy.Expanding if flex else QSizePolicy.Fixed, QSizePolicy.Fixed)
+        return l
+
+    h.addWidget(_col("DATE", 1))
+    h.addWidget(_col("DESCRIPTION", 3))
+    h.addWidget(_col("TRUCK", 1))
+    h.addWidget(_col("CATEGORY", 1))
+    h.addWidget(_col("AMOUNT", 1, Qt.AlignRight))
+    return w
+
+
+def _activity_row(tx, even: bool) -> QWidget:
+    bg = "#ffffff" if even else "#f8fafc"
+    w = QWidget()
+    w.setStyleSheet(f"background: {bg};")
+    h = QHBoxLayout(w)
+    h.setContentsMargins(14, 9, 14, 9)
+    h.setSpacing(0)
+
+    date_str = tx.date.strftime("%b %d") if tx.date else "—"
+    desc     = (tx.description or "—")[:38]
+    truck    = tx.truck_number or "—"
+    cat      = (tx.category_name or "—")[:18]
+
+    if tx.currency == "USD":
+        amount_str = f"$ {_fmt_usd(tx.amount or 0)}"
+        amt_color  = _BLUE
+    else:
+        amount_str = f"{_fmt_tzs(tx.amount or 0)} TZS"
+        amt_color  = _GREEN
+
+    def _cell(text: str, flex: int, color: str = _DARK,
+               align=Qt.AlignLeft, bold=False) -> QLabel:
+        l = QLabel(text)
+        fw = "600" if bold else "400"
+        l.setStyleSheet(
+            f"color: {color}; font-size: 12px; font-weight: {fw}; background: transparent;"
+        )
+        l.setAlignment(align)
+        l.setSizePolicy(QSizePolicy.Expanding if flex else QSizePolicy.Fixed, QSizePolicy.Fixed)
+        return l
+
+    h.addWidget(_cell(date_str, 1, _MUTED))
+    h.addWidget(_cell(desc,     3, _DARK))
+    h.addWidget(_cell(truck,    1, _MUTED))
+    h.addWidget(_cell(cat,      1, _MUTED))
+    h.addWidget(_cell(amount_str, 1, amt_color, Qt.AlignRight, bold=True))
+    return w
+
+
+# ---------------------------------------------------------------------------
+# Quick action button
+# ---------------------------------------------------------------------------
+
+_ACTION_BTN = f"""
+QToolButton {{
+    background: {_TEAL_DARK};
+    border: 1px solid #1b4f4a;
+    border-radius: 8px;
+    padding: 8px 20px;
+    color: #e2e8f0;
+    font-size: 12px;
+    font-weight: 600;
+    min-width: 140px;
+}}
+QToolButton:hover   {{ background: #1b4f4a; color: #ffffff; border-color: #4ade80; }}
+QToolButton:pressed {{ background: #0a1f1d; }}
+"""
+
+
+# ---------------------------------------------------------------------------
+# CashierOverview
+# ---------------------------------------------------------------------------
+
+class CashierOverview(QWidget):
+    go_to_register = Signal()
+    go_to_form     = Signal()
+    go_to_browse   = Signal()
+    export_data    = Signal()
+    import_data    = Signal()
+
+    def __init__(self, user: User, parent=None):
+        super().__init__(parent)
+        self._user = user
+        self._cards: dict[str, _StatCard] = {}
+        self._receipt_bar: _ReceiptBar | None = None
+        self._activity_container: QWidget | None = None
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # Build
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self.setStyleSheet(f"CashierOverview {{ background: {_BG}; }}")
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(f"QScrollArea {{ background: {_BG}; border: none; }}")
+
+        content = QWidget()
+        content.setStyleSheet(f"background: {_BG};")
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(28, 24, 28, 28)
+        cl.setSpacing(0)
+
+        # ── Welcome banner ────────────────────────────────────────────
+        cl.addWidget(self._build_banner())
+        cl.addSpacing(24)
+
+        # ── Today section ─────────────────────────────────────────────
+        cl.addWidget(_section_header("Today"))
+        cl.addSpacing(10)
+        today_grid = QGridLayout()
+        today_grid.setSpacing(12)
+        today_grid.setContentsMargins(0, 0, 0, 0)
+
+        self._cards["t_count"] = _StatCard("list",      "—", "Transactions",   _GREEN,  "entries today")
+        self._cards["t_tzs"]   = _StatCard("money",     "—", "TZS Total",      _GREEN,  "today")
+        self._cards["t_usd"]   = _StatCard("dollar",    "—", "USD Total",       _BLUE,   "today")
+        self._cards["t_rcpt"]  = _StatCard("receipt",   "—", "Pending Receipts",_AMBER,  "today")
+
+        today_grid.addWidget(self._cards["t_count"], 0, 0)
+        today_grid.addWidget(self._cards["t_tzs"],   0, 1)
+        today_grid.addWidget(self._cards["t_usd"],   0, 2)
+        today_grid.addWidget(self._cards["t_rcpt"],  0, 3)
+        cl.addLayout(today_grid)
+        cl.addSpacing(20)
+
+        # ── Month section ─────────────────────────────────────────────
+        today = date.today()
+        cl.addWidget(_section_header(today.strftime("This Month — %B %Y")))
+        cl.addSpacing(10)
+        month_grid = QGridLayout()
+        month_grid.setSpacing(12)
+        month_grid.setContentsMargins(0, 0, 0, 0)
+
+        self._cards["m_count"] = _StatCard("calendar",   "—", "Total Entries",  _BLUE,   "this month")
+        self._cards["m_tzs"]   = _StatCard("money_blue", "—", "TZS Total",      _BLUE,   "this month")
+        self._cards["m_usd"]   = _StatCard("dollar",     "—", "USD Total",       _BLUE,   "this month")
+        self._cards["m_unver"] = _StatCard("clock",      "—", "Unverified",      _PURPLE, "awaiting review")
+
+        month_grid.addWidget(self._cards["m_count"], 0, 0)
+        month_grid.addWidget(self._cards["m_tzs"],   0, 1)
+        month_grid.addWidget(self._cards["m_usd"],   0, 2)
+        month_grid.addWidget(self._cards["m_unver"], 0, 3)
+        cl.addLayout(month_grid)
+        cl.addSpacing(20)
+
+        # ── Quick actions ─────────────────────────────────────────────
+        cl.addWidget(_section_header("Quick Actions"))
+        cl.addSpacing(10)
+        actions = QHBoxLayout()
+        actions.setSpacing(12)
+        actions.setContentsMargins(0, 0, 0, 0)
+
+        def _abtn(label: str, icon_key: str, slot) -> QToolButton:
+            b = QToolButton()
+            b.setText(f"  {label}")
+            b.setIcon(_icon(icon_key, 16))
+            b.setIconSize(QSize(16, 16))
+            b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            b.setStyleSheet(_ACTION_BTN)
+            b.clicked.connect(slot)
+            return b
+
+        actions.addWidget(_abtn("Today's Register", "table_go",  self.go_to_register.emit))
+        actions.addWidget(_abtn("New Entry",         "form_go",   self.go_to_form.emit))
+        actions.addWidget(_abtn("Browse All",        "browse_go", self.go_to_browse.emit))
+        actions.addWidget(_abtn("Export",            "export_go", self.export_data.emit))
+        actions.addWidget(_abtn("Import",            "import_go", self.import_data.emit))
+        actions.addStretch()
+        cl.addLayout(actions)
+        cl.addSpacing(20)
+
+        # ── Receipt status bar ────────────────────────────────────────
+        cl.addWidget(_section_header("Receipt Status  ·  This Month"))
+        cl.addSpacing(10)
+        rcpt_card = QFrame()
+        rcpt_card.setObjectName("RcptCard")
+        rcpt_card.setStyleSheet(f"""
+            QFrame#RcptCard {{
+                background: {_CARD_BG};
+                border: 1px solid {_BORDER};
+                border-radius: 10px;
+            }}
+        """)
+        rcpt_lay = QVBoxLayout(rcpt_card)
+        rcpt_lay.setContentsMargins(18, 14, 18, 14)
+        self._receipt_bar = _ReceiptBar(0, 0, 0)
+        rcpt_lay.addWidget(self._receipt_bar)
+        cl.addWidget(rcpt_card)
+        cl.addSpacing(20)
+
+        # ── Recent activity ───────────────────────────────────────────
+        cl.addWidget(_section_header("Recent Activity"))
+        cl.addSpacing(10)
+
+        activity_card = QFrame()
+        activity_card.setObjectName("ActCard")
+        activity_card.setStyleSheet(f"""
+            QFrame#ActCard {{
+                background: {_CARD_BG};
+                border: 1px solid {_BORDER};
+                border-radius: 10px;
+                overflow: hidden;
+            }}
+        """)
+        self._activity_lay = QVBoxLayout(activity_card)
+        self._activity_lay.setContentsMargins(0, 0, 0, 0)
+        self._activity_lay.setSpacing(0)
+        self._activity_lay.addWidget(_activity_header())
+
+        # placeholder rows
+        self._activity_rows_container = QWidget()
+        self._activity_rows_container.setStyleSheet("background: transparent;")
+        self._rows_lay = QVBoxLayout(self._activity_rows_container)
+        self._rows_lay.setContentsMargins(0, 0, 0, 0)
+        self._rows_lay.setSpacing(0)
+        self._activity_lay.addWidget(self._activity_rows_container)
+
+        # bottom border
+        sep = QFrame()
+        sep.setFrameShape(QFrame.NoFrame)
+        sep.setFixedHeight(8)
+        sep.setStyleSheet(f"background: {_CARD_BG}; border-radius: 0 0 10px 10px;")
+        self._activity_lay.addWidget(sep)
+
+        cl.addWidget(activity_card)
+
+        cl.addStretch()
+        scroll.setWidget(content)
+        root.addWidget(scroll)
+
+    def _build_banner(self) -> QWidget:
+        banner = QWidget()
+        banner.setObjectName("Banner")
+        banner.setStyleSheet(f"""
+            QWidget#Banner {{
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {_TEAL_DARK},
+                    stop:1 #1b4f4a
+                );
+                border-radius: 12px;
+            }}
+        """)
+        banner.setFixedHeight(80)
+
+        bl = QHBoxLayout(banner)
+        bl.setContentsMargins(20, 0, 20, 0)
+        bl.setSpacing(14)
+
+        initials = "".join(p[0].upper() for p in self._user.full_name.split()[:2]) or "U"
+        avatar = QLabel(initials)
+        avatar.setFixedSize(46, 46)
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setStyleSheet(
+            "background: rgba(74,222,128,0.18); border-radius: 23px;"
+            " color: #4ade80; font-size: 16px; font-weight: 700;"
+        )
+
+        text_w = QWidget()
+        text_w.setStyleSheet("background: transparent;")
+        tl = QVBoxLayout(text_w)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(2)
+
+        hour = datetime.now().hour
+        greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 17 else "Good evening")
+        greet_lbl = QLabel(f"{greeting}, {self._user.full_name.split()[0]}")
+        greet_lbl.setStyleSheet(
+            "color: #f1f5f9; font-size: 15px; font-weight: 700; background: transparent;"
+        )
+        sub_lbl = QLabel("Here's your activity summary for today")
+        sub_lbl.setStyleSheet(
+            "color: #6ee7b7; font-size: 11px; background: transparent;"
+        )
+        tl.addWidget(greet_lbl)
+        tl.addWidget(sub_lbl)
+
+        bl.addWidget(avatar)
+        bl.addWidget(text_w)
+        bl.addStretch()
+
+        # date badge
+        date_badge = QWidget()
+        date_badge.setStyleSheet(
+            "background: rgba(255,255,255,0.08); border-radius: 8px;"
+        )
+        dbl = QVBoxLayout(date_badge)
+        dbl.setContentsMargins(14, 8, 14, 8)
+        dbl.setSpacing(0)
+        today = date.today()
+        day_lbl = QLabel(today.strftime("%B %d"))
+        day_lbl.setAlignment(Qt.AlignCenter)
+        day_lbl.setStyleSheet(
+            "color: #f1f5f9; font-size: 13px; font-weight: 700; background: transparent;"
+        )
+        yr_lbl = QLabel(today.strftime("%Y  ·  %A"))
+        yr_lbl.setAlignment(Qt.AlignCenter)
+        yr_lbl.setStyleSheet(
+            "color: #6ee7b7; font-size: 10px; background: transparent;"
+        )
+        dbl.addWidget(day_lbl)
+        dbl.addWidget(yr_lbl)
+        bl.addWidget(date_badge)
+
+        return banner
+
+    # ------------------------------------------------------------------
+    # Load / refresh
+    # ------------------------------------------------------------------
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        try:
+            stats = await get_overview_stats()
+            self._apply(stats)
+        except Exception:
+            pass
+
+    def _apply(self, stats: dict) -> None:
+        t = stats["today"]
+        m = stats["month"]
+
+        # today cards
+        self._cards["t_count"].set_value(str(t.get("count", 0)))
+        self._cards["t_tzs"].set_value(_fmt_tzs(t.get("tzs_total", 0)))
+        pending = t.get("receipt_pending", 0) + t.get("receipt_missing", 0)
+        self._cards["t_rcpt"].set_value(str(pending))
+        self._cards["t_usd"].set_value(_fmt_usd(t.get("usd_total", 0)))
+
+        # month cards
+        self._cards["m_count"].set_value(str(m.get("count", 0)))
+        self._cards["m_tzs"].set_value(_fmt_tzs(m.get("tzs_total", 0)))
+        self._cards["m_usd"].set_value(_fmt_usd(m.get("usd_total", 0)))
+        self._cards["m_unver"].set_value(str(m.get("unverified", 0)))
+
+        # receipt bar
+        if self._receipt_bar:
+            self._receipt_bar.update_data(
+                m.get("receipt_received", 0),
+                m.get("receipt_pending", 0),
+                m.get("receipt_missing", 0),
+            )
+
+        # activity rows
+        while self._rows_lay.count():
+            item = self._rows_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        rows = stats.get("recent", [])
+        if rows:
+            for i, tx in enumerate(rows):
+                row_w = _activity_row(tx, even=(i % 2 == 0))
+                self._rows_lay.addWidget(row_w)
+                if i < len(rows) - 1:
+                    sep = QFrame()
+                    sep.setFrameShape(QFrame.HLine)
+                    sep.setStyleSheet(f"color: {_BORDER};")
+                    self._rows_lay.addWidget(sep)
+        else:
+            empty = QLabel("No transactions yet.")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet(
+                f"color: {_MUTED}; font-size: 12px; padding: 24px; background: transparent;"
+            )
+            self._rows_lay.addWidget(empty)
