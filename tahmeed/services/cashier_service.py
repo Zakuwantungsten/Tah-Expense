@@ -72,8 +72,7 @@ async def get_overview_stats() -> dict:
             {"$group": {
                 "_id": None,
                 "count":            {"$sum": 1},
-                "tzs_total":        {"$sum": {"$cond": [{"$eq": ["$currency", "TZS"]}, "$amount", 0]}},
-                "usd_total":        {"$sum": {"$cond": [{"$eq": ["$currency", "USD"]}, "$amount", 0]}},
+                "tzs_total":        {"$sum": "$amount"},
                 "receipt_received": {"$sum": {"$cond": [{"$eq": ["$receipt_status", "received"]}, 1, 0]}},
                 "receipt_pending":  {"$sum": {"$cond": [{"$eq": ["$receipt_status", "pending"]},  1, 0]}},
                 "receipt_missing":  {"$sum": {"$cond": [{"$eq": ["$receipt_status", "missing"]},  1, 0]}},
@@ -87,7 +86,7 @@ async def get_overview_stats() -> dict:
         db.transactions.find({}).sort([("date", -1), ("created_at", -1)]).limit(8).to_list(8),
     )
 
-    _empty = {"count": 0, "tzs_total": 0.0, "usd_total": 0.0,
+    _empty = {"count": 0, "tzs_total": 0.0,
               "receipt_received": 0, "receipt_pending": 0, "receipt_missing": 0, "unverified": 0}
     return {
         "today":  today_res[0]  if today_res  else _empty,

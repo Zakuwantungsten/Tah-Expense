@@ -25,10 +25,10 @@ class SettingsTab(QWidget):
         form.setHorizontalSpacing(20)
         form.setVerticalSpacing(14)
 
-        # Default currency
+        # Default currency (TZS only)
         self._currency = QComboBox()
         self._currency.setFixedWidth(120)
-        self._currency.addItems(["TZS", "USD"])
+        self._currency.addItems(["TZS"])
         form.addRow("Default currency:", self._currency)
 
         # Confidence threshold

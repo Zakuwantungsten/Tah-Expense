@@ -5,13 +5,13 @@ Layout (top to bottom):
   ┌─ Date nav bar ────────────────────────────────────────┐
   │  ← Prev Day  |  09 June 2026 ▼  |  Next Day →  Today │
   ├─ Column headers ──────────────────────────────────────┤
-  │  # | Date | Description | Truck | LPO | DO | Memo | … │
+  │  # | Date | Description | Truck | Memo | TZS | … │
   ├─ Saved rows (read-only, light-blue) ──────────────────┤
   │  ...existing transactions for the selected date...     │
   ├─ New entry rows (editable, white) ────────────────────┤
   │  ...blank rows for new entry...                        │
   ├─ Footer ──────────────────────────────────────────────┤
-  │  5 entries  ·  TZS 2,202,500  ·  USD 0.00             │
+  │  5 entries  ·  TZS 2,202,500                           │
   └───────────────────────────────────────────────────────┘
 
 Keyboard:
@@ -58,20 +58,16 @@ COL_DATE    = 1
 COL_ITEM    = 2
 COL_DESC    = 3
 COL_TRUCK   = 4
-COL_LPO     = 5
-COL_DO      = 6
-COL_MEMO    = 7
-COL_NOTES   = 8
-COL_TZS     = 9
-COL_USD     = 10
-COL_RECEIPT = 11
-COL_OWN     = 12
-COL_APR     = 13
+COL_MEMO    = 5
+COL_NOTES   = 6
+COL_TZS     = 7
+COL_RECEIPT = 8
+COL_OWN     = 9
+COL_APR     = 10
 
 HEADERS = [
     "S/NO", "Date", "Item", "Description", "Truck No.",
-    "LPO Nos", "DO No.", "Memo", "Notes",
-    "TZS", "USD", "Receipt", "Ownership", "APR BY",
+    "Memo", "Notes", "TZS", "Receipt", "Ownership", "APR BY",
 ]
 
 CHECK_COLS       = {COL_NOTES}
@@ -389,14 +385,11 @@ class DailyRegister(QWidget):
         self._table.setColumnWidth(COL_SNO,     38)
         self._table.setColumnWidth(COL_DATE,    110)
         self._table.setColumnWidth(COL_ITEM,    120)
-        self._table.setColumnWidth(COL_DESC,    320)
+        self._table.setColumnWidth(COL_DESC,    360)
         self._table.setColumnWidth(COL_TRUCK,   82)
-        self._table.setColumnWidth(COL_LPO,     78)
-        self._table.setColumnWidth(COL_DO,      70)
-        self._table.setColumnWidth(COL_MEMO,    110)
+        self._table.setColumnWidth(COL_MEMO,    130)
         self._table.setColumnWidth(COL_NOTES,   52)
-        self._table.setColumnWidth(COL_TZS,     100)
-        self._table.setColumnWidth(COL_USD,     88)
+        self._table.setColumnWidth(COL_TZS,     120)
         self._table.setColumnWidth(COL_RECEIPT, 60)
         self._table.setColumnWidth(COL_OWN,     90)
         self._table.setColumnWidth(COL_APR,     80)
@@ -601,8 +594,6 @@ class DailyRegister(QWidget):
         self._table.setItem(row, COL_ITEM,  saved_item(tx.item or ""))
         self._table.setItem(row, COL_DESC,  saved_item(tx.description))
         self._table.setItem(row, COL_TRUCK, saved_item(tx.truck_number or ""))
-        self._table.setItem(row, COL_LPO,   saved_item(tx.lpo_do or ""))
-        self._table.setItem(row, COL_DO,    saved_item(tx.do_number or ""))
         self._table.setItem(row, COL_MEMO,  saved_item(tx.memo or ""))
 
         # Notes checkbox
@@ -613,18 +604,11 @@ class DailyRegister(QWidget):
         self._table.setItem(row, COL_NOTES, notes_it)
 
         # TZS
-        tzs_str = f"{tx.amount:,.2f}" if tx.currency == "TZS" else ""
+        tzs_str = f"{tx.amount:,.2f}" if tx.amount else ""
         tzs_it  = saved_item(tzs_str, Qt.AlignRight | Qt.AlignVCenter)
-        if tx.amount < 0 and tx.currency == "TZS":
+        if tx.amount and tx.amount < 0:
             tzs_it.setForeground(NEG_COLOR)
         self._table.setItem(row, COL_TZS, tzs_it)
-
-        # USD
-        usd_str = f"{tx.amount:,.2f}" if tx.currency == "USD" else ""
-        usd_it  = saved_item(usd_str, Qt.AlignRight | Qt.AlignVCenter)
-        if tx.amount < 0 and tx.currency == "USD":
-            usd_it.setForeground(NEG_COLOR)
-        self._table.setItem(row, COL_USD, usd_it)
 
         # Receipt badge
         rcpt_it = saved_item(tx.receipt_status or "pending")
@@ -651,18 +635,12 @@ class DailyRegister(QWidget):
 
     def _update_footer(self, transactions: Optional[List[Transaction]] = None) -> None:
         if transactions is None:
-            n, tzs, usd = 0, 0.0, 0.0
+            n, tzs = 0, 0.0
         else:
             n   = len(transactions)
-            tzs = sum(t.amount for t in transactions if t.currency == "TZS")
-            usd = sum(t.amount for t in transactions if t.currency == "USD")
+            tzs = sum(t.amount for t in transactions)
 
-        parts = []
-        if tzs:
-            parts.append(f"TZS {tzs:,.0f}")
-        if usd:
-            parts.append(f"USD {usd:,.2f}")
-        amount_str = "  ·  ".join(parts) if parts else "—"
+        amount_str = f"TZS {tzs:,.0f}" if tzs else "—"
         self._totals_label.setText(
             f"{n} entr{'y' if n == 1 else 'ies'}   ·   {amount_str}"
         )
@@ -1031,12 +1009,9 @@ class DailyRegister(QWidget):
             COL_DATE:    1,
             COL_DESC:    3,
             COL_TRUCK:   4,
-            COL_LPO:     5,
-            COL_DO:      6,
             COL_MEMO:    9,
             COL_NOTES:   10,
             COL_TZS:     11,
-            COL_USD:     12,
             COL_RECEIPT: 13,
             COL_OWN:     14,
             COL_APR:     15,
@@ -1135,10 +1110,7 @@ class DailyRegister(QWidget):
                 def parse_num(s: str) -> float:
                     return float(s.replace(",", "")) if s else 0.0
 
-                tzs = parse_num(txt(COL_TZS))
-                usd = parse_num(txt(COL_USD))
-                amount   = tzs if tzs else usd
-                currency = "TZS" if tzs else "USD"
+                amount = parse_num(txt(COL_TZS))
 
                 rcpt_raw = txt(COL_RECEIPT).lower()
                 rcpt_status = rcpt_raw if rcpt_raw in ("pending", "received", "missing") else "pending"
@@ -1149,9 +1121,7 @@ class DailyRegister(QWidget):
                     item=txt(COL_ITEM),
                     truck_number=txt(COL_TRUCK).upper(),
                     amount=amount,
-                    currency=currency,
-                    lpo_do=txt(COL_LPO),
-                    do_number=txt(COL_DO),
+                    currency="TZS",
                     memo=txt(COL_MEMO),
                     receipt_status=rcpt_status,
                     notes_flag=checked(COL_NOTES),

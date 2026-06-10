@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QDateEdit, QDoubleSpinBox, QComboBox, QCheckBox,
     QPushButton, QLabel, QMessageBox, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QStyledItemDelegate, QSizePolicy,
+    QAbstractItemView, QStyledItemDelegate, QSizePolicy, QSplitter,
 )
 from PySide6.QtCore import Qt, QTimer, QDate, Signal, QSize
 from PySide6.QtGui import QColor, QBrush, QPainter
@@ -87,13 +87,12 @@ QTableWidget::item:selected { color:#111827; }
 
 # Register column indices (identical to excel_grid.py)
 _SNO, _DATE, _ITEM, _DESC, _TRUCK = 0, 1, 2, 3, 4
-_LPO, _DO, _MEMO, _NOTES          = 5, 6, 7, 8
-_TZS, _USD, _RCPT, _OWN, _APR     = 9, 10, 11, 12, 13
+_MEMO, _NOTES                     = 5, 6
+_TZS, _RCPT, _APR                 = 7, 8, 9
 
 _HEADERS = [
     "S/NO", "Date", "Item", "Description", "Truck No.",
-    "LPO Nos", "DO No.", "Memo", "Notes",
-    "TZS", "USD", "Receipt", "Ownership", "APR BY",
+    "Memo", "Ref_Float", "TZS", "Receipt", "APR BY",
 ]
 
 _SAVED_BG = QColor("#eff6ff")
@@ -146,11 +145,11 @@ class EntryForm(QWidget):
 
       Left              Middle                    Right
       ─────             ──────────────────────    ─────────────────
-      Date              Category  (autocomplete)  Amount  [TZS▼]
+      Date              Category  (autocomplete)  Amount (TZS)
       Item              hint label                Receipt ▼
-      Description       LPO Nos                   Notes ☐
-      Truck No.         DO No.                    Ownership
-                        Memo                      APR BY
+      Description       Memo                      Notes ☐
+      Truck No.                                   Ownership
+                                                  APR BY
 
     • Category is a live-search autocomplete (type to filter categories).
     • Description auto-triggers category detection in the background.
@@ -207,10 +206,18 @@ class EntryForm(QWidget):
         self.setStyleSheet("EntryForm { background:#f3f4f6; }")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(12)
+        outer.setSpacing(0)
 
-        outer.addWidget(self._build_table_card(), stretch=1)
-        outer.addWidget(self._build_form_card())
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setHandleWidth(7)
+        splitter.setStyleSheet(
+            "QSplitter::handle { background: #d1d5db; border-radius: 2px; }"
+        )
+        splitter.addWidget(self._build_table_card())
+        splitter.addWidget(self._build_form_card())
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        outer.addWidget(splitter)
 
         # Reload table when date picker changes
         self._date.dateChanged.connect(
@@ -271,14 +278,10 @@ class EntryForm(QWidget):
         self._day_table.setColumnWidth(_DATE,  95)
         self._day_table.setColumnWidth(_ITEM,  100)
         self._day_table.setColumnWidth(_TRUCK, 90)
-        self._day_table.setColumnWidth(_LPO,   80)
-        self._day_table.setColumnWidth(_DO,    70)
-        self._day_table.setColumnWidth(_MEMO,  100)
+        self._day_table.setColumnWidth(_MEMO,  120)
         self._day_table.setColumnWidth(_NOTES, 52)
-        self._day_table.setColumnWidth(_TZS,   100)
-        self._day_table.setColumnWidth(_USD,   80)
+        self._day_table.setColumnWidth(_TZS,   110)
         self._day_table.setColumnWidth(_RCPT,  90)
-        self._day_table.setColumnWidth(_OWN,   90)
         self._day_table.setColumnWidth(_APR,   75)
 
         lay.addWidget(self._day_table)
@@ -290,7 +293,8 @@ class EntryForm(QWidget):
         card = QWidget()
         card.setObjectName("fc")
         card.setStyleSheet(f"#fc {{ {_CARD} }}")
-        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        card.setMinimumHeight(260)
 
         lay = QVBoxLayout(card)
         lay.setContentsMargins(20, 14, 20, 16)
@@ -306,12 +310,23 @@ class EntryForm(QWidget):
         lay.addWidget(sep)
 
         cols = QHBoxLayout()
-        cols.setSpacing(16)
+        cols.setSpacing(20)
         cols.setContentsMargins(0, 0, 0, 0)
         cols.addWidget(self._build_left_col(),  stretch=1)
         cols.addWidget(self._build_mid_col(),   stretch=1)
         cols.addWidget(self._build_right_col(), stretch=1)
         lay.addLayout(cols)
+
+        # Tab navigates across columns row-by-row (not down each column)
+        QWidget.setTabOrder(self._date,        self._cat_input)
+        QWidget.setTabOrder(self._cat_input,   self._amount)
+        QWidget.setTabOrder(self._amount,      self._item)
+        QWidget.setTabOrder(self._item,        self._memo)
+        QWidget.setTabOrder(self._memo,        self._receipt)
+        QWidget.setTabOrder(self._receipt,     self._description)
+        QWidget.setTabOrder(self._description, self._notes)
+        QWidget.setTabOrder(self._notes,       self._truck)
+        QWidget.setTabOrder(self._truck,       self._approver)
 
         # Buttons
         btn_row = QHBoxLayout()
@@ -370,7 +385,7 @@ class EntryForm(QWidget):
         lay.addStretch()
         return w
 
-    # ── Middle column: Category → LPO Nos → DO No. → Memo ─────────────
+    # ── Middle column: Category → Memo ────────────────────────────────
 
     def _build_mid_col(self) -> QWidget:
         w, lay = _col()
@@ -388,20 +403,6 @@ class EntryForm(QWidget):
         self._cat_hint.setWordWrap(True)
         lay.addWidget(self._cat_hint)
 
-        lay.addWidget(_lbl("LPO Nos"))
-        self._lpo = QLineEdit()
-        self._lpo.setPlaceholderText("LPO number(s)")
-        self._lpo.setStyleSheet(_INPUT)
-        lay.addWidget(self._lpo)
-
-        lay.addSpacing(10)
-        lay.addWidget(_lbl("DO No."))
-        self._do = QLineEdit()
-        self._do.setPlaceholderText("Delivery Order No.")
-        self._do.setStyleSheet(_INPUT)
-        lay.addWidget(self._do)
-
-        lay.addSpacing(10)
         lay.addWidget(_lbl("Memo"))
         self._memo = QLineEdit()
         self._memo.setPlaceholderText("Optional note")
@@ -416,22 +417,13 @@ class EntryForm(QWidget):
     def _build_right_col(self) -> QWidget:
         w, lay = _col()
 
-        lay.addWidget(_lbl("Amount"))
-        amt_row = QHBoxLayout()
-        amt_row.setSpacing(6)
-        amt_row.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(_lbl("Amount (TZS)"))
         self._amount = QDoubleSpinBox()
         self._amount.setRange(0, 99_999_999)
         self._amount.setDecimals(2)
         self._amount.setGroupSeparatorShown(True)
         self._amount.setStyleSheet(_INPUT)
-        self._currency = QComboBox()
-        self._currency.addItems(["TZS", "USD"])
-        self._currency.setFixedWidth(70)
-        self._currency.setStyleSheet(_INPUT)
-        amt_row.addWidget(self._amount, stretch=1)
-        amt_row.addWidget(self._currency)
-        lay.addLayout(amt_row)
+        lay.addWidget(self._amount)
 
         lay.addSpacing(10)
         lay.addWidget(_lbl("Receipt"))
@@ -506,8 +498,6 @@ class EntryForm(QWidget):
             self._day_table.setItem(row, _ITEM,  _it(tx.item or ""))
             self._day_table.setItem(row, _DESC,  _it(tx.description or ""))
             self._day_table.setItem(row, _TRUCK, _it(tx.truck_number or ""))
-            self._day_table.setItem(row, _LPO,   _it(tx.lpo_do or ""))
-            self._day_table.setItem(row, _DO,    _it(tx.do_number or ""))
             self._day_table.setItem(row, _MEMO,  _it(tx.memo or ""))
 
             notes_it = _it("✓" if tx.notes_flag else "", Qt.AlignCenter)
@@ -515,17 +505,11 @@ class EntryForm(QWidget):
                 notes_it.setForeground(QColor("#2563eb"))
             self._day_table.setItem(row, _NOTES, notes_it)
 
-            tzs_str = f"{tx.amount:,.2f}" if tx.currency == "TZS" else ""
+            tzs_str = f"{tx.amount:,.2f}" if tx.amount else ""
             tzs_it  = _it(tzs_str, Qt.AlignRight | Qt.AlignVCenter)
-            if tx.amount < 0 and tx.currency == "TZS":
+            if tx.amount and tx.amount < 0:
                 tzs_it.setForeground(_NEG_COL)
             self._day_table.setItem(row, _TZS, tzs_it)
-
-            usd_str = f"{tx.amount:,.2f}" if tx.currency == "USD" else ""
-            usd_it  = _it(usd_str, Qt.AlignRight | Qt.AlignVCenter)
-            if tx.amount < 0 and tx.currency == "USD":
-                usd_it.setForeground(_NEG_COL)
-            self._day_table.setItem(row, _USD, usd_it)
 
             rcpt_it = QTableWidgetItem("")
             rcpt_it.setData(Qt.UserRole, tx.receipt_status)
@@ -639,11 +623,9 @@ class EntryForm(QWidget):
             item=self._item.text().strip(),
             truck_number=self._truck.text().strip().upper(),
             amount=self._amount.value(),
-            currency=self._currency.currentText(),
+            currency="TZS",
             category_id=cat_id,
             category_name=cat_name,
-            lpo_do=self._lpo.text().strip(),
-            do_number=self._do.text().strip(),
             memo=self._memo.text().strip(),
             receipt_status=self._receipt.currentText().lower(),
             notes_flag=self._notes.isChecked(),
@@ -671,8 +653,6 @@ class EntryForm(QWidget):
         self._description.clear()
         self._truck.clear()
         self._amount.setValue(0)
-        self._lpo.clear()
-        self._do.clear()
         self._memo.clear()
         self._receipt.setCurrentIndex(0)
         self._notes.setChecked(False)

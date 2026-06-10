@@ -5,9 +5,9 @@ Layout (scrollable content):
   ┌─ Welcome banner ─────────────────────────────────────────────┐
   ├─ TODAY  · 4 stat cards ──────────────────────────────────────┤
   ├─ THIS MONTH · 4 stat cards ──────────────────────────────────┤
-  ├─ Receipt status bar ─────────────────────────────────────────┤
-  ├─ Recent activity table (last 8 rows) ────────────────────────┤
-  └─ Quick actions ──────────────────────────────────────────────┘
+  ├─ Quick actions ──────────────────────────────────────────────┤
+  ├─ Receipt status (left) │ Recent activity (right) ─────────────┤  ← side-by-side when wide
+  └─ stacked vertically when narrow ────────────────────────────┘
 """
 
 import asyncio
@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt, QByteArray, QSize, Signal
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QBoxLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -46,16 +46,15 @@ _TEAL_DARK = "#0e2e2b"
 _SVGS: dict[str, bytes] = {
     "list": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#22c55e" stroke-width="1.8" stroke-linecap="round">'
-        b'<rect x="4" y="2" width="16" height="20" rx="2"/>'
-        b'<line x1="8" y1="7" x2="16" y2="7"/>'
-        b'<line x1="8" y1="11" x2="16" y2="11"/>'
-        b'<line x1="8" y1="15" x2="12" y2="15"/>'
+        b' stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        b'<polygon points="12,2 2,7 12,12 22,7"/>'
+        b'<polyline points="2,17 12,22 22,17"/>'
+        b'<polyline points="2,12 12,17 22,12"/>'
         b'</svg>'
     ),
     "money": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#22c55e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        b' stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
         b'<rect x="2" y="6" width="20" height="12" rx="2"/>'
         b'<circle cx="12" cy="12" r="3"/>'
         b'<line x1="2" y1="10" x2="5" y2="10"/>'
@@ -64,16 +63,9 @@ _SVGS: dict[str, bytes] = {
         b'<line x1="19" y1="14" x2="22" y2="14"/>'
         b'</svg>'
     ),
-    "dollar": (
-        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#3b82f6" stroke-width="1.8" stroke-linecap="round">'
-        b'<line x1="12" y1="2" x2="12" y2="22"/>'
-        b'<path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/>'
-        b'</svg>'
-    ),
     "receipt": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#f59e0b" stroke-width="1.8" stroke-linecap="round">'
+        b' stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round">'
         b'<path d="M4 2l2 2 2-2 2 2 2-2 2 2 2-2v18l-2-2-2 2-2-2-2 2-2-2-2 2V2z"/>'
         b'<line x1="8" y1="9" x2="16" y2="9"/>'
         b'<line x1="8" y1="13" x2="14" y2="13"/>'
@@ -81,16 +73,21 @@ _SVGS: dict[str, bytes] = {
     ),
     "calendar": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#60a5fa" stroke-width="1.8" stroke-linecap="round">'
+        b' stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round">'
         b'<rect x="3" y="4" width="18" height="18" rx="2"/>'
         b'<line x1="3" y1="9" x2="21" y2="9"/>'
         b'<line x1="8" y1="2" x2="8" y2="6"/>'
         b'<line x1="16" y1="2" x2="16" y2="6"/>'
+        b'<line x1="8" y1="14" x2="10" y2="14"/>'
+        b'<line x1="12" y1="14" x2="14" y2="14"/>'
+        b'<line x1="16" y1="14" x2="18" y2="14"/>'
+        b'<line x1="8" y1="18" x2="10" y2="18"/>'
+        b'<line x1="12" y1="18" x2="14" y2="18"/>'
         b'</svg>'
     ),
     "money_blue": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#60a5fa" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        b' stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
         b'<rect x="2" y="6" width="20" height="12" rx="2"/>'
         b'<circle cx="12" cy="12" r="3"/>'
         b'<line x1="2" y1="10" x2="5" y2="10"/>'
@@ -101,7 +98,7 @@ _SVGS: dict[str, bytes] = {
     ),
     "clock": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#a78bfa" stroke-width="1.8" stroke-linecap="round">'
+        b' stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round">'
         b'<circle cx="12" cy="12" r="9"/>'
         b'<polyline points="12,6 12,12 16,14"/>'
         b'</svg>'
@@ -185,10 +182,6 @@ def _fmt_tzs(v: float) -> str:
     return f"{v:,.0f}"
 
 
-def _fmt_usd(v: float) -> str:
-    return f"{v:,.2f}"
-
-
 # ---------------------------------------------------------------------------
 # Stat card
 # ---------------------------------------------------------------------------
@@ -254,18 +247,11 @@ class _StatCard(QFrame):
         if subtitle:
             sub = QLabel(subtitle)
             sub.setStyleSheet(
-                f"color: {accent}; font-size: 10px; font-weight: 500; background: transparent;"
+                f"color: {_MUTED}; font-size: 10px; font-weight: 500; background: transparent;"
             )
             lay.addWidget(sub)
         else:
             lay.addStretch()
-
-        # left accent stripe
-        stripe = QFrame(self)
-        stripe.setGeometry(0, 10, 3, 88)
-        stripe.setStyleSheet(
-            f"background: {accent}; border-radius: 2px;"
-        )
 
     def set_value(self, v: str) -> None:
         self._val_lbl.setText(v)
@@ -404,10 +390,10 @@ def _activity_header() -> QWidget:
         return l
 
     h.addWidget(_col("DATE", 1))
+    h.addWidget(_col("ITEM", 2))
     h.addWidget(_col("DESCRIPTION", 3))
     h.addWidget(_col("TRUCK", 1))
-    h.addWidget(_col("CATEGORY", 1))
-    h.addWidget(_col("AMOUNT", 1, Qt.AlignRight))
+    h.addWidget(_col("AMOUNT (TZS)", 1, Qt.AlignRight))
     return w
 
 
@@ -419,17 +405,13 @@ def _activity_row(tx, even: bool) -> QWidget:
     h.setContentsMargins(14, 9, 14, 9)
     h.setSpacing(0)
 
-    date_str = tx.date.strftime("%b %d") if tx.date else "—"
+    date_str = tx.date.strftime("%b %d, %Y") if tx.date else "—"
+    item     = (tx.item or "—")[:22]
     desc     = (tx.description or "—")[:38]
     truck    = tx.truck_number or "—"
-    cat      = (tx.category_name or "—")[:18]
 
-    if tx.currency == "USD":
-        amount_str = f"$ {_fmt_usd(tx.amount or 0)}"
-        amt_color  = _BLUE
-    else:
-        amount_str = f"{_fmt_tzs(tx.amount or 0)} TZS"
-        amt_color  = _GREEN
+    amount_str = f"{_fmt_tzs(tx.amount or 0)} TZS"
+    amt_color  = _GREEN
 
     def _cell(text: str, flex: int, color: str = _DARK,
                align=Qt.AlignLeft, bold=False) -> QLabel:
@@ -442,10 +424,10 @@ def _activity_row(tx, even: bool) -> QWidget:
         l.setSizePolicy(QSizePolicy.Expanding if flex else QSizePolicy.Fixed, QSizePolicy.Fixed)
         return l
 
-    h.addWidget(_cell(date_str, 1, _MUTED))
-    h.addWidget(_cell(desc,     3, _DARK))
-    h.addWidget(_cell(truck,    1, _MUTED))
-    h.addWidget(_cell(cat,      1, _MUTED))
+    h.addWidget(_cell(date_str,   1, _MUTED))
+    h.addWidget(_cell(item,       2, _DARK))
+    h.addWidget(_cell(desc,       3, _DARK))
+    h.addWidget(_cell(truck,      1, _MUTED))
     h.addWidget(_cell(amount_str, 1, amt_color, Qt.AlignRight, bold=True))
     return w
 
@@ -468,6 +450,46 @@ QToolButton {{
 QToolButton:hover   {{ background: #1b4f4a; color: #ffffff; border-color: #4ade80; }}
 QToolButton:pressed {{ background: #0a1f1d; }}
 """
+
+
+# ---------------------------------------------------------------------------
+# Responsive side-by-side panel row
+# ---------------------------------------------------------------------------
+
+class _PanelRow(QWidget):
+    """Places two child panels side-by-side (width ≥ _BREAK) or stacked vertically."""
+    _BREAK = 860
+
+    def __init__(self, receipt: QWidget, activity: QWidget, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: transparent;")
+        self._lay = QBoxLayout(QBoxLayout.Direction.LeftToRight, self)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+        self._lay.setSpacing(20)
+        self._lay.addWidget(receipt, 1)
+        self._lay.addWidget(activity, 2)
+        self._horiz: bool | None = None
+
+    def _apply(self, horiz: bool) -> None:
+        if self._horiz == horiz:
+            return
+        self._horiz = horiz
+        if horiz:
+            self._lay.setDirection(QBoxLayout.Direction.LeftToRight)
+            self._lay.setStretch(0, 1)
+            self._lay.setStretch(1, 2)
+        else:
+            self._lay.setDirection(QBoxLayout.Direction.TopToBottom)
+            self._lay.setStretch(0, 0)
+            self._lay.setStretch(1, 0)
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        self._apply(ev.size().width() >= self._BREAK)
+
+    def showEvent(self, ev) -> None:
+        super().showEvent(ev)
+        self._apply(self.width() >= self._BREAK)
 
 
 # ---------------------------------------------------------------------------
@@ -521,15 +543,15 @@ class CashierOverview(QWidget):
         today_grid.setSpacing(12)
         today_grid.setContentsMargins(0, 0, 0, 0)
 
-        self._cards["t_count"] = _StatCard("list",      "—", "Transactions",   _GREEN,  "entries today")
-        self._cards["t_tzs"]   = _StatCard("money",     "—", "TZS Total",      _GREEN,  "today")
-        self._cards["t_usd"]   = _StatCard("dollar",    "—", "USD Total",       _BLUE,   "today")
-        self._cards["t_rcpt"]  = _StatCard("receipt",   "—", "Pending Receipts",_AMBER,  "today")
+        self._cards["t_count"]   = _StatCard("list",      "—", "Transactions",    _GREEN,  "entries today")
+        self._cards["t_tzs"]     = _StatCard("money",     "—", "TZS Total",       _GREEN,  "today")
+        self._cards["t_rcpt_ok"] = _StatCard("check",     "—", "Receipts OK",     _GREEN,  "received today")
+        self._cards["t_rcpt"]    = _StatCard("receipt",   "—", "Pending Receipts", _AMBER,  "today")
 
-        today_grid.addWidget(self._cards["t_count"], 0, 0)
-        today_grid.addWidget(self._cards["t_tzs"],   0, 1)
-        today_grid.addWidget(self._cards["t_usd"],   0, 2)
-        today_grid.addWidget(self._cards["t_rcpt"],  0, 3)
+        today_grid.addWidget(self._cards["t_count"],   0, 0)
+        today_grid.addWidget(self._cards["t_tzs"],     0, 1)
+        today_grid.addWidget(self._cards["t_rcpt_ok"], 0, 2)
+        today_grid.addWidget(self._cards["t_rcpt"],    0, 3)
         cl.addLayout(today_grid)
         cl.addSpacing(20)
 
@@ -541,14 +563,14 @@ class CashierOverview(QWidget):
         month_grid.setSpacing(12)
         month_grid.setContentsMargins(0, 0, 0, 0)
 
-        self._cards["m_count"] = _StatCard("calendar",   "—", "Total Entries",  _BLUE,   "this month")
-        self._cards["m_tzs"]   = _StatCard("money_blue", "—", "TZS Total",      _BLUE,   "this month")
-        self._cards["m_usd"]   = _StatCard("dollar",     "—", "USD Total",       _BLUE,   "this month")
-        self._cards["m_unver"] = _StatCard("clock",      "—", "Unverified",      _PURPLE, "awaiting review")
+        self._cards["m_count"] = _StatCard("calendar",   "—", "Total Entries",   _BLUE,   "this month")
+        self._cards["m_tzs"]   = _StatCard("money_blue", "—", "TZS Total",       _BLUE,   "this month")
+        self._cards["m_avg"]   = _StatCard("money",      "—", "Avg. Daily (TZS)", _PURPLE, "this month")
+        self._cards["m_unver"] = _StatCard("clock",      "—", "Unverified",       _PURPLE, "awaiting review")
 
         month_grid.addWidget(self._cards["m_count"], 0, 0)
         month_grid.addWidget(self._cards["m_tzs"],   0, 1)
-        month_grid.addWidget(self._cards["m_usd"],   0, 2)
+        month_grid.addWidget(self._cards["m_avg"],   0, 2)
         month_grid.addWidget(self._cards["m_unver"], 0, 3)
         cl.addLayout(month_grid)
         cl.addSpacing(20)
@@ -579,9 +601,15 @@ class CashierOverview(QWidget):
         cl.addLayout(actions)
         cl.addSpacing(20)
 
-        # ── Receipt status bar ────────────────────────────────────────
-        cl.addWidget(_section_header("Receipt Status  ·  This Month"))
-        cl.addSpacing(10)
+        # ── Receipt status + Recent activity (side-by-side) ──────────
+        # Left panel
+        left_panel = QWidget()
+        left_panel.setStyleSheet("background: transparent;")
+        lp_lay = QVBoxLayout(left_panel)
+        lp_lay.setContentsMargins(0, 0, 0, 0)
+        lp_lay.setSpacing(10)
+        lp_lay.addWidget(_section_header("Receipt Status  ·  This Month"))
+
         rcpt_card = QFrame()
         rcpt_card.setObjectName("RcptCard")
         rcpt_card.setStyleSheet(f"""
@@ -595,12 +623,16 @@ class CashierOverview(QWidget):
         rcpt_lay.setContentsMargins(18, 14, 18, 14)
         self._receipt_bar = _ReceiptBar(0, 0, 0)
         rcpt_lay.addWidget(self._receipt_bar)
-        cl.addWidget(rcpt_card)
-        cl.addSpacing(20)
+        lp_lay.addWidget(rcpt_card)
+        lp_lay.addStretch()
 
-        # ── Recent activity ───────────────────────────────────────────
-        cl.addWidget(_section_header("Recent Activity"))
-        cl.addSpacing(10)
+        # Right panel
+        right_panel = QWidget()
+        right_panel.setStyleSheet("background: transparent;")
+        rp_lay = QVBoxLayout(right_panel)
+        rp_lay.setContentsMargins(0, 0, 0, 0)
+        rp_lay.setSpacing(10)
+        rp_lay.addWidget(_section_header("Recent Activity"))
 
         activity_card = QFrame()
         activity_card.setObjectName("ActCard")
@@ -632,8 +664,9 @@ class CashierOverview(QWidget):
         sep.setStyleSheet(f"background: {_CARD_BG}; border-radius: 0 0 10px 10px;")
         self._activity_lay.addWidget(sep)
 
-        cl.addWidget(activity_card)
+        rp_lay.addWidget(activity_card)
 
+        cl.addWidget(_PanelRow(left_panel, right_panel))
         cl.addStretch()
         scroll.setWidget(content)
         root.addWidget(scroll)
@@ -735,14 +768,16 @@ class CashierOverview(QWidget):
         # today cards
         self._cards["t_count"].set_value(str(t.get("count", 0)))
         self._cards["t_tzs"].set_value(_fmt_tzs(t.get("tzs_total", 0)))
+        self._cards["t_rcpt_ok"].set_value(str(t.get("receipt_received", 0)))
         pending = t.get("receipt_pending", 0) + t.get("receipt_missing", 0)
         self._cards["t_rcpt"].set_value(str(pending))
-        self._cards["t_usd"].set_value(_fmt_usd(t.get("usd_total", 0)))
 
         # month cards
         self._cards["m_count"].set_value(str(m.get("count", 0)))
         self._cards["m_tzs"].set_value(_fmt_tzs(m.get("tzs_total", 0)))
-        self._cards["m_usd"].set_value(_fmt_usd(m.get("usd_total", 0)))
+        days_elapsed = max(date.today().day, 1)
+        avg_daily = m.get("tzs_total", 0) / days_elapsed
+        self._cards["m_avg"].set_value(_fmt_tzs(avg_daily))
         self._cards["m_unver"].set_value(str(m.get("unverified", 0)))
 
         # receipt bar

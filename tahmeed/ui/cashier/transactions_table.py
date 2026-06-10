@@ -190,9 +190,9 @@ class TransactionBrowser(QDialog):
 
         # ── Results table ──────────────────────────────────────────────
         self._table = QTableWidget()
-        self._table.setColumnCount(8)
+        self._table.setColumnCount(6)
         self._table.setHorizontalHeaderLabels(
-            ["Date", "Description", "Truck", "LPO / DO", "Memo", "TZS", "USD", "Rcpt"]
+            ["Date", "Description", "Truck", "Memo", "TZS", "Rcpt"]
         )
         self._table.setStyleSheet("""
             QTableWidget {
@@ -216,16 +216,14 @@ class TransactionBrowser(QDialog):
         """)
         hh = self._table.horizontalHeader()
         hh.setStretchLastSection(False)
-        for i in range(8):
+        for i in range(6):
             hh.setSectionResizeMode(i, QHeaderView.Interactive)
         self._table.setColumnWidth(0, 90)    # Date
-        self._table.setColumnWidth(1, 340)   # Description
+        self._table.setColumnWidth(1, 400)   # Description
         self._table.setColumnWidth(2, 84)    # Truck
-        self._table.setColumnWidth(3, 88)    # LPO/DO
-        self._table.setColumnWidth(4, 110)   # Memo
-        self._table.setColumnWidth(5, 110)   # TZS
-        self._table.setColumnWidth(6, 90)    # USD
-        self._table.setColumnWidth(7, 50)    # Rcpt
+        self._table.setColumnWidth(3, 130)   # Memo
+        self._table.setColumnWidth(4, 130)   # TZS
+        self._table.setColumnWidth(5, 60)    # Rcpt
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -310,27 +308,19 @@ class TransactionBrowser(QDialog):
             self._table.setItem(i, 0, _ro(date_str))
             self._table.setItem(i, 1, _ro(tx.description))
             self._table.setItem(i, 2, _ro(tx.truck_number or ""))
-            self._table.setItem(i, 3, _ro(tx.lpo_do or ""))
-            self._table.setItem(i, 4, _ro(tx.memo or ""))
+            self._table.setItem(i, 3, _ro(tx.memo or ""))
 
-            tzs_str = f"{tx.amount:,.2f}" if tx.currency == "TZS" else ""
-            usd_str = f"{tx.amount:,.2f}" if tx.currency == "USD" else ""
-
+            tzs_str = f"{tx.amount:,.2f}" if tx.amount else ""
             tzs_it = _ro(tzs_str, Qt.AlignRight | Qt.AlignVCenter)
-            if tx.amount < 0 and tx.currency == "TZS":
+            if tx.amount and tx.amount < 0:
                 tzs_it.setForeground(QColor("#dc2626"))
-            self._table.setItem(i, 5, tzs_it)
-
-            usd_it = _ro(usd_str, Qt.AlignRight | Qt.AlignVCenter)
-            if tx.amount < 0 and tx.currency == "USD":
-                usd_it.setForeground(QColor("#dc2626"))
-            self._table.setItem(i, 6, usd_it)
+            self._table.setItem(i, 4, tzs_it)
 
             rcpt = "✓" if tx.receipt_status == "received" else ""
             rcpt_it = _ro(rcpt, Qt.AlignCenter)
             if rcpt:
                 rcpt_it.setForeground(QColor("#16a34a"))
-            self._table.setItem(i, 7, rcpt_it)
+            self._table.setItem(i, 5, rcpt_it)
 
         self._count_label.setText(f"Number of matches: {len(txs)}")
         self._export_btn.setEnabled(len(txs) > 0)
@@ -363,18 +353,16 @@ class TransactionBrowser(QDialog):
 
     def _on_export(self) -> None:
         """Copy results to clipboard as TSV (paste into Excel)."""
-        lines = ["Date\tDescription\tTruck\tLPO/DO\tMemo\tTZS\tUSD\tReceipt"]
+        lines = ["Date\tDescription\tTruck\tMemo\tTZS\tReceipt"]
         for tx in self._results:
-            tzs = f"{tx.amount:.2f}" if tx.currency == "TZS" else ""
-            usd = f"{tx.amount:.2f}" if tx.currency == "USD" else ""
+            tzs = f"{tx.amount:.2f}" if tx.amount else ""
             rcpt = "received" if tx.receipt_status == "received" else ""
             lines.append("\t".join([
                 tx.date.strftime("%d/%m/%Y") if tx.date else "",
                 tx.description,
                 tx.truck_number or "",
-                tx.lpo_do or "",
                 tx.memo or "",
-                tzs, usd, rcpt,
+                tzs, rcpt,
             ]))
         from PySide6.QtWidgets import QApplication
         QApplication.clipboard().setText("\n".join(lines))
