@@ -52,7 +52,6 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("c28",             "C28",                    "mdi.file-document-outline",        {}),
         ("c40",             "C40",                    "mdi.file-document-outline",        {}),
         ("carbon_permit",   "Carbon & Permit",        "mdi.leaf",                         {}),
-        ("diesel_cash",     "Diesel Cash",            "mdi.gas-station-outline",          {}),
         ("council_fees",    "Council Fees",           "mdi.city-variant",                 {}),
         ("return_weigh",    "Return & Weighbridge",   "mdi.scale",                        {}),
         ("parking_petroda", "Parking Petroda",        "mdi.parking",                      {}),
@@ -75,7 +74,8 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("sm_burhani",      "SM Burhani",           "mdi.scale-balance",     {}),
         ("rahntech",        "RahnTech",             "mdi.devices",           {}),
     ]),
-    ("RECONCILIATION", [
+    ("FUEL CONSUMPTION", [
+        ("diesel_cash",     "Diesel Cash",   "mdi.gas-station-outline", {}),
         ("infinity",        "Infinity",      "mdi.gas-station",  {}),
         ("lake_zambia",     "Lake Zambia",   "mdi.water-pump",   {}),
         ("lake_tunduma",    "Lake Tunduma",  "mdi.water-pump",   {}),
