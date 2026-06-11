@@ -14,18 +14,19 @@ import asyncio
 from datetime import date, datetime
 
 from PySide6.QtCore import Qt, QByteArray, QSize, Signal
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
+from PySide6.QtGui import QColor, QIcon, QPixmap, QPainter
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QBoxLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
+    QBoxLayout, QFrame, QGraphicsDropShadowEffect, QGridLayout,
+    QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from tahmeed.models.user import User
 from tahmeed.services.cashier_service import get_overview_stats
 
 # ---------------------------------------------------------------------------
-# Palette
+# Palette — unified with sidebar navy (#1B2B4B)
 # ---------------------------------------------------------------------------
 _BG        = "#f1f5f9"
 _CARD_BG   = "#ffffff"
@@ -34,15 +35,33 @@ _DARK      = "#0f172a"
 _MUTED     = "#64748b"
 _SECTION   = "#94a3b8"
 _GREEN     = "#22c55e"
-_BLUE      = "#3b82f6"
+_BLUE      = "#0077C5"   # QB blue — matches sidebar/header
 _AMBER     = "#f59e0b"
 _PURPLE    = "#a78bfa"
 _RED       = "#ef4444"
-_TEAL_DARK = "#1c1917"
+_NAVY      = "#1B2B4B"   # sidebar colour — replaces espresso #1c1917
+_NAVY_2    = "#253A5C"   # sidebar active bg
+
+# Light tint pill backgrounds for icon containers
+_GREEN_PILL  = "#dcfce7"
+_BLUE_PILL   = "#dbeafe"
+_AMBER_PILL  = "#fef3c7"
+_PURPLE_PILL = "#ede9fe"
+_RED_PILL    = "#fee2e2"
+
+_ACCENT_PILLS: dict[str, str] = {
+    _GREEN:  _GREEN_PILL,
+    _BLUE:   _BLUE_PILL,
+    _AMBER:  _AMBER_PILL,
+    _PURPLE: _PURPLE_PILL,
+    _RED:    _RED_PILL,
+}
 
 # ---------------------------------------------------------------------------
 # SVG icon set
 # ---------------------------------------------------------------------------
+_SVG_GRAY = b"#94a3b8"   # placeholder replaced by accent colour at render time
+
 _SVGS: dict[str, bytes] = {
     "list": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
@@ -168,8 +187,11 @@ _SVGS: dict[str, bytes] = {
 }
 
 
-def _icon(key: str, size: int = 20) -> QIcon:
-    renderer = QSvgRenderer(QByteArray(_SVGS[key]))
+def _icon(key: str, color: str = "#94a3b8", size: int = 20) -> QIcon:
+    raw = _SVGS[key]
+    if color.lower() != "#94a3b8":
+        raw = raw.replace(_SVG_GRAY, color.lower().encode())
+    renderer = QSvgRenderer(QByteArray(raw))
     px = QPixmap(size, size)
     px.fill(Qt.transparent)
     p = QPainter(px)
@@ -182,8 +204,16 @@ def _fmt_tzs(v: float) -> str:
     return f"{v:,.0f}"
 
 
+def _drop_shadow(widget: QWidget, blur: int = 16, dy: int = 2, alpha: int = 18) -> None:
+    eff = QGraphicsDropShadowEffect(widget)
+    eff.setBlurRadius(blur)
+    eff.setOffset(0, dy)
+    eff.setColor(QColor(15, 23, 42, alpha))
+    widget.setGraphicsEffect(eff)
+
+
 # ---------------------------------------------------------------------------
-# Stat card
+# Stat card  — white card, coloured icon pill, bold value
 # ---------------------------------------------------------------------------
 
 class _StatCard(QFrame):
@@ -202,39 +232,38 @@ class _StatCard(QFrame):
             QFrame#StatCard {{
                 background: {_CARD_BG};
                 border: 1px solid {_BORDER};
-                border-radius: 10px;
+                border-radius: 12px;
             }}
         """)
         self.setMinimumHeight(108)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        _drop_shadow(self)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(4)
+        lay.setSpacing(6)
 
-        # icon + label row
+        # icon pill + label row
         top = QHBoxLayout()
-        top.setSpacing(8)
+        top.setSpacing(10)
         top.setContentsMargins(0, 0, 0, 0)
 
-        icon_lbl = QLabel()
-        icon_lbl.setFixedSize(28, 28)
-        icon_lbl.setAlignment(Qt.AlignCenter)
-        icon_lbl.setStyleSheet(
-            f"background: transparent; border-radius: 0px;"
-        )
-        icon_lbl.setPixmap(_icon(icon_key, 22).pixmap(QSize(22, 22)))
+        pill_bg = _ACCENT_PILLS.get(accent, _BLUE_PILL)
+        icon_pill = QLabel()
+        icon_pill.setFixedSize(36, 36)
+        icon_pill.setAlignment(Qt.AlignCenter)
+        icon_pill.setStyleSheet(f"background: {pill_bg}; border-radius: 8px;")
+        icon_pill.setPixmap(_icon(icon_key, color=accent, size=20).pixmap(QSize(20, 20)))
 
         lbl = QLabel(label)
         lbl.setStyleSheet(
             f"color: {_MUTED}; font-size: 11px; font-weight: 500; background: transparent;"
         )
 
-        top.addWidget(icon_lbl)
+        top.addWidget(icon_pill)
         top.addWidget(lbl)
         top.addStretch()
 
-        # value
         self._val_lbl = QLabel(value)
         self._val_lbl.setStyleSheet(
             f"color: {_DARK}; font-size: 22px; font-weight: 700;"
@@ -299,11 +328,10 @@ class _ReceiptBar(QWidget):
     def _build(self) -> None:
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
+        lay.setSpacing(8)
 
         total = self._received + self._pending + self._missing or 1
 
-        # bar
         bar = QWidget()
         bar.setFixedHeight(10)
         bar.setStyleSheet("background: transparent;")
@@ -329,7 +357,6 @@ class _ReceiptBar(QWidget):
 
         lay.addWidget(bar)
 
-        # legend
         legend = QHBoxLayout()
         legend.setSpacing(20)
         legend.setContentsMargins(0, 0, 0, 0)
@@ -352,14 +379,12 @@ class _ReceiptBar(QWidget):
         legend.addWidget(_dot_label(_AMBER, f"Pending  {self._pending}"))
         legend.addWidget(_dot_label(_RED,   f"Missing  {self._missing}"))
         legend.addStretch()
-
         lay.addLayout(legend)
 
     def update_data(self, received: int, pending: int, missing: int) -> None:
         self._received = received
         self._pending  = pending
         self._missing  = missing
-        # rebuild
         old = self.layout()
         while old.count():
             item = old.takeAt(0)
@@ -369,25 +394,29 @@ class _ReceiptBar(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Recent activity row
+# Recent activity table
 # ---------------------------------------------------------------------------
 
 def _activity_header() -> QWidget:
     w = QWidget()
-    w.setStyleSheet(f"background: {_TEAL_DARK}; border-radius: 6px 6px 0 0;")
+    # Navy header — matches sidebar exactly
+    w.setStyleSheet(f"background: {_NAVY}; border-radius: 6px 6px 0 0;")
     h = QHBoxLayout(w)
-    h.setContentsMargins(14, 8, 14, 8)
+    h.setContentsMargins(16, 10, 16, 10)
     h.setSpacing(0)
 
     def _col(text: str, flex: int, align=Qt.AlignLeft) -> QLabel:
-        l = QLabel(text)
-        l.setStyleSheet(
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
             "color: #94a3b8; font-size: 10px; font-weight: 700;"
             " letter-spacing: 0.8px; background: transparent;"
         )
-        l.setAlignment(align)
-        l.setSizePolicy(QSizePolicy.Expanding if flex else QSizePolicy.Fixed, QSizePolicy.Fixed)
-        return l
+        lbl.setAlignment(align)
+        lbl.setSizePolicy(
+            QSizePolicy.Expanding if flex else QSizePolicy.Fixed,
+            QSizePolicy.Fixed,
+        )
+        return lbl
 
     h.addWidget(_col("DATE", 1))
     h.addWidget(_col("ITEM", 2))
@@ -402,53 +431,62 @@ def _activity_row(tx, even: bool) -> QWidget:
     w = QWidget()
     w.setStyleSheet(f"background: {bg};")
     h = QHBoxLayout(w)
-    h.setContentsMargins(14, 9, 14, 9)
+    h.setContentsMargins(16, 10, 16, 10)
     h.setSpacing(0)
 
     date_str = tx.date.strftime("%b %d, %Y") if tx.date else "—"
     item     = (tx.item or "—")[:22]
     desc     = (tx.description or "—")[:38]
     truck    = tx.truck_number or "—"
-
     amount_str = f"{_fmt_tzs(tx.amount or 0)} TZS"
-    amt_color  = _GREEN
 
     def _cell(text: str, flex: int, color: str = _DARK,
                align=Qt.AlignLeft, bold=False) -> QLabel:
-        l = QLabel(text)
+        lbl = QLabel(text)
         fw = "600" if bold else "400"
-        l.setStyleSheet(
+        lbl.setStyleSheet(
             f"color: {color}; font-size: 12px; font-weight: {fw}; background: transparent;"
         )
-        l.setAlignment(align)
-        l.setSizePolicy(QSizePolicy.Expanding if flex else QSizePolicy.Fixed, QSizePolicy.Fixed)
-        return l
+        lbl.setAlignment(align)
+        lbl.setSizePolicy(
+            QSizePolicy.Expanding if flex else QSizePolicy.Fixed,
+            QSizePolicy.Fixed,
+        )
+        return lbl
 
-    h.addWidget(_cell(date_str,   1, _MUTED))
-    h.addWidget(_cell(item,       2, _DARK))
-    h.addWidget(_cell(desc,       3, _DARK))
-    h.addWidget(_cell(truck,      1, _MUTED))
-    h.addWidget(_cell(amount_str, 1, amt_color, Qt.AlignRight, bold=True))
+    h.addWidget(_cell(date_str,    1, _MUTED))
+    h.addWidget(_cell(item,        2, _DARK))
+    h.addWidget(_cell(desc,        3, _DARK))
+    h.addWidget(_cell(truck,       1, _MUTED))
+    h.addWidget(_cell(amount_str,  1, _GREEN, Qt.AlignRight, bold=True))
     return w
 
 
 # ---------------------------------------------------------------------------
-# Quick action button
+# Quick action button style — white card, orange icon, navy hover
 # ---------------------------------------------------------------------------
 
 _ACTION_BTN = f"""
 QToolButton {{
-    background: {_TEAL_DARK};
-    border: 1px solid #2d1f0a;
+    background: {_CARD_BG};
+    border: 1.5px solid {_BORDER};
     border-radius: 8px;
     padding: 8px 20px;
-    color: #e2e8f0;
+    color: {_DARK};
     font-size: 12px;
     font-weight: 600;
     min-width: 140px;
 }}
-QToolButton:hover   {{ background: #2d1f0a; color: #ffffff; border-color: #E85D04; }}
-QToolButton:pressed {{ background: #0f0a04; }}
+QToolButton:hover   {{
+    background: {_NAVY};
+    color: #ffffff;
+    border-color: {_NAVY};
+}}
+QToolButton:pressed {{
+    background: {_NAVY_2};
+    color: #ffffff;
+    border-color: {_NAVY_2};
+}}
 """
 
 
@@ -524,7 +562,14 @@ class CashierOverview(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet(f"QScrollArea {{ background: {_BG}; border: none; }}")
+        scroll.setStyleSheet(f"""
+            QScrollArea {{ background: {_BG}; border: none; }}
+            QScrollBar:vertical {{ background: {_BG}; width: 6px; margin: 0; }}
+            QScrollBar::handle:vertical {{
+                background: #cbd5e1; border-radius: 3px; min-height: 24px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        """)
 
         content = QWidget()
         content.setStyleSheet(f"background: {_BG};")
@@ -543,10 +588,10 @@ class CashierOverview(QWidget):
         today_grid.setSpacing(12)
         today_grid.setContentsMargins(0, 0, 0, 0)
 
-        self._cards["t_count"]   = _StatCard("list",      "—", "Transactions",    _GREEN,  "entries today")
-        self._cards["t_tzs"]     = _StatCard("money",     "—", "TZS Total",       _GREEN,  "today")
-        self._cards["t_rcpt_ok"] = _StatCard("check",     "—", "Receipts OK",     _GREEN,  "received today")
-        self._cards["t_rcpt"]    = _StatCard("receipt",   "—", "Pending Receipts", _AMBER,  "today")
+        self._cards["t_count"]   = _StatCard("list",    "—", "Transactions",     _GREEN, "entries today")
+        self._cards["t_tzs"]     = _StatCard("money",   "—", "TZS Total",        _GREEN, "today")
+        self._cards["t_rcpt_ok"] = _StatCard("check",   "—", "Receipts OK",      _GREEN, "received today")
+        self._cards["t_rcpt"]    = _StatCard("receipt", "—", "Pending Receipts", _AMBER, "today")
 
         today_grid.addWidget(self._cards["t_count"],   0, 0)
         today_grid.addWidget(self._cards["t_tzs"],     0, 1)
@@ -563,10 +608,10 @@ class CashierOverview(QWidget):
         month_grid.setSpacing(12)
         month_grid.setContentsMargins(0, 0, 0, 0)
 
-        self._cards["m_count"] = _StatCard("calendar",   "—", "Total Entries",   _BLUE,   "this month")
-        self._cards["m_tzs"]   = _StatCard("money_blue", "—", "TZS Total",       _BLUE,   "this month")
+        self._cards["m_count"] = _StatCard("calendar",   "—", "Total Entries",    _BLUE,   "this month")
+        self._cards["m_tzs"]   = _StatCard("money_blue", "—", "TZS Total",        _BLUE,   "this month")
         self._cards["m_avg"]   = _StatCard("money",      "—", "Avg. Daily (TZS)", _PURPLE, "this month")
-        self._cards["m_unver"] = _StatCard("clock",      "—", "Unverified",       _PURPLE, "awaiting review")
+        self._cards["m_unver"] = _StatCard("clock",      "—", "Unverified",        _PURPLE, "awaiting review")
 
         month_grid.addWidget(self._cards["m_count"], 0, 0)
         month_grid.addWidget(self._cards["m_tzs"],   0, 1)
@@ -579,16 +624,17 @@ class CashierOverview(QWidget):
         cl.addWidget(_section_header("Quick Actions"))
         cl.addSpacing(10)
         actions = QHBoxLayout()
-        actions.setSpacing(12)
+        actions.setSpacing(10)
         actions.setContentsMargins(0, 0, 0, 0)
 
         def _abtn(label: str, icon_key: str, slot) -> QToolButton:
             b = QToolButton()
             b.setText(f"  {label}")
-            b.setIcon(_icon(icon_key, 16))
+            b.setIcon(_icon(icon_key, size=16))
             b.setIconSize(QSize(16, 16))
             b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
             b.setStyleSheet(_ACTION_BTN)
+            b.setCursor(Qt.PointingHandCursor)
             b.clicked.connect(slot)
             return b
 
@@ -602,7 +648,6 @@ class CashierOverview(QWidget):
         cl.addSpacing(20)
 
         # ── Receipt status + Recent activity (side-by-side) ──────────
-        # Left panel
         left_panel = QWidget()
         left_panel.setStyleSheet("background: transparent;")
         lp_lay = QVBoxLayout(left_panel)
@@ -616,17 +661,17 @@ class CashierOverview(QWidget):
             QFrame#RcptCard {{
                 background: {_CARD_BG};
                 border: 1px solid {_BORDER};
-                border-radius: 10px;
+                border-radius: 12px;
             }}
         """)
+        _drop_shadow(rcpt_card)
         rcpt_lay = QVBoxLayout(rcpt_card)
-        rcpt_lay.setContentsMargins(18, 14, 18, 14)
+        rcpt_lay.setContentsMargins(18, 16, 18, 16)
         self._receipt_bar = _ReceiptBar(0, 0, 0)
         rcpt_lay.addWidget(self._receipt_bar)
         lp_lay.addWidget(rcpt_card)
         lp_lay.addStretch()
 
-        # Right panel
         right_panel = QWidget()
         right_panel.setStyleSheet("background: transparent;")
         rp_lay = QVBoxLayout(right_panel)
@@ -640,16 +685,16 @@ class CashierOverview(QWidget):
             QFrame#ActCard {{
                 background: {_CARD_BG};
                 border: 1px solid {_BORDER};
-                border-radius: 10px;
+                border-radius: 12px;
                 overflow: hidden;
             }}
         """)
+        _drop_shadow(activity_card)
         self._activity_lay = QVBoxLayout(activity_card)
         self._activity_lay.setContentsMargins(0, 0, 0, 0)
         self._activity_lay.setSpacing(0)
         self._activity_lay.addWidget(_activity_header())
 
-        # placeholder rows
         self._activity_rows_container = QWidget()
         self._activity_rows_container.setStyleSheet("background: transparent;")
         self._rows_lay = QVBoxLayout(self._activity_rows_container)
@@ -657,12 +702,11 @@ class CashierOverview(QWidget):
         self._rows_lay.setSpacing(0)
         self._activity_lay.addWidget(self._activity_rows_container)
 
-        # bottom border
-        sep = QFrame()
-        sep.setFrameShape(QFrame.NoFrame)
-        sep.setFixedHeight(8)
-        sep.setStyleSheet(f"background: {_CARD_BG}; border-radius: 0 0 10px 10px;")
-        self._activity_lay.addWidget(sep)
+        bottom_pad = QFrame()
+        bottom_pad.setFrameShape(QFrame.NoFrame)
+        bottom_pad.setFixedHeight(8)
+        bottom_pad.setStyleSheet(f"background: {_CARD_BG}; border-radius: 0 0 12px 12px;")
+        self._activity_lay.addWidget(bottom_pad)
 
         rp_lay.addWidget(activity_card)
 
@@ -674,17 +718,18 @@ class CashierOverview(QWidget):
     def _build_banner(self) -> QWidget:
         banner = QWidget()
         banner.setObjectName("Banner")
+        # Navy gradient — matches sidebar colours exactly
         banner.setStyleSheet(f"""
             QWidget#Banner {{
                 background: qlineargradient(
                     x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {_TEAL_DARK},
-                    stop:1 #2d1f0a
+                    stop:0 {_NAVY},
+                    stop:1 {_NAVY_2}
                 );
                 border-radius: 12px;
             }}
         """)
-        banner.setFixedHeight(80)
+        banner.setFixedHeight(82)
 
         bl = QHBoxLayout(banner)
         bl.setContentsMargins(20, 0, 20, 0)
@@ -695,15 +740,15 @@ class CashierOverview(QWidget):
         avatar.setFixedSize(46, 46)
         avatar.setAlignment(Qt.AlignCenter)
         avatar.setStyleSheet(
-            "background: rgba(232,93,4,0.18); border-radius: 23px;"
-            " color: #E85D04; font-size: 16px; font-weight: 700;"
+            "background: rgba(0,119,197,0.25); border-radius: 23px;"
+            " color: #7DD3FC; font-size: 16px; font-weight: 700;"
         )
 
         text_w = QWidget()
         text_w.setStyleSheet("background: transparent;")
         tl = QVBoxLayout(text_w)
         tl.setContentsMargins(0, 0, 0, 0)
-        tl.setSpacing(2)
+        tl.setSpacing(3)
 
         hour = datetime.now().hour
         greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 17 else "Good evening")
@@ -713,7 +758,7 @@ class CashierOverview(QWidget):
         )
         sub_lbl = QLabel("Here's your activity summary for today")
         sub_lbl.setStyleSheet(
-            "color: #F48C06; font-size: 11px; background: transparent;"
+            "color: #93C5FD; font-size: 11px; background: transparent;"
         )
         tl.addWidget(greet_lbl)
         tl.addWidget(sub_lbl)
@@ -722,14 +767,13 @@ class CashierOverview(QWidget):
         bl.addWidget(text_w)
         bl.addStretch()
 
-        # date badge
         date_badge = QWidget()
         date_badge.setStyleSheet(
-            "background: rgba(255,255,255,0.08); border-radius: 8px;"
+            "background: rgba(255,255,255,0.10); border-radius: 8px;"
         )
         dbl = QVBoxLayout(date_badge)
-        dbl.setContentsMargins(14, 8, 14, 8)
-        dbl.setSpacing(0)
+        dbl.setContentsMargins(16, 10, 16, 10)
+        dbl.setSpacing(1)
         today = date.today()
         day_lbl = QLabel(today.strftime("%B %d"))
         day_lbl.setAlignment(Qt.AlignCenter)
@@ -739,7 +783,7 @@ class CashierOverview(QWidget):
         yr_lbl = QLabel(today.strftime("%Y  ·  %A"))
         yr_lbl.setAlignment(Qt.AlignCenter)
         yr_lbl.setStyleSheet(
-            "color: #F48C06; font-size: 10px; background: transparent;"
+            "color: #93C5FD; font-size: 10px; background: transparent;"
         )
         dbl.addWidget(day_lbl)
         dbl.addWidget(yr_lbl)
@@ -765,14 +809,12 @@ class CashierOverview(QWidget):
         t = stats["today"]
         m = stats["month"]
 
-        # today cards
         self._cards["t_count"].set_value(str(t.get("count", 0)))
         self._cards["t_tzs"].set_value(_fmt_tzs(t.get("tzs_total", 0)))
         self._cards["t_rcpt_ok"].set_value(str(t.get("receipt_received", 0)))
         pending = t.get("receipt_pending", 0) + t.get("receipt_missing", 0)
         self._cards["t_rcpt"].set_value(str(pending))
 
-        # month cards
         self._cards["m_count"].set_value(str(m.get("count", 0)))
         self._cards["m_tzs"].set_value(_fmt_tzs(m.get("tzs_total", 0)))
         days_elapsed = max(date.today().day, 1)
@@ -780,7 +822,6 @@ class CashierOverview(QWidget):
         self._cards["m_avg"].set_value(_fmt_tzs(avg_daily))
         self._cards["m_unver"].set_value(str(m.get("unverified", 0)))
 
-        # receipt bar
         if self._receipt_bar:
             self._receipt_bar.update_data(
                 m.get("receipt_received", 0),
@@ -788,7 +829,6 @@ class CashierOverview(QWidget):
                 m.get("receipt_missing", 0),
             )
 
-        # activity rows
         while self._rows_lay.count():
             item = self._rows_lay.takeAt(0)
             if item.widget():
