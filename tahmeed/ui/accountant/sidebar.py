@@ -51,12 +51,6 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("health_fee",      "Health Fee",             "mdi.hospital-box",                 {}),
         ("halmashauri",     "Halmashauri Parking",    "mdi.parking",                      {}),
     ]),
-    ("DIESEL STATIONS", [
-        ("infinity",        "Infinity",      "mdi.gas-station",  {}),
-        ("lake_zambia",     "Lake Zambia",   "mdi.water-pump",   {}),
-        ("lake_tunduma",    "Lake Tunduma",  "mdi.water-pump",   {}),
-        ("gbp_diesel",      "GBP Diesel",    "mdi.fuel",         {}),
-    ]),
     ("SEPARATE EXPENSES", [
         ("toll_plaza",      "Toll Plaza",           "mdi.boom-gate",         {}),
         ("parking_congo",   "Parking Congo",        "mdi.parking",           {}),
@@ -67,10 +61,14 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("afritrack",       "Afritrack",            "mdi.satellite-variant", {}),
         ("third_party",     "Third Party Covers",   "mdi.shield-account",    {}),
         ("comesa",          "COMESA Covers",        "mdi.certificate",       {}),
+        ("sm_burhani",      "SM Burhani",           "mdi.scale-balance",     {}),
+        ("rahntech",        "RahnTech",             "mdi.devices",           {}),
     ]),
     ("RECONCILIATION", [
-        ("sm_burhani",      "SM Burhani",    "mdi.scale-balance",  {"chevron": True}),
-        ("rahntech",        "RahnTech",      "mdi.devices",         {}),
+        ("infinity",        "Infinity",      "mdi.gas-station",  {}),
+        ("lake_zambia",     "Lake Zambia",   "mdi.water-pump",   {}),
+        ("lake_tunduma",    "Lake Tunduma",  "mdi.water-pump",   {}),
+        ("gbp_diesel",      "GBP Diesel",    "mdi.fuel",         {}),
     ]),
     ("MANAGE", [
         ("manage_categories", "Categories",       "mdi.tag-edit",        {}),
