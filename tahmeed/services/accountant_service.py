@@ -263,6 +263,7 @@ def _build_master_query(
     truck: str,
     category: str,
     receipt: str,
+    description: str = "",   # exact-ish sub-route filter (description contains)
 ) -> dict:
     _year = year or date.today().year
     if month and 1 <= month <= 12:
@@ -278,8 +279,19 @@ def _build_master_query(
         }
 
     query: dict = {"verified": True, "date": date_filter}
+
+    # Both `search` and `description` constrain the description field; combine
+    # them with $and so a sub-route filter and a free-text search can coexist.
+    desc_conditions = []
     if search.strip():
-        query["description"] = {"$regex": re.escape(search.strip()), "$options": "i"}
+        desc_conditions.append({"$regex": re.escape(search.strip()), "$options": "i"})
+    if description.strip():
+        desc_conditions.append({"$regex": re.escape(description.strip()), "$options": "i"})
+    if len(desc_conditions) == 1:
+        query["description"] = desc_conditions[0]
+    elif len(desc_conditions) == 2:
+        query["$and"] = [{"description": c} for c in desc_conditions]
+
     if truck.strip():
         query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
     if category.strip():
@@ -296,13 +308,14 @@ async def get_master_transactions(
     truck: str = "",
     category: str = "",
     receipt: str = "",
+    description: str = "",
     sort_field: str = "date",
     sort_asc: bool = False,
     limit: int = 50,
     skip: int = 0,
 ) -> List[Transaction]:
     db = get_db()
-    query = _build_master_query(year, month, search, truck, category, receipt)
+    query = _build_master_query(year, month, search, truck, category, receipt, description)
     direction = 1 if sort_asc else -1
     cursor = (
         db.transactions.find(query)
@@ -321,9 +334,10 @@ async def count_master_transactions(
     truck: str = "",
     category: str = "",
     receipt: str = "",
+    description: str = "",
 ) -> int:
     db = get_db()
-    query = _build_master_query(year, month, search, truck, category, receipt)
+    query = _build_master_query(year, month, search, truck, category, receipt, description)
     return await db.transactions.count_documents(query)
 
 
@@ -334,10 +348,11 @@ async def get_master_totals(
     truck: str = "",
     category: str = "",
     receipt: str = "",
+    description: str = "",
 ) -> dict:
     """Aggregate TZS + USD totals for the current filter (all pages, not just current)."""
     db = get_db()
-    query = _build_master_query(year, month, search, truck, category, receipt)
+    query = _build_master_query(year, month, search, truck, category, receipt, description)
     result = await db.transactions.aggregate([
         {"$match": query},
         {"$group": {

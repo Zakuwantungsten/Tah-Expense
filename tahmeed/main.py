@@ -34,8 +34,9 @@ def main() -> None:
 
     with loop:
         loop.run_forever()
-
-    loop.run_until_complete(close_db())
+        # Clean up the DB client while the loop is still open (exiting the
+        # `with` block closes the loop, so this must run inside it).
+        loop.run_until_complete(close_db())
 
 
 if __name__ == "__main__":

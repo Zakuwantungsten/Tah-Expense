@@ -26,6 +26,8 @@ from tahmeed.ui.accountant.separate_expenses import (
     ThirdPartyWidget,
     ComesaWidget,
 )
+from tahmeed.ui.accountant.category_tables import CategoryTableWidget, CATEGORY_DEFS
+from tahmeed.ui.accountant.reconciliation import RPAScheduleWidget, BondsWidget
 
 _APP_BG = "#F4F6F8"
 
@@ -65,6 +67,7 @@ class AccountantDashboard(QWidget):
 
         self._sidebar = SidebarWidget()
         self._sidebar.nav_selected.connect(self._on_nav)
+        self._sidebar.subtable_selected.connect(self._show_subtable)
         body_hl.addWidget(self._sidebar)
 
         # 1-px vertical divider
@@ -119,6 +122,13 @@ class AccountantDashboard(QWidget):
         self._stack.addWidget(self._comesa)            # index 11
 
         self._stack.addWidget(_PlaceholderPage())      # index 12 — other sections
+
+        # Category tables (one per CATEGORIES sidebar key) and user-created
+        # sub-tables are created lazily and cached here as key -> stack index.
+        self._category_indices: dict[str, int] = {}
+        self._subtable_indices: dict[str, int] = {}
+        self._recon_indices: dict[str, int] = {}   # "rpa_schedule" | "bonds" -> stack idx
+
         self._stack.setCurrentIndex(0)
         body_hl.addWidget(self._stack, 1)
 
@@ -154,8 +164,52 @@ class AccountantDashboard(QWidget):
             idx, widget = _routes[key]
             self._stack.setCurrentIndex(idx)
             widget.refresh()
+        elif key in CATEGORY_DEFS:
+            self._show_category(key)
+        elif key == "sm_burhani":
+            # Parent click opens the first sub-table; children open via sidebar.
+            self._show_recon("rpa_schedule")
         else:
             self._stack.setCurrentIndex(12)
+
+    def _show_category(self, key: str) -> None:
+        """Lazily create (and cache) the category sub-table for this sidebar key."""
+        if key not in self._category_indices:
+            title, icon = CATEGORY_DEFS[key]
+            widget = CategoryTableWidget(category_name=title, title=title, icon_name=icon)
+            self._category_indices[key] = self._stack.addWidget(widget)
+        idx = self._category_indices[key]
+        self._stack.setCurrentIndex(idx)
+        self._stack.widget(idx).refresh()
+
+    def _show_recon(self, match: str) -> None:
+        """Lazily create (and cache) an SM Burhani reconciliation view."""
+        if match not in self._recon_indices:
+            widget = BondsWidget() if match == "bonds" else RPAScheduleWidget()
+            self._recon_indices[match] = self._stack.addWidget(widget)
+        idx = self._recon_indices[match]
+        self._stack.setCurrentIndex(idx)
+        self._stack.widget(idx).refresh()
+
+    def _show_subtable(self, parent_key: str, parent_category: str,
+                       name: str, match: str) -> None:
+        """Lazily create (and cache) a sub-table view for a parent category."""
+        if parent_key == "sm_burhani":
+            self._show_recon(match)
+            return
+        cache_key = f"{parent_key}::{name}"
+        if cache_key not in self._subtable_indices:
+            icon = CATEGORY_DEFS.get(parent_key, ("", "mdi.tag-outline"))[1]
+            widget = CategoryTableWidget(
+                category_name=parent_category,
+                title=f"{parent_category} · {name}",
+                icon_name=icon,
+                description_filter=match or name,
+            )
+            self._subtable_indices[cache_key] = self._stack.addWidget(widget)
+        idx = self._subtable_indices[cache_key]
+        self._stack.setCurrentIndex(idx)
+        self._stack.widget(idx).refresh()
 
 
 # ── Placeholder ────────────────────────────────────────────────────────────────
