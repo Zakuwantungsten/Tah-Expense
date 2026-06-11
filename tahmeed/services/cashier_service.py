@@ -95,6 +95,18 @@ async def get_overview_stats() -> dict:
     }
 
 
+async def get_transactions_by_category(
+    cashier_id, category_name: str, limit: int = 500
+) -> List[Transaction]:
+    db = get_db()
+    query: dict = {"category_name": category_name}
+    if cashier_id is not None:
+        query["cashier_id"] = cashier_id
+    cursor = db.transactions.find(query).sort([("date", -1), ("created_at", -1)]).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
+
+
 async def search_descriptions(prefix: str, limit: int = 12) -> List[str]:
     """
     Return distinct descriptions whose prefix matches (case-insensitive),
