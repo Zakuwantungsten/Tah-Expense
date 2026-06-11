@@ -25,6 +25,7 @@ from tahmeed.ui.accountant.separate_expenses import (
     AfritrackWidget,
     ThirdPartyWidget,
     ComesaWidget,
+    RahnTechWidget,
 )
 from tahmeed.ui.accountant.category_tables import CategoryTableWidget, CATEGORY_DEFS
 from tahmeed.ui.accountant.reconciliation import RPAScheduleWidget, BondsWidget
@@ -139,6 +140,10 @@ class AccountantDashboard(QWidget):
         self._gbp_diesel    = GBPDieselWidget()
         self._stack.addWidget(self._gbp_diesel)         # index 16
 
+        # ── RahnTech ──────────────────────────────────────────────────────────
+        self._rahntech = RahnTechWidget()
+        self._stack.addWidget(self._rahntech)           # index 17
+
         # Category tables (one per CATEGORIES sidebar key) and user-created
         # sub-tables are created lazily and cached here as key -> stack index.
         self._category_indices: dict[str, int] = {}
@@ -179,6 +184,7 @@ class AccountantDashboard(QWidget):
             "lake_zambia":    (14, self._lake_zambia),
             "lake_tunduma":   (15, self._lake_tunduma),
             "gbp_diesel":     (16, self._gbp_diesel),
+            "rahntech":       (17, self._rahntech),
         }
         if key in _routes:
             idx, widget = _routes[key]

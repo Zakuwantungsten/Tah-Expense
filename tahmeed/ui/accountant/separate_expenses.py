@@ -26,9 +26,9 @@ import qtawesome as qta
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QMessageBox, QPushButton, QSizePolicy,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSizePolicy,
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget,
 )
@@ -61,6 +61,22 @@ _NAVY    = "#1B2B4B"
 
 _PAGE_SIZES = [25, 50, 100]
 _ROW_H      = 36
+
+# ── Afritrack / QuickBooks-inspired palette (used only for AfritrackWidget) ───
+_QB_HDR_BG   = "#EFF6FF"   # very light blue header
+_QB_HDR_FG   = "#1E3A5F"   # dark navy header text
+_QB_FORM_BG  = "#EFF6FF"   # formula-cell background
+_QB_FORM_FG  = "#1D4ED8"   # formula-cell text (blue)
+_QB_VNEG_BG  = "#FEF2F2"   # negative variance background
+_QB_VNEG_FG  = "#DC2626"   # negative variance text
+_QB_VPOS_FG  = "#15803D"   # positive variance text
+_QB_VZRO_FG  = "#9CA3AF"   # zero variance text
+_QB_SEL_BG   = "#DBEAFE"   # selection highlight
+_QB_SEL_FG   = "#1E3A5F"   # selection text
+_QB_FOOT_BG  = "#F8FAFC"   # footer background
+_QB_BOLD_FG  = "#0F172A"   # bold row text
+_QB_RED_DARK = "#B91C1C"   # red totals text
+_QB_RED_BG   = "#FEF2F2"   # red totals background
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1892,14 +1908,1172 @@ class _PlaceholderExpenseWidget(QWidget):
         pass
 
 
-class AfritrackWidget(_PlaceholderExpenseWidget):
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Afritrack — Schedule of Differences  (Excel-style interactive grid)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_AF_HEADERS = [
+    "S/NO", "TRUCKS", "NO OF DAYS", "NON-TRANS DAYS",
+    "TRANS DAYS", "RATE / DAY", "TOTAL (TAHMEED)",
+    "TOTAL (INVOICE)", "VARIANCE", "REMARKS",
+]
+_AF_NCOLS       = len(_AF_HEADERS)
+_AF_COL_SNO     = 0
+_AF_COL_TRUCK   = 1
+_AF_COL_DAYS    = 2
+_AF_COL_NTRANS  = 3
+_AF_COL_TRANS   = 4   # formula: DAYS − NTRANS
+_AF_COL_RATE    = 5
+_AF_COL_TOTAL_T = 6   # formula: TRANS × RATE
+_AF_COL_TOTAL_I = 7
+_AF_COL_VAR     = 8   # formula: TOTAL_T − TOTAL_I
+_AF_COL_REMARKS = 9
+_AF_FORMULA_COLS = frozenset({_AF_COL_TRANS, _AF_COL_TOTAL_T, _AF_COL_VAR})
+_AF_NUM_COLS     = frozenset(range(2, 9))    # cols 2-8 are numeric
+
+_AF_FOOTER_DEFS: List[Tuple[str, bool, bool, bool, bool]] = [
+    # (key,        bold,   red,    show_i, show_var)
+    ("sub",        False,  False,  True,   True),
+    ("inst",       False,  False,  True,   True),
+    ("sub2",       False,  False,  True,   True),
+    ("vat",        False,  False,  True,   True),
+    ("sub3",       False,  False,  True,   True),
+    ("wht",        False,  False,  True,   True),
+    ("payable",    True,   False,  True,   True),
+    ("bal",        False,  True,   False,  False),
+    ("total",      True,   True,   False,  False),
+]
+
+
+# ── tiny helpers ───────────────────────────────────────────────────────────────
+
+def _af_flt(text: str) -> float:
+    if not text or text in ("-", "—"):
+        return 0.0
+    try:
+        return float(text.replace(",", ""))
+    except Exception:
+        return 0.0
+
+
+def _af_fmt(val: float, decimals: int = 2) -> str:
+    if val == 0.0:
+        return "-"
+    return f"{val:,.{decimals}f}"
+
+
+# ── Excel-style reader ─────────────────────────────────────────────────────────
+
+def _read_afritrack_file(path: str) -> Tuple[List[List[str]], float, float, float]:
+    """Parse Afritrack xlsx.  Returns (data_rows, inst_t, inst_i, bal_mar)."""
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to import Afritrack files.")
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb.active
+    raw = list(ws.iter_rows(values_only=True))
+    if not raw:
+        return [], 0.0, 0.0, 0.0
+
+    data_rows: List[List[str]] = []
+    inst_t = inst_i = bal_mar = 0.0
+
+    def _v(row, idx, fallback=0.0):
+        try:
+            v = row[idx] if len(row) > idx else None
+            return float(v) if v is not None else fallback
+        except Exception:
+            return fallback
+
+    def _s(val, dec=2):
+        if val is None or val == 0.0:
+            return "-"
+        try:
+            f = float(val)
+            return f"{f:,.{dec}f}" if f != 0 else "-"
+        except Exception:
+            return str(val).strip()
+
+    for row in raw[1:]:           # skip header row
+        sno = row[0] if row else None
+        if sno is None:
+            label = " ".join(str(c or "").lower() for c in row[:9])
+            if "installation fee" in label:
+                inst_t = _v(row, 6)
+                inst_i = _v(row, 7)
+            elif "bal mar" in label or "balance mar" in label:
+                bal_mar = _v(row, 6)
+            continue
+        try:
+            sno = int(sno)
+        except (TypeError, ValueError):
+            continue
+
+        days    = _v(row, 2)
+        ntrans  = _v(row, 3)
+        trans   = _v(row, 4) if (len(row) > 4 and row[4] is not None) else days - ntrans
+        rate    = _v(row, 5)
+        total_t = _v(row, 6) if (len(row) > 6 and row[6] is not None) else trans * rate
+        total_i = _v(row, 7)
+        remarks = str(row[9] or "").strip() if len(row) > 9 else ""
+
+        def _int_or_dec(f):
+            return _s(f, 0) if f == int(f) else _s(f)
+
+        data_rows.append([
+            str(sno),
+            str(row[1] or "").strip(),
+            _int_or_dec(days),
+            _int_or_dec(ntrans),
+            _int_or_dec(trans),
+            _s(rate, 6),
+            _s(total_t),
+            _s(total_i),
+            "",             # variance — auto-computed
+            remarks,
+        ])
+
+    return data_rows, inst_t, inst_i, bal_mar
+
+
+# ── Excel exporter ─────────────────────────────────────────────────────────────
+
+def _export_afritrack_xlsx(
+    path: str,
+    grid: "_AfritrackGrid",
+    footer: "_AfritrackFooter",
+    period: str,
+) -> None:
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required for Excel export.")
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Afritrack {period}"
+
+    thin  = Side(border_style="thin", color="E5E7EB")
+    bdr   = Border(left=thin, right=thin, top=thin, bottom=thin)
+    r_aln = Alignment(horizontal="right",  vertical="center")
+    l_aln = Alignment(horizontal="left",   vertical="center")
+    c_aln = Alignment(horizontal="center", vertical="center")
+    w_aln = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    hdr_fill = PatternFill("solid", fgColor="EFF6FF")
+    hdr_font = Font(name="Calibri", bold=True, size=11, color="1E3A5F")
+    frm_fill = PatternFill("solid", fgColor="EFF6FF")
+    frm_font = Font(name="Calibri", size=11, color="1D4ED8")
+    alt_fill = PatternFill("solid", fgColor="F9FAFB")
+    red_fill = PatternFill("solid", fgColor="FEF2F2")
+    red_font = Font(name="Calibri", bold=True, size=11, color="B91C1C")
+    bld_font = Font(name="Calibri", bold=True, size=11)
+    nrm_font = Font(name="Calibri", size=11)
+
+    col_widths_ch = [6, 16, 10, 12, 10, 10, 15, 15, 10, 20]
+    for c, w in enumerate(col_widths_ch, 1):
+        ws.column_dimensions[ws.cell(1, c).column_letter].width = w
+
+    # header row
+    ws.row_dimensions[1].height = 34
+    col_labels = [
+        "S/NO", "TRUCKS", f"NO OF DAYS\n{period.upper()}",
+        "NON-TRANS\nDAYS", "TRANS\nDAYS", "RATE/DAY",
+        "TOTAL AS PER\nTAHMEED", "TOTAL AS PER\nINVOICE", "VARIANCE", "REMARKS",
+    ]
+    for c, label in enumerate(col_labels, 1):
+        cell = ws.cell(row=1, column=c, value=label)
+        cell.font = hdr_font; cell.fill = hdr_fill
+        cell.border = bdr;   cell.alignment = w_aln
+
+    # data rows
+    data = grid.get_all_data()
+    for ri, row in enumerate(data, 2):
+        ws.row_dimensions[ri].height = 18
+        is_alt = (ri % 2 == 0)
+        for ci, val in enumerate(row, 1):
+            is_formula = (ci - 1) in _AF_FORMULA_COLS
+            num = None
+            if 3 <= ci <= 9 and val not in ("", "-", "—"):
+                try:
+                    num = float(val.replace(",", ""))
+                except Exception:
+                    pass
+            cell = ws.cell(row=ri, column=ci,
+                           value=num if num is not None else (val or None))
+            cell.border    = bdr
+            cell.alignment = r_aln if 3 <= ci <= 9 else (c_aln if ci == 1 else l_aln)
+            if is_formula:
+                cell.font = frm_font; cell.fill = frm_fill
+            elif is_alt:
+                cell.font = nrm_font; cell.fill = alt_fill
+            else:
+                cell.font = nrm_font
+
+    # footer rows
+    fd   = footer.get_export_data()
+    st_t, st_i, _ = grid.get_col_totals()
+    it   = fd["inst_t"];  ii  = fd["inst_i"]
+    bm   = fd["bal_mar"]; vr  = fd["vat_rate"]
+    s2t  = st_t + it;     s2i = st_i + ii
+    vat_t = s2t * vr / 100; vat_i = s2i * vr / 100
+    s3t  = s2t + vat_t;   s3i = s2i + vat_i
+    wt   = s3t * 0.05;    wi  = s3i * 0.05
+    pt   = s3t - wt;      pi  = s3i - wi
+    tot  = pt + bm
+
+    fr = len(data) + 2
+    footer_rows = [
+        (fr,   "",                                    st_t,  st_i,  st_t-st_i, False, False),
+        (fr+1, "Installation Fees",                   it,    ii,    it-ii,     False, False),
+        (fr+2, "",                                    s2t,   s2i,   s2t-s2i,   False, False),
+        (fr+3, f"VAT @ {vr:.0f}%",                   vat_t, vat_i, vat_t-vat_i, False, False),
+        (fr+4, "",                                    s3t,   s3i,   s3t-s3i,   False, False),
+        (fr+5, "Less WHT @ 5%",                      wt,    wi,    wt-wi,     False, False),
+        (fr+6, "Amount Payable",                      pt,    pi,    pt-pi,     True,  False),
+        (fr+7, "Add Bal. Mar (WHT Calculations)",     bm,    None,  None,      False, True),
+        (fr+8, f"Total Payable {period} Account",     tot,   None,  None,      True,  True),
+    ]
+    for frow, label, vt_, vi_, vvar, bold, red in footer_rows:
+        ws.row_dimensions[frow].height = 18
+        if label:
+            lc = ws.cell(row=frow, column=5, value=label)
+            lc.alignment = r_aln
+            lc.font = red_font if red else (bld_font if bold else nrm_font)
+            if red:
+                lc.fill = red_fill
+        for xc, xv in [(_AF_COL_TOTAL_T+1, vt_),
+                        (_AF_COL_TOTAL_I+1, vi_),
+                        (_AF_COL_VAR+1,     vvar)]:
+            if xv is not None:
+                cell = ws.cell(row=frow, column=xc, value=xv)
+                cell.alignment = r_aln; cell.border = bdr
+                cell.font = red_font if red else (bld_font if bold else nrm_font)
+                if red:
+                    cell.fill = red_fill
+
+    wb.save(path)
+
+
+# ── Editable grid ─────────────────────────────────────────────────────────────
+
+class _AfritrackGrid(QTableWidget):
+    """
+    Editable Excel-like grid.  Formula cols (TRANS DAYS, TOTAL TAHMEED,
+    VARIANCE) auto-compute and are read-only.  All other cols are editable.
+    Supports Ctrl+C/X/V, Ctrl+Z/Y, Delete, multi-select, right-click menu.
+    """
+    data_changed = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(
-            "Afritrack",
-            "mdi.satellite-variant",
-            "Connect to the Afritrack tracking system to import trip data.",
-            parent,
+        super().__init__(0, _AF_NCOLS, parent)
+        self._block          = False
+        self._undo_stack: List[List[List[str]]] = []
+        self._redo_stack: List[List[List[str]]] = []
+        self._pre_edit_snap: Optional[List[List[str]]] = None
+        self._setup()
+
+    # ── initialisation ────────────────────────────────────────────────────────
+
+    def _setup(self) -> None:
+        self.setHorizontalHeaderLabels(_AF_HEADERS)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setEditTriggers(
+            QAbstractItemView.DoubleClicked | QAbstractItemView.AnyKeyPressed
         )
+        self.setAlternatingRowColors(True)
+        self.verticalHeader().setVisible(False)
+        self.verticalHeader().setDefaultSectionSize(22)
+        self.setShowGrid(True)
+        self.setSortingEnabled(False)
+
+        hdr = self.horizontalHeader()
+        hdr.setHighlightSections(False)
+        hdr.setMinimumSectionSize(36)
+        hdr.setStretchLastSection(True)
+        col_widths = [38, 110, 60, 76, 60, 62, 96, 96, 66, 120]
+        for c, w in enumerate(col_widths):
+            self.setColumnWidth(c, w)
+
+        self.setStyleSheet(self._grid_ss())
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._ctx_menu)
+        self.currentItemChanged.connect(self._capture_pre_edit)
+        self.itemChanged.connect(self._on_item_changed)
+
+    def _grid_ss(self) -> str:
+        return (
+            f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
+            "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
+            f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
+            f"QTableWidget::item:selected{{background:{_QB_SEL_BG};color:{_QB_SEL_FG};}}"
+            f"QTableWidget::item:alternate{{background:#F9FAFB;}}"
+            f"QHeaderView::section{{background:{_QB_HDR_BG};color:{_QB_HDR_FG};"
+            "font-size:11px;font-weight:700;font-family:'Segoe UI',sans-serif;"
+            f"border:none;border-right:1px solid {_BORDER};"
+            f"border-bottom:2px solid {_BLUE};padding:0 6px;height:32px;}}"
+            "QScrollBar:vertical{width:8px;background:transparent;}"
+            f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
+            "QScrollBar:horizontal{height:8px;background:transparent;}"
+            f"QScrollBar::handle:horizontal{{background:#D1D5DB;border-radius:4px;}}"
+        )
+
+    # ── keyboard ──────────────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event) -> None:
+        mod = event.modifiers()
+        key = event.key()
+        if mod == Qt.ControlModifier:
+            if key == Qt.Key_C: self._do_copy();  return
+            if key == Qt.Key_X: self._do_cut();   return
+            if key == Qt.Key_V: self._do_paste();  return
+            if key == Qt.Key_Z: self._do_undo();   return
+            if key == Qt.Key_Y: self._do_redo();   return
+        # Tab on last column → wrap to TRUCKS col of next row (add row if needed)
+        if key == Qt.Key_Tab and not (mod & Qt.ShiftModifier):
+            row, col = self.currentRow(), self.currentColumn()
+            if col == _AF_NCOLS - 1:
+                if row >= self.rowCount() - 1:
+                    self.add_row()
+                self.setCurrentCell(min(row + 1, self.rowCount() - 1), _AF_COL_TRUCK)
+                return
+        if key == Qt.Key_Delete:
+            self.delete_selected_rows(); return
+        if key == Qt.Key_Backspace:
+            self._do_clear(); return
+        super().keyPressEvent(event)
+
+    def closeEditor(self, editor, hint) -> None:
+        """Tab while editing the last column → commit + move to TRUCKS of next row."""
+        from PySide6.QtWidgets import QAbstractItemDelegate
+        if hint == QAbstractItemDelegate.EditNextItem:
+            col = self.currentColumn()
+            row = self.currentRow()
+            if col == _AF_NCOLS - 1:
+                super().closeEditor(editor, QAbstractItemDelegate.SubmitModelCache)
+                if row >= self.rowCount() - 1:
+                    self.add_row()
+                self.setCurrentCell(min(row + 1, self.rowCount() - 1), _AF_COL_TRUCK)
+                return
+        super().closeEditor(editor, hint)
+
+    # ── copy / cut / paste ────────────────────────────────────────────────────
+
+    def _sel_rows_cols(self) -> Tuple[List[int], List[int]]:
+        idxs = self.selectedIndexes()
+        if not idxs:
+            return [], []
+        return (
+            sorted({i.row() for i in idxs}),
+            sorted({i.column() for i in idxs}),
+        )
+
+    def _do_copy(self) -> None:
+        rows, cols = self._sel_rows_cols()
+        if not rows:
+            return
+        lines = []
+        for r in rows:
+            lines.append("\t".join(
+                (self.item(r, c).text() if self.item(r, c) else "") for c in cols
+            ))
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _do_cut(self) -> None:
+        self._do_copy()
+        self._do_clear()
+
+    def _do_paste(self) -> None:
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        paste_rows = [line.split("\t") for line in text.splitlines()]
+        while paste_rows and all(c == "" for c in paste_rows[-1]):
+            paste_rows.pop()
+        sel_rows, sel_cols = self._sel_rows_cols()
+        r0 = sel_rows[0] if sel_rows else max(self.currentRow(), 0)
+        c0 = sel_cols[0] if sel_cols else max(self.currentColumn(), 0)
+        self._push_undo()
+        self._block = True
+        for dr, row_data in enumerate(paste_rows):
+            r = r0 + dr
+            if r >= self.rowCount():
+                self._insert_blank_row(r)
+            for dc, val in enumerate(row_data):
+                c = c0 + dc
+                if c >= self.columnCount() or c in _AF_FORMULA_COLS:
+                    continue
+                item = self.item(r, c) or QTableWidgetItem()
+                item.setText(val.strip())
+                self._style_item(item, r, c)
+                self.setItem(r, c, item)
+        self._block = False
+        self._recalc_all()
+        self.data_changed.emit()
+
+    def _do_clear(self) -> None:
+        self._push_undo()
+        self._block = True
+        for item in self.selectedItems():
+            if item.column() not in (_AF_FORMULA_COLS | {_AF_COL_SNO}):
+                item.setText("")
+        self._block = False
+        self._recalc_all()
+        self.data_changed.emit()
+
+    # ── undo / redo ───────────────────────────────────────────────────────────
+
+    def _snapshot(self) -> List[List[str]]:
+        return [
+            [(self.item(r, c).text() if self.item(r, c) else "")
+             for c in range(self.columnCount())]
+            for r in range(self.rowCount())
+        ]
+
+    def _push_undo(self) -> None:
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > 50:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _restore(self, snap: List[List[str]]) -> None:
+        self._block = True
+        self.setRowCount(len(snap))
+        for r, row_data in enumerate(snap):
+            for c, text in enumerate(row_data):
+                item = self.item(r, c) or QTableWidgetItem()
+                item.setText(text)
+                self._style_item(item, r, c)
+                self.setItem(r, c, item)
+        self._block = False
+        self._recalc_all()
+        self.data_changed.emit()
+
+    def _do_undo(self) -> None:
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        self._restore(self._undo_stack.pop())
+
+    def _do_redo(self) -> None:
+        if not self._redo_stack:
+            return
+        self._push_undo()
+        self._restore(self._redo_stack.pop())
+
+    # ── formula engine ────────────────────────────────────────────────────────
+
+    def _capture_pre_edit(self, _curr, _prev) -> None:
+        if not self._block:
+            self._pre_edit_snap = self._snapshot()
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._block:
+            return
+        col = item.column()
+        if col not in _AF_FORMULA_COLS:
+            if self._pre_edit_snap is not None:
+                self._undo_stack.append(self._pre_edit_snap)
+                if len(self._undo_stack) > 50:
+                    self._undo_stack.pop(0)
+                self._redo_stack.clear()
+                self._pre_edit_snap = None
+        self._recalc_row(item.row())
+        self.data_changed.emit()
+
+    def _recalc_all(self) -> None:
+        for r in range(self.rowCount()):
+            self._recalc_row(r, renumber=False)
+        self._renumber()
+
+    def _recalc_row(self, row: int, renumber: bool = True) -> None:
+        self._block = True
+
+        def _txt(c):
+            it = self.item(row, c)
+            return it.text() if it else ""
+
+        days    = _af_flt(_txt(_AF_COL_DAYS))
+        ntrans  = _af_flt(_txt(_AF_COL_NTRANS))
+        rate    = _af_flt(_txt(_AF_COL_RATE))
+        total_i = _af_flt(_txt(_AF_COL_TOTAL_I))
+        trans   = days - ntrans
+        total_t = trans * rate
+        var     = total_t - total_i
+
+        self._set_fcell(row, _AF_COL_TRANS,   trans,  is_var=False)
+        self._set_fcell(row, _AF_COL_TOTAL_T, total_t, is_var=False)
+        self._set_fcell(row, _AF_COL_VAR,     var,    is_var=True)
+
+        self._block = False
+        if renumber:
+            self._renumber()
+
+    def _set_fcell(self, row: int, col: int, val: float,
+                   is_var: bool = False) -> None:
+        item = self.item(row, col)
+        if item is None:
+            item = QTableWidgetItem()
+            self.setItem(row, col, item)
+        item.setText(_af_fmt(val))
+        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        item.setFlags(
+            (item.flags() & ~Qt.ItemIsEditable) | Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        )
+        if is_var:
+            if val < -0.005:
+                item.setForeground(QColor(_QB_VNEG_FG))
+                item.setBackground(QColor(_QB_VNEG_BG))
+            elif val > 0.005:
+                item.setForeground(QColor(_QB_VPOS_FG))
+                item.setBackground(QColor(_QB_FORM_BG))
+            else:
+                item.setForeground(QColor(_QB_VZRO_FG))
+                item.setBackground(QColor(_QB_FORM_BG))
+        else:
+            item.setForeground(QColor(_QB_FORM_FG))
+            item.setBackground(QColor(_QB_FORM_BG))
+
+    def _style_item(self, item: QTableWidgetItem, row: int, col: int) -> None:
+        if col in _AF_FORMULA_COLS:
+            item.setBackground(QColor(_QB_FORM_BG))
+            item.setForeground(QColor(_QB_FORM_FG))
+            item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        elif col in _AF_NUM_COLS:
+            item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        elif col == _AF_COL_SNO:
+            item.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+            item.setForeground(QColor(_T2))
+
+    def _renumber(self) -> None:
+        self._block = True
+        for r in range(self.rowCount()):
+            item = self.item(r, _AF_COL_SNO)
+            if item is None:
+                item = QTableWidgetItem()
+                self.setItem(r, _AF_COL_SNO, item)
+            item.setText(str(r + 1))
+            item.setForeground(QColor(_T2))
+            item.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+            item.setFlags(
+                (item.flags() & ~Qt.ItemIsEditable) | Qt.ItemIsSelectable | Qt.ItemIsEnabled
+            )
+        self._block = False
+
+    # ── row operations ────────────────────────────────────────────────────────
+
+    def _insert_blank_row(self, r: int) -> None:
+        self.insertRow(r)
+        self._block = True
+        for c in range(_AF_NCOLS):
+            item = QTableWidgetItem("")
+            self._style_item(item, r, c)
+            self.setItem(r, c, item)
+        self._block = False
+
+    def add_row(self, values: List[str] = None) -> None:
+        r = self.rowCount()
+        self._insert_blank_row(r)
+        if values:
+            self._block = True
+            for c in range(min(len(values), _AF_NCOLS)):
+                if c in (_AF_FORMULA_COLS | {_AF_COL_SNO}):
+                    continue
+                item = self.item(r, c) or QTableWidgetItem()
+                item.setText(str(values[c]) if values[c] is not None else "")
+                self._style_item(item, r, c)
+                self.setItem(r, c, item)
+            self._block = False
+        self._recalc_row(r)
+        self.scrollToBottom()
+
+    def insert_row_above(self) -> None:
+        sel_rows, _ = self._sel_rows_cols()
+        r = sel_rows[0] if sel_rows else self.rowCount()
+        self._push_undo()
+        self._insert_blank_row(r)
+        self._recalc_row(r)
+        self._renumber()
+        self.data_changed.emit()
+
+    def delete_selected_rows(self) -> None:
+        rows = sorted({i.row() for i in self.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        self._push_undo()
+        for r in rows:
+            self.removeRow(r)
+        self._renumber()
+        self.data_changed.emit()
+
+    # ── data access ───────────────────────────────────────────────────────────
+
+    def get_all_data(self) -> List[List[str]]:
+        return [
+            [(self.item(r, c).text() if self.item(r, c) else "")
+             for c in range(self.columnCount())]
+            for r in range(self.rowCount())
+        ]
+
+    def get_col_totals(self) -> Tuple[float, float, float]:
+        def _sum(col):
+            return sum(
+                _af_flt(self.item(r, col).text() if self.item(r, col) else "")
+                for r in range(self.rowCount())
+                if not self.isRowHidden(r)
+            )
+        t = _sum(_AF_COL_TOTAL_T)
+        i = _sum(_AF_COL_TOTAL_I)
+        return t, i, t - i
+
+    def filter_rows(self, text: str) -> None:
+        text = text.lower().strip()
+        for r in range(self.rowCount()):
+            match = any(
+                text in (self.item(r, c).text().lower() if self.item(r, c) else "")
+                for c in range(self.columnCount())
+            )
+            self.setRowHidden(r, bool(text) and not match)
+
+    # ── context menu ──────────────────────────────────────────────────────────
+
+    def _ctx_menu(self, pos) -> None:
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu{{background:{_WHITE};border:1px solid {_BORDER};"
+            f"border-radius:6px;padding:4px;"
+            f"font-size:12px;font-family:'Segoe UI',sans-serif;}}"
+            f"QMenu::item{{padding:6px 20px;border-radius:4px;color:{_T1};}}"
+            f"QMenu::item:selected{{background:{_BLUE_L};}}"
+            f"QMenu::separator{{height:1px;background:{_BORDER};margin:4px 8px;}}"
+        )
+        menu.addAction("Copy\t\tCtrl+C",        self._do_copy)
+        menu.addAction("Cut\t\tCtrl+X",         self._do_cut)
+        menu.addAction("Paste\t\tCtrl+V",        self._do_paste)
+        menu.addAction("Clear Cells\tBackspace",  self._do_clear)
+        menu.addSeparator()
+        menu.addAction("Insert Row Above",              self.insert_row_above)
+        menu.addAction("Add Row at Bottom\tTab",        self.add_row)
+        menu.addAction("Delete Row(s)\t\tDel",          self.delete_selected_rows)
+        menu.addSeparator()
+        menu.addAction("Undo\t\tCtrl+Z",  self._do_undo)
+        menu.addAction("Redo\t\tCtrl+Y",  self._do_redo)
+        menu.exec(self.viewport().mapToGlobal(pos))
+
+
+# ── Pinned footer ─────────────────────────────────────────────────────────────
+
+class _AfritrackFooter(QWidget):
+    """
+    Non-scrolling totals section that mirrors the Excel footer layout:
+    Subtotal → Installation Fees → Sub2 → VAT → Total+VAT →
+    Less WHT @5% → Amount Payable → Add Bal. Mar → Total Payable Account
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._inst_t   = 0.0
+        self._inst_i   = 0.0
+        self._bal_mar  = 0.0
+        self._vat_rate = 15.0
+        self._build()
+
+    def _build(self) -> None:
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
+
+        sep = QFrame()
+        sep.setFixedHeight(2)
+        sep.setStyleSheet(f"background:{_BLUE};border:none;")
+        vl.addWidget(sep)
+
+        self._table = QTableWidget(len(_AF_FOOTER_DEFS), _AF_NCOLS)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.horizontalHeader().setVisible(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(24)
+        self._table.setShowGrid(True)
+        self._table.setStyleSheet(self._foot_ss())
+        self._table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._table.setFocusPolicy(Qt.NoFocus)
+
+        for ri in range(len(_AF_FOOTER_DEFS)):
+            self._table.setSpan(ri, 0, 1, 6)   # cols 0-5 → merged label cell
+
+        self._fix_height()
+        vl.addWidget(self._table)
+
+    def _foot_ss(self) -> str:
+        return (
+            f"QTableWidget{{background:{_QB_FOOT_BG};gridline-color:{_BORDER};"
+            "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
+            f"QTableWidget::item{{padding:0 8px;color:{_T1};}}"
+        )
+
+    def _fix_height(self) -> None:
+        h = sum(self._table.rowHeight(r) for r in range(len(_AF_FOOTER_DEFS))) + 2
+        self._table.setFixedHeight(h)
+
+    def sync_columns(self, grid: "_AfritrackGrid") -> None:
+        for c in range(_AF_NCOLS):
+            self._table.setColumnWidth(c, grid.columnWidth(c))
+
+    def set_params(self, inst_t: float, inst_i: float,
+                   bal_mar: float, vat_rate: float) -> None:
+        self._inst_t   = inst_t
+        self._inst_i   = inst_i
+        self._bal_mar  = bal_mar
+        self._vat_rate = vat_rate
+
+    def refresh(self, grid: "_AfritrackGrid", month: str) -> None:
+        sum_t, sum_i, _ = grid.get_col_totals()
+        it   = self._inst_t;  ii  = self._inst_i
+        s2t  = sum_t + it;    s2i = sum_i + ii
+        vt   = s2t * self._vat_rate / 100
+        vi   = s2i * self._vat_rate / 100
+        s3t  = s2t + vt;      s3i = s2i + vi
+        wt   = s3t * 0.05;    wi  = s3i * 0.05
+        pt   = s3t - wt;      pi  = s3i - wi
+        tot  = pt + self._bal_mar
+
+        vals: Dict[str, Tuple[str, float, Optional[float], Optional[float]]] = {
+            "sub":     ("",                                    sum_t,          sum_i,    sum_t - sum_i),
+            "inst":    ("Installation Fees",                   it,             ii,       it - ii),
+            "sub2":    ("",                                    s2t,            s2i,      s2t - s2i),
+            "vat":     (f"VAT @ {self._vat_rate:.0f}%",       vt,             vi,       vt - vi),
+            "sub3":    ("",                                    s3t,            s3i,      s3t - s3i),
+            "wht":     ("Less WHT @ 5%",                      wt,             wi,       wt - wi),
+            "payable": ("Amount Payable",                      pt,             pi,       pt - pi),
+            "bal":     (f"Add Bal. Mar (WHT Calculations)",    self._bal_mar,  None,     None),
+            "total":   (f"Total Payable {month} Account",      tot,            None,     None),
+        }
+
+        t = self._table
+        for ri, (key, bold, red, show_i, show_var) in enumerate(_AF_FOOTER_DEFS):
+            label, vt_, vi_, vvar = vals[key]
+
+            # label cell (merged cols 0-5)
+            lbl = t.item(ri, 0) or QTableWidgetItem()
+            lbl.setText(label)
+            lbl.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            fn = lbl.font(); fn.setBold(bold); lbl.setFont(fn)
+            if red:
+                lbl.setForeground(QColor(_QB_RED_DARK))
+                lbl.setBackground(QColor(_QB_RED_BG))
+            elif bold:
+                lbl.setForeground(QColor(_QB_BOLD_FG))
+                lbl.setBackground(QColor(_QB_FOOT_BG))
+            else:
+                lbl.setForeground(QColor(_T2))
+                lbl.setBackground(QColor(_QB_FOOT_BG))
+            t.setItem(ri, 0, lbl)
+
+            def _put(col: int, val: Optional[float]) -> None:
+                cell = t.item(ri, col) or QTableWidgetItem()
+                if val is None:
+                    cell.setText(""); cell.setBackground(QColor(_QB_FOOT_BG))
+                    t.setItem(ri, col, cell); return
+                cell.setText(_af_fmt(val))
+                cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                fn2 = cell.font(); fn2.setBold(bold); cell.setFont(fn2)
+                if red:
+                    cell.setForeground(QColor(_QB_RED_DARK))
+                    cell.setBackground(QColor(_QB_RED_BG))
+                elif col == _AF_COL_VAR and val < -0.005:
+                    cell.setForeground(QColor(_QB_VNEG_FG))
+                    cell.setBackground(QColor(_QB_VNEG_BG))
+                elif col == _AF_COL_VAR and val > 0.005:
+                    cell.setForeground(QColor(_QB_VPOS_FG))
+                    cell.setBackground(QColor(_QB_FOOT_BG))
+                else:
+                    cell.setForeground(QColor(_QB_BOLD_FG if bold else _T1))
+                    cell.setBackground(QColor(_QB_FOOT_BG))
+                t.setItem(ri, col, cell)
+
+            _put(_AF_COL_TOTAL_T, vt_)
+            _put(_AF_COL_TOTAL_I, vi_  if show_i   else None)
+            _put(_AF_COL_VAR,     vvar if show_var  else None)
+
+        self._fix_height()
+
+    def get_export_data(self) -> Dict[str, float]:
+        return {
+            "inst_t":   self._inst_t,
+            "inst_i":   self._inst_i,
+            "bal_mar":  self._bal_mar,
+            "vat_rate": self._vat_rate,
+        }
+
+
+# ── QB Bill-card field helpers ────────────────────────────────────────────────
+
+def _qb_field_widget(label_text: str, input_widget: QWidget) -> QWidget:
+    """Small ALL-CAPS gray label above an input — matches QB Bill field style."""
+    w = QWidget()
+    w.setStyleSheet("background:transparent;")
+    vl = QVBoxLayout(w)
+    vl.setContentsMargins(0, 0, 0, 0)
+    vl.setSpacing(3)
+    lbl = QLabel(label_text)
+    lbl.setStyleSheet(
+        f"color:{_T2};font-size:9px;font-weight:600;letter-spacing:0.8px;"
+        f"font-family:'Segoe UI',sans-serif;background:transparent;"
+    )
+    vl.addWidget(lbl)
+    vl.addWidget(input_widget)
+    return w
+
+
+def _qb_amount_widget(
+    label_text: str,
+    badge: str = "USD",
+    red: bool = False,
+) -> Tuple[QWidget, QLabel]:
+    """
+    QB-style amount display: currency badge on left + large bold value on right.
+    Returns (container_widget, value_label).
+    """
+    w = QWidget()
+    w.setStyleSheet("background:transparent;")
+    vl = QVBoxLayout(w)
+    vl.setContentsMargins(0, 0, 0, 0)
+    vl.setSpacing(3)
+
+    lbl = QLabel(label_text)
+    lbl.setStyleSheet(
+        f"color:{_T2};font-size:9px;font-weight:600;letter-spacing:0.8px;"
+        f"font-family:'Segoe UI',sans-serif;background:transparent;"
+    )
+    vl.addWidget(lbl)
+
+    box = QFrame()
+    box_bg = _QB_RED_BG if red else _BG
+    box.setStyleSheet(
+        f"QFrame{{background:{box_bg};border:1px solid {_BORDER};border-radius:4px;}}"
+    )
+    box.setFixedHeight(34)
+    hl = QHBoxLayout(box)
+    hl.setContentsMargins(0, 0, 0, 0)
+    hl.setSpacing(0)
+
+    badge_lbl = QLabel(badge)
+    badge_lbl.setFixedWidth(40)
+    badge_lbl.setAlignment(Qt.AlignCenter)
+    badge_bg = _QB_RED_BG if red else _QB_HDR_BG
+    badge_fg = _QB_RED_DARK if red else _QB_HDR_FG
+    badge_lbl.setStyleSheet(
+        f"QLabel{{background:{badge_bg};border:none;"
+        f"border-right:1px solid {_BORDER};"
+        f"border-top-left-radius:4px;border-bottom-left-radius:4px;"
+        f"color:{badge_fg};font-size:10px;font-weight:700;"
+        f"font-family:'Segoe UI',sans-serif;}}"
+    )
+    hl.addWidget(badge_lbl)
+
+    val_lbl = QLabel("0.00")
+    val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    val_fg = _QB_RED_DARK if red else _QB_HDR_FG
+    val_lbl.setStyleSheet(
+        f"QLabel{{color:{val_fg};font-size:14px;font-weight:700;"
+        f"font-family:'Segoe UI',sans-serif;background:transparent;padding:0 10px;}}"
+    )
+    hl.addWidget(val_lbl, 1)
+    vl.addWidget(box)
+    return w, val_lbl
+
+
+# ── Main widget ───────────────────────────────────────────────────────────────
+
+class AfritrackWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._period = "Apr 2026"
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet(f"background:{_BG};")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(20, 16, 20, 12)
+        vl.setSpacing(8)
+
+        # ── QB Bill-style form card (all metadata above the table) ────────────
+        vl.addWidget(self._build_bill_card())
+
+        # ── slim action toolbar ───────────────────────────────────────────────
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search trucks, remarks…")
+        self._search.setFixedWidth(220)
+        self._search.setStyleSheet(_input_ss())
+        self._search.textChanged.connect(lambda t: self._grid.filter_rows(t))
+        tbl.addWidget(self._search)
+        tbl.addStretch()
+
+        self._import_btn = _btn("Import", "mdi.upload-outline", height=32)
+        self._export_btn = _btn("Export", "mdi.download-outline",
+                                primary=False, height=32)
+        recalc_btn = _btn("Recalculate", "mdi.refresh", primary=False, height=32)
+        del_btn    = _btn("Delete Row",  "mdi.delete-outline",
+                          primary=False, height=32)
+
+        self._import_btn.clicked.connect(self._do_import)
+        self._export_btn.clicked.connect(self._do_export)
+        recalc_btn.clicked.connect(self._recalculate)
+        del_btn.clicked.connect(lambda: self._grid.delete_selected_rows())
+
+        tbl.addWidget(self._import_btn)
+        tbl.addWidget(self._export_btn)
+        tbl.addWidget(recalc_btn)
+        tbl.addWidget(del_btn)
+        vl.addWidget(tb)
+
+        # ── grid card — takes all remaining space ─────────────────────────────
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};"
+            "border-radius:6px;}}"
+        )
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+
+        self._grid = _AfritrackGrid()
+        self._grid.data_changed.connect(self._on_data_changed)
+        self._grid.horizontalHeader().sectionResized.connect(
+            lambda *_: self._footer.sync_columns(self._grid)
+        )
+        cl.addWidget(self._grid, 1)
+
+        self._footer = _AfritrackFooter()
+        cl.addWidget(self._footer)
+        vl.addWidget(card, 1)
+
+        # ── status bar ────────────────────────────────────────────────────────
+        self._status = _lbl(
+            "0 trucks  ·  Import an Excel file or add rows manually",
+            11, 400, _T2,
+        )
+        vl.addWidget(self._status)
+
+        self._on_data_changed()
+
+    def _build_bill_card(self) -> QFrame:
+        """
+        QuickBooks Bill-style form card.
+        Left column  : SUPPLIER (read-only) · PERIOD · VAT %
+        Right section: INST. FEES (T/I) · BALANCE MAR · live AMOUNT DUE · TOTAL PAYABLE
+        """
+        card = QFrame()
+        card.setObjectName("af_bill_card")
+        card.setStyleSheet(
+            "QFrame#af_bill_card{"
+            f"background:{_WHITE};border:1px solid {_BORDER};border-radius:8px;}}"
+        )
+
+        root = QVBoxLayout(card)
+        root.setContentsMargins(20, 14, 20, 16)
+        root.setSpacing(10)
+
+        # title row
+        title_lbl = QLabel("Afritrack Schedule")
+        title_lbl.setStyleSheet(
+            f"color:{_QB_HDR_FG};font-size:20px;font-weight:700;"
+            f"font-family:'Segoe UI',sans-serif;background:transparent;"
+        )
+        root.addWidget(title_lbl)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background:{_BORDER};")
+        root.addWidget(sep)
+
+        # ── body: left | divider | right ──────────────────────────────────────
+        body = QWidget()
+        body.setStyleSheet("background:transparent;")
+        fl = QHBoxLayout(body)
+        fl.setContentsMargins(0, 4, 0, 4)
+        fl.setSpacing(0)
+
+        # ── LEFT ──────────────────────────────────────────────────────────────
+        left = QWidget()
+        left.setStyleSheet("background:transparent;")
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 24, 0)
+        ll.setSpacing(10)
+
+        # SUPPLIER (read-only display field, like QB's supplier badge)
+        supp_lbl = QLineEdit("AFRITRACK")
+        supp_lbl.setReadOnly(True)
+        supp_lbl.setFixedWidth(180)
+        supp_lbl.setStyleSheet(
+            f"QLineEdit{{background:{_BG};border:1px solid {_BORDER};"
+            "border-radius:4px;color:#111827;font-size:12px;font-weight:600;"
+            "font-family:'Segoe UI',sans-serif;padding:0 10px;"
+            "min-height:32px;max-height:32px;}}"
+        )
+        ll.addWidget(_qb_field_widget("SUPPLIER", supp_lbl))
+
+        # PERIOD
+        self._period_cb = QComboBox()
+        self._period_cb.setFixedWidth(140)
+        self._period_cb.setStyleSheet(_input_ss())
+        _months = ["Jan","Feb","Mar","Apr","May","Jun",
+                   "Jul","Aug","Sep","Oct","Nov","Dec"]
+        for yr in ["2024", "2025", "2026", "2027"]:
+            for mo in _months:
+                self._period_cb.addItem(f"{mo} {yr}")
+        self._period_cb.setCurrentText("Apr 2026")
+        self._period_cb.currentTextChanged.connect(self._on_period)
+        ll.addWidget(_qb_field_widget("PERIOD", self._period_cb))
+
+        # VAT %
+        self._vat_edit = QLineEdit("15")
+        self._vat_edit.setFixedWidth(70)
+        self._vat_edit.setStyleSheet(_input_ss())
+        self._vat_edit.textChanged.connect(self._on_params)
+        ll.addWidget(_qb_field_widget("VAT %", self._vat_edit))
+
+        ll.addStretch()
+        fl.addWidget(left)
+
+        # vertical divider
+        vdiv = QFrame()
+        vdiv.setFrameShape(QFrame.VLine)
+        vdiv.setFixedWidth(1)
+        vdiv.setStyleSheet(f"background:{_BORDER};")
+        fl.addWidget(vdiv)
+
+        # ── RIGHT ─────────────────────────────────────────────────────────────
+        right = QWidget()
+        right.setStyleSheet("background:transparent;")
+        rl = QGridLayout(right)
+        rl.setContentsMargins(24, 0, 0, 0)
+        rl.setHorizontalSpacing(20)
+        rl.setVerticalSpacing(10)
+        rl.setColumnStretch(0, 1)
+        rl.setColumnStretch(1, 1)
+
+        # row 0: installation fees
+        self._inst_t = QLineEdit("0")
+        self._inst_t.setStyleSheet(_input_ss())
+        self._inst_t.textChanged.connect(self._on_params)
+        rl.addWidget(_qb_field_widget("INST. FEES — TAHMEED", self._inst_t), 0, 0)
+
+        self._inst_i = QLineEdit("0")
+        self._inst_i.setStyleSheet(_input_ss())
+        self._inst_i.textChanged.connect(self._on_params)
+        rl.addWidget(_qb_field_widget("INST. FEES — INVOICE", self._inst_i), 0, 1)
+
+        # row 1: balance mar
+        self._bal_mar = QLineEdit("0")
+        self._bal_mar.setFixedWidth(140)
+        self._bal_mar.setStyleSheet(_input_ss())
+        self._bal_mar.textChanged.connect(self._on_params)
+        rl.addWidget(_qb_field_widget("BALANCE MAR (WHT)", self._bal_mar), 1, 0)
+
+        # row 2: AMOUNT DUE + TOTAL PAYABLE (live computed, QB-style)
+        amt_w, self._amount_due_val = _qb_amount_widget("AMOUNT DUE", "USD", red=False)
+        rl.addWidget(amt_w, 2, 0)
+
+        tot_w, self._total_pay_val = _qb_amount_widget(
+            "TOTAL PAYABLE", "USD", red=True
+        )
+        rl.addWidget(tot_w, 2, 1)
+
+        fl.addWidget(right, 1)
+        root.addWidget(body)
+        return card
+
+    # ── slots ─────────────────────────────────────────────────────────────────
+
+    def _on_period(self, text: str) -> None:
+        self._period = text
+        self._on_data_changed()
+
+    def _on_params(self) -> None:
+        self._on_data_changed()
+
+    def _on_data_changed(self) -> None:
+        try:
+            it = _af_flt(self._inst_t.text())
+            ii = _af_flt(self._inst_i.text())
+            bm = _af_flt(self._bal_mar.text())
+            vr = float(self._vat_edit.text() or "15")
+        except Exception:
+            it = ii = bm = 0.0; vr = 15.0
+
+        self._footer.set_params(it, ii, bm, vr)
+        self._footer.refresh(self._grid, self._period)
+        self._footer.sync_columns(self._grid)
+
+        # ── live bill-card totals ──────────────────────────────────────────────
+        tt, ti, _ = self._grid.get_col_totals()
+        s2t  = tt + it
+        vat_t = s2t * vr / 100
+        s3t  = s2t + vat_t
+        pay_t = s3t * 0.95          # after WHT @5%
+        total = pay_t + bm
+        self._amount_due_val.setText(f"{pay_t:,.2f}")
+        self._total_pay_val.setText(f"{total:,.2f}")
+
+        n = sum(1 for r in range(self._grid.rowCount())
+                if not self._grid.isRowHidden(r))
+        self._status.setText(
+            f"{n:,} truck{'s' if n != 1 else ''}  ·  "
+            f"Tahmeed: {_af_fmt(tt)}  ·  "
+            f"Invoice: {_af_fmt(ti)}  ·  "
+            f"Variance: {_af_fmt(tt - ti)}"
+        )
+
+    def _recalculate(self) -> None:
+        self._grid._recalc_all()
+        self._on_data_changed()
+
+    def _do_import(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Afritrack Schedule", "",
+            "Excel Files (*.xlsx *.xls);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            rows, inst_t, inst_i, bal_mar = _read_afritrack_file(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Error", str(exc))
+            return
+        self._grid.setRowCount(0)
+        for rd in rows:
+            self._grid.add_row(rd)
+        if inst_t or inst_i:
+            self._inst_t.setText(f"{inst_t:.2f}")
+            self._inst_i.setText(f"{inst_i:.2f}")
+        if bal_mar:
+            self._bal_mar.setText(f"{bal_mar:.2f}")
+        self._on_data_changed()
+        QMessageBox.information(
+            self, "Import Complete",
+            f"Loaded {self._grid.rowCount():,} truck rows.",
+        )
+
+    def _do_export(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Afritrack Schedule",
+            f"Afritrack_{self._period.replace(' ', '_')}.xlsx",
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            _export_afritrack_xlsx(path, self._grid, self._footer, self._period)
+            QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Error", str(exc))
 
 
 class ThirdPartyWidget(_PlaceholderExpenseWidget):
@@ -1920,3 +3094,193 @@ class ComesaWidget(_PlaceholderExpenseWidget):
             "Import COMESA cover records when column schema is confirmed.",
             parent,
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RahnTech — Transacted Devices import
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_RAHNTECH_HEADERS = [
+    "S/N", "SALES DATE", "TRIP NUMBER", "DEVICE NUMBER",
+    "TRUCK NUMBER", "DRIVER NAME", "DO",
+]
+_RAHNTECH_COL_MAP = {
+    "sn":            ["s/n", "sn", "#"],
+    "sales_date":    ["sales date", "date", "transaction date"],
+    "trip_number":   ["trip number", "trip no", "trip"],
+    "device_number": ["device number", "device no", "device"],
+    "truck_number":  ["truck number", "truck no", "truck"],
+    "driver_name":   ["driver name", "driver"],
+    "do_number":     ["do", "do number", "delivery order"],
+}
+
+
+def _read_rahntech_rows(path: str) -> Tuple[List[str], List[List[Any]]]:
+    """RahnTech xlsx: row 0 is a title banner; row 1 holds the real headers."""
+    p = Path(path)
+    if p.suffix.lower() in (".xlsx", ".xls") and _HAS_OPENPYXL:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if len(rows) < 2:
+            return [], []
+        headers = [str(c) if c is not None else "" for c in rows[1]]
+        data = [
+            [str(c) if c is not None else "" for c in r]
+            for r in rows[2:]
+            if any(c is not None for c in r)
+        ]
+        return headers, data
+    return _read_file_rows(path)
+
+
+class _RahnTechImportDialog(ImportDialog):
+    """ImportDialog that uses the RahnTech-specific row reader (skips title row)."""
+
+    def _on_file(self, path: str) -> None:
+        self._stats_lbl.setText("Reading file…")
+        try:
+            headers, rows = _read_rahntech_rows(path)
+        except Exception as exc:
+            self._stats_lbl.setText(f"Error reading file: {exc}")
+            return
+
+        self._raw_headers = headers
+        hdr_lower = {h.strip().lower(): i for i, h in enumerate(headers)}
+
+        def _find(candidates: List[str]) -> Optional[int]:
+            for c in candidates:
+                idx = hdr_lower.get(c.lower())
+                if idx is not None:
+                    return idx
+            return None
+
+        field_idxs: Dict[str, Optional[int]] = {
+            key: _find(cands) for key, cands in self._col_map.items()
+        }
+
+        records: List[dict] = []
+        for row in rows:
+            rec: dict = {"_raw": row, "feed_type": self._feed_type}
+            for key, idx in field_idxs.items():
+                rec[key] = str(row[idx]).strip() if (idx is not None and idx < len(row)) else ""
+            records.append(rec)
+
+        self._all_rows = records
+        dedup_vals = [r.get(self._dedup_key, "") for r in records if r.get(self._dedup_key)]
+        asyncio.ensure_future(self._check_dupes(records, dedup_vals))
+
+
+class RahnTechWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._page = 1
+        self._page_size = 25
+        self._total = 0
+        self._search = ""
+        self._build()
+        self.refresh()
+
+    def _build(self) -> None:
+        self.setStyleSheet(f"background:{_BG};")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(20, 20, 20, 16)
+        vl.setSpacing(12)
+
+        header = _PageHeader("RahnTech", "mdi.devices")
+        self._import_btn = _btn("Import Transacted Devices", "mdi.upload-outline")
+        self._import_btn.clicked.connect(self._open_import)
+        header.add_right(self._import_btn)
+        vl.addWidget(header)
+        vl.addWidget(_hsep())
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search truck, driver, trip, device…")
+        self._search_edit.setFixedWidth(280)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+        tbl.addStretch()
+
+        export_btn = _btn("Export", "mdi.download-outline", primary=False)
+        tbl.addWidget(export_btn)
+        vl.addWidget(tb)
+
+        self._table = _make_table(_RAHNTECH_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        vl.addWidget(self._table, 1)
+
+        self._totals = _TotalsBar([("count", "Records: ")])
+        vl.addWidget(self._totals)
+
+        self._pager = _PaginationBar()
+        self._pager.page_changed.connect(self._go_page)
+        self._pager.size_changed.connect(self._on_page_size)
+        vl.addWidget(self._pager)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        skip = (self._page - 1) * self._page_size
+        recs, total = await asyncio.gather(
+            svc.get_imported_feed("rahntech", self._search, "", self._page_size, skip),
+            svc.count_imported_feed("rahntech", self._search, ""),
+        )
+        self._fill_table(recs)
+        self._total = total
+        self._pager.set_total(total, self._page_size, self._page)
+        self._totals.set_total("count", total, "")
+
+    def _fill_table(self, recs: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        for rec in recs:
+            r = t.rowCount()
+            t.insertRow(r)
+            t.setItem(r, 0, _cell(rec.get("sn", "")))
+            t.setItem(r, 1, _cell(rec.get("sales_date", "")))
+            t.setItem(r, 2, _cell(rec.get("trip_number", ""), mono=True))
+            t.setItem(r, 3, _cell(rec.get("device_number", ""), mono=True))
+            t.setItem(r, 4, _cell(rec.get("truck_number", "")))
+            t.setItem(r, 5, _cell(rec.get("driver_name", "")))
+            t.setItem(r, 6, _cell(rec.get("do_number", "")))
+
+    def _open_import(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        dlg = _RahnTechImportDialog(
+            feed_type="rahntech",
+            dedup_key="trip_number",
+            preview_headers=_RAHNTECH_HEADERS,
+            col_map=_RAHNTECH_COL_MAP,
+            save_fn=svc.save_imported_feed,
+            exist_fn=svc.get_existing_feed_keys,
+            parent=self,
+        )
+        dlg.imported.connect(lambda n: (
+            QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records."),
+            self.refresh(),
+        ))
+        dlg.exec()
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._page = 1
+        asyncio.ensure_future(self._load())
+
+    def _go_page(self, page: int) -> None:
+        self._page = page
+        asyncio.ensure_future(self._load())
+
+    def _on_page_size(self, size: int) -> None:
+        self._page_size = size
+        self._page = 1
+        asyncio.ensure_future(self._load())
