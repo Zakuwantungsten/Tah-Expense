@@ -551,7 +551,7 @@ class ImportDialog(QDialog):
 
         records: List[dict] = []
         for row in rows:
-            rec: dict = {"_raw": row}
+            rec: dict = {"_raw": row, "feed_type": self._feed_type}
             for key, idx in field_idxs.items():
                 rec[key] = row[idx].strip() if (idx is not None and idx < len(row)) else ""
             records.append(rec)

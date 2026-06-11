@@ -498,12 +498,13 @@ async def get_existing_feed_keys(keys: List[str]) -> set:
             {"receipt_no": {"$in": keys}},
             {"serial":     {"$in": keys}},
             {"ticket_no":  {"$in": keys}},
+            {"lpo_no":     {"$in": keys}},
         ]},
-        {"receipt_no": 1, "serial": 1, "ticket_no": 1},
+        {"receipt_no": 1, "serial": 1, "ticket_no": 1, "lpo_no": 1},
     ).to_list(length=None)
     found: set = set()
     for doc in docs:
-        for field in ("receipt_no", "serial", "ticket_no"):
+        for field in ("receipt_no", "serial", "ticket_no", "lpo_no"):
             v = doc.get(field)
             if v:
                 found.add(v)
@@ -524,6 +525,65 @@ async def save_imported_feed(records: list) -> int:
         docs.append(doc)
     result = await db.imported_feeds.insert_many(docs, ordered=False)
     return len(result.inserted_ids)
+
+
+# ── Diesel fuel feeds (infinity / lake_zambia / lake_tunduma / gbp) ──────────
+
+async def get_diesel_feed(
+    feed_type: str,
+    search: str = "",
+    truck: str = "",
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    db = get_db()
+    query: dict = {"feed_type": feed_type}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"truck_no":     {"$regex": s, "$options": "i"}},
+            {"lpo_no":       {"$regex": s, "$options": "i"}},
+            {"clients_name": {"$regex": s, "$options": "i"}},
+            {"destinations": {"$regex": s, "$options": "i"}},
+            {"do_sdo_no":    {"$regex": s, "$options": "i"}},
+        ]
+    if truck.strip():
+        query["truck_no"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
+    cursor = db.imported_feeds.find(query).sort("import_date", -1).skip(skip).limit(limit)
+    return await cursor.to_list(length=limit)
+
+
+async def count_diesel_feed(feed_type: str, search: str = "", truck: str = "") -> int:
+    db = get_db()
+    query: dict = {"feed_type": feed_type}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"truck_no":     {"$regex": s, "$options": "i"}},
+            {"lpo_no":       {"$regex": s, "$options": "i"}},
+            {"clients_name": {"$regex": s, "$options": "i"}},
+            {"destinations": {"$regex": s, "$options": "i"}},
+        ]
+    if truck.strip():
+        query["truck_no"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
+    return await db.imported_feeds.count_documents(query)
+
+
+async def get_diesel_totals(feed_type: str) -> dict:
+    db = get_db()
+    pipeline = [
+        {"$match": {"feed_type": feed_type}},
+        {"$group": {
+            "_id":          None,
+            "ltrs":         {"$sum": {"$toDouble": {"$ifNull": ["$ltrs", 0]}}},
+            "total_amount": {"$sum": {"$toDouble": {"$ifNull": ["$total_amount", 0]}}},
+            "lake_usd":     {"$sum": {"$toDouble": {"$ifNull": ["$lake_usd", 0]}}},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        return result[0]
+    return {"ltrs": 0.0, "total_amount": 0.0, "lake_usd": 0.0}
 
 
 # ── Separate expenses (congo_expenses / harrison / ahmed_kimvi) ───────────────

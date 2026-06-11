@@ -28,6 +28,9 @@ from tahmeed.ui.accountant.separate_expenses import (
 )
 from tahmeed.ui.accountant.category_tables import CategoryTableWidget, CATEGORY_DEFS
 from tahmeed.ui.accountant.reconciliation import RPAScheduleWidget, BondsWidget
+from tahmeed.ui.accountant.fuel_consumption import (
+    InfinityWidget, LakeZambiaWidget, LakeTundumaWidget, GBPDieselWidget,
+)
 
 _APP_BG = "#F4F6F8"
 
@@ -123,6 +126,19 @@ class AccountantDashboard(QWidget):
 
         self._stack.addWidget(_PlaceholderPage())      # index 12 — other sections
 
+        # ── Fuel Consumption ──────────────────────────────────────────────────
+        self._infinity      = InfinityWidget()
+        self._stack.addWidget(self._infinity)           # index 13
+
+        self._lake_zambia   = LakeZambiaWidget()
+        self._stack.addWidget(self._lake_zambia)        # index 14
+
+        self._lake_tunduma  = LakeTundumaWidget()
+        self._stack.addWidget(self._lake_tunduma)       # index 15
+
+        self._gbp_diesel    = GBPDieselWidget()
+        self._stack.addWidget(self._gbp_diesel)         # index 16
+
         # Category tables (one per CATEGORIES sidebar key) and user-created
         # sub-tables are created lazily and cached here as key -> stack index.
         self._category_indices: dict[str, int] = {}
@@ -159,6 +175,10 @@ class AccountantDashboard(QWidget):
             "afritrack":      (9,  self._afritrack),
             "third_party":    (10, self._third_party),
             "comesa":         (11, self._comesa),
+            "infinity":       (13, self._infinity),
+            "lake_zambia":    (14, self._lake_zambia),
+            "lake_tunduma":   (15, self._lake_tunduma),
+            "gbp_diesel":     (16, self._gbp_diesel),
         }
         if key in _routes:
             idx, widget = _routes[key]
