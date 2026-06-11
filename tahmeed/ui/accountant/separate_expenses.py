@@ -2040,7 +2040,10 @@ def _read_afritrack_file(path: str) -> Tuple[List[List[str]], float, float, floa
 def _export_afritrack_xlsx(
     path: str,
     grid: "_AfritrackGrid",
-    footer: "_AfritrackFooter",
+    inst_t: float,
+    inst_i: float,
+    bal_mar: float,
+    vat_rate: float,
     period: str,
 ) -> None:
     if not _HAS_OPENPYXL:
@@ -2110,10 +2113,8 @@ def _export_afritrack_xlsx(
                 cell.font = nrm_font
 
     # footer rows
-    fd   = footer.get_export_data()
     st_t, st_i, _ = grid.get_col_totals()
-    it   = fd["inst_t"];  ii  = fd["inst_i"]
-    bm   = fd["bal_mar"]; vr  = fd["vat_rate"]
+    it = inst_t; ii = inst_i; bm = bal_mar; vr = vat_rate
     s2t  = st_t + it;     s2i = st_i + ii
     vat_t = s2t * vr / 100; vat_i = s2i * vr / 100
     s3t  = s2t + vat_t;   s3i = s2i + vat_i
@@ -2182,6 +2183,7 @@ class _AfritrackGrid(QTableWidget):
         )
         self.setAlternatingRowColors(True)
         self.verticalHeader().setVisible(False)
+        self.verticalHeader().setMinimumSectionSize(18)
         self.verticalHeader().setDefaultSectionSize(22)
         self.setShowGrid(True)
         self.setSortingEnabled(False)
@@ -2844,13 +2846,7 @@ class AfritrackWidget(QWidget):
 
         self._grid = _AfritrackGrid()
         self._grid.data_changed.connect(self._on_data_changed)
-        self._grid.horizontalHeader().sectionResized.connect(
-            lambda *_: self._footer.sync_columns(self._grid)
-        )
         cl.addWidget(self._grid, 1)
-
-        self._footer = _AfritrackFooter()
-        cl.addWidget(self._footer)
         vl.addWidget(card, 1)
 
         # ── status bar ────────────────────────────────────────────────────────
@@ -2860,13 +2856,15 @@ class AfritrackWidget(QWidget):
         )
         vl.addWidget(self._status)
 
+        self._grid.add_row()
         self._on_data_changed()
 
     def _build_bill_card(self) -> QFrame:
         """
         QuickBooks Bill-style form card.
-        Left column  : SUPPLIER (read-only) · PERIOD · VAT %
-        Right section: INST. FEES (T/I) · BALANCE MAR · live AMOUNT DUE · TOTAL PAYABLE
+        Left  : SUPPLIER · [PERIOD | VAT%]
+        Right : row 0 — INST. FEES TAHMEED | INST. FEES INVOICE
+                row 1 — BAL MAR | LESS WHT | TOTAL INVOICE | AMOUNT DUE | TOTAL PAYABLE
         """
         card = QFrame()
         card.setObjectName("af_bill_card")
@@ -2907,7 +2905,6 @@ class AfritrackWidget(QWidget):
         ll.setContentsMargins(0, 0, 24, 0)
         ll.setSpacing(10)
 
-        # SUPPLIER (read-only display field, like QB's supplier badge)
         supp_lbl = QLineEdit("AFRITRACK")
         supp_lbl.setReadOnly(True)
         supp_lbl.setFixedWidth(180)
@@ -2919,9 +2916,14 @@ class AfritrackWidget(QWidget):
         )
         ll.addWidget(_qb_field_widget("SUPPLIER", supp_lbl))
 
-        # PERIOD
+        # PERIOD + VAT% on the same row
+        pv_row = QWidget(); pv_row.setStyleSheet("background:transparent;")
+        pvl = QHBoxLayout(pv_row)
+        pvl.setContentsMargins(0, 0, 0, 0)
+        pvl.setSpacing(14)
+
         self._period_cb = QComboBox()
-        self._period_cb.setFixedWidth(140)
+        self._period_cb.setFixedWidth(130)
         self._period_cb.setStyleSheet(_input_ss())
         _months = ["Jan","Feb","Mar","Apr","May","Jun",
                    "Jul","Aug","Sep","Oct","Nov","Dec"]
@@ -2930,15 +2932,16 @@ class AfritrackWidget(QWidget):
                 self._period_cb.addItem(f"{mo} {yr}")
         self._period_cb.setCurrentText("Apr 2026")
         self._period_cb.currentTextChanged.connect(self._on_period)
-        ll.addWidget(_qb_field_widget("PERIOD", self._period_cb))
+        pvl.addWidget(_qb_field_widget("PERIOD", self._period_cb))
 
-        # VAT %
         self._vat_edit = QLineEdit("15")
-        self._vat_edit.setFixedWidth(70)
+        self._vat_edit.setFixedWidth(60)
         self._vat_edit.setStyleSheet(_input_ss())
         self._vat_edit.textChanged.connect(self._on_params)
-        ll.addWidget(_qb_field_widget("VAT %", self._vat_edit))
+        pvl.addWidget(_qb_field_widget("VAT %", self._vat_edit))
+        pvl.addStretch()
 
+        ll.addWidget(pv_row)
         ll.addStretch()
         fl.addWidget(left)
 
@@ -2952,39 +2955,53 @@ class AfritrackWidget(QWidget):
         # ── RIGHT ─────────────────────────────────────────────────────────────
         right = QWidget()
         right.setStyleSheet("background:transparent;")
-        rl = QGridLayout(right)
+        rl = QVBoxLayout(right)
         rl.setContentsMargins(24, 0, 0, 0)
-        rl.setHorizontalSpacing(20)
-        rl.setVerticalSpacing(10)
-        rl.setColumnStretch(0, 1)
-        rl.setColumnStretch(1, 1)
+        rl.setSpacing(10)
 
         # row 0: installation fees
+        inst_row = QWidget(); inst_row.setStyleSheet("background:transparent;")
+        il = QHBoxLayout(inst_row)
+        il.setContentsMargins(0, 0, 0, 0)
+        il.setSpacing(20)
+
         self._inst_t = QLineEdit("0")
         self._inst_t.setStyleSheet(_input_ss())
         self._inst_t.textChanged.connect(self._on_params)
-        rl.addWidget(_qb_field_widget("INST. FEES — TAHMEED", self._inst_t), 0, 0)
+        il.addWidget(_qb_field_widget("INST. FEES — TAHMEED", self._inst_t))
 
         self._inst_i = QLineEdit("0")
         self._inst_i.setStyleSheet(_input_ss())
         self._inst_i.textChanged.connect(self._on_params)
-        rl.addWidget(_qb_field_widget("INST. FEES — INVOICE", self._inst_i), 0, 1)
+        il.addWidget(_qb_field_widget("INST. FEES — INVOICE", self._inst_i))
+        il.addStretch()
+        rl.addWidget(inst_row)
 
-        # row 1: balance mar
+        # row 1: BAL MAR | LESS WHT | TOTAL INVOICE | AMOUNT DUE | TOTAL PAYABLE
+        totals_row = QWidget(); totals_row.setStyleSheet("background:transparent;")
+        tl = QHBoxLayout(totals_row)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(20)
+
         self._bal_mar = QLineEdit("0")
-        self._bal_mar.setFixedWidth(140)
+        self._bal_mar.setFixedWidth(110)
         self._bal_mar.setStyleSheet(_input_ss())
         self._bal_mar.textChanged.connect(self._on_params)
-        rl.addWidget(_qb_field_widget("BALANCE MAR (WHT)", self._bal_mar), 1, 0)
+        tl.addWidget(_qb_field_widget("BALANCE MAR (WHT)", self._bal_mar))
 
-        # row 2: AMOUNT DUE + TOTAL PAYABLE (live computed, QB-style)
+        less_wht_w, self._less_wht_val = _qb_amount_widget("LESS WHT", "USD", red=False)
+        tl.addWidget(less_wht_w)
+
+        total_inv_w, self._total_inv_val = _qb_amount_widget("TOTAL INVOICE", "USD", red=False)
+        tl.addWidget(total_inv_w)
+
         amt_w, self._amount_due_val = _qb_amount_widget("AMOUNT DUE", "USD", red=False)
-        rl.addWidget(amt_w, 2, 0)
+        tl.addWidget(amt_w)
 
-        tot_w, self._total_pay_val = _qb_amount_widget(
-            "TOTAL PAYABLE", "USD", red=True
-        )
-        rl.addWidget(tot_w, 2, 1)
+        tot_w, self._total_pay_val = _qb_amount_widget("TOTAL PAYABLE", "USD", red=True)
+        tl.addWidget(tot_w)
+        tl.addStretch()
+        rl.addWidget(totals_row)
 
         fl.addWidget(right, 1)
         root.addWidget(body)
@@ -3008,17 +3025,23 @@ class AfritrackWidget(QWidget):
         except Exception:
             it = ii = bm = 0.0; vr = 15.0
 
-        self._footer.set_params(it, ii, bm, vr)
-        self._footer.refresh(self._grid, self._period)
-        self._footer.sync_columns(self._grid)
-
         # ── live bill-card totals ──────────────────────────────────────────────
         tt, ti, _ = self._grid.get_col_totals()
-        s2t  = tt + it
+        # Tahmeed side
+        s2t   = tt + it
         vat_t = s2t * vr / 100
-        s3t  = s2t + vat_t
-        pay_t = s3t * 0.95          # after WHT @5%
+        s3t   = s2t + vat_t
+        wht_t = s3t * 0.05
+        pay_t = s3t - wht_t
         total = pay_t + bm
+        # Invoice side (for TOTAL INVOICE display)
+        s2i   = ti + ii
+        vat_i = s2i * vr / 100
+        s3i   = s2i + vat_i
+        pay_i = s3i * 0.95
+
+        self._less_wht_val.setText(f"{wht_t:,.2f}")
+        self._total_inv_val.setText(f"{pay_i:,.2f}")
         self._amount_due_val.setText(f"{pay_t:,.2f}")
         self._total_pay_val.setText(f"{total:,.2f}")
 
@@ -3070,7 +3093,11 @@ class AfritrackWidget(QWidget):
         if not path:
             return
         try:
-            _export_afritrack_xlsx(path, self._grid, self._footer, self._period)
+            it = _af_flt(self._inst_t.text())
+            ii = _af_flt(self._inst_i.text())
+            bm = _af_flt(self._bal_mar.text())
+            vr = float(self._vat_edit.text() or "15")
+            _export_afritrack_xlsx(path, self._grid, it, ii, bm, vr, self._period)
             QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", str(exc))
