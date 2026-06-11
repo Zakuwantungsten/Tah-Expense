@@ -37,17 +37,17 @@ QPushButton:pressed { background: #e5e7eb; }
 
 _PRIMARY_BTN = """
 QPushButton {
-    background: #2563eb;
-    border: 1px solid #1d4ed8;
+    background: #E85D04;
+    border: 1px solid #F48C06;
     border-radius: 5px;
     padding: 5px 18px;
     color: #ffffff;
     font-size: 12px;
     font-weight: 600;
 }
-QPushButton:hover   { background: #1d4ed8; }
-QPushButton:pressed { background: #1e40af; }
-QPushButton:disabled { background: #93c5fd; border-color: #93c5fd; }
+QPushButton:hover   { background: #F48C06; }
+QPushButton:pressed { background: #DC2F02; }
+QPushButton:disabled { background: #fdba74; border-color: #fdba74; }
 """
 
 
@@ -83,7 +83,7 @@ class TransactionBrowser(QDialog):
         header = QWidget()
         header.setFixedHeight(48)
         header.setStyleSheet(
-            "background: #1e3a5f; border-bottom: 1px solid #1e3a5f;"
+            "background: #1c1917; border-bottom: 1px solid #1c1917;"
         )
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 0, 16, 0)
@@ -199,7 +199,7 @@ class TransactionBrowser(QDialog):
                 background: #ffffff;
                 gridline-color: #e5e7eb;
                 border: none;
-                selection-background-color: #dbeafe;
+                selection-background-color: #fff3e8;
                 selection-color: #111827;
             }
             QHeaderView::section {

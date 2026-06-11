@@ -26,6 +26,9 @@ class Transaction:
     verified: bool = False
     verified_by: Optional[ObjectId] = None
     verified_at: Optional[datetime] = None
+    rejection_reason: Optional[str] = None
+    month: Optional[str] = None   # e.g. "Jan 25"
+    year: Optional[int] = None    # e.g. 2025
     created_at: datetime = field(default_factory=datetime.utcnow)
     _id: Optional[ObjectId] = None
 
@@ -51,6 +54,9 @@ class Transaction:
             "verified": self.verified,
             "verified_by": self.verified_by,
             "verified_at": self.verified_at,
+            "rejection_reason": self.rejection_reason,
+            "month": self.month,
+            "year": self.year,
             "created_at": self.created_at,
         }
         if self._id:
@@ -81,5 +87,8 @@ class Transaction:
             verified=doc.get("verified", False),
             verified_by=doc.get("verified_by"),
             verified_at=doc.get("verified_at"),
+            rejection_reason=doc.get("rejection_reason"),
+            month=doc.get("month"),
+            year=doc.get("year"),
             created_at=doc.get("created_at", datetime.utcnow()),
         )

@@ -1,45 +1,99 @@
 import asyncio
+import os
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QLineEdit,
-    QPushButton, QStackedWidget,
+    QPushButton, QStackedWidget, QApplication,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QPalette, QPixmap
 
 from tahmeed.services.auth import authenticate, any_user_exists, create_user
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(os.path.dirname(_HERE))
+_LOGO_LIGHT = os.path.join(_ROOT, "logo.png")
+_LOGO_DARK = os.path.join(_ROOT, "ChatGPT_Image_Jun_10__2026__09_07_13_AM-removebg-preview.png")
+
+_BTN_STYLE = """
+    QPushButton {
+        background-color: #E85D04;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-size: 14px;
+        font-weight: bold;
+    }
+    QPushButton:hover { background-color: #F48C06; }
+    QPushButton:pressed { background-color: #DC2F02; }
+    QPushButton:disabled { background-color: #888; color: #ccc; }
+"""
+
+
+def _is_dark() -> bool:
+    app = QApplication.instance()
+    return app is not None and app.palette().color(QPalette.Window).lightness() < 128
+
+
+def _logo_pixmap(width: int = 200) -> QPixmap:
+    path = _LOGO_DARK if _is_dark() else _LOGO_LIGHT
+    pix = QPixmap(path)
+    return pix.scaledToWidth(width, Qt.SmoothTransformation) if not pix.isNull() else pix
+
+
+def _title_html(text: str, size_pt: int) -> str:
+    """Returns HTML for the title with the trailing 's' in brand orange."""
+    base = text[:-1]
+    s = text[-1]
+    style = f"font-size:{size_pt}pt; font-weight:700; font-family:'Segoe UI';"
+    return (
+        f'<span style="{style}">{base}</span>'
+        f'<span style="{style} color:#E85D04;">{s}</span>'
+    )
+
 
 class LoginWindow(QWidget):
-    login_successful = Signal(object)   # emits User on success
+    login_successful = Signal(object)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Tahmeed Expense")
-        self.setFixedSize(420, 380)
+        self.setWindowTitle("Tahmeed Expenses")
+        self.setFixedSize(460, 520)
         self._build_ui()
-
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-
         self._stack = QStackedWidget()
-        self._stack.addWidget(self._build_login_page())   # index 0
-        self._stack.addWidget(self._build_setup_page())   # index 1
+        self._stack.addWidget(self._build_login_page())
+        self._stack.addWidget(self._build_setup_page())
         root.addWidget(self._stack)
+
+    def _page_bg_style(self, name: str) -> str:
+        if _is_dark():
+            return ""
+        return f"#{name} {{ background-color: #ffffff; }}"
 
     def _build_login_page(self) -> QWidget:
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(52, 52, 52, 52)
-        layout.setSpacing(14)
+        page.setObjectName("loginPage")
+        style = self._page_bg_style("loginPage")
+        if style:
+            page.setStyleSheet(style)
 
-        title = QLabel("Tahmeed Expense")
-        title.setFont(QFont("Segoe UI", 20, QFont.Bold))
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(60, 36, 60, 36)
+        layout.setSpacing(10)
+
+        logo = QLabel()
+        logo.setAlignment(Qt.AlignCenter)
+        pix = _logo_pixmap(200)
+        if not pix.isNull():
+            logo.setPixmap(pix)
+        layout.addWidget(logo)
+        layout.addSpacing(8)
+
+        title = QLabel(_title_html("Tahmeed Expenses", 20))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
@@ -47,17 +101,17 @@ class LoginWindow(QWidget):
         sub.setAlignment(Qt.AlignCenter)
         sub.setStyleSheet("color: #888; font-size: 13px;")
         layout.addWidget(sub)
-        layout.addSpacing(8)
+        layout.addSpacing(14)
 
         self._username = QLineEdit()
         self._username.setPlaceholderText("Username")
-        self._username.setFixedHeight(38)
+        self._username.setFixedHeight(40)
         layout.addWidget(self._username)
 
         self._password = QLineEdit()
         self._password.setPlaceholderText("Password")
         self._password.setEchoMode(QLineEdit.Password)
-        self._password.setFixedHeight(38)
+        self._password.setFixedHeight(40)
         self._password.returnPressed.connect(self._on_login)
         layout.addWidget(self._password)
 
@@ -68,7 +122,9 @@ class LoginWindow(QWidget):
         layout.addWidget(self._login_error)
 
         self._login_btn = QPushButton("Sign In")
-        self._login_btn.setFixedHeight(38)
+        self._login_btn.setFixedHeight(42)
+        self._login_btn.setCursor(Qt.PointingHandCursor)
+        self._login_btn.setStyleSheet(_BTN_STYLE)
         self._login_btn.clicked.connect(self._on_login)
         layout.addWidget(self._login_btn)
 
@@ -76,14 +132,25 @@ class LoginWindow(QWidget):
         return page
 
     def _build_setup_page(self) -> QWidget:
-        """Shown only on first run — creates the admin account."""
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(52, 40, 52, 40)
-        layout.setSpacing(12)
+        page.setObjectName("setupPage")
+        style = self._page_bg_style("setupPage")
+        if style:
+            page.setStyleSheet(style)
 
-        title = QLabel("Welcome to Tahmeed Expense")
-        title.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(60, 24, 60, 24)
+        layout.setSpacing(10)
+
+        logo = QLabel()
+        logo.setAlignment(Qt.AlignCenter)
+        pix = _logo_pixmap(160)
+        if not pix.isNull():
+            logo.setPixmap(pix)
+        layout.addWidget(logo)
+        layout.addSpacing(4)
+
+        title = QLabel(_title_html("Tahmeed Expenses", 16))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
@@ -92,7 +159,7 @@ class LoginWindow(QWidget):
         sub.setStyleSheet("color: #888; font-size: 13px;")
         sub.setWordWrap(True)
         layout.addWidget(sub)
-        layout.addSpacing(4)
+        layout.addSpacing(6)
 
         self._setup_fullname = QLineEdit()
         self._setup_fullname.setPlaceholderText("Full Name")
@@ -123,7 +190,9 @@ class LoginWindow(QWidget):
         layout.addWidget(self._setup_error)
 
         self._setup_btn = QPushButton("Create Admin Account")
-        self._setup_btn.setFixedHeight(38)
+        self._setup_btn.setFixedHeight(40)
+        self._setup_btn.setCursor(Qt.PointingHandCursor)
+        self._setup_btn.setStyleSheet(_BTN_STYLE)
         self._setup_btn.clicked.connect(self._on_setup)
         layout.addWidget(self._setup_btn)
 

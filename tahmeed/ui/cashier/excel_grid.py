@@ -76,7 +76,7 @@ _DATA_SKIP_COLS  = READONLY_COLS | {COL_NOTES, COL_RECEIPT}
 DEFAULT_EDITABLE_ROWS = 20
 
 # Colors
-SAVED_BG  = QColor("#eff6ff")
+SAVED_BG  = QColor("#fff8f0")
 NEW_BG    = QColor("#ffffff")
 EMPTY_BG  = QColor("#fafafa")
 NEG_COLOR = QColor("#dc2626")
@@ -162,8 +162,8 @@ class _DateDelegate(QStyledItemDelegate):
             cur = self._get_current_date()
             suggestion = QDate(cur.year, cur.month, cur.day).toString("dd/MM/yyyy")
             painter.save()
-            painter.fillRect(option.rect, QColor("#dbeafe"))
-            painter.setPen(QColor("#2563eb"))
+            painter.fillRect(option.rect, QColor("#fff3e8"))
+            painter.setPen(QColor("#E85D04"))
             painter.drawText(
                 option.rect.adjusted(6, 0, -22, 0),
                 Qt.AlignVCenter | Qt.AlignLeft,
@@ -223,8 +223,8 @@ class _CheckDelegate(QStyledItemDelegate):
         box = QRect(cx, cy, size, size)
         painter.save()
         if checked:
-            painter.fillRect(box, QColor("#2563eb"))
-            painter.setPen(QPen(QColor("#1e40af"), 1))
+            painter.fillRect(box, QColor("#E85D04"))
+            painter.setPen(QPen(QColor("#DC2F02"), 1))
             painter.drawRect(box)
             painter.setPen(QPen(QColor("#ffffff"), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.drawLine(cx + 2, cy + 7, cx + 5, cy + 10)
@@ -354,7 +354,7 @@ class DailyRegister(QWidget):
                 background: #ffffff;
                 gridline-color: #e5e7eb;
                 border: none;
-                selection-background-color: #dbeafe;
+                selection-background-color: #fff3e8;
                 selection-color: #111827;
             }
             QHeaderView::section {

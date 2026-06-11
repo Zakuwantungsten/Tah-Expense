@@ -45,7 +45,7 @@ QLineEdit, QDateEdit, QComboBox, QDoubleSpinBox {
     max-height: 34px;
 }
 QLineEdit:focus, QDateEdit:focus, QComboBox:focus, QDoubleSpinBox:focus {
-    border-color: #2563eb;
+    border-color: #E85D04;
 }
 QComboBox::drop-down  { border: none; width: 24px; }
 QComboBox::down-arrow { width: 10px; height: 10px; }
@@ -63,18 +63,18 @@ QPushButton:pressed { background:#e5e7eb; }
 
 _BTN_PRIMARY = """
 QPushButton {
-    background:#2563eb; border:1px solid #1d4ed8; border-radius:6px;
+    background:#E85D04; border:1px solid #F48C06; border-radius:6px;
     padding:6px 20px; color:#ffffff; font-size:13px; font-weight:600;
 }
-QPushButton:hover    { background:#1d4ed8; }
-QPushButton:pressed  { background:#1e40af; }
-QPushButton:disabled { background:#93c5fd; border-color:#93c5fd; }
+QPushButton:hover    { background:#F48C06; }
+QPushButton:pressed  { background:#DC2F02; }
+QPushButton:disabled { background:#fdba74; border-color:#fdba74; }
 """
 
 _TABLE_STYLE = """
 QTableWidget {
     background:#ffffff; gridline-color:#e5e7eb; border:none;
-    selection-background-color:#dbeafe; selection-color:#111827;
+    selection-background-color:#fff3e8; selection-color:#111827;
 }
 QHeaderView::section {
     background:#f1f5f9; color:#334155; font-weight:600; font-size:11px;
@@ -95,7 +95,7 @@ _HEADERS = [
     "Memo", "Ref_Float", "TZS", "Receipt", "APR BY",
 ]
 
-_SAVED_BG = QColor("#eff6ff")
+_SAVED_BG = QColor("#fff8f0")
 _SNO_BG   = QColor("#f1f5f9")
 _NEG_COL  = QColor("#dc2626")
 
@@ -502,7 +502,7 @@ class EntryForm(QWidget):
 
             notes_it = _it("✓" if tx.notes_flag else "", Qt.AlignCenter)
             if tx.notes_flag:
-                notes_it.setForeground(QColor("#2563eb"))
+                notes_it.setForeground(QColor("#E85D04"))
             self._day_table.setItem(row, _NOTES, notes_it)
 
             tzs_str = f"{tx.amount:,.2f}" if tx.amount else ""

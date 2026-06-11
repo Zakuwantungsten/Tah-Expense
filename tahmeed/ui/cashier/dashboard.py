@@ -2,9 +2,9 @@
 CashierDashboard — Dark professional toolbar (FuelFlow branded).
 
 Layout:
-  ┌─ Toolbar (52 px, dark teal #0e2e2b) ─────────────────────────────────────┐
-  │  ● FuelFlow                │ [Table][Form] │ [New][Save][Del][Import]     │
-  │    Orders & Deliveries     │               │ [Browse]          Name/Role  │
+  ┌─ Toolbar (52 px, warm dark #1c1917) ─────────────────────────────────────┐
+  │  ● Tahmeed                 │ [Table][Form] │ [New][Save][Del][Import]     │
+  │    Expense Manager         │               │ [Browse]          Name/Role  │
   ├─ Stacked entry area ──────────────────────────────────────────────────────┤
   │  [0] DailyRegister  ← date-nav in footer                                  │
   │  [1] EntryForm                                                             │
@@ -53,7 +53,7 @@ _SVGS: dict = {
     ),
     "new": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#4ade80" stroke-width="2" stroke-linecap="round">'
+        b' stroke="#E85D04" stroke-width="2" stroke-linecap="round">'
         b'<circle cx="12" cy="12" r="9"/>'
         b'<line x1="12" y1="8" x2="12" y2="16"/>'
         b'<line x1="8" y1="12" x2="16" y2="12"/>'
@@ -93,7 +93,7 @@ _SVGS: dict = {
     ),
     "fuel": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+        b' stroke="#E85D04" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
         b'<path d="M5 22V8a2 2 0 012-2h6a2 2 0 012 2v14"/>'
         b'<path d="M5 13h10"/>'
         b'<path d="M17 8l2-2 1 1v5a1 1 0 002 0V9l-3-4"/>'
@@ -118,7 +118,7 @@ _SVGS: dict = {
     ),
     "user": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#4ade80" stroke-width="1.8" stroke-linecap="round">'
+        b' stroke="#E85D04" stroke-width="1.8" stroke-linecap="round">'
         b'<circle cx="12" cy="8" r="4"/>'
         b'<path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/>'
         b'</svg>'
@@ -187,7 +187,7 @@ class CashierDashboard(QWidget):
         # ── Toolbar ────────────────────────────────────────────────────
         toolbar = QWidget()
         toolbar.setFixedHeight(52)
-        toolbar.setStyleSheet("background: #0e2e2b;")
+        toolbar.setStyleSheet("background: #1c1917;")
         tl = QHBoxLayout(toolbar)
         tl.setContentsMargins(12, 0, 12, 0)
         tl.setSpacing(0)
@@ -196,7 +196,7 @@ class CashierDashboard(QWidget):
         logo_icon = QLabel()
         logo_icon.setFixedSize(32, 32)
         logo_icon.setAlignment(Qt.AlignCenter)
-        logo_icon.setStyleSheet("background: #1b4f4a; border-radius: 16px;")
+        logo_icon.setStyleSheet("background: rgba(232,93,4,0.2); border-radius: 16px;")
         logo_icon.setPixmap(_svg_icon("fuel", 18).pixmap(QSize(18, 18)))
 
         logo_text = QWidget()
@@ -204,13 +204,13 @@ class CashierDashboard(QWidget):
         ltl = QVBoxLayout(logo_text)
         ltl.setContentsMargins(0, 0, 0, 0)
         ltl.setSpacing(0)
-        _app_lbl = QLabel("FuelFlow")
+        _app_lbl = QLabel("Tahmeed")
         _app_lbl.setStyleSheet(
             "color: #ffffff; font-size: 13px; font-weight: 700; background: transparent;"
         )
-        _sub_lbl = QLabel("Orders & Deliveries")
+        _sub_lbl = QLabel("Expense Manager")
         _sub_lbl.setStyleSheet(
-            "color: #6ee7b7; font-size: 9px; background: transparent;"
+            "color: #F48C06; font-size: 9px; background: transparent;"
         )
         ltl.addWidget(_app_lbl)
         ltl.addWidget(_sub_lbl)
@@ -289,8 +289,8 @@ class CashierDashboard(QWidget):
         avatar.setFixedSize(32, 32)
         avatar.setAlignment(Qt.AlignCenter)
         avatar.setStyleSheet(
-            "background: #1b4f4a; border-radius: 16px;"
-            " color: #4ade80; font-size: 12px; font-weight: 700;"
+            "background: rgba(232,93,4,0.2); border-radius: 16px;"
+            " color: #E85D04; font-size: 12px; font-weight: 700;"
         )
 
         user_info = QWidget()

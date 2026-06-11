@@ -3,6 +3,7 @@ from PySide6.QtWidgets import QMainWindow, QStatusBar, QLabel
 from tahmeed.models.user import User
 from tahmeed.ui.admin.dashboard import AdminDashboard
 from tahmeed.ui.cashier.dashboard import CashierDashboard
+from tahmeed.ui.accountant.dashboard import AccountantDashboard
 
 
 class MainWindow(QMainWindow):
@@ -18,6 +19,8 @@ class MainWindow(QMainWindow):
             self.setCentralWidget(AdminDashboard(self.user))
         elif self.user.role == "cashier":
             self.setCentralWidget(CashierDashboard(self.user))
+        elif self.user.role == "accountant":
+            self.setCentralWidget(AccountantDashboard(self.user))
         else:
             placeholder = QLabel(f"{self.user.role.title()} dashboard — coming soon")
             self.setCentralWidget(placeholder)

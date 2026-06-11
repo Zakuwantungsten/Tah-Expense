@@ -38,7 +38,7 @@ _BLUE      = "#3b82f6"
 _AMBER     = "#f59e0b"
 _PURPLE    = "#a78bfa"
 _RED       = "#ef4444"
-_TEAL_DARK = "#0e2e2b"
+_TEAL_DARK = "#1c1917"
 
 # ---------------------------------------------------------------------------
 # SVG icon set
@@ -127,15 +127,15 @@ _SVGS: dict[str, bytes] = {
     ),
     "table_go": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-        b'<rect x="3" y="3" width="7" height="7" rx="1.5" fill="#4ade80"/>'
-        b'<rect x="14" y="3" width="7" height="7" rx="1.5" fill="#4ade80"/>'
-        b'<rect x="3" y="14" width="7" height="7" rx="1.5" fill="#4ade80"/>'
-        b'<rect x="14" y="14" width="7" height="7" rx="1.5" fill="#4ade80"/>'
+        b'<rect x="3" y="3" width="7" height="7" rx="1.5" fill="#E85D04"/>'
+        b'<rect x="14" y="3" width="7" height="7" rx="1.5" fill="#E85D04"/>'
+        b'<rect x="3" y="14" width="7" height="7" rx="1.5" fill="#E85D04"/>'
+        b'<rect x="14" y="14" width="7" height="7" rx="1.5" fill="#E85D04"/>'
         b'</svg>'
     ),
     "form_go": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#4ade80" stroke-width="1.8" stroke-linecap="round">'
+        b' stroke="#E85D04" stroke-width="1.8" stroke-linecap="round">'
         b'<rect x="4" y="2" width="16" height="20" rx="2"/>'
         b'<line x1="7" y1="8" x2="17" y2="8"/>'
         b'<line x1="7" y1="12" x2="17" y2="12"/>'
@@ -144,14 +144,14 @@ _SVGS: dict[str, bytes] = {
     ),
     "browse_go": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#4ade80" stroke-width="1.8" stroke-linecap="round">'
+        b' stroke="#E85D04" stroke-width="1.8" stroke-linecap="round">'
         b'<circle cx="11" cy="11" r="7"/>'
         b'<line x1="16.5" y1="16.5" x2="21" y2="21" stroke-width="2.2"/>'
         b'</svg>'
     ),
     "export_go": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#4ade80" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        b' stroke="#E85D04" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
         b'<path d="M12 3v13"/>'
         b'<polyline points="17,8 12,3 7,8"/>'
         b'<path d="M5 20h14"/>'
@@ -159,7 +159,7 @@ _SVGS: dict[str, bytes] = {
     ),
     "import_go": (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
-        b' stroke="#4ade80" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        b' stroke="#E85D04" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
         b'<path d="M12 16V3"/>'
         b'<polyline points="7,11 12,16 17,11"/>'
         b'<path d="M5 20h14"/>'
@@ -439,7 +439,7 @@ def _activity_row(tx, even: bool) -> QWidget:
 _ACTION_BTN = f"""
 QToolButton {{
     background: {_TEAL_DARK};
-    border: 1px solid #1b4f4a;
+    border: 1px solid #2d1f0a;
     border-radius: 8px;
     padding: 8px 20px;
     color: #e2e8f0;
@@ -447,8 +447,8 @@ QToolButton {{
     font-weight: 600;
     min-width: 140px;
 }}
-QToolButton:hover   {{ background: #1b4f4a; color: #ffffff; border-color: #4ade80; }}
-QToolButton:pressed {{ background: #0a1f1d; }}
+QToolButton:hover   {{ background: #2d1f0a; color: #ffffff; border-color: #E85D04; }}
+QToolButton:pressed {{ background: #0f0a04; }}
 """
 
 
@@ -679,7 +679,7 @@ class CashierOverview(QWidget):
                 background: qlineargradient(
                     x1:0, y1:0, x2:1, y2:0,
                     stop:0 {_TEAL_DARK},
-                    stop:1 #1b4f4a
+                    stop:1 #2d1f0a
                 );
                 border-radius: 12px;
             }}
@@ -695,8 +695,8 @@ class CashierOverview(QWidget):
         avatar.setFixedSize(46, 46)
         avatar.setAlignment(Qt.AlignCenter)
         avatar.setStyleSheet(
-            "background: rgba(74,222,128,0.18); border-radius: 23px;"
-            " color: #4ade80; font-size: 16px; font-weight: 700;"
+            "background: rgba(232,93,4,0.18); border-radius: 23px;"
+            " color: #E85D04; font-size: 16px; font-weight: 700;"
         )
 
         text_w = QWidget()
@@ -713,7 +713,7 @@ class CashierOverview(QWidget):
         )
         sub_lbl = QLabel("Here's your activity summary for today")
         sub_lbl.setStyleSheet(
-            "color: #6ee7b7; font-size: 11px; background: transparent;"
+            "color: #F48C06; font-size: 11px; background: transparent;"
         )
         tl.addWidget(greet_lbl)
         tl.addWidget(sub_lbl)
@@ -739,7 +739,7 @@ class CashierOverview(QWidget):
         yr_lbl = QLabel(today.strftime("%Y  ·  %A"))
         yr_lbl.setAlignment(Qt.AlignCenter)
         yr_lbl.setStyleSheet(
-            "color: #6ee7b7; font-size: 10px; background: transparent;"
+            "color: #F48C06; font-size: 10px; background: transparent;"
         )
         dbl.addWidget(day_lbl)
         dbl.addWidget(yr_lbl)
