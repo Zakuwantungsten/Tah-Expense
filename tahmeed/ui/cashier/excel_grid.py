@@ -33,7 +33,7 @@ from typing import List, Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QToolButton, QLabel,
     QTableWidget, QTableWidgetItem, QApplication,
-    QStyledItemDelegate, QMenu, QFileDialog,
+    QStyledItemDelegate, QStyleOptionViewItem, QMenu, QFileDialog,
     QMessageBox, QAbstractItemView, QHeaderView, QDateEdit,
     QStyle, QFrame, QComboBox,
 )
@@ -116,7 +116,59 @@ QToolButton:disabled { color: #9ca3af; }
 # Delegates
 # ---------------------------------------------------------------------------
 
-class _DescriptionDelegate(QStyledItemDelegate):
+class _ExcelCellDelegate(QStyledItemDelegate):
+    """
+    Base delegate implementing Excel's selection visual model:
+      - current + selected  → white background + 2 px QB-blue border
+      - selected (not current) → #cde0f5 fill
+      - normal              → item's own background (saved warm, new white)
+    All specialised delegates inherit from this.
+    """
+    _ACTIVE_PEN  = QColor("#0077C5")
+    _SELECT_FILL = QColor("#cde0f5")
+
+    def _is_current(self, index) -> bool:
+        t = self.parent()
+        return t is not None and t.currentIndex() == index
+
+    def _paint_bg(self, painter: QPainter, option, index) -> None:
+        """Fill cell background only — no border."""
+        is_sel = bool(option.state & QStyle.State_Selected)
+        is_cur = self._is_current(index)
+        if is_cur and is_sel:
+            painter.fillRect(option.rect, QColor("#ffffff"))
+        elif is_sel:
+            painter.fillRect(option.rect, self._SELECT_FILL)
+        else:
+            bg = option.backgroundBrush
+            if bg.style() != Qt.NoBrush:
+                painter.fillRect(option.rect, bg)
+            # else: table stylesheet background (#ffffff) shows through
+
+    def _draw_active_border(self, painter: QPainter, option, index) -> None:
+        """Draw the thick QB-blue border when this is the active/current cell."""
+        if self._is_current(index) and bool(option.state & QStyle.State_Selected):
+            pen = QPen(self._ACTIVE_PEN, 2)
+            pen.setJoinStyle(Qt.MiterJoin)
+            painter.save()
+            painter.setPen(pen)
+            painter.drawRect(option.rect.adjusted(1, 1, -2, -2))
+            painter.restore()
+
+    def _stripped_option(self, option) -> QStyleOptionViewItem:
+        """Copy of option with selection/focus flags removed so Qt won't repaint bg."""
+        opt = QStyleOptionViewItem(option)
+        opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
+        return opt
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        self.initStyleOption(option, index)
+        self._paint_bg(painter, option, index)
+        super().paint(painter, self._stripped_option(option), index)
+        self._draw_active_border(painter, option, index)
+
+
+class _DescriptionDelegate(_ExcelCellDelegate):
     def createEditor(self, parent, option, index):
         ed = TruckLineEdit(fetch_fn=search_descriptions, parent=parent)
         ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
@@ -132,7 +184,7 @@ class _DescriptionDelegate(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
-class _TruckDelegate(QStyledItemDelegate):
+class _TruckDelegate(_ExcelCellDelegate):
     def createEditor(self, parent, option, index):
         ed = TruckLineEdit(fetch_fn=search_trucks, parent=parent)
         ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
@@ -148,21 +200,23 @@ class _TruckDelegate(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
-class _DateDelegate(QStyledItemDelegate):
+class _DateDelegate(_ExcelCellDelegate):
     def __init__(self, get_current_date, parent=None):
         super().__init__(parent)
         self._get_current_date = get_current_date
 
     def paint(self, painter, option, index) -> None:
-        value = (index.data() or "").strip()
-        is_focused = bool(option.state & QStyle.State_Selected)
+        self.initStyleOption(option, index)
+        value  = (index.data() or "").strip()
+        is_sel = bool(option.state & QStyle.State_Selected)
 
-        if not value and is_focused:
-            # Focused empty cell — show register date as a blue highlighted suggestion
+        self._paint_bg(painter, option, index)
+
+        if not value and is_sel:
+            # Empty selected date cell — overlay suggestion text in QB blue
             cur = self._get_current_date()
             suggestion = QDate(cur.year, cur.month, cur.day).toString("dd/MM/yyyy")
             painter.save()
-            painter.fillRect(option.rect, QColor("#cde0f5"))
             painter.setPen(QColor("#0077C5"))
             painter.drawText(
                 option.rect.adjusted(6, 0, -22, 0),
@@ -171,15 +225,17 @@ class _DateDelegate(QStyledItemDelegate):
             )
             painter.restore()
         else:
-            super().paint(painter, option, index)
+            QStyledItemDelegate.paint(self, painter, self._stripped_option(option), index)
 
-        # Calendar icon — only when cell has data or is focused
-        if value or is_focused:
+        # Calendar icon — only when cell has data or is selected
+        if value or is_sel:
             sp_icon = QApplication.style().standardIcon(QStyle.SP_FileDialogDetailedView)
             pix = sp_icon.pixmap(QSize(14, 14))
             ix = option.rect.right() - 18
             iy = option.rect.top() + (option.rect.height() - 14) // 2
             painter.drawPixmap(ix, iy, pix)
+
+        self._draw_active_border(painter, option, index)
 
     def createEditor(self, parent, option, index):
         ed = QDateEdit(parent)
@@ -208,7 +264,7 @@ class _DateDelegate(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
-class _RefFloatDelegate(QStyledItemDelegate):
+class _RefFloatDelegate(_ExcelCellDelegate):
     """Blank or 'Refund to Float' orange badge; toggles via click/Space/Return."""
 
     def paint(self, painter, option, index) -> None:
@@ -216,10 +272,8 @@ class _RefFloatDelegate(QStyledItemDelegate):
         if value is None:
             return  # uninitialised blank row
 
-        if option.state & QStyle.State_Selected:
-            painter.fillRect(option.rect, QColor("#cde0f5"))
-        else:
-            painter.fillRect(option.rect, QColor("#ffffff"))
+        self.initStyleOption(option, index)
+        self._paint_bg(painter, option, index)
 
         if value is True:
             rect = option.rect.adjusted(4, 5, -4, -5)
@@ -235,6 +289,8 @@ class _RefFloatDelegate(QStyledItemDelegate):
             painter.setFont(f)
             painter.drawText(rect, Qt.AlignCenter, "Refund to Float")
             painter.restore()
+
+        self._draw_active_border(painter, option, index)
 
     def editorEvent(self, event, model, option, index) -> bool:
         if not (index.flags() & Qt.ItemIsEditable):
@@ -260,29 +316,35 @@ _RCPT_LABEL = {"received": "Received", "pending": "Pending", "missing": "Missing
 _RECEIPT_OPTS = ["Pending", "Received", "Missing"]
 
 
-class _ReceiptDelegate(QStyledItemDelegate):
+class _ReceiptDelegate(_ExcelCellDelegate):
     """Colored badge painter + QComboBox editor for the Receipt column."""
 
     def paint(self, painter, option, index) -> None:
+        self.initStyleOption(option, index)
         status = (index.data() or "").strip().lower()
-        if not status:
-            super().paint(painter, option, index)
-            return
-        label  = _RCPT_LABEL.get(status, status.capitalize())
-        bg, fg = _RCPT_COLORS.get(status, ("#f3f4f6", "#6b7280"))
-        rect   = option.rect.adjusted(4, 4, -4, -4)
-        painter.save()
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor(bg))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(rect, rect.height() // 2, rect.height() // 2)
-        painter.setPen(QColor(fg))
-        f = painter.font()
-        f.setPointSize(9)
-        f.setBold(True)
-        painter.setFont(f)
-        painter.drawText(rect, Qt.AlignCenter, label)
-        painter.restore()
+
+        self._paint_bg(painter, option, index)
+
+        if status:
+            label  = _RCPT_LABEL.get(status, status.capitalize())
+            bg, fg = _RCPT_COLORS.get(status, ("#f3f4f6", "#6b7280"))
+            rect   = option.rect.adjusted(4, 4, -4, -4)
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setBrush(QColor(bg))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(rect, rect.height() // 2, rect.height() // 2)
+            painter.setPen(QColor(fg))
+            f = painter.font()
+            f.setPointSize(9)
+            f.setBold(True)
+            painter.setFont(f)
+            painter.drawText(rect, Qt.AlignCenter, label)
+            painter.restore()
+        else:
+            QStyledItemDelegate.paint(self, painter, self._stripped_option(option), index)
+
+        self._draw_active_border(painter, option, index)
 
     def createEditor(self, parent, option, index):
         ed = QComboBox(parent)
@@ -296,6 +358,42 @@ class _ReceiptDelegate(QStyledItemDelegate):
 
     def setModelData(self, editor, model, index):
         model.setData(index, editor.currentText().lower())
+
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
+
+
+class _ItemDelegate(_ExcelCellDelegate):
+    """Dropdown of accountant-managed items for the Item column.
+
+    The list is read live via ``items_getter`` so newly-created items appear
+    without rebuilding the grid. Editable so the cashier can type-to-filter.
+    """
+
+    def __init__(self, items_getter, parent=None):
+        super().__init__(parent)
+        self._items_getter = items_getter
+
+    def createEditor(self, parent, option, index):
+        ed = QComboBox(parent)
+        ed.setEditable(True)
+        ed.setInsertPolicy(QComboBox.NoInsert)
+        ed.addItem("")
+        for name in (self._items_getter() or []):
+            ed.addItem(name)
+        ed.setStyleSheet("QComboBox { color: #111827; background: #ffffff; }")
+        return ed
+
+    def setEditorData(self, editor, index):
+        val = (index.data() or "").strip()
+        i = editor.findText(val)
+        if i >= 0:
+            editor.setCurrentIndex(i)
+        else:
+            editor.setEditText(val)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText().strip())
 
     def updateEditorGeometry(self, editor, option, index):
         editor.setGeometry(option.rect)
@@ -334,8 +432,6 @@ class DailyRegister(QWidget):
         self._current_date: date = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
-        self._ref_float_delegate = _RefFloatDelegate(self)
-        self._receipt_delegate   = _ReceiptDelegate(self)
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
 
@@ -402,11 +498,14 @@ class DailyRegister(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.setTabKeyNavigation(False)
 
+        # Excel selection model on every column; per-column delegates override as needed
+        self._table.setItemDelegate(_ExcelCellDelegate(self._table))
+        self._table.setItemDelegateForColumn(COL_ITEM,    _ItemDelegate(lambda: [c.name for c in self._categories], self._table))
         self._table.setItemDelegateForColumn(COL_DESC,    _DescriptionDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_TRUCK,   _TruckDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_DATE,    _DateDelegate(lambda: self._current_date, self._table))
-        self._table.setItemDelegateForColumn(COL_NOTES,   self._ref_float_delegate)
-        self._table.setItemDelegateForColumn(COL_RECEIPT, self._receipt_delegate)
+        self._table.setItemDelegateForColumn(COL_NOTES,   _RefFloatDelegate(self._table))
+        self._table.setItemDelegateForColumn(COL_RECEIPT, _ReceiptDelegate(self._table))
 
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1215,10 +1314,14 @@ class DailyRegister(QWidget):
                 rcpt_raw = txt(COL_RECEIPT).lower()
                 rcpt_status = rcpt_raw if rcpt_raw in ("pending", "received", "missing") else "pending"
 
+                item_name = txt(COL_ITEM)
                 tx = Transaction(
                     date=tx_date,
                     description=description,
-                    item=txt(COL_ITEM),
+                    item=item_name,
+                    # The chosen item *is* the category — keep them in sync so the
+                    # item's sidebar tab (which filters on category_name) shows it.
+                    category_name=item_name or None,
                     truck_number=txt(COL_TRUCK).upper(),
                     amount=amount,
                     currency="TZS",

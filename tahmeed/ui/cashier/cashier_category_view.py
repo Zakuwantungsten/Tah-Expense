@@ -85,12 +85,16 @@ class CashierCategoryView(QWidget):
         category_key: str,
         category_name: str,
         icon_name: str = "mdi.tag-outline",
+        description_filter: str = "",
+        title: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._user = user
-        self._name = category_name
+        self._name = category_name            # DB filter (parent item / category)
+        self._title = title or category_name  # header display text
         self._icon_name = icon_name
+        self._description_filter = description_filter
         self._rows: List[Transaction] = []
         self._build()
 
@@ -132,7 +136,7 @@ class CashierCategoryView(QWidget):
         tcl = QVBoxLayout(text_col)
         tcl.setContentsMargins(0, 0, 0, 0)
         tcl.setSpacing(1)
-        title = QLabel(self._name)
+        title = QLabel(self._title)
         title.setStyleSheet(
             f"color: {_T1}; font-size: 16px; font-weight: 700;"
             " font-family: 'Segoe UI', sans-serif; background: transparent;"
@@ -202,6 +206,7 @@ class CashierCategoryView(QWidget):
             self._rows = await get_transactions_by_category(
                 cashier_id=self._user._id,
                 category_name=self._name,
+                description=self._description_filter,
             )
         except Exception:
             self._rows = []

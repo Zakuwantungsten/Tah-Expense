@@ -27,12 +27,13 @@ from tahmeed.ui.accountant.separate_expenses import (
     ComesaWidget,
     RahnTechWidget,
 )
-from tahmeed.ui.accountant.category_tables import CategoryTableWidget, CATEGORY_DEFS
+from tahmeed.ui.accountant.category_tables import CategoryTableWidget
 from tahmeed.ui.accountant.reconciliation import RPAScheduleWidget, BondsWidget
 from tahmeed.ui.accountant.fuel_consumption import (
     InfinityWidget, LakeZambiaWidget, LakeTundumaWidget, GBPDieselWidget,
 )
 from tahmeed.ui.accountant.fleet_registry import TrucksRegistryWidget, TrailersRegistryWidget
+from tahmeed.ui.accountant.manage_items import ManageItemsWidget
 
 _APP_BG = "#F4F6F8"
 
@@ -152,7 +153,14 @@ class AccountantDashboard(QWidget):
         self._trailers_registry = TrailersRegistryWidget()
         self._stack.addWidget(self._trailers_registry)  # index 19
 
-        # Category tables (one per CATEGORIES sidebar key) and user-created
+        self._manage_items = ManageItemsWidget()
+        self._stack.addWidget(self._manage_items)        # index 20
+        # Rebuild the sidebar's dynamic ITEMS whenever the accountant changes them.
+        self._manage_items.items_changed.connect(self._sidebar.refresh_items)
+        # Live-refresh a single item's sub-item strip when its sub-items change.
+        self._manage_items.subitems_changed.connect(self._sidebar.refresh_subitems)
+
+        # Category tables (one per ITEMS sidebar key) and user-created
         # sub-tables are created lazily and cached here as key -> stack index.
         self._category_indices: dict[str, int] = {}
         self._subtable_indices: dict[str, int] = {}
@@ -195,12 +203,13 @@ class AccountantDashboard(QWidget):
             "rahntech":         (17, self._rahntech),
             "manage_trucks":    (18, self._trucks_registry),
             "manage_trailers":  (19, self._trailers_registry),
+            "manage_categories":(20, self._manage_items),
         }
         if key in _routes:
             idx, widget = _routes[key]
             self._stack.setCurrentIndex(idx)
             widget.refresh()
-        elif key in CATEGORY_DEFS:
+        elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
         elif key == "sm_burhani":
             # Parent click opens the first sub-table; children open via sidebar.
@@ -209,9 +218,13 @@ class AccountantDashboard(QWidget):
             self._stack.setCurrentIndex(12)
 
     def _show_category(self, key: str) -> None:
-        """Lazily create (and cache) the category sub-table for this sidebar key."""
+        """Lazily create (and cache) the item table for this dynamic sidebar key."""
         if key not in self._category_indices:
-            title, icon = CATEGORY_DEFS[key]
+            d = self._sidebar.item_def(key)
+            if d is None:
+                self._stack.setCurrentIndex(12)
+                return
+            title, icon = d
             widget = CategoryTableWidget(category_name=title, title=title, icon_name=icon)
             self._category_indices[key] = self._stack.addWidget(widget)
         idx = self._category_indices[key]
@@ -235,7 +248,8 @@ class AccountantDashboard(QWidget):
             return
         cache_key = f"{parent_key}::{name}"
         if cache_key not in self._subtable_indices:
-            icon = CATEGORY_DEFS.get(parent_key, ("", "mdi.tag-outline"))[1]
+            d = self._sidebar.item_def(parent_key)
+            icon = d[1] if d else "mdi.tag-outline"
             widget = CategoryTableWidget(
                 category_name=parent_category,
                 title=f"{parent_category} · {name}",

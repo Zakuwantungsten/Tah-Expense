@@ -32,7 +32,7 @@ from PySide6.QtCore import Qt
 from tahmeed.models.user import User
 from tahmeed.services.category_service import get_all_categories
 from tahmeed.ui.accountant.header_bar import HeaderBar
-from tahmeed.ui.cashier.sidebar import CashierSidebarWidget, CATEGORY_LABELS, CATEGORY_ICONS
+from tahmeed.ui.cashier.sidebar import CashierSidebarWidget
 from tahmeed.ui.cashier.excel_grid import DailyRegister
 from tahmeed.ui.cashier.entry_form import EntryForm
 from tahmeed.ui.cashier.overview import CashierOverview
@@ -300,13 +300,15 @@ class CashierDashboard(QWidget):
             self._stack.setCurrentIndex(1)
         elif key == "form":
             self._stack.setCurrentIndex(2)
-        elif key in CATEGORY_LABELS:
+        elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
 
     def _show_category(self, key: str) -> None:
         if key not in self._category_indices:
-            label = CATEGORY_LABELS[key]
-            icon = CATEGORY_ICONS.get(key, "mdi.tag-outline")
+            d = self._sidebar.item_def(key)
+            if d is None:
+                return
+            label, icon = d
             widget = CashierCategoryView(
                 user=self._user,
                 category_key=key,

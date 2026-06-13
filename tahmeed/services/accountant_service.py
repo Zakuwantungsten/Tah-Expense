@@ -246,7 +246,8 @@ async def update_transaction_category(
     category_id: Optional[ObjectId] = None,
 ) -> bool:
     db = get_db()
-    update: dict = {"category_name": category_name}
+    # Keep item and category_name in sync — they represent the same thing.
+    update: dict = {"category_name": category_name, "item": category_name}
     if category_id:
         update["category_id"] = category_id
     result = await db.transactions.update_one({"_id": tx_id}, {"$set": update})

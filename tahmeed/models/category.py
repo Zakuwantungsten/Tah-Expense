@@ -5,8 +5,19 @@ from bson import ObjectId
 
 @dataclass
 class Category:
+    """An accountant-managed expense *item*.
+
+    (Stored in the ``categories`` collection for backward compatibility; the UI
+    refers to these as "items".) When ``show_in_sidebar`` is True the item gets
+    its own dedicated sidebar tab, using ``icon`` as its glyph.
+    """
+
     name: str
+    description: str = ""          # hint shown to cashier; auto-fills their description field
     color: str = "#4A90D9"
+    icon: str = "mdi.tag-outline"  # qtawesome mdi.* glyph for the sidebar tab
+    show_in_sidebar: bool = False  # if True, item gets its own sidebar tab
+    sort_order: int = 0
     requires_receipt: bool = False
     requires_truck: bool = True
     active: bool = True
@@ -15,7 +26,11 @@ class Category:
     def to_doc(self) -> dict:
         doc = {
             "name": self.name,
+            "description": self.description,
             "color": self.color,
+            "icon": self.icon,
+            "show_in_sidebar": self.show_in_sidebar,
+            "sort_order": self.sort_order,
             "requires_receipt": self.requires_receipt,
             "requires_truck": self.requires_truck,
             "active": self.active,
@@ -29,7 +44,11 @@ class Category:
         return cls(
             _id=doc.get("_id"),
             name=doc["name"],
+            description=doc.get("description", ""),
             color=doc.get("color", "#4A90D9"),
+            icon=doc.get("icon", "mdi.tag-outline"),
+            show_in_sidebar=doc.get("show_in_sidebar", False),
+            sort_order=doc.get("sort_order", 0),
             requires_receipt=doc.get("requires_receipt", False),
             requires_truck=doc.get("requires_truck", True),
             active=doc.get("active", True),

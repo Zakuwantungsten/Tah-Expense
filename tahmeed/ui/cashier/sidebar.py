@@ -1,6 +1,14 @@
-"""CashierDashboard — Collapsible sidebar (navy palette matching accountant)."""
+"""CashierDashboard — Collapsible sidebar (navy palette matching accountant).
+
+The ITEMS section is loaded dynamically from the DB (accountant-managed,
+sidebar-flagged items). Items that have sub-items are expandable: clicking the
+chevron reveals their sub-items. Clicking the item body opens the cashier's own
+entries for that item (all sub-items combined); clicking a sub-item filters to
+just that sub-item.
+"""
 
 from __future__ import annotations
+import asyncio
 from typing import Optional, Dict, List
 
 import qtawesome as qta
@@ -15,6 +23,7 @@ from tahmeed.models.user import User
 # ── Design tokens (identical to accountant sidebar) ──────────────────────────────
 _NAVY       = "#1B2B4B"
 _ACTIVE_BG  = "#253A5C"
+_SUB_BG     = "#16243f"   # slightly darker strip behind sub-items
 _BLUE       = "#0077C5"
 _WHITE      = "#F9FAFB"
 _MUTED      = "#94A3B8"
@@ -22,75 +31,8 @@ _MUTED      = "#94A3B8"
 EXPANDED_W  = 220
 COLLAPSED_W = 56
 
-# ── Category metadata — used by dashboard and category view ──────────────────────
-CATEGORY_LABELS: dict[str, str] = {
-    # Categories
-    "mileage":         "Mileage",
-    "latra":           "LATRA",
-    "c28":             "C28",
-    "c40":             "C40",
-    "carbon_permit":   "Carbon & Permit",
-    "council_fees":    "Council Fees",
-    "return_weigh":    "Return & Weighbridge",
-    "parking_petroda": "Parking Petroda",
-    "backload":        "Backload Facilitation",
-    "rope_sealing":    "Rope & Sealing",
-    "radiation":       "Radiation Taxes",
-    "health_fee":      "Health Fee",
-    "halmashauri":     "Halmashauri Parking",
-    # Separate expenses
-    "toll_plaza":      "Toll Plaza",
-    "parking_congo":   "Parking Congo",
-    "congo_exp":       "Congo Expenses",
-    "ahmed_kimvi":     "Ahmed Kimvi (Klesa)",
-    "zambia_parking":  "Zambia Parking",
-    "harrison":        "Harrison Expenses",
-    "afritrack":       "Afritrack",
-    "third_party":     "Third Party Covers",
-    "comesa":          "COMESA Covers",
-    "sm_burhani":      "SM Burhani",
-    "rahntech":        "RahnTech",
-    # Fuel consumption
-    "diesel_cash":     "Diesel Cash",
-    "infinity":        "Infinity",
-    "lake_zambia":     "Lake Zambia",
-    "lake_tunduma":    "Lake Tunduma",
-    "gbp_diesel":      "GBP Diesel",
-}
-
-CATEGORY_ICONS: dict[str, str] = {
-    "mileage":         "mdi.road-variant",
-    "latra":           "mdi.card-account-details-outline",
-    "c28":             "mdi.file-document-outline",
-    "c40":             "mdi.file-document-outline",
-    "carbon_permit":   "mdi.leaf",
-    "council_fees":    "mdi.city-variant",
-    "return_weigh":    "mdi.scale",
-    "parking_petroda": "mdi.parking",
-    "backload":        "mdi.truck-delivery",
-    "rope_sealing":    "mdi.link-variant",
-    "radiation":       "mdi.radioactive",
-    "health_fee":      "mdi.hospital-box",
-    "halmashauri":     "mdi.parking",
-    "toll_plaza":      "mdi.boom-gate",
-    "parking_congo":   "mdi.parking",
-    "congo_exp":       "mdi.map-marker",
-    "ahmed_kimvi":     "mdi.account-cash",
-    "zambia_parking":  "mdi.map",
-    "harrison":        "mdi.account-tie",
-    "afritrack":       "mdi.satellite-variant",
-    "third_party":     "mdi.shield-account",
-    "comesa":          "mdi.certificate",
-    "sm_burhani":      "mdi.scale-balance",
-    "rahntech":        "mdi.devices",
-    "diesel_cash":     "mdi.gas-station-outline",
-    "infinity":        "mdi.gas-station",
-    "lake_zambia":     "mdi.water-pump",
-    "lake_tunduma":    "mdi.water-pump",
-    "gbp_diesel":      "mdi.fuel",
-}
-
 # ── Nav sections ──────────────────────────────────────────────────────────────────
+#  ITEMS is loaded dynamically from the DB; the list here is intentionally empty.
 _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     (None, [
         ("overview", "Overview", "mdi.view-dashboard-outline", {}),
@@ -100,22 +42,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("table", "Table", "mdi.table-large", {}),
         ("form",  "Form",  "mdi.form-select", {}),
     ]),
-    ("CATEGORIES", [
-        ("mileage",         "Mileage",                "mdi.road-variant",                 {}),
-        ("latra",           "LATRA",                  "mdi.card-account-details-outline", {}),
-        ("c28",             "C28",                    "mdi.file-document-outline",        {}),
-        ("c40",             "C40",                    "mdi.file-document-outline",        {}),
-        ("carbon_permit",   "Carbon & Permit",        "mdi.leaf",                         {}),
-        ("council_fees",    "Council Fees",           "mdi.city-variant",                 {}),
-        ("return_weigh",    "Return & Weighbridge",   "mdi.scale",                        {}),
-        ("parking_petroda", "Parking Petroda",        "mdi.parking",                      {}),
-        ("backload",        "Backload Facilitation",  "mdi.truck-delivery",               {}),
-        ("rope_sealing",    "Rope & Sealing",         "mdi.link-variant",                 {}),
-        ("radiation",       "Radiation Taxes",        "mdi.radioactive",                  {}),
-        ("health_fee",      "Health Fee",             "mdi.hospital-box",                 {}),
-        ("halmashauri",     "Halmashauri Parking",    "mdi.parking",                      {}),
-        ("diesel_cash",     "Diesel Cash",            "mdi.gas-station-outline",          {}),
-    ]),
+    ("ITEMS", []),
 ]
 
 
@@ -127,21 +54,27 @@ def _qta(name: str, color: str) -> "QIcon":
 
 
 class _NavItem(QWidget):
-    """Single nav row: indicator | icon | label."""
+    """Single nav row: indicator | icon | label | [chevron]."""
 
     activated = Signal(str)
+    toggle_requested = Signal(str)   # chevron clicked (expandable items only)
 
-    def __init__(self, key: str, label: str, icon_name: str, parent=None):
+    def __init__(self, key: str, label: str, icon_name: str,
+                 expandable: bool = False, parent=None):
         super().__init__(parent)
         self._key = key
         self._icon_name = icon_name
         self._active = False
+        self._expandable = expandable
+        self._expanded = False
+        self._has_subtables = False
+        self._is_collapsed = False
         self.setFixedHeight(36)
         self.setCursor(Qt.PointingHandCursor)
-        self._build(label)
+        self._build(label, expandable)
         self._paint(hover=False)
 
-    def _build(self, label: str) -> None:
+    def _build(self, label: str, expandable: bool) -> None:
         hl = QHBoxLayout(self)
         hl.setContentsMargins(0, 0, 8, 0)
         hl.setSpacing(0)
@@ -169,6 +102,16 @@ class _NavItem(QWidget):
         self._text_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         hl.addWidget(self._text_lbl)
 
+        self._chevron_lbl: Optional[QLabel] = None
+        if expandable:
+            self._chevron_lbl = QLabel()
+            self._chevron_lbl.setFixedSize(16, 16)
+            self._chevron_lbl.setAlignment(Qt.AlignCenter)
+            self._chevron_lbl.setStyleSheet("background: transparent;")
+            self._chevron_lbl.setPixmap(_qta("mdi.chevron-right", color=_MUTED).pixmap(14, 14))
+            self._chevron_lbl.setVisible(False)   # hidden until sub-items confirmed
+            hl.addWidget(self._chevron_lbl)
+
         self._refresh_icon(active=False)
 
     def set_active(self, active: bool) -> None:
@@ -176,8 +119,22 @@ class _NavItem(QWidget):
         self._paint(hover=False)
         self._refresh_icon(active=active)
 
+    def set_has_subtables(self, has: bool) -> None:
+        self._has_subtables = has
+        if self._chevron_lbl:
+            self._chevron_lbl.setVisible(has and not self._is_collapsed)
+
     def set_collapsed(self, collapsed: bool) -> None:
+        self._is_collapsed = collapsed
         self._text_lbl.setVisible(not collapsed)
+        if self._chevron_lbl:
+            self._chevron_lbl.setVisible(self._has_subtables and not collapsed)
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._expanded = expanded
+        if self._chevron_lbl:
+            icon = "mdi.chevron-down" if expanded else "mdi.chevron-right"
+            self._chevron_lbl.setPixmap(_qta(icon, color=_MUTED).pixmap(14, 14))
 
     def _refresh_icon(self, active: bool) -> None:
         color = _WHITE if active else _MUTED
@@ -220,7 +177,111 @@ class _NavItem(QWidget):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
-            self.activated.emit(self._key)
+            if (self._expandable and self._chevron_lbl is not None
+                    and self._chevron_lbl.isVisible()
+                    and event.position().x() >= self._chevron_lbl.x() - 4):
+                self.toggle_requested.emit(self._key)
+            else:
+                self.activated.emit(self._key)
+        super().mousePressEvent(event)
+
+
+class _SubNavItem(QWidget):
+    """Indented, read-only sub-item row beneath an expandable parent."""
+
+    activated = Signal(object)   # passes self
+
+    def __init__(self, parent_key: str, parent_category: str, name: str,
+                 match: str = "", icon_name: str = "", parent=None):
+        super().__init__(parent)
+        self.parent_key = parent_key
+        self.parent_category = parent_category
+        self.name = name
+        self.match = match or name
+        self._icon_name = icon_name
+        self._active = False
+        self.setFixedHeight(30)
+        self.setCursor(Qt.PointingHandCursor)
+        self._build()
+        self._paint(hover=False)
+
+    def _build(self) -> None:
+        hl = QHBoxLayout(self)
+        hl.setContentsMargins(0, 0, 8, 0)
+        hl.setSpacing(0)
+
+        self._indicator = QFrame()
+        self._indicator.setFixedWidth(3)
+        self._indicator.setStyleSheet("background: transparent;")
+        hl.addWidget(self._indicator)
+
+        hl.addSpacing(38)   # indent under the parent icon+label
+
+        self._icon_lbl = QLabel()
+        self._icon_lbl.setFixedSize(15, 15)
+        self._icon_lbl.setAlignment(Qt.AlignCenter)
+        self._icon_lbl.setStyleSheet("background: transparent;")
+        icon = self._icon_name or "mdi.circle-medium"
+        self._icon_lbl.setPixmap(_qta(icon, color=_MUTED).pixmap(15, 15))
+        hl.addWidget(self._icon_lbl)
+
+        hl.addSpacing(8)
+
+        self._text_lbl = QLabel(self.name)
+        self._text_lbl.setStyleSheet(
+            f"color: {_MUTED}; font-size: 12px;"
+            " font-family: 'Segoe UI', sans-serif; background: transparent;"
+        )
+        self._text_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        hl.addWidget(self._text_lbl)
+
+    def set_active(self, active: bool) -> None:
+        self._active = active
+        self._paint(hover=False)
+
+    def _refresh_icon(self, bright: bool) -> None:
+        icon = self._icon_name or "mdi.circle-medium"
+        self._icon_lbl.setPixmap(
+            _qta(icon, color=_WHITE if bright else _MUTED).pixmap(15, 15)
+        )
+
+    def _paint(self, hover: bool) -> None:
+        if self._active:
+            self.setStyleSheet(f"background: {_ACTIVE_BG};")
+            self._indicator.setStyleSheet(f"background: {_BLUE};")
+            self._text_lbl.setStyleSheet(
+                f"color: {_WHITE}; font-size: 12px; font-weight: 600;"
+                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            )
+        elif hover:
+            self.setStyleSheet(f"background: {_ACTIVE_BG};")
+            self._indicator.setStyleSheet("background: transparent;")
+            self._text_lbl.setStyleSheet(
+                f"color: {_WHITE}; font-size: 12px;"
+                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            )
+        else:
+            self.setStyleSheet(f"background: {_SUB_BG};")
+            self._indicator.setStyleSheet("background: transparent;")
+            self._text_lbl.setStyleSheet(
+                f"color: {_MUTED}; font-size: 12px;"
+                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            )
+        self._refresh_icon(bright=self._active or hover)
+
+    def enterEvent(self, event) -> None:
+        if not self._active:
+            self._paint(hover=True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if not self._active:
+            self._paint(hover=False)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.activated.emit(self)
         super().mousePressEvent(event)
 
 
@@ -238,6 +299,8 @@ class CashierSidebarWidget(QFrame):
     """Collapsible cashier sidebar — same visual style as accountant sidebar."""
 
     nav_selected = Signal(str)
+    # (parent_key, parent_category, name, match)
+    subtable_selected = Signal(str, str, str, str)
 
     def __init__(self, user: User, parent=None):
         super().__init__(parent)
@@ -246,9 +309,16 @@ class CashierSidebarWidget(QFrame):
         self._items: Dict[str, _NavItem] = {}
         self._section_labels: List[_SectionLabel] = []
         self._separators: List[QFrame] = []
-        self._active_item = None
+        self._child_containers: Dict[str, QWidget] = {}
+        self._expanded: set[str] = set()
+        self._loaded: set[str] = set()
+        self._active_obj = None                  # active _NavItem or _SubNavItem
+        self._item_keys: set[str] = set()        # keys of dynamic ITEMS rows
+        self._item_defs: Dict[str, tuple] = {}   # key -> (name, icon)
+        self._items_host_vl = None
         self._build()
         self.select("overview")
+        asyncio.ensure_future(self._load_items())
 
     def _build(self) -> None:
         self.setObjectName("cashierSidebar")
@@ -299,6 +369,15 @@ class CashierSidebarWidget(QFrame):
                 vl.addWidget(lbl)
                 self._section_labels.append(lbl)
 
+            if section_label == "ITEMS":
+                items_host = QWidget()
+                items_host.setStyleSheet(f"background: {_NAVY};")
+                self._items_host_vl = QVBoxLayout(items_host)
+                self._items_host_vl.setContentsMargins(0, 0, 0, 0)
+                self._items_host_vl.setSpacing(0)
+                vl.addWidget(items_host)
+                continue
+
             for key, label, icon_name, _ in items:
                 nav = _NavItem(key=key, label=label, icon_name=icon_name)
                 nav.activated.connect(self._on_item_clicked)
@@ -338,15 +417,21 @@ class CashierSidebarWidget(QFrame):
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def select(self, key: str) -> None:
-        if self._active_item is not None:
+    def _clear_active(self) -> None:
+        if self._active_obj is not None:
             try:
-                self._active_item.set_active(False)
+                self._active_obj.set_active(False)
             except RuntimeError:
                 pass
-        self._active_item = self._items.get(key)
-        if self._active_item:
-            self._active_item.set_active(True)
+        self._active_obj = None
+
+    def select(self, key: str) -> None:
+        """Activate a top-level nav item (clears any sub-item active)."""
+        self._clear_active()
+        nav = self._items.get(key)
+        if nav:
+            nav.set_active(True)
+            self._active_obj = nav
 
     def toggle_collapsed(self) -> None:
         self._collapsed = not self._collapsed
@@ -358,6 +443,9 @@ class CashierSidebarWidget(QFrame):
             lbl.setVisible(not self._collapsed)
         for sep in self._separators:
             sep.setVisible(not self._collapsed)
+        # Hide sub-item strips while collapsed; restore expanded ones after.
+        for key, child in self._child_containers.items():
+            child.setVisible(not self._collapsed and key in self._expanded)
         if self._collapsed:
             self._collapse_btn.setText("")
             self._collapse_btn.setIcon(_qta("mdi.chevron-right", color=_MUTED))
@@ -367,8 +455,169 @@ class CashierSidebarWidget(QFrame):
             self._collapse_btn.setIcon(_qta("mdi.chevron-left", color=_MUTED))
             self._collapse_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
-    # ── Internal ───────────────────────────────────────────────────────────────
+    # ── Internal: top-level nav ────────────────────────────────────────────────
 
     def _on_item_clicked(self, key: str) -> None:
         self.select(key)
         self.nav_selected.emit(key)
+        # Auto-expand when this item has confirmed sub-items.
+        nav = self._items.get(key)
+        if (key in self._child_containers and key not in self._expanded
+                and nav is not None and nav._has_subtables):
+            self._on_toggle(key)
+
+    # ── Internal: expand / collapse ────────────────────────────────────────────
+
+    def _on_toggle(self, key: str) -> None:
+        if self._collapsed or key not in self._child_containers:
+            return
+        if key in self._expanded:
+            self._expanded.discard(key)
+            self._child_containers[key].setVisible(False)
+            self._items[key].set_expanded(False)
+        else:
+            self._expanded.add(key)
+            self._items[key].set_expanded(True)
+            self._child_containers[key].setVisible(True)
+            if key not in self._loaded:
+                asyncio.ensure_future(self._load_children(key))
+
+    async def _load_children(self, key: str) -> None:
+        from tahmeed.services.subtable_service import get_subtables
+        try:
+            subs = await get_subtables(key)
+        except Exception:
+            subs = []
+        self._loaded.add(key)
+        self._rebuild_children(key, subs)
+
+    def _rebuild_children(self, key: str, subs) -> None:
+        container = self._child_containers.get(key)
+        if container is None:
+            return
+        layout = container.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        parent_category = (
+            self._items[key]._text_lbl.text() if key in self._items else key
+        )
+
+        if key in self._items:
+            self._items[key].set_has_subtables(len(subs) > 0)
+
+        if not subs:
+            self._expanded.discard(key)
+            container.setVisible(False)
+            if key in self._items:
+                self._items[key].set_expanded(False)
+            return
+
+        for sub in subs:
+            row = _SubNavItem(
+                parent_key=key,
+                parent_category=sub.parent_category or parent_category,
+                name=sub.name,
+                match=sub.match,
+            )
+            row.activated.connect(self._on_subitem_clicked)
+            layout.addWidget(row)
+
+    def _on_subitem_clicked(self, row: _SubNavItem) -> None:
+        self._clear_active()
+        row.set_active(True)
+        self._active_obj = row
+        self.subtable_selected.emit(
+            row.parent_key, row.parent_category, row.name, row.match
+        )
+
+    # ── Dynamic ITEMS rows (accountant-managed) ────────────────────────────────
+
+    def item_def(self, key: str):
+        """Return (name, icon) for a dynamic item key, or None."""
+        return self._item_defs.get(key)
+
+    def refresh_items(self) -> None:
+        asyncio.ensure_future(self._load_items())
+
+    async def _load_items(self) -> None:
+        from tahmeed.services.category_service import get_sidebar_categories
+        try:
+            cats = await get_sidebar_categories()
+        except Exception:
+            cats = []
+        self._rebuild_items(cats)
+
+    def _rebuild_items(self, cats: list) -> None:
+        from tahmeed.services.category_service import item_key as _ik
+        if self._items_host_vl is None:
+            return
+
+        for key in self._item_keys:
+            self._items.pop(key, None)
+            self._child_containers.pop(key, None)
+            self._expanded.discard(key)
+            self._loaded.discard(key)
+            self._item_defs.pop(key, None)
+        self._item_keys = set()
+
+        while self._items_host_vl.count():
+            it = self._items_host_vl.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+
+        if not cats:
+            hint = QLabel("  No items yet")
+            hint.setStyleSheet(
+                f"color: {_MUTED}; font-size: 11px; font-style: italic;"
+                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+                " padding: 4px 16px;"
+            )
+            self._items_host_vl.addWidget(hint)
+            return
+
+        for cat in cats:
+            key = _ik(cat.name)
+            if not key or key in self._item_keys:
+                continue
+            icon = cat.icon or "mdi.tag-outline"
+            self._item_defs[key] = (cat.name, icon)
+            self._item_keys.add(key)
+            self._add_item_row(key, cat.name, icon)
+
+        if self._collapsed:
+            for key in self._item_keys:
+                self._items[key].set_collapsed(True)
+
+        asyncio.ensure_future(self._load_item_chevrons())
+
+    def _add_item_row(self, key: str, label: str, icon_name: str) -> None:
+        nav = _NavItem(key=key, label=label, icon_name=icon_name, expandable=True)
+        nav.activated.connect(self._on_item_clicked)
+        nav.toggle_requested.connect(self._on_toggle)
+        self._items[key] = nav
+        self._items_host_vl.addWidget(nav)
+
+        child = QWidget()
+        child.setStyleSheet(f"background: {_SUB_BG};")
+        cvl = QVBoxLayout(child)
+        cvl.setContentsMargins(0, 0, 0, 0)
+        cvl.setSpacing(0)
+        child.setVisible(False)
+        self._child_containers[key] = child
+        self._items_host_vl.addWidget(child)
+
+    async def _load_item_chevrons(self) -> None:
+        from tahmeed.services.subtable_service import get_subtables
+        for key in list(self._item_keys):
+            if key not in self._items:
+                continue
+            try:
+                subs = await get_subtables(key)
+                self._items[key].set_has_subtables(len(subs) > 0)
+            except Exception:
+                pass

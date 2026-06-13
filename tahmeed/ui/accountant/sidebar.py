@@ -13,13 +13,11 @@ from typing import Optional, Dict, List
 import qtawesome as qta
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
-    QScrollArea, QToolButton, QSizePolicy, QDialog, QLineEdit,
+    QScrollArea, QToolButton, QSizePolicy,
     QPushButton, QMessageBox, QMenu,
 )
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QIcon
-
-from tahmeed.ui.accountant.category_tables import CATEGORY_DEFS
 
 # ── Design tokens ─────────────────────────────────────────────────────────────
 
@@ -46,21 +44,9 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("verify",          "Verify",            "mdi.inbox-arrow-down",             {"badge": True}),
         ("master_expenses", "Master Expenses",   "mdi.table-large",                  {}),
     ]),
-    ("CATEGORIES", [
-        ("mileage",         "Mileage",                "mdi.road-variant",                 {}),
-        ("latra",           "LATRA",                  "mdi.card-account-details-outline", {}),
-        ("c28",             "C28",                    "mdi.file-document-outline",        {}),
-        ("c40",             "C40",                    "mdi.file-document-outline",        {}),
-        ("carbon_permit",   "Carbon & Permit",        "mdi.leaf",                         {}),
-        ("council_fees",    "Council Fees",           "mdi.city-variant",                 {}),
-        ("return_weigh",    "Return & Weighbridge",   "mdi.scale",                        {}),
-        ("parking_petroda", "Parking Petroda",        "mdi.parking",                      {}),
-        ("backload",        "Backload Facilitation",  "mdi.truck-delivery",               {}),
-        ("rope_sealing",    "Rope & Sealing",         "mdi.link-variant",                 {}),
-        ("radiation",       "Radiation Taxes",        "mdi.radioactive",                  {}),
-        ("health_fee",      "Health Fee",             "mdi.hospital-box",                 {}),
-        ("halmashauri",     "Halmashauri Parking",    "mdi.parking",                      {}),
-    ]),
+    # ITEMS are loaded dynamically from the DB (accountant-managed). The header
+    # is rendered statically; the rows below it are built by _load_items().
+    ("ITEMS", []),
     ("SEPARATE EXPENSES", [
         ("toll_plaza",      "Toll Plaza",           "mdi.boom-gate",         {}),
         ("parking_congo",   "Parking Congo",        "mdi.parking",           {}),
@@ -82,7 +68,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("gbp_diesel",      "GBP Diesel",    "mdi.fuel",         {}),
     ]),
     ("MANAGE", [
-        ("manage_categories", "Categories",       "mdi.tag-edit",        {}),
+        ("manage_categories", "Items",             "mdi.tag-edit",        {}),
         ("manage_diesel",     "Diesel Stations",  "mdi.gas-station",     {}),
         ("manage_recon",      "Recon. Stations",  "mdi.office-building", {}),
         ("manage_separate",   "Separate Expenses","mdi.view-list",       {}),
@@ -91,8 +77,9 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     ]),
 ]
 
-# Sidebar keys that can host user-created sub-tables.
-_EXPANDABLE_KEYS = {"mileage"}
+# Dynamic ITEMS rows are always expandable (they can host sub-tables). Static
+# sections have no expandable keys except those in _FIXED_CHILDREN.
+_EXPANDABLE_KEYS: set[str] = set()
 
 # Sidebar keys with a fixed (non-editable) set of children.
 #   key -> [(display name, match/route id, mdi icon), ...]
@@ -137,6 +124,8 @@ class _NavItem(QWidget):
         self._has_badge = badge
         self._expandable = expandable
         self._expanded = False
+        self._has_subtables = False   # chevron only shown after DB confirms sub-tables exist
+        self._is_collapsed = False
 
         self.setFixedHeight(36)
         self.setCursor(Qt.PointingHandCursor)
@@ -194,6 +183,7 @@ class _NavItem(QWidget):
             self._chevron_lbl.setAlignment(Qt.AlignCenter)
             self._chevron_lbl.setStyleSheet("background: transparent;")
             self._chevron_lbl.setPixmap(_qta("mdi.chevron-right", color=_MUTED).pixmap(14, 14))
+            self._chevron_lbl.setVisible(False)   # hidden until sub-tables confirmed
             hl.addWidget(self._chevron_lbl)
 
         self._refresh_icon(active=False)
@@ -205,12 +195,20 @@ class _NavItem(QWidget):
         self._paint(hover=False)
         self._refresh_icon(active=active)
 
+    def set_has_subtables(self, has: bool) -> None:
+        """Show or hide the chevron based on whether sub-tables exist in the DB."""
+        self._has_subtables = has
+        if self._chevron_lbl:
+            self._chevron_lbl.setVisible(has and not self._is_collapsed)
+
     def set_collapsed(self, collapsed: bool) -> None:
+        self._is_collapsed = collapsed
         self._text_lbl.setVisible(not collapsed)
         if self._badge_lbl:
             self._badge_lbl.setVisible(not collapsed)
         if self._chevron_lbl:
-            self._chevron_lbl.setVisible(not collapsed)
+            # Only show when expanded AND this item actually has sub-tables
+            self._chevron_lbl.setVisible(self._has_subtables and not collapsed)
 
     def set_badge(self, count: int) -> None:
         if self._badge_lbl:
@@ -413,66 +411,6 @@ class _SubNavItem(QWidget):
             self.delete_requested.emit(self)
 
 
-# ── Add Sub-table dialog ──────────────────────────────────────────────────────
-
-class _AddSubTableDialog(QDialog):
-    def __init__(self, parent_label: str, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(f"Add Sub-table — {parent_label}")
-        self.setMinimumWidth(380)
-        self.setStyleSheet("background: #FFFFFF;")
-        self.result_name: Optional[str] = None
-
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 20)
-        vl.setSpacing(10)
-
-        info = QLabel(
-            f"Create a sub-table under “{parent_label}”. It shows the verified "
-            "rows whose Description matches this name (e.g. a route like "
-            "“Dar to Congo”)."
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet("color: #6B7280; font-size: 12px;")
-        vl.addWidget(info)
-
-        vl.addWidget(QLabel("Sub-table name *"))
-        self._name = QLineEdit()
-        self._name.setPlaceholderText("e.g. Dar to Congo")
-        self._name.setStyleSheet(
-            "QLineEdit { border: 1px solid #E5E7EB; border-radius: 5px;"
-            " padding: 6px 8px; font-size: 13px; }"
-        )
-        self._name.returnPressed.connect(self._accept)
-        vl.addWidget(self._name)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        cancel = QPushButton("Cancel")
-        cancel.clicked.connect(self.reject)
-        cancel.setStyleSheet(
-            "QPushButton { background: #FFFFFF; border: 1px solid #E5E7EB;"
-            " border-radius: 5px; padding: 6px 14px; }"
-        )
-        btn_row.addWidget(cancel)
-        create = QPushButton("Create")
-        create.clicked.connect(self._accept)
-        create.setStyleSheet(
-            "QPushButton { background: #0077C5; color: #FFF; border: none;"
-            " border-radius: 5px; padding: 6px 16px; font-weight: 600; }"
-        )
-        btn_row.addWidget(create)
-        vl.addLayout(btn_row)
-
-    def _accept(self) -> None:
-        name = self._name.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Validation", "Please enter a name.")
-            return
-        self.result_name = name
-        self.accept()
-
-
 # ── SectionLabel ──────────────────────────────────────────────────────────────
 
 class _SectionLabel(QLabel):
@@ -505,8 +443,12 @@ class SidebarWidget(QFrame):
         self._loaded: set[str] = set()
         self._active_obj = None            # active _NavItem or _SubNavItem
         self._active_key: Optional[str] = None
+        self._item_keys: set[str] = set()          # keys of dynamic ITEMS rows
+        self._item_defs: Dict[str, tuple] = {}     # key -> (name, icon)
+        self._items_host_vl = None                 # layout hosting dynamic rows
         self._build()
         self.select("overview")
+        asyncio.ensure_future(self._load_items())
 
     # ── Build ──────────────────────────────────────────────────────────────
 
@@ -562,6 +504,16 @@ class SidebarWidget(QFrame):
                 lbl = _SectionLabel(section_label)
                 vl.addWidget(lbl)
                 self._section_labels.append(lbl)
+
+            if section_label == "ITEMS":
+                # Host for dynamic, accountant-managed item rows.
+                items_host = QWidget()
+                items_host.setStyleSheet(f"background: {_NAVY};")
+                self._items_host_vl = QVBoxLayout(items_host)
+                self._items_host_vl.setContentsMargins(0, 0, 0, 0)
+                self._items_host_vl.setSpacing(0)
+                vl.addWidget(items_host)
+                continue
 
             for key, label, icon_name, opts in items:
                 expandable = key in _EXPANDABLE_KEYS or key in _FIXED_CHILDREN
@@ -672,8 +624,10 @@ class SidebarWidget(QFrame):
     def _on_item_clicked(self, key: str) -> None:
         self.select(key)
         self.nav_selected.emit(key)
-        # Auto-expand a category when its parent is opened.
-        if key in self._child_containers and key not in self._expanded:
+        # Auto-expand only when this item has confirmed sub-tables.
+        nav = self._items.get(key)
+        if (key in self._child_containers and key not in self._expanded
+                and nav is not None and nav._has_subtables):
             self._on_toggle(key)
 
     # ── Internal: expand / collapse ────────────────────────────────────────
@@ -731,14 +685,27 @@ class SidebarWidget(QFrame):
     def _rebuild_children(self, key: str, subs) -> None:
         container = self._child_containers[key]
         layout = container.layout()
-        # Clear existing rows
         while layout.count():
             item = layout.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
 
-        parent_category = CATEGORY_DEFS.get(key, (self._items[key]._text_lbl.text(),))[0]
+        parent_category = (
+            self._items[key]._text_lbl.text() if key in self._items else key
+        )
+
+        # Update chevron visibility based on whether sub-tables exist.
+        if key in self._items:
+            self._items[key].set_has_subtables(len(subs) > 0)
+
+        if not subs:
+            # Collapse the strip — nothing left to show.
+            self._expanded.discard(key)
+            container.setVisible(False)
+            if key in self._items:
+                self._items[key].set_expanded(False)
+            return
 
         for sub in subs:
             row = _SubNavItem(
@@ -752,15 +719,6 @@ class SidebarWidget(QFrame):
             row.delete_requested.connect(self._on_subitem_delete)
             layout.addWidget(row)
 
-        add_row = _SubNavItem(
-            parent_key=key,
-            parent_category=parent_category,
-            name="Add Sub-table",
-            is_add=True,
-        )
-        add_row.activated.connect(self._on_add_clicked)
-        layout.addWidget(add_row)
-
     # ── Internal: sub-item actions ─────────────────────────────────────────
 
     def _on_subitem_clicked(self, row: _SubNavItem) -> None:
@@ -771,26 +729,6 @@ class SidebarWidget(QFrame):
         self.subtable_selected.emit(
             row.parent_key, row.parent_category, row.name, row.match
         )
-
-    def _on_add_clicked(self, row: _SubNavItem) -> None:
-        parent_label = self._items[row.parent_key]._text_lbl.text()
-        dlg = _AddSubTableDialog(parent_label, parent=self)
-        if dlg.exec() == QDialog.Accepted and dlg.result_name:
-            asyncio.ensure_future(
-                self._create_child(row.parent_key, row.parent_category, dlg.result_name)
-            )
-
-    async def _create_child(self, key: str, parent_category: str, name: str) -> None:
-        from tahmeed.services.subtable_service import create_subtable, get_subtables
-        try:
-            await create_subtable(key, parent_category, name)
-            subs = await get_subtables(key)
-        except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Could not create sub-table:\n{exc}")
-            return
-        self._rebuild_children(key, subs)
-        # Open the newly-created sub-table.
-        self.subtable_selected.emit(key, parent_category, name, name)
 
     def _on_subitem_delete(self, row: _SubNavItem) -> None:
         if QMessageBox.question(
@@ -812,3 +750,139 @@ class SidebarWidget(QFrame):
         self._rebuild_children(row.parent_key, subs)
         # Fall back to the parent (all-rows) view.
         self._on_item_clicked(row.parent_key)
+
+    # ── Chevron state management ───────────────────────────────────────────────
+
+    # ── Dynamic ITEMS rows (accountant-managed) ────────────────────────────────
+
+    def item_def(self, key: str):
+        """Return (name, icon) for a dynamic item key, or None."""
+        return self._item_defs.get(key)
+
+    def refresh_items(self) -> None:
+        """Rebuild the dynamic ITEMS rows from the DB (call after Manage Items changes)."""
+        asyncio.ensure_future(self._load_items())
+
+    async def _load_items(self) -> None:
+        from tahmeed.services.category_service import get_sidebar_categories
+        try:
+            cats = await get_sidebar_categories()
+        except Exception:
+            cats = []
+        self._rebuild_items(cats)
+
+    def _rebuild_items(self, cats: list) -> None:
+        from tahmeed.services.category_service import item_key as _ik
+
+        if self._items_host_vl is None:
+            return
+
+        # Drop previously-built dynamic rows from the shared registries.
+        for key in self._item_keys:
+            self._items.pop(key, None)
+            self._child_containers.pop(key, None)
+            self._expanded.discard(key)
+            self._loaded.discard(key)
+            self._item_defs.pop(key, None)
+        self._item_keys = set()
+
+        # Clear the host layout entirely.
+        while self._items_host_vl.count():
+            it = self._items_host_vl.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+
+        if not cats:
+            hint = QLabel("  No sidebar items yet")
+            hint.setStyleSheet(
+                f"color: {_MUTED}; font-size: 11px; font-style: italic;"
+                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+                " padding: 4px 16px;"
+            )
+            self._items_host_vl.addWidget(hint)
+            return
+
+        for cat in cats:
+            key = _ik(cat.name)
+            if not key or key in self._item_keys:
+                continue
+            icon = cat.icon or "mdi.tag-outline"
+            self._item_defs[key] = (cat.name, icon)
+            self._item_keys.add(key)
+            self._add_item_row(key, cat.name, icon)
+
+        if self._collapsed:
+            for key in self._item_keys:
+                self._items[key].set_collapsed(True)
+
+        asyncio.ensure_future(self._load_item_chevrons())
+
+    def _add_item_row(self, key: str, label: str, icon_name: str) -> None:
+        nav = _NavItem(key=key, label=label, icon_name=icon_name, expandable=True)
+        nav.activated.connect(self._on_item_clicked)
+        nav.toggle_requested.connect(self._on_toggle)
+        self._items[key] = nav
+        self._items_host_vl.addWidget(nav)
+
+        child = QWidget()
+        child.setStyleSheet(f"background: {_SUB_BG};")
+        cvl = QVBoxLayout(child)
+        cvl.setContentsMargins(0, 0, 0, 0)
+        cvl.setSpacing(0)
+        child.setVisible(False)
+        self._child_containers[key] = child
+        self._items_host_vl.addWidget(child)
+
+    async def _load_item_chevrons(self) -> None:
+        from tahmeed.services.subtable_service import get_subtables
+        for key in list(self._item_keys):
+            if key not in self._items:
+                continue
+            try:
+                subs = await get_subtables(key)
+                self._items[key].set_has_subtables(len(subs) > 0)
+            except Exception:
+                pass
+
+    async def refresh_chevron(self, key: str) -> None:
+        """Re-check a single item's sub-table count and update its chevron.
+        Call this from Manage Items after adding or deleting sub-items.
+        """
+        from tahmeed.services.subtable_service import get_subtables
+        if key not in self._items:
+            return
+        try:
+            subs = await get_subtables(key)
+            has = len(subs) > 0
+            self._items[key].set_has_subtables(has)
+            if not has and key in self._expanded:
+                self._expanded.discard(key)
+                if key in self._child_containers:
+                    self._child_containers[key].setVisible(False)
+                self._items[key].set_expanded(False)
+        except Exception:
+            pass
+
+    def refresh_subitems(self, key: str) -> None:
+        """Live-update one item's chevron + (if visible) its sub-item strip.
+
+        Called from the dashboard whenever the accountant adds, edits, or
+        deletes a sub-item in Manage Items, so the sidebar reflects it without
+        an app restart.
+        """
+        asyncio.ensure_future(self._refresh_subitems(key))
+
+    async def _refresh_subitems(self, key: str) -> None:
+        if key not in self._items:
+            return
+        from tahmeed.services.subtable_service import get_subtables
+        try:
+            subs = await get_subtables(key)
+        except Exception:
+            return
+        self._items[key].set_has_subtables(len(subs) > 0)
+        # Rebuild the strip live if it's already been built/expanded.
+        if key in self._loaded or key in self._expanded:
+            self._loaded.add(key)
+            self._rebuild_children(key, subs)
