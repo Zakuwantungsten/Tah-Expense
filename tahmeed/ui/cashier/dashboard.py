@@ -20,15 +20,14 @@ Layout:
 """
 
 import asyncio
+from datetime import date
 from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
-    QFrame, QLabel, QPushButton,
+    QFrame, QLabel,
 )
-from PySide6.QtCore import Qt, QSize
-
-import qtawesome as qta
+from PySide6.QtCore import Qt
 
 from tahmeed.models.user import User
 from tahmeed.services.category_service import get_all_categories
@@ -48,70 +47,121 @@ _T1     = "#111827"
 _T2     = "#6B7280"
 
 
-# ── Table action bar ──────────────────────────────────────────────────────────────
+# ── QuickBooks-style document header ─────────────────────────────────────────────
 
-class _TableHeader(QFrame):
-    """Compact action bar sitting above DailyRegister."""
+class _QBDocHeader(QFrame):
+    """QuickBooks-style document summary header with 4 KPI stat tiles."""
 
-    def __init__(self, register: DailyRegister, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._register = register
-        self.setObjectName("tableHeader")
-        self.setFixedHeight(48)
+        self.setObjectName("qbDocHeader")
+        self.setFixedHeight(68)
         self.setStyleSheet(
-            f"QFrame#tableHeader {{"
-            f"  background: {_WHITE}; border-bottom: 1px solid {_BORDER};"
-            f"}}"
+            "QFrame#qbDocHeader {"
+            "  background: #ffffff;"
+            "  border-bottom: 2px solid #0077C5;"
+            "}"
         )
+
         hl = QHBoxLayout(self)
-        hl.setContentsMargins(16, 0, 16, 0)
-        hl.setSpacing(6)
+        hl.setContentsMargins(0, 0, 20, 0)
+        hl.setSpacing(0)
 
-        def _btn(label: str, icon: str, color: str, tip: str) -> QPushButton:
-            b = QPushButton(f"  {label}")
-            b.setToolTip(tip)
-            b.setCursor(Qt.PointingHandCursor)
-            b.setFixedHeight(32)
-            b.setStyleSheet(
-                f"QPushButton {{ background: {_WHITE}; color: {color};"
-                f" border: 1px solid {_BORDER}; border-radius: 5px;"
-                f" font-size: 12px; font-weight: 600;"
-                f" font-family: 'Segoe UI', sans-serif; padding: 0 10px; }}"
-                f"QPushButton:hover {{ background: {_APP_BG}; }}"
-            )
-            try:
-                b.setIcon(qta.icon(icon, color=color))
-                b.setIconSize(QSize(14, 14))
-            except Exception:
-                pass
-            return b
+        # Left accent strip
+        accent = QFrame()
+        accent.setFixedWidth(5)
+        accent.setStyleSheet("background: #0077C5; border: none;")
+        hl.addWidget(accent)
+        hl.addSpacing(14)
 
-        new_btn = _btn("New",      "mdi.plus-circle-outline",      "#E85D04", "Go to first empty row")
-        save_btn = _btn("Save All", "mdi.content-save-all-outline", _BLUE,    "Save all filled rows")
-        del_btn  = _btn("Delete",  "mdi.delete-outline",            "#DC2626", "Delete selected row(s)")
-        imp_btn  = _btn("Import",  "mdi.file-import-outline",       "#7C3AED", "Import from Excel/CSV")
-
-        new_btn.clicked.connect(lambda: self._register.go_to_new_row())
-        save_btn.clicked.connect(self._register.save_rows)
-        del_btn.clicked.connect(self._register.delete_rows)
-        imp_btn.clicked.connect(self._register.import_from_file)
-
-        hl.addWidget(new_btn)
-        hl.addWidget(save_btn)
-        hl.addWidget(del_btn)
-        hl.addWidget(imp_btn)
+        # Title block
+        title_vl = QVBoxLayout()
+        title_vl.setSpacing(2)
+        title_vl.setContentsMargins(0, 10, 0, 10)
+        title_lbl = QLabel("Daily Register")
+        title_lbl.setStyleSheet(
+            "font-size: 18px; font-weight: 700; color: #1B2B4B;"
+            " font-family: 'Segoe UI', sans-serif; background: transparent;"
+        )
+        sub_lbl = QLabel("Cashier  ·  Expense Entry")
+        sub_lbl.setStyleSheet(
+            "font-size: 10px; color: #9CA3AF;"
+            " font-family: 'Segoe UI', sans-serif; background: transparent;"
+        )
+        title_vl.addWidget(title_lbl)
+        title_vl.addWidget(sub_lbl)
+        hl.addLayout(title_vl)
         hl.addStretch()
+
+        # Separator before tile strip
+        sep0 = QFrame()
+        sep0.setFrameShape(QFrame.VLine)
+        sep0.setStyleSheet("color: #E5E7EB;")
+        hl.addWidget(sep0)
+
+        # 4 KPI tiles: label, initial value, label color
+        tiles_cfg = [
+            ("ENTRIES",         "—",                              "#6B7280"),
+            ("TODAY",           date.today().strftime("%d %b %Y"), "#6B7280"),
+            ("REFUND TO FLOAT", "—",                              "#EA580C"),
+            ("TOTAL",           "—",                              "#6B7280"),
+        ]
+        val_labels = []
+        for i, (label, init_val, lbl_color) in enumerate(tiles_cfg):
+            if i > 0:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.VLine)
+                sep.setStyleSheet("color: #E5E7EB;")
+                hl.addWidget(sep)
+
+            tile = QWidget()
+            tile.setFixedWidth(140)
+            tile_vl = QVBoxLayout(tile)
+            tile_vl.setContentsMargins(14, 10, 14, 10)
+            tile_vl.setSpacing(3)
+
+            lbl = QLabel(label)
+            lbl.setStyleSheet(
+                f"font-size: 9px; color: {lbl_color}; font-weight: 600;"
+                " letter-spacing: 0.6px; font-family: 'Segoe UI', sans-serif;"
+                " background: transparent;"
+            )
+            val = QLabel(init_val)
+            val.setStyleSheet(
+                "font-size: 13px; color: #111827; font-weight: 700;"
+                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            )
+            tile_vl.addWidget(lbl)
+            tile_vl.addWidget(val)
+            val_labels.append(val)
+            hl.addWidget(tile)
+
+        (
+            self._val_entries,
+            self._val_today,
+            self._val_refund,
+            self._val_total,
+        ) = val_labels
+
+    def update_stats(self, n_entries: int, total_tzs: float, refund_total: float) -> None:
+        self._val_entries.setText(f"{n_entries} entr{'y' if n_entries == 1 else 'ies'}")
+        self._val_total.setText(f"TZS {total_tzs:,.0f}" if total_tzs else "—")
+        self._val_refund.setText(f"TZS {refund_total:,.0f}" if refund_total else "—")
 
 
 class _TablePage(QWidget):
-    """_TableHeader + DailyRegister stacked vertically."""
+    """_QBDocHeader + DailyRegister stacked vertically."""
 
     def __init__(self, register: DailyRegister, parent=None):
         super().__init__(parent)
         vl = QVBoxLayout(self)
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(0)
-        vl.addWidget(_TableHeader(register))
+
+        self._doc_header = _QBDocHeader()
+        register.stats_updated.connect(self._doc_header.update_stats)
+
+        vl.addWidget(self._doc_header)
         vl.addWidget(register, 1)
 
 
@@ -235,7 +285,6 @@ class CashierDashboard(QWidget):
         self._overview.go_to_form.connect(lambda: self._on_nav("form"))
         self._overview.go_to_browse.connect(self._on_browse)
         self._overview.export_data.connect(self._on_browse)
-        self._overview.import_data.connect(self._on_overview_import)
 
     # ── Routing ───────────────────────────────────────────────────────────────────
 
@@ -281,10 +330,6 @@ class CashierDashboard(QWidget):
     def _on_go_to_date(self, d) -> None:
         self._on_nav("table")
         self._register.navigate_to_date(d)
-
-    def _on_overview_import(self) -> None:
-        self._on_nav("table")
-        self._register.import_from_file()
 
     # ── Load categories ───────────────────────────────────────────────────────────
 

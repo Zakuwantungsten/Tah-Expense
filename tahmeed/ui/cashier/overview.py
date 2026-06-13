@@ -326,7 +326,9 @@ class _ReceiptBar(QWidget):
         self._build()
 
     def _build(self) -> None:
-        lay = QVBoxLayout(self)
+        lay = self.layout()
+        if lay is None:
+            lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
 
@@ -686,7 +688,6 @@ class CashierOverview(QWidget):
                 background: {_CARD_BG};
                 border: 1px solid {_BORDER};
                 border-radius: 12px;
-                overflow: hidden;
             }}
         """)
         _drop_shadow(activity_card)

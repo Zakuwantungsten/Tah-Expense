@@ -31,13 +31,13 @@ from datetime import datetime, date, timedelta
 from typing import List, Optional
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QToolButton, QLabel,
+    QWidget, QVBoxLayout, QHBoxLayout, QToolButton, QLabel,
     QTableWidget, QTableWidgetItem, QApplication,
     QStyledItemDelegate, QMenu, QFileDialog,
     QMessageBox, QAbstractItemView, QHeaderView, QDateEdit,
     QStyle, QFrame, QComboBox,
 )
-from PySide6.QtCore import Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer
+from PySide6.QtCore import Qt, Signal, QDate, QEvent, QRect, QSize, QObject
 from PySide6.QtGui import QKeyEvent, QColor, QBrush, QFont, QPen, QPainter
 
 from tahmeed.models.category import Category
@@ -67,7 +67,7 @@ COL_APR     = 10
 
 HEADERS = [
     "S/NO", "Date", "Item", "Description", "Truck No.",
-    "Memo", "Notes", "TZS", "Receipt", "Ownership", "APR BY",
+    "Memo", "Ref_Float", "TZS", "Receipt", "Ownership", "APR BY",
 ]
 
 CHECK_COLS       = {COL_NOTES}
@@ -200,7 +200,6 @@ class _DateDelegate(QStyledItemDelegate):
         except ValueError:
             cur = self._get_current_date()
             editor.setDate(QDate(cur.year, cur.month, cur.day))
-        QTimer.singleShot(50, editor.showPopup)  # open calendar immediately on click
 
     def setModelData(self, editor, model, index):
         model.setData(index, editor.date().toString("dd/MM/yyyy"))
@@ -209,31 +208,33 @@ class _DateDelegate(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
-class _CheckDelegate(QStyledItemDelegate):
-    """Centered checkbox; toggles via click/Space/Return."""
+class _RefFloatDelegate(QStyledItemDelegate):
+    """Blank or 'Refund to Float' orange badge; toggles via click/Space/Return."""
 
     def paint(self, painter, option, index) -> None:
         value = index.data(Qt.UserRole)
         if value is None:
-            return  # blank row — nothing to draw
-        checked = value is True
-        size = 13
-        cx = option.rect.x() + (option.rect.width() - size) // 2
-        cy = option.rect.y() + (option.rect.height() - size) // 2
-        box = QRect(cx, cy, size, size)
-        painter.save()
-        if checked:
-            painter.fillRect(box, QColor("#E85D04"))
-            painter.setPen(QPen(QColor("#DC2F02"), 1))
-            painter.drawRect(box)
-            painter.setPen(QPen(QColor("#ffffff"), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            painter.drawLine(cx + 2, cy + 7, cx + 5, cy + 10)
-            painter.drawLine(cx + 5, cy + 10, cx + 11, cy + 3)
+            return  # uninitialised blank row
+
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(option.rect, QColor("#cde0f5"))
         else:
-            painter.fillRect(box, QColor("#ffffff"))
-            painter.setPen(QPen(QColor("#9ca3af"), 1))
-            painter.drawRect(box)
-        painter.restore()
+            painter.fillRect(option.rect, QColor("#ffffff"))
+
+        if value is True:
+            rect = option.rect.adjusted(4, 5, -4, -5)
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setBrush(QColor("#FFF7ED"))
+            painter.setPen(QPen(QColor("#EA580C"), 1))
+            painter.drawRoundedRect(rect, 3, 3)
+            painter.setPen(QColor("#EA580C"))
+            f = painter.font()
+            f.setPointSize(8)
+            f.setBold(True)
+            painter.setFont(f)
+            painter.drawText(rect, Qt.AlignCenter, "Refund to Float")
+            painter.restore()
 
     def editorEvent(self, event, model, option, index) -> bool:
         if not (index.flags() & Qt.ItemIsEditable):
@@ -323,7 +324,8 @@ class _TableKeyFilter(QObject):
 class DailyRegister(QWidget):
     """Unified daily expense register (replaces ExcelGrid + TransactionsTable)."""
 
-    rows_saved = Signal(int)
+    rows_saved    = Signal(int)
+    stats_updated = Signal(int, float, float)  # (n_entries, total_tzs, refund_total)
 
     def __init__(self, user: User, categories: List[Category], parent=None):
         super().__init__(parent)
@@ -332,8 +334,8 @@ class DailyRegister(QWidget):
         self._current_date: date = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
-        self._check_delegate   = _CheckDelegate(self)
-        self._receipt_delegate = _ReceiptDelegate(self)
+        self._ref_float_delegate = _RefFloatDelegate(self)
+        self._receipt_delegate   = _ReceiptDelegate(self)
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
 
@@ -389,7 +391,7 @@ class DailyRegister(QWidget):
         self._table.setColumnWidth(COL_DESC,    360)
         self._table.setColumnWidth(COL_TRUCK,   82)
         self._table.setColumnWidth(COL_MEMO,    130)
-        self._table.setColumnWidth(COL_NOTES,   52)
+        self._table.setColumnWidth(COL_NOTES,   96)
         self._table.setColumnWidth(COL_TZS,     120)
         self._table.setColumnWidth(COL_RECEIPT, 60)
         self._table.setColumnWidth(COL_OWN,     90)
@@ -403,7 +405,7 @@ class DailyRegister(QWidget):
         self._table.setItemDelegateForColumn(COL_DESC,    _DescriptionDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_TRUCK,   _TruckDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_DATE,    _DateDelegate(lambda: self._current_date, self._table))
-        self._table.setItemDelegateForColumn(COL_NOTES,   self._check_delegate)
+        self._table.setItemDelegateForColumn(COL_NOTES,   self._ref_float_delegate)
         self._table.setItemDelegateForColumn(COL_RECEIPT, self._receipt_delegate)
 
         self._table.itemChanged.connect(self._on_item_changed)
@@ -636,15 +638,17 @@ class DailyRegister(QWidget):
 
     def _update_footer(self, transactions: Optional[List[Transaction]] = None) -> None:
         if transactions is None:
-            n, tzs = 0, 0.0
+            n, tzs, refund = 0, 0.0, 0.0
         else:
-            n   = len(transactions)
-            tzs = sum(t.amount for t in transactions)
+            n      = len(transactions)
+            tzs    = sum(t.amount for t in transactions)
+            refund = sum(t.amount for t in transactions if t.notes_flag)
 
         amount_str = f"TZS {tzs:,.0f}" if tzs else "—"
         self._totals_label.setText(
             f"{n} entr{'y' if n == 1 else 'ies'}   ·   {amount_str}"
         )
+        self.stats_updated.emit(n, tzs, refund)
 
     def _go_to_first_empty(self) -> None:
         """Scroll to and focus the first empty editable row (New button)."""
@@ -1253,16 +1257,6 @@ class DailyRegister(QWidget):
             if it and it.text().strip():
                 return True
         return False
-
-    # ------------------------------------------------------------------
-    # Public action entry-points (called by CashierDashboard toolbar)
-    # ------------------------------------------------------------------
-
-    def go_to_new_row(self) -> None:
-        self._go_to_first_empty()
-
-    def delete_rows(self) -> None:
-        self._delete_rows()
 
     # ------------------------------------------------------------------
     # Category update
