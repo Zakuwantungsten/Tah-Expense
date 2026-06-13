@@ -86,6 +86,8 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("manage_diesel",     "Diesel Stations",  "mdi.gas-station",     {}),
         ("manage_recon",      "Recon. Stations",  "mdi.office-building", {}),
         ("manage_separate",   "Separate Expenses","mdi.view-list",       {}),
+        ("manage_trucks",     "Trucks",           "mdi.truck",           {}),
+        ("manage_trailers",   "Trailers",         "mdi.truck-trailer",   {}),
     ]),
 ]
 

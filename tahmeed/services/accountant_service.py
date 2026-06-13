@@ -527,6 +527,88 @@ async def save_imported_feed(records: list) -> int:
     return len(result.inserted_ids)
 
 
+# ── Insurance feeds (comesa / third_party) ────────────────────────────────────
+
+def _build_insurance_query(
+    feed_type: str, search: str = "", month: str = "", status: str = ""
+) -> dict:
+    query: dict = {"feed_type": feed_type}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"name":      {"$regex": s, "$options": "i"}},
+            {"card_no":   {"$regex": s, "$options": "i"}},
+            {"truck_reg": {"$regex": s, "$options": "i"}},
+            {"reg_no":    {"$regex": s, "$options": "i"}},
+        ]
+    if month.strip() and month.upper() != "ALL":
+        query["month"] = {"$regex": re.escape(month.strip()), "$options": "i"}
+    if status.strip() and status.upper() != "ALL":
+        query["status"] = status.strip()
+    return query
+
+
+async def get_insurance_feed(
+    feed_type: str,
+    search: str = "",
+    month: str = "",
+    status: str = "",
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    db = get_db()
+    query = _build_insurance_query(feed_type, search, month, status)
+    cursor = db.imported_feeds.find(query).sort(
+        [("month", 1), ("name", 1)]
+    ).skip(skip).limit(limit)
+    return await cursor.to_list(length=limit)
+
+
+async def count_insurance_feed(
+    feed_type: str, search: str = "", month: str = "", status: str = ""
+) -> int:
+    db = get_db()
+    query = _build_insurance_query(feed_type, search, month, status)
+    return await db.imported_feeds.count_documents(query)
+
+
+async def get_insurance_totals(
+    feed_type: str, month: str = "", status: str = ""
+) -> dict:
+    db = get_db()
+    match: dict = {"feed_type": feed_type}
+    if month.strip() and month.upper() != "ALL":
+        match["month"] = {"$regex": re.escape(month.strip()), "$options": "i"}
+    if status.strip() and status.upper() != "ALL":
+        match["status"] = status.strip()
+    pipeline = [
+        {"$match": match},
+        {"$group": {
+            "_id": None,
+            "premium":       {"$sum": {"$toDouble": {"$ifNull": ["$premium", 0]}}},
+            "vat":           {"$sum": {"$toDouble": {"$ifNull": ["$vat", 0]}}},
+            "total_premium": {"$sum": {"$toDouble": {"$ifNull": ["$total_premium", 0]}}},
+            "count":         {"$sum": 1},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        return result[0]
+    return {"premium": 0.0, "vat": 0.0, "total_premium": 0.0, "count": 0}
+
+
+async def get_existing_insurance_keys(feed_type: str, keys: List[str]) -> set:
+    """Return dedup_id values already stored for this insurance feed type."""
+    if not keys:
+        return set()
+    db = get_db()
+    docs = await db.imported_feeds.find(
+        {"feed_type": feed_type, "dedup_id": {"$in": keys}},
+        {"dedup_id": 1},
+    ).to_list(length=None)
+    return {d["dedup_id"] for d in docs if "dedup_id" in d}
+
+
 # ── Diesel fuel feeds (infinity / lake_zambia / lake_tunduma / gbp) ──────────
 
 async def get_diesel_feed(

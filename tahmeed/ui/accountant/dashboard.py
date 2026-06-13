@@ -32,6 +32,7 @@ from tahmeed.ui.accountant.reconciliation import RPAScheduleWidget, BondsWidget
 from tahmeed.ui.accountant.fuel_consumption import (
     InfinityWidget, LakeZambiaWidget, LakeTundumaWidget, GBPDieselWidget,
 )
+from tahmeed.ui.accountant.fleet_registry import TrucksRegistryWidget, TrailersRegistryWidget
 
 _APP_BG = "#F4F6F8"
 
@@ -144,6 +145,13 @@ class AccountantDashboard(QWidget):
         self._rahntech = RahnTechWidget()
         self._stack.addWidget(self._rahntech)           # index 17
 
+        # ── Fleet Registry ────────────────────────────────────────────────────
+        self._trucks_registry = TrucksRegistryWidget()
+        self._stack.addWidget(self._trucks_registry)    # index 18
+
+        self._trailers_registry = TrailersRegistryWidget()
+        self._stack.addWidget(self._trailers_registry)  # index 19
+
         # Category tables (one per CATEGORIES sidebar key) and user-created
         # sub-tables are created lazily and cached here as key -> stack index.
         self._category_indices: dict[str, int] = {}
@@ -184,7 +192,9 @@ class AccountantDashboard(QWidget):
             "lake_zambia":    (14, self._lake_zambia),
             "lake_tunduma":   (15, self._lake_tunduma),
             "gbp_diesel":     (16, self._gbp_diesel),
-            "rahntech":       (17, self._rahntech),
+            "rahntech":         (17, self._rahntech),
+            "manage_trucks":    (18, self._trucks_registry),
+            "manage_trailers":  (19, self._trailers_registry),
         }
         if key in _routes:
             idx, widget = _routes[key]

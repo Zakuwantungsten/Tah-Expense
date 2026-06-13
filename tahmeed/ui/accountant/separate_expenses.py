@@ -3103,24 +3103,950 @@ class AfritrackWidget(QWidget):
             QMessageBox.critical(self, "Export Error", str(exc))
 
 
-class ThirdPartyWidget(_PlaceholderExpenseWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(
-            "Third Party Covers",
-            "mdi.shield-account",
-            "Import third-party cover records when column schema is confirmed.",
-            parent,
-        )
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Insurance helpers — QB-style table, file readers, import dialog, exporters
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_INS_MONTHS = [
+    "All Months", "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY",
+    "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+]
 
 
-class ComesaWidget(_PlaceholderExpenseWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(
-            "COMESA Covers",
-            "mdi.certificate",
-            "Import COMESA cover records when column schema is confirmed.",
-            parent,
+def _ins_table_style() -> str:
+    return (
+        f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
+        "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
+        f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
+        f"QTableWidget::item:selected{{background:{_QB_SEL_BG};color:{_QB_SEL_FG};}}"
+        f"QHeaderView::section{{background:{_QB_HDR_BG};color:{_QB_HDR_FG};"
+        "font-size:11px;font-weight:700;font-family:'Segoe UI',sans-serif;"
+        f"border:none;border-bottom:2px solid #BFDBFE;"
+        "padding:0 8px;height:32px;}}"
+        "QScrollBar:vertical{width:8px;background:transparent;}"
+        f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
+        f"QTableWidget{{alternate-background-color:{_ALT_ROW};}}"
+    )
+
+
+def _ins_make_table(headers: List[str]) -> QTableWidget:
+    t = QTableWidget(0, len(headers))
+    t.setHorizontalHeaderLabels(headers)
+    t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    t.setSelectionBehavior(QAbstractItemView.SelectRows)
+    t.setAlternatingRowColors(True)
+    t.verticalHeader().setVisible(False)
+    t.verticalHeader().setDefaultSectionSize(_ROW_H)
+    t.horizontalHeader().setStretchLastSection(True)
+    t.setStyleSheet(_ins_table_style())
+    return t
+
+
+class _InsTotalsBar(QFrame):
+    """Flexible totals footer bar for insurance widgets."""
+
+    def __init__(
+        self,
+        labels: List[Tuple[str, str, str]],   # (key, display_label, num_prefix)
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(38)
+        self.setStyleSheet(
+            f"QFrame{{background:{_QB_HDR_BG};border-top:2px solid #BFDBFE;"
+            "border-bottom-left-radius:6px;border-bottom-right-radius:6px;}}"
         )
+        hl = QHBoxLayout(self)
+        hl.setContentsMargins(16, 0, 16, 0)
+        hl.setSpacing(32)
+
+        self._map: Dict[str, Tuple[QLabel, str]] = {}
+        for key, display_label, num_prefix in labels:
+            sub = QWidget()
+            sub.setStyleSheet("background:transparent;")
+            sub_hl = QHBoxLayout(sub)
+            sub_hl.setContentsMargins(0, 0, 0, 0)
+            sub_hl.setSpacing(4)
+            sub_hl.addWidget(_lbl(display_label + ":", size=11, weight=600,
+                                   color=_QB_HDR_FG))
+            val = _lbl("—", size=12, weight=700, color=_QB_BOLD_FG)
+            sub_hl.addWidget(val)
+            self._map[key] = (val, num_prefix)
+            hl.addWidget(sub)
+        hl.addStretch()
+
+    def set_value(self, key: str, value: float, decimals: int = 0) -> None:
+        if key in self._map:
+            lbl, prefix = self._map[key]
+            lbl.setText(_fmt_num(value, prefix=prefix, decimals=decimals))
+
+    def set_text(self, key: str, text: str) -> None:
+        if key in self._map:
+            self._map[key][0].setText(text)
+
+
+# ── COMESA file reader ─────────────────────────────────────────────────────────
+
+def _read_comesa_rows(path: str) -> List[dict]:
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to import COMESA files.")
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = next(
+        (wb[n] for n in wb.sheetnames if "comesa" in n.lower()),
+        wb.active,
+    )
+    records: List[dict] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or row[0] is None:
+            continue
+        try:
+            int(row[0])
+        except (TypeError, ValueError):
+            continue
+
+        card_no = str(row[2] or "").strip() if len(row) > 2 else ""
+        if not card_no:
+            continue
+
+        name      = str(row[1] or "").strip() if len(row) > 1 else ""
+        vf        = _fmt_date(row[3]) if (len(row) > 3 and row[3]) else ""
+        vt        = _fmt_date(row[4]) if (len(row) > 4 and row[4]) else ""
+        truck_reg = str(row[5] or "").strip() if len(row) > 5 else ""
+        raw_p     = row[6] if len(row) > 6 else None
+        try:
+            premium = float(raw_p) if raw_p is not None else 0.0
+        except (TypeError, ValueError):
+            premium = 0.0
+        month = str(row[7] or "").strip().upper() if len(row) > 7 else ""
+
+        records.append({
+            "feed_type":  "comesa",
+            "name":       name,
+            "card_no":    card_no,
+            "valid_from": vf,
+            "valid_to":   vt,
+            "truck_reg":  truck_reg,
+            "premium":    premium,
+            "month":      month,
+            "dedup_id":   card_no,
+        })
+    return records
+
+
+# ── Third Party file reader ────────────────────────────────────────────────────
+
+def _read_third_party_rows(path: str) -> List[dict]:
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to import Third Party files.")
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = next(
+        (wb[n] for n in wb.sheetnames
+         if "third" in n.lower() or "party" in n.lower()),
+        wb.active,
+    )
+    records: List[dict] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row:
+            continue
+
+        # ── PAID block: cols A(0)–H(7) ──────────────────────────────────────
+        if row[0] is not None:
+            try:
+                int(row[0])
+            except (TypeError, ValueError):
+                pass
+            else:
+                reg_no = str(row[3] or row[2] or "").strip() if len(row) > 3 else ""
+                name   = str(row[1] or "").strip() if len(row) > 1 else ""
+                raw_p  = row[4] if len(row) > 4 else None
+                month  = str(row[7] or "").strip().upper() if len(row) > 7 else ""
+                if reg_no:
+                    try:
+                        prem = float(raw_p) if raw_p is not None else 0.0
+                    except (TypeError, ValueError):
+                        prem = 0.0
+                    vat   = round(prem * 0.18, 2)
+                    total = round(prem + vat, 2)
+                    records.append({
+                        "feed_type":     "third_party",
+                        "name":          name,
+                        "reg_no":        reg_no,
+                        "premium":       prem,
+                        "vat":           vat,
+                        "total_premium": total,
+                        "month":         month,
+                        "status":        "PAID",
+                        "dedup_id":      f"{reg_no}|{month}|PAID",
+                    })
+
+        # ── UNPAID block: cols L(11)–Q(16) ──────────────────────────────────
+        if len(row) > 11 and row[11] is not None:
+            name_u  = str(row[11] or "").strip()
+            reg_u   = str(row[12] or "").strip() if len(row) > 12 else ""
+            raw_pu  = row[13] if len(row) > 13 else None
+            month_u = str(row[16] or "").strip().upper() if len(row) > 16 else ""
+            if reg_u:
+                try:
+                    prem_u = float(raw_pu) if raw_pu is not None else 0.0
+                except (TypeError, ValueError):
+                    prem_u = 0.0
+                vat_u   = round(prem_u * 0.18, 2)
+                total_u = round(prem_u + vat_u, 2)
+                records.append({
+                    "feed_type":     "third_party",
+                    "name":          name_u,
+                    "reg_no":        reg_u,
+                    "premium":       prem_u,
+                    "vat":           vat_u,
+                    "total_premium": total_u,
+                    "month":         month_u,
+                    "status":        "UNPAID",
+                    "dedup_id":      f"{reg_u}|{month_u}|UNPAID",
+                })
+    return records
+
+
+# ── Shared insurance import dialog ────────────────────────────────────────────
+
+class _InsuranceImportDialog(QDialog):
+    imported = Signal(int)
+
+    def __init__(
+        self,
+        feed_type: str,
+        reader_fn,
+        preview_headers: List[str],
+        preview_keys: List[str],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._feed_type      = feed_type
+        self._reader_fn      = reader_fn
+        self._preview_hdrs   = preview_headers
+        self._preview_keys   = preview_keys
+        self._new_rows: List[dict] = []
+        self.setWindowTitle(f"Import — {feed_type.replace('_', ' ').title()}")
+        self.setMinimumWidth(760)
+        self.setStyleSheet(f"background:{_WHITE};")
+        self._build()
+
+    def _build(self) -> None:
+        vl = QVBoxLayout(self)
+        vl.setSpacing(12)
+        vl.setContentsMargins(20, 20, 20, 20)
+
+        self._drop = _DropZone()
+        self._drop.file_dropped.connect(self._on_file)
+        vl.addWidget(self._drop)
+
+        browse_row = QWidget()
+        browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(browse_row)
+        brl.setContentsMargins(0, 0, 0, 0)
+        brl.setSpacing(8)
+        browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
+        browse_btn.clicked.connect(self._browse)
+        brl.addStretch()
+        brl.addWidget(browse_btn)
+        vl.addWidget(browse_row)
+
+        self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
+        vl.addWidget(self._stats_lbl)
+
+        vl.addWidget(_hsep())
+        vl.addWidget(_lbl("Preview (first 10 rows)", size=12, weight=600))
+
+        self._preview_tbl = _ins_make_table(self._preview_hdrs)
+        self._preview_tbl.setMinimumHeight(200)
+        self._preview_tbl.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        vl.addWidget(self._preview_tbl)
+
+        vl.addWidget(_hsep())
+
+        btn_row = QWidget()
+        btn_row.setStyleSheet("background:transparent;")
+        bbl = QHBoxLayout(btn_row)
+        bbl.setContentsMargins(0, 0, 0, 0)
+        bbl.addStretch()
+        cancel_btn = _btn("Cancel", primary=False)
+        cancel_btn.clicked.connect(self.reject)
+        bbl.addWidget(cancel_btn)
+        self._import_btn = _btn("Import Records", "mdi.check-circle-outline")
+        self._import_btn.setEnabled(False)
+        self._import_btn.clicked.connect(self._do_import)
+        bbl.addWidget(self._import_btn)
+        vl.addWidget(btn_row)
+
+    def _browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open File", "", "Excel (*.xlsx *.xls)"
+        )
+        if path:
+            self._drop.set_path(path)
+            self._on_file(path)
+
+    def _on_file(self, path: str) -> None:
+        self._stats_lbl.setText("Reading file…")
+        try:
+            records = self._reader_fn(path)
+        except Exception as exc:
+            self._stats_lbl.setText(f"Error reading file: {exc}")
+            return
+        keys = [r["dedup_id"] for r in records if r.get("dedup_id")]
+        asyncio.ensure_future(self._check_dupes(records, keys))
+
+    async def _check_dupes(self, records: List[dict], keys: List[str]) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            existing = await svc.get_existing_insurance_keys(self._feed_type, keys)
+        except Exception:
+            existing = set()
+        self._new_rows = [r for r in records if r.get("dedup_id") not in existing]
+        dupes = len(records) - len(self._new_rows)
+        self._stats_lbl.setText(
+            f"New records: {len(self._new_rows):,}  ·  Duplicates (skipped): {dupes:,}"
+        )
+        self._import_btn.setEnabled(bool(self._new_rows))
+        self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
+        self._fill_preview(self._new_rows[:10])
+
+    def _fill_preview(self, rows: List[dict]) -> None:
+        t = self._preview_tbl
+        t.setRowCount(0)
+        for row in rows:
+            r = t.rowCount()
+            t.insertRow(r)
+            for c, key in enumerate(self._preview_keys):
+                if c >= t.columnCount():
+                    break
+                val = row.get(key, "")
+                if isinstance(val, float):
+                    val = f"{val:,.0f}" if val else ""
+                t.setItem(r, c, _cell(str(val)))
+
+    def _do_import(self) -> None:
+        self._import_btn.setEnabled(False)
+        self._import_btn.setText("Importing…")
+        asyncio.ensure_future(self._async_import())
+
+    async def _async_import(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            saved = await svc.save_imported_feed(self._new_rows)
+            self.imported.emit(saved)
+            self.accept()
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Error", str(exc))
+            self._import_btn.setEnabled(True)
+            self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
+
+
+# ── QB-style info card shared by both insurance widgets ───────────────────────
+
+def _ins_info_card(title: str, icon_name: str) -> Tuple[QFrame, QLabel]:
+    card = QFrame()
+    card.setObjectName("ins_info_card")
+    card.setStyleSheet(
+        f"QFrame#ins_info_card{{background:{_QB_HDR_BG};"
+        "border:1px solid #BFDBFE;border-radius:8px;}}"
+    )
+    hl = QHBoxLayout(card)
+    hl.setContentsMargins(20, 14, 20, 14)
+    hl.setSpacing(14)
+
+    try:
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(qta.icon(icon_name, color=_QB_HDR_FG).pixmap(32, 32))
+        icon_lbl.setFixedSize(32, 32)
+        icon_lbl.setStyleSheet("background:transparent;")
+        hl.addWidget(icon_lbl)
+    except Exception:
+        pass
+
+    vl2 = QVBoxLayout()
+    vl2.setSpacing(2)
+    t_lbl = QLabel(title)
+    t_lbl.setStyleSheet(
+        f"color:{_QB_HDR_FG};font-size:18px;font-weight:700;"
+        "font-family:'Segoe UI',sans-serif;background:transparent;"
+    )
+    vl2.addWidget(t_lbl)
+    s_lbl = _lbl("Import records to get started", size=11, color=_T2)
+    vl2.addWidget(s_lbl)
+    hl.addLayout(vl2)
+    hl.addStretch()
+    return card, s_lbl
+
+
+# ── COMESA Excel exporter ──────────────────────────────────────────────────────
+
+def _export_comesa_xlsx(path: str, recs: List[dict]) -> None:
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required for Excel export.")
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "COMESA Covers"
+
+    thin     = Side(border_style="thin", color="E5E7EB")
+    bdr      = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hdr_fill = PatternFill("solid", fgColor="EFF6FF")
+    hdr_font = Font(name="Calibri", bold=True, size=11, color="1E3A5F")
+    alt_fill = PatternFill("solid", fgColor="F9FAFB")
+    nrm_font = Font(name="Calibri", size=11)
+
+    col_widths = [6, 30, 14, 14, 16, 16, 14, 12]
+    for c, w in enumerate(col_widths, 1):
+        ws.column_dimensions[ws.cell(1, c).column_letter].width = w
+
+    ws.row_dimensions[1].height = 30
+    hdrs = ["S/NO", "NAME", "CARD NO.", "VALID FROM", "VALID TO",
+            "TRUCK REG", "PREMIUM", "MONTH"]
+    for c, label in enumerate(hdrs, 1):
+        cell = ws.cell(row=1, column=c, value=label)
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.border = bdr
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for ri, rec in enumerate(recs, 2):
+        ws.row_dimensions[ri].height = 18
+        data = [
+            ri - 1,
+            rec.get("name", ""),
+            rec.get("card_no", ""),
+            rec.get("valid_from", ""),
+            rec.get("valid_to", ""),
+            rec.get("truck_reg", ""),
+            rec.get("premium") or None,
+            rec.get("month", ""),
+        ]
+        aligns = ["center", "left", "center", "center", "center",
+                  "center", "right", "center"]
+        for ci, (val, aln) in enumerate(zip(data, aligns), 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.font = nrm_font
+            cell.border = bdr
+            cell.alignment = Alignment(horizontal=aln, vertical="center")
+            if ri % 2 == 0:
+                cell.fill = alt_fill
+
+    wb.save(path)
+
+
+# ── Third Party Excel exporter ────────────────────────────────────────────────
+
+def _export_third_party_xlsx(path: str, recs: List[dict]) -> None:
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required for Excel export.")
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Third Party Covers"
+
+    thin      = Side(border_style="thin", color="E5E7EB")
+    bdr       = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hdr_fill  = PatternFill("solid", fgColor="EFF6FF")
+    hdr_font  = Font(name="Calibri", bold=True, size=11, color="1E3A5F")
+    alt_fill  = PatternFill("solid", fgColor="F9FAFB")
+    paid_fill = PatternFill("solid", fgColor="DCFCE7")
+    upd_fill  = PatternFill("solid", fgColor="FEF3C7")
+    nrm_font  = Font(name="Calibri", size=11)
+
+    col_widths = [6, 30, 16, 14, 14, 16, 12, 10]
+    for c, w in enumerate(col_widths, 1):
+        ws.column_dimensions[ws.cell(1, c).column_letter].width = w
+
+    ws.row_dimensions[1].height = 30
+    hdrs = ["S/NO", "NAME", "REG. NO.", "PREMIUM", "VAT 18%",
+            "TOTAL PREMIUM", "MONTH", "STATUS"]
+    for c, label in enumerate(hdrs, 1):
+        cell = ws.cell(row=1, column=c, value=label)
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.border = bdr
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for ri, rec in enumerate(recs, 2):
+        ws.row_dimensions[ri].height = 18
+        status = rec.get("status", "")
+        row_fill = (
+            paid_fill if status == "PAID" else
+            upd_fill  if status == "UNPAID" else
+            (alt_fill if ri % 2 == 0 else None)
+        )
+        data = [
+            ri - 1,
+            rec.get("name", ""),
+            rec.get("reg_no", ""),
+            rec.get("premium") or None,
+            rec.get("vat") or None,
+            rec.get("total_premium") or None,
+            rec.get("month", ""),
+            status,
+        ]
+        aligns = ["center", "left", "center", "right", "right",
+                  "right", "center", "center"]
+        for ci, (val, aln) in enumerate(zip(data, aligns), 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.font = nrm_font
+            cell.border = bdr
+            cell.alignment = Alignment(horizontal=aln, vertical="center")
+            if row_fill:
+                cell.fill = row_fill
+
+    wb.save(path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COMESA Covers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_COMESA_HEADERS         = ["S/NO", "NAME", "CARD NO.", "VALID FROM",
+                            "VALID TO", "TRUCK REG", "PREMIUM", "MONTH"]
+_COMESA_PREVIEW_HEADERS = ["NAME", "CARD NO.", "VALID FROM", "VALID TO",
+                            "TRUCK REG", "PREMIUM", "MONTH"]
+_COMESA_PREVIEW_KEYS    = ["name", "card_no", "valid_from", "valid_to",
+                            "truck_reg", "premium", "month"]
+
+
+class ComesaWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._page      = 1
+        self._page_size = 50
+        self._total     = 0
+        self._search    = ""
+        self._month     = ""
+        self._build()
+        self.refresh()
+
+    def _build(self) -> None:
+        self.setStyleSheet(f"background:{_BG};")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(20, 16, 20, 12)
+        vl.setSpacing(8)
+
+        # QB info card
+        self._info_card, self._summary_lbl = _ins_info_card(
+            "COMESA Covers", "mdi.certificate"
+        )
+        vl.addWidget(self._info_card)
+
+        # Toolbar
+        tb  = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search card no., truck, name…")
+        self._search_edit.setFixedWidth(250)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._month_cb = QComboBox()
+        for m in _INS_MONTHS:
+            self._month_cb.addItem(m, "" if m == "All Months" else m)
+        self._month_cb.setFixedWidth(155)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+        tbl.addStretch()
+
+        self._import_btn = _btn("Import", "mdi.upload-outline", height=32)
+        self._export_btn = _btn("Export", "mdi.download-outline",
+                                primary=False, height=32)
+        self._import_btn.clicked.connect(self._do_import)
+        self._export_btn.clicked.connect(self._do_export)
+        tbl.addWidget(self._import_btn)
+        tbl.addWidget(self._export_btn)
+        vl.addWidget(tb)
+
+        # Table card
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};"
+            "border-radius:6px;}}"
+        )
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+
+        self._table = _ins_make_table(_COMESA_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self._table.horizontalHeader().setStretchLastSection(True)
+        cl.addWidget(self._table, 1)
+
+        self._totals_bar = _InsTotalsBar([
+            ("premium", "TOTAL PREMIUM", "TSh "),
+            ("records", "RECORDS", ""),
+        ])
+        cl.addWidget(self._totals_bar)
+        vl.addWidget(card, 1)
+
+        self._pager = _PaginationBar()
+        self._pager.page_changed.connect(self._go_page)
+        self._pager.size_changed.connect(self._on_page_size)
+        vl.addWidget(self._pager)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        skip = (self._page - 1) * self._page_size
+        recs, total, totals = await asyncio.gather(
+            svc.get_insurance_feed(
+                "comesa", self._search, self._month, "",
+                self._page_size, skip,
+            ),
+            svc.count_insurance_feed("comesa", self._search, self._month),
+            svc.get_insurance_totals("comesa", self._month),
+        )
+        self._total = total
+        self._fill_table(recs)
+        self._pager.set_total(total, self._page_size, self._page)
+
+        prem = totals.get("premium", 0.0)
+        self._totals_bar.set_value("premium", prem)
+        self._totals_bar.set_text("records", f"{total:,}")
+        self._summary_lbl.setText(
+            f"{total:,} records  ·  Total Premium: TSh {prem:,.0f}"
+        )
+
+    def _fill_table(self, recs: List[dict]) -> None:
+        t   = self._table
+        off = (self._page - 1) * self._page_size
+        t.setRowCount(0)
+        for idx, rec in enumerate(recs, off + 1):
+            r = t.rowCount()
+            t.insertRow(r)
+            t.setItem(r, 0, _cell(str(idx),
+                                   Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 1, _cell(rec.get("name", "")))
+            t.setItem(r, 2, _cell(rec.get("card_no", ""), mono=True))
+            t.setItem(r, 3, _cell(rec.get("valid_from", "")))
+            t.setItem(r, 4, _cell(rec.get("valid_to", "")))
+            t.setItem(r, 5, _cell(rec.get("truck_reg", ""), mono=True))
+            prem = rec.get("premium", 0.0)
+            t.setItem(r, 6, _cell(
+                _fmt_num(prem, decimals=0) if prem else "—",
+                Qt.AlignRight | Qt.AlignVCenter, mono=True,
+            ))
+            t.setItem(r, 7, _cell(rec.get("month", ""),
+                                   Qt.AlignCenter | Qt.AlignVCenter))
+
+    def _do_import(self) -> None:
+        dlg = _InsuranceImportDialog(
+            "comesa", _read_comesa_rows,
+            _COMESA_PREVIEW_HEADERS, _COMESA_PREVIEW_KEYS,
+            parent=self,
+        )
+        dlg.imported.connect(lambda n: (
+            QMessageBox.information(
+                self, "Import Complete", f"Imported {n:,} new records."
+            ),
+            self.refresh(),
+        ))
+        dlg.exec()
+
+    def _do_export(self) -> None:
+        if self._total == 0:
+            QMessageBox.information(self, "Export", "No records to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export COMESA Covers", "COMESA_Covers.xlsx",
+            "Excel (*.xlsx)",
+        )
+        if path:
+            asyncio.ensure_future(self._async_export(path))
+
+    async def _async_export(self, path: str) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            recs = await svc.get_insurance_feed(
+                "comesa", self._search, self._month, "", 10000, 0
+            )
+            _export_comesa_xlsx(path, recs)
+            QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Error", str(exc))
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._page   = 1
+        asyncio.ensure_future(self._load())
+
+    def _on_month(self) -> None:
+        self._month = self._month_cb.currentData() or ""
+        self._page  = 1
+        asyncio.ensure_future(self._load())
+
+    def _go_page(self, page: int) -> None:
+        self._page = page
+        asyncio.ensure_future(self._load())
+
+    def _on_page_size(self, size: int) -> None:
+        self._page_size = size
+        self._page      = 1
+        asyncio.ensure_future(self._load())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Third Party Covers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_TP_HEADERS         = ["S/NO", "NAME", "REG. NO.", "PREMIUM",
+                        "VAT 18%", "TOTAL PREMIUM", "MONTH", "STATUS"]
+_TP_PREVIEW_HEADERS = ["NAME", "REG. NO.", "PREMIUM", "VAT 18%",
+                        "TOTAL PREMIUM", "MONTH", "STATUS"]
+_TP_PREVIEW_KEYS    = ["name", "reg_no", "premium", "vat",
+                        "total_premium", "month", "status"]
+
+_STATUS_COLORS = {
+    "PAID":   (_GREEN, _GREEN_L),
+    "UNPAID": (_AMBER, _AMBER_L),
+}
+
+
+class ThirdPartyWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._page      = 1
+        self._page_size = 50
+        self._total     = 0
+        self._search    = ""
+        self._month     = ""
+        self._status    = ""
+        self._build()
+        self.refresh()
+
+    def _build(self) -> None:
+        self.setStyleSheet(f"background:{_BG};")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(20, 16, 20, 12)
+        vl.setSpacing(8)
+
+        # QB info card
+        self._info_card, self._summary_lbl = _ins_info_card(
+            "Third Party Covers", "mdi.shield-account"
+        )
+        vl.addWidget(self._info_card)
+
+        # Toolbar
+        tb  = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search reg. no., name…")
+        self._search_edit.setFixedWidth(220)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._month_cb = QComboBox()
+        for m in _INS_MONTHS:
+            self._month_cb.addItem(m, "" if m == "All Months" else m)
+        self._month_cb.setFixedWidth(155)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+
+        self._status_cb = QComboBox()
+        for label, val in [("All Status", ""), ("PAID", "PAID"),
+                            ("UNPAID", "UNPAID")]:
+            self._status_cb.addItem(label, val)
+        self._status_cb.setFixedWidth(120)
+        self._status_cb.setStyleSheet(_input_ss())
+        self._status_cb.currentIndexChanged.connect(self._on_status)
+        tbl.addWidget(self._status_cb)
+        tbl.addStretch()
+
+        self._import_btn = _btn("Import", "mdi.upload-outline", height=32)
+        self._export_btn = _btn("Export", "mdi.download-outline",
+                                primary=False, height=32)
+        self._import_btn.clicked.connect(self._do_import)
+        self._export_btn.clicked.connect(self._do_export)
+        tbl.addWidget(self._import_btn)
+        tbl.addWidget(self._export_btn)
+        vl.addWidget(tb)
+
+        # Table card
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};"
+            "border-radius:6px;}}"
+        )
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+
+        self._table = _ins_make_table(_TP_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self._table.horizontalHeader().setStretchLastSection(True)
+        cl.addWidget(self._table, 1)
+
+        self._totals_bar = _InsTotalsBar([
+            ("premium", "PREMIUM",      "TSh "),
+            ("vat",     "VAT 18%",      "TSh "),
+            ("total",   "TOTAL",        "TSh "),
+            ("records", "RECORDS",      ""),
+        ])
+        cl.addWidget(self._totals_bar)
+        vl.addWidget(card, 1)
+
+        self._pager = _PaginationBar()
+        self._pager.page_changed.connect(self._go_page)
+        self._pager.size_changed.connect(self._on_page_size)
+        vl.addWidget(self._pager)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        skip = (self._page - 1) * self._page_size
+        recs, total, totals = await asyncio.gather(
+            svc.get_insurance_feed(
+                "third_party", self._search, self._month, self._status,
+                self._page_size, skip,
+            ),
+            svc.count_insurance_feed(
+                "third_party", self._search, self._month, self._status
+            ),
+            svc.get_insurance_totals(
+                "third_party", self._month, self._status
+            ),
+        )
+        self._total = total
+        self._fill_table(recs)
+        self._pager.set_total(total, self._page_size, self._page)
+
+        prem = totals.get("premium", 0.0)
+        vat  = totals.get("vat",     0.0)
+        tot  = totals.get("total_premium", 0.0)
+        self._totals_bar.set_value("premium", prem)
+        self._totals_bar.set_value("vat",     vat)
+        self._totals_bar.set_value("total",   tot)
+        self._totals_bar.set_text("records",  f"{total:,}")
+        self._summary_lbl.setText(
+            f"{total:,} records  ·  Premium: TSh {prem:,.0f}"
+            f"  ·  Total inc. VAT: TSh {tot:,.0f}"
+        )
+
+    def _fill_table(self, recs: List[dict]) -> None:
+        t   = self._table
+        off = (self._page - 1) * self._page_size
+        t.setRowCount(0)
+        for idx, rec in enumerate(recs, off + 1):
+            r = t.rowCount()
+            t.insertRow(r)
+            t.setItem(r, 0, _cell(str(idx),
+                                   Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 1, _cell(rec.get("name", "")))
+            t.setItem(r, 2, _cell(rec.get("reg_no", ""), mono=True))
+            prem = rec.get("premium", 0.0)
+            vat  = rec.get("vat",     0.0)
+            tot  = rec.get("total_premium", 0.0)
+            t.setItem(r, 3, _cell(
+                _fmt_num(prem, decimals=0) if prem else "—",
+                Qt.AlignRight | Qt.AlignVCenter, mono=True,
+            ))
+            t.setItem(r, 4, _cell(
+                _fmt_num(vat, decimals=0) if vat else "—",
+                Qt.AlignRight | Qt.AlignVCenter, mono=True,
+            ))
+            t.setItem(r, 5, _cell(
+                _fmt_num(tot, decimals=0) if tot else "—",
+                Qt.AlignRight | Qt.AlignVCenter, mono=True,
+            ))
+            t.setItem(r, 6, _cell(rec.get("month", ""),
+                                   Qt.AlignCenter | Qt.AlignVCenter))
+
+            status = rec.get("status", "")
+            s_item = _cell(status, Qt.AlignCenter | Qt.AlignVCenter)
+            if status in _STATUS_COLORS:
+                fg, bg = _STATUS_COLORS[status]
+                s_item.setForeground(QColor(fg))
+                s_item.setBackground(QColor(bg))
+            t.setItem(r, 7, s_item)
+
+    def _do_import(self) -> None:
+        dlg = _InsuranceImportDialog(
+            "third_party", _read_third_party_rows,
+            _TP_PREVIEW_HEADERS, _TP_PREVIEW_KEYS,
+            parent=self,
+        )
+        dlg.imported.connect(lambda n: (
+            QMessageBox.information(
+                self, "Import Complete", f"Imported {n:,} new records."
+            ),
+            self.refresh(),
+        ))
+        dlg.exec()
+
+    def _do_export(self) -> None:
+        if self._total == 0:
+            QMessageBox.information(self, "Export", "No records to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Third Party Covers", "ThirdParty_Covers.xlsx",
+            "Excel (*.xlsx)",
+        )
+        if path:
+            asyncio.ensure_future(self._async_export(path))
+
+    async def _async_export(self, path: str) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            recs = await svc.get_insurance_feed(
+                "third_party", self._search, self._month, self._status,
+                10000, 0,
+            )
+            _export_third_party_xlsx(path, recs)
+            QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Error", str(exc))
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._page   = 1
+        asyncio.ensure_future(self._load())
+
+    def _on_month(self) -> None:
+        self._month = self._month_cb.currentData() or ""
+        self._page  = 1
+        asyncio.ensure_future(self._load())
+
+    def _on_status(self) -> None:
+        self._status = self._status_cb.currentData() or ""
+        self._page   = 1
+        asyncio.ensure_future(self._load())
+
+    def _go_page(self, page: int) -> None:
+        self._page = page
+        asyncio.ensure_future(self._load())
+
+    def _on_page_size(self, size: int) -> None:
+        self._page_size = size
+        self._page      = 1
+        asyncio.ensure_future(self._load())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
