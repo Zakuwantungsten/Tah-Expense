@@ -162,8 +162,8 @@ class _DateDelegate(QStyledItemDelegate):
             cur = self._get_current_date()
             suggestion = QDate(cur.year, cur.month, cur.day).toString("dd/MM/yyyy")
             painter.save()
-            painter.fillRect(option.rect, QColor("#fff3e8"))
-            painter.setPen(QColor("#E85D04"))
+            painter.fillRect(option.rect, QColor("#cde0f5"))
+            painter.setPen(QColor("#0077C5"))
             painter.drawText(
                 option.rect.adjusted(6, 0, -22, 0),
                 Qt.AlignVCenter | Qt.AlignLeft,
@@ -354,21 +354,22 @@ class DailyRegister(QWidget):
                 background: #ffffff;
                 gridline-color: #e5e7eb;
                 border: none;
-                selection-background-color: #fff3e8;
-                selection-color: #111827;
+                selection-background-color: #cde0f5;
+                selection-color: #1B2B4B;
             }
             QHeaderView::section {
-                background: #f1f5f9;
-                color: #334155;
+                background: #253A5C;
+                color: #F9FAFB;
                 font-weight: 600;
                 font-size: 11px;
                 padding: 5px 8px;
                 border: none;
-                border-right: 1px solid #cbd5e1;
-                border-bottom: 2px solid #cbd5e1;
+                border-right: 1px solid #1B2B4B;
+                border-bottom: 2px solid #0077C5;
             }
             QTableWidget::item         { padding: 2px 6px; color: #111827; }
-            QTableWidget::item:selected { color: #111827; }
+            QTableWidget::item:selected { color: #1B2B4B; font-weight: 500; }
+            QTableWidget::item:hover   { background: #eaf3fb; }
             QLineEdit { color: #111827; background: #ffffff; }
         """)
 
@@ -755,9 +756,24 @@ class DailyRegister(QWidget):
         key = event.key()
 
         if mod == Qt.ControlModifier:
-            if key == Qt.Key_C: self._copy();  return
-            if key == Qt.Key_X: self._cut();   return
-            if key == Qt.Key_V: self._paste(); return
+            if key == Qt.Key_C:    self._copy();                               return
+            if key == Qt.Key_X:    self._cut();                                return
+            if key == Qt.Key_V:    self._paste();                              return
+            if key == Qt.Key_A:    self._table.selectAll();                    return
+            if key == Qt.Key_D:    self._fill_down();                          return
+            if key == Qt.Key_R:    self._fill_right();                         return
+            if key == Qt.Key_Home: self._table.setCurrentCell(0, 0);          return
+            if key == Qt.Key_End:  self._go_to_last_cell();                   return
+
+        if mod == Qt.ShiftModifier:
+            if key in (Qt.Key_Return, Qt.Key_Enter): self._step(-1, 0);      return
+            if key == Qt.Key_Space:                  self._select_row();      return
+
+        if key == Qt.Key_F2:
+            it = self._table.currentItem()
+            if it:
+                self._table.editItem(it)
+            return
 
         if key in (Qt.Key_Delete, Qt.Key_Backspace):
             self._clear_selected(); return
@@ -832,22 +848,24 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
 
     def _copy(self) -> None:
-        ranges = self._table.selectedRanges()
-        if not ranges:
+        items = self._table.selectedItems()
+        if not items:
             return
-        r = ranges[0]
+        rows = sorted(set(it.row() for it in items))
+        cols = sorted(set(it.column() for it in items))
+        cell_map = {(it.row(), it.column()): it for it in items}
         lines = []
-        for row in range(r.topRow(), r.bottomRow() + 1):
-            cells = []
-            for col in range(r.leftColumn(), r.rightColumn() + 1):
-                item = self._table.item(row, col)
-                if item is None:
-                    cells.append("")
+        for row in rows:
+            row_cells = []
+            for col in cols:
+                it = cell_map.get((row, col))
+                if it is None:
+                    row_cells.append("")
                 elif col in CHECK_COLS:
-                    cells.append("1" if item.data(Qt.UserRole) else "0")
+                    row_cells.append("1" if it.data(Qt.UserRole) else "0")
                 else:
-                    cells.append(item.text())
-            lines.append("\t".join(cells))
+                    row_cells.append(it.text())
+            lines.append("\t".join(row_cells))
         QApplication.clipboard().setText("\n".join(lines))
 
     def _cut(self) -> None:
@@ -858,8 +876,14 @@ class DailyRegister(QWidget):
         text = QApplication.clipboard().text()
         if not text:
             return
-        start_row = max(self._table.currentRow(), self._saved_count)
-        start_col = self._table.currentColumn()
+        # Anchor at top-left of current selection (Excel behaviour)
+        sel = self._table.selectedItems()
+        if sel:
+            start_row = max(min(it.row() for it in sel), self._saved_count)
+            start_col = min(it.column() for it in sel)
+        else:
+            start_row = max(self._table.currentRow(), self._saved_count)
+            start_col = self._table.currentColumn()
         self._table.blockSignals(True)
         for r, line in enumerate(text.splitlines()):
             for c, cell in enumerate(line.split("\t")):
@@ -904,6 +928,78 @@ class DailyRegister(QWidget):
             else:
                 item.setText("")
         self._table.blockSignals(False)
+
+    def _fill_down(self) -> None:
+        """Ctrl+D: copy the top row of the selection into all rows below it."""
+        items = self._table.selectedItems()
+        if not items:
+            return
+        rows = sorted(set(it.row() for it in items))
+        cols = sorted(set(it.column() for it in items))
+        if len(rows) < 2:
+            return
+        source_row = rows[0]
+        cell_map = {(it.row(), it.column()): it for it in items}
+        self._table.blockSignals(True)
+        for col in cols:
+            if col in READONLY_COLS:
+                continue
+            src = cell_map.get((source_row, col))
+            if src is None:
+                continue
+            for row in rows[1:]:
+                if row < self._saved_count:
+                    continue
+                if col in CHECK_COLS:
+                    it = self._table.item(row, col) or QTableWidgetItem()
+                    it.setData(Qt.UserRole, src.data(Qt.UserRole))
+                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                    self._table.setItem(row, col, it)
+                else:
+                    self._table.setItem(row, col, QTableWidgetItem(src.text()))
+        self._table.blockSignals(False)
+        self._renumber()
+
+    def _fill_right(self) -> None:
+        """Ctrl+R: copy the leftmost column of the selection into all cols to its right."""
+        items = self._table.selectedItems()
+        if not items:
+            return
+        rows = sorted(set(it.row() for it in items))
+        cols = sorted(set(it.column() for it in items))
+        if len(cols) < 2:
+            return
+        source_col = cols[0]
+        cell_map = {(it.row(), it.column()): it for it in items}
+        self._table.blockSignals(True)
+        for row in rows:
+            if row < self._saved_count:
+                continue
+            src = cell_map.get((row, source_col))
+            if src is None:
+                continue
+            for col in cols[1:]:
+                if col in READONLY_COLS or col in CHECK_COLS:
+                    continue
+                self._table.setItem(row, col, QTableWidgetItem(src.text()))
+        self._table.blockSignals(False)
+        self._renumber()
+
+    def _go_to_last_cell(self) -> None:
+        """Ctrl+End: jump to the last cell that contains data."""
+        last_row, last_col = 0, 0
+        for row in range(self._table.rowCount()):
+            for col in range(1, self._table.columnCount()):
+                it = self._table.item(row, col)
+                if it and it.text().strip():
+                    last_row = max(last_row, row)
+                    last_col = max(last_col, col)
+        self._table.setCurrentCell(last_row, last_col)
+        self._table.scrollTo(self._table.model().index(last_row, last_col))
+
+    def _select_row(self) -> None:
+        """Shift+Space: select the entire current row."""
+        self._table.selectRow(self._table.currentRow())
 
     # ------------------------------------------------------------------
     # Context menu
