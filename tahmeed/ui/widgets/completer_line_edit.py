@@ -81,12 +81,16 @@ class CompleterLineEdit(QLineEdit):
     - Down / Up navigate the popup; Tab / Enter accept the highlighted item
       (writing the canonical value). If multiple matches exist and none is
       selected, Tab / Enter commit the typed text as-is.
+    - Delete / Backspace while a preview is showing dismisses the preview
+      (restores the typed text) without accepting or re-triggering it.
     """
 
     def __init__(self, values: List[str], parent: Optional[QLineEdit] = None) -> None:
         super().__init__(parent)
         self._values = list(values or [])
-        self._typed = ""  # last text the user actually typed (not from the preview)
+        self._typed = ""          # last text the user actually typed (not from the preview)
+        self._suppress_preview = False  # True after Delete dismisses preview
+        self._preview_active   = False  # True while a preview suggestion is displayed
 
         self._model = QStringListModel(self._values, self)
         self._completer = QCompleter(self._model, self)
@@ -113,15 +117,62 @@ class CompleterLineEdit(QLineEdit):
 
     def _on_text_edited(self, text: str) -> None:
         self._typed = text
+        self._suppress_preview = False  # new keystroke — re-enable auto-preview
+        self._preview_active   = False
 
     def _on_highlighted(self, suggestion: str) -> None:
-        show_completion_preview(self, self._typed, suggestion)
+        # Fired when user navigates the popup (Down/Up). Re-derive the typed
+        # prefix from field state because the field may currently be showing a
+        # previous preview (the suffix is a text selection beyond the real cursor).
+        current = self.text()
+        typed = current[:self.selectionStart()] if self.hasSelectedText() else current
+        self._typed = typed
+        show_completion_preview(self, typed, suggestion)
+        self._preview_active = True
 
     def _schedule_highlight(self, _text: str) -> None:
-        QTimer.singleShot(0, lambda: highlight_first(self._completer))
+        if self._suppress_preview:
+            return
+        QTimer.singleShot(0, self._apply_first_suggestion_preview)
+
+    def _apply_first_suggestion_preview(self) -> None:
+        """Show the first matching suggestion as an inline preview.
+
+        Called via QTimer so _typed is already up-to-date with what the user
+        typed.  Reads the suggestion directly from the completion model instead
+        of relying on the highlighted signal, which only fires when the popup's
+        current index *changes* — meaning it silently does nothing on the second
+        and subsequent keystrokes when the same suggestion stays at row 0.
+        """
+        if self._suppress_preview:
+            return
+        model = self._completer.completionModel()
+        if model is None or model.rowCount() == 0:
+            return
+        suggestion = model.index(0, 0).data(Qt.DisplayRole)
+        if not suggestion:
+            return
+        popup = self._completer.popup()
+        if popup is not None and popup.isVisible():
+            popup.setCurrentIndex(model.index(0, 0))
+        show_completion_preview(self, self._typed, suggestion)
+        self._preview_active = True
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter):
+        key = event.key()
+
+        # Delete/Backspace while a preview suggestion is displayed: dismiss the
+        # preview (restore typed text) instead of deleting it and re-triggering
+        # the autocomplete cycle.
+        if key in (Qt.Key_Delete, Qt.Key_Backspace) and self._preview_active:
+            self._suppress_preview = True
+            self._preview_active   = False
+            self.setText(self._typed)
+            self.setCursorPosition(len(self._typed))
+            event.accept()
+            return
+
+        if key in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter):
             if accept_completion(self, self._completer):
                 event.accept()
                 return

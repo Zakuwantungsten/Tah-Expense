@@ -195,6 +195,7 @@ class _ExcelCellDelegate(QStyledItemDelegate):
                 self.closeEditor.emit(obj, QAbstractItemDelegate.NoHint)
                 table = self.parent()
                 if table is not None:
+                    table.setFocus()  # reclaim focus before the timer fires
                     reg = table.parent()
                     if hasattr(reg, '_tab_forward'):
                         QTimer.singleShot(0, reg._tab_forward)
@@ -205,6 +206,7 @@ class _ExcelCellDelegate(QStyledItemDelegate):
                 self.closeEditor.emit(obj, QAbstractItemDelegate.NoHint)
                 table = self.parent()
                 if table is not None:
+                    table.setFocus()  # reclaim focus before the timer fires
                     reg = table.parent()
                     if hasattr(reg, '_step'):
                         QTimer.singleShot(0, lambda: reg._step(+1, 0))
@@ -1039,6 +1041,7 @@ class DailyRegister(QWidget):
             self._table.setCurrentCell(next_row, first_col)
         else:
             self._table.setCurrentCell(row, next_col)
+        self._table.setFocus()  # ensure keyboard focus stays on the table
 
     def _install_key_handler(self) -> None:
         self._key_filter = _TableKeyFilter(self._table_key_press)
