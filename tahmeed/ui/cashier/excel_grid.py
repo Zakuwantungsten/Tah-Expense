@@ -670,6 +670,7 @@ class DailyRegister(QWidget):
         self._table.setItemDelegateForColumn(COL_RECEIPT, _ReceiptDelegate(self._table))
 
         self._table.itemChanged.connect(self._on_item_changed)
+        self._table.model().dataChanged.connect(self._on_model_data_changed)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._show_context_menu)
 
@@ -744,7 +745,7 @@ class DailyRegister(QWidget):
         self._init_editable_rows(self._saved_count, total_rows)
         self._table.blockSignals(False)
         self._renumber()
-        self._update_footer(transactions)
+        self._update_footer()
 
     # ------------------------------------------------------------------
     # Row initialisation helpers
@@ -810,13 +811,24 @@ class DailyRegister(QWidget):
     # Footer
     # ------------------------------------------------------------------
 
-    def _update_footer(self, transactions: Optional[List[Transaction]] = None) -> None:
-        if transactions is None:
-            n, tzs, refund = 0, 0.0, 0.0
-        else:
-            n      = len(transactions)
-            tzs    = sum(t.amount for t in transactions)
-            refund = sum(t.amount for t in transactions if t.notes_flag)
+    def _update_footer(self) -> None:
+        n, tzs, refund = 0, 0.0, 0.0
+        for row in range(self._table.rowCount()):
+            tzs_it = self._table.item(row, COL_TZS)
+            if not tzs_it:
+                continue
+            raw = tzs_it.text().strip().replace(",", "")
+            if not raw:
+                continue
+            try:
+                amount = float(raw)
+            except ValueError:
+                continue
+            n += 1
+            tzs += amount
+            notes_it = self._table.item(row, COL_NOTES)
+            if notes_it and notes_it.data(Qt.UserRole) is True:
+                refund += amount
 
         amount_str = f"TZS {tzs:,.0f}" if tzs else "—"
         self._totals_label.setText(
@@ -910,6 +922,13 @@ class DailyRegister(QWidget):
         # Dynamic row expansion near the bottom
         if row >= self._table.rowCount() - 5 and item.text().strip():
             self._append_editable_rows(10)
+
+        if col == COL_TZS:
+            self._update_footer()
+
+    def _on_model_data_changed(self, top_left, bottom_right, roles=()) -> None:
+        if top_left.column() == COL_NOTES and Qt.UserRole in roles:
+            self._update_footer()
 
     def _activate_row(self, row: int) -> None:
         """Make a blank editable row visible: set S/NO number and create input items."""
