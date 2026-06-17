@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QStyle, QComboBox, QDialog,
 )
 from PySide6.QtCore import Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer
-from PySide6.QtGui import QKeyEvent, QColor, QBrush, QFont, QPen, QPainter
+from PySide6.QtGui import QAction, QKeyEvent, QColor, QBrush, QFont, QPen, QPainter
 
 from tahmeed.models.category import Category
 from tahmeed.models.transaction import Transaction
@@ -567,6 +567,138 @@ class _TableKeyFilter(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Column filter header
+# ---------------------------------------------------------------------------
+
+_FILTER_COLS = set(range(len(HEADERS))) - {COL_SNO}
+
+
+class _FilterMenu(QMenu):
+    """QMenu that stays open when the user clicks checkable (filter) items,
+    so they can tick multiple values before closing."""
+
+    def mouseReleaseEvent(self, event):
+        action = self.activeAction()
+        if action and action.isCheckable():
+            action.setChecked(not action.isChecked())
+            # Do NOT call super — that would close the menu
+        else:
+            super().mouseReleaseEvent(event)
+
+
+class _FilterHeaderView(QHeaderView):
+    """Horizontal header that paints a ▾ chevron on filterable columns and
+    opens a multi-select filter menu on click in the chevron area."""
+
+    filter_changed = Signal(int, set)   # (col_index, accepted_values); empty = cleared
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self._active: dict = {}   # col -> set of accepted values
+
+    # ── Painting ──────────────────────────────────────────────────────────
+    def paintSection(self, painter, rect, logical_index):
+        super().paintSection(painter, rect, logical_index)
+        if logical_index not in _FILTER_COLS or rect.width() < 28:
+            return
+        painter.save()
+        is_active = bool(self._active.get(logical_index))
+        painter.setPen(QColor("#EA580C") if is_active else QColor("#94A3B8"))
+        f = painter.font()
+        f.setPointSize(7)
+        painter.setFont(f)
+        painter.drawText(
+            QRect(rect.right() - 15, rect.top(), 13, rect.height()),
+            Qt.AlignVCenter | Qt.AlignHCenter,
+            "▾",
+        )
+        painter.restore()
+
+    # ── Click handling ────────────────────────────────────────────────────
+    def mousePressEvent(self, event):
+        col = self.logicalIndexAt(event.pos())
+        if col in _FILTER_COLS:
+            x      = event.pos().x()
+            col_x  = self.sectionViewportPosition(col)
+            col_w  = self.sectionSize(col)
+            if x >= col_x + col_w - 20:
+                self._open_menu(col, event.globalPosition().toPoint())
+                return
+        super().mousePressEvent(event)
+
+    def _open_menu(self, col: int, global_pos) -> None:
+        table = self.parent()
+        if not isinstance(table, QTableWidget):
+            return
+
+        # Collect unique non-empty values visible in this column
+        values: set = set()
+        for row in range(table.rowCount()):
+            it = table.item(row, col)
+            if not it:
+                continue
+            if col == COL_NOTES:
+                if it.data(Qt.UserRole) is True:
+                    values.add("Refund to Float")
+            else:
+                v = it.text().strip()
+                if v:
+                    values.add(v)
+
+        if not values:
+            return
+
+        current = self._active.get(col, set())
+
+        menu = _FilterMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: #ffffff;
+                border: 1px solid #D1D5DB;
+                border-radius: 6px;
+                padding: 4px 0;
+                min-width: 190px;
+            }
+            QMenu::item {
+                padding: 5px 16px 5px 30px;
+                font-size: 12px;
+                color: #111827;
+            }
+            QMenu::item:selected { background: #EFF6FF; color: #0077C5; }
+            QMenu::item:checked  { font-weight: 600; }
+            QMenu::separator     { height: 1px; background: #E5E7EB; margin: 4px 0; }
+        """)
+
+        clear_act = menu.addAction("Show All")
+        clear_act.setEnabled(bool(current))
+        menu.addSeparator()
+
+        for val in sorted(values, key=lambda v: v.lower()):
+            act = QAction(val, menu)
+            act.setCheckable(True)
+            act.setChecked(val in current)
+            menu.addAction(act)
+
+        chosen = menu.exec(global_pos)
+
+        if chosen is clear_act:
+            new_filter: set = set()
+        else:
+            new_filter = {
+                act.text() for act in menu.actions()
+                if act.isCheckable() and act.isChecked()
+            }
+
+        if new_filter:
+            self._active[col] = new_filter
+        else:
+            self._active.pop(col, None)
+
+        self.filter_changed.emit(col, new_filter)
+        self.viewport().update()
+
+
+# ---------------------------------------------------------------------------
 # DailyRegister
 # ---------------------------------------------------------------------------
 
@@ -592,6 +724,8 @@ class DailyRegister(QWidget):
         self._retry_timer        = QTimer(self)
         self._retry_timer.setSingleShot(True)
         self._retry_timer.timeout.connect(self._on_retry_timer)
+        self._col_filters: dict  = {}   # col -> set of accepted values
+        self._search_text: str   = ""
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_restrict_setting())
@@ -609,6 +743,9 @@ class DailyRegister(QWidget):
 
         # ── Table ──────────────────────────────────────────────────────
         self._table = QTableWidget(DEFAULT_EDITABLE_ROWS, len(HEADERS))
+        _fhv = _FilterHeaderView(self._table)
+        _fhv.filter_changed.connect(self._on_col_filter_changed)
+        self._table.setHorizontalHeader(_fhv)
         self._table.setHorizontalHeaderLabels(HEADERS)
         self._table.setStyleSheet("""
             QTableWidget {
@@ -753,6 +890,7 @@ class DailyRegister(QWidget):
         self._table.blockSignals(False)
         self._renumber()
         self._update_footer()
+        self._apply_filters()
 
     # ------------------------------------------------------------------
     # Row initialisation helpers
@@ -968,6 +1106,62 @@ class DailyRegister(QWidget):
     def _on_retry_timer(self) -> None:
         for row in list(self._retry_queue):
             asyncio.ensure_future(self._autosave_row(row))
+
+    # ------------------------------------------------------------------
+    # Search & column filtering
+    # ------------------------------------------------------------------
+
+    def set_search(self, text: str) -> None:
+        self._search_text = text.strip().lower()
+        self._apply_filters()
+
+    def _on_col_filter_changed(self, col: int, accepted: set) -> None:
+        if accepted:
+            self._col_filters[col] = accepted
+        else:
+            self._col_filters.pop(col, None)
+        self._apply_filters()
+
+    def _apply_filters(self) -> None:
+        search = self._search_text
+        for row in range(self._table.rowCount()):
+            # Always show editable rows so new entry is never hidden
+            if row >= self._saved_count:
+                self._table.setRowHidden(row, False)
+                continue
+
+            # ── Search ───────────────────────────────────────────────
+            if search:
+                matched = False
+                for col in range(self._table.columnCount()):
+                    it = self._table.item(row, col)
+                    if col == COL_NOTES:
+                        if it and it.data(Qt.UserRole) is True and search in "refund to float":
+                            matched = True
+                            break
+                    else:
+                        if it and search in it.text().lower():
+                            matched = True
+                            break
+                if not matched:
+                    self._table.setRowHidden(row, True)
+                    continue
+
+            # ── Column filters ───────────────────────────────────────
+            visible = True
+            for col, accepted in self._col_filters.items():
+                if not accepted:
+                    continue
+                it = self._table.item(row, col)
+                if col == COL_NOTES:
+                    val = "Refund to Float" if (it and it.data(Qt.UserRole) is True) else ""
+                else:
+                    val = it.text().strip() if it else ""
+                if val not in accepted:
+                    visible = False
+                    break
+
+            self._table.setRowHidden(row, not visible)
 
     def _go_to_first_empty(self) -> None:
         """Scroll to and focus the first empty editable row (New button)."""

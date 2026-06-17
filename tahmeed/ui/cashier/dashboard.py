@@ -25,9 +25,9 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
-    QFrame, QLabel,
+    QFrame, QLabel, QLineEdit,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 from tahmeed.models.user import User
 from tahmeed.services.category_service import get_all_categories
@@ -51,6 +51,8 @@ _T2     = "#6B7280"
 
 class _QBDocHeader(QFrame):
     """QuickBooks-style document summary header with 4 KPI stat tiles."""
+
+    search_changed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -92,6 +94,25 @@ class _QBDocHeader(QFrame):
         title_vl.addWidget(sub_lbl)
         hl.addLayout(title_vl)
         hl.addStretch()
+
+        # Search bar
+        search = QLineEdit()
+        search.setPlaceholderText("Search entries…")
+        search.setFixedWidth(210)
+        search.setFixedHeight(30)
+        search.setStyleSheet(
+            "QLineEdit {"
+            "  border: 1px solid #D1D5DB; border-radius: 4px;"
+            "  padding: 0 8px; font-size: 12px;"
+            "  color: #111827; background: #F9FAFB;"
+            "}"
+            "QLineEdit:focus {"
+            "  border-color: #0077C5; background: #ffffff;"
+            "}"
+        )
+        search.textChanged.connect(self.search_changed)
+        hl.addWidget(search)
+        hl.addSpacing(12)
 
         # Separator before tile strip
         sep0 = QFrame()
@@ -160,6 +181,7 @@ class _TablePage(QWidget):
 
         self._doc_header = _QBDocHeader()
         register.stats_updated.connect(self._doc_header.update_stats)
+        self._doc_header.search_changed.connect(register.set_search)
 
         vl.addWidget(self._doc_header)
         vl.addWidget(register, 1)
