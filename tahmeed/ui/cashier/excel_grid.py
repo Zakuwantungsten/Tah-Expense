@@ -429,6 +429,7 @@ class _ReceiptDelegate(_ExcelCellDelegate):
 
     def createEditor(self, parent, option, index):
         ed = CompleterLineEdit(_RECEIPT_OPTS, parent=parent)
+        ed._completer.setFilterMode(Qt.MatchStartsWith)
         ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
         return ed
 
@@ -914,9 +915,9 @@ class DailyRegister(QWidget):
         QTableWidget.keyPressEvent(self._table, event)
 
     def _tab_forward(self) -> None:
-        """Advance Tab: skip check/readonly cols, wrap to next row at last column."""
+        """Advance Tab: skip readonly cols, wrap to next row at last column."""
         row, col = self._table.currentRow(), self._table.currentColumn()
-        skip = CHECK_COLS | READONLY_COLS
+        skip = READONLY_COLS
         next_col = col + 1
         while next_col < self._table.columnCount() and next_col in skip:
             next_col += 1
