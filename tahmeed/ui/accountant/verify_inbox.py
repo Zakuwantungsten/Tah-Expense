@@ -20,6 +20,7 @@ from PySide6.QtGui import QColor, QFont
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
+from tahmeed.signals import app_signals
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE     = "#FFFFFF"
@@ -537,6 +538,7 @@ class VerifyInboxWidget(QWidget):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(350)
         self._debounce.timeout.connect(self._reload)
+        app_signals.transaction_saved.connect(self._debounce.start)
         self._build()
 
     # ── Layout ─────────────────────────────────────────────────────────────────

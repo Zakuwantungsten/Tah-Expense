@@ -53,6 +53,7 @@ from tahmeed.services.category_service import (
 )
 from tahmeed.services.subtable_service import get_subtables
 from tahmeed.services.settings_service import get_setting
+from tahmeed.signals import app_signals
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_completion
 
@@ -587,6 +588,10 @@ class DailyRegister(QWidget):
         self._current_date: date = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
+        self._retry_queue: set   = set()
+        self._retry_timer        = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._on_retry_timer)
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_restrict_setting())
@@ -671,6 +676,7 @@ class DailyRegister(QWidget):
 
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.model().dataChanged.connect(self._on_model_data_changed)
+        self._table.currentCellChanged.connect(self._on_current_cell_changed)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._show_context_menu)
 
@@ -712,7 +718,7 @@ class DailyRegister(QWidget):
 
     async def _load_date(self, d: date) -> None:
         try:
-            txs = await get_transactions_by_date(d)
+            txs = await get_transactions_by_date(d, cashier_id=self._user._id)
             self._populate(txs)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
@@ -734,6 +740,7 @@ class DailyRegister(QWidget):
         self._table.clearContents()
         self._saved_count = len(transactions)
         self._saved_ids   = {}
+        self._retry_queue.clear()
 
         total_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
         self._table.setRowCount(total_rows)
@@ -835,6 +842,132 @@ class DailyRegister(QWidget):
             f"{n} entr{'y' if n == 1 else 'ies'}   ·   {amount_str}"
         )
         self.stats_updated.emit(n, tzs, refund)
+
+    # ------------------------------------------------------------------
+    # Auto-save
+    # ------------------------------------------------------------------
+
+    def _build_transaction_from_row(self, row: int) -> Optional[Transaction]:
+        """Read cell values for a single row and return a Transaction, or None
+        if the row has no description. Raises ValueError on validation errors
+        (bad item / locked description / unregistered truck) so callers can
+        distinguish logical from network failures and skip retries."""
+        def txt(col: int) -> str:
+            it = self._table.item(row, col)
+            return it.text().strip() if it else ""
+
+        def checked(col: int) -> bool:
+            it = self._table.item(row, col)
+            return it.data(Qt.UserRole) is True if it else False
+
+        description = txt(COL_DESC)
+        if not description:
+            return None
+
+        date_str = txt(COL_DATE)
+        try:
+            tx_date = datetime.strptime(date_str, "%d/%m/%Y")
+        except ValueError:
+            tx_date = datetime(
+                self._current_date.year,
+                self._current_date.month,
+                self._current_date.day,
+            )
+
+        raw_tzs = txt(COL_TZS).replace(",", "")
+        amount = float(raw_tzs) if raw_tzs else 0.0
+
+        rcpt_raw = txt(COL_RECEIPT).lower()
+        rcpt_status = rcpt_raw if rcpt_raw in _VALID_RCPT else "pending"
+
+        item_name = txt(COL_ITEM)
+        cat = self._cat_by_name.get(item_name.lower()) if item_name else None
+        if cat is not None:
+            item_name = cat.name
+        elif item_name and self._restrict_items:
+            raise ValueError(f'"{item_name}" is not a known item.')
+
+        if cat is not None and getattr(cat, "lock_description", False):
+            allowed = self._locked_subitems.get(item_name.lower(), [])
+            if allowed:
+                match = next(
+                    (a for a in allowed if a.lower() == description.lower()), None
+                )
+                if match is None:
+                    raise ValueError(
+                        f'"{description}" is not an allowed description for "{item_name}".'
+                    )
+                description = match
+
+        truck_number = txt(COL_TRUCK).upper()
+        if (truck_number and self._restrict_trucks
+                and truck_number not in self._fleet_numbers):
+            raise ValueError(f'"{truck_number}" is not a registered truck/trailer.')
+
+        return Transaction(
+            date=tx_date,
+            description=description,
+            item=item_name,
+            category_name=item_name or None,
+            truck_number=truck_number,
+            amount=amount,
+            currency="TZS",
+            memo=txt(COL_MEMO),
+            receipt_status=rcpt_status,
+            notes_flag=checked(COL_NOTES),
+            ownership=txt(COL_OWN),
+            approver=txt(COL_APR),
+            cashier_id=self._user._id,
+        )
+
+    def _freeze_row(self, row: int, tx: Transaction) -> None:
+        """Convert a single editable row to read-only saved state without
+        touching any other row."""
+        self._table.blockSignals(True)
+        self._fill_saved_row(row, tx)
+        self._saved_ids[row] = tx._id
+        self._table.blockSignals(False)
+        # Advance _saved_count through the newly contiguous saved block
+        while self._saved_count in self._saved_ids:
+            self._saved_count += 1
+        self._update_footer()
+        self.rows_saved.emit(1)
+
+    def _on_current_cell_changed(
+        self, cur_row: int, cur_col: int, prev_row: int, prev_col: int
+    ) -> None:
+        if prev_row < 0 or prev_row == cur_row:
+            return
+        if prev_row in self._saved_ids:
+            return
+        asyncio.ensure_future(self._autosave_row(prev_row))
+
+    async def _autosave_row(self, row: int) -> None:
+        if row in self._saved_ids:
+            return
+        try:
+            tx = self._build_transaction_from_row(row)
+        except ValueError:
+            return  # validation error — row data is logically invalid, skip retry
+        if tx is None:
+            return  # no description yet
+
+        try:
+            tx = await save_transaction(tx)
+        except Exception:
+            # DB / network failure — queue for retry, don't reload the table
+            self._retry_queue.add(row)
+            if not self._retry_timer.isActive():
+                self._retry_timer.start(4000)
+            return
+
+        self._retry_queue.discard(row)
+        self._freeze_row(row, tx)
+        app_signals.transaction_saved.emit()
+
+    def _on_retry_timer(self) -> None:
+        for row in list(self._retry_queue):
+            asyncio.ensure_future(self._autosave_row(row))
 
     def _go_to_first_empty(self) -> None:
         """Scroll to and focus the first empty editable row (New button)."""
@@ -1432,6 +1565,8 @@ class DailyRegister(QWidget):
         saved, errors = 0, []
 
         for row in range(self._saved_count, self._table.rowCount()):
+            if row in self._saved_ids:
+                continue  # already auto-saved
             if not self._row_has_data(row):
                 continue
 

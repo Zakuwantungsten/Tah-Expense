@@ -8,14 +8,14 @@ from tahmeed.db.connection import get_db
 from tahmeed.models.transaction import Transaction
 
 
-async def get_transactions_by_date(target_date: date) -> List[Transaction]:
+async def get_transactions_by_date(target_date: date, cashier_id=None) -> List[Transaction]:
     db = get_db()
     start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
     end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
-    cursor = (
-        db.transactions.find({"date": {"$gte": start, "$lte": end}})
-        .sort("created_at", 1)
-    )
+    query: dict = {"date": {"$gte": start, "$lte": end}}
+    if cashier_id is not None:
+        query["cashier_id"] = cashier_id
+    cursor = db.transactions.find(query).sort("created_at", 1)
     docs = await cursor.to_list(length=None)
     return [Transaction.from_doc(d) for d in docs]
 

@@ -472,7 +472,7 @@ class EntryForm(QWidget):
     async def _refresh_table(self) -> None:
         self._update_day_label()
         try:
-            txs = await get_transactions_by_date(self._selected_date())
+            txs = await get_transactions_by_date(self._selected_date(), cashier_id=self._user._id)
             self._fill_table(txs)
         except Exception:
             pass
