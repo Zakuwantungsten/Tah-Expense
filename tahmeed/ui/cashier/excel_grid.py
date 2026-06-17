@@ -564,9 +564,8 @@ class DailyRegister(QWidget):
         # All columns interactive (user-draggable) except fixed checkbox cols and S/NO
         for col in range(len(HEADERS)):
             hh.setSectionResizeMode(col, QHeaderView.Interactive)
-        hh.setSectionResizeMode(COL_SNO,     QHeaderView.Fixed)
-        hh.setSectionResizeMode(COL_NOTES,   QHeaderView.Fixed)
-        hh.setSectionResizeMode(COL_RECEIPT, QHeaderView.Fixed)
+        hh.setSectionResizeMode(COL_SNO,   QHeaderView.Fixed)
+        hh.setSectionResizeMode(COL_NOTES, QHeaderView.Fixed)
 
         self._table.setColumnWidth(COL_SNO,     38)
         self._table.setColumnWidth(COL_DATE,    110)
