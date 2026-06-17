@@ -1,8 +1,8 @@
 import asyncio
 from typing import Callable, Awaitable, List
 
-from PySide6.QtWidgets import QLineEdit, QCompleter
-from PySide6.QtCore import Qt, QStringListModel, QTimer
+from PySide6.QtWidgets import QLineEdit, QCompleter, QApplication
+from PySide6.QtCore import Qt, QStringListModel, QTimer, QEvent
 from PySide6.QtGui import QKeyEvent
 
 from tahmeed.ui.widgets.completer_line_edit import (
@@ -46,12 +46,28 @@ class TruckLineEdit(QLineEdit):
         # Qt-internal highlighted→setText that lacks a selection.
         self._completer.highlighted[str].connect(self._on_highlighted)
 
+        # While the popup is open it grabs the keyboard, so Tab/Enter never reach
+        # the table delegate's "accept + move to next cell" filter installed on
+        # this editor — the first press only closes the popup. Re-route those keys
+        # back to the editor so a single Tab accepts the highlighted suggestion AND
+        # advances the cell (Excel behaviour), instead of needing two presses.
+        self._completer.popup().installEventFilter(self)
+
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(150)
         self._debounce.timeout.connect(self._trigger_fetch)
 
         self.textEdited.connect(self._on_text_edited)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._completer.popup() and event.type() == QEvent.KeyPress:
+            if event.key() in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter):
+                QApplication.sendEvent(
+                    self, QKeyEvent(event.type(), event.key(), event.modifiers())
+                )
+                return True
+        return super().eventFilter(obj, event)
 
     def _on_text_edited(self, text: str) -> None:
         self._typed = text
@@ -121,7 +137,7 @@ class TruckLineEdit(QLineEdit):
             event.accept()
             return
 
-        if key in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter):
+        if key in (Qt.Key_Return, Qt.Key_Enter):
             if accept_completion(self, self._completer):
                 event.accept()
                 return

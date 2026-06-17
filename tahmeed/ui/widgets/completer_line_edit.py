@@ -1,7 +1,7 @@
 from typing import List, Optional
 
-from PySide6.QtWidgets import QLineEdit, QCompleter
-from PySide6.QtCore import Qt, QStringListModel, QTimer
+from PySide6.QtWidgets import QLineEdit, QCompleter, QApplication
+from PySide6.QtCore import Qt, QStringListModel, QTimer, QEvent
 from PySide6.QtGui import QKeyEvent
 
 
@@ -104,8 +104,24 @@ class CompleterLineEdit(QLineEdit):
         # Qt-internal highlighted→setText that lacks a selection.
         self._completer.highlighted[str].connect(self._on_highlighted)
 
+        # While the popup is open it grabs the keyboard, so Tab/Enter never reach
+        # the table delegate's "accept + move to next cell" filter installed on
+        # this editor — the first press only closes the popup. Re-route those keys
+        # back to the editor so a single Tab accepts the highlighted suggestion AND
+        # advances the cell (Excel behaviour), instead of needing two presses.
+        self._completer.popup().installEventFilter(self)
+
         self.textEdited.connect(self._on_text_edited)
         self.textEdited.connect(self._schedule_highlight)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._completer.popup() and event.type() == QEvent.KeyPress:
+            if event.key() in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter):
+                QApplication.sendEvent(
+                    self, QKeyEvent(event.type(), event.key(), event.modifiers())
+                )
+                return True
+        return super().eventFilter(obj, event)
 
     def canonical(self, text: str) -> Optional[str]:
         """Return the stored value matching *text* case-insensitively, else None."""
@@ -172,7 +188,7 @@ class CompleterLineEdit(QLineEdit):
             event.accept()
             return
 
-        if key in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter):
+        if key in (Qt.Key_Return, Qt.Key_Enter):
             if accept_completion(self, self._completer):
                 event.accept()
                 return

@@ -27,7 +27,7 @@ Save:
 
 import asyncio
 import csv
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import List, Optional
 
 from PySide6.QtWidgets import (
@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QApplication,
     QAbstractItemDelegate, QStyledItemDelegate, QStyleOptionViewItem, QMenu, QFileDialog,
     QMessageBox, QAbstractItemView, QHeaderView, QDateEdit,
-    QStyle, QFrame, QComboBox, QDialog,
+    QStyle, QComboBox, QDialog,
 )
 from PySide6.QtCore import Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer
 from PySide6.QtGui import QKeyEvent, QColor, QBrush, QFont, QPen, QPainter
@@ -89,20 +89,6 @@ NEW_BG    = QColor("#ffffff")
 EMPTY_BG  = QColor("#fafafa")
 NEG_COLOR = QColor("#dc2626")
 SNO_BG    = QColor("#f1f5f9")
-
-# Nav-bar tool button style
-_NAV_BTN_STYLE = """
-QToolButton {
-    background: #ffffff;
-    border: 1px solid #d1d5db;
-    border-radius: 5px;
-    padding: 4px 10px;
-    color: #374151;
-    font-size: 12px;
-}
-QToolButton:hover   { background: #f9fafb; border-color: #9ca3af; }
-QToolButton:pressed { background: #e5e7eb; }
-"""
 
 # Footer QB-style icon+text-below action buttons
 _FOOTER_BTN_STYLE = """
@@ -617,7 +603,7 @@ class DailyRegister(QWidget):
 
         root.addWidget(self._table)
 
-        # ── Footer — date navigation + totals ─────────────────────────
+        # ── Footer — totals only ───────────────────────────────────────
         footer = QWidget()
         footer.setFixedHeight(48)
         footer.setStyleSheet(
@@ -628,66 +614,6 @@ class DailyRegister(QWidget):
         fl.setContentsMargins(10, 0, 14, 0)
         fl.setSpacing(4)
 
-        _qstyle = QApplication.style()
-
-        self._prev_btn = QToolButton()
-        self._prev_btn.setText(" Prev")
-        self._prev_btn.setIcon(_qstyle.standardIcon(QStyle.SP_ArrowBack))
-        self._prev_btn.setIconSize(QSize(14, 14))
-        self._prev_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._prev_btn.setStyleSheet(_NAV_BTN_STYLE)
-        self._prev_btn.setToolTip("Go to previous day")
-        self._prev_btn.clicked.connect(self._go_prev)
-
-        self._date_edit = QDateEdit()
-        self._date_edit.setCalendarPopup(True)
-        self._date_edit.setDate(QDate.currentDate())
-        self._date_edit.setDisplayFormat("dd MMM yyyy")
-        self._date_edit.setFixedWidth(148)
-        self._date_edit.setStyleSheet(
-            "QDateEdit { border: 1px solid #d1d5db; border-radius: 5px;"
-            " padding: 3px 8px; font-size: 13px; font-weight: 600; color: #111827; background: #ffffff; }"
-        )
-        self._date_edit.dateChanged.connect(self._on_date_changed)
-
-        self._next_btn = QToolButton()
-        self._next_btn.setText("Next ")
-        self._next_btn.setIcon(_qstyle.standardIcon(QStyle.SP_ArrowForward))
-        self._next_btn.setIconSize(QSize(14, 14))
-        self._next_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._next_btn.setLayoutDirection(Qt.RightToLeft)
-        self._next_btn.setStyleSheet(_NAV_BTN_STYLE)
-        self._next_btn.setToolTip("Go to next day")
-        self._next_btn.clicked.connect(self._go_next)
-
-        self._today_btn = QToolButton()
-        self._today_btn.setText(" Today")
-        self._today_btn.setIcon(_qstyle.standardIcon(QStyle.SP_BrowserReload))
-        self._today_btn.setIconSize(QSize(14, 14))
-        self._today_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._today_btn.setStyleSheet(_NAV_BTN_STYLE)
-        self._today_btn.setToolTip("Jump to today")
-        self._today_btn.clicked.connect(self._go_today)
-
-        nav_sep = QFrame()
-        nav_sep.setFrameShape(QFrame.VLine)
-        nav_sep.setFixedHeight(26)
-        nav_sep.setStyleSheet("color: #d1d5db; margin: 0 4px;")
-
-        self._day_label = QLabel("")
-        self._day_label.setStyleSheet("color: #6b7280; font-size: 12px;")
-
-        self._loading_label = QLabel("Loading…")
-        self._loading_label.setStyleSheet("color: #9ca3af; font-size: 12px;")
-        self._loading_label.hide()
-
-        fl.addWidget(self._prev_btn)
-        fl.addWidget(self._date_edit)
-        fl.addWidget(self._next_btn)
-        fl.addWidget(self._today_btn)
-        fl.addWidget(nav_sep)
-        fl.addWidget(self._day_label)
-        fl.addWidget(self._loading_label)
         fl.addStretch()
 
         self._totals_label = QLabel("0 entries")
@@ -702,40 +628,9 @@ class DailyRegister(QWidget):
         self._init_editable_rows(0, DEFAULT_EDITABLE_ROWS)
         self._install_key_handler()
 
-    # ------------------------------------------------------------------
-    # Date navigation
-    # ------------------------------------------------------------------
-
-    def _go_prev(self) -> None:
-        self._current_date -= timedelta(days=1)
-        self._sync_date_edit()
-        asyncio.ensure_future(self._load_date(self._current_date))
-
-    def _go_next(self) -> None:
-        self._current_date += timedelta(days=1)
-        self._sync_date_edit()
-        asyncio.ensure_future(self._load_date(self._current_date))
-
-    def _go_today(self) -> None:
-        self._current_date = date.today()
-        self._sync_date_edit()
-        asyncio.ensure_future(self._load_date(self._current_date))
-
-    def _on_date_changed(self, qdate: QDate) -> None:
-        self._current_date = date(qdate.year(), qdate.month(), qdate.day())
-        asyncio.ensure_future(self._load_date(self._current_date))
-
-    def _sync_date_edit(self) -> None:
-        self._date_edit.blockSignals(True)
-        self._date_edit.setDate(
-            QDate(self._current_date.year, self._current_date.month, self._current_date.day)
-        )
-        self._date_edit.blockSignals(False)
-
     def navigate_to_date(self, d: date) -> None:
         """Called by dashboard when TransactionBrowser 'Go To' is used."""
         self._current_date = d
-        self._sync_date_edit()
         asyncio.ensure_future(self._load_date(d))
 
     # ------------------------------------------------------------------
@@ -743,16 +638,11 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
 
     async def _load_date(self, d: date) -> None:
-        self._loading_label.show()
         try:
             txs = await get_transactions_by_date(d)
             self._populate(txs)
-            day_name = datetime(d.year, d.month, d.day).strftime("%A")
-            self._day_label.setText(day_name)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
-        finally:
-            self._loading_label.hide()
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load_date(self._current_date))
@@ -1041,7 +931,19 @@ class DailyRegister(QWidget):
             self._table.setCurrentCell(next_row, first_col)
         else:
             self._table.setCurrentCell(row, next_col)
-        self._table.setFocus()  # ensure keyboard focus stays on the table
+        self._table.setFocus()
+        # Blank editable rows have no QTableWidgetItem; Qt returns ItemIsDropEnabled
+        # only when there is no item, so edit() silently fails.  Create a placeholder
+        # so the cell is treated as editable before we attempt to open the editor.
+        idx = self._table.currentIndex()
+        trow, tcol = idx.row(), idx.column()
+        if trow >= self._saved_count and not self._table.item(trow, tcol):
+            self._table.blockSignals(True)
+            it = QTableWidgetItem("")
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            self._table.setItem(trow, tcol, it)
+            self._table.blockSignals(False)
+        self._table.edit(idx)
 
     def _install_key_handler(self) -> None:
         self._key_filter = _TableKeyFilter(self._table_key_press)
