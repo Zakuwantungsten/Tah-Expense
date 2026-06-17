@@ -238,6 +238,28 @@ class _FleetRegistryBase(QWidget):
         hdr.addWidget(self._count_chip)
         hdr.addStretch()
 
+        self._restrict_btn = QPushButton("  Restrict in cashier: Off")
+        self._restrict_btn.setFixedHeight(32)
+        self._restrict_btn.setCheckable(True)
+        self._restrict_btn.setCursor(Qt.PointingHandCursor)
+        self._restrict_btn.setToolTip(
+            "When on, the cashier's Truck No. column only accepts numbers that\n"
+            "exist in the truck/trailer registries. Applies to both registries."
+        )
+        try:
+            self._restrict_btn.setIcon(qta.icon("mdi.lock-outline", color=_T2))
+            self._restrict_btn.setIconSize(QSize(15, 15))
+        except Exception:
+            pass
+        self._restrict_btn.setStyleSheet(
+            f"QPushButton{{background:{_WHITE};color:{_T2};border:1px solid {_BORDER};"
+            "border-radius:5px;font-size:12px;font-family:'Segoe UI',sans-serif;padding:0 12px;}}"
+            f"QPushButton:checked{{background:{_GREEN_L};color:{_GREEN};border-color:{_GREEN};}}"
+            f"QPushButton:hover:!checked{{background:{_BG};}}"
+        )
+        self._restrict_btn.toggled.connect(self._on_restrict_toggled)
+        hdr.addWidget(self._restrict_btn)
+
         import_btn = _btn("Import from Excel", icon="mdi.microsoft-excel", primary=False, height=32)
         import_btn.clicked.connect(self._import_excel)
         hdr.addWidget(import_btn)
@@ -308,6 +330,35 @@ class _FleetRegistryBase(QWidget):
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load())
+        asyncio.ensure_future(self._load_restrict_setting())
+
+    # ── Restrict-in-cashier toggle ──────────────────────────────────────────────
+
+    async def _load_restrict_setting(self) -> None:
+        from tahmeed.services.settings_service import get_setting
+        try:
+            on = bool(await get_setting("restrict_trucks"))
+        except Exception:
+            on = False
+        self._restrict_btn.blockSignals(True)
+        self._restrict_btn.setChecked(on)
+        self._restrict_btn.setText(
+            "  Restrict in cashier: On" if on else "  Restrict in cashier: Off"
+        )
+        self._restrict_btn.blockSignals(False)
+
+    def _on_restrict_toggled(self, on: bool) -> None:
+        self._restrict_btn.setText(
+            "  Restrict in cashier: On" if on else "  Restrict in cashier: Off"
+        )
+        asyncio.ensure_future(self._save_restrict_setting(on))
+
+    async def _save_restrict_setting(self, on: bool) -> None:
+        from tahmeed.services.settings_service import set_setting
+        try:
+            await set_setting("restrict_trucks", on)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
 
     # ── Internal ───────────────────────────────────────────────────────────────
 

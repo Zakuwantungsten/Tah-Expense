@@ -40,6 +40,7 @@ async def create_category(
     icon: str = "mdi.tag-outline",
     show_in_sidebar: bool = False,
     sort_order: int = 0,
+    lock_description: bool = False,
 ) -> Category:
     db = get_db()
     cat = Category(
@@ -51,6 +52,7 @@ async def create_category(
         sort_order=sort_order,
         requires_receipt=requires_receipt,
         requires_truck=requires_truck,
+        lock_description=lock_description,
     )
     result = await db.categories.insert_one(cat.to_doc())
     cat._id = result.inserted_id

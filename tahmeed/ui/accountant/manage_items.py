@@ -37,6 +37,7 @@ from tahmeed.services.category_service import (
 from tahmeed.services.subtable_service import (
     get_subtables, create_subtable, update_subtable, delete_subtable,
 )
+from tahmeed.services.settings_service import get_setting, set_setting
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 
@@ -415,7 +416,8 @@ class _ItemDialog(QDialog):
     """Add / Edit Item dialog — includes description hint field."""
 
     def __init__(self, item: Optional[Category] = None,
-                 parent: Optional[QWidget] = None) -> None:
+                 parent: Optional[QWidget] = None,
+                 prefill_name: str = "") -> None:
         super().__init__(parent)
         self._item = item
         self.result_data: dict = {}
@@ -428,6 +430,8 @@ class _ItemDialog(QDialog):
         self._build()
         if item:
             self._populate(item)
+        elif prefill_name:
+            self._name.setText(prefill_name)
 
     def _build(self) -> None:
         vl = QVBoxLayout(self)
@@ -507,9 +511,16 @@ class _ItemDialog(QDialog):
         self._show_sidebar = QCheckBox("Show as its own sidebar tab")
         self._show_sidebar.setStyleSheet(f"color: {_T1}; font-size: 13px;")
         self._show_sidebar.toggled.connect(self._on_sidebar_toggled)
+        self._lock_desc = QCheckBox("Lock description to sub-items")
+        self._lock_desc.setStyleSheet(f"color: {_T1}; font-size: 13px;")
+        self._lock_desc.setToolTip(
+            "When on, the cashier can only choose a description from this item's "
+            "sub-items. When off, any description is allowed for this item."
+        )
         checks_vl.addWidget(self._req_receipt)
         checks_vl.addWidget(self._req_truck)
         checks_vl.addWidget(self._show_sidebar)
+        checks_vl.addWidget(self._lock_desc)
         form.addRow(_lbl("Options", size=12, weight=500, color=_T2), checks_w)
 
         # Sidebar icon picker — only relevant when "Show as its own sidebar tab"
@@ -593,6 +604,7 @@ class _ItemDialog(QDialog):
         self._req_receipt.setChecked(item.requires_receipt)
         self._req_truck.setChecked(item.requires_truck)
         self._show_sidebar.setChecked(item.show_in_sidebar)
+        self._lock_desc.setChecked(item.lock_description)
         self._icon = item.icon or "mdi.tag-outline"
         self._refresh_icon_btn()
         self._on_sidebar_toggled(item.show_in_sidebar)
@@ -645,6 +657,7 @@ class _ItemDialog(QDialog):
             "show_in_sidebar":  self._show_sidebar.isChecked(),
             "requires_receipt": self._req_receipt.isChecked(),
             "requires_truck":   self._req_truck.isChecked(),
+            "lock_description": self._lock_desc.isChecked(),
         }
         self.accept()
 
@@ -1090,6 +1103,30 @@ class ManageItemsWidget(QWidget):
 
         hl.addStretch()
 
+        self._restrict_btn = QPushButton("  Restrict items: Off")
+        self._restrict_btn.setFixedHeight(32)
+        self._restrict_btn.setCheckable(True)
+        self._restrict_btn.setCursor(Qt.PointingHandCursor)
+        self._restrict_btn.setToolTip(
+            "When on, the cashier's Item column only accepts existing items.\n"
+            "Unknown entries prompt the cashier to add the item."
+        )
+        try:
+            self._restrict_btn.setIcon(qta.icon("mdi.lock-outline", color=_T2))
+            self._restrict_btn.setIconSize(QSize(15, 15))
+        except Exception:
+            pass
+        self._restrict_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T2};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 12px; font-family: 'Segoe UI', sans-serif; padding: 0 12px; }}"
+            f"QPushButton:checked {{ background: {_GREEN_L}; color: {_GREEN};"
+            f" border-color: {_GREEN}; }}"
+            f"QPushButton:hover:!checked {{ background: {_BG}; }}"
+        )
+        self._restrict_btn.toggled.connect(self._on_restrict_toggled)
+        hl.addWidget(self._restrict_btn)
+
         self._inactive_btn = QPushButton("Show Inactive")
         self._inactive_btn.setFixedHeight(32)
         self._inactive_btn.setCheckable(True)
@@ -1156,6 +1193,7 @@ class ManageItemsWidget(QWidget):
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load())
+        asyncio.ensure_future(self._load_restrict_setting())
 
     # ── Data ───────────────────────────────────────────────────────────────────
 
@@ -1165,6 +1203,28 @@ class ManageItemsWidget(QWidget):
             self._apply_filter()
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load items:\n{exc}")
+
+    # ── Restrict-items global toggle ───────────────────────────────────────────
+
+    async def _load_restrict_setting(self) -> None:
+        try:
+            on = bool(await get_setting("restrict_items"))
+        except Exception:
+            on = False
+        self._restrict_btn.blockSignals(True)
+        self._restrict_btn.setChecked(on)
+        self._restrict_btn.setText("  Restrict items: On" if on else "  Restrict items: Off")
+        self._restrict_btn.blockSignals(False)
+
+    def _on_restrict_toggled(self, on: bool) -> None:
+        self._restrict_btn.setText("  Restrict items: On" if on else "  Restrict items: Off")
+        asyncio.ensure_future(self._save_restrict_setting(on))
+
+    async def _save_restrict_setting(self, on: bool) -> None:
+        try:
+            await set_setting("restrict_items", on)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
 
     def _apply_filter(self) -> None:
         q = self._search.text().strip().lower()
@@ -1294,6 +1354,7 @@ class ManageItemsWidget(QWidget):
                 data.get("description", ""),
                 icon=data.get("icon", "mdi.tag-outline"),
                 show_in_sidebar=data.get("show_in_sidebar", False),
+                lock_description=data.get("lock_description", False),
             )
             self._selected_id = cat._id
             await self._load()

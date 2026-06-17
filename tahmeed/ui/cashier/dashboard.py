@@ -298,6 +298,7 @@ class CashierDashboard(QWidget):
             self._overview.refresh()
         elif key == "table":
             self._stack.setCurrentIndex(1)
+            self._register.reload_settings()
         elif key == "form":
             self._stack.setCurrentIndex(2)
         elif self._sidebar.item_def(key) is not None:

@@ -20,6 +20,7 @@ class Category:
     sort_order: int = 0
     requires_receipt: bool = False
     requires_truck: bool = True
+    lock_description: bool = False  # if True, cashier may only pick from this item's sub-items
     active: bool = True
     _id: Optional[ObjectId] = None
 
@@ -33,6 +34,7 @@ class Category:
             "sort_order": self.sort_order,
             "requires_receipt": self.requires_receipt,
             "requires_truck": self.requires_truck,
+            "lock_description": self.lock_description,
             "active": self.active,
         }
         if self._id:
@@ -51,5 +53,6 @@ class Category:
             sort_order=doc.get("sort_order", 0),
             requires_receipt=doc.get("requires_receipt", False),
             requires_truck=doc.get("requires_truck", True),
+            lock_description=doc.get("lock_description", False),
             active=doc.get("active", True),
         )

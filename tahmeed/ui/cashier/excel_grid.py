@@ -33,22 +33,28 @@ from typing import List, Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QToolButton, QLabel,
     QTableWidget, QTableWidgetItem, QApplication,
-    QStyledItemDelegate, QStyleOptionViewItem, QMenu, QFileDialog,
+    QAbstractItemDelegate, QStyledItemDelegate, QStyleOptionViewItem, QMenu, QFileDialog,
     QMessageBox, QAbstractItemView, QHeaderView, QDateEdit,
-    QStyle, QFrame, QComboBox,
+    QStyle, QFrame, QComboBox, QDialog,
 )
-from PySide6.QtCore import Qt, Signal, QDate, QEvent, QRect, QSize, QObject
+from PySide6.QtCore import Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer
 from PySide6.QtGui import QKeyEvent, QColor, QBrush, QFont, QPen, QPainter
 
 from tahmeed.models.category import Category
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
-from tahmeed.services.truck_service import search_trucks
+from tahmeed.services.truck_service import search_fleet, get_fleet_numbers
 from tahmeed.services.cashier_service import (
     get_transactions_by_date, save_transaction, delete_transaction,
     search_descriptions,
 )
+from tahmeed.services.category_service import (
+    create_category, get_all_categories, item_key,
+)
+from tahmeed.services.subtable_service import get_subtables
+from tahmeed.services.settings_service import get_setting
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
+from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_completion
 
 # ---------------------------------------------------------------------------
 # Column indices
@@ -73,6 +79,8 @@ HEADERS = [
 CHECK_COLS       = {COL_NOTES}
 READONLY_COLS    = {COL_SNO}
 _DATA_SKIP_COLS  = READONLY_COLS | {COL_NOTES, COL_RECEIPT}
+# Columns that should NOT be auto-uppercased (keys/dates/checkboxes/readonly)
+_UPPER_SKIP_COLS = READONLY_COLS | CHECK_COLS | {COL_RECEIPT, COL_DATE}
 DEFAULT_EDITABLE_ROWS = 20
 
 # Colors
@@ -110,6 +118,22 @@ QToolButton:hover   { background: #ececec; border-radius: 4px; }
 QToolButton:pressed { background: #dcdcdc; border-radius: 4px; }
 QToolButton:disabled { color: #9ca3af; }
 """
+
+
+# ---------------------------------------------------------------------------
+# Delegate helpers
+# ---------------------------------------------------------------------------
+
+def _accept_editor_completion(editor) -> None:
+    """If the editor has an autocomplete popup visible, accept the highlighted item."""
+    completer = getattr(editor, '_completer', None)
+    if completer:
+        accept_completion(editor, completer)
+
+
+def _upper_text(col: int, text: str) -> str:
+    """Return text uppercased unless the column stores structured/non-text data."""
+    return text.upper() if col not in _UPPER_SKIP_COLS else text
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +185,32 @@ class _ExcelCellDelegate(QStyledItemDelegate):
         opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
         return opt
 
+    def eventFilter(self, obj, event) -> bool:
+        """Intercept Tab/Enter in editors: accept autocomplete, commit, navigate."""
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key == Qt.Key_Tab:
+                _accept_editor_completion(obj)
+                self.commitData.emit(obj)
+                self.closeEditor.emit(obj, QAbstractItemDelegate.NoHint)
+                table = self.parent()
+                if table is not None:
+                    reg = table.parent()
+                    if hasattr(reg, '_tab_forward'):
+                        QTimer.singleShot(0, reg._tab_forward)
+                return True
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                _accept_editor_completion(obj)
+                self.commitData.emit(obj)
+                self.closeEditor.emit(obj, QAbstractItemDelegate.NoHint)
+                table = self.parent()
+                if table is not None:
+                    reg = table.parent()
+                    if hasattr(reg, '_step'):
+                        QTimer.singleShot(0, lambda: reg._step(+1, 0))
+                return True
+        return super().eventFilter(obj, event)
+
     def paint(self, painter: QPainter, option, index) -> None:
         self.initStyleOption(option, index)
         self._paint_bg(painter, option, index)
@@ -169,16 +219,42 @@ class _ExcelCellDelegate(QStyledItemDelegate):
 
 
 class _DescriptionDelegate(_ExcelCellDelegate):
+    """Description editor that adapts to the row's chosen Item.
+
+    - If that item has ``lock_description`` set *and* has sub-items, the editor
+      is a restricted popup limited to those sub-item names (the cashier can
+      only pick one of them).
+    - Otherwise it falls back to the free-text editor with history autocomplete.
+    """
+
+    def __init__(self, cat_getter, subs_getter, parent=None):
+        super().__init__(parent)
+        self._cat_getter = cat_getter      # name -> Category | None
+        self._subs_getter = subs_getter    # name -> list[str]
+
     def createEditor(self, parent, option, index):
+        item_name = (index.sibling(index.row(), COL_ITEM).data() or "").strip()
+        cat = self._cat_getter(item_name) if item_name else None
+        if cat is not None and getattr(cat, "lock_description", False):
+            subs = self._subs_getter(item_name)
+            if subs:
+                ed = CompleterLineEdit(subs, parent=parent)
+                ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
+                return ed
         ed = TruckLineEdit(fetch_fn=search_descriptions, parent=parent)
         ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
         return ed
 
     def setEditorData(self, editor, index):
         editor.setText(index.data() or "")
+        editor.selectAll()
 
     def setModelData(self, editor, model, index):
-        model.setData(index, editor.text().strip())
+        text = editor.text().strip()
+        # Snap to the canonical sub-item name when the editor is a restricted list.
+        if isinstance(editor, CompleterLineEdit):
+            text = editor.canonical(text) or text
+        model.setData(index, text)
 
     def updateEditorGeometry(self, editor, option, index):
         editor.setGeometry(option.rect)
@@ -186,7 +262,7 @@ class _DescriptionDelegate(_ExcelCellDelegate):
 
 class _TruckDelegate(_ExcelCellDelegate):
     def createEditor(self, parent, option, index):
-        ed = TruckLineEdit(fetch_fn=search_trucks, parent=parent)
+        ed = TruckLineEdit(fetch_fn=search_fleet, parent=parent)
         ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
         return ed
 
@@ -308,12 +384,29 @@ class _RefFloatDelegate(_ExcelCellDelegate):
 
 
 _RCPT_COLORS = {
-    "received": ("#dcfce7", "#16a34a"),
-    "pending":  ("#fff7ed", "#ea580c"),
-    "missing":  ("#fef2f2", "#dc2626"),
+    "received":   ("#dcfce7", "#16a34a"),
+    "pending":    ("#fff7ed", "#ea580c"),
+    "missing":    ("#fef2f2", "#dc2626"),
+    "no_receipt": ("#f3f4f6", "#6b7280"),
 }
-_RCPT_LABEL = {"received": "Received", "pending": "Pending", "missing": "Missing"}
-_RECEIPT_OPTS = ["Pending", "Received", "Missing"]
+_RCPT_LABEL = {
+    "received": "Received", "pending": "Pending",
+    "missing": "Missing", "no_receipt": "No Receipt",
+}
+_RECEIPT_OPTS = ["Pending", "Received", "Missing", "No Receipt"]
+# Display label (lowercased) -> stored status key
+_RCPT_OPT_KEY = {
+    "pending": "pending", "received": "received",
+    "missing": "missing", "no receipt": "no_receipt",
+}
+# Any incoming text (paste / import) -> stored status key
+_RCPT_NORM = {
+    "received": "received", "1": "received", "yes": "received",
+    "missing": "missing",
+    "pending": "pending", "0": "pending",
+    "no receipt": "no_receipt", "no_receipt": "no_receipt", "none": "no_receipt",
+}
+_VALID_RCPT = {"pending", "received", "missing", "no_receipt"}
 
 
 class _ReceiptDelegate(_ExcelCellDelegate):
@@ -347,27 +440,31 @@ class _ReceiptDelegate(_ExcelCellDelegate):
         self._draw_active_border(painter, option, index)
 
     def createEditor(self, parent, option, index):
-        ed = QComboBox(parent)
-        ed.addItems(_RECEIPT_OPTS)
+        ed = CompleterLineEdit(_RECEIPT_OPTS, parent=parent)
+        ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
         return ed
 
     def setEditorData(self, editor, index):
-        val = (index.data() or "pending").strip().lower()
-        idx = {"pending": 0, "received": 1, "missing": 2}.get(val, 0)
-        editor.setCurrentIndex(idx)
+        val = (index.data() or "").strip().lower()
+        editor.setText(_RCPT_LABEL.get(val, "") if val else "")
+        editor.selectAll()
 
     def setModelData(self, editor, model, index):
-        model.setData(index, editor.currentText().lower())
+        disp = editor.canonical(editor.text().strip()) or editor.text().strip()
+        model.setData(index, _RCPT_OPT_KEY.get(disp.lower(), ""))
 
     def updateEditorGeometry(self, editor, option, index):
         editor.setGeometry(option.rect)
 
 
 class _ItemDelegate(_ExcelCellDelegate):
-    """Dropdown of accountant-managed items for the Item column.
+    """Live popup of accountant-managed items for the Item column.
 
-    The list is read live via ``items_getter`` so newly-created items appear
-    without rebuilding the grid. Editable so the cashier can type-to-filter.
+    Behaves like the Truck No. field: the list narrows in real time as the
+    cashier types, and Tab accepts the highlighted suggestion — writing the
+    *canonical* item name (so "m" + Tab gives "MILEAGE", not "mILEAGE"). The
+    list is read live via ``items_getter`` so newly-created items appear at once.
+    Whether unknown entries are allowed is enforced at the grid level.
     """
 
     def __init__(self, items_getter, parent=None):
@@ -375,25 +472,18 @@ class _ItemDelegate(_ExcelCellDelegate):
         self._items_getter = items_getter
 
     def createEditor(self, parent, option, index):
-        ed = QComboBox(parent)
-        ed.setEditable(True)
-        ed.setInsertPolicy(QComboBox.NoInsert)
-        ed.addItem("")
-        for name in (self._items_getter() or []):
-            ed.addItem(name)
-        ed.setStyleSheet("QComboBox { color: #111827; background: #ffffff; }")
+        ed = CompleterLineEdit(self._items_getter() or [], parent=parent)
+        ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
         return ed
 
     def setEditorData(self, editor, index):
-        val = (index.data() or "").strip()
-        i = editor.findText(val)
-        if i >= 0:
-            editor.setCurrentIndex(i)
-        else:
-            editor.setEditText(val)
+        editor.setText(index.data() or "")
+        editor.selectAll()
 
     def setModelData(self, editor, model, index):
-        model.setData(index, editor.currentText().strip())
+        text = editor.text().strip()
+        # Snap typed text to the canonical item name when it matches one.
+        model.setData(index, editor.canonical(text) or text)
 
     def updateEditorGeometry(self, editor, option, index):
         editor.setGeometry(option.rect)
@@ -429,11 +519,19 @@ class DailyRegister(QWidget):
         super().__init__(parent)
         self._user        = user
         self._categories  = categories
+        self._cat_by_name: dict = {c.name.lower(): c for c in categories}
+        self._locked_subitems: dict = {}   # item name (lower) -> [sub-item names]
+        self._restrict_items: bool = False
+        self._restrict_trucks: bool = False
+        self._fleet_numbers: set = set()   # uppercased valid truck/trailer numbers
         self._current_date: date = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
+        asyncio.ensure_future(self._load_restrict_setting())
+        asyncio.ensure_future(self._load_locked_subitems())
+        asyncio.ensure_future(self._load_fleet_numbers())
 
     # ------------------------------------------------------------------
     # UI construction
@@ -501,7 +599,11 @@ class DailyRegister(QWidget):
         # Excel selection model on every column; per-column delegates override as needed
         self._table.setItemDelegate(_ExcelCellDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_ITEM,    _ItemDelegate(lambda: [c.name for c in self._categories], self._table))
-        self._table.setItemDelegateForColumn(COL_DESC,    _DescriptionDelegate(self._table))
+        self._table.setItemDelegateForColumn(COL_DESC,    _DescriptionDelegate(
+            cat_getter=lambda name: self._cat_by_name.get(name.lower()),
+            subs_getter=lambda name: self._locked_subitems.get(name.lower(), []),
+            parent=self._table,
+        ))
         self._table.setItemDelegateForColumn(COL_TRUCK,   _TruckDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_DATE,    _DateDelegate(lambda: self._current_date, self._table))
         self._table.setItemDelegateForColumn(COL_NOTES,   _RefFloatDelegate(self._table))
@@ -652,6 +754,15 @@ class DailyRegister(QWidget):
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load_date(self._current_date))
+        asyncio.ensure_future(self._load_restrict_setting())
+
+    def reload_settings(self) -> None:
+        """Re-read the restrict toggles, locked sub-items and fleet list without
+        touching the grid rows (so unsaved entries survive). Called on entering
+        the table tab."""
+        asyncio.ensure_future(self._load_restrict_setting())
+        asyncio.ensure_future(self._load_locked_subitems())
+        asyncio.ensure_future(self._load_fleet_numbers())
 
     def _populate(self, transactions: List[Transaction]) -> None:
         self._table.blockSignals(True)
@@ -795,6 +906,14 @@ class DailyRegister(QWidget):
 
         col = item.column()
 
+        # Uppercase all free-text cells
+        if col not in _UPPER_SKIP_COLS:
+            text = item.text()
+            if text and text != text.upper():
+                self._table.blockSignals(True)
+                item.setText(text.upper())
+                self._table.blockSignals(False)
+
         # Activate the row (show S/NO + checkboxes) on first data entry
         if col not in READONLY_COLS and col not in CHECK_COLS and item.text().strip():
             self._activate_row(row)
@@ -815,6 +934,14 @@ class DailyRegister(QWidget):
                 self._table.blockSignals(True)
                 self._table.setItem(row, COL_DATE, QTableWidgetItem(today_str))
                 self._table.blockSignals(False)
+
+        # Item / Description / Truck validation (canonicalise, restrict, locked lists)
+        if col == COL_ITEM and item.text().strip():
+            self._validate_item_cell(row, item)
+        elif col == COL_DESC and item.text().strip():
+            self._validate_locked_description(row, item)
+        elif col == COL_TRUCK and item.text().strip():
+            self._validate_truck_cell(row, item)
 
         # Dynamic row expansion near the bottom
         if row >= self._table.rowCount() - 5 and item.text().strip():
@@ -979,16 +1106,54 @@ class DailyRegister(QWidget):
         text = QApplication.clipboard().text()
         if not text:
             return
-        # Anchor at top-left of current selection (Excel behaviour)
-        sel = self._table.selectedItems()
-        if sel:
-            start_row = max(min(it.row() for it in sel), self._saved_count)
-            start_col = min(it.column() for it in sel)
+
+        lines = text.splitlines()
+
+        # selectedIndexes() covers blank rows (which have no QTableWidgetItem and
+        # therefore never appear in selectedItems()).
+        sel_indexes = self._table.selectedIndexes()
+        if sel_indexes:
+            start_row = max(min(i.row() for i in sel_indexes), self._saved_count)
+            start_col = min(i.column() for i in sel_indexes)
+            sel_rows = sorted({i.row() for i in sel_indexes if i.row() >= self._saved_count})
+            sel_cols = sorted({i.column() for i in sel_indexes})
         else:
             start_row = max(self._table.currentRow(), self._saved_count)
             start_col = self._table.currentColumn()
+            sel_rows = []
+            sel_cols = []
+
+        # Single clipboard value pasted onto a multi-cell selection: fill every
+        # selected editable cell with that value (Excel behaviour).
+        if len(lines) == 1 and "\t" not in lines[0] and sel_rows and (
+            len(sel_rows) > 1 or len(sel_cols) > 1
+        ):
+            cell_value = lines[0].strip()
+            self._table.blockSignals(True)
+            for row in sel_rows:
+                for col in sel_cols:
+                    if col in READONLY_COLS:
+                        continue
+                    if col in CHECK_COLS:
+                        it = self._table.item(row, col) or QTableWidgetItem()
+                        it.setData(Qt.UserRole, cell_value in ("1", "true", "True", "YES"))
+                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                        self._table.setItem(row, col, it)
+                    elif col == COL_RECEIPT:
+                        norm = _RCPT_NORM.get(cell_value.lower(), "pending")
+                        it = self._table.item(row, col) or QTableWidgetItem()
+                        it.setText(norm)
+                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                        self._table.setItem(row, col, it)
+                    else:
+                        self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell_value)))
+            self._table.blockSignals(False)
+            self._renumber()
+            return
+
+        # Multi-row / multi-column clipboard: paste starting at anchor (TSV layout).
         self._table.blockSignals(True)
-        for r, line in enumerate(text.splitlines()):
+        for r, line in enumerate(lines):
             for c, cell in enumerate(line.split("\t")):
                 row = start_row + r
                 col = start_col + c
@@ -1004,18 +1169,13 @@ class DailyRegister(QWidget):
                     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                     self._table.setItem(row, col, it)
                 elif col == COL_RECEIPT:
-                    _rcpt_map = {
-                        "received": "received", "1": "received", "yes": "received",
-                        "missing": "missing",
-                        "pending": "pending", "0": "pending",
-                    }
-                    norm = _rcpt_map.get(cell.strip().lower(), "pending")
+                    norm = _RCPT_NORM.get(cell.strip().lower(), "pending")
                     it = self._table.item(row, col) or QTableWidgetItem()
                     it.setText(norm)
                     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                     self._table.setItem(row, col, it)
                 else:
-                    self._table.setItem(row, col, QTableWidgetItem(cell.strip()))
+                    self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell.strip())))
         self._table.blockSignals(False)
         self._renumber()
 
@@ -1059,7 +1219,7 @@ class DailyRegister(QWidget):
                     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                     self._table.setItem(row, col, it)
                 else:
-                    self._table.setItem(row, col, QTableWidgetItem(src.text()))
+                    self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, src.text())))
         self._table.blockSignals(False)
         self._renumber()
 
@@ -1084,7 +1244,7 @@ class DailyRegister(QWidget):
             for col in cols[1:]:
                 if col in READONLY_COLS or col in CHECK_COLS:
                     continue
-                self._table.setItem(row, col, QTableWidgetItem(src.text()))
+                self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, src.text())))
         self._table.blockSignals(False)
         self._renumber()
 
@@ -1236,11 +1396,7 @@ class DailyRegister(QWidget):
                     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                     self._table.setItem(target, grid_col, it)
                 elif grid_col == COL_RECEIPT:
-                    _rcpt_map = {
-                        "received": "received", "1": "received", "yes": "received",
-                        "missing": "missing",
-                    }
-                    norm = _rcpt_map.get(raw.lower(), "pending")
+                    norm = _RCPT_NORM.get(raw.lower(), "pending")
                     it = self._table.item(target, grid_col) or QTableWidgetItem()
                     it.setText(norm)
                     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
@@ -1257,7 +1413,7 @@ class DailyRegister(QWidget):
                     self._table.setItem(target, grid_col, QTableWidgetItem(formatted))
                 else:
                     if raw and raw != "None":
-                        self._table.setItem(target, grid_col, QTableWidgetItem(raw))
+                        self._table.setItem(target, grid_col, QTableWidgetItem(_upper_text(grid_col, raw)))
 
         self._table.blockSignals(False)
         self._renumber()
@@ -1312,9 +1468,38 @@ class DailyRegister(QWidget):
                 amount = parse_num(txt(COL_TZS))
 
                 rcpt_raw = txt(COL_RECEIPT).lower()
-                rcpt_status = rcpt_raw if rcpt_raw in ("pending", "received", "missing") else "pending"
+                rcpt_status = rcpt_raw if rcpt_raw in _VALID_RCPT else "pending"
 
                 item_name = txt(COL_ITEM)
+                cat = self._cat_by_name.get(item_name.lower()) if item_name else None
+                if cat is not None:
+                    item_name = cat.name  # canonical casing
+                elif item_name and self._restrict_items:
+                    errors.append(f'Row {row + 1}: "{item_name}" is not a known item.')
+                    continue
+
+                # Backstop for description-lock (covers paste / fill-down that
+                # skip the live editor validation).
+                if cat is not None and getattr(cat, "lock_description", False):
+                    allowed = self._locked_subitems.get(item_name.lower(), [])
+                    if allowed:
+                        match = next((a for a in allowed if a.lower() == description.lower()), None)
+                        if match is None:
+                            errors.append(
+                                f'Row {row + 1}: "{description}" is not an allowed '
+                                f'description for "{item_name}".'
+                            )
+                            continue
+                        description = match  # canonical casing
+
+                truck_number = txt(COL_TRUCK).upper()
+                if (truck_number and self._restrict_trucks
+                        and truck_number not in self._fleet_numbers):
+                    errors.append(
+                        f'Row {row + 1}: "{truck_number}" is not a registered truck/trailer.'
+                    )
+                    continue
+
                 tx = Transaction(
                     date=tx_date,
                     description=description,
@@ -1322,7 +1507,7 @@ class DailyRegister(QWidget):
                     # The chosen item *is* the category — keep them in sync so the
                     # item's sidebar tab (which filters on category_name) shows it.
                     category_name=item_name or None,
-                    truck_number=txt(COL_TRUCK).upper(),
+                    truck_number=truck_number,
                     amount=amount,
                     currency="TZS",
                     memo=txt(COL_MEMO),
@@ -1367,6 +1552,178 @@ class DailyRegister(QWidget):
 
     def update_categories(self, categories: List[Category]) -> None:
         self._categories = categories
+        self._cat_by_name = {c.name.lower(): c for c in categories}
+        asyncio.ensure_future(self._load_locked_subitems())
+
+    # ------------------------------------------------------------------
+    # Settings / locked sub-item cache
+    # ------------------------------------------------------------------
+
+    async def _load_restrict_setting(self) -> None:
+        try:
+            self._restrict_items = bool(await get_setting("restrict_items"))
+        except Exception:
+            self._restrict_items = False
+        try:
+            self._restrict_trucks = bool(await get_setting("restrict_trucks"))
+        except Exception:
+            self._restrict_trucks = False
+
+    async def _load_fleet_numbers(self) -> None:
+        try:
+            self._fleet_numbers = await get_fleet_numbers()
+        except Exception:
+            self._fleet_numbers = set()
+
+    async def _load_locked_subitems(self) -> None:
+        """Cache the allowed sub-item names for every lock-description item."""
+        cache: dict = {}
+        for c in self._categories:
+            if getattr(c, "lock_description", False):
+                try:
+                    subs = await get_subtables(item_key(c.name))
+                    cache[c.name.lower()] = [s.name for s in subs]
+                except Exception:
+                    cache[c.name.lower()] = []
+        self._locked_subitems = cache
+
+    # ------------------------------------------------------------------
+    # Item-column validation (canonicalise / restrict / add-new prompt)
+    # ------------------------------------------------------------------
+
+    def _validate_item_cell(self, row: int, item: QTableWidgetItem) -> None:
+        text = item.text().strip()
+        if not text:
+            return
+        cat = self._cat_by_name.get(text.lower())
+        if cat is not None:
+            # Known item — snap to its canonical casing.
+            if item.text() != cat.name:
+                self._table.blockSignals(True)
+                item.setText(cat.name)
+                self._table.blockSignals(False)
+            return
+        if not self._restrict_items:
+            return
+        # Unknown item with restriction on — prompt to add (deferred to avoid
+        # reentering the table's edit machinery).
+        QTimer.singleShot(0, lambda: self._prompt_add_item(row, text))
+
+    def _prompt_add_item(self, row: int, name: str) -> None:
+        it = self._table.item(row, COL_ITEM)
+        if it is None or it.text().strip().lower() != name.lower():
+            return  # cell changed in the meantime
+        # Open the same full Add-Item dialog the accountant uses, pre-filled with
+        # the typed name, so every field can be set just like in Manage Items.
+        from tahmeed.ui.accountant.manage_items import _ItemDialog
+        dlg = _ItemDialog(parent=self, prefill_name=name)
+        if dlg.exec() == QDialog.Accepted and dlg.result_data:
+            asyncio.ensure_future(self._create_item_and_refresh(dlg.result_data, row))
+        else:
+            self._table.blockSignals(True)
+            it.setText("")
+            self._table.blockSignals(False)
+
+    async def _create_item_and_refresh(self, data: dict, row: int) -> None:
+        try:
+            await create_category(
+                data["name"], data["color"],
+                data["requires_receipt"], data["requires_truck"],
+                data.get("description", ""),
+                icon=data.get("icon", "mdi.tag-outline"),
+                show_in_sidebar=data.get("show_in_sidebar", False),
+                lock_description=data.get("lock_description", False),
+            )
+            cats = await get_all_categories()
+            self.update_categories(cats)
+            cat = self._cat_by_name.get(data["name"].lower())
+            it = self._table.item(row, COL_ITEM)
+            if it is not None and cat is not None:
+                self._table.blockSignals(True)
+                it.setText(cat.name)
+                self._table.blockSignals(False)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to add item:\n{exc}")
+
+    # ------------------------------------------------------------------
+    # Truck-column validation (restrict to truck/trailer registry)
+    # ------------------------------------------------------------------
+
+    def _validate_truck_cell(self, row: int, item: QTableWidgetItem) -> None:
+        if not self._restrict_trucks:
+            return
+        number = item.text().strip().upper()
+        if not number:
+            return
+        if number in self._fleet_numbers:
+            if item.text() != number:
+                self._table.blockSignals(True)
+                item.setText(number)
+                self._table.blockSignals(False)
+            return
+        QTimer.singleShot(0, lambda: self._reject_truck(row, number))
+
+    def _reject_truck(self, row: int, number: str) -> None:
+        it = self._table.item(row, COL_TRUCK)
+        if it is None or it.text().strip().upper() != number:
+            return
+        QMessageBox.information(
+            self, "Not in registry",
+            f'"{number}" is not in the truck or trailer registry.\n\n'
+            "Only registered trucks/trailers can be entered. Ask the accountant "
+            "to add it under Manage → Trucks / Trailers.",
+        )
+        self._table.blockSignals(True)
+        it.setText("")
+        self._table.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Description-lock validation
+    # ------------------------------------------------------------------
+
+    def _validate_locked_description(self, row: int, item: QTableWidgetItem) -> None:
+        item_name = self._cell_text(row, COL_ITEM)
+        if not item_name:
+            return
+        cat = self._cat_by_name.get(item_name.lower())
+        if cat is None or not getattr(cat, "lock_description", False):
+            return
+        allowed = self._locked_subitems.get(item_name.lower(), [])
+        if not allowed:
+            return  # locked but no sub-items defined → don't block
+        text = item.text().strip()
+        if not text:
+            return
+        match = next((a for a in allowed if a.lower() == text.lower()), None)
+        if match is not None:
+            if item.text() != match:
+                self._table.blockSignals(True)
+                item.setText(match)
+                self._table.blockSignals(False)
+            return
+        QTimer.singleShot(
+            0, lambda: self._reject_locked_description(row, text, cat.name, allowed)
+        )
+
+    def _reject_locked_description(
+        self, row: int, text: str, item_name: str, allowed: List[str]
+    ) -> None:
+        it = self._table.item(row, COL_DESC)
+        if it is None or it.text().strip().lower() != text.lower():
+            return
+        QMessageBox.information(
+            self, "Description locked",
+            f'"{item_name}" only allows these descriptions:\n\n• '
+            + "\n• ".join(allowed)
+            + "\n\nPlease pick one of the above.",
+        )
+        self._table.blockSignals(True)
+        it.setText("")
+        self._table.blockSignals(False)
+
+    def _cell_text(self, row: int, col: int) -> str:
+        it = self._table.item(row, col)
+        return it.text().strip() if it else ""
 
 
 # ---------------------------------------------------------------------------
