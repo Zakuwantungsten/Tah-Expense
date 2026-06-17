@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QToolButton, QLabel,
     QTableWidget, QTableWidgetItem, QApplication,
     QAbstractItemDelegate, QStyledItemDelegate, QStyleOptionViewItem, QMenu, QFileDialog,
-    QMessageBox, QAbstractItemView, QHeaderView, QDateEdit,
+    QMessageBox, QAbstractItemView, QHeaderView, QDateEdit, QLineEdit,
     QStyle, QComboBox, QDialog,
 )
 from PySide6.QtCore import Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer
@@ -478,6 +478,77 @@ class _ItemDelegate(_ExcelCellDelegate):
         editor.setGeometry(option.rect)
 
 
+class _CurrencyLineEdit(QLineEdit):
+    """QLineEdit that inserts comma thousands-separators in real time."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fmt = False
+        self.textChanged.connect(self._on_text_changed)
+
+    def _on_text_changed(self, text: str) -> None:
+        if self._fmt:
+            return
+        cursor = self.cursorPosition()
+        nc_before = sum(1 for ch in text[:cursor] if ch != ",")
+
+        neg = text.replace(",", "").startswith("-")
+        raw = text.replace(",", "").lstrip("-")
+        clean, dot = "", False
+        for ch in raw:
+            if ch == "." and not dot:
+                clean += ch; dot = True
+            elif ch.isdigit():
+                clean += ch
+
+        if "." in clean:
+            int_s, dec_s = clean.split(".", 1)
+            int_fmt = f"{int(int_s):,}" if int_s else ""
+            new_text = ("-" if neg else "") + int_fmt + "." + dec_s
+        else:
+            new_text = ("-" if neg else "") + (f"{int(clean):,}" if clean else "")
+
+        if new_text == text:
+            return
+
+        self._fmt = True
+        self.setText(new_text)
+        nc, pos = 0, len(new_text)
+        for i, ch in enumerate(new_text):
+            if nc >= nc_before:
+                pos = i
+                break
+            if ch != ",":
+                nc += 1
+        self.setCursorPosition(pos)
+        self._fmt = False
+
+    def value_text(self) -> str:
+        return self.text().replace(",", "")
+
+
+class _TZSDelegate(_ExcelCellDelegate):
+    """Right-aligned currency editor with live comma-thousands formatting."""
+
+    def createEditor(self, parent, option, index):
+        ed = _CurrencyLineEdit(parent)
+        ed.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
+        return ed
+
+    def setEditorData(self, editor, index):
+        editor.blockSignals(True)
+        editor.setText((index.data() or "").strip().replace(",", ""))
+        editor.blockSignals(False)
+        editor.selectAll()
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.text())
+
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
+
+
 # ---------------------------------------------------------------------------
 # Key event filter — captures Tab before Qt's focus-chain system can steal it
 # ---------------------------------------------------------------------------
@@ -595,6 +666,7 @@ class DailyRegister(QWidget):
         self._table.setItemDelegateForColumn(COL_TRUCK,   _TruckDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_DATE,    _DateDelegate(lambda: self._current_date, self._table))
         self._table.setItemDelegateForColumn(COL_NOTES,   _RefFloatDelegate(self._table))
+        self._table.setItemDelegateForColumn(COL_TZS,     _TZSDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_RECEIPT, _ReceiptDelegate(self._table))
 
         self._table.itemChanged.connect(self._on_item_changed)
