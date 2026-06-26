@@ -10,6 +10,8 @@ DEFAULTS = {
     # When True the cashier register's Truck No. column only accepts numbers that
     # exist in the accountant's truck/trailer registries.
     "restrict_trucks": False,
+    # How many days back to scan when checking for duplicate transactions.
+    "duplicate_check_days": 5,
 }
 
 

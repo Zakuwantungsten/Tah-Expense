@@ -53,6 +53,25 @@ class SettingsTab(QWidget):
         threshold_note.setWordWrap(True)
         form.addRow("", threshold_note)
 
+        # Duplicate check window
+        dup_row = QHBoxLayout()
+        self._dup_days = QSpinBox()
+        self._dup_days.setRange(1, 30)
+        self._dup_days.setSuffix(" days")
+        self._dup_days.setFixedWidth(100)
+        dup_row.addWidget(self._dup_days)
+        dup_row.addStretch()
+        form.addRow("Duplicate check window:", dup_row)
+
+        dup_note = QLabel(
+            "When saving a new entry, the system looks back this many days for an identical "
+            "transaction (same truck, amount, item, and description). The cashier is warned "
+            "but can still save — the entry is then flagged for the accountant."
+        )
+        dup_note.setStyleSheet("color: #888; font-size: 12px;")
+        dup_note.setWordWrap(True)
+        form.addRow("", dup_note)
+
         outer.addLayout(form)
         outer.addSpacing(20)
 
@@ -82,12 +101,14 @@ class SettingsTab(QWidget):
             settings = await get_all_settings()
             currency = settings.get("default_currency", "TZS")
             threshold = int(settings.get("confidence_threshold", 75))
+            dup_days = int(settings.get("duplicate_check_days", 5))
 
             idx = self._currency.findText(currency)
             if idx >= 0:
                 self._currency.setCurrentIndex(idx)
             self._threshold.setValue(threshold)
             self._update_threshold_hint(threshold)
+            self._dup_days.setValue(dup_days)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load settings:\n{exc}")
 
@@ -98,6 +119,7 @@ class SettingsTab(QWidget):
         try:
             await set_setting("default_currency", self._currency.currentText())
             await set_setting("confidence_threshold", self._threshold.value())
+            await set_setting("duplicate_check_days", self._dup_days.value())
             self._status_label.setText("Saved.")
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to save settings:\n{exc}")

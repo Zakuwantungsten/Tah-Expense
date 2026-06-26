@@ -1009,8 +1009,17 @@ class VerifyInboxWidget(QWidget):
             sn.setFlags(sn.flags() & ~Qt.ItemIsEditable)
             t.setItem(r, _COL_SN, sn)
 
-            # Col 2: Date
-            t.setItem(r, _COL_DATE, _cell(_fmt_date(tx.date), color=_T2))
+            # Col 2: Date — flag if the transaction date differs from submission date
+            date_item = _cell(_fmt_date(tx.date), color=_T2)
+            if isinstance(tx.date, datetime) and isinstance(tx.created_at, datetime):
+                if tx.date.date() != tx.created_at.date():
+                    date_item.setBackground(QColor(_AMBER_L))
+                    date_item.setForeground(QColor(_AMBER))
+                    date_item.setToolTip(
+                        f"Submitted on {tx.created_at.strftime('%d %b %Y')} "
+                        f"but dated {tx.date.strftime('%d %b %Y')}"
+                    )
+            t.setItem(r, _COL_DATE, date_item)
 
             # Col 3: Cashier
             cashier = cnames.get(tx.cashier_id, "") if tx.cashier_id else ""
@@ -1019,8 +1028,15 @@ class VerifyInboxWidget(QWidget):
             # Col 4: Item
             t.setItem(r, _COL_ITEM, _cell(tx.item or "—"))
 
-            # Col 5: Description
-            t.setItem(r, _COL_DESC, _cell(tx.description or "—"))
+            # Col 5: Description — flag possible duplicates
+            desc_item = _cell(tx.description or "—")
+            if tx.possible_duplicate:
+                desc_item.setBackground(QColor("#FEE2E2"))
+                desc_item.setForeground(QColor(_RED))
+                desc_item.setToolTip(
+                    "Cashier overrode a duplicate warning — similar entry exists in the system"
+                )
+            t.setItem(r, _COL_DESC, desc_item)
 
             # Col 6: Truck
             t.setItem(r, _COL_TRUCK, _cell(tx.truck_number or "—", color=_T2))

@@ -35,6 +35,7 @@ class Transaction:
     month: Optional[str] = None   # e.g. "Jan 25"
     year: Optional[int] = None    # e.g. 2025
     created_at: datetime = field(default_factory=datetime.utcnow)
+    possible_duplicate: bool = False   # set True when cashier overrides a duplicate warning
     _id: Optional[ObjectId] = None
 
     def to_doc(self) -> dict:
@@ -68,6 +69,7 @@ class Transaction:
             "month": self.month,
             "year": self.year,
             "created_at": self.created_at,
+            "possible_duplicate": self.possible_duplicate,
         }
         if self._id:
             doc["_id"] = self._id
@@ -106,4 +108,5 @@ class Transaction:
             month=doc.get("month"),
             year=doc.get("year"),
             created_at=doc.get("created_at", datetime.utcnow()),
+            possible_duplicate=doc.get("possible_duplicate", False),
         )

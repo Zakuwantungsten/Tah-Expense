@@ -1,7 +1,7 @@
 import asyncio
 import re
-from datetime import datetime, date
-from typing import List
+from datetime import datetime, date, timedelta
+from typing import List, Optional
 from bson import ObjectId
 
 from tahmeed.db.connection import get_db
@@ -278,6 +278,36 @@ async def get_rejected_transactions_for_cashier(
         .limit(limit)
     )
     docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
+
+
+async def check_for_duplicates(
+    truck_number: str,
+    amount: float,
+    item: str,
+    description: str,
+    days: int,
+    exclude_id: Optional[ObjectId] = None,
+) -> List[Transaction]:
+    """Return existing transactions within the last `days` days that share
+    truck_number, amount, item, and description with the candidate entry."""
+    db = get_db()
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    query: dict = {
+        "date": {"$gte": cutoff},
+        "rejected": {"$ne": True},
+        "amount": amount,
+    }
+    if truck_number:
+        query["truck_number"] = {"$regex": f"^{re.escape(truck_number)}$", "$options": "i"}
+    if item:
+        query["item"] = {"$regex": f"^{re.escape(item)}$", "$options": "i"}
+    if description:
+        query["description"] = {"$regex": f"^{re.escape(description)}$", "$options": "i"}
+    if exclude_id:
+        query["_id"] = {"$ne": exclude_id}
+    cursor = db.transactions.find(query).sort("date", -1).limit(10)
+    docs = await cursor.to_list(length=10)
     return [Transaction.from_doc(d) for d in docs]
 
 

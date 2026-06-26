@@ -47,6 +47,7 @@ from tahmeed.services.truck_service import search_fleet, get_fleet_numbers
 from tahmeed.services.cashier_service import (
     get_transactions_by_date, save_transaction, delete_transaction,
     search_descriptions, update_transaction, insert_pending_edit,
+    check_for_duplicates,
 )
 from tahmeed.services.category_service import (
     create_category, get_all_categories, item_key,
@@ -91,6 +92,8 @@ NEG_COLOR = QColor("#dc2626")
 SNO_BG    = QColor("#f1f5f9")
 EDIT_BG   = QColor("#FFFBEB")   # warm yellow — saved rows unlocked for editing
 DIRTY_BG  = QColor("#FEF3C7")   # stronger amber — a saved row that was modified
+DUP_BG    = QColor("#FEE2E2")   # light red — possible duplicate flag
+MISMATCH_BG = QColor("#FEF3C7") # amber — date mismatch (submitted vs transaction date)
 
 # Footer QB-style icon+text-below action buttons
 _FOOTER_BTN_STYLE = """
@@ -951,9 +954,22 @@ class DailyRegister(QWidget):
         self._table.setItem(row, COL_SNO, sno)
 
         date_str = tx.date.strftime("%d/%m/%Y") if tx.date else ""
-        self._table.setItem(row, COL_DATE,  saved_item(date_str))
-        self._table.setItem(row, COL_ITEM,  saved_item(tx.item or ""))
-        self._table.setItem(row, COL_DESC,  saved_item(tx.description))
+        date_item = saved_item(date_str)
+        if tx.date and tx.created_at and tx.date.date() != tx.created_at.date():
+            date_item.setBackground(QBrush(MISMATCH_BG))
+            date_item.setToolTip(
+                f"Transaction dated {tx.date.strftime('%d %b %y')} but submitted on "
+                f"{tx.created_at.strftime('%d %b %y')}"
+            )
+        self._table.setItem(row, COL_DATE, date_item)
+
+        self._table.setItem(row, COL_ITEM, saved_item(tx.item or ""))
+
+        desc_item = saved_item(tx.description)
+        if tx.possible_duplicate:
+            desc_item.setBackground(QBrush(DUP_BG))
+            desc_item.setToolTip("Possible duplicate — similar entry found within the check window")
+        self._table.setItem(row, COL_DESC, desc_item)
         self._table.setItem(row, COL_TRUCK, saved_item(tx.truck_number or ""))
         self._table.setItem(row, COL_MEMO,  saved_item(tx.memo or ""))
 
@@ -2026,16 +2042,24 @@ class DailyRegister(QWidget):
                 errors.append(f"Row {row + 1}: {exc}")
 
         # ── Pass 2: insert brand-new rows (INSERT) ───────────────────────
+        try:
+            dup_days = int(await get_setting("duplicate_check_days") or 5)
+        except Exception:
+            dup_days = 5
+
+        cancel_all = False
         for row in range(self._saved_count, self._table.rowCount()):
+            if cancel_all:
+                break
             if not self._row_has_data(row):
                 continue
 
-            def txt(col: int) -> str:
-                it = self._table.item(row, col)
+            def txt(col: int, _row: int = row) -> str:
+                it = self._table.item(_row, col)
                 return it.text().strip() if it else ""
 
-            def checked(col: int) -> bool:
-                it = self._table.item(row, col)
+            def checked(col: int, _row: int = row) -> bool:
+                it = self._table.item(_row, col)
                 return it.data(Qt.UserRole) is True if it else False
 
             description = txt(COL_DESC)
@@ -2091,6 +2115,49 @@ class DailyRegister(QWidget):
                     )
                     continue
 
+                # ── Duplicate check ──────────────────────────────────────
+                is_dup = False
+                try:
+                    dupes = await check_for_duplicates(
+                        truck_number=truck_number,
+                        amount=amount,
+                        item=item_name,
+                        description=description,
+                        days=dup_days,
+                    )
+                except Exception:
+                    dupes = []
+
+                if dupes:
+                    d = dupes[0]
+                    dupe_info = (
+                        f"Row {row + 1}  ·  {description or '—'}  ·  "
+                        f"Truck {truck_number or '—'}  ·  TZS {amount:,.0f}\n\n"
+                        f"A similar entry already exists:\n"
+                        f"  Date: {d.date.strftime('%d %b %Y') if d.date else '—'}\n"
+                        f"  Item: {d.item or '—'}\n"
+                        f"  Description: {d.description or '—'}\n"
+                        f"  Amount: TZS {d.amount:,.0f}\n"
+                        f"  Truck: {d.truck_number or '—'}\n\n"
+                        f"(Checked last {dup_days} day{'s' if dup_days != 1 else ''})"
+                    )
+                    msg = QMessageBox(self)
+                    msg.setWindowTitle("Possible Duplicate Entry")
+                    msg.setText(dupe_info)
+                    msg.setIcon(QMessageBox.Warning)
+                    save_btn   = msg.addButton("Save Anyway", QMessageBox.AcceptRole)
+                    skip_btn   = msg.addButton("Skip Row",    QMessageBox.RejectRole)
+                    cancel_btn = msg.addButton("Cancel Save", QMessageBox.DestructiveRole)
+                    msg.exec()
+                    clicked = msg.clickedButton()
+                    if clicked is cancel_btn:
+                        cancel_all = True
+                        break
+                    elif clicked is skip_btn:
+                        continue
+                    else:
+                        is_dup = True   # "Save Anyway" — mark as duplicate
+
                 tx = Transaction(
                     date=tx_date,
                     description=description,
@@ -2107,6 +2174,7 @@ class DailyRegister(QWidget):
                     ownership=txt(COL_OWN),
                     approver=txt(COL_APR),
                     cashier_id=self._user._id,
+                    possible_duplicate=is_dup,
                 )
                 await save_transaction(tx)
                 saved += 1
