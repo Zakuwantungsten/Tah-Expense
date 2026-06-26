@@ -306,6 +306,10 @@ class _FilterBar(QFrame):
         self._approve_btn.setEnabled(enabled)
         self._reject_btn.setEnabled(enabled)
 
+    def set_bulk_visible(self, visible: bool) -> None:
+        self._approve_btn.setVisible(visible)
+        self._reject_btn.setVisible(visible)
+
     def search_text(self) -> str:
         return self._search.text().strip()
 
@@ -399,11 +403,13 @@ class _ActionPanel(QFrame):
     approved  = Signal(object)       # tx._id
     rejected  = Signal(object, str)  # tx._id, reason
     saved_cat = Signal(object, str)  # tx._id, category
+    returned  = Signal(object)       # tx._id — return rejected entry to inbox
     dismissed = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._tx: Optional[Transaction] = None
+        self._mode = "new"  # "new" | "edited" | "rejected"
         self.setObjectName("actionPanel")
         self.setStyleSheet(
             "QFrame#actionPanel{"
@@ -441,8 +447,9 @@ class _ActionPanel(QFrame):
         # Notes
         notes_w = QWidget(); notes_w.setStyleSheet("background:transparent;")
         nvl = QVBoxLayout(notes_w); nvl.setContentsMargins(0, 0, 0, 0); nvl.setSpacing(3)
-        nvl.addWidget(_lbl("NOTES FOR CASHIER  (required to reject)",
-                           size=9, weight=600, color=_T2))
+        self._notes_lbl = _lbl("NOTES FOR CASHIER  (required to reject)",
+                               size=9, weight=600, color=_T2)
+        nvl.addWidget(self._notes_lbl)
         self._notes = QTextEdit()
         self._notes.setFixedHeight(54)
         self._notes.setPlaceholderText("Leave a reason if rejecting this entry…")
@@ -460,17 +467,22 @@ class _ActionPanel(QFrame):
         bvl = QVBoxLayout(btn_w); bvl.setContentsMargins(0, 0, 0, 0); bvl.setSpacing(5)
         bvl.addStretch()
 
-        save_btn = _btn("Save & Next", "mdi.content-save-outline", primary=False, height=30)
-        save_btn.clicked.connect(self._on_save)
-        bvl.addWidget(save_btn)
+        self._save_btn = _btn("Save & Next", "mdi.content-save-outline", primary=False, height=30)
+        self._save_btn.clicked.connect(self._on_save)
+        bvl.addWidget(self._save_btn)
 
-        approve_btn = _btn("Approve", "mdi.check-circle-outline", height=30)
-        approve_btn.clicked.connect(self._on_approve)
-        bvl.addWidget(approve_btn)
+        self._approve_btn = _btn("Approve", "mdi.check-circle-outline", height=30)
+        self._approve_btn.clicked.connect(self._on_approve)
+        bvl.addWidget(self._approve_btn)
 
-        reject_btn = _btn("Reject & Return", "mdi.close-circle-outline", danger=True, height=30)
-        reject_btn.clicked.connect(self._on_reject)
-        bvl.addWidget(reject_btn)
+        self._reject_btn = _btn("Reject & Return", "mdi.close-circle-outline", danger=True, height=30)
+        self._reject_btn.clicked.connect(self._on_reject)
+        bvl.addWidget(self._reject_btn)
+
+        self._return_btn = _btn("Return to Inbox", "mdi.inbox-arrow-up", height=30)
+        self._return_btn.clicked.connect(self._on_return)
+        self._return_btn.hide()
+        bvl.addWidget(self._return_btn)
 
         dismiss_btn = _btn("✕", "", primary=False, height=30)
         dismiss_btn.setFixedWidth(34)
@@ -480,6 +492,19 @@ class _ActionPanel(QFrame):
 
         hl.addWidget(btn_w)
         vl.addWidget(ctrl)
+
+    def set_mode(self, mode: str) -> None:
+        """Switch panel between 'new', 'edited', and 'rejected' modes."""
+        self._mode = mode
+        is_rejected = mode == "rejected"
+        self._save_btn.setVisible(not is_rejected)
+        self._approve_btn.setVisible(not is_rejected)
+        self._reject_btn.setVisible(not is_rejected)
+        self._return_btn.setVisible(is_rejected)
+        self._notes_lbl.setText(
+            "REJECTION REASON" if is_rejected else
+            "NOTES FOR CASHIER  (required to reject)"
+        )
 
     def load(self, tx: Transaction, cashier_name: str, categories: List[str]) -> None:
         self._tx = tx
@@ -535,13 +560,18 @@ class _ActionPanel(QFrame):
             self.saved_cat.emit(self._tx._id, cat)
         self.dismissed.emit()
 
+    def _on_return(self) -> None:
+        if not self._tx:
+            return
+        self.returned.emit(self._tx._id)
 
-# ── Sub-tab bar (New | Edited) ───────────────────────────────────────────────────
+
+# ── Sub-tab bar (New | Edited | Rejected) ────────────────────────────────────
 
 class _SubTabBar(QFrame):
-    """Segmented New | Edited switcher with live count badges in each label."""
+    """Segmented New | Edited | Rejected switcher with live count badges."""
 
-    tab_changed = Signal(int)   # 0 = New, 1 = Edited
+    tab_changed = Signal(int)   # 0 = New, 1 = Edited, 2 = Rejected
 
     _TAB_SS = (
         "QPushButton{background:transparent;border:none;"
@@ -551,6 +581,14 @@ class _SubTabBar(QFrame):
         "QPushButton:checked{color:%s;border-bottom:2px solid %s;}"
     ) % (_T2, _T1, _BLUE, _BLUE)
 
+    _REJECTED_SS = (
+        "QPushButton{background:transparent;border:none;"
+        "border-bottom:2px solid transparent;color:%s;font-size:13px;font-weight:600;"
+        "font-family:'Segoe UI',sans-serif;padding:0 4px;}"
+        "QPushButton:hover{color:%s;}"
+        "QPushButton:checked{color:%s;border-bottom:2px solid %s;}"
+    ) % (_T2, _RED, _RED, _RED)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedHeight(42)
@@ -558,7 +596,7 @@ class _SubTabBar(QFrame):
             f"QFrame{{background:{_WHITE};border-bottom:1px solid {_BORDER};}}"
         )
         self._current = 0
-        self._labels = ["New", "Edited"]
+        self._labels = ["New", "Edited", "Rejected"]
 
         hl = QHBoxLayout(self)
         hl.setContentsMargins(20, 0, 20, 0)
@@ -570,7 +608,7 @@ class _SubTabBar(QFrame):
             btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFixedHeight(42)
-            btn.setStyleSheet(self._TAB_SS)
+            btn.setStyleSheet(self._REJECTED_SS if i == 2 else self._TAB_SS)
             btn.clicked.connect(lambda _checked, idx=i: self._select(idx))
             self._buttons.append(btn)
             hl.addWidget(btn)
@@ -588,9 +626,10 @@ class _SubTabBar(QFrame):
     def current_tab(self) -> int:
         return self._current
 
-    def set_counts(self, new_count: int, edited_count: int) -> None:
+    def set_counts(self, new_count: int, edited_count: int, rejected_count: int = 0) -> None:
         self._buttons[0].setText(f"New ({new_count})")
         self._buttons[1].setText(f"Edited ({edited_count})")
+        self._buttons[2].setText(f"Rejected ({rejected_count})")
 
 
 # ── Main widget ────────────────────────────────────────────────────────────────
@@ -606,8 +645,8 @@ class VerifyInboxWidget(QWidget):
         self._cashier_names: Dict = {}
         self._page = 0
         self._total = 0
-        self._current_tab = 0   # 0 = New, 1 = Edited
-        self._filters_loaded = False
+        self._current_tab = 0   # 0 = New, 1 = Edited, 2 = Rejected
+        self._filters_tab = -1  # which tab's filters are currently loaded
         self._loading = False
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -703,6 +742,7 @@ class VerifyInboxWidget(QWidget):
         self._panel.approved.connect(self._on_approved)
         self._panel.rejected.connect(self._on_rejected)
         self._panel.saved_cat.connect(self._on_save_category)
+        self._panel.returned.connect(self._on_returned)
         self._panel.dismissed.connect(self._panel.hide)
         cl.addWidget(self._panel)
 
@@ -752,13 +792,16 @@ class VerifyInboxWidget(QWidget):
         self._current_tab = idx
         self._page = 0
         self._panel.hide()
-        self._set_edited_header(idx == 1)
+        self._panel.set_mode("rejected" if idx == 2 else ("edited" if idx == 1 else "new"))
+        self._set_tab_header(idx)
+        self._filter_bar.set_bulk_visible(idx != 2)
+        self._filters_tab = -1  # force filter reload when tab changes
         asyncio.ensure_future(self._reload())
 
-    def _set_edited_header(self, edited: bool) -> None:
+    def _set_tab_header(self, tab: int) -> None:
         item = self._table.horizontalHeaderItem(_COL_APP)
         if item:
-            item.setText("EDITED" if edited else "APP BY")
+            item.setText("EDITED" if tab == 1 else ("REASON" if tab == 2 else "APP BY"))
 
     def _on_filter_changed(self) -> None:
         self._page = 0
@@ -779,6 +822,9 @@ class VerifyInboxWidget(QWidget):
         if row < len(self._transactions):
             tx = self._transactions[row]
             cashier = self._cashier_names.get(tx.cashier_id, "") if tx.cashier_id else ""
+            tab = self._current_tab
+            mode = "rejected" if tab == 2 else ("edited" if tab == 1 else "new")
+            self._panel.set_mode(mode)
             self._panel.load(tx, cashier, self._categories)
             self._panel.show()
 
@@ -821,25 +867,35 @@ class VerifyInboxWidget(QWidget):
             from tahmeed.services.accountant_service import (
                 get_unverified_filtered, count_unverified_filtered,
                 get_edited_transactions, count_edited_transactions,
+                get_rejected_transactions, count_rejected_transactions,
                 get_unverified_trucks, get_unverified_cashier_ids,
-                get_cashier_names, get_pending_count,
+                get_rejected_trucks, get_rejected_cashier_ids,
+                get_cashier_names, get_pending_count, get_rejected_count,
             )
             from tahmeed.services.category_service import get_all_categories
 
             size = self._pagination.current_size()
             skip = self._page * size
-            search  = self._filter_bar.search_text()
-            truck   = self._filter_bar.truck_filter()
-            cid     = self._filter_bar.cashier_id_filter()
-            df, dt  = self._filter_bar.date_filter()
-            edited_tab = self._current_tab == 1
+            search = self._filter_bar.search_text()
+            truck  = self._filter_bar.truck_filter()
+            cid    = self._filter_bar.cashier_id_filter()
+            df, dt = self._filter_bar.date_filter()
+            tab = self._current_tab  # 0=New, 1=Edited, 2=Rejected
 
-            if not self._filters_loaded:
-                cats, trucks, cashier_ids = await asyncio.gather(
-                    get_all_categories(),
-                    get_unverified_trucks(),
-                    get_unverified_cashier_ids(),
-                )
+            # Reload filter dropdowns whenever the tab changes.
+            if self._filters_tab != tab:
+                if tab == 2:
+                    cats, trucks, cashier_ids = await asyncio.gather(
+                        get_all_categories(),
+                        get_rejected_trucks(),
+                        get_rejected_cashier_ids(),
+                    )
+                else:
+                    cats, trucks, cashier_ids = await asyncio.gather(
+                        get_all_categories(),
+                        get_unverified_trucks(),
+                        get_unverified_cashier_ids(),
+                    )
                 self._categories = [c.name for c in cats]
                 cname_map = await get_cashier_names(cashier_ids)
                 self._filter_bar.populate_trucks(trucks)
@@ -848,11 +904,17 @@ class VerifyInboxWidget(QWidget):
                     key=lambda x: x[0],
                 )
                 self._filter_bar.populate_cashiers(clist)
-                self._filters_loaded = True
+                self._filters_tab = tab
             else:
                 cname_map = {}
 
-            if edited_tab:
+            # Choose the right query based on active tab.
+            if tab == 2:
+                txs_coro = get_rejected_transactions(
+                    search=search, truck=truck, cashier_id=cid,
+                    date_from=df, date_to=dt, limit=size, skip=skip,
+                )
+            elif tab == 1:
                 txs_coro = get_edited_transactions(
                     search=search, truck=truck, cashier_id=cid,
                     date_from=df, date_to=dt, limit=size, skip=skip,
@@ -864,7 +926,7 @@ class VerifyInboxWidget(QWidget):
                     edited=False,
                 )
 
-            txs, new_count, edited_count, pending = await asyncio.gather(
+            txs, new_count, edited_count, rejected_count, pending = await asyncio.gather(
                 txs_coro,
                 count_unverified_filtered(
                     search=search, truck=truck, cashier_id=cid,
@@ -874,21 +936,30 @@ class VerifyInboxWidget(QWidget):
                     search=search, truck=truck, cashier_id=cid,
                     date_from=df, date_to=dt,
                 ),
+                count_rejected_transactions(
+                    search=search, truck=truck, cashier_id=cid,
+                    date_from=df, date_to=dt,
+                ),
                 get_pending_count(),
             )
-            total = edited_count if edited_tab else new_count
 
-            # Resolve names for both the owning cashier and whoever last edited.
+            if tab == 2:
+                total = rejected_count
+            elif tab == 1:
+                total = edited_count
+            else:
+                total = new_count
+
+            # Resolve cashier names for everyone on the current page.
             page_ids = {tx.cashier_id for tx in txs if tx.cashier_id}
             page_ids |= {tx.last_edited_by for tx in txs if tx.last_edited_by}
-            page_ids = list(page_ids)
             if page_ids:
-                page_names = await get_cashier_names(page_ids)
+                page_names = await get_cashier_names(list(page_ids))
                 cname_map.update(page_names)
 
             self._cashier_names = cname_map
             self._total = total
-            self._subtabs.set_counts(new_count, edited_count)
+            self._subtabs.set_counts(new_count, edited_count, rejected_count)
             self._fill_table(txs, cname_map, skip)
             self._pagination.update_state(self._page, total, size)
             self._pending_badge.setText(str(pending))
@@ -903,7 +974,7 @@ class VerifyInboxWidget(QWidget):
     def _fill_table(self, txs: List[Transaction], cnames: Dict, skip: int) -> None:
         self._transactions = txs
         self._panel.hide()
-        edited_tab = self._current_tab == 1
+        tab = self._current_tab  # 0=New, 1=Edited, 2=Rejected
 
         t = self._table
         t.clearSpans()
@@ -912,7 +983,11 @@ class VerifyInboxWidget(QWidget):
 
         if not txs:
             t.blockSignals(False)
-            self._show_empty("No pending transactions match the current filters.")
+            msg = (
+                "No rejected entries." if tab == 2 else
+                "No pending transactions match the current filters."
+            )
+            self._show_empty(msg)
             self._update_bulk_buttons()
             return
 
@@ -980,8 +1055,21 @@ class VerifyInboxWidget(QWidget):
                 r_item.setForeground(QColor(_AMBER))
             t.setItem(r, _COL_RCPT, r_item)
 
-            # Col 11: App By — or edit context on the Edited tab
-            if edited_tab:
+            # Col 11: context column varies by tab
+            if tab == 2:
+                # Rejected tab — show truncated rejection reason
+                reason = (tx.rejection_reason or "—")[:60]
+                reason_item = _cell(reason, color=_RED)
+                if tx.rejection_reason:
+                    reason_item.setToolTip(tx.rejection_reason)
+                t.setItem(r, _COL_APP, reason_item)
+                # Red tint for rejected rows
+                for c in range(_NCOLS):
+                    cell = t.item(r, c)
+                    if cell:
+                        cell.setBackground(QColor("#FFF0F0"))
+            elif tab == 1:
+                # Edited tab — show relative edit timestamp
                 rel = _fmt_relative(tx.last_edited_at)
                 ed_item = _cell(rel or "—", color=_AMBER)
                 editor = cnames.get(tx.last_edited_by, "") if tx.last_edited_by else ""
@@ -990,7 +1078,7 @@ class VerifyInboxWidget(QWidget):
                         f"Edited by {editor or '—'} on {_fmt_date(tx.last_edited_at)}"
                     )
                 t.setItem(r, _COL_APP, ed_item)
-                # Subtle orange row highlight to set edited rows apart.
+                # Subtle orange tint for edited rows
                 for c in range(_NCOLS):
                     cell = t.item(r, c)
                     if cell:
@@ -1026,6 +1114,9 @@ class VerifyInboxWidget(QWidget):
 
     def _on_save_category(self, tx_id: ObjectId, category: str) -> None:
         asyncio.ensure_future(self._do_save_category(tx_id, category))
+
+    def _on_returned(self, tx_id: ObjectId) -> None:
+        asyncio.ensure_future(self._do_return_to_inbox(tx_id))
 
     def _on_bulk_approve(self) -> None:
         checked = [
@@ -1129,3 +1220,18 @@ class VerifyInboxWidget(QWidget):
             QMessageBox.information(self, "Done", f"Approved {n} transaction(s) successfully.")
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Bulk approve failed: {exc}")
+
+    async def _do_return_to_inbox(self, tx_id: ObjectId) -> None:
+        from tahmeed.services.accountant_service import return_to_inbox, get_pending_count
+        try:
+            ok = await return_to_inbox(tx_id)
+            if ok:
+                count = await get_pending_count()
+                self.badge_updated.emit(count)
+                self._panel.hide()
+                asyncio.ensure_future(self._reload())
+            else:
+                QMessageBox.warning(self, "Not Found",
+                                    "Could not return this entry — it may have already been updated.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to return entry: {exc}")

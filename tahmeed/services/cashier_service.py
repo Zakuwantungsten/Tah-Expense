@@ -12,7 +12,7 @@ async def get_transactions_by_date(target_date: date, cashier_id=None) -> List[T
     db = get_db()
     start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
     end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
-    query: dict = {"date": {"$gte": start, "$lte": end}}
+    query: dict = {"date": {"$gte": start, "$lte": end}, "rejected": {"$ne": True}}
     if cashier_id is not None:
         query["cashier_id"] = cashier_id
     cursor = db.transactions.find(query).sort("created_at", 1)
@@ -263,3 +263,53 @@ async def search_descriptions(prefix: str, limit: int = 12) -> List[str]:
     cursor = db.transactions.aggregate(pipeline)
     results = await cursor.to_list(length=limit)
     return [r["_id"] for r in results]
+
+
+async def get_rejected_transactions_for_cashier(
+    cashier_id: ObjectId,
+    limit: int = 200,
+) -> List[Transaction]:
+    """All entries that an accountant has rejected for this cashier, newest first."""
+    db = get_db()
+    cursor = (
+        db.transactions
+        .find({"cashier_id": cashier_id, "rejected": True})
+        .sort([("date", -1), ("created_at", -1)])
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
+
+
+async def insert_pending_edit(
+    original_tx_id: ObjectId,
+    updates: dict,
+    cashier_id: ObjectId,
+) -> ObjectId:
+    """Insert a new pending-edit document instead of modifying the original in-place.
+
+    The original approved transaction stays untouched in Master Expenses.
+    The pending doc carries original_transaction_id so the accountant's
+    re_approve_transaction can cascade the new values back to the original.
+    """
+    db = get_db()
+    original_doc = await db.transactions.find_one({"_id": original_tx_id})
+    if not original_doc:
+        raise ValueError(f"Original transaction {original_tx_id} not found")
+
+    pending = dict(original_doc)
+    pending.pop("_id", None)
+    pending.update(updates)
+    pending["original_transaction_id"] = original_tx_id
+    pending["edited_after_verification"] = True
+    pending["verified"] = False
+    pending["verified_by"] = None
+    pending["verified_at"] = None
+    pending["rejection_reason"] = None
+    pending["rejected"] = False
+    pending["last_edited_at"] = datetime.utcnow()
+    pending["last_edited_by"] = cashier_id
+    pending["created_at"] = datetime.utcnow()
+
+    result = await db.transactions.insert_one(pending)
+    return result.inserted_id

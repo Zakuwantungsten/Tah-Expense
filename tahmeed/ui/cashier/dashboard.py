@@ -40,6 +40,7 @@ from tahmeed.ui.cashier.entry_form import EntryForm
 from tahmeed.ui.cashier.overview import CashierOverview
 from tahmeed.ui.cashier.transactions_table import TransactionBrowser
 from tahmeed.ui.cashier.cashier_category_view import CashierCategoryView
+from tahmeed.ui.cashier.rejected_view import RejectedView
 
 _APP_BG = "#F4F6F8"
 _BORDER = "#E5E7EB"
@@ -445,6 +446,10 @@ class CashierDashboard(QWidget):
         self._form = EntryForm(user=self._user)
         self._stack.addWidget(self._form)
 
+        # index 3 — Rejected entries
+        self._rejected_view = RejectedView(user=self._user)
+        self._stack.addWidget(self._rejected_view)
+
         self._stack.setCurrentIndex(0)
         body_hl.addWidget(self._stack, 1)
 
@@ -473,6 +478,9 @@ class CashierDashboard(QWidget):
             self._register.reload_settings()
         elif key == "form":
             self._stack.setCurrentIndex(2)
+        elif key == "rejected":
+            self._stack.setCurrentIndex(3)
+            self._rejected_view.refresh()
         elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
 

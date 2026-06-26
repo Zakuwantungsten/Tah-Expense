@@ -42,6 +42,9 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("table", "Table", "mdi.table-large", {}),
         ("form",  "Form",  "mdi.form-select", {}),
     ]),
+    ("INBOX", [
+        ("rejected", "Rejected", "mdi.alert-circle-outline", {}),
+    ]),
     ("ITEMS", []),
 ]
 

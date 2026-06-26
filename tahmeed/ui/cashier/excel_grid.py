@@ -46,7 +46,7 @@ from tahmeed.models.user import User
 from tahmeed.services.truck_service import search_fleet, get_fleet_numbers
 from tahmeed.services.cashier_service import (
     get_transactions_by_date, save_transaction, delete_transaction,
-    search_descriptions, update_transaction,
+    search_descriptions, update_transaction, insert_pending_edit,
 )
 from tahmeed.services.category_service import (
     create_category, get_all_categories, item_key,
@@ -2006,13 +2006,21 @@ class DailyRegister(QWidget):
             updates["last_edited_at"] = datetime.utcnow()
             updates["last_edited_by"] = self._user._id
             orig = self._saved_txs.get(row)
-            if orig is not None and orig.verified:
-                # Editing a previously-approved row revokes its approval and
-                # routes it to the accountant's "Edited" queue for re-review.
-                updates["verified"] = False
-                updates["edited_after_verification"] = True
             try:
-                await update_transaction(tx_id, updates)
+                if orig is not None and orig.verified:
+                    # Leave the original in Master Expenses intact; insert a
+                    # pending-edit document that the accountant reviews in the
+                    # Edited tab. On re-approval the new values cascade to the
+                    # original in-place.
+                    await insert_pending_edit(tx_id, updates, self._user._id)
+                elif orig is not None and getattr(orig, "rejected", False):
+                    # Re-editing a rejected entry: clear the rejection so it
+                    # returns to the accountant's New inbox tab.
+                    updates["rejected"] = False
+                    updates["rejection_reason"] = None
+                    await update_transaction(tx_id, updates)
+                else:
+                    await update_transaction(tx_id, updates)
                 updated += 1
             except Exception as exc:
                 errors.append(f"Row {row + 1}: {exc}")

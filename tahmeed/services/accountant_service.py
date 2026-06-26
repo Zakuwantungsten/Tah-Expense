@@ -84,6 +84,7 @@ async def reject_transaction(tx_id: ObjectId, reason: str) -> bool:
         {"$set": {
             "verified": False,
             "rejection_reason": reason,
+            "rejected": True,
         }},
     )
     return result.modified_count == 1
@@ -91,7 +92,7 @@ async def reject_transaction(tx_id: ObjectId, reason: str) -> bool:
 
 async def get_pending_count() -> int:
     db = get_db()
-    return await db.transactions.count_documents({"verified": False})
+    return await db.transactions.count_documents({"verified": False, "rejected": {"$ne": True}})
 
 
 async def get_overview_kpis() -> dict:
@@ -103,7 +104,7 @@ async def get_overview_kpis() -> dict:
 
     db = get_db()
     pending_count, ytd_res, month_res = await asyncio.gather(
-        db.transactions.count_documents({"verified": False}),
+        db.transactions.count_documents({"verified": False, "rejected": {"$ne": True}}),
         db.transactions.aggregate([
             {"$match": {"verified": True, "date": {"$gte": year_start, "$lte": year_end}}},
             {"$group": {
@@ -150,7 +151,7 @@ def _build_inbox_query(
     date_to: Optional[datetime] = None,
     edited: Optional[bool] = None,
 ) -> dict:
-    query: dict = {"verified": False}
+    query: dict = {"verified": False, "rejected": {"$ne": True}}
     # edited=False  → "New" tab: fresh entries never edited-after-verification
     #                 (matches both False and missing field on legacy docs)
     # edited=True   → "Edited" tab: rows the cashier changed after approval
@@ -251,14 +252,127 @@ async def get_edited_count() -> int:
     """Total edited-after-verification rows awaiting re-approval (for the badge)."""
     db = get_db()
     return await db.transactions.count_documents(
-        {"verified": False, "edited_after_verification": True}
+        {"verified": False, "edited_after_verification": True, "rejected": {"$ne": True}}
     )
 
 
-async def re_approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bool:
-    """Approve an edited row and clear its edited-after-verification flag so it
-    leaves the Edited tab and cascades back into Master Expenses."""
+# ── Rejected queries ──────────────────────────────────────────────────────────
+
+def _build_rejected_query(
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    query: dict = {"rejected": True}
+    if search.strip():
+        query["description"] = {"$regex": re.escape(search.strip()), "$options": "i"}
+    if truck.strip():
+        query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
+    if cashier_id:
+        query["cashier_id"] = cashier_id
+    if date_from or date_to:
+        df: dict = {}
+        if date_from:
+            df["$gte"] = date_from
+        if date_to:
+            df["$lte"] = date_to
+        query["date"] = df
+    return query
+
+
+async def get_rejected_transactions(
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 25,
+    skip: int = 0,
+) -> List[Transaction]:
     db = get_db()
+    query = _build_rejected_query(search, truck, cashier_id, date_from, date_to)
+    cursor = (
+        db.transactions.find(query)
+        .sort([("date", -1), ("created_at", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
+
+
+async def count_rejected_transactions(
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> int:
+    db = get_db()
+    query = _build_rejected_query(search, truck, cashier_id, date_from, date_to)
+    return await db.transactions.count_documents(query)
+
+
+async def get_rejected_count() -> int:
+    """Total rejected entries across all cashiers (for the badge)."""
+    db = get_db()
+    return await db.transactions.count_documents({"rejected": True})
+
+
+async def return_to_inbox(tx_id: ObjectId) -> bool:
+    """Undo a rejection — clears rejected flag so the entry reappears in its original inbox tab."""
+    db = get_db()
+    result = await db.transactions.update_one(
+        {"_id": tx_id, "rejected": True},
+        {"$set": {"rejected": False, "rejection_reason": None}},
+    )
+    return result.modified_count == 1
+
+
+# ── Re-approve (edited entries) ───────────────────────────────────────────────
+
+_CASCADE_FIELDS = {
+    "date", "description", "truck_number", "amount", "currency",
+    "lpo_do", "do_number", "memo", "receipt_status", "notes_flag",
+    "ownership", "approver", "category_name", "category_id", "item",
+    "category_confidence", "month", "year",
+}
+
+
+async def re_approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bool:
+    """Approve an edited row.
+
+    If the pending-edit document carries an original_transaction_id, the edited
+    values cascade to the original approved record and the pending doc is deleted.
+    Otherwise (legacy in-place edits) the document is flipped verified=True directly.
+    """
+    db = get_db()
+    pending_doc = await db.transactions.find_one({"_id": tx_id, "verified": False})
+    if not pending_doc:
+        return False
+
+    original_id = pending_doc.get("original_transaction_id")
+
+    if original_id:
+        updates = {k: pending_doc[k] for k in _CASCADE_FIELDS if k in pending_doc}
+        updates.update({
+            "verified": True,
+            "verified_by": accountant_id,
+            "verified_at": datetime.utcnow(),
+            "rejection_reason": None,
+            "rejected": False,
+            "edited_after_verification": False,
+            "last_edited_at": pending_doc.get("last_edited_at"),
+            "last_edited_by": pending_doc.get("last_edited_by"),
+        })
+        result = await db.transactions.update_one({"_id": original_id}, {"$set": updates})
+        if result.modified_count == 1:
+            await db.transactions.delete_one({"_id": tx_id})
+            return True
+        return False
+
     result = await db.transactions.update_one(
         {"_id": tx_id, "verified": False},
         {"$set": {
@@ -266,6 +380,7 @@ async def re_approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bo
             "verified_by": accountant_id,
             "verified_at": datetime.utcnow(),
             "rejection_reason": None,
+            "rejected": False,
             "edited_after_verification": False,
         }},
     )
@@ -278,28 +393,57 @@ async def bulk_re_approve_transactions(
     if not tx_ids:
         return 0
     db = get_db()
-    result = await db.transactions.update_many(
+    docs = await db.transactions.find(
         {"_id": {"$in": tx_ids}, "verified": False},
-        {"$set": {
-            "verified": True,
-            "verified_by": accountant_id,
-            "verified_at": datetime.utcnow(),
-            "rejection_reason": None,
-            "edited_after_verification": False,
-        }},
-    )
-    return result.modified_count
+        {"_id": 1, "original_transaction_id": 1},
+    ).to_list(length=None)
+
+    cascade_ids = [d["_id"] for d in docs if d.get("original_transaction_id")]
+    simple_ids = [d["_id"] for d in docs if not d.get("original_transaction_id")]
+
+    count = 0
+    for tx_id in cascade_ids:
+        if await re_approve_transaction(tx_id, accountant_id):
+            count += 1
+
+    if simple_ids:
+        result = await db.transactions.update_many(
+            {"_id": {"$in": simple_ids}, "verified": False},
+            {"$set": {
+                "verified": True,
+                "verified_by": accountant_id,
+                "verified_at": datetime.utcnow(),
+                "rejection_reason": None,
+                "rejected": False,
+                "edited_after_verification": False,
+            }},
+        )
+        count += result.modified_count
+
+    return count
 
 
 async def get_unverified_trucks() -> List[str]:
     db = get_db()
-    vals = await db.transactions.distinct("truck_number", {"verified": False})
+    vals = await db.transactions.distinct("truck_number", {"verified": False, "rejected": {"$ne": True}})
     return sorted(v for v in vals if v)
 
 
 async def get_unverified_cashier_ids() -> List[ObjectId]:
     db = get_db()
-    vals = await db.transactions.distinct("cashier_id", {"verified": False})
+    vals = await db.transactions.distinct("cashier_id", {"verified": False, "rejected": {"$ne": True}})
+    return [v for v in vals if v is not None]
+
+
+async def get_rejected_trucks() -> List[str]:
+    db = get_db()
+    vals = await db.transactions.distinct("truck_number", {"rejected": True})
+    return sorted(v for v in vals if v)
+
+
+async def get_rejected_cashier_ids() -> List[ObjectId]:
+    db = get_db()
+    vals = await db.transactions.distinct("cashier_id", {"rejected": True})
     return [v for v in vals if v is not None]
 
 

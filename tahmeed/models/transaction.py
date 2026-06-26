@@ -30,6 +30,8 @@ class Transaction:
     edited_after_verification: bool = False    # True if cashier edited a previously verified row
     last_edited_at: Optional[datetime] = None  # Timestamp of last cashier edit
     last_edited_by: Optional[ObjectId] = None  # Cashier who made the edit
+    rejected: bool = False                     # True when accountant explicitly rejects the entry
+    original_transaction_id: Optional[ObjectId] = None  # Points to the original approved doc when this is a pending edit
     month: Optional[str] = None   # e.g. "Jan 25"
     year: Optional[int] = None    # e.g. 2025
     created_at: datetime = field(default_factory=datetime.utcnow)
@@ -61,6 +63,8 @@ class Transaction:
             "edited_after_verification": self.edited_after_verification,
             "last_edited_at": self.last_edited_at,
             "last_edited_by": self.last_edited_by,
+            "rejected": self.rejected,
+            "original_transaction_id": self.original_transaction_id,
             "month": self.month,
             "year": self.year,
             "created_at": self.created_at,
@@ -97,6 +101,8 @@ class Transaction:
             edited_after_verification=doc.get("edited_after_verification", False),
             last_edited_at=doc.get("last_edited_at"),
             last_edited_by=doc.get("last_edited_by"),
+            rejected=doc.get("rejected", False),
+            original_transaction_id=doc.get("original_transaction_id"),
             month=doc.get("month"),
             year=doc.get("year"),
             created_at=doc.get("created_at", datetime.utcnow()),
