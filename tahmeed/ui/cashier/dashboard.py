@@ -82,8 +82,6 @@ _BTN_STYLES = {
 class _QBDocHeader(QFrame):
     """QuickBooks-style document summary header with 4 KPI stat tiles."""
 
-    search_changed = Signal(str)
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("qbDocHeader")
@@ -124,25 +122,6 @@ class _QBDocHeader(QFrame):
         title_vl.addWidget(sub_lbl)
         hl.addLayout(title_vl)
         hl.addStretch()
-
-        # Search bar
-        search = QLineEdit()
-        search.setPlaceholderText("Search entries…")
-        search.setFixedWidth(210)
-        search.setFixedHeight(30)
-        search.setStyleSheet(
-            "QLineEdit {"
-            "  border: 1px solid #D1D5DB; border-radius: 4px;"
-            "  padding: 0 8px; font-size: 12px;"
-            "  color: #111827; background: #F9FAFB;"
-            "}"
-            "QLineEdit:focus {"
-            "  border-color: #0077C5; background: #ffffff;"
-            "}"
-        )
-        search.textChanged.connect(self.search_changed)
-        hl.addWidget(search)
-        hl.addSpacing(12)
 
         # Separator before tile strip
         sep0 = QFrame()
@@ -208,6 +187,8 @@ class _ActionBar(QFrame):
     edit_clicked   = Signal()
     save_clicked   = Signal()
     export_clicked = Signal()
+    today_clicked  = Signal()
+    search_changed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -222,6 +203,24 @@ class _ActionBar(QFrame):
         hl = QHBoxLayout(self)
         hl.setContentsMargins(16, 8, 16, 8)
         hl.setSpacing(10)
+
+        # Search bar — left end, opposite the action buttons
+        search = QLineEdit()
+        search.setPlaceholderText("Search entries…")
+        search.setFixedWidth(220)
+        search.setFixedHeight(34)
+        search.setStyleSheet(
+            "QLineEdit {"
+            "  border: 1px solid #D1D5DB; border-radius: 5px;"
+            "  padding: 0 10px; font-size: 12px;"
+            "  color: #111827; background: #F9FAFB;"
+            "}"
+            "QLineEdit:focus {"
+            "  border-color: #0077C5; background: #ffffff;"
+            "}"
+        )
+        search.textChanged.connect(self.search_changed)
+        hl.addWidget(search)
 
         # Edit-mode status pill — hidden unless editing
         self._status = QLabel("")
@@ -238,6 +237,10 @@ class _ActionBar(QFrame):
         self._export_btn = self._make_btn("Export", "mdi.tray-arrow-down", "secondary")
         self._export_btn.clicked.connect(self.export_clicked)
         hl.addWidget(self._export_btn)
+
+        self._today_btn = self._make_btn("Today", "mdi.calendar-today", "secondary")
+        self._today_btn.clicked.connect(self.today_clicked)
+        hl.addWidget(self._today_btn)
 
         self._edit_btn = self._make_btn("Edit", "mdi.pencil-outline", "secondary")
         self._edit_btn.clicked.connect(self.edit_clicked)
@@ -293,12 +296,15 @@ class _TablePage(QWidget):
 
         self._doc_header = _QBDocHeader()
         register.stats_updated.connect(self._doc_header.update_stats)
-        self._doc_header.search_changed.connect(register.set_search)
 
         self._action_bar = _ActionBar()
         self._action_bar.edit_clicked.connect(register.toggle_edit_mode)
         self._action_bar.save_clicked.connect(register.save_rows)
         self._action_bar.export_clicked.connect(register.export_xlsx)
+        self._action_bar.search_changed.connect(register.set_search)
+        self._action_bar.today_clicked.connect(
+            lambda: register.navigate_to_date(date.today())
+        )
         register.edit_state_changed.connect(self._action_bar.set_edit_state)
 
         vl.addWidget(self._doc_header)
