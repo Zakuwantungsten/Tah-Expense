@@ -20,7 +20,6 @@ from PySide6.QtGui import QColor, QFont
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
-from tahmeed.signals import app_signals
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE     = "#FFFFFF"
@@ -183,6 +182,24 @@ def _fmt_date(dt) -> str:
     if isinstance(dt, datetime):
         return dt.strftime("%d %b %y")
     return str(dt) if dt else "—"
+
+
+def _fmt_relative(dt) -> str:
+    """Short human-friendly age, e.g. '2h ago' / '3d ago'. Falls back to a date."""
+    if not isinstance(dt, datetime):
+        return ""
+    secs = (datetime.utcnow() - dt).total_seconds()
+    if secs < 0:
+        return "just now"
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    if secs < 604800:
+        return f"{int(secs // 86400)}d ago"
+    return dt.strftime("%d %b %y")
 
 
 def _short_name(name: str) -> str:
@@ -519,6 +536,63 @@ class _ActionPanel(QFrame):
         self.dismissed.emit()
 
 
+# ── Sub-tab bar (New | Edited) ───────────────────────────────────────────────────
+
+class _SubTabBar(QFrame):
+    """Segmented New | Edited switcher with live count badges in each label."""
+
+    tab_changed = Signal(int)   # 0 = New, 1 = Edited
+
+    _TAB_SS = (
+        "QPushButton{background:transparent;border:none;"
+        "border-bottom:2px solid transparent;color:%s;font-size:13px;font-weight:600;"
+        "font-family:'Segoe UI',sans-serif;padding:0 4px;}"
+        "QPushButton:hover{color:%s;}"
+        "QPushButton:checked{color:%s;border-bottom:2px solid %s;}"
+    ) % (_T2, _T1, _BLUE, _BLUE)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(42)
+        self.setStyleSheet(
+            f"QFrame{{background:{_WHITE};border-bottom:1px solid {_BORDER};}}"
+        )
+        self._current = 0
+        self._labels = ["New", "Edited"]
+
+        hl = QHBoxLayout(self)
+        hl.setContentsMargins(20, 0, 20, 0)
+        hl.setSpacing(8)
+
+        self._buttons: List[QPushButton] = []
+        for i, label in enumerate(self._labels):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(42)
+            btn.setStyleSheet(self._TAB_SS)
+            btn.clicked.connect(lambda _checked, idx=i: self._select(idx))
+            self._buttons.append(btn)
+            hl.addWidget(btn)
+
+        hl.addStretch()
+        self._buttons[0].setChecked(True)
+
+    def _select(self, idx: int) -> None:
+        for i, btn in enumerate(self._buttons):
+            btn.setChecked(i == idx)
+        if idx != self._current:
+            self._current = idx
+            self.tab_changed.emit(idx)
+
+    def current_tab(self) -> int:
+        return self._current
+
+    def set_counts(self, new_count: int, edited_count: int) -> None:
+        self._buttons[0].setText(f"New ({new_count})")
+        self._buttons[1].setText(f"Edited ({edited_count})")
+
+
 # ── Main widget ────────────────────────────────────────────────────────────────
 
 class VerifyInboxWidget(QWidget):
@@ -532,13 +606,13 @@ class VerifyInboxWidget(QWidget):
         self._cashier_names: Dict = {}
         self._page = 0
         self._total = 0
+        self._current_tab = 0   # 0 = New, 1 = Edited
         self._filters_loaded = False
         self._loading = False
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(350)
         self._debounce.timeout.connect(self._reload)
-        app_signals.transaction_saved.connect(self._debounce.start)
         self._build()
 
     # ── Layout ─────────────────────────────────────────────────────────────────
@@ -592,6 +666,11 @@ class VerifyInboxWidget(QWidget):
         refresh_btn.clicked.connect(self.refresh)
         tbl.addWidget(refresh_btn)
         root.addWidget(title_bar)
+
+        # Sub-tab bar (New | Edited)
+        self._subtabs = _SubTabBar()
+        self._subtabs.tab_changed.connect(self._on_subtab_changed)
+        root.addWidget(self._subtabs)
 
         # Filter bar
         self._filter_bar = _FilterBar()
@@ -669,6 +748,18 @@ class VerifyInboxWidget(QWidget):
 
     # ── Event handlers ──────────────────────────────────────────────────────────
 
+    def _on_subtab_changed(self, idx: int) -> None:
+        self._current_tab = idx
+        self._page = 0
+        self._panel.hide()
+        self._set_edited_header(idx == 1)
+        asyncio.ensure_future(self._reload())
+
+    def _set_edited_header(self, edited: bool) -> None:
+        item = self._table.horizontalHeaderItem(_COL_APP)
+        if item:
+            item.setText("EDITED" if edited else "APP BY")
+
     def _on_filter_changed(self) -> None:
         self._page = 0
         self._debounce.start()
@@ -729,6 +820,7 @@ class VerifyInboxWidget(QWidget):
         try:
             from tahmeed.services.accountant_service import (
                 get_unverified_filtered, count_unverified_filtered,
+                get_edited_transactions, count_edited_transactions,
                 get_unverified_trucks, get_unverified_cashier_ids,
                 get_cashier_names, get_pending_count,
             )
@@ -740,6 +832,7 @@ class VerifyInboxWidget(QWidget):
             truck   = self._filter_bar.truck_filter()
             cid     = self._filter_bar.cashier_id_filter()
             df, dt  = self._filter_bar.date_filter()
+            edited_tab = self._current_tab == 1
 
             if not self._filters_loaded:
                 cats, trucks, cashier_ids = await asyncio.gather(
@@ -759,25 +852,43 @@ class VerifyInboxWidget(QWidget):
             else:
                 cname_map = {}
 
-            txs, total, pending = await asyncio.gather(
-                get_unverified_filtered(
+            if edited_tab:
+                txs_coro = get_edited_transactions(
                     search=search, truck=truck, cashier_id=cid,
                     date_from=df, date_to=dt, limit=size, skip=skip,
-                ),
+                )
+            else:
+                txs_coro = get_unverified_filtered(
+                    search=search, truck=truck, cashier_id=cid,
+                    date_from=df, date_to=dt, limit=size, skip=skip,
+                    edited=False,
+                )
+
+            txs, new_count, edited_count, pending = await asyncio.gather(
+                txs_coro,
                 count_unverified_filtered(
+                    search=search, truck=truck, cashier_id=cid,
+                    date_from=df, date_to=dt, edited=False,
+                ),
+                count_edited_transactions(
                     search=search, truck=truck, cashier_id=cid,
                     date_from=df, date_to=dt,
                 ),
                 get_pending_count(),
             )
+            total = edited_count if edited_tab else new_count
 
-            page_cids = list({tx.cashier_id for tx in txs if tx.cashier_id})
-            if page_cids:
-                page_names = await get_cashier_names(page_cids)
+            # Resolve names for both the owning cashier and whoever last edited.
+            page_ids = {tx.cashier_id for tx in txs if tx.cashier_id}
+            page_ids |= {tx.last_edited_by for tx in txs if tx.last_edited_by}
+            page_ids = list(page_ids)
+            if page_ids:
+                page_names = await get_cashier_names(page_ids)
                 cname_map.update(page_names)
 
             self._cashier_names = cname_map
             self._total = total
+            self._subtabs.set_counts(new_count, edited_count)
             self._fill_table(txs, cname_map, skip)
             self._pagination.update_state(self._page, total, size)
             self._pending_badge.setText(str(pending))
@@ -792,6 +903,7 @@ class VerifyInboxWidget(QWidget):
     def _fill_table(self, txs: List[Transaction], cnames: Dict, skip: int) -> None:
         self._transactions = txs
         self._panel.hide()
+        edited_tab = self._current_tab == 1
 
         t = self._table
         t.clearSpans()
@@ -868,8 +980,23 @@ class VerifyInboxWidget(QWidget):
                 r_item.setForeground(QColor(_AMBER))
             t.setItem(r, _COL_RCPT, r_item)
 
-            # Col 11: App By
-            t.setItem(r, _COL_APP, _cell(tx.approver or "—", color=_T2))
+            # Col 11: App By — or edit context on the Edited tab
+            if edited_tab:
+                rel = _fmt_relative(tx.last_edited_at)
+                ed_item = _cell(rel or "—", color=_AMBER)
+                editor = cnames.get(tx.last_edited_by, "") if tx.last_edited_by else ""
+                if tx.last_edited_at:
+                    ed_item.setToolTip(
+                        f"Edited by {editor or '—'} on {_fmt_date(tx.last_edited_at)}"
+                    )
+                t.setItem(r, _COL_APP, ed_item)
+                # Subtle orange row highlight to set edited rows apart.
+                for c in range(_NCOLS):
+                    cell = t.item(r, c)
+                    if cell:
+                        cell.setBackground(QColor("#FFF7ED"))
+            else:
+                t.setItem(r, _COL_APP, _cell(tx.approver or "—", color=_T2))
 
         t.blockSignals(False)
         self._update_bulk_buttons()
@@ -909,6 +1036,17 @@ class VerifyInboxWidget(QWidget):
         if not checked:
             return
         tx_rows = [(r, self._transactions[r]) for r in checked if r < len(self._transactions)]
+
+        # Edited tab: these rows were already human-approved once, so skip the
+        # confidence gate and re-approve every checked row.
+        if self._current_tab == 1:
+            msg = f"Re-approve {len(tx_rows)} edited transaction(s)?"
+            if QMessageBox.question(self, "Re-approve Edited", msg,
+                                    QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+                tx_ids = [tx._id for _, tx in tx_rows if tx._id]
+                asyncio.ensure_future(self._do_bulk_approve(tx_ids))
+            return
+
         auto = [(r, tx) for r, tx in tx_rows if tx.category_confidence >= _AUTO_THRESHOLD]
         low  = [(r, tx) for r, tx in tx_rows if tx.category_confidence < _AUTO_THRESHOLD]
 
@@ -942,9 +1080,15 @@ class VerifyInboxWidget(QWidget):
     # ── Async service calls ─────────────────────────────────────────────────────
 
     async def _do_approve(self, tx_id: ObjectId) -> None:
-        from tahmeed.services.accountant_service import approve_transaction, get_pending_count
+        from tahmeed.services.accountant_service import (
+            approve_transaction, re_approve_transaction, get_pending_count,
+        )
         try:
-            await approve_transaction(tx_id, self._user._id)
+            if self._current_tab == 1:
+                # Edited tab — re-approval also clears edited_after_verification.
+                await re_approve_transaction(tx_id, self._user._id)
+            else:
+                await approve_transaction(tx_id, self._user._id)
             count = await get_pending_count()
             self.badge_updated.emit(count)
             self._panel.hide()
@@ -972,10 +1116,13 @@ class VerifyInboxWidget(QWidget):
 
     async def _do_bulk_approve(self, tx_ids: List[ObjectId]) -> None:
         from tahmeed.services.accountant_service import (
-            bulk_approve_transactions, get_pending_count,
+            bulk_approve_transactions, bulk_re_approve_transactions, get_pending_count,
         )
         try:
-            n = await bulk_approve_transactions(tx_ids, self._user._id)
+            if self._current_tab == 1:
+                n = await bulk_re_approve_transactions(tx_ids, self._user._id)
+            else:
+                n = await bulk_approve_transactions(tx_ids, self._user._id)
             count = await get_pending_count()
             self.badge_updated.emit(count)
             asyncio.ensure_future(self._reload())

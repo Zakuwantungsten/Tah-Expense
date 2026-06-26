@@ -25,9 +25,11 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
-    QFrame, QLabel, QLineEdit,
+    QFrame, QLabel, QLineEdit, QPushButton,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QSize
+
+import qtawesome as qta
 
 from tahmeed.models.user import User
 from tahmeed.services.category_service import get_all_categories
@@ -45,6 +47,34 @@ _WHITE  = "#FFFFFF"
 _BLUE   = "#0077C5"
 _T1     = "#111827"
 _T2     = "#6B7280"
+
+# ── Button styles ────────────────────────────────────────────────────────────────
+# Mirrors the filled / outlined / tonal hierarchy used by Material 3, Stripe and
+# Microsoft Fluent: one high-emphasis filled action (Save), neutral outlined
+# secondaries (Edit / Export), and a warm tonal "active" state for the toggle.
+_BTN_BASE = (
+    "border-radius:6px;font-size:13px;font-weight:600;"
+    "font-family:'Segoe UI',sans-serif;padding:0 16px;"
+)
+_BTN_STYLES = {
+    "primary": (
+        f"QPushButton{{background:{_BLUE};color:#FFFFFF;border:1px solid {_BLUE};{_BTN_BASE}}}"
+        "QPushButton:hover{background:#0369A1;border-color:#0369A1;}"
+        "QPushButton:pressed{background:#075985;border-color:#075985;}"
+        "QPushButton:disabled{background:#93C5FD;border-color:#93C5FD;color:#EFF6FF;}"
+    ),
+    "secondary": (
+        f"QPushButton{{background:#FFFFFF;color:#374151;border:1px solid #D1D5DB;{_BTN_BASE}}}"
+        "QPushButton:hover{background:#F9FAFB;border-color:#9CA3AF;}"
+        "QPushButton:pressed{background:#F3F4F6;}"
+        "QPushButton:disabled{color:#9CA3AF;border-color:#E5E7EB;}"
+    ),
+    "active": (
+        "QPushButton{background:#D97706;color:#FFFFFF;border:1px solid #D97706;" + _BTN_BASE + "}"
+        "QPushButton:hover{background:#B45309;border-color:#B45309;}"
+        "QPushButton:pressed{background:#92400E;border-color:#92400E;}"
+    ),
+}
 
 
 # ── QuickBooks-style document header ─────────────────────────────────────────────
@@ -170,8 +200,90 @@ class _QBDocHeader(QFrame):
         self._val_refund.setText(f"TZS {refund_total:,.0f}" if refund_total else "—")
 
 
+# ── Action bar (Edit / Save / Export) ────────────────────────────────────────────
+
+class _ActionBar(QFrame):
+    """Thin professional action strip between the document header and the table."""
+
+    edit_clicked   = Signal()
+    save_clicked   = Signal()
+    export_clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("registerActionBar")
+        self.setFixedHeight(52)
+        self.setStyleSheet(
+            "QFrame#registerActionBar {"
+            f"  background: {_WHITE}; border-bottom: 1px solid {_BORDER};"
+            "}"
+        )
+
+        hl = QHBoxLayout(self)
+        hl.setContentsMargins(16, 8, 16, 8)
+        hl.setSpacing(10)
+
+        # Edit-mode status pill — hidden unless editing
+        self._status = QLabel("")
+        self._status.setStyleSheet(
+            "QLabel{background:#FEF3C7;color:#92400E;border:1px solid #FDE68A;"
+            "border-radius:5px;padding:4px 10px;font-size:12px;font-weight:600;"
+            "font-family:'Segoe UI',sans-serif;}"
+        )
+        self._status.hide()
+        hl.addWidget(self._status)
+
+        hl.addStretch()
+
+        self._export_btn = self._make_btn("Export", "mdi.tray-arrow-down", "secondary")
+        self._export_btn.clicked.connect(self.export_clicked)
+        hl.addWidget(self._export_btn)
+
+        self._edit_btn = self._make_btn("Edit", "mdi.pencil-outline", "secondary")
+        self._edit_btn.clicked.connect(self.edit_clicked)
+        hl.addWidget(self._edit_btn)
+
+        self._save_btn = self._make_btn("Save", "mdi.content-save-outline", "primary")
+        self._save_btn.clicked.connect(self.save_clicked)
+        hl.addWidget(self._save_btn)
+
+    def _make_btn(self, text: str, icon: str, kind: str) -> QPushButton:
+        b = QPushButton(f"  {text}")
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFixedHeight(36)
+        try:
+            color = "#FFFFFF" if kind == "primary" else "#374151"
+            b.setIcon(qta.icon(icon, color=color))
+            b.setIconSize(QSize(16, 16))
+        except Exception:
+            pass
+        b.setStyleSheet(_BTN_STYLES[kind])
+        return b
+
+    def set_edit_state(self, active: bool, dirty_count: int = 0) -> None:
+        """Reflect the register's edit mode on the toggle + status pill."""
+        if active:
+            self._edit_btn.setText("  Cancel")
+            try:
+                self._edit_btn.setIcon(qta.icon("mdi.close", color="#FFFFFF"))
+            except Exception:
+                pass
+            self._edit_btn.setStyleSheet(_BTN_STYLES["active"])
+            plural = "" if dirty_count == 1 else "s"
+            self._status.setText(f"Edit mode  ·  {dirty_count} unsaved change{plural}")
+            self._status.show()
+        else:
+            self._edit_btn.setText("  Edit")
+            try:
+                self._edit_btn.setIcon(qta.icon("mdi.pencil-outline", color="#374151"))
+            except Exception:
+                pass
+            self._edit_btn.setStyleSheet(_BTN_STYLES["secondary"])
+            self._status.hide()
+
+
 class _TablePage(QWidget):
-    """_QBDocHeader + DailyRegister stacked vertically."""
+    """_QBDocHeader + action bar + DailyRegister stacked vertically."""
 
     def __init__(self, register: DailyRegister, parent=None):
         super().__init__(parent)
@@ -183,7 +295,14 @@ class _TablePage(QWidget):
         register.stats_updated.connect(self._doc_header.update_stats)
         self._doc_header.search_changed.connect(register.set_search)
 
+        self._action_bar = _ActionBar()
+        self._action_bar.edit_clicked.connect(register.toggle_edit_mode)
+        self._action_bar.save_clicked.connect(register.save_rows)
+        self._action_bar.export_clicked.connect(register.export_xlsx)
+        register.edit_state_changed.connect(self._action_bar.set_edit_state)
+
         vl.addWidget(self._doc_header)
+        vl.addWidget(self._action_bar)
         vl.addWidget(register, 1)
 
 

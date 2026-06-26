@@ -148,8 +148,17 @@ def _build_inbox_query(
     cashier_id: Optional[ObjectId] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    edited: Optional[bool] = None,
 ) -> dict:
     query: dict = {"verified": False}
+    # edited=False  → "New" tab: fresh entries never edited-after-verification
+    #                 (matches both False and missing field on legacy docs)
+    # edited=True   → "Edited" tab: rows the cashier changed after approval
+    # edited=None   → no edited filter (all unverified)
+    if edited is True:
+        query["edited_after_verification"] = True
+    elif edited is False:
+        query["edited_after_verification"] = {"$ne": True}
     if search.strip():
         query["description"] = {"$regex": re.escape(search.strip()), "$options": "i"}
     if truck.strip():
@@ -174,9 +183,10 @@ async def get_unverified_filtered(
     date_to: Optional[datetime] = None,
     limit: int = 25,
     skip: int = 0,
+    edited: Optional[bool] = None,
 ) -> List[Transaction]:
     db = get_db()
-    query = _build_inbox_query(search, truck, cashier_id, date_from, date_to)
+    query = _build_inbox_query(search, truck, cashier_id, date_from, date_to, edited)
     cursor = (
         db.transactions.find(query)
         .sort([("date", -1), ("created_at", -1)])
@@ -193,10 +203,92 @@ async def count_unverified_filtered(
     cashier_id: Optional[ObjectId] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    edited: Optional[bool] = None,
 ) -> int:
     db = get_db()
-    query = _build_inbox_query(search, truck, cashier_id, date_from, date_to)
+    query = _build_inbox_query(search, truck, cashier_id, date_from, date_to, edited)
     return await db.transactions.count_documents(query)
+
+
+# ── Edited-after-verification queries (accountant "Edited" sub-tab) ───────────
+
+async def get_edited_transactions(
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 25,
+    skip: int = 0,
+) -> List[Transaction]:
+    """Rows the cashier edited after they had been approved (verified=False AND
+    edited_after_verification=True). Sorted by most-recently-edited first."""
+    db = get_db()
+    query = _build_inbox_query(search, truck, cashier_id, date_from, date_to, edited=True)
+    cursor = (
+        db.transactions.find(query)
+        .sort([("last_edited_at", -1), ("date", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
+
+
+async def count_edited_transactions(
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> int:
+    db = get_db()
+    query = _build_inbox_query(search, truck, cashier_id, date_from, date_to, edited=True)
+    return await db.transactions.count_documents(query)
+
+
+async def get_edited_count() -> int:
+    """Total edited-after-verification rows awaiting re-approval (for the badge)."""
+    db = get_db()
+    return await db.transactions.count_documents(
+        {"verified": False, "edited_after_verification": True}
+    )
+
+
+async def re_approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bool:
+    """Approve an edited row and clear its edited-after-verification flag so it
+    leaves the Edited tab and cascades back into Master Expenses."""
+    db = get_db()
+    result = await db.transactions.update_one(
+        {"_id": tx_id, "verified": False},
+        {"$set": {
+            "verified": True,
+            "verified_by": accountant_id,
+            "verified_at": datetime.utcnow(),
+            "rejection_reason": None,
+            "edited_after_verification": False,
+        }},
+    )
+    return result.modified_count == 1
+
+
+async def bulk_re_approve_transactions(
+    tx_ids: List[ObjectId], accountant_id: ObjectId
+) -> int:
+    if not tx_ids:
+        return 0
+    db = get_db()
+    result = await db.transactions.update_many(
+        {"_id": {"$in": tx_ids}, "verified": False},
+        {"$set": {
+            "verified": True,
+            "verified_by": accountant_id,
+            "verified_at": datetime.utcnow(),
+            "rejection_reason": None,
+            "edited_after_verification": False,
+        }},
+    )
+    return result.modified_count
 
 
 async def get_unverified_trucks() -> List[str]:

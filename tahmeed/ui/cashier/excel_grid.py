@@ -46,14 +46,13 @@ from tahmeed.models.user import User
 from tahmeed.services.truck_service import search_fleet, get_fleet_numbers
 from tahmeed.services.cashier_service import (
     get_transactions_by_date, save_transaction, delete_transaction,
-    search_descriptions,
+    search_descriptions, update_transaction,
 )
 from tahmeed.services.category_service import (
     create_category, get_all_categories, item_key,
 )
 from tahmeed.services.subtable_service import get_subtables
 from tahmeed.services.settings_service import get_setting
-from tahmeed.signals import app_signals
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_completion
 
@@ -90,6 +89,8 @@ NEW_BG    = QColor("#ffffff")
 EMPTY_BG  = QColor("#fafafa")
 NEG_COLOR = QColor("#dc2626")
 SNO_BG    = QColor("#f1f5f9")
+EDIT_BG   = QColor("#FFFBEB")   # warm yellow — saved rows unlocked for editing
+DIRTY_BG  = QColor("#FEF3C7")   # stronger amber — a saved row that was modified
 
 # Footer QB-style icon+text-below action buttons
 _FOOTER_BTN_STYLE = """
@@ -705,8 +706,9 @@ class _FilterHeaderView(QHeaderView):
 class DailyRegister(QWidget):
     """Unified daily expense register (replaces ExcelGrid + TransactionsTable)."""
 
-    rows_saved    = Signal(int)
-    stats_updated = Signal(int, float, float)  # (n_entries, total_tzs, refund_total)
+    rows_saved        = Signal(int)
+    stats_updated     = Signal(int, float, float)  # (n_entries, total_tzs, refund_total)
+    edit_state_changed = Signal(bool, int)         # (edit_mode_active, dirty_row_count)
 
     def __init__(self, user: User, categories: List[Category], parent=None):
         super().__init__(parent)
@@ -720,10 +722,9 @@ class DailyRegister(QWidget):
         self._current_date: date = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
-        self._retry_queue: set   = set()
-        self._retry_timer        = QTimer(self)
-        self._retry_timer.setSingleShot(True)
-        self._retry_timer.timeout.connect(self._on_retry_timer)
+        self._saved_txs: dict    = {}   # row_index -> original Transaction (saved rows)
+        self._edit_mode: bool    = False
+        self._dirty_rows: set    = set()  # saved row indices modified while editing
         self._col_filters: dict  = {}   # col -> set of accepted values
         self._search_text: str   = ""
         self._build_ui()
@@ -813,7 +814,6 @@ class DailyRegister(QWidget):
 
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.model().dataChanged.connect(self._on_model_data_changed)
-        self._table.currentCellChanged.connect(self._on_current_cell_changed)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._show_context_menu)
 
@@ -846,8 +846,27 @@ class DailyRegister(QWidget):
 
     def navigate_to_date(self, d: date) -> None:
         """Called by dashboard when TransactionBrowser 'Go To' is used."""
+        if self._edit_mode and self._dirty_rows:
+            resp = QMessageBox.question(
+                self, "Unsaved changes",
+                "You have unsaved changes on this date.\nSave them before leaving?",
+                QMessageBox.Yes | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if resp == QMessageBox.Cancel:
+                return
+            if resp == QMessageBox.Yes:
+                asyncio.ensure_future(self._save_then_navigate(d))
+                return
+            # Discard → fall through and reload the new date
+        self._reset_edit_state()
         self._current_date = d
         asyncio.ensure_future(self._load_date(d))
+
+    async def _save_then_navigate(self, d: date) -> None:
+        await self._do_save()
+        self._current_date = d
+        await self._load_date(d)
 
     # ------------------------------------------------------------------
     # Load data
@@ -873,11 +892,15 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._load_fleet_numbers())
 
     def _populate(self, transactions: List[Transaction]) -> None:
+        # A fresh load always returns the grid to read-only state.
+        self._edit_mode = False
+        self._dirty_rows = set()
+
         self._table.blockSignals(True)
         self._table.clearContents()
         self._saved_count = len(transactions)
         self._saved_ids   = {}
-        self._retry_queue.clear()
+        self._saved_txs   = {}
 
         total_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
         self._table.setRowCount(total_rows)
@@ -885,12 +908,14 @@ class DailyRegister(QWidget):
         for i, tx in enumerate(transactions):
             self._fill_saved_row(i, tx)
             self._saved_ids[i] = tx._id
+            self._saved_txs[i] = tx
 
         self._init_editable_rows(self._saved_count, total_rows)
         self._table.blockSignals(False)
         self._renumber()
         self._update_footer()
         self._apply_filters()
+        self.edit_state_changed.emit(False, 0)
 
     # ------------------------------------------------------------------
     # Row initialisation helpers
@@ -982,7 +1007,7 @@ class DailyRegister(QWidget):
         self.stats_updated.emit(n, tzs, refund)
 
     # ------------------------------------------------------------------
-    # Auto-save
+    # Row → Transaction
     # ------------------------------------------------------------------
 
     def _build_transaction_from_row(self, row: int) -> Optional[Transaction]:
@@ -1058,54 +1083,187 @@ class DailyRegister(QWidget):
             cashier_id=self._user._id,
         )
 
-    def _freeze_row(self, row: int, tx: Transaction) -> None:
-        """Convert a single editable row to read-only saved state without
-        touching any other row."""
+    # ------------------------------------------------------------------
+    # Edit mode
+    # ------------------------------------------------------------------
+
+    def toggle_edit_mode(self) -> None:
+        """Public entry point for the Edit button: enter edit mode, or exit and
+        discard pending changes on a second press."""
+        if self._edit_mode:
+            if self._dirty_rows:
+                resp = QMessageBox.question(
+                    self, "Discard changes?",
+                    "Exit edit mode and discard your unsaved changes?",
+                    QMessageBox.Discard | QMessageBox.Cancel,
+                    QMessageBox.Cancel,
+                )
+                if resp == QMessageBox.Cancel:
+                    return
+            self._exit_edit_mode(discard=True)
+        else:
+            self._enter_edit_mode()
+
+    def _enter_edit_mode(self) -> None:
+        """Unlock every saved row for editing and tint it warm yellow."""
+        self._edit_mode = True
+        self._dirty_rows = set()
+        editable = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
         self._table.blockSignals(True)
-        self._fill_saved_row(row, tx)
-        self._saved_ids[row] = tx._id
+        for row in range(self._saved_count):
+            for col in range(self._table.columnCount()):
+                if col in READONLY_COLS:
+                    continue
+                it = self._table.item(row, col)
+                if it is None:
+                    continue
+                it.setFlags(editable)
+                it.setBackground(QBrush(EDIT_BG))
         self._table.blockSignals(False)
-        # Advance _saved_count through the newly contiguous saved block
-        while self._saved_count in self._saved_ids:
-            self._saved_count += 1
-        self._update_footer()
-        self.rows_saved.emit(1)
+        self.edit_state_changed.emit(True, 0)
 
-    def _on_current_cell_changed(
-        self, cur_row: int, cur_col: int, prev_row: int, prev_col: int
-    ) -> None:
-        if prev_row < 0 or prev_row == cur_row:
-            return
-        if prev_row in self._saved_ids:
-            return
-        asyncio.ensure_future(self._autosave_row(prev_row))
+    def _exit_edit_mode(self, discard: bool) -> None:
+        """Leave edit mode. When discard is True the date is reloaded so the grid
+        reverts to the stored values; otherwise the caller reloads after saving."""
+        self._reset_edit_state()
+        if discard:
+            asyncio.ensure_future(self._load_date(self._current_date))
 
-    async def _autosave_row(self, row: int) -> None:
-        if row in self._saved_ids:
+    def _reset_edit_state(self) -> None:
+        self._edit_mode = False
+        self._dirty_rows = set()
+        self.edit_state_changed.emit(False, 0)
+
+    def _mark_dirty(self, row: int) -> None:
+        """Flag a saved row as modified and give it a stronger amber background."""
+        if row in self._dirty_rows:
             return
-        try:
-            tx = self._build_transaction_from_row(row)
-        except ValueError:
-            return  # validation error — row data is logically invalid, skip retry
+        self._dirty_rows.add(row)
+        self._table.blockSignals(True)
+        for col in range(self._table.columnCount()):
+            if col in READONLY_COLS:
+                continue
+            it = self._table.item(row, col)
+            if it is not None:
+                it.setBackground(QBrush(DIRTY_BG))
+        self._table.blockSignals(False)
+        self.edit_state_changed.emit(True, len(self._dirty_rows))
+
+    def _updates_from_row(self, row: int) -> Optional[dict]:
+        """Build the $set payload for an edited saved row from its cell values.
+        Returns None when the row has no description. Raises ValueError on
+        validation errors (bad item / locked description / unregistered truck)."""
+        tx = self._build_transaction_from_row(row)
         if tx is None:
-            return  # no description yet
+            return None
+        return {
+            "date": tx.date,
+            "description": tx.description,
+            "item": tx.item,
+            "category_name": tx.category_name,
+            "truck_number": tx.truck_number,
+            "amount": tx.amount,
+            "currency": tx.currency,
+            "memo": tx.memo,
+            "receipt_status": tx.receipt_status,
+            "notes_flag": tx.notes_flag,
+            "ownership": tx.ownership,
+            "approver": tx.approver,
+        }
 
-        try:
-            tx = await save_transaction(tx)
-        except Exception:
-            # DB / network failure — queue for retry, don't reload the table
-            self._retry_queue.add(row)
-            if not self._retry_timer.isActive():
-                self._retry_timer.start(4000)
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    _EXPORT_COLS = [
+        COL_DATE, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
+        COL_NOTES, COL_TZS, COL_RECEIPT, COL_OWN, COL_APR,
+    ]
+
+    def export_xlsx(self) -> None:
+        """Export the currently-visible rows (respecting search + column filters)
+        to an .xlsx (or .csv) file chosen by the user."""
+        default_name = f"register_{self._current_date.isoformat()}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export register", default_name,
+            "Excel Workbook (*.xlsx);;CSV File (*.csv)",
+        )
+        if not path:
             return
+        rows = self._visible_export_rows()
+        if not rows:
+            QMessageBox.information(self, "Nothing to export",
+                                    "There are no visible rows to export.")
+            return
+        try:
+            if path.lower().endswith(".csv"):
+                self._write_csv(path, rows)
+            else:
+                self._write_xlsx(path, rows)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(self, "Export complete",
+                               f"{len(rows)} row(s) exported to:\n{path}")
 
-        self._retry_queue.discard(row)
-        self._freeze_row(row, tx)
-        app_signals.transaction_saved.emit()
+    # Convenience alias — forces the CSV writer regardless of the chosen name.
+    def export_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export register",
+            f"register_{self._current_date.isoformat()}.csv",
+            "CSV File (*.csv)",
+        )
+        if not path:
+            return
+        rows = self._visible_export_rows()
+        if not rows:
+            QMessageBox.information(self, "Nothing to export",
+                                    "There are no visible rows to export.")
+            return
+        try:
+            self._write_csv(path, rows)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(self, "Export complete",
+                               f"{len(rows)} row(s) exported to:\n{path}")
 
-    def _on_retry_timer(self) -> None:
-        for row in list(self._retry_queue):
-            asyncio.ensure_future(self._autosave_row(row))
+    def _visible_export_rows(self) -> List[list]:
+        out: List[list] = []
+        for row in range(self._table.rowCount()):
+            if self._table.isRowHidden(row):
+                continue
+            if not (row < self._saved_count or self._row_has_data(row)):
+                continue
+            rec: list = []
+            for col in self._EXPORT_COLS:
+                it = self._table.item(row, col)
+                if col == COL_NOTES:
+                    rec.append("Refund to Float"
+                               if (it and it.data(Qt.UserRole) is True) else "")
+                elif col == COL_RECEIPT:
+                    val = (it.text().strip() if it else "")
+                    rec.append(_RCPT_LABEL.get(val.lower(), val))
+                else:
+                    rec.append(it.text().strip() if it else "")
+            out.append(rec)
+        return out
+
+    def _write_csv(self, path: str, rows: List[list]) -> None:
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([HEADERS[c] for c in self._EXPORT_COLS])
+            w.writerows(rows)
+
+    def _write_xlsx(self, path: str, rows: List[list]) -> None:
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Register"
+        ws.append([HEADERS[c] for c in self._EXPORT_COLS])
+        for rec in rows:
+            ws.append(rec)
+        wb.save(path)
 
     # ------------------------------------------------------------------
     # Search & column filtering
@@ -1204,10 +1362,23 @@ class DailyRegister(QWidget):
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         row = item.row()
-        if row < self._saved_count:
-            return
-
         col = item.column()
+
+        # Saved rows: only mutable while in edit mode. Track them as dirty and
+        # uppercase free-text, but skip the new-row activation / expansion logic.
+        if row < self._saved_count:
+            if not self._edit_mode:
+                return
+            if col not in _UPPER_SKIP_COLS:
+                text = item.text()
+                if text and text != text.upper():
+                    self._table.blockSignals(True)
+                    item.setText(text.upper())
+                    self._table.blockSignals(False)
+            self._mark_dirty(row)
+            if col == COL_TZS:
+                self._update_footer()
+            return
 
         # Uppercase all free-text cells
         if col not in _UPPER_SKIP_COLS:
@@ -1256,6 +1427,10 @@ class DailyRegister(QWidget):
     def _on_model_data_changed(self, top_left, bottom_right, roles=()) -> None:
         if top_left.column() == COL_NOTES and Qt.UserRole in roles:
             self._update_footer()
+            # Ref_Float toggles go through the model (not itemChanged); mark the
+            # saved row dirty when toggled in edit mode.
+            if self._edit_mode and top_left.row() < self._saved_count:
+                self._mark_dirty(top_left.row())
 
     def _activate_row(self, row: int) -> None:
         """Make a blank editable row visible: set S/NO number and create input items."""
@@ -1756,11 +1931,36 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._do_save())
 
     async def _do_save(self) -> None:
-        saved, errors = 0, []
+        saved, updated, errors = 0, 0, []
 
+        # ── Pass 1: commit edits to already-saved rows (UPDATE) ──────────
+        for row in sorted(self._dirty_rows):
+            tx_id = self._saved_ids.get(row)
+            if tx_id is None:
+                continue
+            try:
+                updates = self._updates_from_row(row)
+            except ValueError as exc:
+                errors.append(f"Row {row + 1}: {exc}")
+                continue
+            if updates is None:
+                continue
+            updates["last_edited_at"] = datetime.utcnow()
+            updates["last_edited_by"] = self._user._id
+            orig = self._saved_txs.get(row)
+            if orig is not None and orig.verified:
+                # Editing a previously-approved row revokes its approval and
+                # routes it to the accountant's "Edited" queue for re-review.
+                updates["verified"] = False
+                updates["edited_after_verification"] = True
+            try:
+                await update_transaction(tx_id, updates)
+                updated += 1
+            except Exception as exc:
+                errors.append(f"Row {row + 1}: {exc}")
+
+        # ── Pass 2: insert brand-new rows (INSERT) ───────────────────────
         for row in range(self._saved_count, self._table.rowCount()):
-            if row in self._saved_ids:
-                continue  # already auto-saved
             if not self._row_has_data(row):
                 continue
 
@@ -1850,15 +2050,14 @@ class DailyRegister(QWidget):
         if errors:
             QMessageBox.warning(
                 self, "Save — partial errors",
-                f"{saved} saved.\n\nErrors:\n" + "\n".join(errors),
+                f"{saved} added, {updated} updated.\n\nErrors:\n" + "\n".join(errors),
             )
-        elif saved == 0:
-            QMessageBox.information(self, "Nothing to save", "No new rows with data found.")
+        elif saved == 0 and updated == 0:
+            QMessageBox.information(self, "Nothing to save", "No changes to save.")
             return
-        else:
-            # Silently reload — no popup for clean saves
-            pass
+        # else: clean save — reload silently, no popup
 
+        self._reset_edit_state()
         self.rows_saved.emit(saved)
         await self._load_date(self._current_date)
 
