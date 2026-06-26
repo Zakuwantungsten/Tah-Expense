@@ -471,9 +471,9 @@ class CashierDashboard(QWidget):
             self._browser.finished.connect(lambda: setattr(self, "_browser", None))
         self._browser.show_and_search()
 
-    def _on_go_to_date(self, d) -> None:
+    def _on_go_to_date(self, d, term: str = "") -> None:
         self._on_nav("table")
-        self._register.navigate_to_date(d)
+        self._register.navigate_to_date(d, highlight_term=term)
 
     # ── Load categories ───────────────────────────────────────────────────────────
 

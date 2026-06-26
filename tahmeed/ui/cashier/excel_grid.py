@@ -725,8 +725,9 @@ class DailyRegister(QWidget):
         self._saved_txs: dict    = {}   # row_index -> original Transaction (saved rows)
         self._edit_mode: bool    = False
         self._dirty_rows: set    = set()  # saved row indices modified while editing
-        self._col_filters: dict  = {}   # col -> set of accepted values
-        self._search_text: str   = ""
+        self._col_filters: dict   = {}   # col -> set of accepted values
+        self._search_text: str    = ""
+        self._pending_highlight: str = ""  # set by navigate_to_date; consumed in _populate
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_restrict_setting())
@@ -844,8 +845,13 @@ class DailyRegister(QWidget):
         self._init_editable_rows(0, DEFAULT_EDITABLE_ROWS)
         self._install_key_handler()
 
-    def navigate_to_date(self, d: date) -> None:
-        """Called by dashboard when TransactionBrowser 'Go To' is used."""
+    def navigate_to_date(self, d: date, highlight_term: str = "") -> None:
+        """Called by dashboard when TransactionBrowser 'Go To' is used.
+
+        highlight_term — if provided, the register scrolls to the first row
+        containing this text after the date loads and briefly flashes it.
+        """
+        self._pending_highlight = highlight_term
         if self._edit_mode and self._dirty_rows:
             resp = QMessageBox.question(
                 self, "Unsaved changes",
@@ -854,6 +860,7 @@ class DailyRegister(QWidget):
                 QMessageBox.Yes,
             )
             if resp == QMessageBox.Cancel:
+                self._pending_highlight = ""
                 return
             if resp == QMessageBox.Yes:
                 asyncio.ensure_future(self._save_then_navigate(d))
@@ -916,6 +923,12 @@ class DailyRegister(QWidget):
         self._update_footer()
         self._apply_filters()
         self.edit_state_changed.emit(False, 0)
+
+        if self._pending_highlight:
+            term = self._pending_highlight
+            self._pending_highlight = ""
+            # Small delay so Qt finishes laying out the rows before we scroll.
+            QTimer.singleShot(80, lambda: self.scroll_and_highlight(term))
 
     # ------------------------------------------------------------------
     # Row initialisation helpers
@@ -1272,6 +1285,51 @@ class DailyRegister(QWidget):
     def set_search(self, text: str) -> None:
         self._search_text = text.strip().lower()
         self._apply_filters()
+
+    def scroll_and_highlight(self, term: str) -> None:
+        """Scroll to the first saved row that contains term and flash-highlight it.
+
+        Scans all visible columns for a case-insensitive substring match.
+        Applies a 2-second amber highlight then restores the original row background.
+        Does NOT change the active search filter.
+        """
+        if not term:
+            return
+        needle = term.strip().lower()
+
+        first_match = -1
+        for row in range(self._saved_count):
+            if self._table.isRowHidden(row):
+                continue
+            for col in range(self._table.columnCount()):
+                it = self._table.item(row, col)
+                if it and needle in it.text().lower():
+                    first_match = row
+                    break
+            if first_match >= 0:
+                break
+
+        if first_match < 0:
+            return
+
+        self._table.scrollTo(self._table.model().index(first_match, COL_DESC))
+        self._table.setCurrentCell(first_match, COL_DESC)
+
+        highlight = QBrush(QColor("#FDE68A"))   # amber-200
+        saved_bgs: dict = {}
+        for col in range(self._table.columnCount()):
+            it = self._table.item(first_match, col)
+            if it:
+                saved_bgs[col] = QBrush(it.background())
+                it.setBackground(highlight)
+
+        def _restore() -> None:
+            for col, bg in saved_bgs.items():
+                it = self._table.item(first_match, col)
+                if it:
+                    it.setBackground(bg)
+
+        QTimer.singleShot(2000, _restore)
 
     def _on_col_filter_changed(self, col: int, accepted: set) -> None:
         if accepted:

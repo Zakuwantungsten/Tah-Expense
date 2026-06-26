@@ -1,27 +1,36 @@
 """
 TransactionBrowser — QuickBooks-style "Find" dialog.
 
-Shows a daily-summary list: one row per calendar day.
-Columns: Date | Transaction ID | Entries | Refund to Float | Total Amount
-Clicking a row and pressing "Go To" (or double-clicking) navigates the
-register to that date.
+Two search modes (pill-toggle in filter panel):
+  Simple   — keyword in description + date range
+  Advanced — keyword + choose item (category) → sub-item + date range
+
+Results show one row per calendar day with aggregated totals:
+  Date | Transaction ID | Entries | Refund to Float | Total Amount
+
+Double-click or "Go To Date" navigates the register to that day.
 """
 
 import asyncio
 from datetime import date, timedelta
-from typing import List
+from typing import List, Optional
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QDateEdit,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QFrame, QWidget,
+    QAbstractItemView, QWidget, QStackedWidget,
+    QComboBox,
 )
 from PySide6.QtCore import Qt, QDate, Signal
 from PySide6.QtGui import QColor, QFont
 
 from tahmeed.services.cashier_service import get_daily_summaries
+from tahmeed.services.category_service import get_all_categories, item_key
+from tahmeed.services.subtable_service import get_subtables
 
+
+# ── Styles ────────────────────────────────────────────────────────────────────
 
 _BTN_STYLE = """
 QPushButton {
@@ -73,13 +82,47 @@ QTableWidget::item { padding: 2px 8px; color: #111827; }
 QTableWidget::item:alternate { background: #f8fafc; }
 """
 
-# Column indices
+_FIELD_SS = (
+    "QLineEdit, QDateEdit, QComboBox {"
+    "  border: 1px solid #d1d5db; border-radius: 4px;"
+    "  padding: 0 8px; font-size: 12px; color: #111827;"
+    "}"
+    "QLineEdit:focus, QDateEdit:focus, QComboBox:focus {"
+    "  border-color: #0077C5;"
+    "}"
+)
+
+# Mode segment-control styles  (left / middle / right pill pieces)
+def _seg_style(position: str) -> str:
+    if position == "left":
+        radius = "border-radius: 4px 0 0 4px;"
+    elif position == "right":
+        radius = "border-radius: 0 4px 4px 0;"
+    else:
+        radius = "border-radius: 0;"
+    return (
+        f"QPushButton {{ background:#ffffff; border:1px solid #d1d5db; {radius}"
+        "  padding:4px 14px; font-size:11px; font-weight:600; color:#6b7280; }}"
+        f"QPushButton:checked {{ background:#0077C5; border-color:#0077C5; color:#ffffff; }}"
+        "QPushButton:hover:!checked { background:#f9fafb; }"
+    )
+
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+_MODE_SIMPLE   = 0
+_MODE_ADVANCED = 1
+
 _COL_DATE    = 0
 _COL_TXN_ID  = 1
 _COL_ENTRIES = 2
 _COL_REFUND  = 3
 _COL_TOTAL   = 4
 
+_ONE_MONTH_AGO = date.today() - timedelta(days=30)
+
+
+# ── Main dialog ───────────────────────────────────────────────────────────────
 
 class TransactionBrowser(QDialog):
     """
@@ -87,12 +130,12 @@ class TransactionBrowser(QDialog):
     Emits go_to_date(date) when the user navigates to a day.
     """
 
-    go_to_date = Signal(object)   # passes a Python date object
+    go_to_date = Signal(object, str)  # (date, highlight_term)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Transaction Browser")
-        self.setMinimumSize(820, 580)
+        self.setMinimumSize(860, 600)
         self.setWindowFlags(
             Qt.Dialog
             | Qt.WindowMinimizeButtonHint
@@ -101,128 +144,233 @@ class TransactionBrowser(QDialog):
         )
         self.setStyleSheet("QDialog { background: #ffffff; }")
         self._results: List[dict] = []
+        self._cats_loaded = False
+        self._current_mode = _MODE_SIMPLE
         self._build_ui()
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
+    # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Header bar ─────────────────────────────────────────────────
+        root.addWidget(self._build_header())
+        root.addWidget(self._build_filter_panel())
+        root.addWidget(self._build_table())
+        root.addWidget(self._build_action_bar())
+
+    # ── Header ────────────────────────────────────────────────────────────────
+
+    def _build_header(self) -> QWidget:
         header = QWidget()
         header.setFixedHeight(48)
-        header.setStyleSheet("background: #1c1917; border-bottom: 1px solid #1c1917;")
+        header.setStyleSheet("background: #1c1917;")
         hl = QHBoxLayout(header)
         hl.setContentsMargins(16, 0, 16, 0)
         title = QLabel("Transaction Browser")
-        title.setStyleSheet("color: #ffffff; font-size: 14px; font-weight: 700;")
+        title.setStyleSheet("color:#ffffff; font-size:14px; font-weight:700;")
         hl.addWidget(title)
         sub = QLabel("Daily summary — one row per day")
-        sub.setStyleSheet("color: #a8a29e; font-size: 11px; margin-left: 12px;")
+        sub.setStyleSheet("color:#a8a29e; font-size:11px; margin-left:12px;")
         hl.addWidget(sub)
         hl.addStretch()
-        root.addWidget(header)
+        return header
 
-        # ── Filter panel ───────────────────────────────────────────────
-        filter_panel = QWidget()
-        filter_panel.setStyleSheet(
-            "background: #f9fafb; border-bottom: 1px solid #e5e7eb;"
+    # ── Filter panel ──────────────────────────────────────────────────────────
+
+    def _build_filter_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("filterPanel")
+        panel.setStyleSheet(
+            "QWidget#filterPanel { background:#f9fafb; border-bottom:1px solid #e5e7eb; }"
         )
-        fl = QHBoxLayout(filter_panel)
-        fl.setContentsMargins(16, 10, 16, 10)
-        fl.setSpacing(16)
 
-        # Keyword (description contains)
-        kw_col = QVBoxLayout()
-        kw_col.setSpacing(3)
-        kw_col.addWidget(_lbl("Description contains"))
+        vl = QVBoxLayout(panel)
+        vl.setContentsMargins(16, 8, 16, 8)
+        vl.setSpacing(6)
+
+        # ── Mode toggle (segmented control) ───────────────────────────────────
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(0)
+
+        labels    = ["Simple", "Advanced"]
+        positions = ["left", "right"]
+        self._mode_btns: List[QPushButton] = []
+        for i, (txt, pos) in enumerate(zip(labels, positions)):
+            btn = QPushButton(txt)
+            btn.setCheckable(True)
+            btn.setFixedHeight(26)
+            btn.setStyleSheet(_seg_style(pos))
+            btn.clicked.connect(lambda _checked, m=i: self._switch_mode(m))
+            self._mode_btns.append(btn)
+            mode_row.addWidget(btn)
+        self._mode_btns[_MODE_SIMPLE].setChecked(True)
+        mode_row.addStretch()
+        vl.addLayout(mode_row)
+
+        self._find_btns: List[QPushButton] = []
+
+        self._filter_stack = QStackedWidget()
+        self._filter_stack.addWidget(self._build_simple_panel())
+        self._filter_stack.addWidget(self._build_advanced_panel())
+        self._filter_stack.setCurrentIndex(_MODE_SIMPLE)
+        self._filter_stack.setFixedHeight(52)
+        vl.addWidget(self._filter_stack)
+
+        # mode(26) + spacing(6) + stack(52) + margins(8+8) = 100
+        panel.setFixedHeight(100)
+        return panel
+
+    # ── Simple mode panel ─────────────────────────────────────────────────────
+
+    def _build_simple_panel(self) -> QWidget:
+        w = QWidget()
+        w.setStyleSheet("background: transparent;")
+        hl = QHBoxLayout(w)
+        hl.setContentsMargins(0, 4, 0, 4)
+        hl.setSpacing(8)
+        hl.setAlignment(Qt.AlignVCenter)
+
+        # Keyword
+        kw_vl = QVBoxLayout()
+        kw_vl.setSpacing(3)
+        kw_vl.addWidget(_lbl("Search"))
         self._kw_edit = QLineEdit()
         self._kw_edit.setPlaceholderText("Search keyword…")
-        self._kw_edit.setFixedHeight(30)
-        self._kw_edit.setStyleSheet(
-            "QLineEdit { border: 1px solid #d1d5db; border-radius: 4px; padding: 0 8px; }"
-        )
+        self._kw_edit.setFixedHeight(28)
+        self._kw_edit.setStyleSheet(_FIELD_SS)
         self._kw_edit.returnPressed.connect(self._do_find)
-        kw_col.addWidget(self._kw_edit)
+        kw_vl.addWidget(self._kw_edit)
+        hl.addLayout(kw_vl, 2)
 
-        # Truck
-        truck_col = QVBoxLayout()
-        truck_col.setSpacing(3)
-        truck_col.addWidget(_lbl("Truck No."))
-        self._truck_edit = QLineEdit()
-        self._truck_edit.setPlaceholderText("e.g. T572 EQF")
-        self._truck_edit.setFixedWidth(130)
-        self._truck_edit.setFixedHeight(30)
-        self._truck_edit.setStyleSheet(
-            "QLineEdit { border: 1px solid #d1d5db; border-radius: 4px; padding: 0 8px; }"
-        )
-        self._truck_edit.returnPressed.connect(self._do_find)
-        truck_col.addWidget(self._truck_edit)
+        # Find / Reset right after search
+        s_find = QPushButton("Find")
+        s_find.setFixedSize(70, 28)
+        s_find.setStyleSheet(_PRIMARY_BTN)
+        s_find.clicked.connect(self._do_find)
+        s_reset = QPushButton("Reset")
+        s_reset.setFixedSize(70, 28)
+        s_reset.setStyleSheet(_BTN_STYLE)
+        s_reset.clicked.connect(self._reset_filters)
+        btn_vl = QVBoxLayout()
+        btn_vl.setSpacing(3)
+        btn_vl.addWidget(_lbl(""))
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+        btn_row.addWidget(s_find)
+        btn_row.addWidget(s_reset)
+        btn_vl.addLayout(btn_row)
+        hl.addLayout(btn_vl)
+        self._find_btns.append(s_find)
 
         # Date From
-        from_col = QVBoxLayout()
-        from_col.setSpacing(3)
-        from_col.addWidget(_lbl("Date From"))
-        self._from_edit = QDateEdit()
-        self._from_edit.setCalendarPopup(True)
-        self._from_edit.setDisplayFormat("dd/MM/yyyy")
-        self._from_edit.setFixedWidth(120)
-        self._from_edit.setFixedHeight(30)
-        one_month_ago = date.today() - timedelta(days=30)
-        self._from_edit.setDate(
-            QDate(one_month_ago.year, one_month_ago.month, one_month_ago.day)
-        )
-        self._from_edit.setStyleSheet(
-            "QDateEdit { border: 1px solid #d1d5db; border-radius: 4px; padding: 0 8px; }"
-        )
-        from_col.addWidget(self._from_edit)
+        sfrom_vl = QVBoxLayout()
+        sfrom_vl.setSpacing(3)
+        sfrom_vl.addWidget(_lbl("Date From"))
+        self._s_from = _date_edit(_ONE_MONTH_AGO)
+        sfrom_vl.addWidget(self._s_from)
+        hl.addLayout(sfrom_vl)
 
         # Date To
-        to_col = QVBoxLayout()
-        to_col.setSpacing(3)
-        to_col.addWidget(_lbl("Date To"))
-        self._to_edit = QDateEdit()
-        self._to_edit.setCalendarPopup(True)
-        self._to_edit.setDisplayFormat("dd/MM/yyyy")
-        self._to_edit.setFixedWidth(120)
-        self._to_edit.setFixedHeight(30)
-        self._to_edit.setDate(QDate.currentDate())
-        self._to_edit.setStyleSheet(
-            "QDateEdit { border: 1px solid #d1d5db; border-radius: 4px; padding: 0 8px; }"
-        )
-        to_col.addWidget(self._to_edit)
+        sto_vl = QVBoxLayout()
+        sto_vl.setSpacing(3)
+        sto_vl.addWidget(_lbl("Date To"))
+        self._s_to = _date_edit(date.today())
+        sto_vl.addWidget(self._s_to)
+        hl.addLayout(sto_vl)
 
-        # Buttons
-        btn_col = QVBoxLayout()
-        btn_col.setSpacing(4)
-        btn_col.addStretch()
+        return w
 
-        self._find_btn = QPushButton("Find")
-        self._find_btn.setFixedWidth(80)
-        self._find_btn.setStyleSheet(_PRIMARY_BTN)
-        self._find_btn.clicked.connect(self._do_find)
+    # ── Advanced mode panel ───────────────────────────────────────────────────
 
-        self._reset_btn = QPushButton("Reset")
-        self._reset_btn.setFixedWidth(80)
-        self._reset_btn.setStyleSheet(_BTN_STYLE)
-        self._reset_btn.clicked.connect(self._reset_filters)
+    def _build_advanced_panel(self) -> QWidget:
+        w = QWidget()
+        w.setStyleSheet("background: transparent;")
+        hl = QHBoxLayout(w)
+        hl.setContentsMargins(0, 4, 0, 4)
+        hl.setSpacing(8)
+        hl.setAlignment(Qt.AlignVCenter)
 
-        btn_col.addWidget(self._find_btn)
-        btn_col.addWidget(self._reset_btn)
+        # Keyword search
+        adv_kw_vl = QVBoxLayout()
+        adv_kw_vl.setSpacing(3)
+        adv_kw_vl.addWidget(_lbl("Search"))
+        self._adv_kw_edit = QLineEdit()
+        self._adv_kw_edit.setPlaceholderText("Search keyword…")
+        self._adv_kw_edit.setFixedHeight(28)
+        self._adv_kw_edit.setStyleSheet(_FIELD_SS)
+        self._adv_kw_edit.returnPressed.connect(self._do_find)
+        adv_kw_vl.addWidget(self._adv_kw_edit)
+        hl.addLayout(adv_kw_vl, 2)
 
-        fl.addLayout(kw_col, 2)
-        fl.addLayout(truck_col)
-        fl.addLayout(from_col)
-        fl.addLayout(to_col)
-        fl.addLayout(btn_col)
+        # Find / Reset right after search
+        a_find = QPushButton("Find")
+        a_find.setFixedSize(70, 28)
+        a_find.setStyleSheet(_PRIMARY_BTN)
+        a_find.clicked.connect(self._do_find)
+        a_reset = QPushButton("Reset")
+        a_reset.setFixedSize(70, 28)
+        a_reset.setStyleSheet(_BTN_STYLE)
+        a_reset.clicked.connect(self._reset_filters)
+        adv_btn_vl = QVBoxLayout()
+        adv_btn_vl.setSpacing(3)
+        adv_btn_vl.addWidget(_lbl(""))
+        adv_btn_row = QHBoxLayout()
+        adv_btn_row.setSpacing(4)
+        adv_btn_row.addWidget(a_find)
+        adv_btn_row.addWidget(a_reset)
+        adv_btn_vl.addLayout(adv_btn_row)
+        hl.addLayout(adv_btn_vl)
+        self._find_btns.append(a_find)
 
-        root.addWidget(filter_panel)
+        # Item (category) combo
+        item_vl = QVBoxLayout()
+        item_vl.setSpacing(3)
+        item_vl.addWidget(_lbl("Item"))
+        self._item_combo = QComboBox()
+        self._item_combo.setFixedHeight(28)
+        self._item_combo.setFixedWidth(160)
+        self._item_combo.setStyleSheet(_FIELD_SS)
+        self._item_combo.addItem("— Loading… —", None)
+        self._item_combo.currentIndexChanged.connect(self._on_item_changed)
+        item_vl.addWidget(self._item_combo)
+        hl.addLayout(item_vl)
 
-        # ── Results table ──────────────────────────────────────────────
+        # Sub-Item combo
+        sub_vl = QVBoxLayout()
+        sub_vl.setSpacing(3)
+        sub_vl.addWidget(_lbl("Sub-Item"))
+        self._subitem_combo = QComboBox()
+        self._subitem_combo.setFixedHeight(28)
+        self._subitem_combo.setFixedWidth(180)
+        self._subitem_combo.setStyleSheet(_FIELD_SS)
+        self._subitem_combo.addItem("— Any Sub-Item —", None)
+        self._subitem_combo.setEnabled(False)
+        sub_vl.addWidget(self._subitem_combo)
+        hl.addLayout(sub_vl)
+
+        # Date From
+        afrom_vl = QVBoxLayout()
+        afrom_vl.setSpacing(3)
+        afrom_vl.addWidget(_lbl("Date From"))
+        self._a_from = _date_edit(_ONE_MONTH_AGO)
+        afrom_vl.addWidget(self._a_from)
+        hl.addLayout(afrom_vl)
+
+        # Date To
+        ato_vl = QVBoxLayout()
+        ato_vl.setSpacing(3)
+        ato_vl.addWidget(_lbl("Date To"))
+        self._a_to = _date_edit(date.today())
+        ato_vl.addWidget(self._a_to)
+        hl.addLayout(ato_vl)
+
+        return w
+
+    # ── Results table ─────────────────────────────────────────────────────────
+
+    def _build_table(self) -> QTableWidget:
         self._table = QTableWidget()
         self._table.setColumnCount(5)
         self._table.setHorizontalHeaderLabels(
@@ -235,11 +383,11 @@ class TransactionBrowser(QDialog):
         hh.setStretchLastSection(True)
         for i in range(5):
             hh.setSectionResizeMode(i, QHeaderView.Interactive)
-        self._table.setColumnWidth(_COL_DATE,    110)
+        self._table.setColumnWidth(_COL_DATE,    130)
         self._table.setColumnWidth(_COL_TXN_ID,  150)
-        self._table.setColumnWidth(_COL_ENTRIES,  80)
-        self._table.setColumnWidth(_COL_REFUND,  160)
-        self._table.setColumnWidth(_COL_TOTAL,   160)
+        self._table.setColumnWidth(_COL_ENTRIES,  70)
+        self._table.setColumnWidth(_COL_REFUND,  155)
+        self._table.setColumnWidth(_COL_TOTAL,   155)
 
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -247,19 +395,20 @@ class TransactionBrowser(QDialog):
         self._table.verticalHeader().setDefaultSectionSize(30)
         self._table.doubleClicked.connect(self._on_go_to)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        return self._table
 
-        root.addWidget(self._table)
+    # ── Action bar ────────────────────────────────────────────────────────────
 
-        # ── Status / action bar ────────────────────────────────────────
-        action_bar = QWidget()
-        action_bar.setFixedHeight(44)
-        action_bar.setStyleSheet("background: #f9fafb; border-top: 1px solid #e5e7eb;")
-        al = QHBoxLayout(action_bar)
+    def _build_action_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setFixedHeight(44)
+        bar.setStyleSheet("background:#f9fafb; border-top:1px solid #e5e7eb;")
+        al = QHBoxLayout(bar)
         al.setContentsMargins(16, 0, 16, 0)
         al.setSpacing(8)
 
         self._count_label = QLabel("Days shown: —")
-        self._count_label.setStyleSheet("color: #6b7280; font-size: 12px;")
+        self._count_label.setStyleSheet("color:#6b7280; font-size:12px;")
 
         self._goto_btn = QPushButton("Go To Date")
         self._goto_btn.setFixedWidth(110)
@@ -283,69 +432,122 @@ class TransactionBrowser(QDialog):
         al.addWidget(self._goto_btn)
         al.addWidget(self._export_btn)
         al.addWidget(close_btn)
+        return bar
 
-        root.addWidget(action_bar)
+    # ── Mode switching ────────────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Actions
-    # ------------------------------------------------------------------
+    def _switch_mode(self, mode: int) -> None:
+        self._current_mode = mode
+        self._filter_stack.setCurrentIndex(mode)
+        for i, btn in enumerate(self._mode_btns):
+            btn.setChecked(i == mode)
+        if mode == _MODE_ADVANCED and not self._cats_loaded:
+            asyncio.ensure_future(self._load_categories())
+
+    # ── Async data loaders (Advanced mode) ────────────────────────────────────
+
+    async def _load_categories(self) -> None:
+        try:
+            cats = await get_all_categories()
+            self._cats_loaded = True
+            self._item_combo.blockSignals(True)
+            self._item_combo.clear()
+            self._item_combo.addItem("— Any Item —", None)
+            for cat in cats:
+                self._item_combo.addItem(cat.name, cat)
+            self._item_combo.blockSignals(False)
+            self._subitem_combo.setEnabled(False)
+        except Exception:
+            self._item_combo.clear()
+            self._item_combo.addItem("— Load error —", None)
+
+    def _on_item_changed(self, _index: int) -> None:
+        cat = self._item_combo.currentData()
+        self._subitem_combo.clear()
+        self._subitem_combo.addItem("— Any Sub-Item —", None)
+        self._subitem_combo.setEnabled(False)
+        if cat is not None:
+            asyncio.ensure_future(self._load_subtables(cat))
+
+    async def _load_subtables(self, cat) -> None:
+        try:
+            key  = item_key(cat.name)
+            subs = await get_subtables(key)
+            self._subitem_combo.blockSignals(True)
+            self._subitem_combo.clear()
+            self._subitem_combo.addItem("— Any Sub-Item —", None)
+            for sub in subs:
+                self._subitem_combo.addItem(sub.name, sub)
+            self._subitem_combo.blockSignals(False)
+            self._subitem_combo.setEnabled(len(subs) > 0)
+        except Exception:
+            self._subitem_combo.setEnabled(False)
+
+    # ── Search params collector ───────────────────────────────────────────────
+
+    def _get_search_params(self) -> dict:
+        mode = self._current_mode
+
+        if mode == _MODE_SIMPLE:
+            return dict(
+                keyword=self._kw_edit.text().strip(),
+                date_from=_qdate_to_py(self._s_from.date()),
+                date_to=_qdate_to_py(self._s_to.date()),
+            )
+
+        # Advanced
+        cat = self._item_combo.currentData()
+        sub = self._subitem_combo.currentData()
+        return dict(
+            keyword=self._adv_kw_edit.text().strip(),
+            category_name=cat.name if cat else "",
+            sub_item_match=sub.match if sub else "",
+            date_from=_qdate_to_py(self._a_from.date()),
+            date_to=_qdate_to_py(self._a_to.date()),
+        )
+
+    # ── Actions ───────────────────────────────────────────────────────────────
 
     def _do_find(self) -> None:
-        self._find_btn.setEnabled(False)
+        for btn in self._find_btns:
+            btn.setEnabled(False)
         asyncio.ensure_future(self._async_find())
 
     async def _async_find(self) -> None:
         try:
-            qfrom = self._from_edit.date()
-            qto   = self._to_edit.date()
-            d_from = date(qfrom.year(), qfrom.month(), qfrom.day())
-            d_to   = date(qto.year(),   qto.month(),   qto.day())
-
-            self._results = await get_daily_summaries(
-                date_from=d_from,
-                date_to=d_to,
-                keyword=self._kw_edit.text().strip(),
-                truck=self._truck_edit.text().strip(),
-            )
+            params = self._get_search_params()
+            self._results = await get_daily_summaries(**params)
             self._populate_results(self._results)
         except Exception as exc:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Search Error", str(exc))
         finally:
-            self._find_btn.setEnabled(True)
+            for btn in self._find_btns:
+                btn.setEnabled(True)
 
     def _populate_results(self, summaries: List[dict]) -> None:
         self._table.setRowCount(len(summaries))
         for i, s in enumerate(summaries):
             d = s["date"]
 
-            # Date column — full weekday for readability
             date_str = d.strftime("%a, %d %b %Y")
             self._table.setItem(i, _COL_DATE, _ro(date_str))
 
-            # Transaction ID — TXN-YYYYMMDD
-            txn_id = f"TXN-{d.strftime('%Y%m%d')}"
-            txn_it = _ro(txn_id)
+            txn_it = _ro(f"TXN-{d.strftime('%Y%m%d')}")
             txn_it.setFont(QFont("Consolas", 10))
             txn_it.setForeground(QColor("#0077C5"))
             self._table.setItem(i, _COL_TXN_ID, txn_it)
 
-            # Entries count
-            count_it = _ro(str(s["entries_count"]), Qt.AlignCenter)
-            self._table.setItem(i, _COL_ENTRIES, count_it)
+            self._table.setItem(i, _COL_ENTRIES, _ro(str(s["entries_count"]), Qt.AlignCenter))
 
-            # Refund to Float
             refund = s["total_refund"]
-            refund_str = f"TZS {refund:,.0f}" if refund else "—"
-            refund_it = _ro(refund_str, Qt.AlignRight | Qt.AlignVCenter)
+            refund_it = _ro(f"TZS {refund:,.0f}" if refund else "—", Qt.AlignRight | Qt.AlignVCenter)
             if refund:
                 refund_it.setForeground(QColor("#EA580C"))
             self._table.setItem(i, _COL_REFUND, refund_it)
 
-            # Total Amount
             total = s["total_tzs"]
-            total_str = f"TZS {total:,.0f}" if total else "—"
-            total_it = _ro(total_str, Qt.AlignRight | Qt.AlignVCenter)
+            total_it = _ro(f"TZS {total:,.0f}" if total else "—", Qt.AlignRight | Qt.AlignVCenter)
             if total and total < 0:
                 total_it.setForeground(QColor("#dc2626"))
             self._table.setItem(i, _COL_TOTAL, total_it)
@@ -355,13 +557,19 @@ class TransactionBrowser(QDialog):
         self._export_btn.setEnabled(n > 0)
 
     def _reset_filters(self) -> None:
-        self._kw_edit.clear()
-        self._truck_edit.clear()
-        one_month_ago = date.today() - timedelta(days=30)
-        self._from_edit.setDate(
-            QDate(one_month_ago.year, one_month_ago.month, one_month_ago.day)
-        )
-        self._to_edit.setDate(QDate.currentDate())
+        mode = self._current_mode
+        if mode == _MODE_SIMPLE:
+            self._kw_edit.clear()
+            self._s_from.setDate(QDate(_ONE_MONTH_AGO.year, _ONE_MONTH_AGO.month, _ONE_MONTH_AGO.day))
+            self._s_to.setDate(QDate.currentDate())
+        elif mode == _MODE_ADVANCED:
+            self._adv_kw_edit.clear()
+            self._item_combo.setCurrentIndex(0)
+            self._subitem_combo.clear()
+            self._subitem_combo.addItem("— Any Sub-Item —", None)
+            self._subitem_combo.setEnabled(False)
+            self._a_from.setDate(QDate(_ONE_MONTH_AGO.year, _ONE_MONTH_AGO.month, _ONE_MONTH_AGO.day))
+            self._a_to.setDate(QDate.currentDate())
         self._table.setRowCount(0)
         self._results = []
         self._count_label.setText("Days shown: —")
@@ -375,11 +583,23 @@ class TransactionBrowser(QDialog):
         row = self._table.currentRow()
         if row < 0 or row >= len(self._results):
             return
-        self.go_to_date.emit(self._results[row]["date"])
+
+        # Build a highlight term for the register so it can scroll-to the match.
+        # Simple mode: keyword or truck.
+        # Advanced mode: sub-item match text (matches description); skip category
+        #   name because it isn't stored in any text column the register searches.
+        # Date mode: no term.
+        term = ""
+        if self._current_mode == _MODE_SIMPLE:
+            term = self._kw_edit.text().strip()
+        elif self._current_mode == _MODE_ADVANCED:
+            sub = self._subitem_combo.currentData()
+            term = sub.match.strip() if sub else ""
+
+        self.go_to_date.emit(self._results[row]["date"], term)
         self.close()
 
     def _on_export(self) -> None:
-        """Copy daily summary results to clipboard as TSV."""
         lines = ["Date\tTransaction ID\tEntries\tRefund to Float (TZS)\tTotal Amount (TZS)"]
         for s in self._results:
             d = s["date"]
@@ -390,28 +610,23 @@ class TransactionBrowser(QDialog):
                 f"{s['total_refund']:.0f}" if s["total_refund"] else "0",
                 f"{s['total_tzs']:.0f}"    if s["total_tzs"]    else "0",
             ]))
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QMessageBox
         QApplication.clipboard().setText("\n".join(lines))
-        from PySide6.QtWidgets import QMessageBox
         QMessageBox.information(
             self, "Exported",
             f"{len(self._results)} days copied to clipboard.\nPaste directly into Excel.",
         )
 
-    # ------------------------------------------------------------------
-    # Public
-    # ------------------------------------------------------------------
+    # ── Public ────────────────────────────────────────────────────────────────
 
     def show_and_search(self) -> None:
-        """Open the dialog and immediately run a search for the last 30 days."""
+        """Open the dialog and immediately run a search in Simple mode (last 30 days)."""
         self.show()
         self.raise_()
         self._do_find()
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _ro(text: str, align=Qt.AlignVCenter | Qt.AlignLeft) -> QTableWidgetItem:
     it = QTableWidgetItem(text)
@@ -422,8 +637,23 @@ def _ro(text: str, align=Qt.AlignVCenter | Qt.AlignLeft) -> QTableWidgetItem:
 
 def _lbl(text: str) -> QLabel:
     lbl = QLabel(text)
-    lbl.setStyleSheet("font-size: 11px; color: #374151; font-weight: 500;")
+    lbl.setStyleSheet("font-size:11px; color:#374151; font-weight:500; background:transparent;")
     return lbl
+
+
+def _date_edit(d: date) -> QDateEdit:
+    de = QDateEdit()
+    de.setCalendarPopup(True)
+    de.setDisplayFormat("dd/MM/yyyy")
+    de.setFixedWidth(115)
+    de.setFixedHeight(28)
+    de.setDate(QDate(d.year, d.month, d.day))
+    de.setStyleSheet(_FIELD_SS)
+    return de
+
+
+def _qdate_to_py(qd: QDate) -> date:
+    return date(qd.year(), qd.month(), qd.day())
 
 
 # Backward-compat alias

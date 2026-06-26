@@ -127,6 +127,8 @@ async def get_daily_summaries(
     date_to: date = None,
     keyword: str = "",
     truck: str = "",
+    category_name: str = "",
+    sub_item_match: str = "",
     limit: int = 365,
 ) -> list:
     """Aggregate transactions by calendar day, returning one summary dict per day.
@@ -134,6 +136,7 @@ async def get_daily_summaries(
     Each dict has: date (date), entries_count (int), total_tzs (float), total_refund (float).
     Filters narrow which *entries* are counted before the group-by, so a truck
     filter returns days that contain that truck with counts/totals for that truck only.
+    sub_item_match filters on description and takes priority over keyword when both are set.
     """
     db = get_db()
     match: dict = {}
@@ -144,10 +147,14 @@ async def get_daily_summaries(
         if date_to:
             date_filter["$lte"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59)
         match["date"] = date_filter
-    if keyword.strip():
-        match["description"] = {"$regex": re.escape(keyword.strip()), "$options": "i"}
+    if category_name.strip():
+        match["category_name"] = category_name.strip()
     if truck.strip():
         match["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
+    # sub_item_match (from advanced search) takes priority over keyword for description filter
+    desc_filter = sub_item_match.strip() or keyword.strip()
+    if desc_filter:
+        match["description"] = {"$regex": re.escape(desc_filter), "$options": "i"}
 
     pipeline = [
         {"$match": match},
