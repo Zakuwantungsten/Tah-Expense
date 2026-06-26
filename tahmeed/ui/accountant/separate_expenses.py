@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -412,25 +413,35 @@ class _DropZone(QFrame):
         self._path_lbl.setText(Path(path).name)
 
 
-def _read_file_rows(path: str) -> Tuple[List[str], List[List[Any]]]:
-    """Return (headers, data_rows) from an xlsx or csv file."""
+def _read_file_rows(
+    path: str, header_row: int = 0
+) -> Tuple[List[str], List[List[Any]]]:
+    """Return (headers, data_rows) from an xlsx or csv file.
+
+    header_row: 0-based index of the row containing column names.
+    Rows before header_row are skipped entirely (e.g. title rows).
+    """
     p = Path(path)
     if p.suffix.lower() in (".xlsx", ".xls") and _HAS_OPENPYXL:
         wb = openpyxl.load_workbook(path, data_only=True)
         ws = wb.active
         rows = list(ws.iter_rows(values_only=True))
-        if not rows:
+        if len(rows) <= header_row:
             return [], []
-        headers = [str(c) if c is not None else "" for c in rows[0]]
-        data = [[str(c) if c is not None else "" for c in r] for r in rows[1:] if any(c is not None for c in r)]
+        headers = [str(c) if c is not None else "" for c in rows[header_row]]
+        data = [
+            [str(c) if c is not None else "" for c in r]
+            for r in rows[header_row + 1:]
+            if any(c is not None for c in r)
+        ]
         return headers, data
     else:
         with open(path, newline="", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
             rows = list(reader)
-        if not rows:
+        if len(rows) <= header_row:
             return [], []
-        return rows[0], rows[1:]
+        return rows[header_row], rows[header_row + 1:]
 
 
 class ImportDialog(QDialog):
@@ -439,13 +450,15 @@ class ImportDialog(QDialog):
 
     Parameters
     ----------
-    feed_type  : str          "toll_plaza" | "parking_congo" | "zambia_parking"
-    dedup_key  : str          column key used for duplicate detection
-    preview_headers : list    column display names for the preview table
-    col_map    : dict         maps expected_key → list of candidate header names
-                              (case-insensitive, first match wins)
-    save_fn    : coroutine    async fn(records: list[dict]) → int (saved count)
-    exist_fn   : coroutine    async fn(keys: list[str]) → set[str] (existing keys)
+    feed_type       : str   "toll_plaza" | "parking_congo" | "zambia_parking"
+    dedup_key       : str   column key used for duplicate detection
+    preview_headers : list  column display names for the preview table
+    col_map         : dict  maps expected_key → list of candidate header names
+                            (case-insensitive, first match wins)
+    save_fn         : coroutine  async fn(records: list[dict]) → int
+    exist_fn        : coroutine  async fn(keys: list[str]) → set[str]
+    header_row      : int   0-based row index of the column headers in the file
+                            (default 0; use 1 for files with a title row above headers)
     """
 
     imported = Signal(int)
@@ -458,15 +471,22 @@ class ImportDialog(QDialog):
         col_map: Dict[str, List[str]],
         save_fn,
         exist_fn,
+        header_row: int = 0,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._feed_type  = feed_type
-        self._dedup_key  = dedup_key
+        self._feed_type       = feed_type
+        self._dedup_key       = dedup_key
         self._preview_headers = preview_headers
-        self._col_map    = col_map
-        self._save_fn    = save_fn
-        self._exist_fn   = exist_fn
+        self._col_map         = col_map
+        self._save_fn         = save_fn
+        self._exist_fn        = exist_fn
+        self._header_row      = header_row
+
+        # A fresh UUID tags every record from this import session so we can
+        # later group/browse records by upload batch.
+        self._upload_id:      str = str(uuid.uuid4())
+        self._source_filename: str = ""
 
         self._raw_headers: List[str] = []
         self._all_rows:    List[dict] = []
@@ -544,8 +564,9 @@ class ImportDialog(QDialog):
 
     def _on_file(self, path: str) -> None:
         self._stats_lbl.setText("Reading file…")
+        self._source_filename = Path(path).name
         try:
-            headers, rows = _read_file_rows(path)
+            headers, rows = _read_file_rows(path, self._header_row)
         except Exception as exc:
             self._stats_lbl.setText(f"Error reading file: {exc}")
             return
@@ -567,7 +588,12 @@ class ImportDialog(QDialog):
 
         records: List[dict] = []
         for row in rows:
-            rec: dict = {"_raw": row, "feed_type": self._feed_type}
+            rec: dict = {
+                "_raw": row,
+                "feed_type":       self._feed_type,
+                "upload_id":       self._upload_id,
+                "source_filename": self._source_filename,
+            }
             for key, idx in field_idxs.items():
                 rec[key] = row[idx].strip() if (idx is not None and idx < len(row)) else ""
             records.append(rec)
@@ -625,32 +651,291 @@ class ImportDialog(QDialog):
 #  1. TollPlazaWidget
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_TOLL_HEADERS = [
-    "TOLL DATE", "TOLL PLAZA", "VEHICLE REG", "CLASS", "TENDER",
-    "RECEIPT NO", "DEVICE", "LANE", "CASHIER",
-]
 _TOLL_COL_MAP = {
     "toll_date":    ["toll date", "date", "transaction date"],
     "toll_plaza":   ["toll plaza", "plaza", "station"],
+    "client_name":  ["client name", "client", "account name"],
+    "card_no":      ["card no", "card number", "card"],
     "vehicle_reg":  ["vehicle reg", "vehicle", "vehicle registration", "plate"],
-    "vehicle_class":["class", "vehicle class"],
+    "vehicle_class":["vehicle class", "class"],
     "tender_amount":["tender", "amount", "tender amount", "zmw"],
     "receipt_no":   ["receipt no", "receipt", "receipt number", "receipt no."],
-    "device":       ["device", "device id"],
+    "device":       ["device code", "device", "device id"],
     "lane":         ["lane"],
     "cashier_name": ["cashier", "cashier name", "operator"],
 }
 
+# Column headers shown in the full per-record detail table
+_TOLL_DETAIL_HEADERS = [
+    "TOLL DATE", "TOLL PLAZA", "CLIENT NAME", "CARD NO", "VEHICLE REG",
+    "CLASS", "TENDER (ZMW)", "RECEIPT NO", "DEVICE", "LANE", "CASHIER",
+]
 
-class TollPlazaWidget(QWidget):
+# Summary columns shown in the upload-list browse table
+_TOLL_BROWSE_HEADERS = [
+    "UPLOAD DATE", "FILE NAME", "RECORDS", "TOTAL (ZMW)", "DATE RANGE",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Upload Browse sub-widget — one row per import batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TollUploadBrowse(QWidget):
+    """Table of every Toll Plaza import batch. Clicking a row drills into it."""
+
+    upload_clicked = Signal(object)   # emits the upload summary dict
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._page = 1
-        self._page_size = 25
-        self._total = 0
-        self._records: List[dict] = []
+        self._uploads: List[dict] = []
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        # Totals strip
+        self._totals = _TotalsBar([("zmw", "ZMW "), ("count", "Total records: ")])
+        vl.addWidget(self._totals)
+
+        self._table = _make_table(_TOLL_BROWSE_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setColumnWidth(0, 160)
+        self._table.setColumnWidth(1, 240)
+        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(3, 120)
+        self._table.setStyleSheet(
+            _table_style()
+            + f"QTableWidget{{alternate-background-color:{_ALT_ROW};}}"
+        )
+        self._table.setCursor(Qt.PointingHandCursor)
+        self._table.cellClicked.connect(self._on_row_clicked)
+        vl.addWidget(self._table, 1)
+
+        hint = _lbl("Click any row to view the full records for that upload.", size=11, color=_TM)
+        hint.setAlignment(Qt.AlignCenter)
+        vl.addWidget(hint)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        uploads = await svc.get_toll_plaza_uploads()
+        self._uploads = uploads
+        self._fill(uploads)
+
+    def _fill(self, uploads: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        total_zmw = 0.0
+        total_recs = 0
+        for up in uploads:
+            r = t.rowCount()
+            t.insertRow(r)
+            import_dt = up.get("import_date")
+            date_str = (
+                import_dt.strftime("%d %b %Y  %H:%M")
+                if isinstance(import_dt, datetime)
+                else (str(import_dt) if import_dt else "—")
+            )
+            count = int(up.get("record_count", 0))
+            zmw   = float(up.get("total_zmw", 0))
+            min_d = str(up.get("min_toll_date", "") or "").strip()
+            max_d = str(up.get("max_toll_date", "") or "").strip()
+            date_range = f"{min_d[:10]} — {max_d[:10]}" if min_d else "—"
+
+            t.setItem(r, 0, _cell(date_str))
+            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 3, _cell(f"{zmw:,.0f}", mono=True, align=Qt.AlignRight | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(date_range))
+            t.setRowHeight(r, _ROW_H)
+            total_zmw  += zmw
+            total_recs += count
+
+        self._totals.set_total("zmw",   total_zmw,  "ZMW ")
+        self._totals.set_total("count", total_recs, "")
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        if row < len(self._uploads):
+            self.upload_clicked.emit(self._uploads[row])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Upload Detail sub-widget — all records for one import batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TollUploadDetail(QWidget):
+    """Full record table for a single Toll Plaza upload batch."""
+
+    back_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._upload_id = ""
+        self._search    = ""
+        self._page      = 1
+        self._page_size = 50
+        self._total     = 0
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        # ── Breadcrumb / back row ──────────────────────────────────────────
+        nav = QWidget()
+        nav.setStyleSheet("background:transparent;")
+        navl = QHBoxLayout(nav)
+        navl.setContentsMargins(0, 0, 0, 0)
+        navl.setSpacing(8)
+
+        back_btn = _btn("← All Uploads", primary=False, height=30)
+        back_btn.clicked.connect(self.back_requested)
+        navl.addWidget(back_btn)
+
+        self._crumb_lbl = _lbl("", size=12, color=_T2)
+        navl.addWidget(self._crumb_lbl)
+        navl.addStretch()
+        vl.addWidget(nav)
+
+        # ── Info strip ────────────────────────────────────────────────────
+        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
+        vl.addWidget(self._info_lbl)
+
+        # ── Toolbar ───────────────────────────────────────────────────────
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search vehicle, plaza, receipt, cashier…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        # ── Full record table ─────────────────────────────────────────────
+        self._table = _make_table(_TOLL_DETAIL_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        vl.addWidget(self._table, 1)
+
+        # ── Footer ───────────────────────────────────────────────────────
+        self._totals = _TotalsBar([("zmw", "ZMW "), ("count", "Records: ")])
+        vl.addWidget(self._totals)
+
+        self._pager = _PaginationBar()
+        self._pager.page_changed.connect(self._go_page)
+        self._pager.size_changed.connect(self._on_page_size)
+        vl.addWidget(self._pager)
+
+    def load_upload(self, upload_doc: dict) -> None:
+        self._upload_id = str(upload_doc.get("_id") or "")
+        filename   = upload_doc.get("source_filename") or "Unknown file"
+        count      = int(upload_doc.get("record_count", 0))
+        zmw        = float(upload_doc.get("total_zmw", 0))
+        import_dt  = upload_doc.get("import_date")
+        date_str   = (
+            import_dt.strftime("%d %b %Y")
+            if isinstance(import_dt, datetime) else ""
+        )
+        self._crumb_lbl.setText(f"Uploads  ›  {filename}")
+        self._info_lbl.setText(
+            f"{filename}   •   {count:,} records   •   ZMW {zmw:,.0f}   •   {date_str}"
+        )
+        self._totals.set_total("zmw",   zmw,   "ZMW ")
+        self._totals.set_total("count", count, "")
+
+        # Reset search + pagination for this upload
         self._search = ""
-        self._plaza_filter = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._page = 1
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id:
+            return
+        skip = (self._page - 1) * self._page_size
+        recs, total = await asyncio.gather(
+            svc.get_toll_plaza_upload_records(
+                self._upload_id, self._search, self._page_size, skip
+            ),
+            svc.count_toll_plaza_upload_records(self._upload_id, self._search),
+        )
+        self._total = total
+        self._fill_table(recs)
+        self._pager.set_total(total, self._page_size, self._page)
+        # Update totals with live search count
+        self._totals.set_total("count", total, "")
+
+    def _fill_table(self, recs: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        for rec in recs:
+            r = t.rowCount()
+            t.insertRow(r)
+            t.setItem(r,  0, _cell(str(rec.get("toll_date",    "") or "")))
+            t.setItem(r,  1, _cell(str(rec.get("toll_plaza",   "") or "")))
+            t.setItem(r,  2, _cell(str(rec.get("client_name",  "") or "")))
+            t.setItem(r,  3, _cell(str(rec.get("card_no",      "") or "")))
+            t.setItem(r,  4, _cell(str(rec.get("vehicle_reg",  "") or "")))
+            t.setItem(r,  5, _cell(str(rec.get("vehicle_class","") or "")))
+            t.setItem(r,  6, _cell(
+                _fmt_num(rec.get("tender_amount"), "", 0),
+                mono=True, align=Qt.AlignRight | Qt.AlignVCenter,
+            ))
+            t.setItem(r,  7, _cell(str(rec.get("receipt_no",   "") or "")))
+            t.setItem(r,  8, _cell(str(rec.get("device",       "") or "")))
+            t.setItem(r,  9, _cell(str(rec.get("lane",         "") or ""),
+                                   align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 10, _cell(str(rec.get("cashier_name", "") or "")))
+            t.setRowHeight(r, _ROW_H)
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._page   = 1
+        asyncio.ensure_future(self._load())
+
+    def _go_page(self, page: int) -> None:
+        self._page = page
+        asyncio.ensure_future(self._load())
+
+    def _on_page_size(self, size: int) -> None:
+        self._page_size = size
+        self._page      = 1
+        asyncio.ensure_future(self._load())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  1. TollPlazaWidget — master/detail shell
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TollPlazaWidget(QWidget):
+    """
+    Toll Plaza main page.
+
+    Browse tab (default): one row per import batch — date, filename, record
+    count, total ZMW, date range.  Clicking a row drills into the full
+    per-record detail view for that upload.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
         self._build()
         self.refresh()
 
@@ -660,6 +945,7 @@ class TollPlazaWidget(QWidget):
         vl.setContentsMargins(20, 20, 20, 16)
         vl.setSpacing(12)
 
+        # ── Page header (always visible) ───────────────────────────────────
         header = _PageHeader("Toll Plaza", "mdi.boom-gate")
         self._import_btn = _btn("Import from Dot Com Zambia", "mdi.upload-outline")
         self._import_btn.clicked.connect(self._open_import)
@@ -667,118 +953,54 @@ class TollPlazaWidget(QWidget):
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        # Toolbar
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
+        # ── Master / detail stack ──────────────────────────────────────────
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background:transparent;")
 
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search vehicle, plaza, receipt…")
-        self._search_edit.setFixedWidth(260)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
+        self._browse = _TollUploadBrowse()
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._stack.addWidget(self._browse)      # index 0 — Upload list
 
-        self._plaza_cb = QComboBox()
-        self._plaza_cb.addItem("All Plazas", "")
-        self._plaza_cb.setFixedWidth(160)
-        self._plaza_cb.setStyleSheet(_input_ss())
-        self._plaza_cb.currentIndexChanged.connect(self._on_filter)
-        tbl.addWidget(self._plaza_cb)
-        tbl.addStretch()
+        self._detail = _TollUploadDetail()
+        self._detail.back_requested.connect(self._show_browse)
+        self._stack.addWidget(self._detail)      # index 1 — Record detail
 
-        export_btn = _btn("Export", "mdi.download-outline", primary=False)
-        tbl.addWidget(export_btn)
-        vl.addWidget(tb)
+        self._stack.setCurrentIndex(0)
+        vl.addWidget(self._stack, 1)
 
-        # Table
-        self._table = _make_table(_TOLL_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
-        vl.addWidget(self._table, 1)
-
-        # Totals + pagination
-        self._totals = _TotalsBar([("zmw", "ZMW "), ("count", "Records: ")])
-        vl.addWidget(self._totals)
-
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+    # ── Public API ─────────────────────────────────────────────────────────
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._load())
+        self._show_browse()
 
-    async def _load(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_imported_feed("toll_plaza", self._search, self._plaza_filter,
-                                  self._page_size, skip),
-            svc.count_imported_feed("toll_plaza", self._search, self._plaza_filter),
-        )
-        self._records = recs
-        self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
-        totals = await svc.get_imported_feed_totals("toll_plaza")
-        zmw = totals.get("tender_amount", 0.0)
-        self._totals.set_total("zmw", zmw, "ZMW ")
-        self._totals.set_total("count", total, "")
+    # ── Internal ───────────────────────────────────────────────────────────
 
-    def _fill_table(self, recs: List[dict]) -> None:
-        t = self._table
-        t.setRowCount(0)
-        for rec in recs:
-            r = t.rowCount()
-            t.insertRow(r)
-            t.setItem(r, 0, _cell(rec.get("toll_date", "")))
-            t.setItem(r, 1, _cell(rec.get("toll_plaza", "")))
-            t.setItem(r, 2, _cell(rec.get("vehicle_reg", "")))
-            t.setItem(r, 3, _cell(rec.get("vehicle_class", "")))
-            t.setItem(r, 4, _cell(_fmt_num(rec.get("tender_amount"), "ZMW ", 0), mono=True))
-            t.setItem(r, 5, _cell(rec.get("receipt_no", "")))
-            t.setItem(r, 6, _cell(rec.get("device", "")))
-            t.setItem(r, 7, _cell(rec.get("lane", "")))
-            t.setItem(r, 8, _cell(rec.get("cashier_name", "")))
+    def _show_browse(self) -> None:
+        self._stack.setCurrentIndex(0)
+        self._browse.refresh()
+
+    def _show_detail(self, upload_doc: dict) -> None:
+        self._detail.load_upload(upload_doc)
+        self._stack.setCurrentIndex(1)
 
     def _open_import(self) -> None:
         from tahmeed.services import accountant_service as svc
         dlg = ImportDialog(
             feed_type="toll_plaza",
             dedup_key="receipt_no",
-            preview_headers=_TOLL_HEADERS,
+            preview_headers=_TOLL_DETAIL_HEADERS,
             col_map=_TOLL_COL_MAP,
             save_fn=svc.save_imported_feed,
             exist_fn=svc.get_existing_feed_keys,
+            header_row=1,   # Dot Com Zambia xlsx has a title row above the headers
             parent=self,
         )
-        dlg.imported.connect(lambda n: (
-            QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records."),
-            self.refresh(),
-        ))
+        dlg.imported.connect(self._on_imported)
         dlg.exec()
 
-    def _on_search(self, text: str) -> None:
-        self._search = text
-        self._page = 1
-        asyncio.ensure_future(self._load())
-
-    def _on_filter(self) -> None:
-        self._plaza_filter = self._plaza_cb.currentData() or ""
-        self._page = 1
-        asyncio.ensure_future(self._load())
-
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page = 1
-        asyncio.ensure_future(self._load())
+    def _on_imported(self, n: int) -> None:
+        QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        self._show_browse()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

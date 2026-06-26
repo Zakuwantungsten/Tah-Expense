@@ -707,16 +707,25 @@ async def count_imported_feed(feed_type: str, search: str = "", extra: str = "")
     return await db.imported_feeds.count_documents(query)
 
 
+def _safe_double(field: str) -> dict:
+    """$convert expression that safely coerces a string field to double.
+
+    Handles null, missing, and empty-string values — all yield 0.0 rather
+    than raising ConversionFailure (which $toDouble does on empty strings).
+    """
+    return {"$convert": {"input": f"${field}", "to": "double", "onError": 0.0, "onNull": 0.0}}
+
+
 async def get_imported_feed_totals(feed_type: str) -> dict:
     db = get_db()
     pipeline = [
         {"$match": {"feed_type": feed_type}},
         {"$group": {
             "_id": None,
-            "tender_amount": {"$sum": {"$toDouble": {"$ifNull": ["$tender_amount", 0]}}},
-            "amount":        {"$sum": {"$toDouble": {"$ifNull": ["$amount", 0]}}},
-            "debit":         {"$sum": {"$toDouble": {"$ifNull": ["$debit", 0]}}},
-            "credit":        {"$sum": {"$toDouble": {"$ifNull": ["$credit", 0]}}},
+            "tender_amount": {"$sum": _safe_double("tender_amount")},
+            "amount":        {"$sum": _safe_double("amount")},
+            "debit":         {"$sum": _safe_double("debit")},
+            "credit":        {"$sum": _safe_double("credit")},
         }},
     ]
     result = await db.imported_feeds.aggregate(pipeline).to_list(1)
@@ -749,7 +758,11 @@ async def get_existing_feed_keys(keys: List[str]) -> set:
 
 
 async def save_imported_feed(records: list) -> int:
-    """Upsert a batch of imported feed records; returns the count inserted."""
+    """Insert a batch of imported feed records; returns the count inserted.
+
+    Records are expected to carry upload_id and source_filename already (set by
+    ImportDialog before calling this function).
+    """
     if not records:
         return 0
     db = get_db()
@@ -762,6 +775,63 @@ async def save_imported_feed(records: list) -> int:
         docs.append(doc)
     result = await db.imported_feeds.insert_many(docs, ordered=False)
     return len(result.inserted_ids)
+
+
+async def get_toll_plaza_uploads() -> list:
+    """Return one summary doc per upload batch for the toll_plaza feed."""
+    db = get_db()
+    pipeline = [
+        {"$match": {"feed_type": "toll_plaza"}},
+        {"$group": {
+            "_id":             "$upload_id",
+            "source_filename": {"$first": "$source_filename"},
+            "import_date":     {"$first": "$import_date"},
+            "record_count":    {"$sum": 1},
+            "total_zmw":       {"$sum": _safe_double("tender_amount")},
+            "min_toll_date":   {"$min": "$toll_date"},
+            "max_toll_date":   {"$max": "$toll_date"},
+        }},
+        {"$sort": {"import_date": -1}},
+    ]
+    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+
+
+async def get_toll_plaza_upload_records(
+    upload_id: str,
+    search: str = "",
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated records for a single toll plaza upload batch."""
+    db = get_db()
+    query: dict = {"feed_type": "toll_plaza", "upload_id": upload_id}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"vehicle_reg":  {"$regex": s, "$options": "i"}},
+            {"toll_plaza":   {"$regex": s, "$options": "i"}},
+            {"receipt_no":   {"$regex": s, "$options": "i"}},
+            {"cashier_name": {"$regex": s, "$options": "i"}},
+            {"client_name":  {"$regex": s, "$options": "i"}},
+        ]
+    cursor = db.imported_feeds.find(query).sort("toll_date", 1).skip(skip).limit(limit)
+    return await cursor.to_list(length=limit)
+
+
+async def count_toll_plaza_upload_records(upload_id: str, search: str = "") -> int:
+    """Count records for a single toll plaza upload batch."""
+    db = get_db()
+    query: dict = {"feed_type": "toll_plaza", "upload_id": upload_id}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"vehicle_reg":  {"$regex": s, "$options": "i"}},
+            {"toll_plaza":   {"$regex": s, "$options": "i"}},
+            {"receipt_no":   {"$regex": s, "$options": "i"}},
+            {"cashier_name": {"$regex": s, "$options": "i"}},
+            {"client_name":  {"$regex": s, "$options": "i"}},
+        ]
+    return await db.imported_feeds.count_documents(query)
 
 
 # ── Insurance feeds (comesa / third_party) ────────────────────────────────────

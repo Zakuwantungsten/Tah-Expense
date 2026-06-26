@@ -61,14 +61,14 @@ _FROZEN_COLS = [
 _SCROLL_COLS = [
     ("MONTH",           80,  None),
     ("TRUCK NO",        95,  "truck_number"),
-    ("LPO NOS",         80,  "lpo_do"),
-    ("DO NO",           80,  "do_number"),
     ("MEMO",           140,  "memo"),
     ("NOTES",           56,  None),
     ("TZS",            120,  None),
     ("USD",             90,  None),
     ("RECEIPT STATUS", 118,  "receipt_status"),
     ("OWNERSHIP",       95,  "ownership"),
+    ("APPROVED BY",    110,  "approver"),
+    ("CASHIER",        110,  None),
 ]
 
 _MONTHS = [
@@ -208,6 +208,13 @@ def _receipt_badge(status: str) -> QWidget:
     )
     hl.addWidget(lbl)
     return container
+
+
+def _short_name(name: str) -> str:
+    parts = (name or "").strip().split()
+    if len(parts) >= 2:
+        return f"{parts[0]} {parts[1][0]}."
+    return name or "—"
 
 
 def _set_cell(
@@ -460,6 +467,7 @@ class _FrozenTable(QFrame):
             self._ftbl.setColumnWidth(i, width)
             fhdr.setSectionResizeMode(i, QHeaderView.Interactive)
         fhdr.sectionClicked.connect(lambda col: self._on_header_click(col, frozen=True))
+        fhdr.sectionResized.connect(self._on_frozen_resized)
 
         # ── Main table (right, scrolls horizontally) ─────────────────────
         self._mtbl = QTableWidget(0, len(_SCROLL_COLS))
@@ -502,6 +510,12 @@ class _FrozenTable(QFrame):
 
         # Initial sort indicator
         self._ftbl.horizontalHeader().setSortIndicator(1, Qt.DescendingOrder)
+
+    # ── Frozen resize ─────────────────────────────────────────────────────
+
+    def _on_frozen_resized(self, _logical: int, _old: int, _new: int) -> None:
+        total = sum(self._ftbl.columnWidth(i) for i in range(self._ftbl.columnCount())) + 2
+        self._ftbl.setFixedWidth(total)
 
     # ── Sync helpers ───────────────────────────────────────────────────────
 
@@ -565,7 +579,10 @@ class _FrozenTable(QFrame):
 
     # ── Populate ───────────────────────────────────────────────────────────
 
-    def populate(self, txs: List[Transaction], skip: int) -> None:
+    def populate(self, txs: List[Transaction], skip: int,
+                 cashier_names: Dict = None) -> None:
+        if cashier_names is None:
+            cashier_names = {}
         n = len(txs)
         self._ftbl.setRowCount(n)
         self._mtbl.setRowCount(n)
@@ -585,12 +602,12 @@ class _FrozenTable(QFrame):
 
             # ── Scrollable columns ────────────────────────────────────────
             month_str = tx.month or (tx.date.strftime("%b %y") if tx.date else "—")
+            cashier_name = _short_name(cashier_names.get(tx.cashier_id, "")) if tx.cashier_id else "—"
+
             _set_cell(self._mtbl, i, 0, month_str, Qt.AlignLeft, row_bg)
             _set_cell(self._mtbl, i, 1, tx.truck_number or "—", Qt.AlignLeft, row_bg)
-            _set_cell(self._mtbl, i, 2, tx.lpo_do or "—", Qt.AlignLeft, row_bg)
-            _set_cell(self._mtbl, i, 3, tx.do_number or "—", Qt.AlignLeft, row_bg)
-            _set_cell(self._mtbl, i, 4, tx.memo or "—", Qt.AlignLeft, row_bg)
-            _set_cell(self._mtbl, i, 5, "✓" if tx.notes_flag else "—",
+            _set_cell(self._mtbl, i, 2, tx.memo or "—", Qt.AlignLeft, row_bg)
+            _set_cell(self._mtbl, i, 3, "✓" if tx.notes_flag else "—",
                       Qt.AlignCenter, row_bg, color=_BLUE if tx.notes_flag else _TM)
 
             # TZS
@@ -600,7 +617,7 @@ class _FrozenTable(QFrame):
             else:
                 tzs_txt = "—"
                 tzs_col = _TM
-            _set_cell(self._mtbl, i, 6, tzs_txt, Qt.AlignRight, row_bg,
+            _set_cell(self._mtbl, i, 4, tzs_txt, Qt.AlignRight, row_bg,
                       color=tzs_col, mono=True)
 
             # USD
@@ -610,14 +627,16 @@ class _FrozenTable(QFrame):
             else:
                 usd_txt = "—"
                 usd_col = _TM
-            _set_cell(self._mtbl, i, 7, usd_txt, Qt.AlignRight, row_bg,
+            _set_cell(self._mtbl, i, 5, usd_txt, Qt.AlignRight, row_bg,
                       color=usd_col, mono=True)
 
             # Receipt status badge (cell widget)
             badge = _receipt_badge(tx.receipt_status or "pending")
-            self._mtbl.setCellWidget(i, 8, badge)
+            self._mtbl.setCellWidget(i, 6, badge)
 
-            _set_cell(self._mtbl, i, 9, tx.ownership or "—", Qt.AlignLeft, row_bg)
+            _set_cell(self._mtbl, i, 7, tx.ownership or "—", Qt.AlignLeft, row_bg)
+            _set_cell(self._mtbl, i, 8, tx.approver or "—", Qt.AlignLeft, row_bg, color=_T2)
+            _set_cell(self._mtbl, i, 9, cashier_name, Qt.AlignLeft, row_bg)
             self._mtbl.setRowHeight(i, _ROW_H)
 
     def show_empty(self, message: str) -> None:
@@ -924,6 +943,7 @@ class MasterExpensesWidget(QWidget):
                 get_master_transactions, count_master_transactions,
                 get_master_totals, get_master_month_totals,
                 get_master_trucks, get_master_categories,
+                get_cashier_names,
             )
 
             size = self._pagination.current_size()
@@ -963,9 +983,12 @@ class MasterExpensesWidget(QWidget):
                     get_master_totals(**kw),
                 )
 
+            cashier_ids = [tx.cashier_id for tx in txs if tx.cashier_id]
+            cashier_names = await get_cashier_names(cashier_ids) if cashier_ids else {}
+
             self._total = total
             if txs:
-                self._table.populate(txs, skip)
+                self._table.populate(txs, skip, cashier_names)
             else:
                 self._table.show_empty("No records match the current filters.")
 
@@ -994,7 +1017,7 @@ class MasterExpensesWidget(QWidget):
             )
             return
 
-        from tahmeed.services.accountant_service import get_master_transactions
+        from tahmeed.services.accountant_service import get_master_transactions, get_cashier_names
 
         kw = dict(
             year=self._year, month=self._month,
@@ -1011,6 +1034,9 @@ class MasterExpensesWidget(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")
             return
+
+        export_cashier_ids = [tx.cashier_id for tx in txs if tx.cashier_id]
+        export_cashier_names = await get_cashier_names(export_cashier_ids) if export_cashier_ids else {}
 
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -1066,9 +1092,10 @@ class MasterExpensesWidget(QWidget):
         rcpt_red   = Font(name="Segoe UI", bold=True, size=10, color="DC2626")
 
         for i, tx in enumerate(txs):
-            date_str   = tx.date.strftime("%d-%b-%Y") if tx.date else ""
-            month_str  = tx.month or (tx.date.strftime("%b %y") if tx.date else "")
-            notes_str  = "Yes" if tx.notes_flag else ""
+            date_str    = tx.date.strftime("%d-%b-%Y") if tx.date else ""
+            month_str   = tx.month or (tx.date.strftime("%b %y") if tx.date else "")
+            notes_str   = "Yes" if tx.notes_flag else ""
+            cashier_str = _short_name(export_cashier_names.get(tx.cashier_id, "")) if tx.cashier_id else ""
             receipt_str = {"received": "Received", "pending": "Pending",
                            "missing": "No Receipt"}.get(tx.receipt_status or "", "")
 
@@ -1081,10 +1108,9 @@ class MasterExpensesWidget(QWidget):
 
             row_data = [
                 i + 1, date_str, tx.description or "", month_str,
-                tx.truck_number or "", tx.lpo_do or "", tx.do_number or "",
-                tx.memo or "", notes_str,
+                tx.truck_number or "", tx.memo or "", notes_str,
                 tzs_val, usd_val,
-                receipt_str, tx.ownership or "",
+                receipt_str, tx.ownership or "", tx.approver or "", cashier_str,
             ]
             ws.append(row_data)
             r = ws.max_row
@@ -1096,12 +1122,12 @@ class MasterExpensesWidget(QWidget):
 
             # Amount formatting
             if tzs_val is not None:
-                c = ws.cell(r, 10)
+                c = ws.cell(r, 8)
                 c.font = red_font if tzs_val < 0 else mono_font
                 c.number_format = '#,##0'
                 c.alignment = Alignment(horizontal="right", vertical="center")
             if usd_val is not None:
-                c = ws.cell(r, 11)
+                c = ws.cell(r, 9)
                 c.font = red_font if usd_val < 0 else mono_font
                 c.number_format = '#,##0.00'
                 c.alignment = Alignment(horizontal="right", vertical="center")
@@ -1110,14 +1136,14 @@ class MasterExpensesWidget(QWidget):
             rcpt_fonts = {"Received": rcpt_green, "Pending": amber_font, "No Receipt": rcpt_red}
             rf = rcpt_fonts.get(receipt_str)
             if rf:
-                ws.cell(r, 12).font = rf
-            ws.cell(r, 12).alignment = Alignment(horizontal="center", vertical="center")
+                ws.cell(r, 10).font = rf
+            ws.cell(r, 10).alignment = Alignment(horizontal="center", vertical="center")
 
         # ── Totals row ────────────────────────────────────────────────
         ws.append([])
         ws.append([
-            "", "", "TOTAL", "", "", "", "", "", "",
-            tzs_total or "", usd_total or "", "", "",
+            "", "", "TOTAL", "", "", "", "",
+            tzs_total or "", usd_total or "", "", "", "", "",
         ])
         total_r = ws.max_row
         ws.row_dimensions[total_r].height = 18
@@ -1126,20 +1152,21 @@ class MasterExpensesWidget(QWidget):
             cell.fill = total_fill
         ws.cell(total_r, 3).font = Font(name="Segoe UI", bold=True, size=11)
         if tzs_total:
-            c = ws.cell(total_r, 10)
+            c = ws.cell(total_r, 8)
             c.font = Font(name="Cascadia Code", bold=True, size=11,
                           color="DC2626" if tzs_total < 0 else "111827")
             c.number_format = '#,##0'
             c.alignment = Alignment(horizontal="right", vertical="center")
         if usd_total:
-            c = ws.cell(total_r, 11)
+            c = ws.cell(total_r, 9)
             c.font = Font(name="Cascadia Code", bold=True, size=11,
                           color="DC2626" if usd_total < 0 else "111827")
             c.number_format = '#,##0.00'
             c.alignment = Alignment(horizontal="right", vertical="center")
 
         # ── Column widths ─────────────────────────────────────────────
-        col_widths = [7, 13, 35, 10, 13, 12, 12, 22, 7, 16, 13, 16, 14]
+        # S/NO, DATE, DESCRIPTION, MONTH, TRUCK NO, MEMO, NOTES, TZS, USD, RECEIPT, OWNERSHIP, APPROVED BY, CASHIER
+        col_widths = [7, 13, 35, 10, 13, 22, 7, 16, 13, 16, 14, 14, 14]
         for idx, w in enumerate(col_widths, 1):
             ws.column_dimensions[ws.cell(1, idx).column_letter].width = w
 
