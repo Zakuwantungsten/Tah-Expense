@@ -222,6 +222,31 @@ class _ActionBar(QFrame):
         search.textChanged.connect(self.search_changed)
         hl.addWidget(search)
 
+        # Search / Clear toggle button
+        self._search_clear_btn = QPushButton("Search")
+        self._search_clear_btn.setFixedHeight(34)
+        self._search_clear_btn.setFixedWidth(72)
+        self._search_clear_btn.setCursor(Qt.PointingHandCursor)
+        self._search_clear_btn.setStyleSheet(_BTN_STYLES["secondary"])
+
+        def _on_search_clear_clicked():
+            if search.text():
+                search.clear()
+            # no-op when empty — auto-search already fires on textChanged
+
+        def _on_text_changed(text: str):
+            self.search_changed.emit(text)
+            self._search_clear_btn.setText("Clear" if text else "Search")
+            self._search_clear_btn.setStyleSheet(
+                _BTN_STYLES["active"] if text else _BTN_STYLES["secondary"]
+            )
+
+        # rewire: textChanged now goes through _on_text_changed
+        search.textChanged.disconnect(self.search_changed)
+        search.textChanged.connect(_on_text_changed)
+        self._search_clear_btn.clicked.connect(_on_search_clear_clicked)
+        hl.addWidget(self._search_clear_btn)
+
         # Edit-mode status pill — hidden unless editing
         self._status = QLabel("")
         self._status.setStyleSheet(

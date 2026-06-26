@@ -151,10 +151,17 @@ async def get_daily_summaries(
         match["category_name"] = category_name.strip()
     if truck.strip():
         match["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
-    # sub_item_match (from advanced search) takes priority over keyword for description filter
-    desc_filter = sub_item_match.strip() or keyword.strip()
-    if desc_filter:
-        match["description"] = {"$regex": re.escape(desc_filter), "$options": "i"}
+    if sub_item_match.strip():
+        # advanced exact-match on description only
+        match["description"] = {"$regex": re.escape(sub_item_match.strip()), "$options": "i"}
+    elif keyword.strip():
+        # simple keyword: OR across description, truck_number, memo
+        kw_re = {"$regex": re.escape(keyword.strip()), "$options": "i"}
+        match["$or"] = [
+            {"description":  kw_re},
+            {"truck_number": kw_re},
+            {"memo":         kw_re},
+        ]
 
     pipeline = [
         {"$match": match},
@@ -185,6 +192,56 @@ async def get_daily_summaries(
             "total_refund":  d["total_refund"],
         })
     return result
+
+
+async def get_transactions_flat(
+    date_from: date = None,
+    date_to: date = None,
+    keyword: str = "",
+    category_name: str = "",
+    sub_item_match: str = "",
+    limit: int = 1000,
+) -> List[Transaction]:
+    """Return individual transactions matching all supplied filters."""
+    db = get_db()
+    match: dict = {}
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            date_filter["$gte"] = datetime(date_from.year, date_from.month, date_from.day)
+        if date_to:
+            date_filter["$lte"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59)
+        match["date"] = date_filter
+    if category_name.strip():
+        match["category_name"] = category_name.strip()
+    if sub_item_match.strip():
+        match["description"] = {"$regex": re.escape(sub_item_match.strip()), "$options": "i"}
+    elif keyword.strip():
+        kw_re = {"$regex": re.escape(keyword.strip()), "$options": "i"}
+        match["$or"] = [
+            {"description":  kw_re},
+            {"truck_number": kw_re},
+            {"memo":         kw_re},
+        ]
+    cursor = db.transactions.find(match).sort([("date", -1), ("created_at", -1)]).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
+
+
+async def get_available_months() -> list:
+    """Return (year, month) tuples for every month that has transactions, newest first."""
+    db = get_db()
+    pipeline = [
+        {"$group": {
+            "_id": {
+                "year":  {"$year":  "$date"},
+                "month": {"$month": "$date"},
+            }
+        }},
+        {"$sort": {"_id.year": -1, "_id.month": -1}},
+    ]
+    docs = await db.transactions.aggregate(pipeline).to_list(length=None)
+    return [(d["_id"]["year"], d["_id"]["month"]) for d in docs]
 
 
 async def search_descriptions(prefix: str, limit: int = 12) -> List[str]:
