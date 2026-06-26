@@ -1007,30 +1007,275 @@ class TollPlazaWidget(QWidget):
 #  2. ParkingCongoWidget
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_PCONGO_HEADERS = [
-    "SN", "TRANSACTION DATE", "TYPE", "SERIAL", "VEHICLE #",
-    "AMOUNT", "BALANCE", "GATE IN", "GATE OUT",
-]
 _PCONGO_COL_MAP = {
-    "sn":               ["sn", "s/n", "no", "#"],
-    "transaction_date": ["transaction date", "date", "trans date"],
-    "transaction_type": ["type", "transaction type", "trans type"],
-    "serial":           ["serial", "serial no", "serial number"],
-    "vehicle_no":       ["vehicle #", "vehicle no", "vehicle", "plate"],
-    "amount":           ["amount", "amt"],
-    "balance":          ["balance", "bal"],
-    "gate_in":          ["gate in", "in"],
-    "gate_out":         ["gate out", "out"],
+    "sn":                  ["#", "sn", "s/n", "no"],
+    "ledger_id":           ["ledger id", "ledger_id", "id"],
+    "payment_date":        ["payment date", "date", "payment_date"],
+    "transaction_type":    ["type", "transaction type", "trans type"],
+    "amount":              ["amount", "amt"],
+    "running_bal":         ["running bal", "running balance", "bal", "balance"],
+    "cashier":             ["cashier"],
+    "vehicle_no":          ["vehicle #", "vehicle no", "vehicle", "plate"],
+    "direction":           ["direction", "dir"],
+    "gate_in":             ["gate in", "in"],
+    "transaction_details": ["transaction details", "details", "trans details"],
 }
 
+_PCONGO_DETAIL_HEADERS = [
+    "#", "LEDGER ID", "PAYMENT DATE", "TYPE", "AMOUNT", "RUNNING BAL",
+    "CASHIER", "VEHICLE #", "DIRECTION", "GATE IN", "TRANSACTION DETAILS",
+]
 
-class ParkingCongoWidget(QWidget):
+_PCONGO_BROWSE_HEADERS = [
+    "UPLOAD DATE", "FILE NAME", "RECORDS", "DATE RANGE",
+]
+
+
+def _pcongo_amount_color(amt_str: str) -> str:
+    """Return green for credits (positive), red for debits (negative)."""
+    try:
+        return _GREEN if float(amt_str) > 0 else _RED
+    except (ValueError, TypeError):
+        return _T1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Upload Browse sub-widget — one row per import batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _CongoUploadBrowse(QWidget):
+    """Table of every Parking Congo import batch. Clicking a row drills into it."""
+
+    upload_clicked = Signal(object)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._page = 1
-        self._page_size = 25
-        self._total = 0
+        self._uploads: List[dict] = []
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        self._table = _make_table(_PCONGO_BROWSE_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setColumnWidth(0, 180)
+        self._table.setColumnWidth(1, 260)
+        self._table.setColumnWidth(2, 80)
+        self._table.setStyleSheet(
+            _table_style()
+            + f"QTableWidget{{alternate-background-color:{_ALT_ROW};}}"
+        )
+        self._table.setCursor(Qt.PointingHandCursor)
+        self._table.cellClicked.connect(self._on_row_clicked)
+        vl.addWidget(self._table, 1)
+
+        hint = _lbl("Click any row to view the full records for that upload.", size=11, color=_TM)
+        hint.setAlignment(Qt.AlignCenter)
+        vl.addWidget(hint)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        uploads = await svc.get_parking_congo_uploads()
+        self._uploads = uploads
+        self._fill(uploads)
+
+    def _fill(self, uploads: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        for up in uploads:
+            r = t.rowCount()
+            t.insertRow(r)
+            import_dt = up.get("import_date")
+            date_str = (
+                import_dt.strftime("%d %b %Y  %H:%M")
+                if isinstance(import_dt, datetime)
+                else (str(import_dt) if import_dt else "—")
+            )
+            count  = int(up.get("record_count", 0))
+            min_d  = str(up.get("min_date", "") or "").strip()
+            max_d  = str(up.get("max_date", "") or "").strip()
+            date_range = f"{min_d[:10]} — {max_d[:10]}" if min_d else "—"
+
+            t.setItem(r, 0, _cell(date_str))
+            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 3, _cell(date_range))
+            t.setRowHeight(r, _ROW_H)
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        if row < len(self._uploads):
+            self.upload_clicked.emit(self._uploads[row])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Upload Detail sub-widget — all records for one import batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _CongoUploadDetail(QWidget):
+    """Full record table for a single Parking Congo upload batch."""
+
+    back_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._upload_id = ""
+        self._search    = ""
+        self._page      = 1
+        self._page_size = 50
+        self._total     = 0
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        nav = QWidget()
+        nav.setStyleSheet("background:transparent;")
+        navl = QHBoxLayout(nav)
+        navl.setContentsMargins(0, 0, 0, 0)
+        navl.setSpacing(8)
+
+        back_btn = _btn("← All Uploads", primary=False, height=30)
+        back_btn.clicked.connect(self.back_requested)
+        navl.addWidget(back_btn)
+
+        self._crumb_lbl = _lbl("", size=12, color=_T2)
+        navl.addWidget(self._crumb_lbl)
+        navl.addStretch()
+        vl.addWidget(nav)
+
+        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
+        vl.addWidget(self._info_lbl)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search vehicle, ledger ID, type, cashier…")
+        self._search_edit.setFixedWidth(320)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._table = _make_table(_PCONGO_DETAIL_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        vl.addWidget(self._table, 1)
+
+        self._totals = _TotalsBar([("count", "Records: ")])
+        vl.addWidget(self._totals)
+
+        self._pager = _PaginationBar()
+        self._pager.page_changed.connect(self._go_page)
+        self._pager.size_changed.connect(self._on_page_size)
+        vl.addWidget(self._pager)
+
+    def load_upload(self, upload_doc: dict) -> None:
+        self._upload_id = str(upload_doc.get("_id") or "")
+        filename  = upload_doc.get("source_filename") or "Unknown file"
+        count     = int(upload_doc.get("record_count", 0))
+        import_dt = upload_doc.get("import_date")
+        date_str  = (
+            import_dt.strftime("%d %b %Y")
+            if isinstance(import_dt, datetime) else ""
+        )
+        self._crumb_lbl.setText(f"Uploads  ›  {filename}")
+        self._info_lbl.setText(
+            f"{filename}   •   {count:,} records   •   {date_str}"
+        )
+        self._totals.set_total("count", count, "")
+
         self._search = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._page = 1
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id:
+            return
+        skip = (self._page - 1) * self._page_size
+        recs, total = await asyncio.gather(
+            svc.get_parking_congo_upload_records(
+                self._upload_id, self._search, self._page_size, skip
+            ),
+            svc.count_parking_congo_upload_records(self._upload_id, self._search),
+        )
+        self._total = total
+        self._fill_table(recs)
+        self._pager.set_total(total, self._page_size, self._page)
+        self._totals.set_total("count", total, "")
+
+    def _fill_table(self, recs: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        for rec in recs:
+            r = t.rowCount()
+            t.insertRow(r)
+            amt_str   = str(rec.get("amount", "") or "")
+            amt_color = _pcongo_amount_color(amt_str)
+            try:
+                amt_display = _fmt_num(float(amt_str), "", 0)
+            except (ValueError, TypeError):
+                amt_display = amt_str or "—"
+
+            t.setItem(r,  0, _cell(str(rec.get("sn", "") or "")))
+            t.setItem(r,  1, _cell(str(rec.get("ledger_id", "") or "")))
+            t.setItem(r,  2, _cell(str(rec.get("payment_date", "") or "")))
+            t.setItem(r,  3, _cell(str(rec.get("transaction_type", "") or ""), color=amt_color))
+            t.setItem(r,  4, _cell(amt_display, mono=True,
+                                   align=Qt.AlignRight | Qt.AlignVCenter, color=amt_color))
+            t.setItem(r,  5, _cell(str(rec.get("running_bal", "") or ""), mono=True,
+                                   align=Qt.AlignRight | Qt.AlignVCenter))
+            t.setItem(r,  6, _cell(str(rec.get("cashier", "") or "")))
+            t.setItem(r,  7, _cell(str(rec.get("vehicle_no", "") or "")))
+            t.setItem(r,  8, _cell(str(rec.get("direction", "") or "")))
+            t.setItem(r,  9, _cell(str(rec.get("gate_in", "") or "")))
+            t.setItem(r, 10, _cell(str(rec.get("transaction_details", "") or "")))
+            t.setRowHeight(r, _ROW_H)
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._page   = 1
+        asyncio.ensure_future(self._load())
+
+    def _go_page(self, page: int) -> None:
+        self._page = page
+        asyncio.ensure_future(self._load())
+
+    def _on_page_size(self, size: int) -> None:
+        self._page_size = size
+        self._page      = 1
+        asyncio.ensure_future(self._load())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  2. ParkingCongoWidget — master/detail shell
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ParkingCongoWidget(QWidget):
+    """
+    Parking Congo main page — browse uploads then drill into per-record detail.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
         self._build()
         self.refresh()
 
@@ -1047,99 +1292,49 @@ class ParkingCongoWidget(QWidget):
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background:transparent;")
 
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search vehicle, serial…")
-        self._search_edit.setFixedWidth(240)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-        tbl.addStretch()
+        self._browse = _CongoUploadBrowse()
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._stack.addWidget(self._browse)      # index 0 — Upload list
 
-        export_btn = _btn("Export", "mdi.download-outline", primary=False)
-        tbl.addWidget(export_btn)
-        vl.addWidget(tb)
+        self._detail = _CongoUploadDetail()
+        self._detail.back_requested.connect(self._show_browse)
+        self._stack.addWidget(self._detail)      # index 1 — Record detail
 
-        self._table = _make_table(_PCONGO_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
-        vl.addWidget(self._table, 1)
-
-        self._totals = _TotalsBar([("amount", "$ ")])
-        vl.addWidget(self._totals)
-
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+        self._stack.setCurrentIndex(0)
+        vl.addWidget(self._stack, 1)
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._load())
+        self._show_browse()
 
-    async def _load(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_imported_feed("parking_congo", self._search, "",
-                                  self._page_size, skip),
-            svc.count_imported_feed("parking_congo", self._search, ""),
-        )
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
-        totals = await svc.get_imported_feed_totals("parking_congo")
-        self._totals.set_total("amount", totals.get("amount", 0.0), "$ ")
+    def _show_browse(self) -> None:
+        self._stack.setCurrentIndex(0)
+        self._browse.refresh()
 
-    def _fill_table(self, recs: List[dict]) -> None:
-        t = self._table
-        t.setRowCount(0)
-        for rec in recs:
-            r = t.rowCount()
-            t.insertRow(r)
-            t.setItem(r, 0, _cell(rec.get("sn", "")))
-            t.setItem(r, 1, _cell(rec.get("transaction_date", "")))
-            t.setItem(r, 2, _cell(rec.get("transaction_type", "")))
-            t.setItem(r, 3, _cell(rec.get("serial", "")))
-            t.setItem(r, 4, _cell(rec.get("vehicle_no", "")))
-            t.setItem(r, 5, _cell(_fmt_num(rec.get("amount"), "$ "), mono=True))
-            t.setItem(r, 6, _cell(_fmt_num(rec.get("balance"), "$ "), mono=True))
-            t.setItem(r, 7, _cell(rec.get("gate_in", "")))
-            t.setItem(r, 8, _cell(rec.get("gate_out", "")))
+    def _show_detail(self, upload_doc: dict) -> None:
+        self._detail.load_upload(upload_doc)
+        self._stack.setCurrentIndex(1)
 
     def _open_import(self) -> None:
         from tahmeed.services import accountant_service as svc
         dlg = ImportDialog(
             feed_type="parking_congo",
-            dedup_key="serial",
-            preview_headers=_PCONGO_HEADERS,
+            dedup_key="ledger_id",
+            preview_headers=_PCONGO_DETAIL_HEADERS,
             col_map=_PCONGO_COL_MAP,
             save_fn=svc.save_imported_feed,
             exist_fn=svc.get_existing_feed_keys,
+            header_row=8,   # Congo ledger xlsx has 8 title rows before the column headers
             parent=self,
         )
-        dlg.imported.connect(lambda n: (
-            QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records."),
-            self.refresh(),
-        ))
+        dlg.imported.connect(self._on_imported)
         dlg.exec()
 
-    def _on_search(self, text: str) -> None:
-        self._search = text
-        self._page = 1
-        asyncio.ensure_future(self._load())
-
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page = 1
-        asyncio.ensure_future(self._load())
+    def _on_imported(self, n: int) -> None:
+        QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        self._show_browse()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
