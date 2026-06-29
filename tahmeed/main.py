@@ -27,6 +27,14 @@ def main() -> None:
         login.hide()
         win = MainWindow(user)
         _open_windows.append(win)
+
+        def on_logout():
+            win.close()
+            _open_windows.remove(win)
+            login.clear_fields()
+            login.show()
+
+        win.logout_requested.connect(on_logout)
         win.show()
 
     login.login_successful.connect(on_login_success)

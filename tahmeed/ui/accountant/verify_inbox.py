@@ -683,11 +683,11 @@ class VerifyInboxWidget(QWidget):
         self._pending_badge = QLabel("…")
         self._pending_badge.setAlignment(Qt.AlignCenter)
         self._pending_badge.setStyleSheet(
-            "color:#FFFFFF;background:#D97706;border-radius:10px;"
-            "padding:2px 8px;font-size:10px;font-weight:600;"
+            "color:#6B7280;background:#F3F4F6;border-radius:8px;"
+            "padding:2px 8px;font-size:11px;font-weight:600;"
             "font-family:'Segoe UI',sans-serif;"
         )
-        self._pending_badge.setMinimumWidth(36)
+        self._pending_badge.setMinimumWidth(28)
         tbl.addWidget(self._pending_badge)
         tbl.addStretch()
         refresh_btn = QPushButton()
@@ -963,6 +963,7 @@ class VerifyInboxWidget(QWidget):
             self._fill_table(txs, cname_map, skip)
             self._pagination.update_state(self._page, total, size)
             self._pending_badge.setText(str(pending))
+            self.badge_updated.emit(pending)
 
         except Exception as exc:
             self._show_empty(f"Failed to load: {exc}")

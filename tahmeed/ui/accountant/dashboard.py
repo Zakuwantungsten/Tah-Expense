@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
     QLabel, QFrame,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 from tahmeed.models.user import User
 from tahmeed.ui.accountant.header_bar import HeaderBar
@@ -39,6 +39,8 @@ _APP_BG = "#F4F6F8"
 
 
 class AccountantDashboard(QWidget):
+    logout_requested = Signal()
+
     def __init__(self, user: User, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._user = user
@@ -74,6 +76,7 @@ class AccountantDashboard(QWidget):
         self._sidebar = SidebarWidget()
         self._sidebar.nav_selected.connect(self._on_nav)
         self._sidebar.subtable_selected.connect(self._show_subtable)
+        self._sidebar.logout_requested.connect(self.logout_requested)
         body_hl.addWidget(self._sidebar)
 
         # 1-px vertical divider

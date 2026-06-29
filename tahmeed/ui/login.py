@@ -215,6 +215,11 @@ class LoginWindow(QWidget):
             self._stack.setCurrentIndex(0)
 
     # ------------------------------------------------------------------
+    def clear_fields(self) -> None:
+        self._username.clear()
+        self._password.clear()
+        self._login_error.setText("")
+
     # Login flow
     # ------------------------------------------------------------------
 

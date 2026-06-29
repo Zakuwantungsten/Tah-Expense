@@ -379,6 +379,8 @@ class _StatusBar(QFrame):
 # ── CashierDashboard ─────────────────────────────────────────────────────────────
 
 class CashierDashboard(QWidget):
+    logout_requested = Signal()
+
     def __init__(self, user: User, parent=None):
         super().__init__(parent)
         self._user = user
@@ -400,6 +402,7 @@ class CashierDashboard(QWidget):
         # Build sidebar first so its toggle fn can be passed to the header bar.
         self._sidebar = CashierSidebarWidget(user=self._user)
         self._sidebar.nav_selected.connect(self._on_nav)
+        self._sidebar.logout_requested.connect(self.logout_requested)
 
         # ── Header bar ────────────────────────────────────────────────────────
         self._header = HeaderBar(

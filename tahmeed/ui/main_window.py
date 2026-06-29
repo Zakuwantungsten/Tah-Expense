@@ -1,4 +1,5 @@
 from PySide6.QtWidgets import QMainWindow, QStatusBar, QLabel
+from PySide6.QtCore import Signal
 
 from tahmeed.models.user import User
 from tahmeed.ui.admin.dashboard import AdminDashboard
@@ -7,6 +8,8 @@ from tahmeed.ui.accountant.dashboard import AccountantDashboard
 
 
 class MainWindow(QMainWindow):
+    logout_requested = Signal()
+
     def __init__(self, user: User):
         super().__init__()
         self.user = user
@@ -16,14 +19,17 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         if self.user.role == "admin":
-            self.setCentralWidget(AdminDashboard(self.user))
+            dash = AdminDashboard(self.user)
         elif self.user.role == "cashier":
-            self.setCentralWidget(CashierDashboard(self.user))
+            dash = CashierDashboard(self.user)
         elif self.user.role == "accountant":
-            self.setCentralWidget(AccountantDashboard(self.user))
+            dash = AccountantDashboard(self.user)
         else:
-            placeholder = QLabel(f"{self.user.role.title()} dashboard — coming soon")
-            self.setCentralWidget(placeholder)
+            dash = QLabel(f"{self.user.role.title()} dashboard — coming soon")
+
+        if hasattr(dash, "logout_requested"):
+            dash.logout_requested.connect(self.logout_requested)
+        self.setCentralWidget(dash)
 
         bar = QStatusBar()
         bar.showMessage(f"  {self.user.full_name}  ·  {self.user.role.title()}")

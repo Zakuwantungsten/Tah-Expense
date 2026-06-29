@@ -302,8 +302,8 @@ class CashierSidebarWidget(QFrame):
     """Collapsible cashier sidebar — same visual style as accountant sidebar."""
 
     nav_selected = Signal(str)
-    # (parent_key, parent_category, name, match)
     subtable_selected = Signal(str, str, str, str)
+    logout_requested = Signal()
 
     def __init__(self, user: User, parent=None):
         super().__init__(parent)
@@ -418,6 +418,26 @@ class CashierSidebarWidget(QFrame):
         self._collapse_btn.clicked.connect(self.toggle_collapsed)
         root.addWidget(self._collapse_btn)
 
+        self._logout_btn = QToolButton()
+        self._logout_btn.setFixedHeight(40)
+        self._logout_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._logout_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._logout_btn.setIcon(_qta("mdi.logout", color="#EF4444"))
+        self._logout_btn.setIconSize(QSize(16, 16))
+        self._logout_btn.setText("  Log Out")
+        self._logout_btn.setStyleSheet("""
+            QToolButton {
+                background: transparent; border: none;
+                color: #EF4444; font-size: 12px;
+                font-family: 'Segoe UI', sans-serif;
+                padding: 0 14px; text-align: left;
+            }
+            QToolButton:hover { background: rgba(239,68,68,0.10); }
+        """)
+        self._logout_btn.setCursor(Qt.PointingHandCursor)
+        self._logout_btn.clicked.connect(self.logout_requested)
+        root.addWidget(self._logout_btn)
+
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def _clear_active(self) -> None:
@@ -453,10 +473,14 @@ class CashierSidebarWidget(QFrame):
             self._collapse_btn.setText("")
             self._collapse_btn.setIcon(_qta("mdi.chevron-right", color=_MUTED))
             self._collapse_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            self._logout_btn.setText("")
+            self._logout_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
         else:
             self._collapse_btn.setText("  Collapse")
             self._collapse_btn.setIcon(_qta("mdi.chevron-left", color=_MUTED))
             self._collapse_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            self._logout_btn.setText("  Log Out")
+            self._logout_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
     # ── Internal: top-level nav ────────────────────────────────────────────────
 
