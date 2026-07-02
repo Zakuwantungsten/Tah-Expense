@@ -1095,37 +1095,259 @@ async def save_separate_expense(expense_type: str, data: dict) -> bool:
     return result.inserted_id is not None
 
 
-# ── Ahmed Kimvi visit-sheet helpers ──────────────────────────────────────────
+# ── Ahmed Kimvi — Excel import (last sheet per workbook) ─────────────────────
 
-async def get_kimvi_sheets() -> List[str]:
-    """Return distinct sheet_labels sorted chronologically."""
+async def kimvi_sheet_exists(sheet_label: str) -> bool:
+    """True when a sheet with this exact tab name was already imported."""
+    if not sheet_label.strip():
+        return False
     db = get_db()
-    labels = await db.separate_expenses.distinct(
-        "sheet_label", {"expense_type": "ahmed_kimvi"}
+    count = await db.separate_expenses.count_documents({
+        "expense_type": "ahmed_kimvi",
+        "sheet_label":  sheet_label.strip(),
+    })
+    return count > 0
+
+
+async def kimvi_existing_sheet_labels(labels: List[str]) -> set:
+    """Return sheet tab names from labels that were already imported."""
+    clean = [l.strip() for l in labels if l and l.strip()]
+    if not clean:
+        return set()
+    db = get_db()
+    found = await db.separate_expenses.distinct(
+        "sheet_label",
+        {"expense_type": "ahmed_kimvi", "sheet_label": {"$in": clean}},
     )
-    return sorted(l for l in labels if l)
+    return set(found)
 
 
-async def get_kimvi_sheet_entries(sheet_label: str) -> list:
+async def save_kimvi_import(records: list) -> int:
+    """Insert a batch of Ahmed Kimvi rows from an Excel import."""
+    if not records:
+        return 0
     db = get_db()
+    now = datetime.utcnow()
+    docs = []
+    for rec in records:
+        doc = dict(rec)
+        doc.pop("_raw", None)
+        doc["expense_type"] = "ahmed_kimvi"
+        doc["import_date"]  = now
+        doc["created_at"]   = now
+        docs.append(doc)
+    result = await db.separate_expenses.insert_many(docs, ordered=False)
+    return len(result.inserted_ids)
+
+
+async def get_kimvi_uploads() -> list:
+    """Return one summary doc per import batch."""
+    db = get_db()
+    pipeline = [
+        {"$match": {
+            "expense_type": "ahmed_kimvi",
+            "upload_id":    {"$exists": True, "$ne": ""},
+        }},
+        {"$group": {
+            "_id":             "$upload_id",
+            "sheet_label":     {"$first": "$sheet_label"},
+            "source_filename": {"$first": "$source_filename"},
+            "import_date":     {"$first": "$import_date"},
+            "record_count":    {"$sum": 1},
+            "balance_usd":     {"$sum": {"$ifNull": ["$amount_usd", 0]}},
+            "money_in":        {"$sum": {
+                "$cond": [
+                    {"$lt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
+                    {"$ifNull": ["$amount_usd", 0]},
+                    0,
+                ],
+            }},
+            "money_out":       {"$sum": {
+                "$cond": [
+                    {"$gt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
+                    {"$ifNull": ["$amount_usd", 0]},
+                    0,
+                ],
+            }},
+            "min_expense_date": {"$min": "$expense_date"},
+            "max_expense_date": {"$max": "$expense_date"},
+        }},
+        {"$sort": {"import_date": -1}},
+    ]
+    return await db.separate_expenses.aggregate(pipeline).to_list(length=None)
+
+
+async def get_kimvi_upload_records(
+    upload_id: str,
+    search: str = "",
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated rows for a single Ahmed Kimvi import batch."""
+    db = get_db()
+    query: dict = {
+        "expense_type": "ahmed_kimvi",
+        "upload_id":    upload_id,
+    }
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"description": {"$regex": s, "$options": "i"}},
+            {"truck_no":    {"$regex": s, "$options": "i"}},
+            {"date_str":    {"$regex": s, "$options": "i"}},
+        ]
     cursor = (
         db.separate_expenses
-        .find({"expense_type": "ahmed_kimvi", "sheet_label": sheet_label})
-        .sort([("is_advance", -1), ("created_at", 1)])
+        .find(query)
+        .sort([("row_index", 1), ("created_at", 1)])
+        .skip(skip)
+        .limit(limit)
     )
-    return await cursor.to_list(length=None)
+    return await cursor.to_list(length=limit)
 
 
-async def create_kimvi_sheet(label: str, date_str: str, advance: float) -> None:
-    """Insert the advance row that starts a new visit sheet."""
+async def count_kimvi_upload_records(upload_id: str, search: str = "") -> int:
+    """Count rows for a single Ahmed Kimvi import batch."""
     db = get_db()
-    await db.separate_expenses.insert_one({
+    query: dict = {
         "expense_type": "ahmed_kimvi",
-        "sheet_label":  label,
-        "date_str":     date_str,
-        "truck_no":     "",
-        "description":  "Cash Advance Payment",
-        "amount_usd":   advance,
-        "is_advance":   True,
-        "created_at":   datetime.utcnow(),
+        "upload_id":    upload_id,
+    }
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"description": {"$regex": s, "$options": "i"}},
+            {"truck_no":    {"$regex": s, "$options": "i"}},
+            {"date_str":    {"$regex": s, "$options": "i"}},
+        ]
+    return await db.separate_expenses.count_documents(query)
+
+
+# ── Congo Expenses — Excel import (last sheet per workbook) ──────────────────
+
+async def congo_sheet_exists(sheet_label: str) -> bool:
+    """True when a sheet with this exact tab name was already imported."""
+    if not sheet_label.strip():
+        return False
+    db = get_db()
+    count = await db.separate_expenses.count_documents({
+        "expense_type": "congo_expenses",
+        "sheet_label":  sheet_label.strip(),
     })
+    return count > 0
+
+
+async def congo_existing_sheet_labels(labels: List[str]) -> set:
+    """Return sheet tab names from labels that were already imported."""
+    clean = [l.strip() for l in labels if l and l.strip()]
+    if not clean:
+        return set()
+    db = get_db()
+    found = await db.separate_expenses.distinct(
+        "sheet_label",
+        {"expense_type": "congo_expenses", "sheet_label": {"$in": clean}},
+    )
+    return set(found)
+
+
+async def save_congo_import(records: list) -> int:
+    """Insert a batch of Congo Expenses rows from an Excel import."""
+    if not records:
+        return 0
+    db = get_db()
+    now = datetime.utcnow()
+    docs = []
+    for rec in records:
+        doc = dict(rec)
+        doc.pop("_raw", None)
+        doc["expense_type"] = "congo_expenses"
+        doc["import_date"]  = now
+        doc["created_at"]   = now
+        docs.append(doc)
+    result = await db.separate_expenses.insert_many(docs, ordered=False)
+    return len(result.inserted_ids)
+
+
+async def get_congo_uploads() -> list:
+    """Return one summary doc per Congo Expenses import batch."""
+    db = get_db()
+    pipeline = [
+        {"$match": {
+            "expense_type": "congo_expenses",
+            "upload_id":    {"$exists": True, "$ne": ""},
+        }},
+        {"$group": {
+            "_id":             "$upload_id",
+            "sheet_label":     {"$first": "$sheet_label"},
+            "source_filename": {"$first": "$source_filename"},
+            "import_date":     {"$first": "$import_date"},
+            "record_count":    {"$sum": 1},
+            "balance_usd":     {"$sum": {"$ifNull": ["$amount_usd", 0]}},
+            "money_in":        {"$sum": {
+                "$cond": [
+                    {"$lt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
+                    {"$ifNull": ["$amount_usd", 0]},
+                    0,
+                ],
+            }},
+            "money_out":       {"$sum": {
+                "$cond": [
+                    {"$gt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
+                    {"$ifNull": ["$amount_usd", 0]},
+                    0,
+                ],
+            }},
+            "min_expense_date": {"$min": "$expense_date"},
+            "max_expense_date": {"$max": "$expense_date"},
+        }},
+        {"$sort": {"import_date": -1}},
+    ]
+    return await db.separate_expenses.aggregate(pipeline).to_list(length=None)
+
+
+async def get_congo_upload_records(
+    upload_id: str,
+    search: str = "",
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated rows for a single Congo Expenses import batch."""
+    db = get_db()
+    query: dict = {
+        "expense_type": "congo_expenses",
+        "upload_id":    upload_id,
+    }
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"description": {"$regex": s, "$options": "i"}},
+            {"truck_no":    {"$regex": s, "$options": "i"}},
+            {"lpo_no":      {"$regex": s, "$options": "i"}},
+            {"date_str":    {"$regex": s, "$options": "i"}},
+        ]
+    cursor = (
+        db.separate_expenses
+        .find(query)
+        .sort([("row_index", 1), ("created_at", 1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_congo_upload_records(upload_id: str, search: str = "") -> int:
+    """Count rows for a single Congo Expenses import batch."""
+    db = get_db()
+    query: dict = {
+        "expense_type": "congo_expenses",
+        "upload_id":    upload_id,
+    }
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"description": {"$regex": s, "$options": "i"}},
+            {"truck_no":    {"$regex": s, "$options": "i"}},
+            {"lpo_no":      {"$regex": s, "$options": "i"}},
+            {"date_str":    {"$regex": s, "$options": "i"}},
+        ]
+    return await db.separate_expenses.count_documents(query)

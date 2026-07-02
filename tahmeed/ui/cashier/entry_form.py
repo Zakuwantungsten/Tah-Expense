@@ -20,7 +20,7 @@ from tahmeed.services.truck_service import search_trucks
 from tahmeed.services.rule_service import test_description
 from tahmeed.services.category_service import get_all_categories
 from tahmeed.services.settings_service import get_setting
-from tahmeed.services.cashier_service import save_transaction, get_transactions_by_date
+from tahmeed.services.cashier_service import save_transaction, get_transactions_by_date, check_for_duplicates
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 
 
@@ -517,7 +517,6 @@ class EntryForm(QWidget):
             rcpt_it.setTextAlignment(Qt.AlignCenter)
             self._day_table.setItem(row, _RCPT, rcpt_it)
 
-            self._day_table.setItem(row, _OWN, _it(tx.ownership or ""))
             self._day_table.setItem(row, _APR, _it(tx.approver or ""))
 
         n = len(txs)
@@ -617,6 +616,61 @@ class EntryForm(QWidget):
         qdate   = self._date.date()
         tx_date = datetime(qdate.year(), qdate.month(), qdate.day())
 
+        # ── Off-date warning ──────────────────────────────────────────────
+        if tx_date.date() != date.today():
+            if QMessageBox.warning(
+                self, "Off-date Entry",
+                f"The selected date ({tx_date.strftime('%d %b %Y')}) is not today "
+                f"({date.today().strftime('%d %b %Y')}).\n\n"
+                "This entry will be flagged in the accountant's verify inbox.\n\n"
+                "Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            ) == QMessageBox.No:
+                self._submit_btn.setEnabled(True)
+                return
+
+        # ── Duplicate check ───────────────────────────────────────────────
+        try:
+            dup_days = int(await get_setting("duplicate_check_days") or 5)
+        except Exception:
+            dup_days = 5
+
+        possible_dup = False
+        try:
+            dupes = await check_for_duplicates(
+                truck_number=self._truck.text().strip().upper(),
+                amount=self._amount.value(),
+                item=self._item.text().strip(),
+                description=description,
+                days=dup_days,
+            )
+        except Exception:
+            dupes = []
+
+        if dupes:
+            d = dupes[0]
+            _msg = QMessageBox(self)
+            _msg.setWindowTitle("Possible Duplicate Entry")
+            _msg.setText(
+                f"A similar entry already exists:\n\n"
+                f"  Description: {d.description or '—'}\n"
+                f"  Item:        {d.item or '—'}\n"
+                f"  Truck:       {d.truck_number or '—'}\n"
+                f"  Amount:      TZS {d.amount:,.0f}\n"
+                f"  Date:        {d.date.strftime('%d %b %Y') if d.date else '—'}\n\n"
+                f"(Checked last {dup_days} day{'s' if dup_days != 1 else ''})\n\n"
+                "Save anyway?"
+            )
+            _msg.setIcon(QMessageBox.Warning)
+            _save_btn   = _msg.addButton("Save Anyway", QMessageBox.AcceptRole)
+            _cancel_btn = _msg.addButton("Cancel",      QMessageBox.RejectRole)
+            _msg.exec()
+            if _msg.clickedButton() is _cancel_btn:
+                self._submit_btn.setEnabled(True)
+                return
+            possible_dup = True
+
         tx = Transaction(
             date=tx_date,
             description=description,
@@ -632,6 +686,7 @@ class EntryForm(QWidget):
             ownership=self._ownership.text().strip(),
             approver=self._approver.text().strip(),
             cashier_id=self._user._id,
+            possible_duplicate=possible_dup,
         )
 
         try:

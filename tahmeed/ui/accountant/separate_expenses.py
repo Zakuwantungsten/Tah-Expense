@@ -3,8 +3,8 @@
 Covers all nine views under the SEPARATE EXPENSES sidebar section:
   TollPlazaWidget      — import from Dot Com Zambia xlsx/csv, dedup by Receipt No
   ParkingCongoWidget   — import from Congo transporter ledger, dedup by Serial
-  CongoExpensesWidget  — manual entry (Date·LPO No·Truck·Desc·USD·Approved By)
-  AhmedKimviWidget     — visit-sheet pagination, advance + itemised rows + balance
+  CongoExpensesWidget  — Excel import (last sheet), upload browse + detail view
+  AhmedKimviWidget     — Excel import (last sheet), upload browse + detail view
   ZambiaParkingWidget  — weekly statement import, opening-balance row handling
   HarrisonExpensesWidget — manual entry, USD + Kwacha columns
   AfritrackWidget      — placeholder stub
@@ -1043,7 +1043,7 @@ def _pcongo_amount_color(amt_str: str) -> str:
 #  Upload Browse sub-widget — one row per import batch
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _CongoUploadBrowse(QWidget):
+class _ParkingCongoUploadBrowse(QWidget):
     """Table of every Parking Congo import batch. Clicking a row drills into it."""
 
     upload_clicked = Signal(object)
@@ -1118,7 +1118,7 @@ class _CongoUploadBrowse(QWidget):
 #  Upload Detail sub-widget — all records for one import batch
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _CongoUploadDetail(QWidget):
+class _ParkingCongoUploadDetail(QWidget):
     """Full record table for a single Parking Congo upload batch."""
 
     back_requested = Signal()
@@ -1295,11 +1295,11 @@ class ParkingCongoWidget(QWidget):
         self._stack = QStackedWidget()
         self._stack.setStyleSheet("background:transparent;")
 
-        self._browse = _CongoUploadBrowse()
+        self._browse = _ParkingCongoUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
         self._stack.addWidget(self._browse)      # index 0 — Upload list
 
-        self._detail = _CongoUploadDetail()
+        self._detail = _ParkingCongoUploadDetail()
         self._detail.back_requested.connect(self._show_browse)
         self._stack.addWidget(self._detail)      # index 1 — Record detail
 
@@ -1338,22 +1338,147 @@ class ParkingCongoWidget(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  3. CongoExpensesWidget  — manual entry
+#  3. CongoExpensesWidget  — Excel import (last sheet), upload browse + detail
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_CONGO_EXP_HEADERS = [
-    "S/NO", "DATE", "LPO NO", "TRUCK NO", "DESCRIPTION", "AMOUNT (USD)", "APPROVED BY",
+_CONGO_HEADERS = [
+    "S/NO", "DATE", "LPO NO", "TRUCK NO", "DESCRIPTION", "AMOUNT (USD)",
+]
+
+_CONGO_BROWSE_HEADERS = [
+    "UPLOAD DATE", "FILE NAME", "SHEET", "RECORDS", "BALANCE (USD)", "DATE RANGE",
 ]
 
 
-class _CongoEntryDialog(QDialog):
-    saved = Signal(dict)
+def _parse_congo_sheet(ws) -> List[dict]:
+    """Parse one Congo Expenses worksheet into row dicts."""
+    rows = list(ws.iter_rows(values_only=True))
+    if len(rows) < 2:
+        return []
 
-    def __init__(self, record: dict | None = None, parent: QWidget | None = None) -> None:
+    records: List[dict] = []
+    for row_idx, row in enumerate(rows[1:], start=2):
+        if not any(c is not None for c in row):
+            continue
+
+        s_no        = row[0] if len(row) > 0 else None
+        dt          = row[1] if len(row) > 1 else None
+        lpo         = row[2] if len(row) > 2 else None
+        truck       = row[3] if len(row) > 3 else None
+        description = row[4] if len(row) > 4 else None
+        amount      = row[5] if len(row) > 5 else None
+
+        desc_str = str(description).strip() if description is not None else ""
+        if desc_str.upper() == "TOTAL":
+            continue
+
+        try:
+            amt = float(amount) if amount is not None else 0.0
+        except (TypeError, ValueError):
+            amt = 0.0
+
+        if isinstance(dt, datetime):
+            date_str     = dt.strftime("%d %b %Y")
+            expense_date = dt
+        else:
+            date_str     = str(dt).strip() if dt is not None else ""
+            expense_date = None
+
+        lpo_str   = str(lpo).strip() if lpo is not None else ""
+        truck_str = str(truck).strip() if truck is not None else ""
+
+        serial_no: Optional[int] = None
+        if s_no is not None and str(s_no).strip():
+            try:
+                serial_no = int(float(s_no))
+            except (TypeError, ValueError):
+                serial_no = None
+
+        records.append({
+            "serial_no":    serial_no,
+            "date_str":     date_str,
+            "expense_date": expense_date,
+            "lpo_no":       lpo_str,
+            "truck_no":     truck_str,
+            "description":  desc_str,
+            "amount_usd":   amt,
+            "is_advance":   serial_no is None,
+            "row_index":    row_idx,
+        })
+
+    return records
+
+
+def _parse_congo_last_sheet(path: str) -> Tuple[str, List[dict]]:
+    """Read only the last worksheet from a Congo Expenses workbook."""
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to import Congo Expenses Excel files.")
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    if not wb.sheetnames:
+        return "", []
+
+    sheet_name = wb.sheetnames[-1]
+    return sheet_name, _parse_congo_sheet(wb[sheet_name])
+
+
+def _parse_congo_all_sheets(path: str) -> List[dict]:
+    """Parse every worksheet in a Congo Expenses workbook."""
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to import Congo Expenses Excel files.")
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    batches: List[dict] = []
+    for sheet_name in wb.sheetnames:
+        records = _parse_congo_sheet(wb[sheet_name])
+        if records:
+            batches.append({"sheet_label": sheet_name, "records": records})
+    return batches
+
+
+def _congo_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
+    """Populate one Congo Expenses row — same signed-amount styling as Kimvi."""
+    serial = rec.get("serial_no")
+    amt    = rec.get("amount_usd", 0)
+    try:
+        amt_f = float(amt) if amt is not None else 0.0
+    except (TypeError, ValueError):
+        amt_f = 0.0
+
+    is_in   = amt_f < 0
+    row_bg  = _KIMVI_IN_BG if is_in else _kimvi_stripe_bg(r)
+    amt_clr = _KIMVI_IN_FG if is_in else _T1
+
+    t.setItem(r, 0, _cell("—" if serial is None else str(serial)))
+    t.setItem(r, 1, _cell(rec.get("date_str", "")))
+    t.setItem(r, 2, _cell(rec.get("lpo_no", "")))
+    t.setItem(r, 3, _cell(rec.get("truck_no", "")))
+    t.setItem(r, 4, _cell(rec.get("description", "")))
+    t.setItem(r, 5, _cell(
+        _kimvi_fmt_amount(amt_f),
+        mono=True,
+        color=amt_clr,
+        align=Qt.AlignRight | Qt.AlignVCenter,
+    ))
+    _kimvi_apply_row_bg(t, r, row_bg)
+    t.setRowHeight(r, _KIMVI_ROW_H)
+
+
+class CongoImportDialog(QDialog):
+    """Import the last worksheet from a Congo Expenses workbook."""
+
+    imported = Signal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._record = record
-        self.setWindowTitle("New Congo Expense" if not record else "Edit Congo Expense")
-        self.setMinimumWidth(400)
+        self._upload_id       = str(uuid.uuid4())
+        self._source_filename = ""
+        self._sheet_label     = ""
+        self._records: List[dict] = []
+        self._already_exists  = False
+
+        self.setWindowTitle("Import — Congo Expenses")
+        self.setMinimumWidth(720)
         self.setStyleSheet(f"background:{_WHITE};")
         self._build()
 
@@ -1362,87 +1487,405 @@ class _CongoEntryDialog(QDialog):
         vl.setSpacing(12)
         vl.setContentsMargins(20, 20, 20, 20)
 
-        form = QFormLayout()
-        form.setSpacing(10)
-        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        hint = _lbl(
+            "Only the last sheet in the workbook will be imported "
+            "(one LPO period per upload).",
+            size=12, color=_T2,
+        )
+        vl.addWidget(hint)
 
-        def _field(placeholder: str = "", fixed_w: int = 0) -> QLineEdit:
-            e = QLineEdit()
-            e.setPlaceholderText(placeholder)
-            e.setStyleSheet(_input_ss())
-            if fixed_w:
-                e.setFixedWidth(fixed_w)
-            return e
+        self._drop = _DropZone()
+        self._drop.file_dropped.connect(self._on_file)
+        vl.addWidget(self._drop)
 
-        self._date_edit  = _field("dd mmm yyyy, e.g. 01 Jan 2025")
-        self._lpo_edit   = _field("C001")
-        self._truck_edit = _field("T700 DXY")
-        self._desc_edit  = _field("Seal Facilitation")
-        self._amt_edit   = _field("0.00", fixed_w=120)
-        self._appr_edit  = _field("Name")
+        browse_row = QWidget()
+        browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(browse_row)
+        brl.setContentsMargins(0, 0, 0, 0)
+        browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
+        browse_btn.clicked.connect(self._browse)
+        brl.addStretch()
+        brl.addWidget(browse_btn)
+        vl.addWidget(browse_row)
 
-        form.addRow("Date *", self._date_edit)
-        form.addRow("LPO No.", self._lpo_edit)
-        form.addRow("Truck No.", self._truck_edit)
-        form.addRow("Description *", self._desc_edit)
-        form.addRow("Amount (USD) *", self._amt_edit)
-        form.addRow("Approved By", self._appr_edit)
-        vl.addLayout(form)
+        self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
+        vl.addWidget(self._stats_lbl)
+        vl.addWidget(_hsep())
 
-        if self._record:
-            self._date_edit.setText(self._record.get("date_str", ""))
-            self._lpo_edit.setText(self._record.get("lpo_no", ""))
-            self._truck_edit.setText(self._record.get("truck_no", ""))
-            self._desc_edit.setText(self._record.get("description", ""))
-            self._amt_edit.setText(str(self._record.get("amount_usd", "")))
-            self._appr_edit.setText(self._record.get("approved_by", ""))
+        preview_title = _lbl("Preview (first 10 rows)", size=12, weight=600)
+        vl.addWidget(preview_title)
 
+        self._preview_tbl = _make_kimvi_table(_CONGO_HEADERS)
+        self._preview_tbl.setMinimumHeight(200)
+        vl.addWidget(self._preview_tbl)
         vl.addWidget(_hsep())
 
         btn_row = QWidget()
         btn_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(btn_row)
-        brl.setContentsMargins(0, 0, 0, 0)
-        brl.addStretch()
-        cancel = _btn("Cancel", primary=False)
-        cancel.clicked.connect(self.reject)
-        brl.addWidget(cancel)
-        save = _btn("Save Entry", "mdi.content-save-outline")
-        save.clicked.connect(self._save)
-        brl.addWidget(save)
+        bbl = QHBoxLayout(btn_row)
+        bbl.setContentsMargins(0, 0, 0, 0)
+        bbl.addStretch()
+
+        cancel_btn = _btn("Cancel", primary=False)
+        cancel_btn.clicked.connect(self.reject)
+        bbl.addWidget(cancel_btn)
+
+        self._import_btn = _btn("Import Sheet", "mdi.check-circle-outline")
+        self._import_btn.setEnabled(False)
+        self._import_btn.clicked.connect(self._do_import)
+        bbl.addWidget(self._import_btn)
         vl.addWidget(btn_row)
 
-    def _save(self) -> None:
-        desc = self._desc_edit.text().strip()
-        amt_text = self._amt_edit.text().strip()
-        if not desc or not amt_text:
-            QMessageBox.warning(self, "Validation", "Description and Amount are required.")
-            return
+    def _browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Congo Expenses Workbook", "", "Excel (*.xlsx *.xls)"
+        )
+        if path:
+            self._drop.set_path(path)
+            self._on_file(path)
+
+    def _on_file(self, path: str) -> None:
+        self._stats_lbl.setText("Reading file…")
+        self._source_filename = Path(path).name
         try:
-            amt = float(amt_text)
-        except ValueError:
-            QMessageBox.warning(self, "Validation", "Amount must be a number.")
+            sheet_label, records = _parse_congo_last_sheet(path)
+        except Exception as exc:
+            self._stats_lbl.setText(f"Error reading file: {exc}")
+            self._import_btn.setEnabled(False)
             return
-        self.saved.emit({
-            "date_str":    self._date_edit.text().strip(),
-            "lpo_no":      self._lpo_edit.text().strip(),
-            "truck_no":    self._truck_edit.text().strip(),
-            "description": desc,
-            "amount_usd":  amt,
-            "approved_by": self._appr_edit.text().strip(),
-        })
-        self.accept()
+
+        self._sheet_label = sheet_label
+        self._records = records
+        asyncio.ensure_future(self._check_sheet(sheet_label, records))
+
+    async def _check_sheet(self, sheet_label: str, records: List[dict]) -> None:
+        from tahmeed.services import accountant_service as svc
+
+        try:
+            exists = await svc.congo_sheet_exists(sheet_label)
+        except Exception:
+            exists = False
+
+        self._already_exists = exists
+        money_in  = sum(r["amount_usd"] for r in records if r["amount_usd"] < 0)
+        money_out = sum(r["amount_usd"] for r in records if r["amount_usd"] > 0)
+        balance   = money_in + money_out
+
+        if exists:
+            self._stats_lbl.setText(
+                f"Sheet \"{sheet_label}\" was already uploaded — import blocked."
+            )
+            self._import_btn.setEnabled(False)
+            self._import_btn.setText("Already Uploaded")
+        elif not records:
+            self._stats_lbl.setText(
+                f"Last sheet \"{sheet_label}\" has no data rows to import."
+            )
+            self._import_btn.setEnabled(False)
+            self._import_btn.setText("Import Sheet")
+        else:
+            self._stats_lbl.setText(
+                f"Last sheet: {sheet_label}     "
+                f"Rows: {len(records):,}     "
+                f"In: USD {money_in:,.0f}     "
+                f"Out: USD {money_out:,.0f}     "
+                f"Balance: USD {balance:,.0f}"
+            )
+            self._import_btn.setEnabled(True)
+            self._import_btn.setText(f"Import {len(records):,} Rows")
+
+        t = self._preview_tbl
+        t.setRowCount(0)
+        for rec in records[:10]:
+            row = t.rowCount()
+            t.insertRow(row)
+            _congo_fill_row(t, row, rec)
+
+    def _do_import(self) -> None:
+        if self._already_exists or not self._records:
+            return
+        self._import_btn.setEnabled(False)
+        self._import_btn.setText("Importing…")
+        asyncio.ensure_future(self._async_import())
+
+    async def _async_import(self) -> None:
+        from tahmeed.services import accountant_service as svc
+
+        docs = []
+        for rec in self._records:
+            doc = dict(rec)
+            doc["sheet_label"]     = self._sheet_label
+            doc["upload_id"]       = self._upload_id
+            doc["source_filename"] = self._source_filename
+            docs.append(doc)
+
+        try:
+            saved = await svc.save_congo_import(docs)
+            self.imported.emit(saved)
+            self.accept()
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Error", str(exc))
+            self._import_btn.setEnabled(True)
+            self._import_btn.setText(f"Import {len(self._records):,} Rows")
+
+
+class _CongoExpUploadBrowse(QWidget):
+    upload_clicked = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._uploads: List[dict] = []
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        self._totals = _TotalsBar([
+            ("balance", "Balance USD "),
+            ("count",   "Total records: "),
+        ])
+        vl.addWidget(self._totals)
+
+        self._table = _make_kimvi_table(_CONGO_BROWSE_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setColumnWidth(0, 160)
+        self._table.setColumnWidth(1, 220)
+        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(3, 80)
+        self._table.setColumnWidth(4, 120)
+        self._table.setCursor(Qt.PointingHandCursor)
+        self._table.cellClicked.connect(self._on_row_clicked)
+        vl.addWidget(self._table, 1)
+
+        hint = _lbl(
+            "Click any row to view the full records for that upload.",
+            size=11, color=_TM,
+        )
+        hint.setAlignment(Qt.AlignCenter)
+        vl.addWidget(hint)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        uploads = await svc.get_congo_uploads()
+        self._uploads = uploads
+        self._fill(uploads)
+
+    def _fill(self, uploads: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        total_balance = 0.0
+        total_recs    = 0
+
+        for up in uploads:
+            r = t.rowCount()
+            t.insertRow(r)
+
+            import_dt = up.get("import_date")
+            date_str = (
+                import_dt.strftime("%d %b %Y  %H:%M")
+                if isinstance(import_dt, datetime)
+                else (str(import_dt) if import_dt else "—")
+            )
+            count   = int(up.get("record_count", 0))
+            balance = float(up.get("balance_usd", 0))
+
+            min_d = up.get("min_expense_date")
+            max_d = up.get("max_expense_date")
+            if isinstance(min_d, datetime) and isinstance(max_d, datetime):
+                date_range = f"{min_d.strftime('%d %b %Y')} — {max_d.strftime('%d %b %Y')}"
+            else:
+                date_range = "—"
+
+            t.setItem(r, 0, _cell(date_str))
+            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 2, _cell(up.get("sheet_label") or "—", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else "")
+            t.setItem(r, 4, _cell(
+                _kimvi_fmt_amount(balance),
+                mono=True,
+                color=bal_color,
+                align=Qt.AlignRight | Qt.AlignVCenter,
+            ))
+            t.setItem(r, 5, _cell(date_range))
+            _kimvi_apply_row_bg(t, r, _kimvi_stripe_bg(r))
+            t.setRowHeight(r, _KIMVI_ROW_H)
+
+            total_balance += balance
+            total_recs    += count
+
+        self._totals.set_total("balance", total_balance, "Balance USD ")
+        self._totals.set_total("count",   total_recs,    "")
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        if row < len(self._uploads):
+            self.upload_clicked.emit(self._uploads[row])
+
+
+class _CongoExpUploadDetail(QWidget):
+    back_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._upload_id = ""
+        self._search    = ""
+        self._page      = 1
+        self._page_size = 50
+        self._total     = 0
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        nav = QWidget()
+        nav.setStyleSheet("background:transparent;")
+        navl = QHBoxLayout(nav)
+        navl.setContentsMargins(0, 0, 0, 0)
+        navl.setSpacing(8)
+
+        back_btn = _btn("← All Uploads", primary=False, height=30)
+        back_btn.clicked.connect(self.back_requested)
+        navl.addWidget(back_btn)
+
+        self._crumb_lbl = _lbl("", size=12, color=_T2)
+        navl.addWidget(self._crumb_lbl)
+        navl.addStretch()
+        vl.addWidget(nav)
+
+        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
+        vl.addWidget(self._info_lbl)
+
+        self._summary_frame = QFrame()
+        self._summary_frame.setStyleSheet(
+            f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
+            "border-radius:6px;padding:8px;}}"
+        )
+        sl = QHBoxLayout(self._summary_frame)
+        sl.setContentsMargins(12, 8, 12, 8)
+        sl.setSpacing(24)
+
+        self._in_lbl  = _lbl("Money In: —", size=12, weight=600, color=_GREEN)
+        self._out_lbl = _lbl("Money Out: —", size=12, color=_T2)
+        self._bal_lbl = _lbl("Balance: —", size=12, weight=600, color=_T1)
+        sl.addWidget(self._in_lbl)
+        sl.addWidget(self._out_lbl)
+        sl.addWidget(self._bal_lbl)
+        sl.addStretch()
+        vl.addWidget(self._summary_frame)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search LPO, truck, description, date…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._table = _make_kimvi_table(_CONGO_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        vl.addWidget(self._table, 1)
+
+        self._totals = _TotalsBar([("count", "Records: ")])
+        vl.addWidget(self._totals)
+
+        self._pager = _PaginationBar()
+        self._pager.page_changed.connect(self._go_page)
+        self._pager.size_changed.connect(self._on_page_size)
+        vl.addWidget(self._pager)
+
+    def load_upload(self, upload_doc: dict) -> None:
+        self._upload_id = str(upload_doc.get("_id") or "")
+        filename    = upload_doc.get("source_filename") or "Unknown file"
+        sheet_label = upload_doc.get("sheet_label") or "—"
+        count       = int(upload_doc.get("record_count", 0))
+        money_in    = float(upload_doc.get("money_in", 0))
+        money_out   = float(upload_doc.get("money_out", 0))
+        balance     = float(upload_doc.get("balance_usd", 0))
+        import_dt   = upload_doc.get("import_date")
+        date_str    = (
+            import_dt.strftime("%d %b %Y")
+            if isinstance(import_dt, datetime) else ""
+        )
+
+        self._crumb_lbl.setText(f"Uploads  ›  {filename}  ›  Sheet {sheet_label}")
+        self._info_lbl.setText(
+            f"Sheet {sheet_label}   •   {count:,} rows   •   {date_str}"
+        )
+        self._in_lbl.setText(f"Money In: USD {_kimvi_fmt_amount(money_in)}")
+        self._out_lbl.setText(f"Money Out: USD {_kimvi_fmt_amount(money_out)}")
+        bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else _T1)
+        self._bal_lbl.setText(f"Balance: USD {_kimvi_fmt_amount(balance)}")
+        self._bal_lbl.setStyleSheet(
+            f"color:{bal_color};font-size:12px;font-weight:600;"
+            "font-family:'Segoe UI',sans-serif;background:transparent;"
+        )
+
+        self._totals.set_total("count", count, "")
+
+        self._search = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._page = 1
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id:
+            return
+        skip = (self._page - 1) * self._page_size
+        recs, total = await asyncio.gather(
+            svc.get_congo_upload_records(
+                self._upload_id, self._search, self._page_size, skip
+            ),
+            svc.count_congo_upload_records(self._upload_id, self._search),
+        )
+        self._total = total
+        t = self._table
+        t.setRowCount(0)
+        for rec in recs:
+            r = t.rowCount()
+            t.insertRow(r)
+            _congo_fill_row(t, r, rec)
+        self._pager.set_total(total, self._page_size, self._page)
+        self._totals.set_total("count", total, "")
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._page   = 1
+        asyncio.ensure_future(self._load())
+
+    def _go_page(self, page: int) -> None:
+        self._page = page
+        asyncio.ensure_future(self._load())
+
+    def _on_page_size(self, size: int) -> None:
+        self._page_size = size
+        self._page      = 1
+        asyncio.ensure_future(self._load())
 
 
 class CongoExpensesWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._page = 1
-        self._page_size = 25
-        self._total = 0
-        self._search = ""
-        self._truck_filter = ""
         self._build()
         self.refresh()
 
@@ -1453,11 +1896,809 @@ class CongoExpensesWidget(QWidget):
         vl.setSpacing(12)
 
         header = _PageHeader("Congo Expenses", "mdi.map-marker")
-        new_btn = _btn("New Entry", "mdi.plus-circle-outline")
-        new_btn.clicked.connect(self._new_entry)
-        header.add_right(new_btn)
+        bulk_btn = _btn("Bulk Import All Sheets", "mdi.file-multiple-outline", primary=False)
+        bulk_btn.clicked.connect(self._open_bulk_import)
+        self._import_btn = _btn("Import Latest Sheet", "mdi.upload-outline")
+        self._import_btn.clicked.connect(self._open_import)
+        header.add_right(bulk_btn)
+        header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
+
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background:transparent;")
+
+        self._browse = _CongoExpUploadBrowse()
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._stack.addWidget(self._browse)
+
+        self._detail = _CongoExpUploadDetail()
+        self._detail.back_requested.connect(self._show_browse)
+        self._stack.addWidget(self._detail)
+
+        self._stack.setCurrentIndex(0)
+        vl.addWidget(self._stack, 1)
+
+    def refresh(self) -> None:
+        self._show_browse()
+
+    def _show_browse(self) -> None:
+        self._stack.setCurrentIndex(0)
+        self._browse.refresh()
+
+    def _show_detail(self, upload_doc: dict) -> None:
+        self._detail.load_upload(upload_doc)
+        self._stack.setCurrentIndex(1)
+
+    def _open_import(self) -> None:
+        dlg = CongoImportDialog(parent=self)
+        dlg.imported.connect(self._on_imported)
+        dlg.exec()
+
+    def _on_imported(self, n: int) -> None:
+        QMessageBox.information(self, "Import Complete", f"Imported {n:,} rows.")
+        self._show_browse()
+
+    def _open_bulk_import(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        dlg = BulkSheetImportDialog(
+            title="Bulk Import — Congo Expenses",
+            hint=(
+                "Every sheet in the workbook will be checked. "
+                "New sheets are imported; sheets already uploaded are skipped."
+            ),
+            parse_all_fn=_parse_congo_all_sheets,
+            existing_fn=svc.congo_existing_sheet_labels,
+            save_fn=svc.save_congo_import,
+            parent=self,
+        )
+        dlg.imported.connect(self._on_bulk_imported)
+        dlg.exec()
+
+    def _on_bulk_imported(self, sheets: int, rows: int) -> None:
+        QMessageBox.information(
+            self, "Bulk Import Complete",
+            f"Imported {sheets:,} sheet{'s' if sheets != 1 else ''} ({rows:,} rows).",
+        )
+        self._show_browse()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  4. AhmedKimviWidget  — Excel import (last sheet), upload browse + detail
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_KIMVI_HEADERS = ["S/NO", "DATE", "TRUCK NO", "PARTICULARS", "AMOUNT (USD)"]
+
+_KIMVI_BROWSE_HEADERS = [
+    "UPLOAD DATE", "FILE NAME", "SHEET", "RECORDS", "BALANCE (USD)", "DATE RANGE",
+]
+
+# Compact, readable palette — manual striping (not Qt alternate) avoids clashes
+# with money-in row highlights.
+_KIMVI_ROW_H    = 28
+_KIMVI_HDR_H    = 26
+_KIMVI_ROW_EVEN = "#FFFFFF"
+_KIMVI_ROW_ODD  = "#F1F5F9"   # slate-100
+_KIMVI_IN_BG    = "#E6F4EC"   # soft mint — money-in rows
+_KIMVI_IN_FG    = "#047857"   # emerald-700 — readable on mint
+
+
+def _kimvi_table_style() -> str:
+    return (
+        f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
+        "border:none;font-size:11px;font-family:'Segoe UI',sans-serif;}}"
+        f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
+        f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
+        f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
+        "font-size:10px;font-weight:600;font-family:'Segoe UI',sans-serif;"
+        f"border:none;border-bottom:1px solid {_BORDER};"
+        f"padding:0 8px;height:{_KIMVI_HDR_H}px;}}"
+        "QScrollBar:vertical{width:8px;background:transparent;}"
+        f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
+    )
+
+
+def _make_kimvi_table(headers: List[str]) -> QTableWidget:
+    t = QTableWidget(0, len(headers))
+    t.setHorizontalHeaderLabels(headers)
+    t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    t.setSelectionBehavior(QAbstractItemView.SelectRows)
+    t.setAlternatingRowColors(False)
+    t.verticalHeader().setVisible(False)
+    t.verticalHeader().setDefaultSectionSize(_KIMVI_ROW_H)
+    t.horizontalHeader().setStretchLastSection(True)
+    t.setStyleSheet(_kimvi_table_style())
+    return t
+
+
+def _kimvi_stripe_bg(row_idx: int) -> str:
+    return _KIMVI_ROW_ODD if row_idx % 2 else _KIMVI_ROW_EVEN
+
+
+def _kimvi_apply_row_bg(t: QTableWidget, row: int, bg: str) -> None:
+    for col in range(t.columnCount()):
+        item = t.item(row, col)
+        if item:
+            item.setBackground(QColor(bg))
+
+
+def _parse_kimvi_sheet(ws) -> List[dict]:
+    """Parse one Ahmed Kimvi worksheet into row dicts."""
+    rows = list(ws.iter_rows(values_only=True))
+    if len(rows) < 2:
+        return []
+
+    records: List[dict] = []
+    for row_idx, row in enumerate(rows[1:], start=2):
+        if not any(c is not None for c in row):
+            continue
+
+        s_no        = row[0] if len(row) > 0 else None
+        dt          = row[1] if len(row) > 1 else None
+        truck       = row[2] if len(row) > 2 else None
+        particulars = row[3] if len(row) > 3 else None
+        amount      = row[4] if len(row) > 4 else None
+
+        particulars_str = str(particulars).strip() if particulars is not None else ""
+        if particulars_str.upper() == "TOTAL":
+            continue
+
+        try:
+            amt = float(amount) if amount is not None else 0.0
+        except (TypeError, ValueError):
+            amt = 0.0
+
+        if isinstance(dt, datetime):
+            date_str     = dt.strftime("%d %b %Y")
+            expense_date = dt
+        else:
+            date_str     = str(dt).strip() if dt is not None else ""
+            expense_date = None
+
+        truck_str = str(truck).strip() if truck is not None else ""
+
+        serial_no: Optional[int] = None
+        if s_no is not None and str(s_no).strip():
+            try:
+                serial_no = int(float(s_no))
+            except (TypeError, ValueError):
+                serial_no = None
+
+        records.append({
+            "serial_no":    serial_no,
+            "date_str":     date_str,
+            "expense_date": expense_date,
+            "truck_no":     truck_str,
+            "description":  particulars_str,
+            "amount_usd":   amt,
+            "is_advance":   serial_no is None,
+            "row_index":    row_idx,
+        })
+
+    return records
+
+
+def _parse_kimvi_last_sheet(path: str) -> Tuple[str, List[dict]]:
+    """Read only the last worksheet from an Ahmed Kimvi expenses workbook."""
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to import Ahmed Kimvi Excel files.")
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    if not wb.sheetnames:
+        return "", []
+
+    sheet_name = wb.sheetnames[-1]
+    return sheet_name, _parse_kimvi_sheet(wb[sheet_name])
+
+
+def _parse_kimvi_all_sheets(path: str) -> List[dict]:
+    """Parse every worksheet in an Ahmed Kimvi expenses workbook."""
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to import Ahmed Kimvi Excel files.")
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    batches: List[dict] = []
+    for sheet_name in wb.sheetnames:
+        records = _parse_kimvi_sheet(wb[sheet_name])
+        if records:
+            batches.append({"sheet_label": sheet_name, "records": records})
+    return batches
+
+
+_BULK_SHEET_HEADERS = ["SHEET", "RECORDS", "BALANCE (USD)", "STATUS"]
+
+
+class BulkSheetImportDialog(QDialog):
+    """Import every new worksheet from a multi-sheet expenses workbook."""
+
+    imported = Signal(int, int)   # (sheets_imported, total_rows)
+
+    def __init__(
+        self,
+        title: str,
+        hint: str,
+        parse_all_fn,
+        existing_fn,
+        save_fn,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._title          = title
+        self._parse_all_fn   = parse_all_fn
+        self._existing_fn    = existing_fn
+        self._save_fn        = save_fn
+        self._source_filename = ""
+        self._pending: List[dict] = []
+        self._skipped_count = 0
+
+        self.setWindowTitle(title)
+        self.setMinimumWidth(720)
+        self.setMinimumHeight(480)
+        self.setStyleSheet(f"background:{_WHITE};")
+        self._build()
+        self._hint_lbl.setText(hint)
+
+    def _build(self) -> None:
+        vl = QVBoxLayout(self)
+        vl.setSpacing(12)
+        vl.setContentsMargins(20, 20, 20, 20)
+
+        self._hint_lbl = _lbl("", size=12, color=_T2)
+        vl.addWidget(self._hint_lbl)
+
+        self._drop = _DropZone()
+        self._drop.file_dropped.connect(self._on_file)
+        vl.addWidget(self._drop)
+
+        browse_row = QWidget()
+        browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(browse_row)
+        brl.setContentsMargins(0, 0, 0, 0)
+        browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
+        browse_btn.clicked.connect(self._browse)
+        brl.addStretch()
+        brl.addWidget(browse_btn)
+        vl.addWidget(browse_row)
+
+        self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
+        vl.addWidget(self._stats_lbl)
+        vl.addWidget(_hsep())
+
+        preview_title = _lbl("Sheets in workbook", size=12, weight=600)
+        vl.addWidget(preview_title)
+
+        self._preview_tbl = _make_kimvi_table(_BULK_SHEET_HEADERS)
+        self._preview_tbl.setMinimumHeight(260)
+        vl.addWidget(self._preview_tbl, 1)
+        vl.addWidget(_hsep())
+
+        btn_row = QWidget()
+        btn_row.setStyleSheet("background:transparent;")
+        bbl = QHBoxLayout(btn_row)
+        bbl.setContentsMargins(0, 0, 0, 0)
+        bbl.addStretch()
+
+        cancel_btn = _btn("Cancel", primary=False)
+        cancel_btn.clicked.connect(self.reject)
+        bbl.addWidget(cancel_btn)
+
+        self._import_btn = _btn("Import All New Sheets", "mdi.check-all")
+        self._import_btn.setEnabled(False)
+        self._import_btn.clicked.connect(self._do_import)
+        bbl.addWidget(self._import_btn)
+        vl.addWidget(btn_row)
+
+    def _browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, self._title, "", "Excel (*.xlsx *.xls)"
+        )
+        if path:
+            self._drop.set_path(path)
+            self._on_file(path)
+
+    def _on_file(self, path: str) -> None:
+        self._stats_lbl.setText("Reading file…")
+        self._source_filename = Path(path).name
+        try:
+            batches = self._parse_all_fn(path)
+        except Exception as exc:
+            self._stats_lbl.setText(f"Error reading file: {exc}")
+            self._import_btn.setEnabled(False)
+            self._pending = []
+            self._preview_tbl.setRowCount(0)
+            return
+
+        asyncio.ensure_future(self._check_batches(batches))
+
+    async def _check_batches(self, batches: List[dict]) -> None:
+        labels = [b["sheet_label"] for b in batches]
+        try:
+            existing: set = await self._existing_fn(labels)
+        except Exception:
+            existing = set()
+
+        self._pending = []
+        self._skipped_count = 0
+        preview_rows: List[dict] = []
+
+        for batch in batches:
+            label   = batch["sheet_label"]
+            records = batch["records"]
+            balance = sum(r["amount_usd"] for r in records)
+            if label in existing:
+                status = "Already uploaded"
+                self._skipped_count += 1
+            else:
+                status = "New"
+                self._pending.append({
+                    "sheet_label": label,
+                    "records":     records,
+                    "upload_id":   str(uuid.uuid4()),
+                })
+            preview_rows.append({
+                "sheet_label": label,
+                "count":       len(records),
+                "balance":     balance,
+                "status":      status,
+            })
+
+        new_sheets = len(self._pending)
+        new_rows   = sum(len(b["records"]) for b in self._pending)
+
+        if not batches:
+            self._stats_lbl.setText("Workbook has no sheets with data to import.")
+            self._import_btn.setEnabled(False)
+            self._import_btn.setText("Import All New Sheets")
+        elif new_sheets == 0:
+            self._stats_lbl.setText(
+                f"All {len(batches):,} sheets were already uploaded — nothing new to import."
+            )
+            self._import_btn.setEnabled(False)
+            self._import_btn.setText("Nothing to Import")
+        else:
+            self._stats_lbl.setText(
+                f"Sheets in file: {len(batches):,}     "
+                f"New: {new_sheets:,} ({new_rows:,} rows)     "
+                f"Skipped: {self._skipped_count:,}"
+            )
+            self._import_btn.setEnabled(True)
+            self._import_btn.setText(
+                f"Import {new_sheets:,} Sheet{'s' if new_sheets != 1 else ''} "
+                f"({new_rows:,} rows)"
+            )
+
+        self._fill_preview(preview_rows)
+
+    def _fill_preview(self, rows: List[dict]) -> None:
+        t = self._preview_tbl
+        t.setRowCount(0)
+        for i, row in enumerate(rows):
+            r = t.rowCount()
+            t.insertRow(r)
+            status = row["status"]
+            is_skip = status == "Already uploaded"
+            status_color = _TM if is_skip else _GREEN
+
+            t.setItem(r, 0, _cell(row["sheet_label"]))
+            t.setItem(r, 1, _cell(
+                f"{row['count']:,}", align=Qt.AlignCenter | Qt.AlignVCenter,
+            ))
+            balance = row["balance"]
+            bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else "")
+            t.setItem(r, 2, _cell(
+                _kimvi_fmt_amount(balance),
+                mono=True,
+                color=bal_color,
+                align=Qt.AlignRight | Qt.AlignVCenter,
+            ))
+            t.setItem(r, 3, _cell(status, color=status_color))
+            _kimvi_apply_row_bg(t, r, _kimvi_stripe_bg(i))
+            t.setRowHeight(r, _KIMVI_ROW_H)
+
+    def _do_import(self) -> None:
+        if not self._pending:
+            return
+        self._import_btn.setEnabled(False)
+        self._import_btn.setText("Importing…")
+        asyncio.ensure_future(self._async_import())
+
+    async def _async_import(self) -> None:
+        sheets_imported = 0
+        total_rows      = 0
+
+        try:
+            for batch in self._pending:
+                docs = []
+                for rec in batch["records"]:
+                    doc = dict(rec)
+                    doc["sheet_label"]     = batch["sheet_label"]
+                    doc["upload_id"]       = batch["upload_id"]
+                    doc["source_filename"] = self._source_filename
+                    docs.append(doc)
+                saved = await self._save_fn(docs)
+                if saved:
+                    sheets_imported += 1
+                    total_rows      += saved
+
+            self.imported.emit(sheets_imported, total_rows)
+            self.accept()
+        except Exception as exc:
+            QMessageBox.critical(self, "Bulk Import Error", str(exc))
+            new_rows = sum(len(b["records"]) for b in self._pending)
+            self._import_btn.setEnabled(True)
+            self._import_btn.setText(
+                f"Import {len(self._pending):,} Sheets ({new_rows:,} rows)"
+            )
+
+
+class KimviImportDialog(QDialog):
+    """Import the last worksheet from an Ahmed Kimvi expenses workbook."""
+
+    imported = Signal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._upload_id       = str(uuid.uuid4())
+        self._source_filename = ""
+        self._sheet_label     = ""
+        self._records: List[dict] = []
+        self._already_exists  = False
+
+        self.setWindowTitle("Import — Ahmed Kimvi (Klesa)")
+        self.setMinimumWidth(680)
+        self.setStyleSheet(f"background:{_WHITE};")
+        self._build()
+
+    def _build(self) -> None:
+        vl = QVBoxLayout(self)
+        vl.setSpacing(12)
+        vl.setContentsMargins(20, 20, 20, 20)
+
+        hint = _lbl(
+            "Only the last sheet in the workbook will be imported "
+            "(one visit period per upload).",
+            size=12, color=_T2,
+        )
+        vl.addWidget(hint)
+
+        self._drop = _DropZone()
+        self._drop.file_dropped.connect(self._on_file)
+        vl.addWidget(self._drop)
+
+        browse_row = QWidget()
+        browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(browse_row)
+        brl.setContentsMargins(0, 0, 0, 0)
+        browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
+        browse_btn.clicked.connect(self._browse)
+        brl.addStretch()
+        brl.addWidget(browse_btn)
+        vl.addWidget(browse_row)
+
+        self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
+        vl.addWidget(self._stats_lbl)
+
+        vl.addWidget(_hsep())
+
+        preview_title = _lbl("Preview (first 10 rows)", size=12, weight=600)
+        vl.addWidget(preview_title)
+
+        self._preview_tbl = _make_kimvi_table(_KIMVI_HEADERS)
+        self._preview_tbl.setMinimumHeight(200)
+        vl.addWidget(self._preview_tbl)
+
+        vl.addWidget(_hsep())
+
+        btn_row = QWidget()
+        btn_row.setStyleSheet("background:transparent;")
+        bbl = QHBoxLayout(btn_row)
+        bbl.setContentsMargins(0, 0, 0, 0)
+        bbl.addStretch()
+
+        cancel_btn = _btn("Cancel", primary=False)
+        cancel_btn.clicked.connect(self.reject)
+        bbl.addWidget(cancel_btn)
+
+        self._import_btn = _btn("Import Sheet", "mdi.check-circle-outline")
+        self._import_btn.setEnabled(False)
+        self._import_btn.clicked.connect(self._do_import)
+        bbl.addWidget(self._import_btn)
+
+        vl.addWidget(btn_row)
+
+    def _browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Ahmed Kimvi Workbook", "", "Excel (*.xlsx *.xls)"
+        )
+        if path:
+            self._drop.set_path(path)
+            self._on_file(path)
+
+    def _on_file(self, path: str) -> None:
+        self._stats_lbl.setText("Reading file…")
+        self._source_filename = Path(path).name
+        try:
+            sheet_label, records = _parse_kimvi_last_sheet(path)
+        except Exception as exc:
+            self._stats_lbl.setText(f"Error reading file: {exc}")
+            self._import_btn.setEnabled(False)
+            return
+
+        self._sheet_label = sheet_label
+        self._records = records
+        asyncio.ensure_future(self._check_sheet(sheet_label, records))
+
+    async def _check_sheet(self, sheet_label: str, records: List[dict]) -> None:
+        from tahmeed.services import accountant_service as svc
+
+        try:
+            exists = await svc.kimvi_sheet_exists(sheet_label)
+        except Exception:
+            exists = False
+
+        self._already_exists = exists
+        money_in  = sum(r["amount_usd"] for r in records if r["amount_usd"] < 0)
+        money_out = sum(r["amount_usd"] for r in records if r["amount_usd"] > 0)
+        balance   = money_in + money_out
+
+        if exists:
+            self._stats_lbl.setText(
+                f"Sheet \"{sheet_label}\" was already uploaded — import blocked."
+            )
+            self._import_btn.setEnabled(False)
+            self._import_btn.setText("Already Uploaded")
+        elif not records:
+            self._stats_lbl.setText(
+                f"Last sheet \"{sheet_label}\" has no data rows to import."
+            )
+            self._import_btn.setEnabled(False)
+            self._import_btn.setText("Import Sheet")
+        else:
+            self._stats_lbl.setText(
+                f"Last sheet: {sheet_label}     "
+                f"Rows: {len(records):,}     "
+                f"In: USD {money_in:,.0f}     "
+                f"Out: USD {money_out:,.0f}     "
+                f"Balance: USD {balance:,.0f}"
+            )
+            self._import_btn.setEnabled(True)
+            self._import_btn.setText(f"Import {len(records):,} Rows")
+
+        self._fill_preview(records[:10])
+
+    def _fill_preview(self, rows: List[dict]) -> None:
+        t = self._preview_tbl
+        t.setRowCount(0)
+        for rec in rows:
+            r = t.rowCount()
+            t.insertRow(r)
+            _kimvi_fill_row(t, r, rec)
+
+    def _do_import(self) -> None:
+        if self._already_exists or not self._records:
+            return
+        self._import_btn.setEnabled(False)
+        self._import_btn.setText("Importing…")
+        asyncio.ensure_future(self._async_import())
+
+    async def _async_import(self) -> None:
+        from tahmeed.services import accountant_service as svc
+
+        docs = []
+        for rec in self._records:
+            doc = dict(rec)
+            doc["sheet_label"]     = self._sheet_label
+            doc["upload_id"]       = self._upload_id
+            doc["source_filename"] = self._source_filename
+            docs.append(doc)
+
+        try:
+            saved = await svc.save_kimvi_import(docs)
+            self.imported.emit(saved)
+            self.accept()
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Error", str(exc))
+            self._import_btn.setEnabled(True)
+            self._import_btn.setText(f"Import {len(self._records):,} Rows")
+
+
+def _kimvi_fmt_amount(amt: float) -> str:
+    """Format signed USD — negative = money in, positive = money out."""
+    if amt is None:
+        return "—"
+    try:
+        v = float(amt)
+    except (TypeError, ValueError):
+        return str(amt)
+    if v < 0:
+        return f"({abs(v):,.0f})"
+    return f"{v:,.0f}"
+
+
+def _kimvi_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
+    """Populate one Ahmed Kimvi row — green tint for money-in, slate stripe otherwise."""
+    serial = rec.get("serial_no")
+    amt    = rec.get("amount_usd", 0)
+    try:
+        amt_f = float(amt) if amt is not None else 0.0
+    except (TypeError, ValueError):
+        amt_f = 0.0
+
+    is_in   = amt_f < 0
+    row_bg  = _KIMVI_IN_BG if is_in else _kimvi_stripe_bg(r)
+    amt_clr = _KIMVI_IN_FG if is_in else _T1
+
+    t.setItem(r, 0, _cell("—" if serial is None else str(serial)))
+    t.setItem(r, 1, _cell(rec.get("date_str", "")))
+    t.setItem(r, 2, _cell(rec.get("truck_no", "")))
+    t.setItem(r, 3, _cell(rec.get("description", "")))
+    t.setItem(r, 4, _cell(
+        _kimvi_fmt_amount(amt_f),
+        mono=True,
+        color=amt_clr,
+        align=Qt.AlignRight | Qt.AlignVCenter,
+    ))
+    _kimvi_apply_row_bg(t, r, row_bg)
+    t.setRowHeight(r, _KIMVI_ROW_H)
+
+
+class _KimviUploadBrowse(QWidget):
+    """Table of every Ahmed Kimvi import batch."""
+
+    upload_clicked = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._uploads: List[dict] = []
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        self._totals = _TotalsBar([
+            ("balance", "Balance USD "),
+            ("count",   "Total records: "),
+        ])
+        vl.addWidget(self._totals)
+
+        self._table = _make_kimvi_table(_KIMVI_BROWSE_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setColumnWidth(0, 160)
+        self._table.setColumnWidth(1, 220)
+        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(3, 80)
+        self._table.setColumnWidth(4, 120)
+        self._table.setCursor(Qt.PointingHandCursor)
+        self._table.cellClicked.connect(self._on_row_clicked)
+        vl.addWidget(self._table, 1)
+
+        hint = _lbl(
+            "Click any row to view the full records for that upload.",
+            size=11, color=_TM,
+        )
+        hint.setAlignment(Qt.AlignCenter)
+        vl.addWidget(hint)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        uploads = await svc.get_kimvi_uploads()
+        self._uploads = uploads
+        self._fill(uploads)
+
+    def _fill(self, uploads: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        total_balance = 0.0
+        total_recs    = 0
+
+        for up in uploads:
+            r = t.rowCount()
+            t.insertRow(r)
+
+            import_dt = up.get("import_date")
+            date_str = (
+                import_dt.strftime("%d %b %Y  %H:%M")
+                if isinstance(import_dt, datetime)
+                else (str(import_dt) if import_dt else "—")
+            )
+            count   = int(up.get("record_count", 0))
+            balance = float(up.get("balance_usd", 0))
+
+            min_d = up.get("min_expense_date")
+            max_d = up.get("max_expense_date")
+            if isinstance(min_d, datetime) and isinstance(max_d, datetime):
+                date_range = f"{min_d.strftime('%d %b %Y')} — {max_d.strftime('%d %b %Y')}"
+            else:
+                date_range = "—"
+
+            t.setItem(r, 0, _cell(date_str))
+            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 2, _cell(up.get("sheet_label") or "—", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else "")
+            t.setItem(r, 4, _cell(
+                _kimvi_fmt_amount(balance),
+                mono=True,
+                color=bal_color,
+                align=Qt.AlignRight | Qt.AlignVCenter,
+            ))
+            t.setItem(r, 5, _cell(date_range))
+            _kimvi_apply_row_bg(t, r, _kimvi_stripe_bg(r))
+            t.setRowHeight(r, _KIMVI_ROW_H)
+
+            total_balance += balance
+            total_recs    += count
+
+        self._totals.set_total("balance", total_balance, "Balance USD ")
+        self._totals.set_total("count",   total_recs,    "")
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        if row < len(self._uploads):
+            self.upload_clicked.emit(self._uploads[row])
+
+
+class _KimviUploadDetail(QWidget):
+    """Full record table for a single Ahmed Kimvi import batch."""
+
+    back_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._upload_id = ""
+        self._search    = ""
+        self._page      = 1
+        self._page_size = 50
+        self._total     = 0
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        nav = QWidget()
+        nav.setStyleSheet("background:transparent;")
+        navl = QHBoxLayout(nav)
+        navl.setContentsMargins(0, 0, 0, 0)
+        navl.setSpacing(8)
+
+        back_btn = _btn("← All Uploads", primary=False, height=30)
+        back_btn.clicked.connect(self.back_requested)
+        navl.addWidget(back_btn)
+
+        self._crumb_lbl = _lbl("", size=12, color=_T2)
+        navl.addWidget(self._crumb_lbl)
+        navl.addStretch()
+        vl.addWidget(nav)
+
+        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
+        vl.addWidget(self._info_lbl)
+
+        self._summary_frame = QFrame()
+        self._summary_frame.setStyleSheet(
+            f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
+            "border-radius:6px;padding:8px;}}"
+        )
+        sl = QHBoxLayout(self._summary_frame)
+        sl.setContentsMargins(12, 8, 12, 8)
+        sl.setSpacing(24)
+
+        self._in_lbl  = _lbl("Money In: —", size=12, weight=600, color=_GREEN)
+        self._out_lbl = _lbl("Money Out: —", size=12, color=_T2)
+        self._bal_lbl = _lbl("Balance: —", size=12, weight=600, color=_T1)
+        sl.addWidget(self._in_lbl)
+        sl.addWidget(self._out_lbl)
+        sl.addWidget(self._bal_lbl)
+        sl.addStretch()
+        vl.addWidget(self._summary_frame)
 
         tb = QWidget()
         tb.setStyleSheet("background:transparent;")
@@ -1466,30 +2707,20 @@ class CongoExpensesWidget(QWidget):
         tbl.setSpacing(8)
 
         self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search description, truck…")
-        self._search_edit.setFixedWidth(240)
+        self._search_edit.setPlaceholderText("Search truck, particulars, date…")
+        self._search_edit.setFixedWidth(300)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
-
-        self._truck_cb = QComboBox()
-        self._truck_cb.addItem("All Trucks", "")
-        self._truck_cb.setFixedWidth(140)
-        self._truck_cb.setStyleSheet(_input_ss())
-        self._truck_cb.currentIndexChanged.connect(self._on_filter)
-        tbl.addWidget(self._truck_cb)
         tbl.addStretch()
-
-        export_btn = _btn("Export", "mdi.download-outline", primary=False)
-        tbl.addWidget(export_btn)
         vl.addWidget(tb)
 
-        self._table = _make_table(_CONGO_EXP_HEADERS)
+        self._table = _make_kimvi_table(_KIMVI_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         vl.addWidget(self._table, 1)
 
-        self._totals = _TotalsBar([("usd", "USD ")])
+        self._totals = _TotalsBar([("count", "Records: ")])
         vl.addWidget(self._totals)
 
         self._pager = _PaginationBar()
@@ -1497,58 +2728,69 @@ class CongoExpensesWidget(QWidget):
         self._pager.size_changed.connect(self._on_page_size)
         vl.addWidget(self._pager)
 
-    def refresh(self) -> None:
+    def load_upload(self, upload_doc: dict) -> None:
+        self._upload_id = str(upload_doc.get("_id") or "")
+        filename    = upload_doc.get("source_filename") or "Unknown file"
+        sheet_label = upload_doc.get("sheet_label") or "—"
+        count       = int(upload_doc.get("record_count", 0))
+        money_in    = float(upload_doc.get("money_in", 0))
+        money_out   = float(upload_doc.get("money_out", 0))
+        balance     = float(upload_doc.get("balance_usd", 0))
+        import_dt   = upload_doc.get("import_date")
+        date_str    = (
+            import_dt.strftime("%d %b %Y")
+            if isinstance(import_dt, datetime) else ""
+        )
+
+        self._crumb_lbl.setText(f"Uploads  ›  {filename}  ›  Sheet {sheet_label}")
+        self._info_lbl.setText(
+            f"Sheet {sheet_label}   •   {count:,} rows   •   {date_str}"
+        )
+        self._in_lbl.setText(f"Money In: USD {_kimvi_fmt_amount(money_in)}")
+        self._out_lbl.setText(f"Money Out: USD {_kimvi_fmt_amount(money_out)}")
+        bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else _T1)
+        self._bal_lbl.setText(f"Balance: USD {_kimvi_fmt_amount(balance)}")
+        self._bal_lbl.setStyleSheet(
+            f"color:{bal_color};font-size:12px;font-weight:600;"
+            "font-family:'Segoe UI',sans-serif;background:transparent;"
+        )
+
+        self._totals.set_total("count", count, "")
+
+        self._search = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._page = 1
         asyncio.ensure_future(self._load())
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
+        if not self._upload_id:
+            return
         skip = (self._page - 1) * self._page_size
         recs, total = await asyncio.gather(
-            svc.get_separate_expenses_list("congo_expenses", self._search,
-                                           self._truck_filter, self._page_size, skip),
-            svc.count_separate_expenses("congo_expenses", self._search, self._truck_filter),
+            svc.get_kimvi_upload_records(
+                self._upload_id, self._search, self._page_size, skip
+            ),
+            svc.count_kimvi_upload_records(self._upload_id, self._search),
         )
         self._total = total
         self._fill_table(recs)
         self._pager.set_total(total, self._page_size, self._page)
-        totals = await svc.get_separate_expense_totals("congo_expenses")
-        self._totals.set_total("usd", totals.get("amount_usd", 0.0), "USD ")
+        self._totals.set_total("count", total, "")
 
     def _fill_table(self, recs: List[dict]) -> None:
         t = self._table
         t.setRowCount(0)
-        for i, rec in enumerate(recs, 1):
+        for rec in recs:
             r = t.rowCount()
             t.insertRow(r)
-            t.setItem(r, 0, _cell(str(i)))
-            t.setItem(r, 1, _cell(rec.get("date_str", "")))
-            t.setItem(r, 2, _cell(rec.get("lpo_no", "")))
-            t.setItem(r, 3, _cell(rec.get("truck_no", "")))
-            t.setItem(r, 4, _cell(rec.get("description", "")))
-            t.setItem(r, 5, _cell(_fmt_num(rec.get("amount_usd"), "$ "), mono=True))
-            t.setItem(r, 6, _cell(rec.get("approved_by", "")))
-
-    def _new_entry(self) -> None:
-        dlg = _CongoEntryDialog(parent=self)
-        dlg.saved.connect(self._on_saved)
-        dlg.exec()
-
-    def _on_saved(self, data: dict) -> None:
-        asyncio.ensure_future(self._save_entry(data))
-
-    async def _save_entry(self, data: dict) -> None:
-        from tahmeed.services import accountant_service as svc
-        await svc.save_separate_expense("congo_expenses", data)
-        self.refresh()
+            _kimvi_fill_row(t, r, rec)
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page = 1
-        asyncio.ensure_future(self._load())
-
-    def _on_filter(self) -> None:
-        self._truck_filter = self._truck_cb.currentData() or ""
-        self._page = 1
+        self._page   = 1
         asyncio.ensure_future(self._load())
 
     def _go_page(self, page: int) -> None:
@@ -1557,158 +2799,20 @@ class CongoExpensesWidget(QWidget):
 
     def _on_page_size(self, size: int) -> None:
         self._page_size = size
-        self._page = 1
+        self._page      = 1
         asyncio.ensure_future(self._load())
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  4. AhmedKimviWidget  — visit-sheet pagination
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_KIMVI_HEADERS = ["S/NO", "DATE", "TRUCK NO", "PARTICULARS", "AMOUNT (USD)"]
-
-
-class _NewKimviSheetDialog(QDialog):
-    created = Signal(str, str, float)
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("New Visit Sheet")
-        self.setMinimumWidth(360)
-        self.setStyleSheet(f"background:{_WHITE};")
-        vl = QVBoxLayout(self)
-        vl.setSpacing(12)
-        vl.setContentsMargins(20, 20, 20, 20)
-
-        form = QFormLayout()
-        form.setSpacing(10)
-
-        self._label_edit = QLineEdit()
-        self._label_edit.setPlaceholderText("e.g. 02.06 (visit date)")
-        self._label_edit.setStyleSheet(_input_ss())
-
-        self._date_edit = QLineEdit()
-        self._date_edit.setPlaceholderText("02 Jun 2026")
-        self._date_edit.setStyleSheet(_input_ss())
-
-        self._advance_edit = QLineEdit()
-        self._advance_edit.setPlaceholderText("1500.00")
-        self._advance_edit.setStyleSheet(_input_ss())
-
-        form.addRow("Sheet Label *", self._label_edit)
-        form.addRow("Visit Date *", self._date_edit)
-        form.addRow("Cash Advance (USD) *", self._advance_edit)
-        vl.addLayout(form)
-        vl.addWidget(_hsep())
-
-        btn_row = QWidget()
-        btn_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(btn_row)
-        brl.setContentsMargins(0, 0, 0, 0)
-        brl.addStretch()
-        cancel = _btn("Cancel", primary=False)
-        cancel.clicked.connect(self.reject)
-        brl.addWidget(cancel)
-        create = _btn("Create Sheet", "mdi.plus-circle-outline")
-        create.clicked.connect(self._create)
-        brl.addWidget(create)
-        vl.addWidget(btn_row)
-
-    def _create(self) -> None:
-        label = self._label_edit.text().strip()
-        date_str = self._date_edit.text().strip()
-        try:
-            advance = float(self._advance_edit.text().strip())
-        except ValueError:
-            QMessageBox.warning(self, "Validation", "Cash Advance must be a number.")
-            return
-        if not label or not date_str:
-            QMessageBox.warning(self, "Validation", "Label and Date are required.")
-            return
-        self.created.emit(label, date_str, advance)
-        self.accept()
-
-
-class _KimviRowDialog(QDialog):
-    saved = Signal(dict)
-
-    def __init__(self, sheet_label: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._sheet_label = sheet_label
-        self.setWindowTitle("Add Item")
-        self.setMinimumWidth(360)
-        self.setStyleSheet(f"background:{_WHITE};")
-        vl = QVBoxLayout(self)
-        vl.setSpacing(12)
-        vl.setContentsMargins(20, 20, 20, 20)
-
-        form = QFormLayout()
-        form.setSpacing(10)
-
-        self._date_edit  = QLineEdit()
-        self._date_edit.setPlaceholderText("02 Jun 2026")
-        self._date_edit.setStyleSheet(_input_ss())
-
-        self._truck_edit = QLineEdit()
-        self._truck_edit.setPlaceholderText("T587 DTB")
-        self._truck_edit.setStyleSheet(_input_ss())
-
-        self._part_edit  = QLineEdit()
-        self._part_edit.setPlaceholderText("Entry Card Renewal")
-        self._part_edit.setStyleSheet(_input_ss())
-
-        self._amt_edit   = QLineEdit()
-        self._amt_edit.setPlaceholderText("20.00")
-        self._amt_edit.setStyleSheet(_input_ss())
-        self._amt_edit.setFixedWidth(120)
-
-        form.addRow("Date", self._date_edit)
-        form.addRow("Truck No.", self._truck_edit)
-        form.addRow("Particulars *", self._part_edit)
-        form.addRow("Amount (USD) *", self._amt_edit)
-        vl.addLayout(form)
-        vl.addWidget(_hsep())
-
-        btn_row = QWidget()
-        btn_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(btn_row)
-        brl.setContentsMargins(0, 0, 0, 0)
-        brl.addStretch()
-        cancel = _btn("Cancel", primary=False)
-        cancel.clicked.connect(self.reject)
-        brl.addWidget(cancel)
-        save = _btn("Add Item", "mdi.plus")
-        save.clicked.connect(self._save)
-        brl.addWidget(save)
-        vl.addWidget(btn_row)
-
-    def _save(self) -> None:
-        part = self._part_edit.text().strip()
-        try:
-            amt = float(self._amt_edit.text().strip())
-        except ValueError:
-            QMessageBox.warning(self, "Validation", "Amount must be a number.")
-            return
-        if not part:
-            QMessageBox.warning(self, "Validation", "Particulars are required.")
-            return
-        self.saved.emit({
-            "sheet_label": self._sheet_label,
-            "date_str":    self._date_edit.text().strip(),
-            "truck_no":    self._truck_edit.text().strip(),
-            "description": part,
-            "amount_usd":  amt,
-            "is_advance":  False,
-        })
-        self.accept()
-
-
 class AhmedKimviWidget(QWidget):
+    """
+    Ahmed Kimvi (Klesa) main page.
+
+    Browse tab (default): one row per Excel import.  Clicking a row drills into
+    the full per-row detail view for that upload.
+    """
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._sheets: List[str] = []
-        self._current_idx: int = 0
-        self._entries: List[dict] = []
         self._build()
         self.refresh()
 
@@ -1719,181 +2823,71 @@ class AhmedKimviWidget(QWidget):
         vl.setSpacing(12)
 
         header = _PageHeader("Ahmed Kimvi (Klesa)", "mdi.account-cash")
-        new_sheet_btn = _btn("New Sheet", "mdi.plus-circle-outline", primary=False)
-        new_sheet_btn.clicked.connect(self._new_sheet)
-        add_item_btn = _btn("Add Item", "mdi.plus")
-        add_item_btn.clicked.connect(self._add_item)
-        header.add_right(new_sheet_btn)
-        header.add_right(add_item_btn)
+        bulk_btn = _btn("Bulk Import All Sheets", "mdi.file-multiple-outline", primary=False)
+        bulk_btn.clicked.connect(self._open_bulk_import)
+        self._import_btn = _btn("Import Latest Sheet", "mdi.upload-outline")
+        self._import_btn.clicked.connect(self._open_import)
+        header.add_right(bulk_btn)
+        header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        # Sheet navigation bar
-        nav = QWidget()
-        nav.setStyleSheet("background:transparent;")
-        navl = QHBoxLayout(nav)
-        navl.setContentsMargins(0, 0, 0, 0)
-        navl.setSpacing(8)
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background:transparent;")
 
-        self._prev_sheet = _btn("◀", primary=False, height=30)
-        self._prev_sheet.setFixedWidth(36)
-        self._prev_sheet.clicked.connect(self._prev)
-        navl.addWidget(self._prev_sheet)
+        self._browse = _KimviUploadBrowse()
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._stack.addWidget(self._browse)
 
-        self._sheet_lbl = _lbl("Sheet —", size=13, weight=600)
-        navl.addWidget(self._sheet_lbl)
+        self._detail = _KimviUploadDetail()
+        self._detail.back_requested.connect(self._show_browse)
+        self._stack.addWidget(self._detail)
 
-        self._next_sheet = _btn("▶", primary=False, height=30)
-        self._next_sheet.setFixedWidth(36)
-        self._next_sheet.clicked.connect(self._next)
-        navl.addWidget(self._next_sheet)
-        navl.addStretch()
-
-        export_btn = _btn("Export All", "mdi.download-outline", primary=False)
-        navl.addWidget(export_btn)
-        vl.addWidget(nav)
-
-        # Summary card
-        self._summary = QFrame()
-        self._summary.setStyleSheet(
-            f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
-            "border-radius:6px;padding:8px;}}"
-        )
-        sl = QHBoxLayout(self._summary)
-        sl.setContentsMargins(12, 8, 12, 8)
-        sl.setSpacing(24)
-
-        self._adv_lbl   = _lbl("Cash Advance: —", size=12, weight=600)
-        self._bal_lbl   = _lbl("Running Balance: —", size=12, weight=600, color=_GREEN)
-        self._spent_lbl = _lbl("Spent: —", size=12, color=_T2)
-        sl.addWidget(self._adv_lbl)
-        sl.addWidget(self._spent_lbl)
-        sl.addWidget(self._bal_lbl)
-        sl.addStretch()
-        vl.addWidget(self._summary)
-
-        # Table
-        self._table = _make_table(_KIMVI_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
-        vl.addWidget(self._table, 1)
+        self._stack.setCurrentIndex(0)
+        vl.addWidget(self._stack, 1)
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._load_sheets())
+        self._show_browse()
 
-    async def _load_sheets(self) -> None:
+    def _show_browse(self) -> None:
+        self._stack.setCurrentIndex(0)
+        self._browse.refresh()
+
+    def _show_detail(self, upload_doc: dict) -> None:
+        self._detail.load_upload(upload_doc)
+        self._stack.setCurrentIndex(1)
+
+    def _open_import(self) -> None:
+        dlg = KimviImportDialog(parent=self)
+        dlg.imported.connect(self._on_imported)
+        dlg.exec()
+
+    def _on_imported(self, n: int) -> None:
+        QMessageBox.information(self, "Import Complete", f"Imported {n:,} rows.")
+        self._show_browse()
+
+    def _open_bulk_import(self) -> None:
         from tahmeed.services import accountant_service as svc
-        self._sheets = await svc.get_kimvi_sheets()
-        if self._sheets and self._current_idx >= len(self._sheets):
-            self._current_idx = len(self._sheets) - 1
-        await self._load_current()
-
-    async def _load_current(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        if not self._sheets:
-            self._sheet_lbl.setText("No sheets yet")
-            self._table.setRowCount(0)
-            self._prev_sheet.setEnabled(False)
-            self._next_sheet.setEnabled(False)
-            self._adv_lbl.setText("Cash Advance: —")
-            self._bal_lbl.setText("Running Balance: —")
-            self._spent_lbl.setText("Spent: —")
-            return
-
-        label = self._sheets[self._current_idx]
-        self._sheet_lbl.setText(f"Sheet {self._current_idx + 1} of {len(self._sheets)}: {label}")
-        self._prev_sheet.setEnabled(self._current_idx > 0)
-        self._next_sheet.setEnabled(self._current_idx < len(self._sheets) - 1)
-
-        entries = await svc.get_kimvi_sheet_entries(label)
-        self._entries = entries
-        self._fill_table(entries)
-        self._update_summary(entries)
-
-    def _fill_table(self, entries: List[dict]) -> None:
-        t = self._table
-        t.setRowCount(0)
-        item_no = 0
-        for entry in entries:
-            r = t.rowCount()
-            t.insertRow(r)
-            is_advance = entry.get("is_advance", False)
-            if is_advance:
-                t.setItem(r, 0, _cell("—"))
-            else:
-                item_no += 1
-                t.setItem(r, 0, _cell(str(item_no)))
-            t.setItem(r, 1, _cell(entry.get("date_str", "")))
-            t.setItem(r, 2, _cell(entry.get("truck_no", "")))
-            t.setItem(r, 3, _cell(entry.get("description", "")))
-            amt = entry.get("amount_usd", 0.0)
-            color = _RED if (not is_advance and amt > 0) else _GREEN
-            t.setItem(r, 4, _cell(
-                f"({'.' if is_advance else ''}{_fmt_num(abs(amt), '$ ')})",
-                mono=True, color=color,
-            ))
-            if is_advance:
-                for col in range(t.columnCount()):
-                    item = t.item(r, col)
-                    if item:
-                        item.setBackground(QColor(_AMBER_L))
-
-    def _update_summary(self, entries: List[dict]) -> None:
-        advance = sum(e.get("amount_usd", 0) for e in entries if e.get("is_advance"))
-        spent   = sum(e.get("amount_usd", 0) for e in entries if not e.get("is_advance"))
-        balance = advance - spent
-        self._adv_lbl.setText(f"Cash Advance: USD {_fmt_num(advance)}")
-        self._spent_lbl.setText(f"Spent: USD {_fmt_num(spent)}")
-        self._bal_lbl.setText(f"Running Balance: USD {_fmt_num(balance)}")
-        self._bal_lbl.setStyleSheet(
-            f"color:{'#DC2626' if balance < 0 else '#16A34A'};"
-            "font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;"
-            "background:transparent;"
+        dlg = BulkSheetImportDialog(
+            title="Bulk Import — Ahmed Kimvi (Klesa)",
+            hint=(
+                "Every sheet in the workbook will be checked. "
+                "New sheets are imported; sheets already uploaded are skipped."
+            ),
+            parse_all_fn=_parse_kimvi_all_sheets,
+            existing_fn=svc.kimvi_existing_sheet_labels,
+            save_fn=svc.save_kimvi_import,
+            parent=self,
         )
-
-    def _new_sheet(self) -> None:
-        dlg = _NewKimviSheetDialog(parent=self)
-        dlg.created.connect(self._on_sheet_created)
+        dlg.imported.connect(self._on_bulk_imported)
         dlg.exec()
 
-    def _on_sheet_created(self, label: str, date_str: str, advance: float) -> None:
-        asyncio.ensure_future(self._create_sheet(label, date_str, advance))
-
-    async def _create_sheet(self, label: str, date_str: str, advance: float) -> None:
-        from tahmeed.services import accountant_service as svc
-        await svc.create_kimvi_sheet(label, date_str, advance)
-        await self._load_sheets()
-        # Navigate to the new sheet (last)
-        if self._sheets:
-            self._current_idx = len(self._sheets) - 1
-            await self._load_current()
-
-    def _add_item(self) -> None:
-        if not self._sheets:
-            QMessageBox.information(self, "No Sheet", "Create a visit sheet first.")
-            return
-        label = self._sheets[self._current_idx]
-        dlg = _KimviRowDialog(sheet_label=label, parent=self)
-        dlg.saved.connect(self._on_item_saved)
-        dlg.exec()
-
-    def _on_item_saved(self, data: dict) -> None:
-        asyncio.ensure_future(self._save_item(data))
-
-    async def _save_item(self, data: dict) -> None:
-        from tahmeed.services import accountant_service as svc
-        await svc.save_separate_expense("ahmed_kimvi", data)
-        await self._load_current()
-
-    def _prev(self) -> None:
-        if self._current_idx > 0:
-            self._current_idx -= 1
-            asyncio.ensure_future(self._load_current())
-
-    def _next(self) -> None:
-        if self._current_idx < len(self._sheets) - 1:
-            self._current_idx += 1
-            asyncio.ensure_future(self._load_current())
+    def _on_bulk_imported(self, sheets: int, rows: int) -> None:
+        QMessageBox.information(
+            self, "Bulk Import Complete",
+            f"Imported {sheets:,} sheet{'s' if sheets != 1 else ''} ({rows:,} rows).",
+        )
+        self._show_browse()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

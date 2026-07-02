@@ -2047,6 +2047,33 @@ class DailyRegister(QWidget):
         except Exception:
             dup_days = 5
 
+        # ── Pre-scan: warn once if any new rows carry a non-today date ──────
+        _off_date = 0
+        for _s in range(self._saved_count, self._table.rowCount()):
+            if not self._row_has_data(_s):
+                continue
+            _it = self._table.item(_s, COL_DATE)
+            _ds = _it.text().strip() if _it else ""
+            try:
+                _td = datetime.strptime(_ds, "%d/%m/%Y").date()
+            except ValueError:
+                _td = self._current_date
+            if _td != date.today():
+                _off_date += 1
+        if _off_date:
+            _plural = "s" if _off_date != 1 else ""
+            _are    = "are" if _off_date != 1 else "is"
+            if QMessageBox.warning(
+                self, "Off-date Entries",
+                f"{_off_date} row{_plural} {_are} not dated today "
+                f"({date.today().strftime('%d %b %Y')}).\n\n"
+                "These entries will be flagged in the accountant's verify inbox.\n\n"
+                "Proceed with save?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            ) == QMessageBox.No:
+                return
+
         cancel_all = False
         for row in range(self._saved_count, self._table.rowCount()):
             if cancel_all:

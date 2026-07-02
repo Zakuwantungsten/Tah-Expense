@@ -1102,6 +1102,13 @@ class VerifyInboxWidget(QWidget):
                         cell.setBackground(QColor("#FFF7ED"))
             else:
                 t.setItem(r, _COL_APP, _cell(tx.approver or "—", color=_T2))
+                # Amber row tint when the transaction date differs from submission date
+                if isinstance(tx.date, datetime) and isinstance(tx.created_at, datetime):
+                    if tx.date.date() != tx.created_at.date():
+                        for _c in range(_NCOLS):
+                            _cell_item = t.item(r, _c)
+                            if _cell_item:
+                                _cell_item.setBackground(QColor(_AMBER_L))
 
         t.blockSignals(False)
         self._update_bulk_buttons()
