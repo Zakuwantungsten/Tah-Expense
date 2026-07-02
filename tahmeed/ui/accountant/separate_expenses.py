@@ -61,7 +61,12 @@ _ALT_ROW = "#F9FAFB"
 _NAVY    = "#1B2B4B"
 
 _PAGE_SIZES = [25, 50, 100]
-_ROW_H      = 36
+_ROW_H      = 28
+_HDR_H      = 26
+_ROW_EVEN   = "#FFFFFF"
+_ROW_ODD    = "#F1F5F9"   # slate-100 — manual stripe (readable on all row types)
+_CREDIT_ROW_BG = "#E6F4EC"  # soft mint for money-in / credit rows
+_CREDIT_FG       = "#047857"
 
 # ── Afritrack / QuickBooks-inspired palette (used only for AfritrackWidget) ───
 _QB_HDR_BG   = "#EFF6FF"   # very light blue header
@@ -159,16 +164,35 @@ def _card(widget: QWidget) -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
-        f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
+        "border:none;font-size:11px;font-family:'Segoe UI',sans-serif;}}"
+        f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
-        "font-size:11px;font-weight:600;font-family:'Segoe UI',sans-serif;"
+        "font-size:10px;font-weight:600;font-family:'Segoe UI',sans-serif;"
         f"border:none;border-bottom:1px solid {_BORDER};"
-        "padding:0 6px;height:30px;}}"
+        f"padding:0 8px;height:{_HDR_H}px;}}"
         "QScrollBar:vertical{width:8px;background:transparent;}"
         f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
     )
+
+
+def _stripe_bg(row_idx: int) -> str:
+    return _ROW_ODD if row_idx % 2 else _ROW_EVEN
+
+
+def _apply_row_bg(t: QTableWidget, row: int, bg: str) -> None:
+    for col in range(t.columnCount()):
+        item = t.item(row, col)
+        if item:
+            item.setBackground(QColor(bg))
+
+
+def _finish_table_row(
+    t: QTableWidget, row: int, bg: str | None = None,
+) -> None:
+    """Apply stripe (or custom) background and compact row height."""
+    _apply_row_bg(t, row, bg if bg else _stripe_bg(row))
+    t.setRowHeight(row, _ROW_H)
 
 
 def _make_table(headers: List[str]) -> QTableWidget:
@@ -176,16 +200,11 @@ def _make_table(headers: List[str]) -> QTableWidget:
     t.setHorizontalHeaderLabels(headers)
     t.setEditTriggers(QAbstractItemView.NoEditTriggers)
     t.setSelectionBehavior(QAbstractItemView.SelectRows)
-    t.setAlternatingRowColors(True)
+    t.setAlternatingRowColors(False)
     t.verticalHeader().setVisible(False)
     t.verticalHeader().setDefaultSectionSize(_ROW_H)
     t.horizontalHeader().setStretchLastSection(True)
     t.setStyleSheet(_table_style())
-    t.setAlternatingRowColors(True)
-    t.setStyleSheet(
-        _table_style()
-        + f"QTableWidget{{alternate-background-color:{_ALT_ROW};}}"
-    )
     return t
 
 
@@ -214,6 +233,19 @@ def _fmt_num(v, prefix: str = "", decimals: int = 2) -> str:
         return f"{prefix}{float(v):,.{decimals}f}"
     except Exception:
         return str(v)
+
+
+def _kimvi_fmt_amount(amt: float) -> str:
+    """Format signed USD — negative = money in, positive = money out."""
+    if amt is None:
+        return "—"
+    try:
+        v = float(amt)
+    except (TypeError, ValueError):
+        return str(amt)
+    if v < 0:
+        return f"({abs(v):,.0f})"
+    return f"{v:,.0f}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -630,6 +662,7 @@ class ImportDialog(QDialog):
             for c, key in enumerate(keys):
                 if c < t.columnCount():
                     t.setItem(r, c, _cell(row.get(key, "")))
+            _finish_table_row(t, r)
 
     def _do_import(self) -> None:
         self._import_btn.setEnabled(False)
@@ -708,10 +741,7 @@ class _TollUploadBrowse(QWidget):
         self._table.setColumnWidth(1, 240)
         self._table.setColumnWidth(2, 80)
         self._table.setColumnWidth(3, 120)
-        self._table.setStyleSheet(
-            _table_style()
-            + f"QTableWidget{{alternate-background-color:{_ALT_ROW};}}"
-        )
+        self._table.setStyleSheet(_table_style())
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         vl.addWidget(self._table, 1)
@@ -754,7 +784,7 @@ class _TollUploadBrowse(QWidget):
             t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
             t.setItem(r, 3, _cell(f"{zmw:,.0f}", mono=True, align=Qt.AlignRight | Qt.AlignVCenter))
             t.setItem(r, 4, _cell(date_range))
-            t.setRowHeight(r, _ROW_H)
+            _finish_table_row(t, r)
             total_zmw  += zmw
             total_recs += count
 
@@ -904,7 +934,7 @@ class _TollUploadDetail(QWidget):
             t.setItem(r,  9, _cell(str(rec.get("lane",         "") or ""),
                                    align=Qt.AlignCenter | Qt.AlignVCenter))
             t.setItem(r, 10, _cell(str(rec.get("cashier_name", "") or "")))
-            t.setRowHeight(r, _ROW_H)
+            _finish_table_row(t, r)
 
     def _on_search(self, text: str) -> None:
         self._search = text
@@ -1065,10 +1095,7 @@ class _ParkingCongoUploadBrowse(QWidget):
         self._table.setColumnWidth(0, 180)
         self._table.setColumnWidth(1, 260)
         self._table.setColumnWidth(2, 80)
-        self._table.setStyleSheet(
-            _table_style()
-            + f"QTableWidget{{alternate-background-color:{_ALT_ROW};}}"
-        )
+        self._table.setStyleSheet(_table_style())
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         vl.addWidget(self._table, 1)
@@ -1107,7 +1134,7 @@ class _ParkingCongoUploadBrowse(QWidget):
             t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
             t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
             t.setItem(r, 3, _cell(date_range))
-            t.setRowHeight(r, _ROW_H)
+            _finish_table_row(t, r)
 
     def _on_row_clicked(self, row: int, _col: int) -> None:
         if row < len(self._uploads):
@@ -1248,7 +1275,7 @@ class _ParkingCongoUploadDetail(QWidget):
             t.setItem(r,  8, _cell(str(rec.get("direction", "") or "")))
             t.setItem(r,  9, _cell(str(rec.get("gate_in", "") or "")))
             t.setItem(r, 10, _cell(str(rec.get("transaction_details", "") or "")))
-            t.setRowHeight(r, _ROW_H)
+            _finish_table_row(t, r)
 
     def _on_search(self, text: str) -> None:
         self._search = text
@@ -1446,8 +1473,8 @@ def _congo_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
         amt_f = 0.0
 
     is_in   = amt_f < 0
-    row_bg  = _KIMVI_IN_BG if is_in else _kimvi_stripe_bg(r)
-    amt_clr = _KIMVI_IN_FG if is_in else _T1
+    row_bg  = _CREDIT_ROW_BG if is_in else _stripe_bg(r)
+    amt_clr = _CREDIT_FG if is_in else _T1
 
     t.setItem(r, 0, _cell("—" if serial is None else str(serial)))
     t.setItem(r, 1, _cell(rec.get("date_str", "")))
@@ -1460,8 +1487,8 @@ def _congo_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
         color=amt_clr,
         align=Qt.AlignRight | Qt.AlignVCenter,
     ))
-    _kimvi_apply_row_bg(t, r, row_bg)
-    t.setRowHeight(r, _KIMVI_ROW_H)
+    _apply_row_bg(t, r, row_bg)
+    t.setRowHeight(r, _ROW_H)
 
 
 class CongoImportDialog(QDialog):
@@ -1715,8 +1742,7 @@ class _CongoExpUploadBrowse(QWidget):
                 align=Qt.AlignRight | Qt.AlignVCenter,
             ))
             t.setItem(r, 5, _cell(date_range))
-            _kimvi_apply_row_bg(t, r, _kimvi_stripe_bg(r))
-            t.setRowHeight(r, _KIMVI_ROW_H)
+            _finish_table_row(t, r)
 
             total_balance += balance
             total_recs    += count
@@ -1973,53 +1999,8 @@ _KIMVI_BROWSE_HEADERS = [
     "UPLOAD DATE", "FILE NAME", "SHEET", "RECORDS", "BALANCE (USD)", "DATE RANGE",
 ]
 
-# Compact, readable palette — manual striping (not Qt alternate) avoids clashes
-# with money-in row highlights.
-_KIMVI_ROW_H    = 28
-_KIMVI_HDR_H    = 26
-_KIMVI_ROW_EVEN = "#FFFFFF"
-_KIMVI_ROW_ODD  = "#F1F5F9"   # slate-100
-_KIMVI_IN_BG    = "#E6F4EC"   # soft mint — money-in rows
-_KIMVI_IN_FG    = "#047857"   # emerald-700 — readable on mint
-
-
-def _kimvi_table_style() -> str:
-    return (
-        f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:11px;font-family:'Segoe UI',sans-serif;}}"
-        f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
-        f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
-        f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
-        "font-size:10px;font-weight:600;font-family:'Segoe UI',sans-serif;"
-        f"border:none;border-bottom:1px solid {_BORDER};"
-        f"padding:0 8px;height:{_KIMVI_HDR_H}px;}}"
-        "QScrollBar:vertical{width:8px;background:transparent;}"
-        f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
-    )
-
-
-def _make_kimvi_table(headers: List[str]) -> QTableWidget:
-    t = QTableWidget(0, len(headers))
-    t.setHorizontalHeaderLabels(headers)
-    t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-    t.setSelectionBehavior(QAbstractItemView.SelectRows)
-    t.setAlternatingRowColors(False)
-    t.verticalHeader().setVisible(False)
-    t.verticalHeader().setDefaultSectionSize(_KIMVI_ROW_H)
-    t.horizontalHeader().setStretchLastSection(True)
-    t.setStyleSheet(_kimvi_table_style())
-    return t
-
-
-def _kimvi_stripe_bg(row_idx: int) -> str:
-    return _KIMVI_ROW_ODD if row_idx % 2 else _KIMVI_ROW_EVEN
-
-
-def _kimvi_apply_row_bg(t: QTableWidget, row: int, bg: str) -> None:
-    for col in range(t.columnCount()):
-        item = t.item(row, col)
-        if item:
-            item.setBackground(QColor(bg))
+_KIMVI_IN_FG = _CREDIT_FG
+_make_kimvi_table = _make_table
 
 
 def _parse_kimvi_sheet(ws) -> List[dict]:
@@ -2292,8 +2273,7 @@ class BulkSheetImportDialog(QDialog):
                 align=Qt.AlignRight | Qt.AlignVCenter,
             ))
             t.setItem(r, 3, _cell(status, color=status_color))
-            _kimvi_apply_row_bg(t, r, _kimvi_stripe_bg(i))
-            t.setRowHeight(r, _KIMVI_ROW_H)
+            _finish_table_row(t, r, _stripe_bg(i))
 
     def _do_import(self) -> None:
         if not self._pending:
@@ -2502,19 +2482,6 @@ class KimviImportDialog(QDialog):
             self._import_btn.setText(f"Import {len(self._records):,} Rows")
 
 
-def _kimvi_fmt_amount(amt: float) -> str:
-    """Format signed USD — negative = money in, positive = money out."""
-    if amt is None:
-        return "—"
-    try:
-        v = float(amt)
-    except (TypeError, ValueError):
-        return str(amt)
-    if v < 0:
-        return f"({abs(v):,.0f})"
-    return f"{v:,.0f}"
-
-
 def _kimvi_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     """Populate one Ahmed Kimvi row — green tint for money-in, slate stripe otherwise."""
     serial = rec.get("serial_no")
@@ -2525,8 +2492,8 @@ def _kimvi_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
         amt_f = 0.0
 
     is_in   = amt_f < 0
-    row_bg  = _KIMVI_IN_BG if is_in else _kimvi_stripe_bg(r)
-    amt_clr = _KIMVI_IN_FG if is_in else _T1
+    row_bg  = _CREDIT_ROW_BG if is_in else _stripe_bg(r)
+    amt_clr = _CREDIT_FG if is_in else _T1
 
     t.setItem(r, 0, _cell("—" if serial is None else str(serial)))
     t.setItem(r, 1, _cell(rec.get("date_str", "")))
@@ -2538,8 +2505,8 @@ def _kimvi_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
         color=amt_clr,
         align=Qt.AlignRight | Qt.AlignVCenter,
     ))
-    _kimvi_apply_row_bg(t, r, row_bg)
-    t.setRowHeight(r, _KIMVI_ROW_H)
+    _apply_row_bg(t, r, row_bg)
+    t.setRowHeight(r, _ROW_H)
 
 
 class _KimviUploadBrowse(QWidget):
@@ -2630,8 +2597,7 @@ class _KimviUploadBrowse(QWidget):
                 align=Qt.AlignRight | Qt.AlignVCenter,
             ))
             t.setItem(r, 5, _cell(date_range))
-            _kimvi_apply_row_bg(t, r, _kimvi_stripe_bg(r))
-            t.setRowHeight(r, _KIMVI_ROW_H)
+            _finish_table_row(t, r)
 
             total_balance += balance
             total_recs    += count
@@ -3016,11 +2982,8 @@ class ZambiaParkingWidget(QWidget):
                                   color=_GREEN if credit else ""))
             t.setItem(r, 6, _cell(_fmt_num(rec.get("balance"), "ZMW ", 0), mono=True))
             t.setItem(r, 7, _cell(rec.get("heading_to", "")))
-            if is_opening:
-                for col in range(t.columnCount()):
-                    item = t.item(r, col)
-                    if item:
-                        item.setBackground(QColor(_BLUE_L))
+            row_bg = _BLUE_L if is_opening else None
+            _finish_table_row(t, r, row_bg)
 
     def _open_import(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -3230,6 +3193,7 @@ class HarrisonExpensesWidget(QWidget):
             t.setItem(r, 4, _cell(rec.get("description", "")))
             t.setItem(r, 5, _cell(_fmt_num(rec.get("amount_usd"), "$ "), mono=True))
             t.setItem(r, 6, _cell(_fmt_num(rec.get("amount_kwacha"), "ZMW ", 0), mono=True))
+            _finish_table_row(t, r)
 
     def _new_entry(self) -> None:
         dlg = _HarrisonEntryDialog(parent=self)
@@ -3592,10 +3556,10 @@ class _AfritrackGrid(QTableWidget):
         self.setEditTriggers(
             QAbstractItemView.DoubleClicked | QAbstractItemView.AnyKeyPressed
         )
-        self.setAlternatingRowColors(True)
+        self.setAlternatingRowColors(False)
         self.verticalHeader().setVisible(False)
         self.verticalHeader().setMinimumSectionSize(18)
-        self.verticalHeader().setDefaultSectionSize(22)
+        self.verticalHeader().setDefaultSectionSize(_ROW_H)
         self.setShowGrid(True)
         self.setSortingEnabled(False)
 
@@ -3619,11 +3583,10 @@ class _AfritrackGrid(QTableWidget):
             "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
             f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
             f"QTableWidget::item:selected{{background:{_QB_SEL_BG};color:{_QB_SEL_FG};}}"
-            f"QTableWidget::item:alternate{{background:#F9FAFB;}}"
             f"QHeaderView::section{{background:{_QB_HDR_BG};color:{_QB_HDR_FG};"
-            "font-size:11px;font-weight:700;font-family:'Segoe UI',sans-serif;"
+            "font-size:10px;font-weight:700;font-family:'Segoe UI',sans-serif;"
             f"border:none;border-right:1px solid {_BORDER};"
-            f"border-bottom:2px solid {_BLUE};padding:0 6px;height:32px;}}"
+            f"border-bottom:2px solid {_BLUE};padding:0 6px;height:{_HDR_H}px;}}"
             "QScrollBar:vertical{width:8px;background:transparent;}"
             f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
             "QScrollBar:horizontal{height:8px;background:transparent;}"
@@ -3853,9 +3816,13 @@ class _AfritrackGrid(QTableWidget):
             item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         elif col in _AF_NUM_COLS:
             item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            item.setBackground(QColor(_stripe_bg(row)))
         elif col == _AF_COL_SNO:
             item.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
             item.setForeground(QColor(_T2))
+            item.setBackground(QColor(_stripe_bg(row)))
+        else:
+            item.setBackground(QColor(_stripe_bg(row)))
 
     def _renumber(self) -> None:
         self._block = True
@@ -3881,6 +3848,7 @@ class _AfritrackGrid(QTableWidget):
             item = QTableWidgetItem("")
             self._style_item(item, r, c)
             self.setItem(r, c, item)
+        self.setRowHeight(r, _ROW_H)
         self._block = False
 
     def add_row(self, values: List[str] = None) -> None:
@@ -4524,33 +4492,9 @@ _INS_MONTHS = [
 ]
 
 
-def _ins_table_style() -> str:
-    return (
-        f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
-        f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
-        f"QTableWidget::item:selected{{background:{_QB_SEL_BG};color:{_QB_SEL_FG};}}"
-        f"QHeaderView::section{{background:{_QB_HDR_BG};color:{_QB_HDR_FG};"
-        "font-size:11px;font-weight:700;font-family:'Segoe UI',sans-serif;"
-        f"border:none;border-bottom:2px solid #BFDBFE;"
-        "padding:0 8px;height:32px;}}"
-        "QScrollBar:vertical{width:8px;background:transparent;}"
-        f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
-        f"QTableWidget{{alternate-background-color:{_ALT_ROW};}}"
-    )
-
-
 def _ins_make_table(headers: List[str]) -> QTableWidget:
-    t = QTableWidget(0, len(headers))
-    t.setHorizontalHeaderLabels(headers)
-    t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-    t.setSelectionBehavior(QAbstractItemView.SelectRows)
-    t.setAlternatingRowColors(True)
-    t.verticalHeader().setVisible(False)
-    t.verticalHeader().setDefaultSectionSize(_ROW_H)
-    t.horizontalHeader().setStretchLastSection(True)
-    t.setStyleSheet(_ins_table_style())
-    return t
+    """Insurance / COMESA tables — same compact scheme as other separate expenses."""
+    return _make_table(headers)
 
 
 class _InsTotalsBar(QFrame):
@@ -4836,6 +4780,7 @@ class _InsuranceImportDialog(QDialog):
                 if isinstance(val, float):
                     val = f"{val:,.0f}" if val else ""
                 t.setItem(r, c, _cell(str(val)))
+            _finish_table_row(t, r)
 
     def _do_import(self) -> None:
         self._import_btn.setEnabled(False)
@@ -5157,6 +5102,7 @@ class ComesaWidget(QWidget):
             ))
             t.setItem(r, 7, _cell(rec.get("month", ""),
                                    Qt.AlignCenter | Qt.AlignVCenter))
+            _finish_table_row(t, r)
 
     def _do_import(self) -> None:
         dlg = _InsuranceImportDialog(
@@ -5397,6 +5343,13 @@ class ThirdPartyWidget(QWidget):
                 s_item.setForeground(QColor(fg))
                 s_item.setBackground(QColor(bg))
             t.setItem(r, 7, s_item)
+            _finish_table_row(t, r)
+            if status in _STATUS_COLORS:
+                fg, bg = _STATUS_COLORS[status]
+                item = t.item(r, 7)
+                if item:
+                    item.setForeground(QColor(fg))
+                    item.setBackground(QColor(bg))
 
     def _do_import(self) -> None:
         dlg = _InsuranceImportDialog(
@@ -5617,6 +5570,7 @@ class RahnTechWidget(QWidget):
             t.setItem(r, 4, _cell(rec.get("truck_number", "")))
             t.setItem(r, 5, _cell(rec.get("driver_name", "")))
             t.setItem(r, 6, _cell(rec.get("do_number", "")))
+            _finish_table_row(t, r)
 
     def _open_import(self) -> None:
         from tahmeed.services import accountant_service as svc
