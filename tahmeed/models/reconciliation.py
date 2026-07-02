@@ -49,6 +49,8 @@ class ReconciliationEntry:
 
     import_date: datetime = field(default_factory=datetime.utcnow)
     imported_by: Optional[ObjectId] = None
+    upload_id: str = ""
+    source_filename: str = ""
     _id: Optional[ObjectId] = None
 
     @property
@@ -79,6 +81,8 @@ class ReconciliationEntry:
             "dedup_key": self.dedup_key,
             "import_date": self.import_date,
             "imported_by": self.imported_by,
+            "upload_id": self.upload_id,
+            "source_filename": self.source_filename,
         }
         if self._id:
             doc["_id"] = self._id
@@ -109,4 +113,6 @@ class ReconciliationEntry:
             dispute_note=doc.get("dispute_note", ""),
             import_date=doc.get("import_date", datetime.utcnow()),
             imported_by=doc.get("imported_by"),
+            upload_id=doc.get("upload_id", ""),
+            source_filename=doc.get("source_filename", ""),
         )

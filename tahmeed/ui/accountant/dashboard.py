@@ -21,7 +21,6 @@ from tahmeed.ui.accountant.separate_expenses import (
     CongoExpensesWidget,
     AhmedKimviWidget,
     ZambiaParkingWidget,
-    HarrisonExpensesWidget,
     AfritrackWidget,
     ThirdPartyWidget,
     ComesaWidget,
@@ -118,46 +117,43 @@ class AccountantDashboard(QWidget):
         self._zambia_parking   = ZambiaParkingWidget()
         self._stack.addWidget(self._zambia_parking)    # index 7
 
-        self._harrison         = HarrisonExpensesWidget()
-        self._stack.addWidget(self._harrison)          # index 8
-
         self._afritrack        = AfritrackWidget()
-        self._stack.addWidget(self._afritrack)         # index 9
+        self._stack.addWidget(self._afritrack)         # index 8
 
         self._third_party      = ThirdPartyWidget()
-        self._stack.addWidget(self._third_party)       # index 10
+        self._stack.addWidget(self._third_party)       # index 9
 
         self._comesa           = ComesaWidget()
-        self._stack.addWidget(self._comesa)            # index 11
+        self._stack.addWidget(self._comesa)            # index 10
 
-        self._stack.addWidget(_PlaceholderPage())      # index 12 — other sections
+        self._stack.addWidget(_PlaceholderPage())      # index 11 — other sections
 
         # ── Fuel Consumption ──────────────────────────────────────────────────
         self._infinity      = InfinityWidget()
-        self._stack.addWidget(self._infinity)           # index 13
+        self._stack.addWidget(self._infinity)           # index 12
 
         self._lake_zambia   = LakeZambiaWidget()
-        self._stack.addWidget(self._lake_zambia)        # index 14
+        self._stack.addWidget(self._lake_zambia)        # index 13
 
         self._lake_tunduma  = LakeTundumaWidget()
-        self._stack.addWidget(self._lake_tunduma)       # index 15
+        self._stack.addWidget(self._lake_tunduma)       # index 14
 
         self._gbp_diesel    = GBPDieselWidget()
-        self._stack.addWidget(self._gbp_diesel)         # index 16
+        self._stack.addWidget(self._gbp_diesel)         # index 15
 
         # ── RahnTech ──────────────────────────────────────────────────────────
         self._rahntech = RahnTechWidget()
-        self._stack.addWidget(self._rahntech)           # index 17
+        self._stack.addWidget(self._rahntech)           # index 16
 
         # ── Fleet Registry ────────────────────────────────────────────────────
         self._trucks_registry = TrucksRegistryWidget()
-        self._stack.addWidget(self._trucks_registry)    # index 18
+        self._stack.addWidget(self._trucks_registry)    # index 17
 
         self._trailers_registry = TrailersRegistryWidget()
-        self._stack.addWidget(self._trailers_registry)  # index 19
+        self._stack.addWidget(self._trailers_registry)  # index 18
 
         self._manage_items = ManageItemsWidget()
-        self._stack.addWidget(self._manage_items)        # index 20
+        self._stack.addWidget(self._manage_items)        # index 19
         # Rebuild the sidebar's dynamic ITEMS whenever the accountant changes them.
         self._manage_items.items_changed.connect(self._sidebar.refresh_items)
         # Live-refresh a single item's sub-item strip when its sub-items change.
@@ -195,18 +191,17 @@ class AccountantDashboard(QWidget):
             "congo_exp":      (5,  self._congo_exp),
             "ahmed_kimvi":    (6,  self._ahmed_kimvi),
             "zambia_parking": (7,  self._zambia_parking),
-            "harrison":       (8,  self._harrison),
-            "afritrack":      (9,  self._afritrack),
-            "third_party":    (10, self._third_party),
-            "comesa":         (11, self._comesa),
-            "infinity":       (13, self._infinity),
-            "lake_zambia":    (14, self._lake_zambia),
-            "lake_tunduma":   (15, self._lake_tunduma),
-            "gbp_diesel":     (16, self._gbp_diesel),
-            "rahntech":         (17, self._rahntech),
-            "manage_trucks":    (18, self._trucks_registry),
-            "manage_trailers":  (19, self._trailers_registry),
-            "manage_categories":(20, self._manage_items),
+            "afritrack":      (8,  self._afritrack),
+            "third_party":    (9,  self._third_party),
+            "comesa":         (10, self._comesa),
+            "infinity":       (12, self._infinity),
+            "lake_zambia":    (13, self._lake_zambia),
+            "lake_tunduma":   (14, self._lake_tunduma),
+            "gbp_diesel":     (15, self._gbp_diesel),
+            "rahntech":         (16, self._rahntech),
+            "manage_trucks":    (17, self._trucks_registry),
+            "manage_trailers":  (18, self._trailers_registry),
+            "manage_categories":(19, self._manage_items),
         }
         if key in _routes:
             idx, widget = _routes[key]
@@ -215,17 +210,17 @@ class AccountantDashboard(QWidget):
         elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
         elif key == "sm_burhani":
-            # Parent click opens the first sub-table; children open via sidebar.
-            self._show_recon("rpa_schedule")
+            # Parent click is handled by the sidebar (expand + first sub-item).
+            pass
         else:
-            self._stack.setCurrentIndex(12)
+            self._stack.setCurrentIndex(11)
 
     def _show_category(self, key: str) -> None:
         """Lazily create (and cache) the item table for this dynamic sidebar key."""
         if key not in self._category_indices:
             d = self._sidebar.item_def(key)
             if d is None:
-                self._stack.setCurrentIndex(12)
+                self._stack.setCurrentIndex(11)
                 return
             title, icon = d
             widget = CategoryTableWidget(category_name=title, title=title, icon_name=icon)

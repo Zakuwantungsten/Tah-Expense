@@ -1,12 +1,11 @@
 """AccountantDashboard — Separate Expenses widgets (ASK 8).
 
-Covers all nine views under the SEPARATE EXPENSES sidebar section:
+Covers all eight views under the SEPARATE EXPENSES sidebar section:
   TollPlazaWidget      — import from Dot Com Zambia xlsx/csv, dedup by Receipt No
   ParkingCongoWidget   — import from Congo transporter ledger, dedup by Serial
   CongoExpensesWidget  — Excel import (last sheet), upload browse + detail view
   AhmedKimviWidget     — Excel import (last sheet), upload browse + detail view
-  ZambiaParkingWidget  — weekly statement import, opening-balance row handling
-  HarrisonExpensesWidget — manual entry, USD + Kwacha columns
+  ZambiaParkingWidget  — weekly statement import, upload browse + detail view
   AfritrackWidget      — placeholder stub
   ThirdPartyWidget     — placeholder stub
   ComesaWidget         — placeholder stub
@@ -2101,6 +2100,8 @@ class BulkSheetImportDialog(QDialog):
         parse_all_fn,
         existing_fn,
         save_fn,
+        balance_fn=None,
+        balance_header: str = "BALANCE (USD)",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -2108,6 +2109,10 @@ class BulkSheetImportDialog(QDialog):
         self._parse_all_fn   = parse_all_fn
         self._existing_fn    = existing_fn
         self._save_fn        = save_fn
+        self._balance_fn     = balance_fn or (
+            lambda records: sum(r.get("amount_usd", 0) for r in records)
+        )
+        self._balance_header = balance_header
         self._source_filename = ""
         self._pending: List[dict] = []
         self._skipped_count = 0
@@ -2148,7 +2153,8 @@ class BulkSheetImportDialog(QDialog):
         preview_title = _lbl("Sheets in workbook", size=12, weight=600)
         vl.addWidget(preview_title)
 
-        self._preview_tbl = _make_kimvi_table(_BULK_SHEET_HEADERS)
+        bulk_headers = ["SHEET", "RECORDS", self._balance_header, "STATUS"]
+        self._preview_tbl = _make_kimvi_table(bulk_headers)
         self._preview_tbl.setMinimumHeight(260)
         vl.addWidget(self._preview_tbl, 1)
         vl.addWidget(_hsep())
@@ -2205,7 +2211,7 @@ class BulkSheetImportDialog(QDialog):
         for batch in batches:
             label   = batch["sheet_label"]
             records = batch["records"]
-            balance = sum(r["amount_usd"] for r in records)
+            balance = self._balance_fn(records)
             if label in existing:
                 status = "Already uploaded"
                 self._skipped_count += 1
@@ -2857,76 +2863,484 @@ class AhmedKimviWidget(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  5. ZambiaParkingWidget  — weekly statement import
+#  5. ZambiaParkingWidget  — weekly statement import, upload browse + detail
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ZAMBIA_PARK_HEADERS = [
     "DATE", "TYPE", "PLATE NUM.", "TICKET NO.", "DEBIT", "CREDIT", "BALANCE", "HEADING TO",
 ]
-_ZAMBIA_PARK_COL_MAP = {
-    "date":       ["date", "transaction date"],
-    "type":       ["type", "transaction type"],
-    "plate_num":  ["plate num.", "plate num", "plate", "vehicle", "plate number"],
-    "ticket_no":  ["ticket no.", "ticket no", "ticket", "ticket number"],
-    "debit":      ["debit", "dr"],
-    "credit":     ["credit", "cr"],
-    "balance":    ["balance", "bal"],
-    "heading_to": ["heading to", "heading", "destination"],
-}
+
+_ZAMBIA_BROWSE_HEADERS = [
+    "UPLOAD DATE", "FILE NAME", "SHEET", "RECORDS", "CLOSING BAL (ZMW)", "DATE RANGE",
+]
 
 
-class ZambiaParkingWidget(QWidget):
+def _zambia_to_float(val) -> Optional[float]:
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _zambia_is_balance_row(type_str: str) -> bool:
+    upper = type_str.upper()
+    return (
+        "CLOSING" in upper
+        or "OPENING" in upper
+        or upper in ("OB", "OPENING BALANCE")
+    )
+
+
+def _parse_zambia_parking_sheet(ws, sheet_label: str = "") -> List[dict]:
+    """Parse one Zambia Parking weekly worksheet into row dicts."""
+    rows = list(ws.iter_rows(values_only=True))
+    if len(rows) < 3:
+        return []
+
+    records: List[dict] = []
+    for row_idx, row in enumerate(rows[2:], start=3):
+        if not any(c is not None for c in row):
+            continue
+
+        dt          = row[0] if len(row) > 0 else None
+        typ         = row[1] if len(row) > 1 else None
+        plate       = row[2] if len(row) > 2 else None
+        ticket      = row[3] if len(row) > 3 else None
+        debit       = row[4] if len(row) > 4 else None
+        credit      = row[5] if len(row) > 5 else None
+        balance     = row[6] if len(row) > 6 else None
+        heading     = row[7] if len(row) > 7 else None
+
+        type_str = str(typ).strip() if typ is not None else ""
+
+        if isinstance(dt, datetime):
+            date_str         = dt.strftime("%d %b %Y")
+            transaction_date = dt
+        else:
+            date_str         = str(dt).strip() if dt is not None else ""
+            transaction_date = None
+
+        ticket_str = ""
+        if ticket is not None and str(ticket).strip():
+            if isinstance(ticket, float) and ticket == int(ticket):
+                ticket_str = str(int(ticket))
+            else:
+                ticket_str = str(ticket).strip()
+
+        records.append({
+            "date":              date_str,
+            "transaction_date":  transaction_date,
+            "type":              type_str,
+            "plate_num":         str(plate).strip() if plate is not None else "",
+            "ticket_no":         ticket_str,
+            "debit":             _zambia_to_float(debit),
+            "credit":            _zambia_to_float(credit),
+            "balance":           _zambia_to_float(balance),
+            "heading_to":        str(heading).strip() if heading is not None else "",
+            "is_balance_row":    _zambia_is_balance_row(type_str),
+            "sheet_label":       sheet_label,
+            "row_index":         row_idx,
+            "feed_type":         "zambia_parking",
+        })
+
+    return records
+
+
+def _parse_zambia_last_sheet(path: str) -> Tuple[str, List[dict]]:
+    """Read only the last worksheet from a Zambia Parking workbook."""
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to import Zambia Parking Excel files.")
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    if not wb.sheetnames:
+        return "", []
+
+    sheet_name = wb.sheetnames[-1]
+    return sheet_name, _parse_zambia_parking_sheet(wb[sheet_name], sheet_name)
+
+
+def _parse_zambia_all_sheets(path: str) -> List[dict]:
+    """Parse every worksheet in a Zambia Parking workbook."""
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to import Zambia Parking Excel files.")
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    batches: List[dict] = []
+    for sheet_name in wb.sheetnames:
+        records = _parse_zambia_parking_sheet(wb[sheet_name], sheet_name)
+        if records:
+            batches.append({"sheet_label": sheet_name, "records": records})
+    return batches
+
+
+def _zambia_batch_balance(records: List[dict]) -> float:
+    for rec in reversed(records):
+        bal = rec.get("balance")
+        if bal is not None:
+            try:
+                return float(bal)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def _zambia_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
+    """Populate one Zambia Parking row."""
+    is_balance = rec.get("is_balance_row") or _zambia_is_balance_row(rec.get("type", ""))
+    row_bg     = _BLUE_L if is_balance else None
+
+    t.setItem(r, 0, _cell(rec.get("date", "")))
+    t.setItem(r, 1, _cell(rec.get("type", "")))
+    t.setItem(r, 2, _cell(rec.get("plate_num", "")))
+    t.setItem(r, 3, _cell(rec.get("ticket_no", "")))
+    t.setItem(r, 4, _cell(
+        _fmt_num(rec.get("debit"), "ZMW ", 0) if rec.get("debit") is not None else "—",
+        mono=True,
+    ))
+    credit = rec.get("credit")
+    t.setItem(r, 5, _cell(
+        _fmt_num(credit, "ZMW ", 0) if credit is not None else "—",
+        mono=True,
+        color=_GREEN if credit else "",
+    ))
+    t.setItem(r, 6, _cell(
+        _fmt_num(rec.get("balance"), "ZMW ", 0) if rec.get("balance") is not None else "—",
+        mono=True,
+    ))
+    t.setItem(r, 7, _cell(rec.get("heading_to", "")))
+    _finish_table_row(t, r, row_bg)
+
+
+class ZambiaParkingImportDialog(QDialog):
+    """Import the last worksheet from a Zambia Parking weekly statement."""
+
+    imported = Signal(int)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._page = 1
-        self._page_size = 25
-        self._total = 0
-        self._search = ""
+        self._upload_id       = str(uuid.uuid4())
+        self._source_filename = ""
+        self._sheet_label     = ""
+        self._records: List[dict] = []
+        self._already_exists  = False
+
+        self.setWindowTitle("Import — Zambia Parking")
+        self.setMinimumWidth(720)
+        self.setStyleSheet(f"background:{_WHITE};")
         self._build()
-        self.refresh()
 
     def _build(self) -> None:
-        self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
         vl.setSpacing(12)
+        vl.setContentsMargins(20, 20, 20, 20)
 
-        header = _PageHeader("Zambia Parking", "mdi.map")
-        self._import_btn = _btn("Import Weekly Statement", "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        header.add_right(self._import_btn)
-        vl.addWidget(header)
+        hint = _lbl(
+            "Only the last sheet in the workbook will be imported "
+            "(one weekly statement per upload).",
+            size=12, color=_T2,
+        )
+        vl.addWidget(hint)
+
+        self._drop = _DropZone()
+        self._drop.file_dropped.connect(self._on_file)
+        vl.addWidget(self._drop)
+
+        browse_row = QWidget()
+        browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(browse_row)
+        brl.setContentsMargins(0, 0, 0, 0)
+        browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
+        browse_btn.clicked.connect(self._browse)
+        brl.addStretch()
+        brl.addWidget(browse_btn)
+        vl.addWidget(browse_row)
+
+        self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
+        vl.addWidget(self._stats_lbl)
         vl.addWidget(_hsep())
 
-        # Info bar
-        self._info_bar = QFrame()
-        self._info_bar.setStyleSheet(
-            f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;border-radius:6px;}}"
+        preview_title = _lbl("Preview (first 10 rows)", size=12, weight=600)
+        vl.addWidget(preview_title)
+
+        self._preview_tbl = _make_table(_ZAMBIA_PARK_HEADERS)
+        self._preview_tbl.setMinimumHeight(200)
+        vl.addWidget(self._preview_tbl)
+        vl.addWidget(_hsep())
+
+        btn_row = QWidget()
+        btn_row.setStyleSheet("background:transparent;")
+        bbl = QHBoxLayout(btn_row)
+        bbl.setContentsMargins(0, 0, 0, 0)
+        bbl.addStretch()
+
+        cancel_btn = _btn("Cancel", primary=False)
+        cancel_btn.clicked.connect(self.reject)
+        bbl.addWidget(cancel_btn)
+
+        self._import_btn = _btn("Import Sheet", "mdi.check-circle-outline")
+        self._import_btn.setEnabled(False)
+        self._import_btn.clicked.connect(self._do_import)
+        bbl.addWidget(self._import_btn)
+        vl.addWidget(btn_row)
+
+    def _browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Zambia Parking Workbook", "", "Excel (*.xlsx *.xls)"
         )
-        ibl = QHBoxLayout(self._info_bar)
-        ibl.setContentsMargins(12, 6, 12, 6)
-        ibl.setSpacing(24)
-        self._balance_lbl   = _lbl("Current Balance: —", size=12, weight=600, color=_BLUE)
-        self._statement_lbl = _lbl("Last Statement: —", size=11, color=_T2)
-        ibl.addWidget(self._balance_lbl)
-        ibl.addWidget(self._statement_lbl)
-        ibl.addStretch()
-        vl.addWidget(self._info_bar)
+        if path:
+            self._drop.set_path(path)
+            self._on_file(path)
+
+    def _on_file(self, path: str) -> None:
+        self._stats_lbl.setText("Reading file…")
+        self._source_filename = Path(path).name
+        try:
+            sheet_label, records = _parse_zambia_last_sheet(path)
+        except Exception as exc:
+            self._stats_lbl.setText(f"Error reading file: {exc}")
+            self._import_btn.setEnabled(False)
+            return
+
+        self._sheet_label = sheet_label
+        self._records = records
+        asyncio.ensure_future(self._check_sheet(sheet_label, records))
+
+    async def _check_sheet(self, sheet_label: str, records: List[dict]) -> None:
+        from tahmeed.services import accountant_service as svc
+
+        try:
+            exists = await svc.zambia_sheet_exists(sheet_label)
+        except Exception:
+            exists = False
+
+        self._already_exists = exists
+        total_debit  = sum(r.get("debit") or 0 for r in records)
+        total_credit = sum(r.get("credit") or 0 for r in records)
+        closing_bal  = _zambia_batch_balance(records)
+
+        if exists:
+            self._stats_lbl.setText(
+                f"Sheet \"{sheet_label}\" was already uploaded — import blocked."
+            )
+            self._import_btn.setEnabled(False)
+            self._import_btn.setText("Already Uploaded")
+        elif not records:
+            self._stats_lbl.setText(
+                f"Last sheet \"{sheet_label}\" has no data rows to import."
+            )
+            self._import_btn.setEnabled(False)
+            self._import_btn.setText("Import Sheet")
+        else:
+            self._stats_lbl.setText(
+                f"Last sheet: {sheet_label}     "
+                f"Rows: {len(records):,}     "
+                f"Debit: ZMW {total_debit:,.0f}     "
+                f"Credit: ZMW {total_credit:,.0f}     "
+                f"Closing: ZMW {closing_bal:,.0f}"
+            )
+            self._import_btn.setEnabled(True)
+            self._import_btn.setText(f"Import {len(records):,} Rows")
+
+        t = self._preview_tbl
+        t.setRowCount(0)
+        for rec in records[:10]:
+            row = t.rowCount()
+            t.insertRow(row)
+            _zambia_fill_row(t, row, rec)
+
+    def _do_import(self) -> None:
+        if self._already_exists or not self._records:
+            return
+        self._import_btn.setEnabled(False)
+        self._import_btn.setText("Importing…")
+        asyncio.ensure_future(self._async_import())
+
+    async def _async_import(self) -> None:
+        from tahmeed.services import accountant_service as svc
+
+        docs = []
+        for rec in self._records:
+            doc = dict(rec)
+            doc["sheet_label"]     = self._sheet_label
+            doc["upload_id"]       = self._upload_id
+            doc["source_filename"] = self._source_filename
+            docs.append(doc)
+
+        try:
+            saved = await svc.save_imported_feed(docs)
+            self.imported.emit(saved)
+            self.accept()
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Error", str(exc))
+            self._import_btn.setEnabled(True)
+            self._import_btn.setText(f"Import {len(self._records):,} Rows")
+
+
+class _ZambiaParkingUploadBrowse(QWidget):
+    upload_clicked = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._uploads: List[dict] = []
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        self._totals = _TotalsBar([
+            ("balance", "Closing bal: ZMW "),
+            ("count",   "Total records: "),
+        ])
+        vl.addWidget(self._totals)
+
+        self._table = _make_table(_ZAMBIA_BROWSE_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setColumnWidth(0, 160)
+        self._table.setColumnWidth(1, 220)
+        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(3, 80)
+        self._table.setColumnWidth(4, 130)
+        self._table.setCursor(Qt.PointingHandCursor)
+        self._table.cellClicked.connect(self._on_row_clicked)
+        vl.addWidget(self._table, 1)
+
+        hint = _lbl(
+            "Click any row to view the full records for that upload.",
+            size=11, color=_TM,
+        )
+        hint.setAlignment(Qt.AlignCenter)
+        vl.addWidget(hint)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        uploads = await svc.get_zambia_parking_uploads()
+        self._uploads = uploads
+        self._fill(uploads)
+
+    def _fill(self, uploads: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        total_balance = 0.0
+        total_recs    = 0
+
+        for up in uploads:
+            r = t.rowCount()
+            t.insertRow(r)
+
+            import_dt = up.get("import_date")
+            date_str = (
+                import_dt.strftime("%d %b %Y  %H:%M")
+                if isinstance(import_dt, datetime)
+                else (str(import_dt) if import_dt else "—")
+            )
+            count         = int(up.get("record_count", 0))
+            closing_bal   = float(up.get("closing_balance", 0) or 0)
+            min_d         = up.get("min_transaction_date")
+            max_d         = up.get("max_transaction_date")
+            if isinstance(min_d, datetime) and isinstance(max_d, datetime):
+                date_range = f"{min_d.strftime('%d %b %Y')} — {max_d.strftime('%d %b %Y')}"
+            else:
+                date_range = "—"
+
+            t.setItem(r, 0, _cell(date_str))
+            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 2, _cell(up.get("sheet_label") or "—", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(
+                _fmt_num(closing_bal, "ZMW ", 0),
+                mono=True,
+                align=Qt.AlignRight | Qt.AlignVCenter,
+            ))
+            t.setItem(r, 5, _cell(date_range))
+            _finish_table_row(t, r)
+
+            total_balance += closing_bal
+            total_recs    += count
+
+        self._totals.set_total("balance", total_balance, "Closing bal: ZMW ")
+        self._totals.set_total("count",   total_recs,    "")
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        if row < len(self._uploads):
+            self.upload_clicked.emit(self._uploads[row])
+
+
+class _ZambiaParkingUploadDetail(QWidget):
+    back_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._upload_id = ""
+        self._search    = ""
+        self._page      = 1
+        self._page_size = 50
+        self._total     = 0
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        nav = QWidget()
+        nav.setStyleSheet("background:transparent;")
+        navl = QHBoxLayout(nav)
+        navl.setContentsMargins(0, 0, 0, 0)
+        navl.setSpacing(8)
+
+        back_btn = _btn("← All Uploads", primary=False, height=30)
+        back_btn.clicked.connect(self.back_requested)
+        navl.addWidget(back_btn)
+
+        self._crumb_lbl = _lbl("", size=12, color=_T2)
+        navl.addWidget(self._crumb_lbl)
+        navl.addStretch()
+        vl.addWidget(nav)
+
+        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
+        vl.addWidget(self._info_lbl)
+
+        self._summary_frame = QFrame()
+        self._summary_frame.setStyleSheet(
+            f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
+            "border-radius:6px;padding:8px;}}"
+        )
+        sl = QHBoxLayout(self._summary_frame)
+        sl.setContentsMargins(12, 8, 12, 8)
+        sl.setSpacing(24)
+
+        self._debit_lbl  = _lbl("Total Debit: —", size=12, color=_T2)
+        self._credit_lbl = _lbl("Total Credit: —", size=12, weight=600, color=_GREEN)
+        self._bal_lbl    = _lbl("Closing Balance: —", size=12, weight=600, color=_BLUE)
+        sl.addWidget(self._debit_lbl)
+        sl.addWidget(self._credit_lbl)
+        sl.addWidget(self._bal_lbl)
+        sl.addStretch()
+        vl.addWidget(self._summary_frame)
 
         tb = QWidget()
         tb.setStyleSheet("background:transparent;")
         tbl = QHBoxLayout(tb)
         tbl.setContentsMargins(0, 0, 0, 0)
         tbl.setSpacing(8)
+
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search plate, ticket, destination…")
-        self._search_edit.setFixedWidth(260)
+        self._search_edit.setFixedWidth(300)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
         tbl.addStretch()
-        export_btn = _btn("Export", "mdi.download-outline", primary=False)
-        tbl.addWidget(export_btn)
         vl.addWidget(tb)
 
         self._table = _make_table(_ZAMBIA_PARK_HEADERS)
@@ -2942,69 +3356,63 @@ class ZambiaParkingWidget(QWidget):
         self._pager.size_changed.connect(self._on_page_size)
         vl.addWidget(self._pager)
 
-    def refresh(self) -> None:
+    def load_upload(self, upload_doc: dict) -> None:
+        self._upload_id = str(upload_doc.get("_id") or "")
+        filename      = upload_doc.get("source_filename") or "Unknown file"
+        sheet_label   = upload_doc.get("sheet_label") or "—"
+        count         = int(upload_doc.get("record_count", 0))
+        total_debit   = float(upload_doc.get("total_debit", 0) or 0)
+        total_credit  = float(upload_doc.get("total_credit", 0) or 0)
+        closing_bal   = float(upload_doc.get("closing_balance", 0) or 0)
+        import_dt     = upload_doc.get("import_date")
+        date_str      = (
+            import_dt.strftime("%d %b %Y")
+            if isinstance(import_dt, datetime) else ""
+        )
+
+        self._crumb_lbl.setText(f"Uploads  ›  {filename}  ›  {sheet_label}")
+        self._info_lbl.setText(
+            f"{sheet_label}   •   {count:,} rows   •   {date_str}"
+        )
+        self._debit_lbl.setText(f"Total Debit: ZMW {total_debit:,.0f}")
+        self._credit_lbl.setText(f"Total Credit: ZMW {total_credit:,.0f}")
+        self._bal_lbl.setText(f"Closing Balance: ZMW {closing_bal:,.0f}")
+
+        self._totals.set_total("debit",  total_debit,  "ZMW ")
+        self._totals.set_total("credit", total_credit, "CR: ZMW ")
+
+        self._search = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._page = 1
         asyncio.ensure_future(self._load())
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
+        if not self._upload_id:
+            return
         skip = (self._page - 1) * self._page_size
         recs, total = await asyncio.gather(
-            svc.get_imported_feed("zambia_parking", self._search, "",
-                                  self._page_size, skip),
-            svc.count_imported_feed("zambia_parking", self._search, ""),
+            svc.get_zambia_parking_upload_records(
+                self._upload_id, self._search, self._page_size, skip
+            ),
+            svc.count_zambia_parking_upload_records(self._upload_id, self._search),
         )
         self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
-        totals = await svc.get_imported_feed_totals("zambia_parking")
-        self._totals.set_total("debit", totals.get("debit", 0.0), "ZMW ")
-        self._totals.set_total("credit", totals.get("credit", 0.0), "CR: ZMW ")
-        # Show current balance from last row
-        if recs:
-            last_bal = recs[-1].get("balance", "")
-            self._balance_lbl.setText(f"Current Balance: ZMW {last_bal}" if last_bal else "Current Balance: —")
-        self._statement_lbl.setText(f"Total records: {total:,}")
-
-    def _fill_table(self, recs: List[dict]) -> None:
         t = self._table
         t.setRowCount(0)
         for rec in recs:
             r = t.rowCount()
             t.insertRow(r)
-            is_opening = rec.get("type", "").upper() in ("OPENING", "OPENING BALANCE", "OB")
-            t.setItem(r, 0, _cell(rec.get("date", "")))
-            t.setItem(r, 1, _cell(rec.get("type", "")))
-            t.setItem(r, 2, _cell(rec.get("plate_num", "")))
-            t.setItem(r, 3, _cell(rec.get("ticket_no", "")))
-            t.setItem(r, 4, _cell(_fmt_num(rec.get("debit"), "ZMW ", 0), mono=True))
-            credit = rec.get("credit")
-            t.setItem(r, 5, _cell(_fmt_num(credit, "ZMW ", 0) if credit else "—", mono=True,
-                                  color=_GREEN if credit else ""))
-            t.setItem(r, 6, _cell(_fmt_num(rec.get("balance"), "ZMW ", 0), mono=True))
-            t.setItem(r, 7, _cell(rec.get("heading_to", "")))
-            row_bg = _BLUE_L if is_opening else None
-            _finish_table_row(t, r, row_bg)
-
-    def _open_import(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        dlg = ImportDialog(
-            feed_type="zambia_parking",
-            dedup_key="ticket_no",
-            preview_headers=_ZAMBIA_PARK_HEADERS,
-            col_map=_ZAMBIA_PARK_COL_MAP,
-            save_fn=svc.save_imported_feed,
-            exist_fn=svc.get_existing_feed_keys,
-            parent=self,
-        )
-        dlg.imported.connect(lambda n: (
-            QMessageBox.information(self, "Import Complete", f"Imported {n:,} records."),
-            self.refresh(),
-        ))
-        dlg.exec()
+            _zambia_fill_row(t, r, rec)
+        self._pager.set_total(total, self._page_size, self._page)
+        self._totals.set_total("debit",  sum(r.get("debit") or 0 for r in recs), "ZMW ")
+        self._totals.set_total("credit", sum(r.get("credit") or 0 for r in recs), "CR: ZMW ")
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page = 1
+        self._page   = 1
         asyncio.ensure_future(self._load())
 
     def _go_page(self, page: int) -> None:
@@ -3013,110 +3421,17 @@ class ZambiaParkingWidget(QWidget):
 
     def _on_page_size(self, size: int) -> None:
         self._page_size = size
-        self._page = 1
+        self._page      = 1
         asyncio.ensure_future(self._load())
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  6. HarrisonExpensesWidget  — manual entry, USD + Kwacha
-# ═══════════════════════════════════════════════════════════════════════════════
+class ZambiaParkingWidget(QWidget):
+    """
+    Zambia Parking main page — browse weekly uploads then drill into per-record detail.
+    """
 
-_HARRISON_HEADERS = [
-    "S/NO", "DATE", "TRUCK NO", "TRAILER NO", "DESCRIPTION", "USD", "KWACHA",
-]
-
-
-class _HarrisonEntryDialog(QDialog):
-    saved = Signal(dict)
-
-    def __init__(self, record: dict | None = None, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._record = record
-        self.setWindowTitle("New Harrison Expense" if not record else "Edit Harrison Expense")
-        self.setMinimumWidth(400)
-        self.setStyleSheet(f"background:{_WHITE};")
-        vl = QVBoxLayout(self)
-        vl.setSpacing(12)
-        vl.setContentsMargins(20, 20, 20, 20)
-
-        form = QFormLayout()
-        form.setSpacing(10)
-
-        def _f(placeholder: str = "", fw: int = 0) -> QLineEdit:
-            e = QLineEdit()
-            e.setPlaceholderText(placeholder)
-            e.setStyleSheet(_input_ss())
-            if fw:
-                e.setFixedWidth(fw)
-            return e
-
-        self._date_edit    = _f("dd mmm yyyy")
-        self._truck_edit   = _f("T700 DXY")
-        self._trailer_edit = _f("T966 DYY")
-        self._desc_edit    = _f("Description")
-        self._usd_edit     = _f("0.00", fw=120)
-        self._kwacha_edit  = _f("0.00", fw=120)
-
-        form.addRow("Date *",        self._date_edit)
-        form.addRow("Truck No.",     self._truck_edit)
-        form.addRow("Trailer No.",   self._trailer_edit)
-        form.addRow("Description *", self._desc_edit)
-        form.addRow("USD",           self._usd_edit)
-        form.addRow("Kwacha",        self._kwacha_edit)
-        vl.addLayout(form)
-
-        if self._record:
-            self._date_edit.setText(self._record.get("date_str", ""))
-            self._truck_edit.setText(self._record.get("truck_no", ""))
-            self._trailer_edit.setText(self._record.get("trailer_no", ""))
-            self._desc_edit.setText(self._record.get("description", ""))
-            self._usd_edit.setText(str(self._record.get("amount_usd", "")))
-            self._kwacha_edit.setText(str(self._record.get("amount_kwacha", "")))
-
-        vl.addWidget(_hsep())
-
-        btn_row = QWidget()
-        btn_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(btn_row)
-        brl.setContentsMargins(0, 0, 0, 0)
-        brl.addStretch()
-        cancel = _btn("Cancel", primary=False)
-        cancel.clicked.connect(self.reject)
-        brl.addWidget(cancel)
-        save = _btn("Save Entry", "mdi.content-save-outline")
-        save.clicked.connect(self._save)
-        brl.addWidget(save)
-        vl.addWidget(btn_row)
-
-    def _save(self) -> None:
-        desc = self._desc_edit.text().strip()
-        if not desc:
-            QMessageBox.warning(self, "Validation", "Description is required.")
-            return
-        try:
-            usd    = float(self._usd_edit.text().strip() or "0")
-            kwacha = float(self._kwacha_edit.text().strip() or "0")
-        except ValueError:
-            QMessageBox.warning(self, "Validation", "USD and Kwacha must be numbers.")
-            return
-        self.saved.emit({
-            "date_str":      self._date_edit.text().strip(),
-            "truck_no":      self._truck_edit.text().strip(),
-            "trailer_no":    self._trailer_edit.text().strip(),
-            "description":   desc,
-            "amount_usd":    usd,
-            "amount_kwacha": kwacha,
-        })
-        self.accept()
-
-
-class HarrisonExpensesWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._page = 1
-        self._page_size = 25
-        self._total = 0
-        self._search = ""
         self._build()
         self.refresh()
 
@@ -3126,101 +3441,74 @@ class HarrisonExpensesWidget(QWidget):
         vl.setContentsMargins(20, 20, 20, 16)
         vl.setSpacing(12)
 
-        header = _PageHeader("Harrison Expenses", "mdi.account-tie")
-        new_btn = _btn("New Entry", "mdi.plus-circle-outline")
-        new_btn.clicked.connect(self._new_entry)
-        header.add_right(new_btn)
+        header = _PageHeader("Zambia Parking", "mdi.map")
+        bulk_btn = _btn("Bulk Import All Sheets", "mdi.file-multiple-outline", primary=False)
+        bulk_btn.clicked.connect(self._open_bulk_import)
+        self._import_btn = _btn("Import Latest Sheet", "mdi.upload-outline")
+        self._import_btn.clicked.connect(self._open_import)
+        header.add_right(bulk_btn)
+        header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search description, truck…")
-        self._search_edit.setFixedWidth(240)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-        tbl.addStretch()
-        export_btn = _btn("Export", "mdi.download-outline", primary=False)
-        tbl.addWidget(export_btn)
-        vl.addWidget(tb)
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background:transparent;")
 
-        self._table = _make_table(_HARRISON_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
-        vl.addWidget(self._table, 1)
+        self._browse = _ZambiaParkingUploadBrowse()
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._stack.addWidget(self._browse)
 
-        self._totals = _TotalsBar([("usd", "USD "), ("kwacha", "ZMW ")])
-        vl.addWidget(self._totals)
+        self._detail = _ZambiaParkingUploadDetail()
+        self._detail.back_requested.connect(self._show_browse)
+        self._stack.addWidget(self._detail)
 
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+        self._stack.setCurrentIndex(0)
+        vl.addWidget(self._stack, 1)
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._load())
+        self._show_browse()
 
-    async def _load(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_separate_expenses_list("harrison", self._search, "",
-                                           self._page_size, skip),
-            svc.count_separate_expenses("harrison", self._search, ""),
-        )
-        self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
-        totals = await svc.get_separate_expense_totals("harrison")
-        self._totals.set_total("usd", totals.get("amount_usd", 0.0), "USD ")
-        self._totals.set_total("kwacha", totals.get("amount_kwacha", 0.0), "ZMW ")
+    def _show_browse(self) -> None:
+        self._stack.setCurrentIndex(0)
+        self._browse.refresh()
 
-    def _fill_table(self, recs: List[dict]) -> None:
-        t = self._table
-        t.setRowCount(0)
-        for i, rec in enumerate(recs, 1):
-            r = t.rowCount()
-            t.insertRow(r)
-            t.setItem(r, 0, _cell(str(i)))
-            t.setItem(r, 1, _cell(rec.get("date_str", "")))
-            t.setItem(r, 2, _cell(rec.get("truck_no", "")))
-            t.setItem(r, 3, _cell(rec.get("trailer_no", "")))
-            t.setItem(r, 4, _cell(rec.get("description", "")))
-            t.setItem(r, 5, _cell(_fmt_num(rec.get("amount_usd"), "$ "), mono=True))
-            t.setItem(r, 6, _cell(_fmt_num(rec.get("amount_kwacha"), "ZMW ", 0), mono=True))
-            _finish_table_row(t, r)
+    def _show_detail(self, upload_doc: dict) -> None:
+        self._detail.load_upload(upload_doc)
+        self._stack.setCurrentIndex(1)
 
-    def _new_entry(self) -> None:
-        dlg = _HarrisonEntryDialog(parent=self)
-        dlg.saved.connect(self._on_saved)
+    def _open_import(self) -> None:
+        dlg = ZambiaParkingImportDialog(parent=self)
+        dlg.imported.connect(self._on_imported)
         dlg.exec()
 
-    def _on_saved(self, data: dict) -> None:
-        asyncio.ensure_future(self._save_entry(data))
+    def _on_imported(self, n: int) -> None:
+        QMessageBox.information(self, "Import Complete", f"Imported {n:,} rows.")
+        self._show_browse()
 
-    async def _save_entry(self, data: dict) -> None:
+    def _open_bulk_import(self) -> None:
         from tahmeed.services import accountant_service as svc
-        await svc.save_separate_expense("harrison", data)
-        self.refresh()
+        dlg = BulkSheetImportDialog(
+            title="Bulk Import — Zambia Parking",
+            hint=(
+                "Every sheet (week) in the workbook will be checked. "
+                "New sheets are imported; sheets already uploaded are skipped."
+            ),
+            parse_all_fn=_parse_zambia_all_sheets,
+            existing_fn=svc.zambia_existing_sheet_labels,
+            save_fn=svc.save_imported_feed,
+            balance_fn=_zambia_batch_balance,
+            balance_header="CLOSING BAL (ZMW)",
+            parent=self,
+        )
+        dlg.imported.connect(self._on_bulk_imported)
+        dlg.exec()
 
-    def _on_search(self, text: str) -> None:
-        self._search = text
-        self._page = 1
-        asyncio.ensure_future(self._load())
-
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page = 1
-        asyncio.ensure_future(self._load())
+    def _on_bulk_imported(self, sheets: int, rows: int) -> None:
+        QMessageBox.information(
+            self, "Bulk Import Complete",
+            f"Imported {sheets:,} sheet{'s' if sheets != 1 else ''} ({rows:,} rows).",
+        )
+        self._show_browse()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

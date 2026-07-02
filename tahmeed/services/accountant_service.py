@@ -891,6 +891,103 @@ async def count_parking_congo_upload_records(upload_id: str, search: str = "") -
     return await db.imported_feeds.count_documents(query)
 
 
+# ── Zambia Parking — weekly statement import (sheet tab = week label) ─────────
+
+async def zambia_sheet_exists(sheet_label: str) -> bool:
+    """True when a weekly sheet tab was already imported."""
+    if not sheet_label.strip():
+        return False
+    db = get_db()
+    count = await db.imported_feeds.count_documents({
+        "feed_type":   "zambia_parking",
+        "sheet_label": sheet_label.strip(),
+    })
+    return count > 0
+
+
+async def zambia_existing_sheet_labels(labels: List[str]) -> set:
+    """Return sheet tab names from labels that were already imported."""
+    clean = [l.strip() for l in labels if l and l.strip()]
+    if not clean:
+        return set()
+    db = get_db()
+    found = await db.imported_feeds.distinct(
+        "sheet_label",
+        {"feed_type": "zambia_parking", "sheet_label": {"$in": clean}},
+    )
+    return set(found)
+
+
+async def get_zambia_parking_uploads() -> list:
+    """Return one summary doc per Zambia Parking import batch."""
+    db = get_db()
+    pipeline = [
+        {"$match": {
+            "feed_type": "zambia_parking",
+            "upload_id": {"$exists": True, "$ne": ""},
+        }},
+        {"$sort": {"row_index": 1}},
+        {"$group": {
+            "_id":             "$upload_id",
+            "sheet_label":     {"$first": "$sheet_label"},
+            "source_filename": {"$first": "$source_filename"},
+            "import_date":     {"$first": "$import_date"},
+            "record_count":    {"$sum": 1},
+            "total_debit":     {"$sum": _safe_double("debit")},
+            "total_credit":    {"$sum": _safe_double("credit")},
+            "closing_balance": {"$last": _safe_double("balance")},
+            "min_transaction_date": {"$min": "$transaction_date"},
+            "max_transaction_date": {"$max": "$transaction_date"},
+        }},
+        {"$sort": {"import_date": -1}},
+    ]
+    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+
+
+async def get_zambia_parking_upload_records(
+    upload_id: str,
+    search: str = "",
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated records for a single Zambia Parking upload batch."""
+    db = get_db()
+    query: dict = {"feed_type": "zambia_parking", "upload_id": upload_id}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"plate_num":  {"$regex": s, "$options": "i"}},
+            {"ticket_no":  {"$regex": s, "$options": "i"}},
+            {"heading_to": {"$regex": s, "$options": "i"}},
+            {"type":       {"$regex": s, "$options": "i"}},
+            {"date":       {"$regex": s, "$options": "i"}},
+        ]
+    cursor = (
+        db.imported_feeds
+        .find(query)
+        .sort([("row_index", 1), ("import_date", 1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_zambia_parking_upload_records(upload_id: str, search: str = "") -> int:
+    """Count records for a single Zambia Parking upload batch."""
+    db = get_db()
+    query: dict = {"feed_type": "zambia_parking", "upload_id": upload_id}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"plate_num":  {"$regex": s, "$options": "i"}},
+            {"ticket_no":  {"$regex": s, "$options": "i"}},
+            {"heading_to": {"$regex": s, "$options": "i"}},
+            {"type":       {"$regex": s, "$options": "i"}},
+            {"date":       {"$regex": s, "$options": "i"}},
+        ]
+    return await db.imported_feeds.count_documents(query)
+
+
 # ── Insurance feeds (comesa / third_party) ────────────────────────────────────
 
 def _build_insurance_query(
@@ -1030,69 +1127,6 @@ async def get_diesel_totals(feed_type: str) -> dict:
     if result:
         return result[0]
     return {"ltrs": 0.0, "total_amount": 0.0, "lake_usd": 0.0}
-
-
-# ── Separate expenses (congo_expenses / harrison / ahmed_kimvi) ───────────────
-
-def _build_sep_query(expense_type: str, search: str = "", truck: str = "") -> dict:
-    query: dict = {"expense_type": expense_type}
-    if search.strip():
-        query["$or"] = [
-            {"description": {"$regex": re.escape(search.strip()), "$options": "i"}},
-            {"truck_no":    {"$regex": re.escape(search.strip()), "$options": "i"}},
-            {"lpo_no":      {"$regex": re.escape(search.strip()), "$options": "i"}},
-        ]
-    if truck.strip():
-        query["truck_no"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
-    return query
-
-
-async def get_separate_expenses_list(
-    expense_type: str,
-    search: str = "",
-    truck: str = "",
-    limit: int = 50,
-    skip: int = 0,
-) -> list:
-    db = get_db()
-    query = _build_sep_query(expense_type, search, truck)
-    cursor = db.separate_expenses.find(query).sort("created_at", -1).skip(skip).limit(limit)
-    return await cursor.to_list(length=limit)
-
-
-async def count_separate_expenses(
-    expense_type: str,
-    search: str = "",
-    truck: str = "",
-) -> int:
-    db = get_db()
-    query = _build_sep_query(expense_type, search, truck)
-    return await db.separate_expenses.count_documents(query)
-
-
-async def get_separate_expense_totals(expense_type: str) -> dict:
-    db = get_db()
-    pipeline = [
-        {"$match": {"expense_type": expense_type}},
-        {"$group": {
-            "_id": None,
-            "amount_usd":    {"$sum": {"$ifNull": ["$amount_usd", 0]}},
-            "amount_kwacha": {"$sum": {"$ifNull": ["$amount_kwacha", 0]}},
-        }},
-    ]
-    result = await db.separate_expenses.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"amount_usd": 0.0, "amount_kwacha": 0.0}
-
-
-async def save_separate_expense(expense_type: str, data: dict) -> bool:
-    db = get_db()
-    doc = dict(data)
-    doc["expense_type"] = expense_type
-    doc["created_at"]   = datetime.utcnow()
-    result = await db.separate_expenses.insert_one(doc)
-    return result.inserted_id is not None
 
 
 # ── Ahmed Kimvi — Excel import (last sheet per workbook) ─────────────────────

@@ -53,7 +53,6 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("congo_exp",       "Congo Expenses",       "mdi.map-marker",        {}),
         ("ahmed_kimvi",     "Ahmed Kimvi (Klesa)",  "mdi.account-cash",      {}),
         ("zambia_parking",  "Zambia Parking",       "mdi.map",               {}),
-        ("harrison",        "Harrison Expenses",    "mdi.account-tie",       {}),
         ("afritrack",       "Afritrack",            "mdi.satellite-variant", {}),
         ("third_party",     "Third Party Covers",   "mdi.shield-account",    {}),
         ("comesa",          "COMESA Covers",        "mdi.certificate",       {}),
@@ -450,6 +449,12 @@ class SidebarWidget(QFrame):
         self._build()
         self.select("overview")
         asyncio.ensure_future(self._load_items())
+        for key in _FIXED_CHILDREN:
+            if key in self._items:
+                self._items[key].set_has_subtables(True)
+            if key not in self._loaded:
+                self._loaded.add(key)
+                self._build_fixed_children(key)
 
     # ── Build ──────────────────────────────────────────────────────────────
 
@@ -647,6 +652,12 @@ class SidebarWidget(QFrame):
     # ── Internal: top-level nav ────────────────────────────────────────────
 
     def _on_item_clicked(self, key: str) -> None:
+        if key in _FIXED_CHILDREN:
+            self.select(key)
+            if key not in self._expanded:
+                self._on_toggle(key)
+            self._activate_first_fixed_child(key)
+            return
         self.select(key)
         self.nav_selected.emit(key)
         # Auto-expand only when this item has confirmed sub-tables.
@@ -673,8 +684,9 @@ class SidebarWidget(QFrame):
 
     async def _load_children(self, key: str) -> None:
         if key in _FIXED_CHILDREN:
-            self._loaded.add(key)
-            self._build_fixed_children(key)
+            if key not in self._loaded:
+                self._loaded.add(key)
+                self._build_fixed_children(key)
             return
         from tahmeed.services.subtable_service import get_subtables
         try:
@@ -706,6 +718,23 @@ class SidebarWidget(QFrame):
             )
             row.activated.connect(self._on_subitem_clicked)
             layout.addWidget(row)
+
+        if key in self._items:
+            self._items[key].set_has_subtables(True)
+
+    def _activate_first_fixed_child(self, key: str) -> None:
+        """Select the first fixed sub-item under a parent like SM Burhani."""
+        container = self._child_containers.get(key)
+        if container is None:
+            return
+        layout = container.layout()
+        if layout is None:
+            return
+        for i in range(layout.count()):
+            w = layout.itemAt(i).widget()
+            if isinstance(w, _SubNavItem) and not w.is_add:
+                self._on_subitem_clicked(w)
+                return
 
     def _rebuild_children(self, key: str, subs) -> None:
         container = self._child_containers[key]

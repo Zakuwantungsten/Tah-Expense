@@ -9,7 +9,8 @@ the Excel files the accountant receives from the bonding company:
                       station (Nakonde / Kasumbalesa / Sakania, + Add Station),
                       with a reconciliation summary card.
 
-Both allow Import (upload the schedule .xlsx, header-row auto-detected, dedup by
+Both use the upload-browse pattern (list of imports → click → full records),
+allow Import (upload the schedule .xlsx, header-row auto-detected, dedup by
 PRN + ENTRY REG) and Export (branded .xlsx), and use the same QuickBooks-style
 striped table as the rest of the dashboard.
 """
@@ -17,6 +18,7 @@ striped table as the rest of the dashboard.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -27,7 +29,7 @@ from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QVBoxLayout, QWidget,
+    QPushButton, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 # Reuse the shared primitives / design tokens from the Separate Expenses module
@@ -37,6 +39,7 @@ from tahmeed.ui.accountant.separate_expenses import (
     _RED, _RED_L, _T1, _T2, _TM, _HDR_BG,
     _lbl, _btn, _input_ss, _hsep, _make_table, _cell, _fmt_num,
     _DropZone, _PageHeader, _PaginationBar, _TotalsBar,
+    _table_style, _finish_table_row,
 )
 from tahmeed.models.reconciliation import ReconciliationEntry
 from tahmeed.services import reconciliation_service as recon_svc
@@ -280,6 +283,7 @@ class ReconImportDialog(QDialog):
         self._cols = cols
         self._entries: List[ReconciliationEntry] = []
         self._new: List[ReconciliationEntry] = []
+        self._source_path = ""
 
         self.setWindowTitle(f"Import — {title}")
         self.setMinimumWidth(720)
@@ -338,6 +342,7 @@ class ReconImportDialog(QDialog):
             self._on_file(path)
 
     def _on_file(self, path: str) -> None:
+        self._source_path = path
         self._stats.setText("Reading file…")
         try:
             self._entries = parse_recon_workbook(path, self._table)
@@ -395,6 +400,11 @@ class ReconImportDialog(QDialog):
 
     async def _async_import(self) -> None:
         try:
+            upload_id = str(uuid.uuid4())
+            filename = Path(self._source_path).name if self._source_path else "Unknown"
+            for e in self._new:
+                e.upload_id = upload_id
+                e.source_filename = filename
             saved = await recon_svc.save_reconciliation_rows(self._new)
             self.imported.emit(saved)
             self.accept()
@@ -405,241 +415,13 @@ class ReconImportDialog(QDialog):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Shared reconciliation table base
+#  Upload browse / detail widgets
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class _ReconTableBase(QWidget):
-    """Common chrome: header + import/export, search, table, totals, pagination."""
+_RECON_BROWSE_HEADERS = [
+    "UPLOAD DATE", "FILE NAME", "RECORDS", "TOTAL CHARGE", "SCHEDULE PERIOD",
+]
 
-    def __init__(self, table: str, title: str, icon: str, cols,
-                 import_label: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._table = table
-        self._title = title
-        self._icon = icon
-        self._cols = cols
-        self._import_label = import_label
-        self._station = ""          # "" = all stations (only Bonds narrows this)
-        self._page = 1
-        self._page_size = 25
-        self._total = 0
-        self._search = ""
-        self._build()
-
-    # ── Build ────────────────────────────────────────────────────────────────
-    def _build(self) -> None:
-        self.setStyleSheet(f"background:{_BG};")
-        self._root = QVBoxLayout(self)
-        self._root.setContentsMargins(20, 20, 20, 16)
-        self._root.setSpacing(12)
-
-        header = _PageHeader(self._title, self._icon)
-        self._import_btn = _btn(self._import_label, "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        export_btn = _btn("Export", "mdi.download-outline", primary=False)
-        export_btn.clicked.connect(self._export)
-        header.add_right(export_btn)
-        header.add_right(self._import_btn)
-        self._root.addWidget(header)
-        self._root.addWidget(_hsep())
-
-        self._build_subheader()   # hook (Bonds adds station tabs + summary)
-
-        # Toolbar
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search PRN, SM ref, importer, truck…")
-        self._search_edit.setFixedWidth(280)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-        tbl.addStretch()
-        self._schedule_lbl = _lbl("", size=11, color=_TM)
-        tbl.addWidget(self._schedule_lbl)
-        self._root.addWidget(tb)
-
-        # Table
-        self._tbl = _make_table([c[0] for c in self._cols])
-        hdr = self._tbl.horizontalHeader()
-        for i, (_, _f, width, _a, _m) in enumerate(self._cols):
-            self._tbl.setColumnWidth(i, width)
-            hdr.setSectionResizeMode(i, QHeaderView.Interactive)
-        hdr.setStretchLastSection(True)
-        self._root.addWidget(self._tbl, 1)
-
-        # Totals + pagination
-        self._totals = _TotalsBar([("charge", "$ "), ("count", "Records: ")])
-        self._root.addWidget(self._totals)
-
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        self._root.addWidget(self._pager)
-
-    def _build_subheader(self) -> None:
-        """Override hook — Bonds inserts station tabs + summary card here."""
-
-    # ── Data ─────────────────────────────────────────────────────────────────
-    def refresh(self) -> None:
-        self._page = 1
-        asyncio.ensure_future(self._load())
-
-    async def _load(self) -> None:
-        skip = (self._page - 1) * self._page_size
-        rows, total, totals = await asyncio.gather(
-            recon_svc.get_reconciliation_rows(
-                self._table, self._station, self._search, self._page_size, skip),
-            recon_svc.count_reconciliation_rows(self._table, self._station, self._search),
-            recon_svc.get_reconciliation_totals(self._table, self._station),
-        )
-        self._total = total
-        self._fill_table(rows)
-        self._pager.set_total(total, self._page_size, self._page)
-        self._totals.set_total("charge", totals["invoiced"], "$ ")
-        self._totals.set_total("count", totals["count"], "")
-        self._schedule_lbl.setText(rows[0].schedule_period if rows else "")
-        self._on_totals(totals)
-
-    def _on_totals(self, totals: dict) -> None:
-        """Override hook — Bonds updates its reconciliation summary card."""
-
-    def _fill_table(self, rows: List[ReconciliationEntry]) -> None:
-        t = self._tbl
-        t.setRowCount(0)
-        for e in rows:
-            r = t.rowCount()
-            t.insertRow(r)
-            for c, (_, field, _w, align, mono) in enumerate(self._cols):
-                flag = {"left": Qt.AlignLeft, "right": Qt.AlignRight,
-                        "center": Qt.AlignHCenter}[align] | Qt.AlignVCenter
-                color = _RED if (field == "charge" and (e.charge or 0) < 0) else ""
-                t.setItem(r, c, _cell(_fmt_recon_value(e, field), flag, mono=mono, color=color))
-
-    # ── Events ───────────────────────────────────────────────────────────────
-    def _on_search(self, text: str) -> None:
-        self._search = text
-        self._page = 1
-        asyncio.ensure_future(self._load())
-
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page = 1
-        asyncio.ensure_future(self._load())
-
-    # ── Import ───────────────────────────────────────────────────────────────
-    def _open_import(self) -> None:
-        dlg = ReconImportDialog(self._table, self._title, self._cols, parent=self)
-        dlg.imported.connect(self._on_imported)
-        dlg.exec()
-
-    def _on_imported(self, n: int) -> None:
-        QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
-        self._after_import()
-        self.refresh()
-
-    def _after_import(self) -> None:
-        """Override hook — Bonds reloads its station tabs."""
-
-    # ── Export ───────────────────────────────────────────────────────────────
-    def _export(self) -> None:
-        asyncio.ensure_future(self._do_export())
-
-    async def _do_export(self) -> None:
-        if not _HAS_OPENPYXL:
-            QMessageBox.critical(self, "Missing Dependency",
-                                 "openpyxl is required for Excel export.")
-            return
-        from openpyxl.styles import Font, PatternFill, Alignment
-
-        rows = await recon_svc.get_reconciliation_rows(
-            self._table, self._station, self._search, limit=100_000, skip=0)
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = self._title[:28]
-        last_col = len(self._cols)
-        col_end = ws.cell(1, last_col).column_letter
-
-        ws.merge_cells(f"A1:{col_end}1")
-        ws["A1"] = "TAHMEED COACH TZ LTD"
-        ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
-        ws["A1"].alignment = Alignment(horizontal="center")
-        sub = self._title + (f" — {self._station.title()}" if self._station else "")
-        ws.merge_cells(f"A2:{col_end}2")
-        ws["A2"] = sub
-        ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
-        ws["A2"].alignment = Alignment(horizontal="center")
-        ws.append([])
-
-        ws.append([c[0] for c in self._cols])
-        hdr_row = ws.max_row
-        grey = PatternFill("solid", fgColor="F1F5F9")
-        for cell in ws[hdr_row]:
-            cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
-            cell.fill = grey
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        alt = PatternFill("solid", fgColor="F9FAFB")
-        charge_total = 0.0
-        for i, e in enumerate(rows):
-            charge_total += e.charge or 0.0
-            ws.append([_fmt_recon_value(e, c[1]).replace("$ ", "") for c in self._cols])
-            if i % 2:
-                for cell in ws[ws.max_row]:
-                    cell.fill = alt
-
-        ws.append([])
-        total_row = ["" for _ in self._cols]
-        total_row[0] = "TOTAL"
-        total_row[-1] = f"$ {charge_total:,.0f}"
-        ws.append(total_row)
-        ws.cell(ws.max_row, 1).font = Font(name="Segoe UI", bold=True, size=11)
-        ws.cell(ws.max_row, last_col).font = Font(name="Cascadia Code", bold=True, size=11)
-
-        for idx, (_, _f, width, _a, _m) in enumerate(self._cols, 1):
-            ws.column_dimensions[ws.cell(1, idx).column_letter].width = max(10, width // 7)
-        ws.freeze_panes = ws.cell(hdr_row + 1, 1)
-
-        tag = (self._station or "all").title()
-        default = f"SM_Burhani_{self._title.replace(' ', '_')}_{tag}.xlsx"
-        path, _ = QFileDialog.getSaveFileName(self, "Export", default, "Excel Files (*.xlsx)")
-        if path:
-            try:
-                wb.save(path)
-                QMessageBox.information(self, "Export Complete",
-                                        f"Exported {len(rows):,} records to:\n{path}")
-            except Exception as exc:
-                QMessageBox.critical(self, "Save Error", f"Could not save file:\n{exc}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  RPA Schedule
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class RPAScheduleWidget(_ReconTableBase):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(
-            table="rpa_schedule",
-            title="SM Burhani — RPA Schedule",
-            icon="mdi.file-table-outline",
-            cols=_RPA_COLS,
-            import_label="Import RPA Schedule",
-            parent=parent,
-        )
-        self.refresh()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Bonds  (station tabs + reconciliation summary)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class _StationTabBar(QWidget):
     station_changed = Signal(str)   # slug
@@ -758,42 +540,224 @@ class _AddStationDialog(QDialog):
         self.accept()
 
 
-class BondsWidget(_ReconTableBase):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(
-            table="bonds",
-            title="SM Burhani — Bonds",
-            icon="mdi.bank-outline",
-            cols=_BONDS_COLS,
-            import_label="Import Bonds Schedule",
-            parent=parent,
-        )
-        asyncio.ensure_future(self._load_stations())
+class _ReconUploadBrowse(QWidget):
+    """Table of every import batch for one SM Burhani table type."""
 
-    def _build_subheader(self) -> None:
-        self._tabs = _StationTabBar()
-        self._tabs.station_changed.connect(self._on_station)
-        self._tabs.add_requested.connect(self._add_station)
-        self._root.addWidget(self._tabs)
+    upload_clicked = Signal(object)
 
-        # Reconciliation summary card
-        self._summary = QFrame()
-        self._summary.setStyleSheet(
-            f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;border-radius:6px;}}"
+    def __init__(self, table: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._table = table
+        self._uploads: List[dict] = []
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        self._totals = _TotalsBar([("charge", "$ "), ("count", "Total records: ")])
+        vl.addWidget(self._totals)
+
+        self._table_w = _make_table(_RECON_BROWSE_HEADERS)
+        self._table_w.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._table_w.horizontalHeader().setStretchLastSection(True)
+        self._table_w.setColumnWidth(0, 160)
+        self._table_w.setColumnWidth(1, 260)
+        self._table_w.setColumnWidth(2, 80)
+        self._table_w.setColumnWidth(3, 120)
+        self._table_w.setStyleSheet(_table_style())
+        self._table_w.setCursor(Qt.PointingHandCursor)
+        self._table_w.cellClicked.connect(self._on_row_clicked)
+        vl.addWidget(self._table_w, 1)
+
+        hint = _lbl("Click any row to view the full records for that upload.", size=11, color=_TM)
+        hint.setAlignment(Qt.AlignCenter)
+        vl.addWidget(hint)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        uploads = await recon_svc.get_recon_uploads(self._table)
+        self._uploads = uploads
+        self._fill(uploads)
+
+    def _fill(self, uploads: List[dict]) -> None:
+        t = self._table_w
+        t.setRowCount(0)
+        total_charge = 0.0
+        total_recs = 0
+        for up in uploads:
+            r = t.rowCount()
+            t.insertRow(r)
+            import_dt = up.get("import_date")
+            date_str = (
+                import_dt.strftime("%d %b %Y  %H:%M")
+                if isinstance(import_dt, datetime)
+                else (str(import_dt) if import_dt else "—")
+            )
+            count = int(up.get("record_count", 0))
+            charge = float(up.get("total_charge", 0))
+            period = str(up.get("schedule_period") or "—").strip() or "—"
+
+            t.setItem(r, 0, _cell(date_str))
+            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 3, _cell(
+                _fmt_num(charge, "$ ", 0),
+                mono=True, align=Qt.AlignRight | Qt.AlignVCenter,
+            ))
+            t.setItem(r, 4, _cell(period))
+            _finish_table_row(t, r)
+            total_charge += charge
+            total_recs += count
+
+        self._totals.set_total("charge", total_charge, "$ ")
+        self._totals.set_total("count", total_recs, "")
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        if row < len(self._uploads):
+            self.upload_clicked.emit(self._uploads[row])
+
+
+class _ReconUploadDetail(QWidget):
+    """Full record table for a single SM Burhani upload batch."""
+
+    back_requested = Signal()
+
+    def __init__(
+        self,
+        table: str,
+        title: str,
+        cols,
+        bonds: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._table = table
+        self._title = title
+        self._cols = cols
+        self._bonds = bonds
+        self._upload_id = ""
+        self._station = ""
+        self._search = ""
+        self._page = 1
+        self._page_size = 50
+        self._total = 0
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        nav = QWidget()
+        nav.setStyleSheet("background:transparent;")
+        navl = QHBoxLayout(nav)
+        navl.setContentsMargins(0, 0, 0, 0)
+        navl.setSpacing(8)
+        back_btn = _btn("← All Uploads", primary=False, height=30)
+        back_btn.clicked.connect(self.back_requested)
+        navl.addWidget(back_btn)
+        self._crumb_lbl = _lbl("", size=12, color=_T2)
+        navl.addWidget(self._crumb_lbl)
+        navl.addStretch()
+        export_btn = _btn("Export", "mdi.download-outline", primary=False, height=30)
+        export_btn.clicked.connect(self._export)
+        navl.addWidget(export_btn)
+        vl.addWidget(nav)
+
+        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
+        vl.addWidget(self._info_lbl)
+
+        if self._bonds:
+            self._tabs = _StationTabBar()
+            self._tabs.station_changed.connect(self._on_station)
+            self._tabs.add_requested.connect(self._add_station)
+            vl.addWidget(self._tabs)
+
+            self._summary = QFrame()
+            self._summary.setStyleSheet(
+                f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;border-radius:6px;}}"
+            )
+            sl = QHBoxLayout(self._summary)
+            sl.setContentsMargins(16, 10, 16, 10)
+            sl.setSpacing(28)
+            self._inv_lbl = _lbl("Invoiced: —", size=12, weight=600)
+            self._conf_lbl = _lbl("Confirmed: —", size=12, weight=600, color=_GREEN)
+            self._var_lbl = _lbl("Variance: —", size=12, weight=600, color=_AMBER)
+            self._disp_lbl = _lbl("Disputed: 0", size=12, color=_T2)
+            sl.addWidget(self._inv_lbl)
+            sl.addWidget(self._conf_lbl)
+            sl.addWidget(self._var_lbl)
+            sl.addWidget(self._disp_lbl)
+            sl.addStretch()
+            vl.addWidget(self._summary)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search PRN, SM ref, importer, truck…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+        tbl.addStretch()
+        self._schedule_lbl = _lbl("", size=11, color=_TM)
+        tbl.addWidget(self._schedule_lbl)
+        vl.addWidget(tb)
+
+        self._tbl = _make_table([c[0] for c in self._cols])
+        hdr = self._tbl.horizontalHeader()
+        for i, (_, _f, width, _a, _m) in enumerate(self._cols):
+            self._tbl.setColumnWidth(i, width)
+            hdr.setSectionResizeMode(i, QHeaderView.Interactive)
+        hdr.setStretchLastSection(True)
+        vl.addWidget(self._tbl, 1)
+
+        self._totals = _TotalsBar([("charge", "$ "), ("count", "Records: ")])
+        vl.addWidget(self._totals)
+
+        self._pager = _PaginationBar()
+        self._pager.page_changed.connect(self._go_page)
+        self._pager.size_changed.connect(self._on_page_size)
+        vl.addWidget(self._pager)
+
+    def load_upload(self, upload_doc: dict) -> None:
+        self._upload_id = str(upload_doc.get("_id") or "")
+        filename = upload_doc.get("source_filename") or "Unknown file"
+        count = int(upload_doc.get("record_count", 0))
+        charge = float(upload_doc.get("total_charge", 0))
+        period = str(upload_doc.get("schedule_period") or "").strip()
+        import_dt = upload_doc.get("import_date")
+        date_str = (
+            import_dt.strftime("%d %b %Y")
+            if isinstance(import_dt, datetime) else ""
         )
-        sl = QHBoxLayout(self._summary)
-        sl.setContentsMargins(16, 10, 16, 10)
-        sl.setSpacing(28)
-        self._inv_lbl = _lbl("Invoiced: —", size=12, weight=600)
-        self._conf_lbl = _lbl("Confirmed: —", size=12, weight=600, color=_GREEN)
-        self._var_lbl = _lbl("Variance: —", size=12, weight=600, color=_AMBER)
-        self._disp_lbl = _lbl("Disputed: 0", size=12, color=_T2)
-        sl.addWidget(self._inv_lbl)
-        sl.addWidget(self._conf_lbl)
-        sl.addWidget(self._var_lbl)
-        sl.addWidget(self._disp_lbl)
-        sl.addStretch()
-        self._root.addWidget(self._summary)
+        self._crumb_lbl.setText(f"Uploads  ›  {filename}")
+        self._info_lbl.setText(
+            f"{filename}   •   {count:,} records   •   $ {charge:,.0f}   •   {date_str}"
+        )
+        self._schedule_lbl.setText(period)
+        self._totals.set_total("charge", charge, "$ ")
+        self._totals.set_total("count", count, "")
+
+        self._search = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._page = 1
+
+        if self._bonds:
+            asyncio.ensure_future(self._load_stations())
+        else:
+            asyncio.ensure_future(self._load())
 
     async def _load_stations(self) -> None:
         stations = await recon_svc.get_recon_stations("bonds")
@@ -806,22 +770,242 @@ class BondsWidget(_ReconTableBase):
         self._page = 1
         asyncio.ensure_future(self._load())
 
-    def _on_totals(self, totals: dict) -> None:
-        self._inv_lbl.setText(f"Invoiced: $ {totals['invoiced']:,.0f}")
-        self._conf_lbl.setText(f"Confirmed: $ {totals['confirmed']:,.0f}")
-        self._var_lbl.setText(f"Variance: $ {totals['variance']:,.0f}")
-        self._disp_lbl.setText(f"Disputed: {totals['disputed']}")
+    async def _load(self) -> None:
+        if not self._upload_id:
+            return
+        skip = (self._page - 1) * self._page_size
+        rows, total, totals = await asyncio.gather(
+            recon_svc.get_recon_upload_records(
+                self._upload_id, self._table, self._station,
+                self._search, self._page_size, skip,
+            ),
+            recon_svc.count_recon_upload_records(
+                self._upload_id, self._table, self._station, self._search,
+            ),
+            recon_svc.get_recon_upload_totals(
+                self._upload_id, self._table, self._station,
+            ),
+        )
+        self._total = total
+        self._fill_table(rows)
+        self._pager.set_total(total, self._page_size, self._page)
+        self._totals.set_total("charge", totals["invoiced"], "$ ")
+        self._totals.set_total("count", totals["count"], "")
+        if self._bonds:
+            self._inv_lbl.setText(f"Invoiced: $ {totals['invoiced']:,.0f}")
+            self._conf_lbl.setText(f"Confirmed: $ {totals['confirmed']:,.0f}")
+            self._var_lbl.setText(f"Variance: $ {totals['variance']:,.0f}")
+            self._disp_lbl.setText(f"Disputed: {totals['disputed']}")
 
-    def _after_import(self) -> None:
-        asyncio.ensure_future(self._load_stations())
+    def _fill_table(self, rows: List[ReconciliationEntry]) -> None:
+        t = self._tbl
+        t.setRowCount(0)
+        for e in rows:
+            r = t.rowCount()
+            t.insertRow(r)
+            for c, (_, field, _w, align, mono) in enumerate(self._cols):
+                flag = {"left": Qt.AlignLeft, "right": Qt.AlignRight,
+                        "center": Qt.AlignHCenter}[align] | Qt.AlignVCenter
+                color = _RED if (field == "charge" and (e.charge or 0) < 0) else ""
+                t.setItem(r, c, _cell(_fmt_recon_value(e, field), flag, mono=mono, color=color))
+            _finish_table_row(t, r)
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._page = 1
+        asyncio.ensure_future(self._load())
+
+    def _go_page(self, page: int) -> None:
+        self._page = page
+        asyncio.ensure_future(self._load())
+
+    def _on_page_size(self, size: int) -> None:
+        self._page_size = size
+        self._page = 1
+        asyncio.ensure_future(self._load())
 
     def _add_station(self) -> None:
         dlg = _AddStationDialog(parent=self)
         dlg.submitted.connect(
-            lambda name, border: asyncio.ensure_future(self._do_add(name, border))
+            lambda name, border: asyncio.ensure_future(self._do_add_station(name, border))
         )
         dlg.exec()
 
-    async def _do_add(self, name: str, border: str) -> None:
+    async def _do_add_station(self, name: str, border: str) -> None:
         await recon_svc.add_recon_station(name, border, "bonds")
         await self._load_stations()
+
+    def _export(self) -> None:
+        asyncio.ensure_future(self._do_export())
+
+    async def _do_export(self) -> None:
+        if not _HAS_OPENPYXL:
+            QMessageBox.critical(self, "Missing Dependency",
+                                 "openpyxl is required for Excel export.")
+            return
+        from openpyxl.styles import Font, PatternFill, Alignment
+
+        rows = await recon_svc.get_recon_upload_records(
+            self._upload_id, self._table, self._station,
+            self._search, limit=100_000, skip=0,
+        )
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = self._title[:28]
+        last_col = len(self._cols)
+        col_end = ws.cell(1, last_col).column_letter
+
+        ws.merge_cells(f"A1:{col_end}1")
+        ws["A1"] = "TAHMEED COACH TZ LTD"
+        ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
+        ws["A1"].alignment = Alignment(horizontal="center")
+        sub = self._title + (f" — {self._station.title()}" if self._station else "")
+        ws.merge_cells(f"A2:{col_end}2")
+        ws["A2"] = sub
+        ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
+        ws["A2"].alignment = Alignment(horizontal="center")
+        ws.append([])
+
+        ws.append([c[0] for c in self._cols])
+        hdr_row = ws.max_row
+        grey = PatternFill("solid", fgColor="F1F5F9")
+        for cell in ws[hdr_row]:
+            cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
+            cell.fill = grey
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        alt = PatternFill("solid", fgColor="F9FAFB")
+        charge_total = 0.0
+        for i, e in enumerate(rows):
+            charge_total += e.charge or 0.0
+            ws.append([_fmt_recon_value(e, c[1]).replace("$ ", "") for c in self._cols])
+            if i % 2:
+                for cell in ws[ws.max_row]:
+                    cell.fill = alt
+
+        ws.append([])
+        total_row = ["" for _ in self._cols]
+        total_row[0] = "TOTAL"
+        total_row[-1] = f"$ {charge_total:,.0f}"
+        ws.append(total_row)
+        ws.cell(ws.max_row, 1).font = Font(name="Segoe UI", bold=True, size=11)
+        ws.cell(ws.max_row, last_col).font = Font(name="Cascadia Code", bold=True, size=11)
+
+        for idx, (_, _f, width, _a, _m) in enumerate(self._cols, 1):
+            ws.column_dimensions[ws.cell(1, idx).column_letter].width = max(10, width // 7)
+        ws.freeze_panes = ws.cell(hdr_row + 1, 1)
+
+        tag = (self._station or "all").title()
+        default = f"SM_Burhani_{self._title.replace(' ', '_')}_{tag}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(self, "Export", default, "Excel Files (*.xlsx)")
+        if path:
+            try:
+                wb.save(path)
+                QMessageBox.information(self, "Export Complete",
+                                        f"Exported {len(rows):,} records to:\n{path}")
+            except Exception as exc:
+                QMessageBox.critical(self, "Save Error", f"Could not save file:\n{exc}")
+
+
+class _ReconShellWidget(QWidget):
+    """Browse uploads then drill into per-record detail — Toll Plaza pattern."""
+
+    def __init__(
+        self,
+        table: str,
+        title: str,
+        icon: str,
+        cols,
+        import_label: str,
+        bonds: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._table = table
+        self._title = title
+        self._icon = icon
+        self._cols = cols
+        self._import_label = import_label
+        self._bonds = bonds
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet(f"background:{_BG};")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(20, 20, 20, 16)
+        vl.setSpacing(12)
+
+        header = _PageHeader(self._title, self._icon)
+        self._import_btn = _btn(self._import_label, "mdi.upload-outline")
+        self._import_btn.clicked.connect(self._open_import)
+        header.add_right(self._import_btn)
+        vl.addWidget(header)
+        vl.addWidget(_hsep())
+
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background:transparent;")
+
+        self._browse = _ReconUploadBrowse(self._table)
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._stack.addWidget(self._browse)
+
+        self._detail = _ReconUploadDetail(
+            self._table, self._title, self._cols, bonds=self._bonds,
+        )
+        self._detail.back_requested.connect(self._show_browse)
+        self._stack.addWidget(self._detail)
+
+        self._stack.setCurrentIndex(0)
+        vl.addWidget(self._stack, 1)
+
+    def refresh(self) -> None:
+        self._show_browse()
+
+    def _show_browse(self) -> None:
+        self._stack.setCurrentIndex(0)
+        self._browse.refresh()
+
+    def _show_detail(self, upload_doc: dict) -> None:
+        self._detail.load_upload(upload_doc)
+        self._stack.setCurrentIndex(1)
+
+    def _open_import(self) -> None:
+        dlg = ReconImportDialog(self._table, self._title, self._cols, parent=self)
+        dlg.imported.connect(self._on_imported)
+        dlg.exec()
+
+    def _on_imported(self, n: int) -> None:
+        QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        self._show_browse()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RPA Schedule
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RPAScheduleWidget(_ReconShellWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(
+            table="rpa_schedule",
+            title="SM Burhani — RPA Schedule",
+            icon="mdi.file-table-outline",
+            cols=_RPA_COLS,
+            import_label="Import RPA Schedule",
+            parent=parent,
+        )
+        self.refresh()
+
+
+class BondsWidget(_ReconShellWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(
+            table="bonds",
+            title="SM Burhani — Bonds",
+            icon="mdi.bank-outline",
+            cols=_BONDS_COLS,
+            import_label="Import Bonds Schedule",
+            bonds=True,
+            parent=parent,
+        )
+        self.refresh()
