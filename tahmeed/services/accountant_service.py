@@ -741,17 +741,19 @@ async def get_existing_feed_keys(keys: List[str]) -> set:
     db = get_db()
     docs = await db.imported_feeds.find(
         {"$or": [
-            {"receipt_no": {"$in": keys}},
-            {"serial":     {"$in": keys}},
-            {"ticket_no":  {"$in": keys}},
-            {"lpo_no":     {"$in": keys}},
-            {"ledger_id":  {"$in": keys}},
+            {"receipt_no":  {"$in": keys}},
+            {"serial":      {"$in": keys}},
+            {"ticket_no":   {"$in": keys}},
+            {"lpo_no":      {"$in": keys}},
+            {"ledger_id":   {"$in": keys}},
+            {"trip_number": {"$in": keys}},
         ]},
-        {"receipt_no": 1, "serial": 1, "ticket_no": 1, "lpo_no": 1, "ledger_id": 1},
+        {"receipt_no": 1, "serial": 1, "ticket_no": 1, "lpo_no": 1,
+         "ledger_id": 1, "trip_number": 1},
     ).to_list(length=None)
     found: set = set()
     for doc in docs:
-        for field in ("receipt_no", "serial", "ticket_no", "lpo_no", "ledger_id"):
+        for field in ("receipt_no", "serial", "ticket_no", "lpo_no", "ledger_id", "trip_number"):
             v = doc.get(field)
             if v:
                 found.add(v)
@@ -887,6 +889,67 @@ async def count_parking_congo_upload_records(upload_id: str, search: str = "") -
             {"transaction_type":    {"$regex": s, "$options": "i"}},
             {"cashier":             {"$regex": s, "$options": "i"}},
             {"transaction_details": {"$regex": s, "$options": "i"}},
+        ]
+    return await db.imported_feeds.count_documents(query)
+
+
+# ── RahnTech — transacted devices import ─────────────────────────────────────
+
+async def get_rahntech_uploads() -> list:
+    """Return one summary doc per upload batch for the rahntech feed."""
+    db = get_db()
+    pipeline = [
+        {"$match": {
+            "feed_type": "rahntech",
+            "upload_id": {"$exists": True, "$ne": ""},
+        }},
+        {"$group": {
+            "_id":             "$upload_id",
+            "source_filename": {"$first": "$source_filename"},
+            "import_date":     {"$first": "$import_date"},
+            "record_count":    {"$sum": 1},
+            "min_sales_date":  {"$min": "$sales_date"},
+            "max_sales_date":  {"$max": "$sales_date"},
+        }},
+        {"$sort": {"import_date": -1}},
+    ]
+    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+
+
+async def get_rahntech_upload_records(
+    upload_id: str,
+    search: str = "",
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated records for a single RahnTech upload batch."""
+    db = get_db()
+    query: dict = {"feed_type": "rahntech", "upload_id": upload_id}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"truck_number":  {"$regex": s, "$options": "i"}},
+            {"driver_name":   {"$regex": s, "$options": "i"}},
+            {"trip_number":   {"$regex": s, "$options": "i"}},
+            {"device_number": {"$regex": s, "$options": "i"}},
+            {"do_number":     {"$regex": s, "$options": "i"}},
+        ]
+    cursor = db.imported_feeds.find(query).sort("sales_date", -1).skip(skip).limit(limit)
+    return await cursor.to_list(length=limit)
+
+
+async def count_rahntech_upload_records(upload_id: str, search: str = "") -> int:
+    """Count records for a single RahnTech upload batch."""
+    db = get_db()
+    query: dict = {"feed_type": "rahntech", "upload_id": upload_id}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"truck_number":  {"$regex": s, "$options": "i"}},
+            {"driver_name":   {"$regex": s, "$options": "i"}},
+            {"trip_number":   {"$regex": s, "$options": "i"}},
+            {"device_number": {"$regex": s, "$options": "i"}},
+            {"do_number":     {"$regex": s, "$options": "i"}},
         ]
     return await db.imported_feeds.count_documents(query)
 

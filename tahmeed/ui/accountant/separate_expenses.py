@@ -5709,6 +5709,9 @@ _RAHNTECH_HEADERS = [
     "S/N", "SALES DATE", "TRIP NUMBER", "DEVICE NUMBER",
     "TRUCK NUMBER", "DRIVER NAME", "DO",
 ]
+_RAHNTECH_BROWSE_HEADERS = [
+    "UPLOAD DATE", "FILE NAME", "RECORDS", "DATE RANGE",
+]
 _RAHNTECH_COL_MAP = {
     "sn":            ["s/n", "sn", "#"],
     "sales_date":    ["sales date", "date", "transaction date"],
@@ -5744,6 +5747,7 @@ class _RahnTechImportDialog(ImportDialog):
 
     def _on_file(self, path: str) -> None:
         self._stats_lbl.setText("Reading file…")
+        self._source_filename = Path(path).name
         try:
             headers, rows = _read_rahntech_rows(path)
         except Exception as exc:
@@ -5766,7 +5770,12 @@ class _RahnTechImportDialog(ImportDialog):
 
         records: List[dict] = []
         for row in rows:
-            rec: dict = {"_raw": row, "feed_type": self._feed_type}
+            rec: dict = {
+                "_raw": row,
+                "feed_type":       self._feed_type,
+                "upload_id":       self._upload_id,
+                "source_filename": self._source_filename,
+            }
             for key, idx in field_idxs.items():
                 rec[key] = str(row[idx]).strip() if (idx is not None and idx < len(row)) else ""
             records.append(rec)
@@ -5776,45 +5785,129 @@ class _RahnTechImportDialog(ImportDialog):
         asyncio.ensure_future(self._check_dupes(records, dedup_vals))
 
 
-class RahnTechWidget(QWidget):
+class _RahnTechUploadBrowse(QWidget):
+    """Table of every RahnTech import batch. Clicking a row drills into it."""
+
+    upload_clicked = Signal(object)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._page = 1
-        self._page_size = 25
-        self._total = 0
-        self._search = ""
+        self._uploads: List[dict] = []
         self._build()
-        self.refresh()
 
     def _build(self) -> None:
-        self.setStyleSheet(f"background:{_BG};")
+        self.setStyleSheet("background:transparent;")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
-        vl.setSpacing(12)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
 
-        header = _PageHeader("RahnTech", "mdi.devices")
-        self._import_btn = _btn("Import Transacted Devices", "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        header.add_right(self._import_btn)
-        vl.addWidget(header)
-        vl.addWidget(_hsep())
+        self._totals = _TotalsBar([("count", "Total records: ")])
+        vl.addWidget(self._totals)
+
+        self._table = _make_table(_RAHNTECH_BROWSE_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setColumnWidth(0, 160)
+        self._table.setColumnWidth(1, 260)
+        self._table.setColumnWidth(2, 80)
+        self._table.setStyleSheet(_table_style())
+        self._table.setCursor(Qt.PointingHandCursor)
+        self._table.cellClicked.connect(self._on_row_clicked)
+        vl.addWidget(self._table, 1)
+
+        hint = _lbl("Click any row to view the full records for that upload.", size=11, color=_TM)
+        hint.setAlignment(Qt.AlignCenter)
+        vl.addWidget(hint)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        uploads = await svc.get_rahntech_uploads()
+        self._uploads = uploads
+        self._fill(uploads)
+
+    def _fill(self, uploads: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        total_recs = 0
+        for up in uploads:
+            r = t.rowCount()
+            t.insertRow(r)
+            import_dt = up.get("import_date")
+            date_str = (
+                import_dt.strftime("%d %b %Y  %H:%M")
+                if isinstance(import_dt, datetime)
+                else (str(import_dt) if import_dt else "—")
+            )
+            count = int(up.get("record_count", 0))
+            min_d = str(up.get("min_sales_date", "") or "").strip()
+            max_d = str(up.get("max_sales_date", "") or "").strip()
+            date_range = f"{min_d[:10]} — {max_d[:10]}" if min_d else "—"
+
+            t.setItem(r, 0, _cell(date_str))
+            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 3, _cell(date_range))
+            _finish_table_row(t, r)
+            total_recs += count
+
+        self._totals.set_total("count", total_recs, "")
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        if row < len(self._uploads):
+            self.upload_clicked.emit(self._uploads[row])
+
+
+class _RahnTechUploadDetail(QWidget):
+    """Full record table for a single RahnTech upload batch."""
+
+    back_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._upload_id = ""
+        self._search = ""
+        self._page = 1
+        self._page_size = 50
+        self._total = 0
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        nav = QWidget()
+        nav.setStyleSheet("background:transparent;")
+        navl = QHBoxLayout(nav)
+        navl.setContentsMargins(0, 0, 0, 0)
+        navl.setSpacing(8)
+        back_btn = _btn("← All Uploads", primary=False, height=30)
+        back_btn.clicked.connect(self.back_requested)
+        navl.addWidget(back_btn)
+        self._crumb_lbl = _lbl("", size=12, color=_T2)
+        navl.addWidget(self._crumb_lbl)
+        navl.addStretch()
+        vl.addWidget(nav)
+
+        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
+        vl.addWidget(self._info_lbl)
 
         tb = QWidget()
         tb.setStyleSheet("background:transparent;")
         tbl = QHBoxLayout(tb)
         tbl.setContentsMargins(0, 0, 0, 0)
         tbl.setSpacing(8)
-
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search truck, driver, trip, device…")
-        self._search_edit.setFixedWidth(280)
+        self._search_edit.setFixedWidth(300)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
         tbl.addStretch()
-
-        export_btn = _btn("Export", "mdi.download-outline", primary=False)
-        tbl.addWidget(export_btn)
         vl.addWidget(tb)
 
         self._table = _make_table(_RAHNTECH_HEADERS)
@@ -5830,18 +5923,41 @@ class RahnTechWidget(QWidget):
         self._pager.size_changed.connect(self._on_page_size)
         vl.addWidget(self._pager)
 
-    def refresh(self) -> None:
+    def load_upload(self, upload_doc: dict) -> None:
+        self._upload_id = str(upload_doc.get("_id") or "")
+        filename = upload_doc.get("source_filename") or "Unknown file"
+        count = int(upload_doc.get("record_count", 0))
+        import_dt = upload_doc.get("import_date")
+        date_str = (
+            import_dt.strftime("%d %b %Y")
+            if isinstance(import_dt, datetime) else ""
+        )
+        self._crumb_lbl.setText(f"Uploads  ›  {filename}")
+        self._info_lbl.setText(
+            f"{filename}   •   {count:,} records   •   {date_str}"
+        )
+        self._totals.set_total("count", count, "")
+
+        self._search = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._page = 1
         asyncio.ensure_future(self._load())
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
+        if not self._upload_id:
+            return
         skip = (self._page - 1) * self._page_size
         recs, total = await asyncio.gather(
-            svc.get_imported_feed("rahntech", self._search, "", self._page_size, skip),
-            svc.count_imported_feed("rahntech", self._search, ""),
+            svc.get_rahntech_upload_records(
+                self._upload_id, self._search, self._page_size, skip
+            ),
+            svc.count_rahntech_upload_records(self._upload_id, self._search),
         )
-        self._fill_table(recs)
         self._total = total
+        self._fill_table(recs)
         self._pager.set_total(total, self._page_size, self._page)
         self._totals.set_total("count", total, "")
 
@@ -5860,23 +5976,6 @@ class RahnTechWidget(QWidget):
             t.setItem(r, 6, _cell(rec.get("do_number", "")))
             _finish_table_row(t, r)
 
-    def _open_import(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        dlg = _RahnTechImportDialog(
-            feed_type="rahntech",
-            dedup_key="trip_number",
-            preview_headers=_RAHNTECH_HEADERS,
-            col_map=_RAHNTECH_COL_MAP,
-            save_fn=svc.save_imported_feed,
-            exist_fn=svc.get_existing_feed_keys,
-            parent=self,
-        )
-        dlg.imported.connect(lambda n: (
-            QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records."),
-            self.refresh(),
-        ))
-        dlg.exec()
-
     def _on_search(self, text: str) -> None:
         self._search = text
         self._page = 1
@@ -5890,3 +5989,70 @@ class RahnTechWidget(QWidget):
         self._page_size = size
         self._page = 1
         asyncio.ensure_future(self._load())
+
+
+class RahnTechWidget(QWidget):
+    """
+    RahnTech main page — browse uploads then drill into per-record detail.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._build()
+        self.refresh()
+
+    def _build(self) -> None:
+        self.setStyleSheet(f"background:{_BG};")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(20, 20, 20, 16)
+        vl.setSpacing(12)
+
+        header = _PageHeader("RahnTech", "mdi.devices")
+        self._import_btn = _btn("Import Transacted Devices", "mdi.upload-outline")
+        self._import_btn.clicked.connect(self._open_import)
+        header.add_right(self._import_btn)
+        vl.addWidget(header)
+        vl.addWidget(_hsep())
+
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background:transparent;")
+
+        self._browse = _RahnTechUploadBrowse()
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._stack.addWidget(self._browse)
+
+        self._detail = _RahnTechUploadDetail()
+        self._detail.back_requested.connect(self._show_browse)
+        self._stack.addWidget(self._detail)
+
+        self._stack.setCurrentIndex(0)
+        vl.addWidget(self._stack, 1)
+
+    def refresh(self) -> None:
+        self._show_browse()
+
+    def _show_browse(self) -> None:
+        self._stack.setCurrentIndex(0)
+        self._browse.refresh()
+
+    def _show_detail(self, upload_doc: dict) -> None:
+        self._detail.load_upload(upload_doc)
+        self._stack.setCurrentIndex(1)
+
+    def _open_import(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        dlg = _RahnTechImportDialog(
+            feed_type="rahntech",
+            dedup_key="trip_number",
+            preview_headers=_RAHNTECH_HEADERS,
+            col_map=_RAHNTECH_COL_MAP,
+            save_fn=svc.save_imported_feed,
+            exist_fn=svc.get_existing_feed_keys,
+            parent=self,
+        )
+        dlg.imported.connect(self._on_imported)
+        dlg.exec()
+
+    def _on_imported(self, n: int) -> None:
+        QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        self._show_browse()
