@@ -3,7 +3,8 @@
 QuickBooks-style full verified ledger with:
   - FY year selector (persists in app_state)
   - Month tab bar (All · Jan–Dec) with per-month TZS totals
-  - Frozen first 3 columns (S/NO · DATE · DESCRIPTION) via two synced QTableWidgets
+  - Single unified table (Bonds / Diesel Cash row styling), ITEM column sourced
+    from the approved cashier entry's category
   - Sort on any column (server-side, DB re-query)
   - ReceiptBadge color pill
   - TZS / USD footer totals bar
@@ -22,13 +23,16 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
     QLineEdit, QComboBox, QPushButton, QSizePolicy,
-    QMessageBox, QFileDialog,
+    QMessageBox, QFileDialog, QAbstractItemView,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QSize
 from PySide6.QtGui import QFont, QColor, QBrush
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.app_state import app_state
+from tahmeed.ui.accountant.separate_expenses import (
+    _make_table, _cell, _finish_table_row, _stripe_bg,
+)
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE   = "#FFFFFF"
@@ -52,23 +56,22 @@ _NAVY    = "#1B2B4B"
 _PAGE_SIZES = [25, 50, 100]
 _ROW_H = 36
 
-# (label, pixel-width, mongo sort field or None)
-_FROZEN_COLS = [
-    ("S/NO",        50,  None),
-    ("DATE",        95,  "date"),
-    ("DESCRIPTION", 230, "description"),
-]
-_SCROLL_COLS = [
-    ("MONTH",           80,  None),
-    ("TRUCK NO",        95,  "truck_number"),
-    ("MEMO",           140,  "memo"),
-    ("NOTES",           56,  None),
-    ("TZS",            120,  None),
-    ("USD",             90,  None),
-    ("RECEIPT STATUS", 118,  "receipt_status"),
-    ("OWNERSHIP",       95,  "ownership"),
-    ("APPROVED BY",    110,  "approver"),
-    ("CASHIER",        110,  None),
+# (label, pixel-width, alignment, mongo sort field or None)
+_COLS = [
+    ("S/NO",           52,  "center", None),
+    ("DATE",           95,  "left",   "date"),
+    ("ITEM",           120, "left",   "category_name"),
+    ("DESCRIPTION",    230, "left",   "description"),
+    ("MONTH",          70,  "left",   None),
+    ("TRUCK NO",       95,  "left",   "truck_number"),
+    ("MEMO",           140, "left",   "memo"),
+    ("NOTES",          56,  "center", None),
+    ("TZS",            120, "right",  None),
+    ("USD",            90,  "right",  None),
+    ("RECEIPT STATUS", 118, "center", "receipt_status"),
+    ("OWNERSHIP",      95,  "left",   "ownership"),
+    ("APPROVED BY",    110, "left",   "approver"),
+    ("CASHIER",        110, "left",   None),
 ]
 
 _MONTHS = [
@@ -192,10 +195,10 @@ def _action_btn(text: str, icon_name: str, primary: bool = True) -> QPushButton:
     return b
 
 
-def _receipt_badge(status: str) -> QWidget:
+def _receipt_badge(status: str, row_bg: str = _WHITE) -> QWidget:
     text, fg, bg = _RECEIPT_MAP.get(status, ("Unknown", _TM, "#F3F4F6"))
     container = QWidget()
-    container.setStyleSheet("background: transparent;")
+    container.setStyleSheet(f"background: {row_bg};")
     hl = QHBoxLayout(container)
     hl.setContentsMargins(3, 3, 3, 3)
     hl.setAlignment(Qt.AlignCenter)
@@ -420,140 +423,48 @@ class _FilterBar(QFrame):
         return self._rcpt_cb.currentData() or "all"
 
 
-# ── Frozen-column table (two QTableWidgets, synced vertically) ─────────────────
+# ── Unified ledger table (single QTableWidget, Bonds / Diesel Cash styling) ────
 
-class _FrozenTable(QFrame):
-    """
-    Left panel: frozen 3 columns (S/NO · DATE · DESCRIPTION).
-    Right panel: scrollable remaining 10 columns.
-    Both panels share vertical scroll state.
-    """
+class _LedgerTable(QFrame):
+    """Single scrolling table with all columns, server-side sort on header click."""
 
     sort_changed = Signal(str, bool)  # (sort_field, ascending)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setStyleSheet(f"QFrame {{ background: {_WHITE}; border: none; }}")
-        self._syncing = False
         self._sort_field = "date"
         self._sort_asc = False
         self._build()
 
     def _build(self) -> None:
-        hl = QHBoxLayout(self)
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(0)
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
 
-        # ── Frozen table (left) ──────────────────────────────────────────
-        self._ftbl = QTableWidget(0, len(_FROZEN_COLS))
-        self._ftbl.setStyleSheet(_TABLE_SS)
-        self._ftbl.verticalHeader().setVisible(False)
-        self._ftbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._ftbl.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._ftbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._ftbl.setSelectionBehavior(QTableWidget.SelectRows)
-        self._ftbl.setSelectionMode(QTableWidget.SingleSelection)
-        self._ftbl.verticalHeader().setDefaultSectionSize(_ROW_H)
-        self._ftbl.setShowGrid(True)
+        self._tbl = _make_table([c[0] for c in _COLS])
+        self._tbl.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._tbl.setShowGrid(True)
+        hdr = self._tbl.horizontalHeader()
+        hdr.setSortIndicatorShown(True)
+        hdr.setSectionsMovable(False)
+        for i, (_, width, _a, _f) in enumerate(_COLS):
+            self._tbl.setColumnWidth(i, width)
+            hdr.setSectionResizeMode(i, QHeaderView.Interactive)
+        hdr.setStretchLastSection(True)
+        hdr.sectionClicked.connect(self._on_header_click)
+        self._update_sort_indicator()
+        vl.addWidget(self._tbl)
 
-        frozen_w = sum(w for _, w, _ in _FROZEN_COLS) + 2
-        self._ftbl.setFixedWidth(frozen_w)
-
-        fhdr = self._ftbl.horizontalHeader()
-        fhdr.setSortIndicatorShown(True)
-        fhdr.setSectionsMovable(False)
-        for i, (label, width, _) in enumerate(_FROZEN_COLS):
-            self._ftbl.setHorizontalHeaderItem(i, QTableWidgetItem(label))
-            self._ftbl.setColumnWidth(i, width)
-            fhdr.setSectionResizeMode(i, QHeaderView.Interactive)
-        fhdr.sectionClicked.connect(lambda col: self._on_header_click(col, frozen=True))
-        fhdr.sectionResized.connect(self._on_frozen_resized)
-
-        # ── Main table (right, scrolls horizontally) ─────────────────────
-        self._mtbl = QTableWidget(0, len(_SCROLL_COLS))
-        self._mtbl.setStyleSheet(_TABLE_SS)
-        self._mtbl.verticalHeader().setVisible(False)
-        self._mtbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._mtbl.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._mtbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._mtbl.setSelectionBehavior(QTableWidget.SelectRows)
-        self._mtbl.setSelectionMode(QTableWidget.SingleSelection)
-        self._mtbl.verticalHeader().setDefaultSectionSize(_ROW_H)
-        self._mtbl.setShowGrid(True)
-
-        mhdr = self._mtbl.horizontalHeader()
-        mhdr.setSortIndicatorShown(True)
-        mhdr.setSectionsMovable(False)
-        for i, (label, width, _) in enumerate(_SCROLL_COLS):
-            self._mtbl.setHorizontalHeaderItem(i, QTableWidgetItem(label))
-            self._mtbl.setColumnWidth(i, width)
-            mhdr.setSectionResizeMode(i, QHeaderView.Interactive)
-        mhdr.sectionClicked.connect(lambda col: self._on_header_click(col, frozen=False))
-
-        # ── Sync vertical scroll ─────────────────────────────────────────
-        self._mtbl.verticalScrollBar().valueChanged.connect(self._sync_scroll_to_frozen)
-        self._ftbl.verticalScrollBar().valueChanged.connect(self._sync_scroll_to_main)
-
-        # ── Sync row selection ────────────────────────────────────────────
-        self._mtbl.itemSelectionChanged.connect(self._sync_sel_to_frozen)
-        self._ftbl.itemSelectionChanged.connect(self._sync_sel_to_main)
-
-        # ── Layout ───────────────────────────────────────────────────────
-        # Thin divider between frozen and scrollable
-        div = QFrame()
-        div.setFixedWidth(1)
-        div.setStyleSheet(f"background: {_BORDER};")
-
-        hl.addWidget(self._ftbl)
-        hl.addWidget(div)
-        hl.addWidget(self._mtbl, 1)
-
-        # Initial sort indicator
-        self._ftbl.horizontalHeader().setSortIndicator(1, Qt.DescendingOrder)
-
-    # ── Frozen resize ─────────────────────────────────────────────────────
-
-    def _on_frozen_resized(self, _logical: int, _old: int, _new: int) -> None:
-        total = sum(self._ftbl.columnWidth(i) for i in range(self._ftbl.columnCount())) + 2
-        self._ftbl.setFixedWidth(total)
-
-    # ── Sync helpers ───────────────────────────────────────────────────────
-
-    def _sync_scroll_to_frozen(self, val: int) -> None:
-        if not self._syncing:
-            self._syncing = True
-            self._ftbl.verticalScrollBar().setValue(val)
-            self._syncing = False
-
-    def _sync_scroll_to_main(self, val: int) -> None:
-        if not self._syncing:
-            self._syncing = True
-            self._mtbl.verticalScrollBar().setValue(val)
-            self._syncing = False
-
-    def _sync_sel_to_frozen(self) -> None:
-        if self._syncing:
-            return
-        self._syncing = True
-        row = self._mtbl.currentRow()
-        if row >= 0:
-            self._ftbl.selectRow(row)
-        self._syncing = False
-
-    def _sync_sel_to_main(self) -> None:
-        if self._syncing:
-            return
-        self._syncing = True
-        row = self._ftbl.currentRow()
-        if row >= 0:
-            self._mtbl.selectRow(row)
-        self._syncing = False
+    @staticmethod
+    def _flag(align: str) -> Qt.AlignmentFlag:
+        return {"left": Qt.AlignLeft, "right": Qt.AlignRight,
+                "center": Qt.AlignHCenter}[align] | Qt.AlignVCenter
 
     # ── Sort ───────────────────────────────────────────────────────────────
 
-    def _on_header_click(self, col: int, frozen: bool) -> None:
-        cols = _FROZEN_COLS if frozen else _SCROLL_COLS
-        sort_field = cols[col][2]
+    def _on_header_click(self, col: int) -> None:
+        sort_field = _COLS[col][3]
         if sort_field is None:
             return
         if self._sort_field == sort_field:
@@ -566,15 +477,9 @@ class _FrozenTable(QFrame):
 
     def _update_sort_indicator(self) -> None:
         order = Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
-        self._ftbl.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
-        self._mtbl.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
-        for i, (_, _, f) in enumerate(_FROZEN_COLS):
+        for i, (_, _, _a, f) in enumerate(_COLS):
             if f == self._sort_field:
-                self._ftbl.horizontalHeader().setSortIndicator(i, order)
-                return
-        for i, (_, _, f) in enumerate(_SCROLL_COLS):
-            if f == self._sort_field:
-                self._mtbl.horizontalHeader().setSortIndicator(i, order)
+                self._tbl.horizontalHeader().setSortIndicator(i, order)
                 return
 
     # ── Populate ───────────────────────────────────────────────────────────
@@ -583,68 +488,52 @@ class _FrozenTable(QFrame):
                  cashier_names: Dict = None) -> None:
         if cashier_names is None:
             cashier_names = {}
-        n = len(txs)
-        self._ftbl.setRowCount(n)
-        self._mtbl.setRowCount(n)
-
-        mono_font = QFont("Cascadia Code", 12)
-        mono_font.setStyleHint(QFont.Monospace)
+        t = self._tbl
+        t.setRowCount(0)
 
         for i, tx in enumerate(txs):
-            row_bg = _ALT_ROW if i % 2 == 1 else _WHITE
+            r = t.rowCount()
+            t.insertRow(r)
+            row_bg = _stripe_bg(i)
 
-            # ── Frozen columns ────────────────────────────────────────────
-            _set_cell(self._ftbl, i, 0, str(skip + i + 1), Qt.AlignCenter, row_bg)
-            date_str = tx.date.strftime("%d %b %Y") if tx.date else "—"
-            _set_cell(self._ftbl, i, 1, date_str, Qt.AlignLeft, row_bg)
-            _set_cell(self._ftbl, i, 2, tx.description or "—", Qt.AlignLeft, row_bg)
-            self._ftbl.setRowHeight(i, _ROW_H)
-
-            # ── Scrollable columns ────────────────────────────────────────
             month_str = tx.month or (tx.date.strftime("%b %y") if tx.date else "—")
             cashier_name = _short_name(cashier_names.get(tx.cashier_id, "")) if tx.cashier_id else "—"
+            item_str = tx.item or tx.category_name or "—"
+            date_str = tx.date.strftime("%d %b %Y") if tx.date else "—"
 
-            _set_cell(self._mtbl, i, 0, month_str, Qt.AlignLeft, row_bg)
-            _set_cell(self._mtbl, i, 1, tx.truck_number or "—", Qt.AlignLeft, row_bg)
-            _set_cell(self._mtbl, i, 2, tx.memo or "—", Qt.AlignLeft, row_bg)
-            _set_cell(self._mtbl, i, 3, "✓" if tx.notes_flag else "—",
-                      Qt.AlignCenter, row_bg, color=_BLUE if tx.notes_flag else _TM)
+            t.setItem(r, 0, _cell(str(skip + i + 1), self._flag("center")))
+            t.setItem(r, 1, _cell(date_str))
+            t.setItem(r, 2, _cell(item_str))
+            t.setItem(r, 3, _cell(tx.description or "—"))
+            t.setItem(r, 4, _cell(month_str))
+            t.setItem(r, 5, _cell(tx.truck_number or "—"))
+            t.setItem(r, 6, _cell(tx.memo or "—"))
+            t.setItem(r, 7, _cell("✓" if tx.notes_flag else "—", self._flag("center"),
+                                  color=_BLUE if tx.notes_flag else _TM))
 
-            # TZS
             if tx.currency == "TZS":
-                tzs_txt = f"{tx.amount:,.0f}"
-                tzs_col = _RED if tx.amount < 0 else _T1
+                tzs_txt, tzs_col = f"{tx.amount:,.0f}", (_RED if tx.amount < 0 else _T1)
             else:
-                tzs_txt = "—"
-                tzs_col = _TM
-            _set_cell(self._mtbl, i, 4, tzs_txt, Qt.AlignRight, row_bg,
-                      color=tzs_col, mono=True)
+                tzs_txt, tzs_col = "—", _TM
+            t.setItem(r, 8, _cell(tzs_txt, self._flag("right"), mono=True, color=tzs_col))
 
-            # USD
             if tx.currency == "USD":
-                usd_txt = f"${tx.amount:,.2f}"
-                usd_col = _RED if tx.amount < 0 else _T1
+                usd_txt, usd_col = f"${tx.amount:,.2f}", (_RED if tx.amount < 0 else _T1)
             else:
-                usd_txt = "—"
-                usd_col = _TM
-            _set_cell(self._mtbl, i, 5, usd_txt, Qt.AlignRight, row_bg,
-                      color=usd_col, mono=True)
+                usd_txt, usd_col = "—", _TM
+            t.setItem(r, 9, _cell(usd_txt, self._flag("right"), mono=True, color=usd_col))
 
-            # Receipt status badge (cell widget)
-            badge = _receipt_badge(tx.receipt_status or "pending")
-            self._mtbl.setCellWidget(i, 6, badge)
-
-            _set_cell(self._mtbl, i, 7, tx.ownership or "—", Qt.AlignLeft, row_bg)
-            _set_cell(self._mtbl, i, 8, tx.approver or "—", Qt.AlignLeft, row_bg, color=_T2)
-            _set_cell(self._mtbl, i, 9, cashier_name, Qt.AlignLeft, row_bg)
-            self._mtbl.setRowHeight(i, _ROW_H)
+            t.setCellWidget(r, 10, _receipt_badge(tx.receipt_status or "pending", row_bg))
+            t.setItem(r, 11, _cell(tx.ownership or "—"))
+            t.setItem(r, 12, _cell(tx.approver or "—", color=_T2))
+            t.setItem(r, 13, _cell(cashier_name))
+            _finish_table_row(t, r, row_bg)
 
     def show_empty(self, message: str) -> None:
-        self._ftbl.setRowCount(0)
-        self._mtbl.setRowCount(0)
+        self._tbl.setRowCount(0)
 
     def row_count(self) -> int:
-        return self._mtbl.rowCount()
+        return self._tbl.rowCount()
 
 
 # ── Footer totals bar ─────────────────────────────────────────────────────────
@@ -875,7 +764,7 @@ class MasterExpensesWidget(QWidget):
         root.addWidget(self._filter_bar)
 
         # ── Table ────────────────────────────────────────────────────────
-        self._table = _FrozenTable()
+        self._table = _LedgerTable()
         self._table.sort_changed.connect(self._on_sort_changed)
         root.addWidget(self._table, 1)
 
@@ -1043,20 +932,20 @@ class MasterExpensesWidget(QWidget):
         ws.title = f"Master Expenses FY{self._year}"
 
         # ── Header block ──────────────────────────────────────────────
-        ws.merge_cells("A1:M1")
+        ws.merge_cells("A1:N1")
         ws["A1"] = "TAHMEED COACH TZ LTD"
         ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
         ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
         ws.row_dimensions[1].height = 22
 
         month_label = dict(_MONTHS).get(self._month, "All Months")
-        ws.merge_cells("A2:M2")
+        ws.merge_cells("A2:N2")
         ws["A2"] = f"Master Expenses Report — FY {self._year}  |  {month_label}"
         ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
         ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
         ws.row_dimensions[2].height = 18
 
-        ws.merge_cells("A3:M3")
+        ws.merge_cells("A3:N3")
         ws["A3"] = f"Exported: {datetime.now().strftime('%d %b %Y  %H:%M')}"
         ws["A3"].font = Font(name="Segoe UI", italic=True, size=9, color="9CA3AF")
         ws["A3"].alignment = Alignment(horizontal="center", vertical="center")
@@ -1065,7 +954,7 @@ class MasterExpensesWidget(QWidget):
         ws.append([])  # blank separator row
 
         # ── Column headers ────────────────────────────────────────────
-        all_col_names = [c[0] for c in _FROZEN_COLS + _SCROLL_COLS]
+        all_col_names = [c[0] for c in _COLS]
         ws.append(all_col_names)
         hdr_row = ws.max_row
         ws.row_dimensions[hdr_row].height = 18
@@ -1093,6 +982,7 @@ class MasterExpensesWidget(QWidget):
 
         for i, tx in enumerate(txs):
             date_str    = tx.date.strftime("%d-%b-%Y") if tx.date else ""
+            item_str    = tx.item or tx.category_name or ""
             month_str   = tx.month or (tx.date.strftime("%b %y") if tx.date else "")
             notes_str   = "Yes" if tx.notes_flag else ""
             cashier_str = _short_name(export_cashier_names.get(tx.cashier_id, "")) if tx.cashier_id else ""
@@ -1107,7 +997,7 @@ class MasterExpensesWidget(QWidget):
                 usd_total += tx.amount
 
             row_data = [
-                i + 1, date_str, tx.description or "", month_str,
+                i + 1, date_str, item_str, tx.description or "", month_str,
                 tx.truck_number or "", tx.memo or "", notes_str,
                 tzs_val, usd_val,
                 receipt_str, tx.ownership or "", tx.approver or "", cashier_str,
@@ -1120,29 +1010,29 @@ class MasterExpensesWidget(QWidget):
                 cell.fill = fill
                 cell.alignment = Alignment(vertical="center")
 
-            # Amount formatting
+            # Amount formatting (TZS=col 9, USD=col 10 after ITEM insertion)
             if tzs_val is not None:
-                c = ws.cell(r, 8)
+                c = ws.cell(r, 9)
                 c.font = red_font if tzs_val < 0 else mono_font
                 c.number_format = '#,##0'
                 c.alignment = Alignment(horizontal="right", vertical="center")
             if usd_val is not None:
-                c = ws.cell(r, 9)
+                c = ws.cell(r, 10)
                 c.font = red_font if usd_val < 0 else mono_font
                 c.number_format = '#,##0.00'
                 c.alignment = Alignment(horizontal="right", vertical="center")
 
-            # Receipt font color
+            # Receipt font color (col 11)
             rcpt_fonts = {"Received": rcpt_green, "Pending": amber_font, "No Receipt": rcpt_red}
             rf = rcpt_fonts.get(receipt_str)
             if rf:
-                ws.cell(r, 10).font = rf
-            ws.cell(r, 10).alignment = Alignment(horizontal="center", vertical="center")
+                ws.cell(r, 11).font = rf
+            ws.cell(r, 11).alignment = Alignment(horizontal="center", vertical="center")
 
         # ── Totals row ────────────────────────────────────────────────
         ws.append([])
         ws.append([
-            "", "", "TOTAL", "", "", "", "",
+            "", "", "", "TOTAL", "", "", "", "",
             tzs_total or "", usd_total or "", "", "", "", "",
         ])
         total_r = ws.max_row
@@ -1150,28 +1040,28 @@ class MasterExpensesWidget(QWidget):
         total_fill = PatternFill("solid", fgColor="EFF6FF")
         for cell in ws[total_r]:
             cell.fill = total_fill
-        ws.cell(total_r, 3).font = Font(name="Segoe UI", bold=True, size=11)
+        ws.cell(total_r, 4).font = Font(name="Segoe UI", bold=True, size=11)
         if tzs_total:
-            c = ws.cell(total_r, 8)
+            c = ws.cell(total_r, 9)
             c.font = Font(name="Cascadia Code", bold=True, size=11,
                           color="DC2626" if tzs_total < 0 else "111827")
             c.number_format = '#,##0'
             c.alignment = Alignment(horizontal="right", vertical="center")
         if usd_total:
-            c = ws.cell(total_r, 9)
+            c = ws.cell(total_r, 10)
             c.font = Font(name="Cascadia Code", bold=True, size=11,
                           color="DC2626" if usd_total < 0 else "111827")
             c.number_format = '#,##0.00'
             c.alignment = Alignment(horizontal="right", vertical="center")
 
         # ── Column widths ─────────────────────────────────────────────
-        # S/NO, DATE, DESCRIPTION, MONTH, TRUCK NO, MEMO, NOTES, TZS, USD, RECEIPT, OWNERSHIP, APPROVED BY, CASHIER
-        col_widths = [7, 13, 35, 10, 13, 22, 7, 16, 13, 16, 14, 14, 14]
+        # S/NO, DATE, ITEM, DESCRIPTION, MONTH, TRUCK NO, MEMO, NOTES, TZS, USD, RECEIPT, OWNERSHIP, APPROVED BY, CASHIER
+        col_widths = [7, 13, 16, 35, 10, 13, 22, 7, 16, 13, 16, 14, 14, 14]
         for idx, w in enumerate(col_widths, 1):
             ws.column_dimensions[ws.cell(1, idx).column_letter].width = w
 
-        # ── Freeze panes (freeze first 3 columns) ─────────────────────
-        ws.freeze_panes = ws.cell(hdr_row + 1, 4)  # freeze rows above + cols A-C
+        # ── Freeze panes (header rows + first 4 columns incl. ITEM) ────
+        ws.freeze_panes = ws.cell(hdr_row + 1, 5)  # freeze rows above + cols A-D
 
         # ── Save dialog ───────────────────────────────────────────────
         month_tag = dict(_MONTHS).get(self._month, "All")

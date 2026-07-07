@@ -16,16 +16,19 @@ import qtawesome as qta
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QHeaderView,
     QLineEdit, QComboBox, QPushButton, QMessageBox, QFileDialog,
-    QAbstractItemView, QStackedWidget,
+    QStackedWidget,
 )
 
 from tahmeed.app_state import app_state
 from tahmeed.models.transaction import Transaction
 from tahmeed.ui.accountant.category_tables import (
-    _COLS, _TABLE_SS, _ROW_H, _STRIPE, _WHITE, _BG, _BORDER, _BLUE,
-    _T1, _T2, _TM, _RED, _lbl, _input_ss, _btn, _set_cell, _receipt_badge,
+    _COLS, _WHITE, _BG, _BORDER, _BLUE,
+    _T1, _T2, _TM, _RED, _lbl, _input_ss, _btn, _receipt_badge,
+)
+from tahmeed.ui.accountant.separate_expenses import (
+    _make_table, _cell, _finish_table_row, _stripe_bg,
 )
 
 _MONTH_SHORT = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -83,14 +86,7 @@ class _DieselCashMonthBrowse(QWidget):
         tl.addWidget(self._summary_lbl)
         vl.addWidget(toolbar)
 
-        self._table = QTableWidget(0, len(_BROWSE_HEADERS))
-        self._table.setHorizontalHeaderLabels(_BROWSE_HEADERS)
-        self._table.setStyleSheet(_TABLE_SS)
-        self._table.verticalHeader().setVisible(False)
-        self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
-        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table = _make_table(_BROWSE_HEADERS)
         self._table.setShowGrid(True)
         self._table.setCursor(Qt.PointingHandCursor)
         hdr = self._table.horizontalHeader()
@@ -130,22 +126,24 @@ class _DieselCashMonthBrowse(QWidget):
         self._fill(summaries)
 
     def _fill(self, summaries: List[dict]) -> None:
-        self._table.setRowCount(len(summaries))
+        t = self._table
+        t.setRowCount(0)
         total_recs = 0
         total_tzs = 0.0
         for i, s in enumerate(summaries):
-            row_bg = _STRIPE if i % 2 else _WHITE
+            r = t.rowCount()
+            t.insertRow(r)
             month_idx = int(s.get("month", 0))
             month_label = s.get("month_name") or _MONTH_SHORT[month_idx]
             count = int(s.get("record_count", 0))
             tzs = float(s.get("tzs_total", 0))
             date_range = _fmt_date_range(s.get("min_date"), s.get("max_date"))
 
-            _set_cell(self._table, i, 0, month_label, "left", row_bg)
-            _set_cell(self._table, i, 1, f"{count:,}", "center", row_bg)
-            _set_cell(self._table, i, 2, f"{tzs:,.0f}", "right", row_bg, mono=True)
-            _set_cell(self._table, i, 3, date_range, "left", row_bg)
-            self._table.setRowHeight(i, _ROW_H)
+            t.setItem(r, 0, _cell(month_label))
+            t.setItem(r, 1, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 2, _cell(f"{tzs:,.0f}", align=Qt.AlignRight | Qt.AlignVCenter, mono=True))
+            t.setItem(r, 3, _cell(date_range))
+            _finish_table_row(t, r)
             total_recs += count
             total_tzs += tzs
 
@@ -234,14 +232,7 @@ class _DieselCashMonthDetail(QWidget):
         tl.addWidget(export_btn)
         vl.addWidget(toolbar)
 
-        self._table = QTableWidget(0, len(_COLS))
-        self._table.setHorizontalHeaderLabels([c[0] for c in _COLS])
-        self._table.setStyleSheet(_TABLE_SS)
-        self._table.verticalHeader().setVisible(False)
-        self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
-        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table = _make_table([c[0] for c in _COLS])
         self._table.setShowGrid(True)
         hdr = self._table.horizontalHeader()
         hdr.setSectionsMovable(False)
@@ -388,30 +379,41 @@ class _DieselCashMonthDetail(QWidget):
             self._loading = False
 
     def _populate(self, txs: List[Transaction], skip: int) -> None:
-        self._table.setRowCount(len(txs))
+        t = self._table
+        t.setRowCount(0)
         for i, tx in enumerate(txs):
-            row_bg = _STRIPE if i % 2 else _WHITE
-            _set_cell(self._table, i, 0, str(skip + i + 1), "center", row_bg)
-            _set_cell(self._table, i, 1,
-                      tx.date.strftime("%d %b %Y") if tx.date else "—", "left", row_bg)
-            _set_cell(self._table, i, 2, tx.item or "—", "left", row_bg)
-            _set_cell(self._table, i, 3, tx.description or "—", "left", row_bg)
-            _set_cell(self._table, i, 4, tx.truck_number or "—", "left", row_bg)
-            _set_cell(self._table, i, 5, tx.memo or "—", "left", row_bg)
-            _set_cell(self._table, i, 6, "✓" if tx.notes_flag else "—", "center",
-                      row_bg, color=_BLUE if tx.notes_flag else _TM)
+            r = t.rowCount()
+            t.insertRow(r)
+            row_bg = _stripe_bg(i)
+
+            t.setItem(r, 0, _cell(str(skip + i + 1), align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 1, _cell(
+                tx.date.strftime("%d %b %Y") if tx.date else "—",
+            ))
+            t.setItem(r, 2, _cell(tx.item or "—"))
+            t.setItem(r, 3, _cell(tx.description or "—"))
+            t.setItem(r, 4, _cell(tx.truck_number or "—"))
+            t.setItem(r, 5, _cell(tx.memo or "—"))
+            t.setItem(r, 6, _cell(
+                "✓" if tx.notes_flag else "—",
+                align=Qt.AlignCenter | Qt.AlignVCenter,
+                color=_BLUE if tx.notes_flag else _TM,
+            ))
             if tx.currency == "TZS":
                 tzs_txt = f"{tx.amount:,.0f}"
                 tzs_col = _RED if tx.amount < 0 else _T1
             else:
                 tzs_txt, tzs_col = "—", _TM
-            _set_cell(self._table, i, 7, tzs_txt, "right", row_bg, color=tzs_col, mono=True)
-            self._table.setCellWidget(
-                i, 8, _receipt_badge(tx.receipt_status or "pending", row_bg),
+            t.setItem(r, 7, _cell(
+                tzs_txt, align=Qt.AlignRight | Qt.AlignVCenter,
+                mono=True, color=tzs_col,
+            ))
+            t.setCellWidget(
+                r, 8, _receipt_badge(tx.receipt_status or "pending", row_bg),
             )
-            _set_cell(self._table, i, 9, tx.ownership or "—", "left", row_bg)
-            _set_cell(self._table, i, 10, tx.approver or "—", "left", row_bg)
-            self._table.setRowHeight(i, _ROW_H)
+            t.setItem(r, 9, _cell(tx.ownership or "—"))
+            t.setItem(r, 10, _cell(tx.approver or "—"))
+            _finish_table_row(t, r)
 
     def _update_pager(self, total: int, size: int) -> None:
         max_pg = max(0, (total - 1) // size) if total else 0
