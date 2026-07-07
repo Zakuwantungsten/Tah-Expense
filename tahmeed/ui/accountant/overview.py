@@ -40,7 +40,7 @@ def _lbl(text: str, size: int = 13, weight: int = 400,
     w = QLabel(text)
     w.setStyleSheet(
         f"color: {color}; font-size: {size}px; font-weight: {weight};"
-        " font-family: 'Segoe UI', sans-serif; background: transparent;"
+        " font-family:'Segoe UI'; background: transparent;"
     )
     if wrap:
         w.setWordWrap(True)
@@ -338,7 +338,7 @@ def _activity_card() -> QFrame:
     view_all.setCursor(Qt.PointingHandCursor)
     view_all.setStyleSheet(
         f"QPushButton {{ border: none; color: {_BLUE}; font-size: 11px;"
-        " font-family: 'Segoe UI', sans-serif; background: transparent; }}"
+        " font-family:'Segoe UI'; background: transparent; }}"
         f"QPushButton:hover {{ color: #005fa3; }}"
     )
     header.addWidget(view_all)
@@ -402,7 +402,7 @@ def _quick_actions() -> QFrame:
                 border-radius: 6px;
                 color: {_T1};
                 font-size: 12px;
-                font-family: 'Segoe UI', sans-serif;
+                font-family:'Segoe UI';
                 padding: 0 12px;
                 text-align: left;
             }}

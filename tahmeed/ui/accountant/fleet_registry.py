@@ -55,7 +55,7 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400,
     w = QLabel(text)
     w.setStyleSheet(
         f"color:{color};font-size:{size}px;font-weight:{weight};"
-        "font-family:'Segoe UI',sans-serif;background:transparent;"
+        "font-family:'Segoe UI';background:transparent;"
     )
     return w
 
@@ -73,17 +73,17 @@ def _btn(text: str, icon: str = "", primary: bool = True,
             pass
     if danger:
         ss = (f"QPushButton{{background:{_RED};color:#FFF;border:none;border-radius:5px;"
-              f"font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              f"font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
               f"QPushButton:hover{{background:#B91C1C;}}"
               f"QPushButton:disabled{{background:#FCA5A5;}}")
     elif primary:
         ss = (f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:5px;"
-              f"font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              f"font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
               f"QPushButton:hover{{background:#005EA3;}}"
               f"QPushButton:disabled{{background:#93C5FD;}}")
     else:
         ss = (f"QPushButton{{background:{_WHITE};color:{_T1};border:1px solid {_BORDER};"
-              f"border-radius:5px;font-size:12px;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              f"border-radius:5px;font-size:12px;font-family:'Segoe UI';padding:0 14px;}}"
               f"QPushButton:hover{{background:{_BG};}}"
               f"QPushButton:disabled{{color:{_TM};}}")
     b.setStyleSheet(ss)
@@ -93,11 +93,11 @@ def _btn(text: str, icon: str = "", primary: bool = True,
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
+        "border:none;font-size:12px;font-family:'Segoe UI';}}"
         f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
-        "font-size:11px;font-weight:600;font-family:'Segoe UI',sans-serif;"
+        "font-size:11px;font-weight:600;font-family:'Segoe UI';"
         f"border:none;border-bottom:1px solid {_BORDER};"
         "padding:0 6px;height:30px;}}"
         "QScrollBar:vertical{width:8px;background:transparent;}"
@@ -124,12 +124,12 @@ def _status_chip(active: bool) -> QLabel:
     if active:
         lbl.setStyleSheet(
             f"background:{_GREEN_L};color:{_GREEN};font-size:10px;font-weight:700;"
-            "border-radius:11px;padding:0 8px;font-family:'Segoe UI',sans-serif;"
+            "border-radius:11px;padding:0 8px;font-family:'Segoe UI';"
         )
     else:
         lbl.setStyleSheet(
             f"background:{_RED_L};color:{_RED};font-size:10px;font-weight:700;"
-            "border-radius:11px;padding:0 8px;font-family:'Segoe UI',sans-serif;"
+            "border-radius:11px;padding:0 8px;font-family:'Segoe UI';"
         )
     return lbl
 
@@ -156,7 +156,7 @@ class _AddVehicleDialog(QDialog):
         self._inp.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:13px;"
-            "font-family:'Segoe UI',sans-serif;padding:0 8px;"
+            "font-family:'Segoe UI';padding:0 8px;"
             "min-height:34px;max-height:34px;}}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
@@ -233,7 +233,7 @@ class _FleetRegistryBase(QWidget):
         self._count_chip.setStyleSheet(
             f"background:{_BLUE_L};color:{_BLUE};font-size:11px;font-weight:700;"
             "border-radius:10px;padding:2px 10px;"
-            "font-family:'Segoe UI',sans-serif;"
+            "font-family:'Segoe UI';"
         )
         hdr.addWidget(self._count_chip)
         hdr.addStretch()
@@ -253,7 +253,7 @@ class _FleetRegistryBase(QWidget):
             pass
         self._restrict_btn.setStyleSheet(
             f"QPushButton{{background:{_WHITE};color:{_T2};border:1px solid {_BORDER};"
-            "border-radius:5px;font-size:12px;font-family:'Segoe UI',sans-serif;padding:0 12px;}}"
+            "border-radius:5px;font-size:12px;font-family:'Segoe UI';padding:0 12px;}}"
             f"QPushButton:checked{{background:{_GREEN_L};color:{_GREEN};border-color:{_GREEN};}}"
             f"QPushButton:hover:!checked{{background:{_BG};}}"
         )
@@ -280,7 +280,7 @@ class _FleetRegistryBase(QWidget):
         self._search.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI',sans-serif;padding:0 8px;}}"
+            "font-family:'Segoe UI';padding:0 8px;}}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
         self._search.textChanged.connect(self._on_search)
@@ -292,7 +292,7 @@ class _FleetRegistryBase(QWidget):
         self._filter_cb.setStyleSheet(
             f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI',sans-serif;padding:0 8px;min-width:120px;}}"
+            "font-family:'Segoe UI';padding:0 8px;min-width:120px;}}"
             f"QComboBox:focus{{border-color:{_BLUE};}}"
             "QComboBox::drop-down{border:none;width:20px;}"
         )

@@ -458,7 +458,7 @@ class _StationTabBar(QWidget):
         add.setStyleSheet(
             f"QPushButton{{background:transparent;color:{_BLUE};border:1px dashed {_BLUE};"
             "border-radius:15px;font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+            "font-family:'Segoe UI';padding:0 14px;}}"
             f"QPushButton:hover{{background:{_BLUE_L};}}"
         )
         add.clicked.connect(self.add_requested.emit)
@@ -476,13 +476,13 @@ class _StationTabBar(QWidget):
                 chip.setStyleSheet(
                     f"QPushButton{{background:{_BLUE};color:#FFF;border:none;"
                     "border-radius:15px;font-size:12px;font-weight:600;"
-                    "font-family:'Segoe UI',sans-serif;padding:0 16px;}}"
+                    "font-family:'Segoe UI';padding:0 16px;}}"
                 )
             else:
                 chip.setStyleSheet(
                     f"QPushButton{{background:{_WHITE};color:{_T2};border:1px solid {_BORDER};"
                     "border-radius:15px;font-size:12px;"
-                    "font-family:'Segoe UI',sans-serif;padding:0 16px;}}"
+                    "font-family:'Segoe UI';padding:0 16px;}}"
                     f"QPushButton:hover{{background:{_BG};color:{_T1};}}"
                 )
         if emit:

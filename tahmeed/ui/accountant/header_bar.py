@@ -77,7 +77,7 @@ class HeaderBar(QFrame):
         logo.setStyleSheet(
             f"background: {_BLUE}; color: #ffffff; font-size: 14px;"
             " font-weight: 700; border-radius: 15px;"
-            " font-family: 'Segoe UI', sans-serif;"
+            " font-family:'Segoe UI';"
         )
         hl.addWidget(logo)
         hl.addSpacing(9)
@@ -86,7 +86,7 @@ class HeaderBar(QFrame):
         app_name = QLabel("Tahmeed Expense")
         app_name.setStyleSheet(
             f"color: {text_col}; font-size: 15px; font-weight: 700;"
-            " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            " font-family:'Segoe UI'; background: transparent;"
         )
         hl.addWidget(app_name)
 
@@ -123,7 +123,7 @@ class HeaderBar(QFrame):
                 "  border: none;"
                 "  font-size: 12px;"
                 "  color: #6B7280;"
-                "  font-family: 'Segoe UI', sans-serif;"
+                "  font-family:'Segoe UI';"
                 "}"
             )
             sw.addWidget(search_icon)
@@ -145,7 +145,7 @@ class HeaderBar(QFrame):
         avatar.setStyleSheet(
             f"background: {_BLUE}; color: #ffffff; font-size: 12px;"
             " font-weight: 700; border-radius: 16px;"
-            " font-family: 'Segoe UI', sans-serif;"
+            " font-family:'Segoe UI';"
         )
         avatar.setCursor(Qt.PointingHandCursor)
         hl.addWidget(avatar)
@@ -180,7 +180,7 @@ class _BellWidget(QWidget):
         self._badge.setStyleSheet(
             "background: #DC2626; color: #ffffff; font-size: 9px;"
             " font-weight: 700; border-radius: 8px;"
-            " font-family: 'Segoe UI', sans-serif;"
+            " font-family:'Segoe UI';"
         )
         self._badge.move(19, 2)
 

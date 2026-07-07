@@ -90,7 +90,7 @@ _TABLE_SS = (
     f"  background: {_WHITE};"
     f"  gridline-color: {_BORDER};"
     f"  font-size: 12px;"
-    f"  font-family: 'Segoe UI', sans-serif;"
+    f"  font-family:'Segoe UI';"
     f"  color: {_T1};"
     f"  border: none;"
     f"  selection-background-color: #DBEAFE;"
@@ -105,7 +105,7 @@ _TABLE_SS = (
     f"  color: {_T2};"
     f"  font-size: 11px;"
     f"  font-weight: 600;"
-    f"  font-family: 'Segoe UI', sans-serif;"
+    f"  font-family:'Segoe UI';"
     f"  border: none;"
     f"  border-bottom: 2px solid {_BORDER};"
     f"  border-right: 1px solid {_BORDER};"
@@ -136,7 +136,7 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400,
     w = QLabel(text)
     w.setStyleSheet(
         f"color: {color}; font-size: {size}px; font-weight: {weight};"
-        " font-family: 'Segoe UI', sans-serif; background: transparent;"
+        " font-family:'Segoe UI'; background: transparent;"
     )
     return w
 
@@ -146,7 +146,7 @@ def _input_ss() -> str:
         f"QLineEdit, QComboBox {{"
         f"  border: 1px solid {_BORDER}; border-radius: 5px;"
         f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
-        "  font-family: 'Segoe UI', sans-serif; padding: 0 8px;"
+        "  font-family:'Segoe UI'; padding: 0 8px;"
         "  min-height: 32px; max-height: 32px; }}"
         f"QLineEdit:focus, QComboBox:focus {{ border-color: {_BLUE}; }}"
         "QComboBox::drop-down { border: none; width: 20px; }"
@@ -176,7 +176,7 @@ def _action_btn(text: str, icon_name: str, primary: bool = True) -> QPushButton:
         ss = (
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 12px; font-weight: 600;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 12px; }}"
+            " font-family:'Segoe UI'; padding: 0 12px; }}"
             "QPushButton:hover { background: #005EA3; }"
             "QPushButton:disabled { background: #93C5FD; }"
         )
@@ -185,7 +185,7 @@ def _action_btn(text: str, icon_name: str, primary: bool = True) -> QPushButton:
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER};"
             " border-radius: 5px; font-size: 12px;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 12px; }}"
+            " font-family:'Segoe UI'; padding: 0 12px; }}"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
     b.setStyleSheet(ss)
@@ -204,7 +204,7 @@ def _receipt_badge(status: str) -> QWidget:
     lbl.setStyleSheet(
         f"color: {fg}; background: {bg}; border-radius: 10px;"
         " padding: 2px 8px; font-size: 10px; font-weight: 600;"
-        " font-family: 'Segoe UI', sans-serif;"
+        " font-family:'Segoe UI';"
     )
     hl.addWidget(lbl)
     return container
@@ -275,14 +275,14 @@ class _MonthTabBar(QFrame):
                 f"QPushButton {{ background: {_BLUE}; color: #fff;"
                 " border: none; border-radius: 14px;"
                 " font-size: 11px; font-weight: 700;"
-                " font-family: 'Segoe UI', sans-serif; padding: 0 10px; }}"
+                " font-family:'Segoe UI'; padding: 0 10px; }}"
             )
         else:
             btn.setStyleSheet(
                 f"QPushButton {{ background: transparent; color: {_T2};"
                 f" border: 1px solid {_BORDER}; border-radius: 14px;"
                 " font-size: 11px;"
-                " font-family: 'Segoe UI', sans-serif; padding: 0 10px; }}"
+                " font-family:'Segoe UI'; padding: 0 10px; }}"
                 f"QPushButton:hover {{ background: {_BG}; color: {_T1}; }}"
             )
 

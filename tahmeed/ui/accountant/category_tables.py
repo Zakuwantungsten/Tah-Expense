@@ -108,14 +108,14 @@ _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE};"
     f"  gridline-color: {_BORDER};"
-    f"  font-size: 12px; font-family: 'Segoe UI', sans-serif;"
+    f"  font-size: 12px; font-family:'Segoe UI';"
     f"  color: {_T1}; border: none;"
     f"  selection-background-color: #DBEAFE; selection-color: {_T1};"
     f"}}"
     f"QTableWidget::item {{ padding: 2px 6px; border: none; }}"
     f"QHeaderView::section {{"
     f"  background: {_HDR_BG}; color: {_T2};"
-    f"  font-size: 11px; font-weight: 600; font-family: 'Segoe UI', sans-serif;"
+    f"  font-size: 11px; font-weight: 600; font-family:'Segoe UI';"
     f"  border: none; border-bottom: 2px solid {_BORDER};"
     f"  border-right: 1px solid {_BORDER}; padding: 0 6px; min-height: 30px;"
     f"}}"
@@ -134,7 +134,7 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400, color: str = _T1) ->
     w = QLabel(text)
     w.setStyleSheet(
         f"color: {color}; font-size: {size}px; font-weight: {weight};"
-        " font-family: 'Segoe UI', sans-serif; background: transparent;"
+        " font-family:'Segoe UI'; background: transparent;"
     )
     return w
 
@@ -144,7 +144,7 @@ def _input_ss() -> str:
         f"QLineEdit, QComboBox {{"
         f"  border: 1px solid {_BORDER}; border-radius: 5px;"
         f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
-        "  font-family: 'Segoe UI', sans-serif; padding: 0 8px;"
+        "  font-family:'Segoe UI'; padding: 0 8px;"
         "  min-height: 32px; max-height: 32px; }}"
         f"QLineEdit:focus, QComboBox:focus {{ border-color: {_BLUE}; }}"
         "QComboBox::drop-down { border: none; width: 20px; }"
@@ -165,7 +165,7 @@ def _btn(text: str, icon_name: str = "", primary: bool = False) -> QPushButton:
         b.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 12px; font-weight: 600;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 12px; }}"
+            " font-family:'Segoe UI'; padding: 0 12px; }}"
             "QPushButton:hover { background: #005EA3; }"
             "QPushButton:disabled { background: #93C5FD; }"
         )
@@ -173,7 +173,7 @@ def _btn(text: str, icon_name: str = "", primary: bool = False) -> QPushButton:
         b.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px; font-size: 12px;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 12px; }}"
+            " font-family:'Segoe UI'; padding: 0 12px; }}"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
     return b
@@ -211,7 +211,7 @@ def _receipt_badge(status: str, bg: str) -> QWidget:
         pill.setStyleSheet(
             f"color: {fg}; background: {badge_bg}; border-radius: 9px;"
             " padding: 2px 8px; font-size: 10px; font-weight: 600;"
-            " font-family: 'Segoe UI', sans-serif;"
+            " font-family:'Segoe UI';"
         )
     hl.addWidget(pill)
     return container

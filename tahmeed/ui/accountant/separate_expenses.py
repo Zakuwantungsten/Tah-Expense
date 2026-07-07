@@ -93,7 +93,7 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400,
     w = QLabel(text)
     w.setStyleSheet(
         f"color:{color};font-size:{size}px;font-weight:{weight};"
-        "font-family:'Segoe UI',sans-serif;background:transparent;"
+        "font-family:'Segoe UI';background:transparent;"
     )
     return w
 
@@ -111,17 +111,17 @@ def _btn(text: str, icon: str = "", primary: bool = True,
             pass
     if danger:
         ss = (f"QPushButton{{background:{_RED};color:#FFF;border:none;border-radius:5px;"
-              f"font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              f"font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
               f"QPushButton:hover{{background:#B91C1C;}}"
               f"QPushButton:disabled{{background:#FCA5A5;}}")
     elif primary:
         ss = (f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:5px;"
-              f"font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              f"font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
               f"QPushButton:hover{{background:#005EA3;}}"
               f"QPushButton:disabled{{background:#93C5FD;}}")
     else:
         ss = (f"QPushButton{{background:{_WHITE};color:{_T1};border:1px solid {_BORDER};"
-              f"border-radius:5px;font-size:12px;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              f"border-radius:5px;font-size:12px;font-family:'Segoe UI';padding:0 14px;}}"
               f"QPushButton:hover{{background:{_BG};}}"
               f"QPushButton:disabled{{color:{_TM};}}")
     b.setStyleSheet(ss)
@@ -132,7 +132,7 @@ def _input_ss() -> str:
     return (
         f"QLineEdit,QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
         f"background:{_WHITE};color:{_T1};font-size:12px;"
-        f"font-family:'Segoe UI',sans-serif;padding:0 8px;"
+        f"font-family:'Segoe UI';padding:0 8px;"
         f"min-height:32px;max-height:32px;}}"
         f"QLineEdit:focus,QComboBox:focus{{border-color:{_BLUE};}}"
         "QComboBox::drop-down{border:none;width:20px;}"
@@ -163,11 +163,11 @@ def _card(widget: QWidget) -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:11px;font-family:'Segoe UI',sans-serif;}}"
+        "border:none;font-size:11px;font-family:'Segoe UI';}}"
         f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
-        "font-size:10px;font-weight:600;font-family:'Segoe UI',sans-serif;"
+        "font-size:10px;font-weight:600;font-family:'Segoe UI';"
         f"border:none;border-bottom:1px solid {_BORDER};"
         f"padding:0 8px;height:{_HDR_H}px;}}"
         "QScrollBar:vertical{width:8px;background:transparent;}"
@@ -1860,7 +1860,7 @@ class _CongoExpUploadDetail(QWidget):
         self._bal_lbl.setText(f"Balance: USD {_kimvi_fmt_amount(balance)}")
         self._bal_lbl.setStyleSheet(
             f"color:{bal_color};font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI',sans-serif;background:transparent;"
+            "font-family:'Segoe UI';background:transparent;"
         )
 
         self._totals.set_total("count", count, "")
@@ -2724,7 +2724,7 @@ class _KimviUploadDetail(QWidget):
         self._bal_lbl.setText(f"Balance: USD {_kimvi_fmt_amount(balance)}")
         self._bal_lbl.setStyleSheet(
             f"color:{bal_color};font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI',sans-serif;background:transparent;"
+            "font-family:'Segoe UI';background:transparent;"
         )
 
         self._totals.set_total("count", count, "")
@@ -3868,11 +3868,11 @@ class _AfritrackGrid(QTableWidget):
     def _grid_ss(self) -> str:
         return (
             f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-            "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
+            "border:none;font-size:12px;font-family:'Segoe UI';}}"
             f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
             f"QTableWidget::item:selected{{background:{_QB_SEL_BG};color:{_QB_SEL_FG};}}"
             f"QHeaderView::section{{background:{_QB_HDR_BG};color:{_QB_HDR_FG};"
-            "font-size:10px;font-weight:700;font-family:'Segoe UI',sans-serif;"
+            "font-size:10px;font-weight:700;font-family:'Segoe UI';"
             f"border:none;border-right:1px solid {_BORDER};"
             f"border-bottom:2px solid {_BLUE};padding:0 6px;height:{_HDR_H}px;}}"
             "QScrollBar:vertical{width:8px;background:transparent;}"
@@ -4210,7 +4210,7 @@ class _AfritrackGrid(QTableWidget):
         menu.setStyleSheet(
             f"QMenu{{background:{_WHITE};border:1px solid {_BORDER};"
             f"border-radius:6px;padding:4px;"
-            f"font-size:12px;font-family:'Segoe UI',sans-serif;}}"
+            f"font-size:12px;font-family:'Segoe UI';}}"
             f"QMenu::item{{padding:6px 20px;border-radius:4px;color:{_T1};}}"
             f"QMenu::item:selected{{background:{_BLUE_L};}}"
             f"QMenu::separator{{height:1px;background:{_BORDER};margin:4px 8px;}}"
@@ -4275,7 +4275,7 @@ class _AfritrackFooter(QWidget):
     def _foot_ss(self) -> str:
         return (
             f"QTableWidget{{background:{_QB_FOOT_BG};gridline-color:{_BORDER};"
-            "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
+            "border:none;font-size:12px;font-family:'Segoe UI';}}"
             f"QTableWidget::item{{padding:0 8px;color:{_T1};}}"
         )
 
@@ -4386,7 +4386,7 @@ def _qb_field_widget(label_text: str, input_widget: QWidget) -> QWidget:
     lbl = QLabel(label_text)
     lbl.setStyleSheet(
         f"color:{_T2};font-size:9px;font-weight:600;letter-spacing:0.8px;"
-        f"font-family:'Segoe UI',sans-serif;background:transparent;"
+        f"font-family:'Segoe UI';background:transparent;"
     )
     vl.addWidget(lbl)
     vl.addWidget(input_widget)
@@ -4411,7 +4411,7 @@ def _qb_amount_widget(
     lbl = QLabel(label_text)
     lbl.setStyleSheet(
         f"color:{_T2};font-size:9px;font-weight:600;letter-spacing:0.8px;"
-        f"font-family:'Segoe UI',sans-serif;background:transparent;"
+        f"font-family:'Segoe UI';background:transparent;"
     )
     vl.addWidget(lbl)
 
@@ -4435,7 +4435,7 @@ def _qb_amount_widget(
         f"border-right:1px solid {_BORDER};"
         f"border-top-left-radius:4px;border-bottom-left-radius:4px;"
         f"color:{badge_fg};font-size:10px;font-weight:700;"
-        f"font-family:'Segoe UI',sans-serif;}}"
+        f"font-family:'Segoe UI';}}"
     )
     hl.addWidget(badge_lbl)
 
@@ -4444,7 +4444,7 @@ def _qb_amount_widget(
     val_fg = _QB_RED_DARK if red else _QB_HDR_FG
     val_lbl.setStyleSheet(
         f"QLabel{{color:{val_fg};font-size:14px;font-weight:700;"
-        f"font-family:'Segoe UI',sans-serif;background:transparent;padding:0 10px;}}"
+        f"font-family:'Segoe UI';background:transparent;padding:0 10px;}}"
     )
     hl.addWidget(val_lbl, 1)
     vl.addWidget(box)
@@ -4548,7 +4548,7 @@ class AfritrackWidget(QWidget):
         title_lbl = QLabel("Afritrack Schedule")
         title_lbl.setStyleSheet(
             f"color:{_QB_HDR_FG};font-size:20px;font-weight:700;"
-            f"font-family:'Segoe UI',sans-serif;background:transparent;"
+            f"font-family:'Segoe UI';background:transparent;"
         )
         root.addWidget(title_lbl)
 
@@ -4578,7 +4578,7 @@ class AfritrackWidget(QWidget):
         supp_lbl.setStyleSheet(
             f"QLineEdit{{background:{_BG};border:1px solid {_BORDER};"
             "border-radius:4px;color:#111827;font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI',sans-serif;padding:0 10px;"
+            "font-family:'Segoe UI';padding:0 10px;"
             "min-height:32px;max-height:32px;}}"
         )
         ll.addWidget(_qb_field_widget("SUPPLIER", supp_lbl))
@@ -4768,6 +4768,12 @@ class AfritrackWidget(QWidget):
             QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", str(exc))
+
+    def refresh(self) -> None:
+        """Called when the sidebar navigates to this page."""
+        self._search.clear()
+        self._grid.filter_rows("")
+        self._on_data_changed()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5114,7 +5120,7 @@ def _ins_info_card(title: str, icon_name: str) -> Tuple[QFrame, QLabel]:
     t_lbl = QLabel(title)
     t_lbl.setStyleSheet(
         f"color:{_QB_HDR_FG};font-size:18px;font-weight:700;"
-        "font-family:'Segoe UI',sans-serif;background:transparent;"
+        "font-family:'Segoe UI';background:transparent;"
     )
     vl2.addWidget(t_lbl)
     s_lbl = _lbl("Import records to get started", size=11, color=_T2)

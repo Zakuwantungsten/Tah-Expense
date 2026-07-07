@@ -92,7 +92,7 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400,
     w = QLabel(text)
     w.setStyleSheet(
         f"color:{color};font-size:{size}px;font-weight:{weight};"
-        "font-family:'Segoe UI',sans-serif;background:transparent;"
+        "font-family:'Segoe UI';background:transparent;"
     )
     return w
 
@@ -110,17 +110,17 @@ def _btn(text: str, icon: str = "", primary: bool = True,
             pass
     if danger:
         ss = (f"QPushButton{{background:{_RED};color:#FFF;border:none;border-radius:5px;"
-              "font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
               "QPushButton:hover{background:#B91C1C;}"
               "QPushButton:disabled{background:#FCA5A5;}")
     elif primary:
         ss = (f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:5px;"
-              "font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
               "QPushButton:hover{background:#005EA3;}"
               "QPushButton:disabled{background:#93C5FD;}")
     else:
         ss = (f"QPushButton{{background:{_WHITE};color:{_T1};border:1px solid {_BORDER};"
-              f"border-radius:5px;font-size:12px;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              f"border-radius:5px;font-size:12px;font-family:'Segoe UI';padding:0 14px;}}"
               f"QPushButton:hover{{background:{_BG};}}"
               f"QPushButton:disabled{{color:{_TM};}}")
     b.setStyleSheet(ss)
@@ -131,7 +131,7 @@ def _input_ss() -> str:
     return (
         f"QLineEdit,QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
         f"background:{_WHITE};color:{_T1};font-size:12px;"
-        "font-family:'Segoe UI',sans-serif;padding:0 8px;"
+        "font-family:'Segoe UI';padding:0 8px;"
         "min-height:32px;max-height:32px;}}"
         f"QLineEdit:focus,QComboBox:focus{{border-color:{_BLUE};}}"
         "QComboBox::drop-down{border:none;width:20px;}"
@@ -149,12 +149,12 @@ def _hsep() -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
+        "border:none;font-size:12px;font-family:'Segoe UI';}}"
         f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_QB_SEL_BG};color:{_QB_SEL_FG};}}"
         f"QTableWidget::item:alternate{{background:#F9FAFB;}}"
         f"QHeaderView::section{{background:{_QB_HDR_BG};color:{_QB_HDR_FG};"
-        "font-size:11px;font-weight:700;font-family:'Segoe UI',sans-serif;"
+        "font-size:11px;font-weight:700;font-family:'Segoe UI';"
         f"border:none;border-right:1px solid {_BORDER};"
         f"border-bottom:2px solid {_BLUE};padding:0 6px;height:32px;}}"
         "QScrollBar:vertical{width:8px;background:transparent;}"
@@ -456,7 +456,7 @@ class _ActionPanel(QFrame):
         self._notes.setStyleSheet(
             f"QTextEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI',sans-serif;padding:5px;}}"
+            "font-family:'Segoe UI';padding:5px;}}"
             f"QTextEdit:focus{{border-color:{_BLUE};}}"
         )
         nvl.addWidget(self._notes)
@@ -576,7 +576,7 @@ class _SubTabBar(QFrame):
     _TAB_SS = (
         "QPushButton{background:transparent;border:none;"
         "border-bottom:2px solid transparent;color:%s;font-size:13px;font-weight:600;"
-        "font-family:'Segoe UI',sans-serif;padding:0 4px;}"
+        "font-family:'Segoe UI';padding:0 4px;}"
         "QPushButton:hover{color:%s;}"
         "QPushButton:checked{color:%s;border-bottom:2px solid %s;}"
     ) % (_T2, _T1, _BLUE, _BLUE)
@@ -584,7 +584,7 @@ class _SubTabBar(QFrame):
     _REJECTED_SS = (
         "QPushButton{background:transparent;border:none;"
         "border-bottom:2px solid transparent;color:%s;font-size:13px;font-weight:600;"
-        "font-family:'Segoe UI',sans-serif;padding:0 4px;}"
+        "font-family:'Segoe UI';padding:0 4px;}"
         "QPushButton:hover{color:%s;}"
         "QPushButton:checked{color:%s;border-bottom:2px solid %s;}"
     ) % (_T2, _RED, _RED, _RED)
@@ -685,7 +685,7 @@ class VerifyInboxWidget(QWidget):
         self._pending_badge.setStyleSheet(
             "color:#6B7280;background:#F3F4F6;border-radius:8px;"
             "padding:2px 8px;font-size:11px;font-weight:600;"
-            "font-family:'Segoe UI',sans-serif;"
+            "font-family:'Segoe UI';"
         )
         self._pending_badge.setMinimumWidth(28)
         tbl.addWidget(self._pending_badge)

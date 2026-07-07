@@ -649,6 +649,162 @@ async def get_master_categories(year: Optional[int] = None) -> List[str]:
     return sorted(v for v in vals if v)
 
 
+# ── Diesel Cash (cashier-fed, verified transactions) ─────────────────────────
+
+DIESEL_CASH_CATEGORY = "Diesel Cash"
+
+# Canonical cashier item name for diesel cash. Matched case-insensitively so
+# minor casing variations still land in the Diesel Cash tab.
+DIESEL_CASH_CATEGORIES = ("Diesel Cash",)
+
+_MONTH_NAMES = (
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def _diesel_cash_name_filter() -> dict:
+    """Case-insensitive exact match against any known diesel-cash item name."""
+    alternation = "|".join(re.escape(n) for n in DIESEL_CASH_CATEGORIES)
+    return {"$regex": f"^(?:{alternation})$", "$options": "i"}
+
+
+def _build_diesel_cash_query(
+    year: Optional[int],
+    month: int = 0,
+    search: str = "",
+    truck: str = "",
+    receipt: str = "",
+) -> dict:
+    _year = year or date.today().year
+    if month and 1 <= month <= 12:
+        last_day = calendar.monthrange(_year, month)[1]
+        date_filter: dict = {
+            "$gte": datetime(_year, month, 1),
+            "$lte": datetime(_year, month, last_day, 23, 59, 59),
+        }
+    else:
+        date_filter = {
+            "$gte": datetime(_year, 1, 1),
+            "$lte": datetime(_year, 12, 31, 23, 59, 59),
+        }
+
+    query: dict = {
+        "verified": True,
+        "category_name": _diesel_cash_name_filter(),
+        "date": date_filter,
+    }
+    if search.strip():
+        query["description"] = {"$regex": re.escape(search.strip()), "$options": "i"}
+    if truck.strip():
+        query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
+    if receipt.strip() and receipt != "all":
+        query["receipt_status"] = receipt.strip()
+    return query
+
+
+async def get_diesel_cash_month_summaries(year: int) -> list:
+    """One summary row per calendar month for verified Diesel Cash transactions."""
+    db = get_db()
+    pipeline = [
+        {"$match": {
+            "verified": True,
+            "category_name": _diesel_cash_name_filter(),
+            "date": {
+                "$gte": datetime(year, 1, 1),
+                "$lte": datetime(year, 12, 31, 23, 59, 59),
+            },
+        }},
+        {"$group": {
+            "_id": {"$month": "$date"},
+            "record_count": {"$sum": 1},
+            "tzs_total": {
+                "$sum": {"$cond": [{"$eq": ["$currency", "TZS"]}, "$amount", 0]},
+            },
+            "usd_total": {
+                "$sum": {"$cond": [{"$eq": ["$currency", "USD"]}, "$amount", 0]},
+            },
+            "min_date": {"$min": "$date"},
+            "max_date": {"$max": "$date"},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+    docs = await db.transactions.aggregate(pipeline).to_list(length=12)
+    summaries = []
+    for doc in docs:
+        month_idx = int(doc["_id"])
+        min_d = doc.get("min_date")
+        max_d = doc.get("max_date")
+        summaries.append({
+            "month": month_idx,
+            "month_name": _MONTH_NAMES[month_idx] if 1 <= month_idx <= 12 else str(month_idx),
+            "record_count": int(doc.get("record_count", 0)),
+            "tzs_total": float(doc.get("tzs_total", 0)),
+            "usd_total": float(doc.get("usd_total", 0)),
+            "min_date": min_d,
+            "max_date": max_d,
+        })
+    return summaries
+
+
+async def get_diesel_cash_transactions(
+    year: Optional[int] = None,
+    month: int = 0,
+    search: str = "",
+    truck: str = "",
+    receipt: str = "",
+    sort_field: str = "date",
+    sort_asc: bool = False,
+    limit: int = 50,
+    skip: int = 0,
+) -> List[Transaction]:
+    db = get_db()
+    query = _build_diesel_cash_query(year, month, search, truck, receipt)
+    direction = 1 if sort_asc else -1
+    cursor = (
+        db.transactions.find(query)
+        .sort([(sort_field, direction), ("created_at", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
+
+
+async def count_diesel_cash_transactions(
+    year: Optional[int] = None,
+    month: int = 0,
+    search: str = "",
+    truck: str = "",
+    receipt: str = "",
+) -> int:
+    db = get_db()
+    query = _build_diesel_cash_query(year, month, search, truck, receipt)
+    return await db.transactions.count_documents(query)
+
+
+async def get_diesel_cash_totals(
+    year: Optional[int] = None,
+    month: int = 0,
+    search: str = "",
+    truck: str = "",
+    receipt: str = "",
+) -> dict:
+    db = get_db()
+    query = _build_diesel_cash_query(year, month, search, truck, receipt)
+    result = await db.transactions.aggregate([
+        {"$match": query},
+        {"$group": {
+            "_id": None,
+            "tzs_total": {"$sum": {"$cond": [{"$eq": ["$currency", "TZS"]}, "$amount", 0]}},
+            "usd_total": {"$sum": {"$cond": [{"$eq": ["$currency", "USD"]}, "$amount", 0]}},
+        }},
+    ]).to_list(1)
+    if result:
+        return {"tzs": result[0]["tzs_total"], "usd": result[0]["usd_total"]}
+    return {"tzs": 0.0, "usd": 0.0}
+
+
 # ── stubs (diesel / reconciliation) ──────────────────────────────────────────
 
 async def get_diesel_entries(
@@ -1181,15 +1337,110 @@ async def get_diesel_totals(feed_type: str) -> dict:
         {"$match": {"feed_type": feed_type}},
         {"$group": {
             "_id":          None,
-            "ltrs":         {"$sum": {"$toDouble": {"$ifNull": ["$ltrs", 0]}}},
-            "total_amount": {"$sum": {"$toDouble": {"$ifNull": ["$total_amount", 0]}}},
-            "lake_usd":     {"$sum": {"$toDouble": {"$ifNull": ["$lake_usd", 0]}}},
+            "ltrs":         {"$sum": _safe_double("ltrs")},
+            "total_amount": {"$sum": _safe_double("total_amount")},
         }},
     ]
     result = await db.imported_feeds.aggregate(pipeline).to_list(1)
     if result:
         return result[0]
-    return {"ltrs": 0.0, "total_amount": 0.0, "lake_usd": 0.0}
+    return {"ltrs": 0.0, "total_amount": 0.0}
+
+
+# ── Diesel feed — per-upload batch browse/detail ─────────────────────────────
+#  Each Import tags its rows with a shared upload_id + source_filename +
+#  sheet_label so the fuel pages can browse imports as batches (like Toll
+#  Plaza / Parking Congo) and drill into a single upload's records.
+
+async def get_diesel_uploads(feed_type: str) -> list:
+    """Return one summary doc per import batch for a diesel feed_type."""
+    db = get_db()
+    pipeline = [
+        {"$match": {
+            "feed_type": feed_type,
+            "upload_id": {"$exists": True, "$ne": ""},
+        }},
+        {"$group": {
+            "_id":             "$upload_id",
+            "source_filename": {"$first": "$source_filename"},
+            "sheet_label":     {"$first": "$sheet_label"},
+            "import_date":     {"$first": "$import_date"},
+            "record_count":    {"$sum": 1},
+            "ltrs":            {"$sum": _safe_double("ltrs")},
+            "total_amount":    {"$sum": _safe_double("total_amount")},
+            "min_date":        {"$min": "$date"},
+            "max_date":        {"$max": "$date"},
+        }},
+        {"$sort": {"import_date": -1}},
+    ]
+    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+
+
+def _diesel_records_query(feed_type: str, upload_id: str, search: str) -> dict:
+    query: dict = {"feed_type": feed_type, "upload_id": upload_id}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"truck_no":     {"$regex": s, "$options": "i"}},
+            {"lpo_no":       {"$regex": s, "$options": "i"}},
+            {"do_sdo_no":    {"$regex": s, "$options": "i"}},
+            {"clients_name": {"$regex": s, "$options": "i"}},
+            {"destinations": {"$regex": s, "$options": "i"}},
+            {"diesel_at":    {"$regex": s, "$options": "i"}},
+        ]
+    return query
+
+
+async def get_diesel_upload_records(
+    feed_type: str,
+    upload_id: str,
+    search: str = "",
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated records for a single diesel upload batch."""
+    db = get_db()
+    query = _diesel_records_query(feed_type, upload_id, search)
+    cursor = db.imported_feeds.find(query).sort("date", 1).skip(skip).limit(limit)
+    return await cursor.to_list(length=limit)
+
+
+async def count_diesel_upload_records(
+    feed_type: str, upload_id: str, search: str = "",
+) -> int:
+    """Count records for a single diesel upload batch."""
+    db = get_db()
+    return await db.imported_feeds.count_documents(
+        _diesel_records_query(feed_type, upload_id, search)
+    )
+
+
+async def get_diesel_upload_totals(
+    feed_type: str, upload_id: str, search: str = "",
+) -> dict:
+    """Ltrs + amount totals for the (optionally searched) upload batch."""
+    db = get_db()
+    pipeline = [
+        {"$match": _diesel_records_query(feed_type, upload_id, search)},
+        {"$group": {
+            "_id":          None,
+            "ltrs":         {"$sum": _safe_double("ltrs")},
+            "total_amount": {"$sum": _safe_double("total_amount")},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        return result[0]
+    return {"ltrs": 0.0, "total_amount": 0.0}
+
+
+async def delete_diesel_upload(feed_type: str, upload_id: str) -> int:
+    """Delete every record belonging to one diesel upload batch."""
+    db = get_db()
+    result = await db.imported_feeds.delete_many(
+        {"feed_type": feed_type, "upload_id": upload_id}
+    )
+    return result.deleted_count
 
 
 # ── Ahmed Kimvi — Excel import (last sheet per workbook) ─────────────────────

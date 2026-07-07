@@ -1,18 +1,22 @@
 """Fuel Consumption widgets — Infinity, Lake Zambia, Lake Tunduma, GBP Diesel.
 
-Each widget mirrors the Excel sheet columns from 'infinity,lake tunduma.xlsx':
-  DIESEL INFINITY    → InfinityWidget     (Date·LPO·DO/SDO·Diesel@·Client·Dest·Truck·Ltrs·Price·Total)
-  DIESEL LAKE ZAMBIA → LakeZambiaWidget   (same + S/No · Lake US$ · Remark)
-  DIESEL LAKE TUNDUMA→ LakeTundumaWidget  (same structure as Infinity)
-  DIESEL GBP         → GBPDieselWidget    (S/No + Infinity columns)
+Each station owns a fixed column structure (mirroring its sheet in the
+reconciliation workbook).  Uploading works like Separate Expenses:
 
-Design: QuickBooks-inspired — metric cards, clean table, import with sheet selector.
+    Import  →  pick the sheet  →  headers are validated against this
+    station's structure  →  preview  →  import  →  land on the Uploads
+    list (one row per import batch)  →  click a batch to drill into its
+    records.
+
+If the chosen sheet's headers don't match the station's structure the
+import is blocked and the user is asked to pick the correct sheet.
 """
 
 from __future__ import annotations
 
 import asyncio
 import csv
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,8 +27,8 @@ from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFrame,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
+    QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
@@ -43,82 +47,131 @@ _BLUE_L  = "#E8F4FD"
 _T1      = "#111827"
 _T2      = "#6B7280"
 _TM      = "#9CA3AF"
+_RED     = "#DC2626"
+_GREEN   = "#059669"
 _HDR_BG  = "#F1F5F9"
-_ALT_ROW = "#F9FAFB"
+
+# Row styling — mirrors SM Burhani / Bonds: compact rows, manual slate stripe.
+_ROW_EVEN = "#FFFFFF"
+_ROW_ODD  = "#F1F5F9"   # slate-100
 
 _PAGE_SIZES = [25, 50, 100]
-_ROW_H      = 36
-
-
-# ── Column definitions ─────────────────────────────────────────────────────────
-
-_DIESEL_HEADERS = [
-    "DATE", "LPO NO.", "DO/SDO NO.", "DIESEL @",
-    "CLIENT", "DESTINATIONS", "TRUCK NO.", "LTRS", "PRICE/LTR", "TOTAL (TZS)",
-]
-_DIESEL_COL_MAP: Dict[str, List[str]] = {
-    "date":          ["date"],
-    "lpo_no":        ["lpo no.", "lpo no", "lpo"],
-    "do_sdo_no":     ["do/sdo no.", "do/sdo no", "do no.", "sdo no."],
-    "diesel_at":     ["diesel @", "diesel at", "station"],
-    "clients_name":  ["clients name", "client name", "client"],
-    "destinations":  ["destinations", "destination"],
-    "truck_no":      ["truck no.", "truck no", "truck"],
-    "ltrs":          ["ltrs", "litres", "liters", "qty", "quantity"],
-    "price_per_ltr": ["price per ltr", "price/ltr", "unit price", "rate"],
-    "total_amount":  ["total amount", "total", "amount"],
-}
-
-_ZAMBIA_HEADERS = [
-    "S/NO", "DATE", "LPO NO.", "DO/SDO NO.", "DIESEL @",
-    "CLIENT", "DESTINATIONS", "TRUCK NO.", "LTRS", "PRICE/LTR",
-    "TOTAL (TZS)", "LAKE US$", "REMARK",
-]
-_ZAMBIA_COL_MAP: Dict[str, List[str]] = {
-    "sn":            ["s/no.", "s/n", "sn", "no.", "s/no"],
-    "date":          ["date"],
-    "lpo_no":        ["lpo no.", "lpo no", "lpo"],
-    "do_sdo_no":     ["do/sdo no.", "do/sdo no", "do no.", "sdo no."],
-    "diesel_at":     ["diesel @", "diesel at", "station"],
-    "clients_name":  ["clients name", "client name", "client"],
-    "destinations":  ["destinations", "destination"],
-    "truck_no":      ["truck no.", "truck no", "truck"],
-    "ltrs":          ["ltrs", "litres", "liters", "qty", "quantity"],
-    "price_per_ltr": ["price per ltr", "price/ltr", "unit price", "rate"],
-    "total_amount":  ["total amount", "total", "amount"],
-    "lake_usd":      ["lake us $", "lake usd", "usd", "us $"],
-    "remark":        ["remark", "remarks", "notes"],
-}
-
-_GBP_HEADERS = [
-    "S/NO", "DATE", "LPO NO.", "DO/SDO NO.", "DIESEL @",
-    "CLIENT", "DESTINATIONS", "TRUCK NO.", "LTRS", "PRICE/LTR", "TOTAL (TZS)",
-]
-_GBP_COL_MAP: Dict[str, List[str]] = {
-    "sn":            ["s/no.", "s/n", "sn", "no.", "s/no"],
-    "date":          ["date"],
-    "lpo_no":        ["lpo no.", "lpo no", "lpo"],
-    "do_sdo_no":     ["do/sdo no.", "do/sdo no", "do no.", "sdo no."],
-    "diesel_at":     ["diesel @", "diesel at", "station"],
-    "clients_name":  ["clients name", "client name", "client"],
-    "destinations":  ["destinations", "destination"],
-    "truck_no":      ["truck no.", "truck no", "truck"],
-    "ltrs":          ["ltrs", "litres", "liters", "qty", "quantity"],
-    "price_per_ltr": ["price per ltr", "price/ltr", "unit price", "rate"],
-    "total_amount":  ["total amount", "total", "amount"],
-}
-
-# Auto-select hint: feed_type → expected sheet name substring
-_SHEET_HINTS: Dict[str, str] = {
-    "diesel_infinity":    "DIESEL INFINITY",
-    "diesel_lake_zambia": "DIESEL LAKE ZAMBIA",
-    "diesel_lake_tunduma":"DIESEL LAKE TUNDUMA",
-    "diesel_gbp":         "DIESEL GBP",
-}
+_ROW_H      = 28
+_HDR_H      = 26
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  UI helpers (self-contained — mirrors separate_expenses.py palette)
+#  Column schema
+#
+#  Each station defines an ordered list of columns:
+#     (display_label, field_key, kind)      kind ∈ {text, date, num, money}
+#  plus the set of field_keys that MUST resolve for a sheet to be accepted.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Candidate header names per field (case-insensitive, exact match after strip).
+_FIELD_CANDIDATES: Dict[str, List[str]] = {
+    "sn":            ["s/no.", "s/n", "sn", "s/no", "no.", "#"],
+    "date":          ["date"],
+    "lpo_no":        ["lpo no.", "lpo no", "lpo"],
+    "do_sdo_no":     ["do/sdo no.", "do/sdo no", "do/sdo", "do no.", "do no", "do", "sdo no."],
+    "diesel_at":     ["diesel @", "diesel at", "supplier", "station"],
+    "ownership":     ["ownership", "owner"],
+    "clients_name":  ["clients name", "client name", "client"],
+    "destinations":  ["destinations", "destination", "destijnation", "dest"],
+    "truck_no":      ["truck no.", "truck no", "truck"],
+    "ltrs":          ["ltrs", "litres", "liters", "qty", "quantity"],
+    "price_per_ltr": ["price per ltr", "price/ltr", "unit price", "rate"],
+    "total_amount":  ["total amount", "total", "amount"],
+}
+
+# Column layout + required fields per station (matches the real workbook sheets).
+_FUEL_SCHEMAS: Dict[str, dict] = {
+    "diesel_infinity": {
+        "title":      "Infinity Diesel",
+        "icon":       "mdi.gas-station",
+        "sheet_hint": "INFINITY",
+        "columns": [
+            ("S/NO",        "sn",            "text"),
+            ("DATE",        "date",          "date"),
+            ("LPO",         "lpo_no",        "text"),
+            ("DO",          "do_sdo_no",     "text"),
+            ("SUPPLIER",    "diesel_at",     "text"),
+            ("OWNERSHIP",   "ownership",     "text"),
+            ("DESTINATION", "destinations",  "text"),
+            ("TRUCK NO",    "truck_no",      "text"),
+            ("LTRS",        "ltrs",          "num"),
+            ("RATE",        "price_per_ltr", "num"),
+            ("AMOUNT",      "total_amount",  "money"),
+        ],
+        "required": ["date", "lpo_no", "truck_no", "ltrs", "price_per_ltr", "total_amount"],
+    },
+    "diesel_lake_zambia": {
+        "title":      "Lake Zambia Diesel",
+        "icon":       "mdi.water-pump",
+        "sheet_hint": "LAKE OIL",
+        "columns": [
+            ("S/NO",         "sn",            "text"),
+            ("DATE",         "date",          "date"),
+            ("LPO NO.",      "lpo_no",        "text"),
+            ("DIESEL @",     "diesel_at",     "text"),
+            ("DO/SDO",       "do_sdo_no",     "text"),
+            ("TRUCK NO.",    "truck_no",      "text"),
+            ("LTRS",         "ltrs",          "num"),
+            ("PRICE/LTR",    "price_per_ltr", "num"),
+            ("AMOUNT",       "total_amount",  "money"),
+            ("DESTINATIONS", "destinations",  "text"),
+        ],
+        "required": ["date", "lpo_no", "diesel_at", "truck_no", "ltrs",
+                     "price_per_ltr", "total_amount"],
+    },
+    "diesel_gbp": {
+        "title":      "GBP Diesel",
+        "icon":       "mdi.fuel",
+        "sheet_hint": "GBP",
+        "columns": [
+            ("S/NO",         "sn",            "text"),
+            ("DATE",         "date",          "date"),
+            ("LPO NO.",      "lpo_no",        "text"),
+            ("DO/SDO NO.",   "do_sdo_no",     "text"),
+            ("DIESEL @",     "diesel_at",     "text"),
+            ("CLIENTS NAME", "clients_name",  "text"),
+            ("DESTINATIONS", "destinations",  "text"),
+            ("TRUCK NO.",    "truck_no",      "text"),
+            ("LTRS",         "ltrs",          "num"),
+            ("PRICE/LTR",    "price_per_ltr", "num"),
+        ],
+        "required": ["date", "lpo_no", "truck_no", "ltrs", "price_per_ltr", "clients_name"],
+    },
+    "diesel_lake_tunduma": {
+        "title":      "Lake Tunduma Diesel",
+        "icon":       "mdi.water-pump",
+        "sheet_hint": "TUNDUMA",
+        "columns": [
+            ("DATE",        "date",         "date"),
+            ("LPO NO.",     "lpo_no",       "text"),
+            ("DO NO.",      "do_sdo_no",    "text"),
+            ("STATION",     "diesel_at",    "text"),
+            ("DESTINATION", "destinations", "text"),
+            ("TRUCK NO.",   "truck_no",     "text"),
+            ("LTRS",        "ltrs",         "num"),
+        ],
+        "required": ["date", "lpo_no", "truck_no", "ltrs", "do_sdo_no"],
+    },
+}
+
+
+def _pretty_field(key: str) -> str:
+    return {
+        "sn": "S/No", "date": "Date", "lpo_no": "LPO", "do_sdo_no": "DO/SDO",
+        "diesel_at": "Station/Supplier", "ownership": "Ownership",
+        "clients_name": "Client", "destinations": "Destination",
+        "truck_no": "Truck No.", "ltrs": "Litres",
+        "price_per_ltr": "Price/Ltr", "total_amount": "Amount",
+    }.get(key, key)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UI helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _lbl(text: str = "", size: int = 13, weight: int = 400,
@@ -126,7 +179,7 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400,
     w = QLabel(text)
     w.setStyleSheet(
         f"color:{color};font-size:{size}px;font-weight:{weight};"
-        "font-family:'Segoe UI',sans-serif;background:transparent;"
+        "font-family:'Segoe UI';background:transparent;"
     )
     return w
 
@@ -144,12 +197,12 @@ def _btn(text: str, icon: str = "", primary: bool = True,
             pass
     if primary:
         ss = (f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:5px;"
-              f"font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              f"font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
               f"QPushButton:hover{{background:#005EA3;}}"
               f"QPushButton:disabled{{background:#93C5FD;}}")
     else:
         ss = (f"QPushButton{{background:{_WHITE};color:{_T1};border:1px solid {_BORDER};"
-              f"border-radius:5px;font-size:12px;font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+              f"border-radius:5px;font-size:12px;font-family:'Segoe UI';padding:0 14px;}}"
               f"QPushButton:hover{{background:{_BG};}}"
               f"QPushButton:disabled{{color:{_TM};}}")
     b.setStyleSheet(ss)
@@ -160,7 +213,7 @@ def _input_ss() -> str:
     return (
         f"QLineEdit,QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
         f"background:{_WHITE};color:{_T1};font-size:12px;"
-        f"font-family:'Segoe UI',sans-serif;padding:0 8px;"
+        f"font-family:'Segoe UI';padding:0 8px;"
         f"min-height:32px;max-height:32px;}}"
         f"QLineEdit:focus,QComboBox:focus{{border-color:{_BLUE};}}"
         "QComboBox::drop-down{border:none;width:20px;}"
@@ -178,13 +231,13 @@ def _hsep() -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;}}"
-        f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
+        "border:none;font-size:11px;font-family:'Segoe UI';}}"
+        f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
-        "font-size:11px;font-weight:600;font-family:'Segoe UI',sans-serif;"
+        "font-size:10px;font-weight:600;font-family:'Segoe UI';"
         f"border:none;border-bottom:1px solid {_BORDER};"
-        "padding:0 6px;height:30px;}}"
+        f"padding:0 8px;height:{_HDR_H}px;}}"
         "QScrollBar:vertical{width:8px;background:transparent;}"
         f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
     )
@@ -195,15 +248,22 @@ def _make_table(headers: List[str]) -> QTableWidget:
     t.setHorizontalHeaderLabels(headers)
     t.setEditTriggers(QAbstractItemView.NoEditTriggers)
     t.setSelectionBehavior(QAbstractItemView.SelectRows)
+    t.setAlternatingRowColors(False)
     t.verticalHeader().setVisible(False)
     t.verticalHeader().setDefaultSectionSize(_ROW_H)
     t.horizontalHeader().setStretchLastSection(True)
-    t.setStyleSheet(
-        _table_style()
-        + f"QTableWidget{{alternate-background-color:{_ALT_ROW};}}"
-    )
-    t.setAlternatingRowColors(True)
+    t.setStyleSheet(_table_style())
     return t
+
+
+def _finish_table_row(t: QTableWidget, row: int, bg: str | None = None) -> None:
+    """Apply the Bonds-style manual stripe + compact row height."""
+    color = bg if bg else (_ROW_ODD if row % 2 else _ROW_EVEN)
+    for col in range(t.columnCount()):
+        item = t.item(row, col)
+        if item is not None:
+            item.setBackground(QColor(color))
+    t.setRowHeight(row, _ROW_H)
 
 
 def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
@@ -227,12 +287,49 @@ def _fmt_num(v: Any, prefix: str = "", decimals: int = 2) -> str:
         return str(v)
 
 
+_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S",
+                 "%d/%m/%Y", "%m/%d/%Y")
+
+
 def _fmt_date_str(val: Any) -> str:
-    if not val or str(val) in ("None", ""):
+    if val is None or str(val) in ("None", ""):
         return "—"
     if isinstance(val, datetime):
         return val.strftime("%d %b %y")
-    return str(val)
+    s = str(val).strip()
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).strftime("%d %b %y")
+        except ValueError:
+            continue
+    return s
+
+
+def _looks_like_date(val: Any) -> bool:
+    if val in (None, ""):
+        return False
+    if isinstance(val, datetime):
+        return True
+    s = str(val).strip()
+    for fmt in _DATE_FORMATS:
+        try:
+            datetime.strptime(s, fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _fmt_cell(kind: str, value: Any) -> Tuple[str, Qt.AlignmentFlag, bool]:
+    """Return (text, alignment, mono) for a value given its column kind."""
+    if kind == "date":
+        return _fmt_date_str(value), Qt.AlignLeft | Qt.AlignVCenter, False
+    if kind == "num":
+        return _fmt_num(value, decimals=2), Qt.AlignRight | Qt.AlignVCenter, True
+    if kind == "money":
+        return _fmt_num(value, "TZS ", 0), Qt.AlignRight | Qt.AlignVCenter, True
+    return (str(value) if value not in (None, "") else "—",
+            Qt.AlignLeft | Qt.AlignVCenter, False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -356,7 +453,7 @@ class _TotalsBar(QFrame):
             sub_hl = QHBoxLayout(sub)
             sub_hl.setContentsMargins(0, 0, 0, 0)
             sub_hl.setSpacing(4)
-            sub_hl.addWidget(_lbl("TOTAL:", size=11, weight=600, color=_T2))
+            sub_hl.addWidget(_lbl(prefix, size=11, weight=600, color=_T2))
             val = _lbl("—", size=12, weight=700, color=_T1)
             sub_hl.addWidget(val)
             self._lbl_map[key] = val
@@ -365,112 +462,7 @@ class _TotalsBar(QFrame):
 
     def set_total(self, key: str, value: float, prefix: str = "") -> None:
         if key in self._lbl_map:
-            self._lbl_map[key].setText(_fmt_num(value, prefix=prefix))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Summary bar  (QuickBooks horizontal KPI strip)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class _SummaryBar(QFrame):
-    """
-    Single white card divided by vertical rules — one cell per KPI.
-    Each cell: UPPERCASE label · currency/unit badge · bold value.
-    Mirrors the QuickBooks bill/report summary bar aesthetic.
-    """
-
-    # Palette kept intentionally neutral so every station looks consistent.
-    _BADGE_BG   = "#EEF2F7"   # soft slate — matches QB field label chips
-    _BADGE_FG   = "#475569"
-    _LABEL_CLR  = "#94A3B8"   # muted slate
-    _VAL_CLR    = "#0F172A"   # near-black
-    _DIV_CLR    = "#E2E8F0"   # light divider
-
-    def __init__(
-        self,
-        metrics: List[Tuple[str, str, str]],   # (key, label, badge)
-        parent: QWidget | None = None,
-    ) -> None:
-        """
-        metrics: list of (key, display_label, unit_badge)
-            badge="" for plain count, "TZS"/"USD"/"L" for units.
-        """
-        super().__init__(parent)
-        self.setFixedHeight(82)
-        self.setObjectName("summaryBar")
-        self.setStyleSheet(
-            "QFrame#summaryBar{"
-            f"  background:{_WHITE};"
-            "  border:1px solid #D1D9E6;"
-            "  border-radius:8px;"
-            "}"
-        )
-
-        hl = QHBoxLayout(self)
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(0)
-
-        self._val_map: Dict[str, QLabel] = {}
-
-        for i, (key, label, badge) in enumerate(metrics):
-            # Divider between cells
-            if i > 0:
-                div = QFrame()
-                div.setFrameShape(QFrame.VLine)
-                div.setFixedWidth(1)
-                div.setStyleSheet(f"background:{self._DIV_CLR};")
-                hl.addWidget(div)
-
-            cell = QWidget()
-            cell.setStyleSheet("background:transparent;")
-            cvl = QVBoxLayout(cell)
-            cvl.setContentsMargins(24, 14, 24, 12)
-            cvl.setSpacing(5)
-
-            # ── label row ────────────────────────────────────────────────
-            lbl_w = QLabel(label.upper())
-            lbl_w.setStyleSheet(
-                f"color:{self._LABEL_CLR};"
-                "font-size:10px;font-weight:600;letter-spacing:0.5px;"
-                "font-family:'Segoe UI',sans-serif;background:transparent;"
-            )
-            cvl.addWidget(lbl_w)
-
-            # ── value row: [badge] [number] ───────────────────────────────
-            val_row = QWidget()
-            val_row.setStyleSheet("background:transparent;")
-            vhl = QHBoxLayout(val_row)
-            vhl.setContentsMargins(0, 0, 0, 0)
-            vhl.setSpacing(7)
-            vhl.setAlignment(Qt.AlignVCenter)
-
-            if badge:
-                bl = QLabel(badge)
-                bl.setStyleSheet(
-                    f"background:{self._BADGE_BG};color:{self._BADGE_FG};"
-                    "font-size:10px;font-weight:700;letter-spacing:0.3px;"
-                    "border-radius:4px;padding:1px 7px;"
-                    "font-family:'Segoe UI',sans-serif;"
-                )
-                bl.setFixedHeight(20)
-                vhl.addWidget(bl)
-
-            val_lbl = QLabel("—")
-            val_lbl.setStyleSheet(
-                f"color:{self._VAL_CLR};"
-                "font-size:20px;font-weight:700;"
-                "font-family:'Segoe UI',sans-serif;background:transparent;"
-            )
-            self._val_map[key] = val_lbl
-            vhl.addWidget(val_lbl)
-            vhl.addStretch()
-
-            cvl.addWidget(val_row)
-            hl.addWidget(cell, 1)
-
-    def set_value(self, key: str, text: str) -> None:
-        if key in self._val_map:
-            self._val_map[key].setText(text)
+            self._lbl_map[key].setText(_fmt_num(value, prefix=prefix, decimals=0))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -530,47 +522,51 @@ class _DropZone(QFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Fuel Import Dialog  (sheet-aware — auto-selects the matching sheet)
+#  Fuel Import Dialog  (sheet picker + structure validation + preview)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _FuelImportDialog(QDialog):
-    """
-    Import dialog for diesel feed data.
-    Supports sheet selection for multi-sheet workbooks so the user can pick
-    the correct sheet (e.g. DIESEL INFINITY) without having to re-save the file.
+    """Import diesel feed data.
+
+    Flow: choose file → pick the sheet → the sheet's headers are validated
+    against this station's required columns.  A mismatched sheet blocks the
+    import and prompts the user to pick the correct one.  Matching sheets
+    are previewed and imported as a single tagged upload batch.
     """
 
     imported = Signal(int)
 
-    def __init__(
-        self,
-        feed_type: str,
-        title: str,
-        col_map: Dict[str, List[str]],
-        preview_headers: List[str],
-        dedup_key: str = "lpo_no",
-        parent: QWidget | None = None,
-    ) -> None:
+    _PREVIEW_ROWS = 12
+
+    def __init__(self, feed_type: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._feed_type       = feed_type
-        self._col_map         = col_map
-        self._preview_headers = preview_headers
-        self._dedup_key       = dedup_key
+        self._feed_type = feed_type
+        self._schema    = _FUEL_SCHEMAS[feed_type]
+        self._columns   = self._schema["columns"]
+        self._required  = self._schema["required"]
+        self._headers   = [c[0] for c in self._columns]
 
-        self._wb          = None
-        self._new_rows:   List[dict] = []
+        self._wb: Any = None
+        self._source_filename = ""
+        self._rows: List[dict] = []          # rows that will be imported
 
-        self.setWindowTitle(f"Import — {title}")
-        self.setMinimumWidth(720)
+        self.setWindowTitle(f"Import — {self._schema['title']}")
+        self.setMinimumWidth(760)
         self.setStyleSheet(f"background:{_WHITE};")
         self._build()
 
+    # ── Build ────────────────────────────────────────────────────────────────
     def _build(self) -> None:
         vl = QVBoxLayout(self)
         vl.setSpacing(12)
         vl.setContentsMargins(20, 20, 20, 20)
 
-        # Drop zone
+        # Expected structure hint
+        expect = ", ".join(_pretty_field(k) for k in self._required)
+        hint = _lbl(f"This sheet must contain: {expect}", size=11, color=_T2)
+        hint.setWordWrap(True)
+        vl.addWidget(hint)
+
         self._drop = _DropZone()
         self._drop.file_dropped.connect(self._on_file)
         vl.addWidget(self._drop)
@@ -590,7 +586,7 @@ class _FuelImportDialog(QDialog):
         ctrl_hl.addWidget(_lbl("Sheet:", size=12, color=_T2))
 
         self._sheet_cb = QComboBox()
-        self._sheet_cb.setFixedWidth(220)
+        self._sheet_cb.setFixedWidth(240)
         self._sheet_cb.setStyleSheet(_input_ss())
         self._sheet_cb.setEnabled(False)
         self._sheet_cb.currentIndexChanged.connect(self._on_sheet_changed)
@@ -598,16 +594,15 @@ class _FuelImportDialog(QDialog):
         ctrl_hl.addStretch()
         vl.addWidget(ctrl)
 
-        # Stats row
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
+        self._stats_lbl.setWordWrap(True)
         vl.addWidget(self._stats_lbl)
 
         vl.addWidget(_hsep())
+        vl.addWidget(_lbl("Preview", size=12, weight=600))
 
-        vl.addWidget(_lbl("Preview — first 10 new rows", size=12, weight=600))
-
-        self._preview_tbl = _make_table(self._preview_headers)
-        self._preview_tbl.setMinimumHeight(180)
+        self._preview_tbl = _make_table(self._headers)
+        self._preview_tbl.setMinimumHeight(200)
         vl.addWidget(self._preview_tbl)
 
         vl.addWidget(_hsep())
@@ -627,11 +622,9 @@ class _FuelImportDialog(QDialog):
         self._import_btn.setEnabled(False)
         self._import_btn.clicked.connect(self._do_import)
         bbl.addWidget(self._import_btn)
-
         vl.addWidget(btn_row)
 
-    # ── file handling ──────────────────────────────────────────────────────────
-
+    # ── File handling ──────────────────────────────────────────────────────────
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Open File", "", "Excel / CSV (*.xlsx *.xls *.csv)"
@@ -641,38 +634,36 @@ class _FuelImportDialog(QDialog):
             self._on_file(path)
 
     def _on_file(self, path: str) -> None:
+        self._source_filename = Path(path).name
         self._stats_lbl.setText("Reading file…")
         self._sheet_cb.blockSignals(True)
         self._sheet_cb.clear()
         self._sheet_cb.setEnabled(False)
         self._sheet_cb.blockSignals(False)
-        self._import_btn.setEnabled(False)
+        self._set_import_enabled(False)
+        self._preview_tbl.setRowCount(0)
 
         p = Path(path)
         if p.suffix.lower() in (".xlsx", ".xls") and _HAS_OPENPYXL:
             try:
-                self._wb = openpyxl.load_workbook(path, data_only=True)
+                self._wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
             except Exception as exc:
                 self._stats_lbl.setText(f"Error opening file: {exc}")
                 return
 
             names = self._wb.sheetnames
             self._sheet_cb.blockSignals(True)
+            # No name-based auto-detection: sheets may be named "Sheet1",
+            # "Sheet8", etc. The user must actively choose which one to import.
+            self._sheet_cb.addItem("— Select a sheet —", None)
             for name in names:
-                self._sheet_cb.addItem(name)
+                self._sheet_cb.addItem(name, name)
+            self._sheet_cb.setCurrentIndex(0)
             self._sheet_cb.setEnabled(True)
             self._sheet_cb.blockSignals(False)
-
-            # Auto-select the sheet matching this feed type
-            hint = _SHEET_HINTS.get(self._feed_type, "").upper()
-            best_idx = 0
-            for i, name in enumerate(names):
-                if hint and hint in name.upper():
-                    best_idx = i
-                    break
-            self._sheet_cb.setCurrentIndex(best_idx)
-            self._on_sheet_changed()
-
+            self._reset_preview(
+                f"{len(names)} sheet(s) found. Select a sheet to preview it."
+            )
         else:
             self._wb = None
             try:
@@ -684,36 +675,37 @@ class _FuelImportDialog(QDialog):
             if not rows:
                 self._stats_lbl.setText("File is empty.")
                 return
+            headers = [str(c) if c is not None else "" for c in rows[0]]
             data = [
-                [str(c) for c in r]
-                for r in rows[1:]
-                if any(c for c in r)
+                [str(c) if c is not None else "" for c in r]
+                for r in rows[1:] if any(str(c).strip() for c in r)
             ]
-            self._parse(rows[0], data)
+            self._process(headers, data, sheet_label="")
 
     def _on_sheet_changed(self, _idx: int = 0) -> None:
         if self._wb is None:
             return
-        name = self._sheet_cb.currentText()
+        name = self._sheet_cb.currentData()
+        if not name:   # placeholder "— Select a sheet —"
+            self._reset_preview("Select a sheet to preview it.")
+            return
         try:
             ws = self._wb[name]
         except Exception:
             return
         rows = list(ws.iter_rows(values_only=True))
         if not rows:
-            self._stats_lbl.setText("Sheet is empty.")
+            self._show_mismatch(f"Sheet “{name}” is empty.")
             return
         headers = [str(c) if c is not None else "" for c in rows[0]]
         data = [
             [str(c) if c is not None else "" for c in r]
-            for r in rows[1:]
-            if any(c is not None for c in r)
+            for r in rows[1:] if any(c is not None and str(c).strip() for c in r)
         ]
-        self._parse(headers, data)
+        self._process(headers, data, sheet_label=name)
 
-    # ── column mapping + dedup ─────────────────────────────────────────────────
-
-    def _parse(self, headers: List[str], rows: List[List[str]]) -> None:
+    # ── Mapping + validation ─────────────────────────────────────────────────
+    def _resolve_indices(self, headers: List[str]) -> Dict[str, Optional[int]]:
         hdr_lower = {h.strip().lower(): i for i, h in enumerate(headers)}
 
         def _find(cands: List[str]) -> Optional[int]:
@@ -723,221 +715,349 @@ class _FuelImportDialog(QDialog):
                     return idx
             return None
 
-        idxs = {key: _find(cands) for key, cands in self._col_map.items()}
+        return {
+            key: _find(_FIELD_CANDIDATES.get(key, [key]))
+            for _, key, _ in self._columns
+        }
+
+    def _process(self, headers: List[str], rows: List[List[str]],
+                 sheet_label: str) -> None:
+        idxs = self._resolve_indices(headers)
+
+        missing = [k for k in self._required if idxs.get(k) is None]
+        if missing:
+            names = ", ".join(_pretty_field(k) for k in missing)
+            where = f" in “{sheet_label}”" if sheet_label else ""
+            self._show_mismatch(
+                f"This sheet{where} doesn't match {self._schema['title']}. "
+                f"Missing column(s): {names}. Please choose the correct sheet."
+            )
+            return
 
         records: List[dict] = []
         for row in rows:
             rec: dict = {"feed_type": self._feed_type}
-            for key, idx in idxs.items():
+            for _, key, _kind in self._columns:
+                idx = idxs.get(key)
                 rec[key] = (
-                    row[idx].strip()
+                    str(row[idx]).strip()
                     if idx is not None and idx < len(row) and row[idx] is not None
                     else ""
                 )
+            self._normalize_row(rec)
             records.append(rec)
 
-        dedup_vals = [r.get(self._dedup_key, "") for r in records if r.get(self._dedup_key)]
-        asyncio.ensure_future(self._check_dupes(records, dedup_vals))
-
-    async def _check_dupes(self, records: List[dict], keys: List[str]) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            existing = await svc.get_existing_feed_keys(keys)
-        except Exception:
-            existing = set()
-
-        self._new_rows = [r for r in records if r.get(self._dedup_key) not in existing]
-        dupe_count = len(records) - len(self._new_rows)
-
-        self._stats_lbl.setText(
-            f"New records: {len(self._new_rows):,}     "
-            f"Duplicates (skipped): {dupe_count:,}"
+        self._rows = records
+        self._stats_lbl.setStyleSheet(
+            f"color:{_GREEN};font-size:12px;font-family:'Segoe UI';background:transparent;"
         )
-        self._import_btn.setEnabled(bool(self._new_rows))
-        self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
-        self._fill_preview(self._new_rows[:10])
+        where = f"“{sheet_label}” · " if sheet_label else ""
+        self._stats_lbl.setText(
+            f"{where}{len(records):,} rows ready to import."
+        )
+        self._fill_preview(records[: self._PREVIEW_ROWS])
+        self._set_import_enabled(bool(records))
+        self._import_btn.setText(f"Import {len(records):,} Records")
+
+    def _reset_preview(self, message: str) -> None:
+        """Neutral state: clear preview + disable import, show an info message."""
+        self._rows = []
+        self._preview_tbl.setRowCount(0)
+        self._stats_lbl.setStyleSheet(
+            f"color:{_T2};font-size:12px;font-family:'Segoe UI';background:transparent;"
+        )
+        self._stats_lbl.setText(message)
+        self._set_import_enabled(False)
+        self._import_btn.setText("Import Records")
+
+    @staticmethod
+    def _normalize_row(rec: dict) -> None:
+        """Recover a leading S/No column that the header row doesn't declare.
+
+        Some sheets stack rows that carry an extra leading S/No (and drop the
+        DO column) beneath the same header, shifting DATE/LPO/DO one column to
+        the right.  Detect it per row: when the DATE cell isn't a date but the
+        LPO cell is, treat the first value as S/No and shift back.
+        """
+        if _looks_like_date(rec.get("date")) or not _looks_like_date(rec.get("lpo_no")):
+            return
+        rec["sn"] = rec.get("date", "")
+        rec["date"] = rec.get("lpo_no", "")
+        rec["lpo_no"] = rec.get("do_sdo_no", "")
+        rec["do_sdo_no"] = ""
+
+    def _show_mismatch(self, message: str) -> None:
+        self._rows = []
+        self._preview_tbl.setRowCount(0)
+        self._stats_lbl.setStyleSheet(
+            f"color:{_RED};font-size:12px;font-weight:600;"
+            "font-family:'Segoe UI';background:transparent;"
+        )
+        self._stats_lbl.setText(message)
+        self._set_import_enabled(False)
+        self._import_btn.setText("Import Records")
+
+    def _set_import_enabled(self, ok: bool) -> None:
+        self._import_btn.setEnabled(ok)
 
     def _fill_preview(self, rows: List[dict]) -> None:
         t = self._preview_tbl
         t.setRowCount(0)
-        keys = list(self._col_map.keys())
         for row in rows:
             r = t.rowCount()
             t.insertRow(r)
-            for c, key in enumerate(keys):
-                if c < t.columnCount():
-                    t.setItem(r, c, _cell(row.get(key, "")))
+            for c, (_, key, kind) in enumerate(self._columns):
+                text, align, mono = _fmt_cell(kind, row.get(key, ""))
+                t.setItem(r, c, _cell(text, align, mono=mono))
+            _finish_table_row(t, r)
 
-    # ── import ─────────────────────────────────────────────────────────────────
-
+    # ── Import ─────────────────────────────────────────────────────────────────
     def _do_import(self) -> None:
-        self._import_btn.setEnabled(False)
+        self._set_import_enabled(False)
         self._import_btn.setText("Importing…")
         asyncio.ensure_future(self._async_import())
 
     async def _async_import(self) -> None:
         from tahmeed.services import accountant_service as svc
+        upload_id = str(uuid.uuid4())
+        sheet_label = (self._sheet_cb.currentData() or "") if self._wb is not None else ""
+        docs = []
+        for rec in self._rows:
+            doc = dict(rec)
+            doc["upload_id"] = upload_id
+            doc["source_filename"] = self._source_filename
+            doc["sheet_label"] = sheet_label
+            docs.append(doc)
         try:
-            saved = await svc.save_imported_feed(self._new_rows)
+            saved = await svc.save_imported_feed(docs)
             self.imported.emit(saved)
             self.accept()
         except Exception as exc:
             QMessageBox.critical(self, "Import Error", str(exc))
-            self._import_btn.setEnabled(True)
-            self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
+            self._set_import_enabled(True)
+            self._import_btn.setText(f"Import {len(self._rows):,} Records")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Base diesel widget
+#  Upload browse — one row per import batch
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class _BaseDieselWidget(QWidget):
-    """
-    Shared scaffold for all four fuel consumption pages.
+_BROWSE_HEADERS = ["UPLOAD DATE", "SHEET", "FILE NAME", "RECORDS", "LTRS", "TOTAL (TZS)"]
 
-    Subclasses set class attributes:
-        _FEED_TYPE, _TITLE, _ICON, _HEADERS, _COL_MAP, _DEDUP_KEY
-    and override _fill_row() if their column order differs from the base.
-    LakeZambiaWidget also overrides _make_summary(), _totals_defs(), _load().
-    """
 
-    _FEED_TYPE: str              = ""
-    _TITLE:     str              = ""
-    _ICON:      str              = "mdi.gas-station"
-    _HEADERS:   List[str]        = []
-    _COL_MAP:   Dict[str, List[str]] = {}
-    _DEDUP_KEY: str              = "lpo_no"
+class _DieselUploadBrowse(QWidget):
+    upload_clicked  = Signal(object)
+    delete_clicked  = Signal(object)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, feed_type: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._page       = 1
-        self._page_size  = 25
-        self._total      = 0
-        self._search     = ""
-        self._truck_filter = ""
+        self._feed_type = feed_type
+        self._uploads: List[dict] = []
         self._build()
-        self.refresh()
-
-    # ── Build ──────────────────────────────────────────────────────────────────
 
     def _build(self) -> None:
-        self.setStyleSheet(f"background:{_BG};")
+        self.setStyleSheet("background:transparent;")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
-        vl.setSpacing(12)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
 
-        # Header row
-        header = _PageHeader(self._TITLE, self._ICON)
-        self._import_btn = _btn("Import from Excel", "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        header.add_right(self._import_btn)
-        export_btn = _btn("Export", "mdi.download-outline", primary=False)
-        header.add_right(export_btn)
-        vl.addWidget(header)
-        vl.addWidget(_hsep())
-
-        # Summary metrics strip
-        self._summary = self._make_summary()
-        vl.addWidget(self._summary)
-
-        # Toolbar: search + truck filter
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search truck, LPO, client, destination…")
-        self._search_edit.setFixedWidth(280)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-
-        self._truck_cb = QComboBox()
-        self._truck_cb.addItem("All Trucks", "")
-        self._truck_cb.setFixedWidth(140)
-        self._truck_cb.setStyleSheet(_input_ss())
-        self._truck_cb.currentIndexChanged.connect(self._on_filter)
-        tbl.addWidget(self._truck_cb)
-        tbl.addStretch()
-        vl.addWidget(tb)
-
-        # Table
-        self._table = _make_table(self._HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table = _make_table(_BROWSE_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setColumnWidth(0, 160)
+        self._table.setColumnWidth(1, 160)
+        self._table.setColumnWidth(2, 220)
+        self._table.setColumnWidth(3, 90)
+        self._table.setColumnWidth(4, 110)
+        self._table.setCursor(Qt.PointingHandCursor)
+        self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table, 1)
 
-        # Totals footer
-        self._totals = _TotalsBar(self._totals_defs())
+        self._totals = _TotalsBar([("count", "Total records: "),
+                                   ("ltrs", "Ltrs: "), ("amount", "TZS: ")])
         vl.addWidget(self._totals)
 
-        # Pagination
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
-
-    def _make_summary(self) -> _SummaryBar:
-        return _SummaryBar([
-            ("records", "Total Records",  ""),
-            ("ltrs",    "Total Litres",   "L"),
-            ("amount",  "Total Amount",   "TZS"),
-        ])
-
-    def _totals_defs(self) -> List[Tuple[str, str]]:
-        return [("ltrs", "Ltrs "), ("amount", "TZS ")]
-
-    # ── Import ─────────────────────────────────────────────────────────────────
-
-    def _open_import(self) -> None:
-        dlg = _FuelImportDialog(
-            feed_type=self._FEED_TYPE,
-            title=self._TITLE,
-            col_map=self._COL_MAP,
-            preview_headers=self._HEADERS,
-            dedup_key=self._DEDUP_KEY,
-            parent=self,
-        )
-        dlg.imported.connect(lambda n: (
-            QMessageBox.information(self, "Import Complete",
-                                    f"Imported {n:,} new records."),
-            self.refresh(),
-        ))
-        dlg.exec()
-
-    # ── Data ───────────────────────────────────────────────────────────────────
+        hint = _lbl("Click a row to view its records · right-click to delete an upload.",
+                    size=11, color=_TM)
+        hint.setAlignment(Qt.AlignCenter)
+        vl.addWidget(hint)
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load())
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
+        try:
+            uploads = await svc.get_diesel_uploads(self._feed_type)
+        except Exception:
+            self._uploads = []
+            self._table.setRowCount(0)
+            self._totals.set_total("count", 0)
+            return
+        self._uploads = uploads
+        self._fill(uploads)
+
+    def _fill(self, uploads: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        tot_recs = 0
+        tot_ltrs = 0.0
+        tot_amt = 0.0
+        for up in uploads:
+            r = t.rowCount()
+            t.insertRow(r)
+            import_dt = up.get("import_date")
+            date_str = (
+                import_dt.strftime("%d %b %Y  %H:%M")
+                if isinstance(import_dt, datetime)
+                else (str(import_dt) if import_dt else "—")
+            )
+            count = int(up.get("record_count", 0))
+            ltrs  = float(up.get("ltrs", 0) or 0)
+            amt   = float(up.get("total_amount", 0) or 0)
+            t.setItem(r, 0, _cell(date_str))
+            t.setItem(r, 1, _cell(up.get("sheet_label") or "—"))
+            t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 3, _cell(f"{count:,}", Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(_fmt_num(ltrs, decimals=0),
+                                  Qt.AlignRight | Qt.AlignVCenter, mono=True))
+            t.setItem(r, 5, _cell(_fmt_num(amt, decimals=0),
+                                  Qt.AlignRight | Qt.AlignVCenter, mono=True))
+            _finish_table_row(t, r)
+            tot_recs += count
+            tot_ltrs += ltrs
+            tot_amt  += amt
+        self._totals.set_total("count", tot_recs)
+        self._totals.set_total("ltrs", tot_ltrs)
+        self._totals.set_total("amount", tot_amt)
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        if 0 <= row < len(self._uploads):
+            self.upload_clicked.emit(self._uploads[row])
+
+    def _on_menu(self, pos) -> None:
+        row = self._table.rowAt(pos.y())
+        if not (0 <= row < len(self._uploads)):
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Delete this upload")
+        if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
+            self.delete_clicked.emit(self._uploads[row])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Upload detail — records within one batch
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _DieselUploadDetail(QWidget):
+    back_requested = Signal()
+
+    def __init__(self, feed_type: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._feed_type = feed_type
+        self._schema    = _FUEL_SCHEMAS[feed_type]
+        self._columns   = self._schema["columns"]
+        self._has_amount = any(k == "total_amount" for _, k, _ in self._columns)
+        self._upload_id = ""
+        self._search    = ""
+        self._page      = 1
+        self._page_size = 50
+        self._total     = 0
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        nav = QWidget()
+        nav.setStyleSheet("background:transparent;")
+        navl = QHBoxLayout(nav)
+        navl.setContentsMargins(0, 0, 0, 0)
+        navl.setSpacing(8)
+        back_btn = _btn("← All Uploads", primary=False, height=30)
+        back_btn.clicked.connect(self.back_requested)
+        navl.addWidget(back_btn)
+        self._crumb_lbl = _lbl("", size=12, color=_T2)
+        navl.addWidget(self._crumb_lbl)
+        navl.addStretch()
+        vl.addWidget(nav)
+
+        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
+        vl.addWidget(self._info_lbl)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search truck, LPO, client, destination…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._table = _make_table([c[0] for c in self._columns])
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        vl.addWidget(self._table, 1)
+
+        totals_defs = [("ltrs", "Ltrs: ")]
+        if self._has_amount:
+            totals_defs.append(("amount", "TZS: "))
+        totals_defs.append(("count", "Records: "))
+        self._totals = _TotalsBar(totals_defs)
+        vl.addWidget(self._totals)
+
+        self._pager = _PaginationBar()
+        self._pager.page_changed.connect(self._go_page)
+        self._pager.size_changed.connect(self._on_page_size)
+        vl.addWidget(self._pager)
+
+    def load_upload(self, upload_doc: dict) -> None:
+        self._upload_id = str(upload_doc.get("_id") or "")
+        filename  = upload_doc.get("source_filename") or "Unknown file"
+        sheet     = upload_doc.get("sheet_label") or "—"
+        count     = int(upload_doc.get("record_count", 0))
+        import_dt = upload_doc.get("import_date")
+        date_str  = import_dt.strftime("%d %b %Y") if isinstance(import_dt, datetime) else ""
+        self._crumb_lbl.setText(f"Uploads  ›  {sheet}")
+        self._info_lbl.setText(
+            f"{filename}   •   sheet: {sheet}   •   {count:,} records   •   {date_str}"
+        )
+        self._search = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._page = 1
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id:
+            return
         skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_diesel_feed(
-                self._FEED_TYPE, self._search, self._truck_filter,
-                self._page_size, skip,
-            ),
-            svc.count_diesel_feed(
-                self._FEED_TYPE, self._search, self._truck_filter,
-            ),
+        recs, total, totals = await asyncio.gather(
+            svc.get_diesel_upload_records(
+                self._feed_type, self._upload_id, self._search, self._page_size, skip),
+            svc.count_diesel_upload_records(
+                self._feed_type, self._upload_id, self._search),
+            svc.get_diesel_upload_totals(
+                self._feed_type, self._upload_id, self._search),
         )
         self._total = total
         self._fill_table(recs)
         self._pager.set_total(total, self._page_size, self._page)
-
-        totals = await svc.get_diesel_totals(self._FEED_TYPE)
-        ltrs   = totals.get("ltrs", 0.0)
-        amount = totals.get("total_amount", 0.0)
-
-        self._summary.set_value("records", f"{total:,}")
-        self._summary.set_value("ltrs",    _fmt_num(ltrs,   decimals=0))
-        self._summary.set_value("amount",  _fmt_num(amount, "TZS ", 0))
-
-        self._totals.set_total("ltrs",   ltrs,   "Ltrs ")
-        self._totals.set_total("amount", amount, "TZS ")
+        self._totals.set_total("count", total)
+        self._totals.set_total("ltrs", float(totals.get("ltrs", 0) or 0))
+        if self._has_amount:
+            self._totals.set_total("amount", float(totals.get("total_amount", 0) or 0))
 
     def _fill_table(self, recs: List[dict]) -> None:
         t = self._table
@@ -945,33 +1065,13 @@ class _BaseDieselWidget(QWidget):
         for rec in recs:
             r = t.rowCount()
             t.insertRow(r)
-            self._fill_row(t, r, rec)
-
-    def _fill_row(self, t: QTableWidget, r: int, rec: dict) -> None:
-        """Base row layout: Date LPO DO/SDO Diesel@ Client Dest Truck Ltrs Price Total."""
-        t.setItem(r, 0, _cell(_fmt_date_str(rec.get("date", ""))))
-        t.setItem(r, 1, _cell(rec.get("lpo_no", "")))
-        t.setItem(r, 2, _cell(rec.get("do_sdo_no", "")))
-        t.setItem(r, 3, _cell(rec.get("diesel_at", "")))
-        t.setItem(r, 4, _cell(rec.get("clients_name", "")))
-        t.setItem(r, 5, _cell(rec.get("destinations", "")))
-        t.setItem(r, 6, _cell(rec.get("truck_no", "")))
-        t.setItem(r, 7, _cell(_fmt_num(rec.get("ltrs"), decimals=2),
-                              Qt.AlignRight | Qt.AlignVCenter, mono=True))
-        t.setItem(r, 8, _cell(_fmt_num(rec.get("price_per_ltr"), decimals=2),
-                              Qt.AlignRight | Qt.AlignVCenter, mono=True))
-        t.setItem(r, 9, _cell(_fmt_num(rec.get("total_amount"), "TZS ", 0),
-                              Qt.AlignRight | Qt.AlignVCenter, mono=True))
-
-    # ── Controls ───────────────────────────────────────────────────────────────
+            for c, (_, key, kind) in enumerate(self._columns):
+                text, align, mono = _fmt_cell(kind, rec.get(key, ""))
+                t.setItem(r, c, _cell(text, align, mono=mono))
+            _finish_table_row(t, r)
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page = 1
-        asyncio.ensure_future(self._load())
-
-    def _on_filter(self) -> None:
-        self._truck_filter = self._truck_cb.currentData() or ""
         self._page = 1
         asyncio.ensure_future(self._load())
 
@@ -986,116 +1086,105 @@ class _BaseDieselWidget(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Concrete widgets
+#  Base station widget — browse ↔ detail shell
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _BaseDieselWidget(QWidget):
+    """Master/detail page shared by all four fuel stations."""
+
+    _FEED_TYPE: str = ""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._schema = _FUEL_SCHEMAS[self._FEED_TYPE]
+        self._build()
+        self.refresh()
+
+    def _build(self) -> None:
+        self.setStyleSheet(f"background:{_BG};")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(20, 20, 20, 16)
+        vl.setSpacing(12)
+
+        header = _PageHeader(self._schema["title"], self._schema["icon"])
+        self._import_btn = _btn("Import from Excel", "mdi.upload-outline")
+        self._import_btn.clicked.connect(self._open_import)
+        header.add_right(self._import_btn)
+        vl.addWidget(header)
+        vl.addWidget(_hsep())
+
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background:transparent;")
+
+        self._browse = _DieselUploadBrowse(self._FEED_TYPE)
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._stack.addWidget(self._browse)
+
+        self._detail = _DieselUploadDetail(self._FEED_TYPE)
+        self._detail.back_requested.connect(self._show_browse)
+        self._stack.addWidget(self._detail)
+
+        self._stack.setCurrentIndex(0)
+        vl.addWidget(self._stack, 1)
+
+    # ── Public API ───────────────────────────────────────────────────────────
+    def refresh(self) -> None:
+        self._show_browse()
+
+    # ── Internal ───────────────────────────────────────────────────────────────
+    def _show_browse(self) -> None:
+        self._stack.setCurrentIndex(0)
+        self._browse.refresh()
+
+    def _show_detail(self, upload_doc: dict) -> None:
+        self._detail.load_upload(upload_doc)
+        self._stack.setCurrentIndex(1)
+
+    def _open_import(self) -> None:
+        dlg = _FuelImportDialog(self._FEED_TYPE, parent=self)
+        dlg.imported.connect(self._on_imported)
+        dlg.exec()
+
+    def _on_imported(self, n: int) -> None:
+        QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        self._show_browse()
+
+    def _on_delete_upload(self, upload_doc: dict) -> None:
+        count = int(upload_doc.get("record_count", 0))
+        sheet = upload_doc.get("sheet_label") or upload_doc.get("source_filename") or ""
+        if QMessageBox.question(
+            self, "Delete upload",
+            f"Delete this upload ({sheet}) and its {count:,} records?",
+        ) != QMessageBox.Yes:
+            return
+        asyncio.ensure_future(self._delete_upload(str(upload_doc.get("_id") or "")))
+
+    async def _delete_upload(self, upload_id: str) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            await svc.delete_diesel_upload(self._FEED_TYPE, upload_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete Error", str(exc))
+            return
+        self._show_browse()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Concrete stations
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class InfinityWidget(_BaseDieselWidget):
-    """DIESEL INFINITY sheet — no S/No., no USD column."""
     _FEED_TYPE = "diesel_infinity"
-    _TITLE     = "Infinity Diesel"
-    _ICON      = "mdi.gas-station"
-    _HEADERS   = _DIESEL_HEADERS
-    _COL_MAP   = _DIESEL_COL_MAP
-
-
-class LakeTundumaWidget(_BaseDieselWidget):
-    """DIESEL LAKE TUNDUMA sheet — same column structure as Infinity."""
-    _FEED_TYPE = "diesel_lake_tunduma"
-    _TITLE     = "Lake Tunduma Diesel"
-    _ICON      = "mdi.water-pump"
-    _HEADERS   = _DIESEL_HEADERS
-    _COL_MAP   = _DIESEL_COL_MAP
-
-
-class GBPDieselWidget(_BaseDieselWidget):
-    """DIESEL GBP sheet — adds S/No. as first column."""
-    _FEED_TYPE = "diesel_gbp"
-    _TITLE     = "GBP Diesel"
-    _ICON      = "mdi.fuel"
-    _HEADERS   = _GBP_HEADERS
-    _COL_MAP   = _GBP_COL_MAP
-
-    def _fill_row(self, t: QTableWidget, r: int, rec: dict) -> None:
-        t.setItem(r, 0,  _cell(rec.get("sn", "")))
-        t.setItem(r, 1,  _cell(_fmt_date_str(rec.get("date", ""))))
-        t.setItem(r, 2,  _cell(rec.get("lpo_no", "")))
-        t.setItem(r, 3,  _cell(rec.get("do_sdo_no", "")))
-        t.setItem(r, 4,  _cell(rec.get("diesel_at", "")))
-        t.setItem(r, 5,  _cell(rec.get("clients_name", "")))
-        t.setItem(r, 6,  _cell(rec.get("destinations", "")))
-        t.setItem(r, 7,  _cell(rec.get("truck_no", "")))
-        t.setItem(r, 8,  _cell(_fmt_num(rec.get("ltrs"), decimals=2),
-                               Qt.AlignRight | Qt.AlignVCenter, mono=True))
-        t.setItem(r, 9,  _cell(_fmt_num(rec.get("price_per_ltr"), decimals=2),
-                               Qt.AlignRight | Qt.AlignVCenter, mono=True))
-        t.setItem(r, 10, _cell(_fmt_num(rec.get("total_amount"), "TZS ", 0),
-                               Qt.AlignRight | Qt.AlignVCenter, mono=True))
 
 
 class LakeZambiaWidget(_BaseDieselWidget):
-    """DIESEL LAKE ZAMBIA sheet — extra Lake US$ and Remark columns."""
     _FEED_TYPE = "diesel_lake_zambia"
-    _TITLE     = "Lake Zambia Diesel"
-    _ICON      = "mdi.water-pump"
-    _HEADERS   = _ZAMBIA_HEADERS
-    _COL_MAP   = _ZAMBIA_COL_MAP
 
-    def _make_summary(self) -> _SummaryBar:
-        return _SummaryBar([
-            ("records",  "Total Records", ""),
-            ("ltrs",     "Total Litres",  "L"),
-            ("amount",   "Total Amount",  "TZS"),
-            ("lake_usd", "Lake US$",      "USD"),
-        ])
 
-    def _totals_defs(self) -> List[Tuple[str, str]]:
-        return [("ltrs", "Ltrs "), ("amount", "TZS "), ("lake_usd", "USD ")]
+class LakeTundumaWidget(_BaseDieselWidget):
+    _FEED_TYPE = "diesel_lake_tunduma"
 
-    async def _load(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_diesel_feed(
-                self._FEED_TYPE, self._search, self._truck_filter,
-                self._page_size, skip,
-            ),
-            svc.count_diesel_feed(
-                self._FEED_TYPE, self._search, self._truck_filter,
-            ),
-        )
-        self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
 
-        totals   = await svc.get_diesel_totals(self._FEED_TYPE)
-        ltrs     = totals.get("ltrs", 0.0)
-        amount   = totals.get("total_amount", 0.0)
-        lake_usd = totals.get("lake_usd", 0.0)
-
-        self._summary.set_value("records",  f"{total:,}")
-        self._summary.set_value("ltrs",     _fmt_num(ltrs,     decimals=0))
-        self._summary.set_value("amount",   _fmt_num(amount,   "TZS ", 0))
-        self._summary.set_value("lake_usd", _fmt_num(lake_usd, "$ ", 2))
-
-        self._totals.set_total("ltrs",     ltrs,     "Ltrs ")
-        self._totals.set_total("amount",   amount,   "TZS ")
-        self._totals.set_total("lake_usd", lake_usd, "USD ")
-
-    def _fill_row(self, t: QTableWidget, r: int, rec: dict) -> None:
-        t.setItem(r, 0,  _cell(rec.get("sn", "")))
-        t.setItem(r, 1,  _cell(_fmt_date_str(rec.get("date", ""))))
-        t.setItem(r, 2,  _cell(rec.get("lpo_no", "")))
-        t.setItem(r, 3,  _cell(rec.get("do_sdo_no", "")))
-        t.setItem(r, 4,  _cell(rec.get("diesel_at", "")))
-        t.setItem(r, 5,  _cell(rec.get("clients_name", "")))
-        t.setItem(r, 6,  _cell(rec.get("destinations", "")))
-        t.setItem(r, 7,  _cell(rec.get("truck_no", "")))
-        t.setItem(r, 8,  _cell(_fmt_num(rec.get("ltrs"), decimals=2),
-                               Qt.AlignRight | Qt.AlignVCenter, mono=True))
-        t.setItem(r, 9,  _cell(_fmt_num(rec.get("price_per_ltr"), decimals=2),
-                               Qt.AlignRight | Qt.AlignVCenter, mono=True))
-        t.setItem(r, 10, _cell(_fmt_num(rec.get("total_amount"), "TZS ", 0),
-                               Qt.AlignRight | Qt.AlignVCenter, mono=True))
-        t.setItem(r, 11, _cell(_fmt_num(rec.get("lake_usd"), "$ ", 2),
-                               Qt.AlignRight | Qt.AlignVCenter, mono=True))
-        t.setItem(r, 12, _cell(rec.get("remark", "")))
+class GBPDieselWidget(_BaseDieselWidget):
+    _FEED_TYPE = "diesel_gbp"

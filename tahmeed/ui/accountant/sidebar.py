@@ -156,7 +156,7 @@ class _NavItem(QWidget):
         self._text_lbl = QLabel(label)
         self._text_lbl.setStyleSheet(
             f"color: {_MUTED}; font-size: 13px;"
-            " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            " font-family:'Segoe UI'; background: transparent;"
         )
         self._text_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         hl.addWidget(self._text_lbl)
@@ -170,7 +170,7 @@ class _NavItem(QWidget):
             self._badge_lbl.setStyleSheet(
                 f"background: {_RED}; color: #ffffff; font-size: 10px;"
                 " font-weight: 700; border-radius: 9px; padding: 0 5px;"
-                " font-family: 'Segoe UI', sans-serif;"
+                " font-family:'Segoe UI';"
             )
             self._badge_lbl.setVisible(False)
             hl.addWidget(self._badge_lbl)
@@ -233,21 +233,21 @@ class _NavItem(QWidget):
             self._indicator.setStyleSheet(f"background: {_BLUE};")
             self._text_lbl.setStyleSheet(
                 f"color: {_WHITE}; font-size: 13px; font-weight: 600;"
-                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+                " font-family:'Segoe UI'; background: transparent;"
             )
         elif hover:
             self.setStyleSheet(f"background: {_ACTIVE_BG};")
             self._indicator.setStyleSheet("background: transparent;")
             self._text_lbl.setStyleSheet(
                 f"color: {_WHITE}; font-size: 13px;"
-                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+                " font-family:'Segoe UI'; background: transparent;"
             )
         else:
             self.setStyleSheet("background: transparent;")
             self._indicator.setStyleSheet("background: transparent;")
             self._text_lbl.setStyleSheet(
                 f"color: {_MUTED}; font-size: 13px;"
-                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+                " font-family:'Segoe UI'; background: transparent;"
             )
 
     # ── Qt events ──────────────────────────────────────────────────────────
@@ -343,7 +343,7 @@ class _SubNavItem(QWidget):
         color = _BLUE if self.is_add else _MUTED
         self._text_lbl.setStyleSheet(
             f"color: {color}; font-size: 12px;"
-            " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            " font-family:'Segoe UI'; background: transparent;"
         )
         self._text_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         hl.addWidget(self._text_lbl)
@@ -370,21 +370,21 @@ class _SubNavItem(QWidget):
             self._indicator.setStyleSheet(f"background: {_BLUE};")
             self._text_lbl.setStyleSheet(
                 f"color: {_WHITE}; font-size: 12px; font-weight: 600;"
-                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+                " font-family:'Segoe UI'; background: transparent;"
             )
         elif hover:
             self.setStyleSheet(f"background: {_ACTIVE_BG};")
             self._indicator.setStyleSheet("background: transparent;")
             self._text_lbl.setStyleSheet(
                 f"color: {_WHITE}; font-size: 12px;"
-                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+                " font-family:'Segoe UI'; background: transparent;"
             )
         else:
             self.setStyleSheet(f"background: {_SUB_BG};")
             self._indicator.setStyleSheet("background: transparent;")
             self._text_lbl.setStyleSheet(
                 f"color: {_MUTED}; font-size: 12px;"
-                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+                " font-family:'Segoe UI'; background: transparent;"
             )
         self._refresh_icon(bright=self._active or hover)
 
@@ -418,7 +418,7 @@ class _SectionLabel(QLabel):
         super().__init__(text.upper(), parent)
         self.setStyleSheet(
             f"color: {_MUTED}; font-size: 10px; font-weight: 600;"
-            " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            " font-family:'Segoe UI'; background: transparent;"
             " padding: 6px 16px 2px 16px; letter-spacing: 1px;"
         )
 
@@ -568,7 +568,7 @@ class SidebarWidget(QFrame):
                 border: none;
                 color: {_MUTED};
                 font-size: 12px;
-                font-family: 'Segoe UI', sans-serif;
+                font-family:'Segoe UI';
                 padding: 0 14px;
                 text-align: left;
             }}
@@ -592,7 +592,7 @@ class SidebarWidget(QFrame):
             QToolButton {
                 background: transparent; border: none;
                 color: #EF4444; font-size: 12px;
-                font-family: 'Segoe UI', sans-serif;
+                font-family:'Segoe UI';
                 padding: 0 14px; text-align: left;
             }
             QToolButton:hover { background: rgba(239,68,68,0.10); }
@@ -851,7 +851,7 @@ class SidebarWidget(QFrame):
             hint = QLabel("  No sidebar items yet")
             hint.setStyleSheet(
                 f"color: {_MUTED}; font-size: 11px; font-style: italic;"
-                " font-family: 'Segoe UI', sans-serif; background: transparent;"
+                " font-family:'Segoe UI'; background: transparent;"
                 " padding: 4px 16px;"
             )
             self._items_host_vl.addWidget(hint)

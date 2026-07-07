@@ -62,14 +62,14 @@ _ROW_H   = 40
 _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE}; gridline-color: {_BORDER};"
-    f"  font-size: 12px; font-family: 'Segoe UI', sans-serif;"
+    f"  font-size: 12px; font-family:'Segoe UI';"
     f"  color: {_T1}; border: none;"
     f"  selection-background-color: #DBEAFE; selection-color: {_T1};"
     f"}}"
     f"QTableWidget::item {{ padding: 2px 8px; border: none; }}"
     f"QHeaderView::section {{"
     f"  background: {_HDR_BG}; color: {_T2};"
-    f"  font-size: 11px; font-weight: 600; font-family: 'Segoe UI', sans-serif;"
+    f"  font-size: 11px; font-weight: 600; font-family:'Segoe UI';"
     f"  border: none; border-bottom: 2px solid {_BORDER};"
     f"  border-right: 1px solid {_BORDER}; padding: 0 8px; min-height: 32px;"
     f"}}"
@@ -187,7 +187,7 @@ class _IconPickerDialog(QDialog):
         cancel.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 13px; font-family: 'Segoe UI', sans-serif; padding: 0 18px; }}"
+            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }}"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         cancel.clicked.connect(self.reject)
@@ -212,7 +212,7 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400, color: str = _T1) ->
     w = QLabel(text)
     w.setStyleSheet(
         f"color: {color}; font-size: {size}px; font-weight: {weight};"
-        " font-family: 'Segoe UI', sans-serif; background: transparent;"
+        " font-family:'Segoe UI'; background: transparent;"
     )
     return w
 
@@ -222,7 +222,7 @@ def _input_ss() -> str:
         f"QLineEdit, QTextEdit {{"
         f"  border: 1px solid {_BORDER}; border-radius: 5px;"
         f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
-        "  font-family: 'Segoe UI', sans-serif; padding: 4px 8px; }}"
+        "  font-family:'Segoe UI'; padding: 4px 8px; }}"
         f"QLineEdit {{ min-height: 32px; max-height: 32px; }}"
         f"QLineEdit:focus, QTextEdit:focus {{ border-color: {_BLUE}; }}"
     )
@@ -241,7 +241,7 @@ def _pill_cell(text: str, colors: tuple, row_bg: str) -> QWidget:
     pill.setStyleSheet(
         f"color: {fg}; background: {bg}; border-radius: 11px;"
         " padding: 0 10px; font-size: 10px; font-weight: 600;"
-        " font-family: 'Segoe UI', sans-serif;"
+        " font-family:'Segoe UI';"
     )
     hl.addWidget(pill)
     return container
@@ -369,7 +369,7 @@ class _SubItemDialog(QDialog):
         cancel.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 13px; font-family: 'Segoe UI', sans-serif; padding: 0 18px; }}"
+            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }}"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         cancel.clicked.connect(self.reject)
@@ -383,7 +383,7 @@ class _SubItemDialog(QDialog):
         save.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 18px; }}"
+            " font-family:'Segoe UI'; padding: 0 18px; }}"
             "QPushButton:hover { background: #005EA3; }"
         )
         save.clicked.connect(self._validate)
@@ -539,7 +539,7 @@ class _ItemDialog(QDialog):
         self._choose_icon_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family: 'Segoe UI', sans-serif; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
             f"QPushButton:hover {{ background: {_BG}; }}"
             f"QPushButton:disabled {{ color: {_TM}; }}"
         )
@@ -577,7 +577,7 @@ class _ItemDialog(QDialog):
         cancel.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 13px; font-family: 'Segoe UI', sans-serif; padding: 0 18px; }}"
+            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }}"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         cancel.clicked.connect(self.reject)
@@ -591,7 +591,7 @@ class _ItemDialog(QDialog):
         save.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 18px; }}"
+            " font-family:'Segoe UI'; padding: 0 18px; }}"
             "QPushButton:hover { background: #005EA3; }"
         )
         save.clicked.connect(self._validate)
@@ -735,7 +735,7 @@ class _SubItemsPanel(QWidget):
         self._add_btn.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 12px; font-weight: 600;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 12px; }}"
+            " font-family:'Segoe UI'; padding: 0 12px; }}"
             "QPushButton:hover { background: #005EA3; }"
         )
         self._add_btn.clicked.connect(self._on_add)
@@ -1062,7 +1062,7 @@ class ManageItemsWidget(QWidget):
         add_btn.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 16px; }}"
+            " font-family:'Segoe UI'; padding: 0 16px; }}"
             "QPushButton:hover { background: #005EA3; }"
         )
         add_btn.clicked.connect(self._on_add)
@@ -1094,7 +1094,7 @@ class ManageItemsWidget(QWidget):
         self._search.setStyleSheet(
             f"QLineEdit {{ border: 1px solid {_BORDER}; border-radius: 5px;"
             f" background: {_WHITE}; color: {_T1}; font-size: 12px;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 8px;"
+            " font-family:'Segoe UI'; padding: 0 8px;"
             " min-height: 32px; max-height: 32px; }}"
             f"QLineEdit:focus {{ border-color: {_BLUE}; }}"
         )
@@ -1119,7 +1119,7 @@ class ManageItemsWidget(QWidget):
         self._restrict_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family: 'Segoe UI', sans-serif; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
             f"QPushButton:checked {{ background: {_GREEN_L}; color: {_GREEN};"
             f" border-color: {_GREEN}; }}"
             f"QPushButton:hover:!checked {{ background: {_BG}; }}"
@@ -1134,7 +1134,7 @@ class ManageItemsWidget(QWidget):
         self._inactive_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family: 'Segoe UI', sans-serif; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
             f"QPushButton:checked {{ background: {_NAVY}; color: #FFF; border-color: {_NAVY}; }}"
             f"QPushButton:hover:!checked {{ background: {_BG}; }}"
         )
@@ -1452,7 +1452,7 @@ class ManageItemsWidget(QWidget):
             pill.setStyleSheet(
                 f"color: {_GREEN}; background: {_GREEN_L}; border-radius: 11px;"
                 " padding: 0 10px; font-size: 10px; font-weight: 600;"
-                " font-family: 'Segoe UI', sans-serif;"
+                " font-family:'Segoe UI';"
             )
             hl.addWidget(pill)
         else:
@@ -1477,7 +1477,7 @@ class ManageItemsWidget(QWidget):
             f"QPushButton {{ background: {_WHITE}; color: {_BLUE};"
             f" border: 1px solid {_BLUE}; border-radius: 4px;"
             " font-size: 11px; font-weight: 600;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 10px; }}"
+            " font-family:'Segoe UI'; padding: 0 10px; }}"
             f"QPushButton:hover {{ background: #EFF6FF; }}"
         )
         edit_btn.clicked.connect(lambda _, it=item: self._on_edit(it))
@@ -1491,7 +1491,7 @@ class ManageItemsWidget(QWidget):
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 4px;"
             " font-size: 11px;"
-            " font-family: 'Segoe UI', sans-serif; padding: 0 10px; }}"
+            " font-family:'Segoe UI'; padding: 0 10px; }}"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         toggle_btn.clicked.connect(lambda _, it=item: self._on_toggle(it))

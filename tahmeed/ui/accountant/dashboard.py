@@ -31,6 +31,7 @@ from tahmeed.ui.accountant.reconciliation import RPAScheduleWidget, BondsWidget
 from tahmeed.ui.accountant.fuel_consumption import (
     InfinityWidget, LakeZambiaWidget, LakeTundumaWidget, GBPDieselWidget,
 )
+from tahmeed.ui.accountant.diesel_cash import DieselCashWidget
 from tahmeed.ui.accountant.fleet_registry import TrucksRegistryWidget, TrailersRegistryWidget
 from tahmeed.ui.accountant.manage_items import ManageItemsWidget
 
@@ -129,31 +130,34 @@ class AccountantDashboard(QWidget):
         self._stack.addWidget(_PlaceholderPage())      # index 11 — other sections
 
         # ── Fuel Consumption ──────────────────────────────────────────────────
+        self._diesel_cash   = DieselCashWidget()
+        self._stack.addWidget(self._diesel_cash)        # index 12
+
         self._infinity      = InfinityWidget()
-        self._stack.addWidget(self._infinity)           # index 12
+        self._stack.addWidget(self._infinity)           # index 13
 
         self._lake_zambia   = LakeZambiaWidget()
-        self._stack.addWidget(self._lake_zambia)        # index 13
+        self._stack.addWidget(self._lake_zambia)        # index 14
 
         self._lake_tunduma  = LakeTundumaWidget()
-        self._stack.addWidget(self._lake_tunduma)       # index 14
+        self._stack.addWidget(self._lake_tunduma)       # index 15
 
         self._gbp_diesel    = GBPDieselWidget()
-        self._stack.addWidget(self._gbp_diesel)         # index 15
+        self._stack.addWidget(self._gbp_diesel)         # index 16
 
         # ── RahnTech ──────────────────────────────────────────────────────────
         self._rahntech = RahnTechWidget()
-        self._stack.addWidget(self._rahntech)           # index 16
+        self._stack.addWidget(self._rahntech)           # index 17
 
         # ── Fleet Registry ────────────────────────────────────────────────────
         self._trucks_registry = TrucksRegistryWidget()
-        self._stack.addWidget(self._trucks_registry)    # index 17
+        self._stack.addWidget(self._trucks_registry)    # index 18
 
         self._trailers_registry = TrailersRegistryWidget()
-        self._stack.addWidget(self._trailers_registry)  # index 18
+        self._stack.addWidget(self._trailers_registry)  # index 19
 
         self._manage_items = ManageItemsWidget()
-        self._stack.addWidget(self._manage_items)        # index 19
+        self._stack.addWidget(self._manage_items)        # index 20
         # Rebuild the sidebar's dynamic ITEMS whenever the accountant changes them.
         self._manage_items.items_changed.connect(self._sidebar.refresh_items)
         # Live-refresh a single item's sub-item strip when its sub-items change.
@@ -194,19 +198,22 @@ class AccountantDashboard(QWidget):
             "afritrack":      (8,  self._afritrack),
             "third_party":    (9,  self._third_party),
             "comesa":         (10, self._comesa),
-            "infinity":       (12, self._infinity),
-            "lake_zambia":    (13, self._lake_zambia),
-            "lake_tunduma":   (14, self._lake_tunduma),
-            "gbp_diesel":     (15, self._gbp_diesel),
-            "rahntech":         (16, self._rahntech),
-            "manage_trucks":    (17, self._trucks_registry),
-            "manage_trailers":  (18, self._trailers_registry),
-            "manage_categories":(19, self._manage_items),
+            "diesel_cash":    (12, self._diesel_cash),
+            "infinity":       (13, self._infinity),
+            "lake_zambia":    (14, self._lake_zambia),
+            "lake_tunduma":   (15, self._lake_tunduma),
+            "gbp_diesel":     (16, self._gbp_diesel),
+            "rahntech":         (17, self._rahntech),
+            "manage_trucks":    (18, self._trucks_registry),
+            "manage_trailers":  (19, self._trailers_registry),
+            "manage_categories":(20, self._manage_items),
         }
         if key in _routes:
             idx, widget = _routes[key]
             self._stack.setCurrentIndex(idx)
-            widget.refresh()
+            refresh = getattr(widget, "refresh", None)
+            if callable(refresh):
+                refresh()
         elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
         elif key == "sm_burhani":
@@ -285,7 +292,7 @@ class _PlaceholderPage(QWidget):
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet(
             "color: #9CA3AF; font-size: 14px;"
-            " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            " font-family:'Segoe UI'; background: transparent;"
         )
         vl.addWidget(hint)
 
@@ -323,7 +330,7 @@ class _StatusBar(QFrame):
         )
         status.setStyleSheet(
             "color: #6B7280; font-size: 11px;"
-            " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            " font-family:'Segoe UI'; background: transparent;"
         )
         hl.addWidget(status)
         hl.addStretch()
