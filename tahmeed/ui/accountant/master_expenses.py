@@ -195,22 +195,10 @@ def _action_btn(text: str, icon_name: str, primary: bool = True) -> QPushButton:
     return b
 
 
-def _receipt_badge(status: str, row_bg: str = _WHITE) -> QWidget:
-    text, fg, bg = _RECEIPT_MAP.get(status, ("Unknown", _TM, "#F3F4F6"))
-    container = QWidget()
-    container.setStyleSheet(f"background: {row_bg};")
-    hl = QHBoxLayout(container)
-    hl.setContentsMargins(3, 3, 3, 3)
-    hl.setAlignment(Qt.AlignCenter)
-    lbl = QLabel(text)
-    lbl.setAlignment(Qt.AlignCenter)
-    lbl.setStyleSheet(
-        f"color: {fg}; background: {bg}; border-radius: 10px;"
-        " padding: 2px 8px; font-size: 10px; font-weight: 600;"
-        " font-family:'Segoe UI';"
-    )
-    hl.addWidget(lbl)
-    return container
+def _receipt_text(status: str) -> tuple:
+    """Return (display text, text color) for a receipt status — no pill/background."""
+    text, fg, _bg = _RECEIPT_MAP.get(status, ("Unknown", _TM, ""))
+    return text, fg
 
 
 def _short_name(name: str) -> str:
@@ -523,7 +511,8 @@ class _LedgerTable(QFrame):
                 usd_txt, usd_col = "—", _TM
             t.setItem(r, 9, _cell(usd_txt, self._flag("right"), mono=True, color=usd_col))
 
-            t.setCellWidget(r, 10, _receipt_badge(tx.receipt_status or "pending", row_bg))
+            rcpt_text, rcpt_fg = _receipt_text(tx.receipt_status or "pending")
+            t.setItem(r, 10, _cell(rcpt_text, self._flag("center"), color=rcpt_fg))
             t.setItem(r, 11, _cell(tx.ownership or "—"))
             t.setItem(r, 12, _cell(tx.approver or "—", color=_T2))
             t.setItem(r, 13, _cell(cashier_name))

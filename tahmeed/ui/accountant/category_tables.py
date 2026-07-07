@@ -197,26 +197,10 @@ def _set_cell(table: QTableWidget, row: int, col: int, text: str,
     table.setItem(row, col, item)
 
 
-def _receipt_badge(status: str, bg: str) -> QWidget:
-    text, fg, badge_bg = _RECEIPT_MAP.get(status, ("—", _TM, "#F3F4F6"))
-    container = QWidget()
-    container.setStyleSheet(f"background: {bg};")
-    hl = QHBoxLayout(container)
-    hl.setContentsMargins(3, 3, 3, 3)
-    hl.setAlignment(Qt.AlignCenter)
-    if text == "—":
-        pill = QLabel("—")
-        pill.setStyleSheet(f"color: {_TM}; background: transparent; font-size: 12px;")
-    else:
-        pill = QLabel(text)
-        pill.setAlignment(Qt.AlignCenter)
-        pill.setStyleSheet(
-            f"color: {fg}; background: {badge_bg}; border-radius: 9px;"
-            " padding: 2px 8px; font-size: 10px; font-weight: 600;"
-            " font-family:'Segoe UI';"
-        )
-    hl.addWidget(pill)
-    return container
+def _receipt_text(status: str) -> tuple:
+    """Return (display text, text color) for a receipt status — no pill/background."""
+    text, fg, _bg = _RECEIPT_MAP.get(status, ("—", _TM, ""))
+    return text, fg
 
 
 def _fmt_short(amount: float) -> str:
@@ -565,8 +549,9 @@ class CategoryTableWidget(QWidget):
                 tzs_txt, tzs_col = "—", _TM
             _set_cell(self._table, i, 7, tzs_txt, "right", row_bg, color=tzs_col, mono=True)
 
-            # Receipt badge (cell widget paints the row stripe behind it)
-            self._table.setCellWidget(i, 8, _receipt_badge(tx.receipt_status or "pending", row_bg))
+            # Receipt — plain colored text on the normal row background
+            rcpt_text, rcpt_fg = _receipt_text(tx.receipt_status or "pending")
+            _set_cell(self._table, i, 8, rcpt_text, "center", row_bg, color=rcpt_fg)
 
             _set_cell(self._table, i, 9, tx.ownership or "—", "left", row_bg)
             _set_cell(self._table, i, 10, tx.approver or "—", "left", row_bg)

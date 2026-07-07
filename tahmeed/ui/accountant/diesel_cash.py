@@ -25,7 +25,7 @@ from tahmeed.app_state import app_state
 from tahmeed.models.transaction import Transaction
 from tahmeed.ui.accountant.category_tables import (
     _COLS, _WHITE, _BG, _BORDER, _BLUE,
-    _T1, _T2, _TM, _RED, _lbl, _input_ss, _btn, _receipt_badge,
+    _T1, _T2, _TM, _RED, _lbl, _input_ss, _btn, _receipt_text,
 )
 from tahmeed.ui.accountant.separate_expenses import (
     _make_table, _cell, _finish_table_row, _stripe_bg,
@@ -408,9 +408,10 @@ class _DieselCashMonthDetail(QWidget):
                 tzs_txt, align=Qt.AlignRight | Qt.AlignVCenter,
                 mono=True, color=tzs_col,
             ))
-            t.setCellWidget(
-                r, 8, _receipt_badge(tx.receipt_status or "pending", row_bg),
-            )
+            rcpt_text, rcpt_fg = _receipt_text(tx.receipt_status or "pending")
+            t.setItem(r, 8, _cell(
+                rcpt_text, align=Qt.AlignCenter | Qt.AlignVCenter, color=rcpt_fg,
+            ))
             t.setItem(r, 9, _cell(tx.ownership or "—"))
             t.setItem(r, 10, _cell(tx.approver or "—"))
             _finish_table_row(t, r)
