@@ -56,22 +56,24 @@ _RED     = "#DC2626"
 _RED_L   = "#FEE2E2"
 _AMBER   = "#D97706"
 _AMBER_L = "#FEF3C7"
-_STRIPE  = "#E8F4FD"
-_ROW_H   = 40
+_BLUE_L  = "#E8F4FD"   # row selection highlight (matches SM Burhani Bonds)
+_STRIPE  = "#F1F5F9"   # subtle slate zebra stripe (matches SM Burhani Bonds)
+_ROW_H   = 32
+_HDR_H   = 28
 
 _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE}; gridline-color: {_BORDER};"
-    f"  font-size: 12px; font-family:'Segoe UI';"
+    f"  font-size: 11px; font-family:'Segoe UI';"
     f"  color: {_T1}; border: none;"
-    f"  selection-background-color: #DBEAFE; selection-color: {_T1};"
     f"}}"
     f"QTableWidget::item {{ padding: 2px 8px; border: none; }}"
+    f"QTableWidget::item:selected {{ background: {_BLUE_L}; color: {_T1}; }}"
     f"QHeaderView::section {{"
     f"  background: {_HDR_BG}; color: {_T2};"
-    f"  font-size: 11px; font-weight: 600; font-family:'Segoe UI';"
-    f"  border: none; border-bottom: 2px solid {_BORDER};"
-    f"  border-right: 1px solid {_BORDER}; padding: 0 8px; min-height: 32px;"
+    f"  font-size: 10px; font-weight: 600; font-family:'Segoe UI';"
+    f"  border: none; border-bottom: 1px solid {_BORDER};"
+    f"  padding: 0 8px; min-height: {_HDR_H}px;"
     f"}}"
     f"QHeaderView::section:hover {{ background: #E2E8F0; }}"
     f"QScrollBar:vertical {{ background: {_BG}; width: 8px; margin: 0; }}"
@@ -228,29 +230,23 @@ def _input_ss() -> str:
     )
 
 
-def _pill_cell(text: str, colors: tuple, row_bg: str) -> QWidget:
-    fg, bg = colors
-    container = QWidget()
-    container.setStyleSheet(f"background: {row_bg};")
-    hl = QHBoxLayout(container)
-    hl.setContentsMargins(4, 4, 4, 4)
-    hl.setAlignment(Qt.AlignCenter)
-    pill = QLabel(text)
-    pill.setAlignment(Qt.AlignCenter)
-    pill.setFixedHeight(22)
-    pill.setStyleSheet(
-        f"color: {fg}; background: {bg}; border-radius: 11px;"
-        " padding: 0 10px; font-size: 10px; font-weight: 600;"
-        " font-family:'Segoe UI';"
-    )
-    hl.addWidget(pill)
-    return container
+def _status_item(text: str, color: str, row_bg: str, bold: bool = True) -> QTableWidgetItem:
+    """Flat, centered status text cell (matches the SM Burhani Bonds grid look)."""
+    it = QTableWidgetItem(text)
+    it.setTextAlignment(Qt.AlignCenter)
+    it.setForeground(QBrush(QColor(color)))
+    it.setBackground(QBrush(QColor(row_bg)))
+    f = QFont("Segoe UI", 11)
+    f.setBold(bold)
+    it.setFont(f)
+    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+    return it
 
 
 def _icon_btn(icon_name: str, tooltip: str, color: str = _T2,
               hover_bg: str = _BG) -> QPushButton:
     btn = QPushButton()
-    btn.setFixedSize(28, 28)
+    btn.setFixedSize(24, 24)
     btn.setCursor(Qt.PointingHandCursor)
     btn.setToolTip(tooltip)
     btn.setStyleSheet(
@@ -260,7 +256,7 @@ def _icon_btn(icon_name: str, tooltip: str, color: str = _T2,
     )
     try:
         btn.setIcon(qta.icon(icon_name, color=color))
-        btn.setIconSize(QSize(14, 14))
+        btn.setIconSize(QSize(13, 13))
     except Exception:
         pass
     return btn
@@ -949,7 +945,7 @@ class _SubItemsPanel(QWidget):
         container = QWidget()
         container.setStyleSheet(f"background: {row_bg};")
         hl = QHBoxLayout(container)
-        hl.setContentsMargins(6, 5, 6, 5)
+        hl.setContentsMargins(6, 4, 6, 4)
         hl.setSpacing(4)
 
         edit_btn = _icon_btn("mdi.pencil-outline", "Edit sub-item", _BLUE, "#EFF6FF")
@@ -1257,9 +1253,9 @@ class ManageItemsWidget(QWidget):
             dl.setContentsMargins(0, 0, 0, 0)
             dl.setAlignment(Qt.AlignCenter)
             dot = QLabel()
-            dot.setFixedSize(18, 18)
+            dot.setFixedSize(14, 14)
             dot.setStyleSheet(
-                f"background: {item.color}; border-radius: 9px;"
+                f"background: {item.color}; border-radius: 7px;"
                 " border: 1px solid rgba(0,0,0,0.1);"
             )
             dl.addWidget(dot)
@@ -1269,7 +1265,7 @@ class ManageItemsWidget(QWidget):
             name_it = QTableWidgetItem(item.name)
             name_it.setBackground(QBrush(QColor(row_bg)))
             name_it.setForeground(QBrush(QColor(_T1 if item.active else _TM)))
-            f = QFont("Segoe UI", 12)
+            f = QFont("Segoe UI", 11)
             if not item.active:
                 f.setItalic(True)
             name_it.setFont(f)
@@ -1287,27 +1283,28 @@ class ManageItemsWidget(QWidget):
             self._table.setItem(i, 2, desc_it)
 
             # Col 3: sidebar tab indicator (icon + On / —)
-            self._table.setCellWidget(i, 3, self._sidebar_cell(item, row_bg))
+            if item.show_in_sidebar:
+                self._table.setCellWidget(i, 3, self._sidebar_cell(item, row_bg))
+            else:
+                self._table.removeCellWidget(i, 3)
+                self._table.setItem(i, 3, _status_item("—", _TM, row_bg, bold=False))
 
-            # Col 4: req receipt pill
-            self._table.setCellWidget(i, 4, _pill_cell(
+            # Col 4: req receipt
+            self._table.setItem(i, 4, _status_item(
                 "Yes" if item.requires_receipt else "No",
-                (_GREEN, _GREEN_L) if item.requires_receipt else (_T2, _BG),
-                row_bg,
+                _GREEN if item.requires_receipt else _TM, row_bg,
             ))
 
-            # Col 5: req truck pill
-            self._table.setCellWidget(i, 5, _pill_cell(
+            # Col 5: req truck
+            self._table.setItem(i, 5, _status_item(
                 "Yes" if item.requires_truck else "No",
-                (_GREEN, _GREEN_L) if item.requires_truck else (_T2, _BG),
-                row_bg,
+                _GREEN if item.requires_truck else _TM, row_bg,
             ))
 
-            # Col 6: status pill
-            self._table.setCellWidget(i, 6, _pill_cell(
+            # Col 6: status
+            self._table.setItem(i, 6, _status_item(
                 "Active" if item.active else "Inactive",
-                (_GREEN, _GREEN_L) if item.active else (_RED, _RED_L),
-                row_bg,
+                _GREEN if item.active else _RED, row_bg,
             ))
 
             # Col 7: action buttons
@@ -1315,6 +1312,7 @@ class ManageItemsWidget(QWidget):
             self._table.setRowHeight(i, _ROW_H)
 
         self._table.selectionModel().blockSignals(False)
+        self._repaint_row_widgets()
 
         # Restore previous selection
         if restore_row is not None:
@@ -1334,6 +1332,7 @@ class ManageItemsWidget(QWidget):
         else:
             self._selected_id = None
             self._sub_panel.clear()
+        self._repaint_row_widgets()
 
     # ── Item CRUD ──────────────────────────────────────────────────────────────
 
@@ -1432,34 +1431,42 @@ class ManageItemsWidget(QWidget):
         container = QWidget()
         container.setStyleSheet(f"background: {row_bg};")
         hl = QHBoxLayout(container)
-        hl.setContentsMargins(4, 4, 4, 4)
+        hl.setContentsMargins(4, 2, 4, 2)
         hl.setSpacing(5)
         hl.setAlignment(Qt.AlignCenter)
-        if item.show_in_sidebar:
-            icon_lbl = QLabel()
-            icon_lbl.setFixedSize(16, 16)
-            icon_lbl.setStyleSheet("background: transparent;")
-            try:
-                icon_lbl.setPixmap(
-                    qta.icon(item.icon or "mdi.tag-outline", color=_BLUE).pixmap(16, 16)
-                )
-            except Exception:
-                pass
-            hl.addWidget(icon_lbl)
-            pill = QLabel("On")
-            pill.setAlignment(Qt.AlignCenter)
-            pill.setFixedHeight(22)
-            pill.setStyleSheet(
-                f"color: {_GREEN}; background: {_GREEN_L}; border-radius: 11px;"
-                " padding: 0 10px; font-size: 10px; font-weight: 600;"
-                " font-family:'Segoe UI';"
+
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(15, 15)
+        icon_lbl.setStyleSheet("background: transparent;")
+        try:
+            icon_lbl.setPixmap(
+                qta.icon(item.icon or "mdi.tag-outline", color=_BLUE).pixmap(15, 15)
             )
-            hl.addWidget(pill)
-        else:
-            dash = QLabel("—")
-            dash.setStyleSheet(f"color: {_TM}; background: transparent; font-size: 12px;")
-            hl.addWidget(dash)
+        except Exception:
+            pass
+        hl.addWidget(icon_lbl)
+
+        on = QLabel("On")
+        on.setStyleSheet(
+            f"color: {_GREEN}; background: transparent;"
+            " font-size: 11px; font-weight: 700; font-family:'Segoe UI';"
+        )
+        hl.addWidget(on)
         return container
+
+    # ── Uniform selection highlight for widget cells ───────────────────────────
+
+    def _repaint_row_widgets(self) -> None:
+        """Repaint the dot / sidebar / action cell-widgets so the selected row
+        highlights uniformly with the plain text cells (which Qt handles via QSS)."""
+        sel = self._table.currentRow()
+        last = len(self._ITEM_COLS) - 1
+        for r in range(self._table.rowCount()):
+            bg = _BLUE_L if r == sel else (_STRIPE if r % 2 else _WHITE)
+            for c in (0, 3, last):
+                w = self._table.cellWidget(r, c)
+                if w is not None:
+                    w.setStyleSheet(f"background: {bg};")
 
     # ── Action buttons cell ────────────────────────────────────────────────────
 
@@ -1467,11 +1474,11 @@ class ManageItemsWidget(QWidget):
         container = QWidget()
         container.setStyleSheet(f"background: {row_bg};")
         hl = QHBoxLayout(container)
-        hl.setContentsMargins(8, 5, 8, 5)
+        hl.setContentsMargins(8, 4, 8, 4)
         hl.setSpacing(5)
 
         edit_btn = QPushButton("Edit")
-        edit_btn.setFixedHeight(28)
+        edit_btn.setFixedHeight(24)
         edit_btn.setCursor(Qt.PointingHandCursor)
         edit_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_BLUE};"
@@ -1485,7 +1492,7 @@ class ManageItemsWidget(QWidget):
 
         toggle_lbl = "Activate" if not item.active else "Deactivate"
         toggle_btn = QPushButton(toggle_lbl)
-        toggle_btn.setFixedHeight(28)
+        toggle_btn.setFixedHeight(24)
         toggle_btn.setCursor(Qt.PointingHandCursor)
         toggle_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"

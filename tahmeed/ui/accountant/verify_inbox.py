@@ -38,6 +38,11 @@ _QB_HDR_BG = "#EFF6FF"
 _QB_HDR_FG = "#1E3A5F"
 _QB_SEL_BG = "#DBEAFE"
 _QB_SEL_FG = "#1E3A5F"
+# Shared grid look — matches Master Expenses / SM Burhani Bonds
+_HDR_BG    = "#F1F5F9"
+_STRIPE    = "#F1F5F9"
+_HDR_H     = 28
+_ROW_H     = 28
 
 _AUTO_THRESHOLD = 0.70
 _PAGE_SIZES     = [25, 50, 100]
@@ -149,14 +154,15 @@ def _hsep() -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:12px;font-family:'Segoe UI';}}"
-        f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
-        f"QTableWidget::item:selected{{background:{_QB_SEL_BG};color:{_QB_SEL_FG};}}"
-        f"QTableWidget::item:alternate{{background:#F9FAFB;}}"
-        f"QHeaderView::section{{background:{_QB_HDR_BG};color:{_QB_HDR_FG};"
-        "font-size:11px;font-weight:700;font-family:'Segoe UI';"
+        "border:none;font-size:11px;font-family:'Segoe UI';}}"
+        f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
+        f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
+        f"QTableWidget::item:alternate{{background:{_STRIPE};}}"
+        f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
+        "font-size:10px;font-weight:600;font-family:'Segoe UI';"
         f"border:none;border-right:1px solid {_BORDER};"
-        f"border-bottom:2px solid {_BLUE};padding:0 6px;height:32px;}}"
+        f"border-bottom:1px solid {_BORDER};padding:0 8px;height:{_HDR_H}px;}}"
+        f"QHeaderView::section:hover{{background:#E2E8F0;}}"
         "QScrollBar:vertical{width:8px;background:transparent;}"
         "QScrollBar::handle:vertical{background:#D1D5DB;border-radius:4px;}"
         "QScrollBar:horizontal{height:8px;background:transparent;}"
@@ -762,10 +768,10 @@ class VerifyInboxWidget(QWidget):
         t.setSelectionMode(QAbstractItemView.SingleSelection)
         t.setAlternatingRowColors(True)
         t.verticalHeader().setVisible(False)
-        t.verticalHeader().setDefaultSectionSize(34)
+        t.verticalHeader().setDefaultSectionSize(_ROW_H)
         t.setShowGrid(True)
         t.setStyleSheet(
-            _table_style() + f"QTableWidget{{alternate-background-color:#F9FAFB;}}"
+            _table_style() + f"QTableWidget{{alternate-background-color:{_STRIPE};}}"
         )
         hdr = t.horizontalHeader()
         hdr.setHighlightSections(False)
