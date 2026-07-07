@@ -8,8 +8,8 @@ DailyRegister (excel_grid.py):
     S/NO · DATE · ITEM · DESCRIPTION · TRUCK NO. · MEMO · NOTES
          · TZS · RECEIPT · OWNERSHIP · APR BY
 
-Design follows the QuickBooks LPO reference: alternating light-blue / white
-striped rows, muted grey headers, colored receipt pill, red negatives.
+Design matches the Master Expenses / Verify grid: slate zebra stripes,
+muted grey headers, colored receipt pill, red negatives.
 
 The widget reuses the existing Master Expenses service queries
 (``get_master_transactions`` etc.) with a fixed ``category`` filter — no data
@@ -42,7 +42,8 @@ _WHITE      = "#FFFFFF"
 _BG         = "#F4F6F8"
 _BORDER     = "#E5E7EB"
 _BLUE       = "#0077C5"
-_STRIPE     = "#E8F4FD"   # light-blue alternating row (QuickBooks LPO look)
+_BLUE_L     = "#E8F4FD"   # row selection highlight (matches Master / Verify)
+_STRIPE     = "#F1F5F9"   # slate zebra stripe (matches Master / Verify)
 _GREEN      = "#16A34A"
 _GREEN_L    = "#DCFCE7"
 _AMBER      = "#D97706"
@@ -55,7 +56,8 @@ _TM         = "#9CA3AF"
 _HDR_BG     = "#F1F5F9"
 
 _PAGE_SIZES = [25, 50, 100]
-_ROW_H      = 34
+_ROW_H      = 28
+_HDR_H      = 28
 
 # (label, pixel width, right-aligned?, mono?)
 _COLS = [
@@ -108,16 +110,16 @@ _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE};"
     f"  gridline-color: {_BORDER};"
-    f"  font-size: 12px; font-family:'Segoe UI';"
+    f"  font-size: 11px; font-family:'Segoe UI';"
     f"  color: {_T1}; border: none;"
-    f"  selection-background-color: #DBEAFE; selection-color: {_T1};"
     f"}}"
-    f"QTableWidget::item {{ padding: 2px 6px; border: none; }}"
+    f"QTableWidget::item {{ padding: 2px 8px; border: none; }}"
+    f"QTableWidget::item:selected {{ background: {_BLUE_L}; color: {_T1}; }}"
     f"QHeaderView::section {{"
     f"  background: {_HDR_BG}; color: {_T2};"
-    f"  font-size: 11px; font-weight: 600; font-family:'Segoe UI';"
-    f"  border: none; border-bottom: 2px solid {_BORDER};"
-    f"  border-right: 1px solid {_BORDER}; padding: 0 6px; min-height: 30px;"
+    f"  font-size: 10px; font-weight: 600; font-family:'Segoe UI';"
+    f"  border: none; border-bottom: 1px solid {_BORDER};"
+    f"  border-right: 1px solid {_BORDER}; padding: 0 8px; min-height: {_HDR_H}px;"
     f"}}"
     f"QHeaderView::section:hover {{ background: #E2E8F0; }}"
     f"QScrollBar:horizontal {{ background: {_BG}; height: 8px; margin: 0; }}"
@@ -634,7 +636,7 @@ class CategoryTableWidget(QWidget):
             cell.fill = grey
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        stripe = PatternFill("solid", fgColor="E8F4FD")
+        stripe = PatternFill("solid", fgColor="F1F5F9")
         white = PatternFill("solid", fgColor="FFFFFF")
         mono = Font(name="Cascadia Code", size=10)
         red = Font(name="Cascadia Code", size=10, color="DC2626")
