@@ -803,11 +803,14 @@ class _FuelImportDialog(QDialog):
     def _fill_preview(self, rows: List[dict]) -> None:
         t = self._preview_tbl
         t.setRowCount(0)
-        for row in rows:
+        for i, row in enumerate(rows):
             r = t.rowCount()
             t.insertRow(r)
             for c, (_, key, kind) in enumerate(self._columns):
-                text, align, mono = _fmt_cell(kind, row.get(key, ""))
+                val = row.get(key, "")
+                if key == "sn" and (val is None or str(val).strip() == ""):
+                    val = i + 1
+                text, align, mono = _fmt_cell(kind, val)
                 t.setItem(r, c, _cell(text, align, mono=mono))
             _finish_table_row(t, r)
 
@@ -1052,21 +1055,25 @@ class _DieselUploadDetail(QWidget):
                 self._feed_type, self._upload_id, self._search),
         )
         self._total = total
-        self._fill_table(recs)
+        self._fill_table(recs, skip)
         self._pager.set_total(total, self._page_size, self._page)
         self._totals.set_total("count", total)
         self._totals.set_total("ltrs", float(totals.get("ltrs", 0) or 0))
         if self._has_amount:
             self._totals.set_total("amount", float(totals.get("total_amount", 0) or 0))
 
-    def _fill_table(self, recs: List[dict]) -> None:
+    def _fill_table(self, recs: List[dict], skip: int = 0) -> None:
         t = self._table
         t.setRowCount(0)
-        for rec in recs:
+        for i, rec in enumerate(recs):
             r = t.rowCount()
             t.insertRow(r)
             for c, (_, key, kind) in enumerate(self._columns):
-                text, align, mono = _fmt_cell(kind, rec.get(key, ""))
+                val = rec.get(key, "")
+                # Auto-number rows when the sheet has no S/No of its own.
+                if key == "sn" and (val is None or str(val).strip() == ""):
+                    val = skip + i + 1
+                text, align, mono = _fmt_cell(kind, val)
                 t.setItem(r, c, _cell(text, align, mono=mono))
             _finish_table_row(t, r)
 
