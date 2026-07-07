@@ -1,4 +1,8 @@
 .env
+.env.production
+.env.build
+installer_output/
+releases/*.zip
 __pycache__/
 *.pyc
 *.pyo

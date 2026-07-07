@@ -213,6 +213,18 @@ class LoginWindow(QWidget):
         except Exception as exc:
             self._login_error.setText(f"Database connection error: {exc}")
             self._stack.setCurrentIndex(0)
+        asyncio.ensure_future(self._check_for_updates())
+
+    async def _check_for_updates(self) -> None:
+        try:
+            from tahmeed.services.update_service import check_for_update
+            from tahmeed.ui.dialogs.update_dialog import UpdateDialog
+
+            info = await check_for_update()
+            if info:
+                UpdateDialog(info, self).exec()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     def clear_fields(self) -> None:
