@@ -35,6 +35,27 @@ async def create_user(
     return user
 
 
+async def change_password(
+    username: str, current_password: str, new_password: str
+) -> bool:
+    """Verify the user's current password and set a new one.
+
+    Returns True on success, False if the current password is incorrect
+    (or the user no longer exists / is inactive).
+    """
+    db = get_db()
+    doc = await db.users.find_one({"username": username, "active": True})
+    if not doc:
+        return False
+    if not bcrypt.checkpw(current_password.encode(), doc["password_hash"].encode()):
+        return False
+    new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+    await db.users.update_one(
+        {"_id": doc["_id"]}, {"$set": {"password_hash": new_hash}}
+    )
+    return True
+
+
 async def any_user_exists() -> bool:
     db = get_db()
     return await db.users.count_documents({}) > 0

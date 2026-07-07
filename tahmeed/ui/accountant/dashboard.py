@@ -1,15 +1,17 @@
 """AccountantDashboard — Main shell: header + sidebar + content stack + status bar."""
 
 from __future__ import annotations
+import asyncio
 from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
-    QLabel, QFrame,
+    QLabel, QFrame, QDialog, QMessageBox,
 )
 from PySide6.QtCore import Qt, Signal
 
 from tahmeed.models.user import User
+from tahmeed.ui.dialogs.change_password_dialog import ChangePasswordDialog
 from tahmeed.ui.accountant.header_bar import HeaderBar
 from tahmeed.ui.accountant.sidebar import SidebarWidget
 from tahmeed.ui.accountant.overview import OverviewWidget
@@ -60,7 +62,10 @@ class AccountantDashboard(QWidget):
         self._header = HeaderBar(
             user=self._user,
             sidebar_toggle_fn=self._toggle_sidebar,
+            show_search=False,
         )
+        self._header.logout_requested.connect(self.logout_requested)
+        self._header.change_password_requested.connect(self._on_change_password)
         root.addWidget(self._header)
 
         # ── Body = sidebar + content ───────────────────────────────────────
@@ -76,7 +81,6 @@ class AccountantDashboard(QWidget):
         self._sidebar = SidebarWidget()
         self._sidebar.nav_selected.connect(self._on_nav)
         self._sidebar.subtable_selected.connect(self._show_subtable)
-        self._sidebar.logout_requested.connect(self.logout_requested)
         body_hl.addWidget(self._sidebar)
 
         # 1-px vertical divider
@@ -181,6 +185,30 @@ class AccountantDashboard(QWidget):
 
     def _toggle_sidebar(self) -> None:
         self._sidebar.toggle_collapsed()
+
+    def _on_change_password(self) -> None:
+        dlg = ChangePasswordDialog(parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            asyncio.ensure_future(self._do_change_password(dlg.result_data))
+
+    async def _do_change_password(self, data: dict) -> None:
+        from tahmeed.services.auth import change_password
+        try:
+            ok = await change_password(
+                self._user.username, data["current"], data["new"]
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to change password:\n{exc}")
+            return
+        if ok:
+            QMessageBox.information(
+                self, "Password Changed", "Your password has been updated."
+            )
+        else:
+            QMessageBox.warning(
+                self, "Incorrect Password",
+                "Your current password is incorrect. Please try again.",
+            )
 
     def _on_badge_updated(self, count: int) -> None:
         self._sidebar.set_verify_badge(count)

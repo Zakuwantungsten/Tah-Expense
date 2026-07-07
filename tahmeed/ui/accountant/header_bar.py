@@ -5,9 +5,9 @@ from typing import Callable, Optional
 
 import qtawesome as qta
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QToolButton, QWidget,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QToolButton, QWidget,
 )
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, Signal
 
 from tahmeed.models.user import User
 
@@ -18,6 +18,9 @@ _BORDER = "#E5E7EB"
 
 
 class HeaderBar(QFrame):
+    logout_requested = Signal()
+    change_password_requested = Signal()
+
     def __init__(
         self,
         user: User,
@@ -137,17 +140,50 @@ class HeaderBar(QFrame):
         hl.addWidget(bell_wrap)
         hl.addSpacing(10)
 
-        # ── Avatar + initials ──
+        # ── Avatar + initials (opens profile menu) ──
         initials = "".join(p[0].upper() for p in self._user.full_name.split()[:2]) or "AC"
-        avatar = QLabel(initials)
+        avatar = QToolButton()
+        avatar.setText(initials)
         avatar.setFixedSize(32, 32)
-        avatar.setAlignment(Qt.AlignCenter)
-        avatar.setStyleSheet(
-            f"background: {_BLUE}; color: #ffffff; font-size: 12px;"
-            " font-weight: 700; border-radius: 16px;"
-            " font-family:'Segoe UI';"
-        )
         avatar.setCursor(Qt.PointingHandCursor)
+        avatar.setToolTip(self._user.full_name)
+        avatar.setPopupMode(QToolButton.InstantPopup)
+        avatar.setStyleSheet(
+            "QToolButton {"
+            f"  background: {_BLUE}; color: #ffffff; font-size: 12px;"
+            "   font-weight: 700; border: none; border-radius: 16px;"
+            "   font-family:'Segoe UI';"
+            "}"
+            "QToolButton::menu-indicator { image: none; width: 0; }"
+        )
+
+        menu = QMenu(avatar)
+        menu.setStyleSheet(
+            "QMenu {"
+            f"  background: {bg}; border: 1px solid {border};"
+            "   border-radius: 6px; padding: 4px;"
+            "}"
+            "QMenu::item {"
+            f"  color: {text_col}; font-size: 13px; font-family:'Segoe UI';"
+            "   padding: 7px 18px 7px 12px; border-radius: 4px;"
+            "}"
+            f"QMenu::item:selected {{ background: {hover_bg}; }}"
+            f"QMenu::separator {{ height: 1px; background: {border}; margin: 4px 6px; }}"
+        )
+
+        change_pw_action = menu.addAction(
+            qta.icon("mdi.lock-reset", color=icon_col), "Change Password"
+        )
+        change_pw_action.triggered.connect(self.change_password_requested)
+
+        menu.addSeparator()
+
+        logout_action = menu.addAction(
+            qta.icon("mdi.logout", color="#EF4444"), "Log Out"
+        )
+        logout_action.triggered.connect(self.logout_requested)
+
+        avatar.setMenu(menu)
         hl.addWidget(avatar)
 
 

@@ -25,7 +25,7 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
-    QFrame, QLabel, QLineEdit, QPushButton,
+    QFrame, QLabel, QLineEdit, QPushButton, QDialog, QMessageBox,
 )
 from PySide6.QtCore import Qt, Signal, QSize
 
@@ -34,6 +34,7 @@ import qtawesome as qta
 from tahmeed.models.user import User
 from tahmeed.services.category_service import get_all_categories
 from tahmeed.ui.accountant.header_bar import HeaderBar
+from tahmeed.ui.dialogs.change_password_dialog import ChangePasswordDialog
 from tahmeed.ui.cashier.sidebar import CashierSidebarWidget
 from tahmeed.ui.cashier.excel_grid import DailyRegister
 from tahmeed.ui.cashier.entry_form import EntryForm
@@ -402,7 +403,6 @@ class CashierDashboard(QWidget):
         # Build sidebar first so its toggle fn can be passed to the header bar.
         self._sidebar = CashierSidebarWidget(user=self._user)
         self._sidebar.nav_selected.connect(self._on_nav)
-        self._sidebar.logout_requested.connect(self.logout_requested)
 
         # ── Header bar ────────────────────────────────────────────────────────
         self._header = HeaderBar(
@@ -411,6 +411,8 @@ class CashierDashboard(QWidget):
             dark=True,
             show_search=False,
         )
+        self._header.logout_requested.connect(self.logout_requested)
+        self._header.change_password_requested.connect(self._on_change_password)
         root.addWidget(self._header)
 
         # ── Body = sidebar + content ───────────────────────────────────────────
@@ -465,6 +467,32 @@ class CashierDashboard(QWidget):
         self._overview.go_to_form.connect(lambda: self._on_nav("form"))
         self._overview.go_to_browse.connect(self._on_browse)
         self._overview.export_data.connect(self._on_browse)
+
+    # ── Profile menu ────────────────────────────────────────────────────────────
+
+    def _on_change_password(self) -> None:
+        dlg = ChangePasswordDialog(parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            asyncio.ensure_future(self._do_change_password(dlg.result_data))
+
+    async def _do_change_password(self, data: dict) -> None:
+        from tahmeed.services.auth import change_password
+        try:
+            ok = await change_password(
+                self._user.username, data["current"], data["new"]
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to change password:\n{exc}")
+            return
+        if ok:
+            QMessageBox.information(
+                self, "Password Changed", "Your password has been updated."
+            )
+        else:
+            QMessageBox.warning(
+                self, "Incorrect Password",
+                "Your current password is incorrect. Please try again.",
+            )
 
     # ── Routing ───────────────────────────────────────────────────────────────────
 

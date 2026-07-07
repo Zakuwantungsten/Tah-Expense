@@ -130,6 +130,9 @@ class _NavItem(QWidget):
     def set_collapsed(self, collapsed: bool) -> None:
         self._is_collapsed = collapsed
         self._text_lbl.setVisible(not collapsed)
+        px = 26 if collapsed else 18
+        self._icon_lbl.setFixedSize(px, px)
+        self._refresh_icon(active=self._active)
         if self._chevron_lbl:
             self._chevron_lbl.setVisible(self._has_subtables and not collapsed)
 
@@ -141,7 +144,8 @@ class _NavItem(QWidget):
 
     def _refresh_icon(self, active: bool) -> None:
         color = _WHITE if active else _MUTED
-        self._icon_lbl.setPixmap(_qta(self._icon_name, color=color).pixmap(18, 18))
+        px = 26 if self._is_collapsed else 18
+        self._icon_lbl.setPixmap(_qta(self._icon_name, color=color).pixmap(px, px))
 
     def _paint(self, hover: bool) -> None:
         if self._active:
@@ -303,7 +307,6 @@ class CashierSidebarWidget(QFrame):
 
     nav_selected = Signal(str)
     subtable_selected = Signal(str, str, str, str)
-    logout_requested = Signal()
 
     def __init__(self, user: User, parent=None):
         super().__init__(parent)
@@ -338,7 +341,7 @@ class CashierSidebarWidget(QFrame):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet(f"""
             QScrollArea {{ background: {_NAVY}; border: none; }}
@@ -418,26 +421,6 @@ class CashierSidebarWidget(QFrame):
         self._collapse_btn.clicked.connect(self.toggle_collapsed)
         root.addWidget(self._collapse_btn)
 
-        self._logout_btn = QToolButton()
-        self._logout_btn.setFixedHeight(40)
-        self._logout_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._logout_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._logout_btn.setIcon(_qta("mdi.logout", color="#EF4444"))
-        self._logout_btn.setIconSize(QSize(16, 16))
-        self._logout_btn.setText("  Log Out")
-        self._logout_btn.setStyleSheet("""
-            QToolButton {
-                background: transparent; border: none;
-                color: #EF4444; font-size: 12px;
-                font-family: 'Segoe UI', sans-serif;
-                padding: 0 14px; text-align: left;
-            }
-            QToolButton:hover { background: rgba(239,68,68,0.10); }
-        """)
-        self._logout_btn.setCursor(Qt.PointingHandCursor)
-        self._logout_btn.clicked.connect(self.logout_requested)
-        root.addWidget(self._logout_btn)
-
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def _clear_active(self) -> None:
@@ -473,14 +456,10 @@ class CashierSidebarWidget(QFrame):
             self._collapse_btn.setText("")
             self._collapse_btn.setIcon(_qta("mdi.chevron-right", color=_MUTED))
             self._collapse_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
-            self._logout_btn.setText("")
-            self._logout_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
         else:
             self._collapse_btn.setText("  Collapse")
             self._collapse_btn.setIcon(_qta("mdi.chevron-left", color=_MUTED))
             self._collapse_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-            self._logout_btn.setText("  Log Out")
-            self._logout_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
     # ── Internal: top-level nav ────────────────────────────────────────────────
 
