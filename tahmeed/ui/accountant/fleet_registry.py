@@ -13,13 +13,19 @@ from typing import Any, Callable, Coroutine, List, Optional
 
 import qtawesome as qta
 from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QBrush
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
     QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
+
+from tahmeed.ui.accountant.separate_expenses import (
+    _finish_table_row, _stripe_bg, _table_style, _ROW_H,
+)
+from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 # ── Design tokens (match dashboard palette) ────────────────────────────────────
 _WHITE   = "#FFFFFF"
@@ -40,7 +46,8 @@ _HDR_BG  = "#F1F5F9"
 _ALT_ROW = "#F9FAFB"
 _NAVY    = "#1B2B4B"
 
-_ROW_H = 36
+_FLEET_COL_DEFAULTS = [52, 220, 100]
+_PAGE_SIZE = 100
 
 # Default Excel path (pre-fills the file picker)
 _DEFAULT_EXCEL = str(
@@ -90,28 +97,14 @@ def _btn(text: str, icon: str = "", primary: bool = True,
     return b
 
 
-def _table_style() -> str:
-    return (
-        f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:12px;font-family:'Segoe UI';}}"
-        f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
-        f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
-        f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
-        "font-size:11px;font-weight:600;font-family:'Segoe UI';"
-        f"border:none;border-bottom:1px solid {_BORDER};"
-        "padding:0 6px;height:30px;}}"
-        "QScrollBar:vertical{width:8px;background:transparent;}"
-        f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
-        f"QTableWidget{{alternate-background-color:{_ALT_ROW};}}"
-    )
-
-
 def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
-          mono: bool = False) -> QTableWidgetItem:
+          mono: bool = False, bg: str = "") -> QTableWidgetItem:
     item = QTableWidgetItem(str(text) if text is not None else "—")
     item.setTextAlignment(align)
     if mono:
         item.setFont(QFont("Cascadia Code", 11))
+    if bg:
+        item.setBackground(QBrush(QColor(bg)))
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
     return item
 
@@ -188,15 +181,17 @@ class _FleetRegistryBase(QWidget):
     """
     Shared base for Trucks and Trailers registry pages.
     Subclasses supply: _kind, _icon, _excel_sheet, _excel_section,
-    _fn_get_all, _fn_add, _fn_remove, _fn_set_active, _fn_bulk_add.
+    _fn_list, _fn_count, _fn_add, _fn_remove, _fn_set_active, _fn_bulk_add.
     """
 
     _kind: str = "Vehicle"
     _icon: str = "mdi.truck"
     _excel_section: str = "TRUCKS"   # "TRUCKS" or "TRAILERS"
+    _col_prefs_key: str = "fleet_registry"
 
     # async callables — set by subclass
-    _fn_get_all: Callable
+    _fn_list: Callable
+    _fn_count: Callable
     _fn_add: Callable
     _fn_remove: Callable
     _fn_set_active: Callable
@@ -205,6 +200,13 @@ class _FleetRegistryBase(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._rows: List[dict] = []
+        self._page = 0
+        self._total = 0
+        self._loading = False
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(350)
+        self._search_debounce.timeout.connect(self._on_search_commit)
         self._build()
 
     # ── Build ──────────────────────────────────────────────────────────────────
@@ -283,7 +285,7 @@ class _FleetRegistryBase(QWidget):
             "font-family:'Segoe UI';padding:0 8px;}}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
-        self._search.textChanged.connect(self._on_search)
+        self._search.textChanged.connect(self._on_search_changed)
         toolbar.addWidget(self._search, 1)
 
         self._filter_cb = QComboBox()
@@ -296,17 +298,23 @@ class _FleetRegistryBase(QWidget):
             f"QComboBox:focus{{border-color:{_BLUE};}}"
             "QComboBox::drop-down{border:none;width:20px;}"
         )
-        self._filter_cb.currentIndexChanged.connect(self._populate_table)
+        self._filter_cb.currentIndexChanged.connect(self._on_filter_changed)
         toolbar.addWidget(self._filter_cb)
 
         root.addLayout(toolbar)
 
         # ── Table ────────────────────────────────────────────────────────────
+        self._table_host = QFrame()
+        self._table_host.setStyleSheet("QFrame { background: transparent; border: none; }")
+        table_vl = QVBoxLayout(self._table_host)
+        table_vl.setContentsMargins(0, 0, 0, 0)
+        table_vl.setSpacing(0)
+
         self._table = QTableWidget(0, 3)
         self._table.setHorizontalHeaderLabels(["#", "Registration No.", "Status"])
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setAlternatingRowColors(True)
+        self._table.setAlternatingRowColors(False)
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
         self._table.setStyleSheet(_table_style())
@@ -314,13 +322,45 @@ class _FleetRegistryBase(QWidget):
         self._table.customContextMenuRequested.connect(self._context_menu)
 
         hdr_view = self._table.horizontalHeader()
-        hdr_view.setSectionResizeMode(0, QHeaderView.Fixed)
-        self._table.setColumnWidth(0, 50)
-        hdr_view.setSectionResizeMode(1, QHeaderView.Stretch)
-        hdr_view.setSectionResizeMode(2, QHeaderView.Fixed)
-        self._table.setColumnWidth(2, 100)
+        hdr_view.setSectionsMovable(False)
+        hdr_view.setStretchLastSection(True)
+        for i, width in enumerate(_FLEET_COL_DEFAULTS):
+            self._table.setColumnWidth(i, width)
+            hdr_view.setSectionResizeMode(i, QHeaderView.Interactive)
+        bind_column_width_persistence(
+            self._table, self._col_prefs_key, _FLEET_COL_DEFAULTS,
+        )
 
-        root.addWidget(self._table, 1)
+        table_vl.addWidget(self._table)
+        root.addWidget(self._table_host, 1)
+
+        self._loading_overlay = LoadingOverlay(self._table_host, "Loading…")
+
+        # ── Pagination ───────────────────────────────────────────────────────
+        pager = QFrame()
+        pager.setFixedHeight(44)
+        pager.setStyleSheet(
+            f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};border-radius:6px;}}"
+        )
+        pl = QHBoxLayout(pager)
+        pl.setContentsMargins(12, 0, 12, 0)
+        pl.setSpacing(10)
+
+        self._page_info = _lbl("—", size=12, color=_T2)
+        pl.addWidget(self._page_info)
+        pl.addStretch()
+
+        self._prev_btn = _btn("← Prev", primary=False, height=30)
+        self._prev_btn.setFixedWidth(88)
+        self._prev_btn.clicked.connect(self._on_prev_page)
+        pl.addWidget(self._prev_btn)
+
+        self._next_btn = _btn("Next →", primary=False, height=30)
+        self._next_btn.setFixedWidth(88)
+        self._next_btn.clicked.connect(self._on_next_page)
+        pl.addWidget(self._next_btn)
+
+        root.addWidget(pager)
 
         # ── Footer ───────────────────────────────────────────────────────────
         self._footer = _lbl("", size=11, color=_TM)
@@ -362,70 +402,129 @@ class _FleetRegistryBase(QWidget):
 
     # ── Internal ───────────────────────────────────────────────────────────────
 
+    def _active_filter(self) -> str:
+        idx = self._filter_cb.currentIndex()
+        if idx == 1:
+            return "active"
+        if idx == 2:
+            return "inactive"
+        return "all"
+
+    def _on_search_changed(self) -> None:
+        self._search_debounce.start()
+
+    def _on_search_commit(self) -> None:
+        self._page = 0
+        asyncio.ensure_future(self._load())
+
+    def _on_filter_changed(self) -> None:
+        self._page = 0
+        asyncio.ensure_future(self._load())
+
+    def _on_prev_page(self) -> None:
+        if self._page > 0:
+            self._page -= 1
+            asyncio.ensure_future(self._load())
+
+    def _on_next_page(self) -> None:
+        max_pg = max(0, (self._total - 1) // _PAGE_SIZE) if self._total else 0
+        if self._page < max_pg:
+            self._page += 1
+            asyncio.ensure_future(self._load())
+
+    def _update_pager(self) -> None:
+        total = self._total
+        size = _PAGE_SIZE
+        page = self._page
+        max_pg = max(0, (total - 1) // size) if total else 0
+        start = page * size + 1 if total else 0
+        end = min((page + 1) * size, total)
+        self._page_info.setText(
+            f"Showing {start:,}–{end:,} of {total:,}  ·  Page {page + 1} of {max_pg + 1}"
+        )
+        self._prev_btn.setEnabled(page > 0)
+        self._next_btn.setEnabled(page < max_pg)
+
     async def _load(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._loading_overlay.show_loading(f"Loading {self._kind.lower()}s…")
         try:
-            self._rows = await self._fn_get_all()
+            search = self._search.text().strip()
+            active_filter = self._active_filter()
+            skip = self._page * _PAGE_SIZE
+            rows, total = await asyncio.gather(
+                self._fn_list(
+                    search=search,
+                    active_filter=active_filter,
+                    limit=_PAGE_SIZE,
+                    skip=skip,
+                ),
+                self._fn_count(search=search, active_filter=active_filter),
+            )
+            max_pg = max(0, (total - 1) // _PAGE_SIZE) if total else 0
+            if self._page > max_pg:
+                self._page = max_pg
+                skip = self._page * _PAGE_SIZE
+                rows = await self._fn_list(
+                    search=search,
+                    active_filter=active_filter,
+                    limit=_PAGE_SIZE,
+                    skip=skip,
+                )
+            self._rows = rows
+            self._total = total
+            self._populate_table()
+            self._update_pager()
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Could not load {self._kind.lower()}s:\n{exc}")
-            return
-        self._populate_table()
-
-    def _visible_rows(self) -> List[dict]:
-        search = self._search.text().strip().lower()
-        flt = self._filter_cb.currentIndex()  # 0=All, 1=Active, 2=Inactive
-        result = []
-        for row in self._rows:
-            if search and search not in row["number"].lower():
-                continue
-            active = row.get("active", True)
-            if flt == 1 and not active:
-                continue
-            if flt == 2 and active:
-                continue
-            result.append(row)
-        return result
+        finally:
+            self._loading = False
+            self._loading_overlay.hide_loading()
 
     def _populate_table(self) -> None:
-        rows = self._visible_rows()
+        rows = self._rows
+        skip = self._page * _PAGE_SIZE
         self._table.setRowCount(0)
-        self._count_chip.setText(f"{len(self._rows)} {self._kind.lower()}s")
+        self._count_chip.setText(f"{self._total:,} {self._kind.lower()}s")
 
         for i, row in enumerate(rows):
             self._table.insertRow(i)
             active = row.get("active", True)
+            row_bg = _stripe_bg(i)
 
-            num_item = _cell(str(i + 1), Qt.AlignCenter | Qt.AlignVCenter)
-            self._table.setItem(i, 0, num_item)
-
-            reg_item = _cell(row["number"], mono=True)
-            self._table.setItem(i, 1, reg_item)
+            self._table.setItem(
+                i, 0,
+                _cell(str(skip + i + 1), Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
+            )
+            self._table.setItem(
+                i, 1,
+                _cell(row["number"], mono=True, bg=row_bg),
+            )
 
             chip = _status_chip(active)
             chip_container = QWidget()
-            chip_container.setStyleSheet("background:transparent;")
+            chip_container.setStyleSheet(f"background: {row_bg};")
             cl = QHBoxLayout(chip_container)
-            cl.setContentsMargins(6, 4, 6, 4)
+            cl.setContentsMargins(6, 2, 6, 2)
             cl.addWidget(chip)
             cl.addStretch()
             self._table.setCellWidget(i, 2, chip_container)
+            _finish_table_row(self._table, i, row_bg)
 
-        total = len(self._rows)
         shown = len(rows)
         self._footer.setText(
-            f"Showing {shown} of {total} {self._kind.lower()}s"
+            f"{shown} on this page  ·  {self._total:,} total matching"
         )
-
-    def _on_search(self) -> None:
-        self._populate_table()
 
     def _context_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
         if row < 0:
             return
-        visible = self._visible_rows()
-        if row >= len(visible):
+        if row >= len(self._rows):
             return
-        entry = visible[row]
+        entry = self._rows[row]
         active = entry.get("active", True)
 
         menu = QMenu(self)
@@ -491,9 +590,11 @@ class _FleetRegistryBase(QWidget):
         asyncio.ensure_future(self._do_import(path))
 
     async def _do_import(self, path: str) -> None:
+        self._loading_overlay.show_loading(f"Importing {self._kind.lower()}s…")
         try:
             import openpyxl
         except ImportError:
+            self._loading_overlay.hide_loading()
             QMessageBox.critical(self, "Missing library",
                                  "openpyxl is required. Run: pip install openpyxl")
             return
@@ -503,11 +604,13 @@ class _FleetRegistryBase(QWidget):
             sheet = wb.active
             rows = list(sheet.iter_rows(values_only=True))
         except Exception as exc:
+            self._loading_overlay.hide_loading()
             QMessageBox.critical(self, "Import Error", f"Could not read file:\n{exc}")
             return
 
         numbers = self._parse_numbers(rows)
         if not numbers:
+            self._loading_overlay.hide_loading()
             fname = Path(path).name
             section = self._excel_section
             kind = self._kind.lower()
@@ -522,9 +625,11 @@ class _FleetRegistryBase(QWidget):
         try:
             count = await self._fn_bulk_add(numbers)
         except Exception as exc:
+            self._loading_overlay.hide_loading()
             QMessageBox.critical(self, "Import Error", str(exc))
             return
 
+        self._loading_overlay.hide_loading()
         QMessageBox.information(
             self, "Import Complete",
             f"Parsed {len(numbers)} {self._kind.lower()}s from the file.\n"
@@ -566,17 +671,19 @@ class TrucksRegistryWidget(_FleetRegistryBase):
     _kind          = "Truck"
     _icon          = "mdi.truck"
     _excel_section = "TRUCKS"
+    _col_prefs_key = "fleet_trucks"
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         from tahmeed.services.truck_service import (
-            get_all_trucks, add_truck, remove_truck,
+            list_trucks, count_trucks, add_truck, remove_truck,
             set_truck_active, bulk_add_trucks,
         )
-        self._fn_get_all   = get_all_trucks
-        self._fn_add       = add_truck
-        self._fn_remove    = remove_truck
+        self._fn_list       = list_trucks
+        self._fn_count      = count_trucks
+        self._fn_add        = add_truck
+        self._fn_remove     = remove_truck
         self._fn_set_active = set_truck_active
-        self._fn_bulk_add  = bulk_add_trucks
+        self._fn_bulk_add   = bulk_add_trucks
         super().__init__(parent)
 
 
@@ -586,13 +693,15 @@ class TrailersRegistryWidget(_FleetRegistryBase):
     _kind          = "Trailer"
     _icon          = "mdi.truck-trailer"
     _excel_section = "TRAILERS"
+    _col_prefs_key = "fleet_trailers"
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         from tahmeed.services.truck_service import (
-            get_all_trailers, add_trailer, remove_trailer,
+            list_trailers, count_trailers, add_trailer, remove_trailer,
             set_trailer_active, bulk_add_trailers,
         )
-        self._fn_get_all    = get_all_trailers
+        self._fn_list       = list_trailers
+        self._fn_count      = count_trailers
         self._fn_add        = add_trailer
         self._fn_remove     = remove_trailer
         self._fn_set_active = set_trailer_active

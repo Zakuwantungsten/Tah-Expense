@@ -36,6 +36,9 @@ from PySide6.QtGui import QFont, QColor, QBrush
 
 from tahmeed.app_state import app_state
 from tahmeed.models.transaction import Transaction
+from tahmeed.services.category_service import item_key
+from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 # ── Design tokens (match accountant dashboard palette) ──────────────────────────
 _WHITE      = "#FFFFFF"
@@ -366,6 +369,11 @@ class CategoryTableWidget(QWidget):
         for i, (_, width, _a, _m) in enumerate(_COLS):
             self._table.setColumnWidth(i, width)
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
+        bind_column_width_persistence(
+            self._table,
+            f"category_{item_key(self._category)}",
+            [c[1] for c in _COLS],
+        )
         root.addWidget(self._table, 1)
 
         # ── Footer totals ──────────────────────────────────────────────────
@@ -435,6 +443,8 @@ class CategoryTableWidget(QWidget):
         pl.addWidget(self._next_btn)
         root.addWidget(pager)
 
+        self._loading_overlay = LoadingOverlay(self, "Loading…")
+
     # ── Public API ───────────────────────────────────────────────────────────
     def refresh(self) -> None:
         self._page = 0
@@ -489,6 +499,7 @@ class CategoryTableWidget(QWidget):
         if self._loading:
             return
         self._loading = True
+        self._loading_overlay.show_loading(f"Loading {self._title}…")
         try:
             from tahmeed.services.accountant_service import (
                 get_master_transactions, count_master_transactions, get_master_totals,
@@ -526,6 +537,7 @@ class CategoryTableWidget(QWidget):
             self._page_info.setText(f"Failed to load: {exc}")
         finally:
             self._loading = False
+            self._loading_overlay.hide_loading()
 
     def _populate(self, txs: List[Transaction], skip: int) -> None:
         self._table.setRowCount(len(txs))

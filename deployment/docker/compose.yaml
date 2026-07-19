@@ -1,0 +1,68 @@
+name: tahmeed-api
+
+x-security: &security
+  user: "10001:10001"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  init: true
+  restart: unless-stopped
+  network_mode: host
+  env_file:
+    - ${TAHMEED_ENV_FILE:-./tahmeed-api.env}
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  api:
+    <<: *security
+    image: tahmeed-api:${TAHMEED_IMAGE_TAG:-local}
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --no-server-header
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3).read()
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    stop_grace_period: 30s
+
+  scheduler:
+    <<: *security
+    image: tahmeed-api:${TAHMEED_IMAGE_TAG:-local}
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    command:
+      - tahmeed-scheduler
+    volumes:
+      - tahmeed-backups:/var/lib/tahmeed
+    healthcheck:
+      disable: true
+    stop_grace_period: 2m
+
+volumes:
+  tahmeed-backups:
+    name: tahmeed-api-backups

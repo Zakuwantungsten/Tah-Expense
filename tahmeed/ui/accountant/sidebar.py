@@ -39,6 +39,7 @@ COLLAPSED_W = 56
 _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     (None, [
         ("overview",        "Overview",          "mdi.view-dashboard-outline", {}),
+        ("truck_overview",  "Truck Overview",    "mdi.truck-fast-outline",     {}),
     ]),
     ("CASHIER FLOW", [
         ("verify",          "Verify",            "mdi.inbox-arrow-down",             {"badge": True}),
@@ -70,6 +71,8 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("manage_categories", "Items",             "mdi.tag-multiple-outline", {}),
         ("manage_trucks",     "Trucks",           "mdi.truck",           {}),
         ("manage_trailers",   "Trailers",         "mdi.truck-trailer",   {}),
+        ("manage_users",      "Users",            "mdi.account-multiple-outline", {}),
+        ("backup",            "Backups",          "mdi.database-export-outline", {}),
     ]),
 ]
 

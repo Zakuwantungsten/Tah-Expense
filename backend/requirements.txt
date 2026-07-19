@@ -1,0 +1,8 @@
+fastapi>=0.115
+uvicorn[standard]>=0.34
+pymongo>=4.9
+pydantic-settings>=2.7
+PyJWT>=2.10
+bcrypt>=4.2
+python-multipart>=0.0.20
+boto3>=1.35

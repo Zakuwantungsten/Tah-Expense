@@ -1,0 +1,25 @@
+[Unit]
+Description=Tahmeed local weekly MongoDB backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tahmeed-api
+Group=tahmeed-api
+WorkingDirectory=/opt/tahmeed-api/current/backend
+EnvironmentFile=/etc/tahmeed-api/tahmeed-api.env
+ExecStart=/opt/tahmeed-api/current/venv/bin/tahmeed-backup run --cadence weekly
+TimeoutStartSec=45min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/var/lib/tahmeed-api/backups /var/lock/tahmeed-api
+UMask=0077

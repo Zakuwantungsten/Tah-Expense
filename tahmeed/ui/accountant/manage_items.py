@@ -23,21 +23,24 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QMessageBox, QAbstractItemView,
     QDialog, QFormLayout, QCheckBox, QColorDialog,
     QSplitter, QStackedWidget, QSizePolicy,
-    QScrollArea, QGridLayout, QToolButton,
+    QScrollArea, QGridLayout, QToolButton, QFileDialog,
 )
-from PySide6.QtCore import Qt, QSize, Signal
+from PySide6.QtCore import Qt, QSize, Signal, QTimer
 from PySide6.QtGui import QColor, QBrush, QFont
 
 from tahmeed.models.category import Category
 from tahmeed.models.sub_table import SubTable
 from tahmeed.services.category_service import (
-    get_all_categories, create_category, update_category,
+    list_categories, count_categories,
+    create_category, update_category,
     toggle_category, delete_category, item_key,
 )
 from tahmeed.services.subtable_service import (
     get_subtables, create_subtable, update_subtable, delete_subtable,
 )
 from tahmeed.services.settings_service import get_setting, set_setting
+from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 
@@ -60,6 +63,7 @@ _BLUE_L  = "#E8F4FD"   # row selection highlight (matches SM Burhani Bonds)
 _STRIPE  = "#F1F5F9"   # subtle slate zebra stripe (matches SM Burhani Bonds)
 _ROW_H   = 32
 _HDR_H   = 28
+_PAGE_SIZE = 100
 
 _TABLE_SS = (
     f"QTableWidget {{"
@@ -80,6 +84,16 @@ _TABLE_SS = (
     f"QScrollBar::handle:vertical {{ background: #D1D5DB; border-radius: 4px; min-height: 24px; }}"
     f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ width: 0; height: 0; }}"
 )
+
+
+def _item_table_font(*, bold: bool = False, italic: bool = False) -> QFont:
+    """Uniform 11px cell font — matches the Description column (CSS px, not pt)."""
+    f = QFont("Segoe UI")
+    f.setPixelSize(11)
+    f.setBold(bold)
+    f.setItalic(italic)
+    return f
+
 
 def _item_key(item_name: str) -> str:
     """Return the sidebar / sub-table parent_key for an item name."""
@@ -230,15 +244,13 @@ def _input_ss() -> str:
     )
 
 
-def _status_item(text: str, color: str, row_bg: str, bold: bool = True) -> QTableWidgetItem:
-    """Flat, centered status text cell (matches the SM Burhani Bonds grid look)."""
+def _status_item(text: str, color: str, row_bg: str, bold: bool = False) -> QTableWidgetItem:
+    """Flat, centered status text cell (matches the Description column size)."""
     it = QTableWidgetItem(text)
     it.setTextAlignment(Qt.AlignCenter)
     it.setForeground(QBrush(QColor(color)))
     it.setBackground(QBrush(QColor(row_bg)))
-    f = QFont("Segoe UI", 11)
-    f.setBold(bold)
-    it.setFont(f)
+    it.setFont(_item_table_font(bold=bold))
     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
     return it
 
@@ -877,6 +889,7 @@ class _SubItemsPanel(QWidget):
 
             name_it = QTableWidgetItem(sub.name)
             name_it.setBackground(QBrush(QColor(row_bg)))
+            name_it.setFont(_item_table_font())
             name_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self._sub_table.setItem(i, 0, name_it)
 
@@ -884,6 +897,7 @@ class _SubItemsPanel(QWidget):
             match_it = QTableWidgetItem(match_text)
             match_it.setBackground(QBrush(QColor(row_bg)))
             match_it.setForeground(QBrush(QColor(_T2 if match_text == "—" else _T1)))
+            match_it.setFont(_item_table_font())
             match_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self._sub_table.setItem(i, 1, match_it)
 
@@ -974,7 +988,7 @@ class ManageItemsWidget(QWidget):
     # Items table columns
     _ITEM_COLS = [
         ("",            44,  False, "center"),   # colour dot
-        ("Name",         0,  True,  "left"),     # stretch
+        ("Name",       300,  False, "left"),
         ("Description", 140, False, "left"),
         ("Sidebar",      96, False, "center"),
         ("Req. Receipt", 96, False, "center"),
@@ -982,6 +996,7 @@ class ManageItemsWidget(QWidget):
         ("Status",        88, False, "center"),
         ("Actions",      196, False, "center"),
     ]
+    _ITEM_COL_DEFAULTS = [44, 300, 140, 96, 96, 90, 88, 196]
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -989,6 +1004,13 @@ class ManageItemsWidget(QWidget):
         self._visible: List[Category] = []
         self._show_inactive = False
         self._selected_id: Optional[ObjectId] = None
+        self._page = 0
+        self._total = 0
+        self._loading = False
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(350)
+        self._search_debounce.timeout.connect(self._on_search_commit)
         self._build()
 
     # ── Build ──────────────────────────────────────────────────────────────────
@@ -1020,6 +1042,8 @@ class ManageItemsWidget(QWidget):
 
         splitter.setSizes([600, 340])
         root.addWidget(splitter, 1)
+
+        self._loading_overlay = LoadingOverlay(self, "Loading items…")
 
     def _build_title_bar(self) -> QFrame:
         bar = QFrame()
@@ -1063,6 +1087,23 @@ class ManageItemsWidget(QWidget):
         )
         add_btn.clicked.connect(self._on_add)
         hl.addWidget(add_btn)
+
+        import_coa_btn = QPushButton("  Import Chart of Accounts")
+        import_coa_btn.setFixedHeight(34)
+        import_coa_btn.setCursor(Qt.PointingHandCursor)
+        try:
+            import_coa_btn.setIcon(qta.icon("mdi.file-upload-outline", color="#FFF"))
+            import_coa_btn.setIconSize(QSize(16, 16))
+        except Exception:
+            pass
+        import_coa_btn.setStyleSheet(
+            f"QPushButton {{ background: {_NAVY}; color: #FFF; border: none;"
+            " border-radius: 5px; font-size: 13px; font-weight: 600;"
+            " font-family:'Segoe UI'; padding: 0 16px; }}"
+            "QPushButton:hover { background: #253A5C; }"
+        )
+        import_coa_btn.clicked.connect(self._on_import_coa)
+        hl.addWidget(import_coa_btn)
         return bar
 
     def _build_filter_bar(self) -> QFrame:
@@ -1094,7 +1135,7 @@ class ManageItemsWidget(QWidget):
             " min-height: 32px; max-height: 32px; }}"
             f"QLineEdit:focus {{ border-color: {_BLUE}; }}"
         )
-        self._search.textChanged.connect(self._apply_filter)
+        self._search.textChanged.connect(self._on_search_changed)
         hl.addWidget(self._search)
 
         hl.addStretch()
@@ -1172,17 +1213,60 @@ class ManageItemsWidget(QWidget):
 
         hh = self._table.horizontalHeader()
         hh.setSectionsMovable(False)
-        for i, (_, w_col, stretch, _align) in enumerate(self._ITEM_COLS):
-            if stretch:
-                hh.setSectionResizeMode(i, QHeaderView.Stretch)
-            else:
-                hh.setSectionResizeMode(i, QHeaderView.Fixed)
-                if w_col:
-                    self._table.setColumnWidth(i, w_col)
+        hh.setStretchLastSection(True)
+        for i, (_, w_col, _stretch, _align) in enumerate(self._ITEM_COLS):
+            hh.setSectionResizeMode(i, QHeaderView.Interactive)
+            if w_col:
+                self._table.setColumnWidth(i, w_col)
+        bind_column_width_persistence(
+            self._table, "manage_items", self._ITEM_COL_DEFAULTS,
+        )
 
         self._table.selectionModel().currentRowChanged.connect(self._on_row_changed)
 
         vl.addWidget(self._table, 1)
+
+        # Pagination (100 items per page; search hits the full collection)
+        pager = QFrame()
+        pager.setFixedHeight(44)
+        pager.setStyleSheet(
+            f"QFrame {{ background: {_WHITE}; border-top: 1px solid {_BORDER}; }}"
+        )
+        pl = QHBoxLayout(pager)
+        pl.setContentsMargins(12, 0, 12, 0)
+        pl.setSpacing(10)
+
+        self._page_info = _lbl("—", size=12, color=_T2)
+        pl.addWidget(self._page_info)
+        pl.addStretch()
+
+        self._prev_btn = QPushButton("← Prev")
+        self._prev_btn.setFixedSize(88, 30)
+        self._prev_btn.setCursor(Qt.PointingHandCursor)
+        self._prev_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T1};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 12px; font-family:'Segoe UI'; }}"
+            f"QPushButton:hover {{ background: {_BG}; }}"
+            f"QPushButton:disabled {{ color: {_TM}; }}"
+        )
+        self._prev_btn.clicked.connect(self._on_prev_page)
+        pl.addWidget(self._prev_btn)
+
+        self._next_btn = QPushButton("Next →")
+        self._next_btn.setFixedSize(88, 30)
+        self._next_btn.setCursor(Qt.PointingHandCursor)
+        self._next_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T1};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 12px; font-family:'Segoe UI'; }}"
+            f"QPushButton:hover {{ background: {_BG}; }}"
+            f"QPushButton:disabled {{ color: {_TM}; }}"
+        )
+        self._next_btn.clicked.connect(self._on_next_page)
+        pl.addWidget(self._next_btn)
+
+        vl.addWidget(pager)
         return w
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -1193,12 +1277,78 @@ class ManageItemsWidget(QWidget):
 
     # ── Data ───────────────────────────────────────────────────────────────────
 
+    def _on_search_changed(self) -> None:
+        self._search_debounce.start()
+
+    def _on_search_commit(self) -> None:
+        self._page = 0
+        asyncio.ensure_future(self._load())
+
+    def _on_prev_page(self) -> None:
+        if self._page > 0:
+            self._page -= 1
+            asyncio.ensure_future(self._load())
+
+    def _on_next_page(self) -> None:
+        max_pg = max(0, (self._total - 1) // _PAGE_SIZE) if self._total else 0
+        if self._page < max_pg:
+            self._page += 1
+            asyncio.ensure_future(self._load())
+
+    def _update_pager(self) -> None:
+        total = self._total
+        size = _PAGE_SIZE
+        page = self._page
+        max_pg = max(0, (total - 1) // size) if total else 0
+        start = page * size + 1 if total else 0
+        end = min((page + 1) * size, total)
+        self._page_info.setText(
+            f"Showing {start:,}–{end:,} of {total:,}  ·  Page {page + 1} of {max_pg + 1}"
+        )
+        self._prev_btn.setEnabled(page > 0)
+        self._next_btn.setEnabled(page < max_pg)
+
     async def _load(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._loading_overlay.show_loading("Loading items…")
         try:
-            self._items = await get_all_categories(include_inactive=self._show_inactive)
-            self._apply_filter()
+            search = self._search.text().strip()
+            skip = self._page * _PAGE_SIZE
+            items, total = await asyncio.gather(
+                list_categories(
+                    search=search,
+                    include_inactive=self._show_inactive,
+                    limit=_PAGE_SIZE,
+                    skip=skip,
+                ),
+                count_categories(
+                    search=search,
+                    include_inactive=self._show_inactive,
+                ),
+            )
+            # If the current page is past the end (e.g. after delete), snap back.
+            max_pg = max(0, (total - 1) // _PAGE_SIZE) if total else 0
+            if self._page > max_pg:
+                self._page = max_pg
+                skip = self._page * _PAGE_SIZE
+                items = await list_categories(
+                    search=search,
+                    include_inactive=self._show_inactive,
+                    limit=_PAGE_SIZE,
+                    skip=skip,
+                )
+            self._items = items
+            self._visible = items
+            self._total = total
+            self._populate()
+            self._update_pager()
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load items:\n{exc}")
+        finally:
+            self._loading = False
+            self._loading_overlay.hide_loading()
 
     # ── Restrict-items global toggle ───────────────────────────────────────────
 
@@ -1222,17 +1372,12 @@ class ManageItemsWidget(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
 
-    def _apply_filter(self) -> None:
-        q = self._search.text().strip().lower()
-        self._visible = [it for it in self._items if not q or q in it.name.lower()]
-        self._populate()
-
     def _populate(self) -> None:
-        total = len(self._items)
+        total = self._total
         shown = len(self._visible)
         self._count_lbl.setText(
-            f"{total} item{'s' if total != 1 else ''}"
-            + (f"  ·  {shown} shown" if shown != total else "")
+            f"{total:,} item{'s' if total != 1 else ''}"
+            + (f"  ·  {shown} on this page" if total > shown else "")
         )
 
         # Block selection signals while rebuilding rows
@@ -1265,21 +1410,17 @@ class ManageItemsWidget(QWidget):
             name_it = QTableWidgetItem(item.name)
             name_it.setBackground(QBrush(QColor(row_bg)))
             name_it.setForeground(QBrush(QColor(_T1 if item.active else _TM)))
-            f = QFont("Segoe UI", 11)
-            if not item.active:
-                f.setItalic(True)
-            name_it.setFont(f)
+            name_it.setFont(_item_table_font(italic=not item.active))
             name_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self._table.setItem(i, 1, name_it)
 
             # Col 2: description hint
             desc_text = item.description or ""
-            desc_it = QTableWidgetItem(desc_text)
+            desc_it = QTableWidgetItem(desc_text if desc_text else "—")
             desc_it.setBackground(QBrush(QColor(row_bg)))
             desc_it.setForeground(QBrush(QColor(_T2 if desc_text else _TM)))
+            desc_it.setFont(_item_table_font())
             desc_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            if not desc_text:
-                desc_it.setText("—")
             self._table.setItem(i, 2, desc_it)
 
             # Col 3: sidebar tab indicator (icon + On / —)
@@ -1338,7 +1479,61 @@ class ManageItemsWidget(QWidget):
 
     def _on_inactive_toggled(self, checked: bool) -> None:
         self._show_inactive = checked
+        self._page = 0
         self.refresh()
+
+    def _on_import_coa(self) -> None:
+        asyncio.ensure_future(self._do_import_coa())
+
+    async def _do_import_coa(self) -> None:
+        from pathlib import Path
+
+        from tahmeed.services.chart_of_accounts_service import import_chart_of_accounts
+
+        default_dir = str(Path(__file__).resolve().parents[3])
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Chart of Accounts",
+            default_dir,
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+
+        reply = QMessageBox.warning(
+            self,
+            "Replace All Items?",
+            "This will delete every existing item, sub-item, keyword rule, "
+            "and description mapping, then load all accounts from the "
+            "Chart of Accounts file.\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._loading_overlay.show_loading("Importing Chart of Accounts…")
+        try:
+            result = await import_chart_of_accounts(path, replace_existing=True)
+        except Exception as exc:
+            self._loading_overlay.hide_loading()
+            QMessageBox.critical(self, "Import Error", f"Could not import Chart of Accounts:\n{exc}")
+            return
+
+        removed = result["removed"]
+        self._loading_overlay.hide_loading()
+        QMessageBox.information(
+            self,
+            "Import Complete",
+            f"Imported {result['imported']:,} items from Chart of Accounts.\n\n"
+            f"Removed {removed['categories']:,} old item(s), "
+            f"{removed['subtables']:,} sub-item(s), "
+            f"{removed['keyword_rules']:,} keyword rule(s), "
+            f"and {removed['mappings']:,} description mapping(s).",
+        )
+        self._page = 0
+        await self._load()
+        self.items_changed.emit()
 
     def _on_add(self) -> None:
         dlg = _ItemDialog(parent=self)
@@ -1449,7 +1644,7 @@ class ManageItemsWidget(QWidget):
         on = QLabel("On")
         on.setStyleSheet(
             f"color: {_GREEN}; background: transparent;"
-            " font-size: 11px; font-weight: 700; font-family:'Segoe UI';"
+            " font-size: 11px; font-weight: 400; font-family:'Segoe UI';"
         )
         hl.addWidget(on)
         return container
@@ -1483,7 +1678,7 @@ class ManageItemsWidget(QWidget):
         edit_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_BLUE};"
             f" border: 1px solid {_BLUE}; border-radius: 4px;"
-            " font-size: 11px; font-weight: 600;"
+            " font-size: 11px; font-weight: 400;"
             " font-family:'Segoe UI'; padding: 0 10px; }}"
             f"QPushButton:hover {{ background: #EFF6FF; }}"
         )

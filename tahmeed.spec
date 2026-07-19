@@ -11,8 +11,11 @@ root = Path(SPECPATH)
 datas = [(".env.build", ".")]
 datas += collect_data_files("qtawesome")
 
-hiddenimports = collect_submodules("motor") + collect_submodules("pymongo") + [
-    "bcrypt",
+hiddenimports = (
+    collect_submodules("motor")
+    + collect_submodules("pymongo")
+    + collect_submodules("httpx")
+    + [
     "qasync",
     "openpyxl",
     "pyqtgraph",
@@ -21,7 +24,8 @@ hiddenimports = collect_submodules("motor") + collect_submodules("pymongo") + [
     "bson",
     "dns",
     "dns.resolver",
-]
+    ]
+)
 
 a = Analysis(
     ["run.py"],

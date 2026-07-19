@@ -44,7 +44,6 @@ _STRIPE    = "#F1F5F9"
 _HDR_H     = 28
 _ROW_H     = 28
 
-_AUTO_THRESHOLD = 0.70
 _PAGE_SIZES     = [25, 50, 100]
 _DATE_OPTS      = ["All Dates", "Today", "Last 7 Days", "Last 30 Days", "This Month"]
 
@@ -405,7 +404,7 @@ class _PaginationBar(QFrame):
 # ── Action panel ───────────────────────────────────────────────────────────────
 
 class _ActionPanel(QFrame):
-    """Pinned review panel that slides in below the table when a row is clicked."""
+    """Pinned review panel that slides in below the table when a row is double-clicked."""
     approved  = Signal(object)       # tx._id
     rejected  = Signal(object, str)  # tx._id, reason
     saved_cat = Signal(object, str)  # tx._id, category
@@ -658,6 +657,12 @@ class VerifyInboxWidget(QWidget):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(350)
         self._debounce.timeout.connect(self._reload)
+        # Distinguish single-click (select) from double-click (open panel)
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(250)
+        self._click_timer.timeout.connect(self._commit_row_click)
+        self._pending_click_row: Optional[int] = None
         self._build()
 
     # ── Layout ─────────────────────────────────────────────────────────────────
@@ -765,7 +770,7 @@ class VerifyInboxWidget(QWidget):
         t.setHorizontalHeaderLabels(_HEADERS)
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
-        t.setSelectionMode(QAbstractItemView.SingleSelection)
+        t.setSelectionMode(QAbstractItemView.ExtendedSelection)
         t.setAlternatingRowColors(True)
         t.verticalHeader().setVisible(False)
         t.verticalHeader().setDefaultSectionSize(_ROW_H)
@@ -783,6 +788,7 @@ class VerifyInboxWidget(QWidget):
                 hdr.setSectionResizeMode(c, QHeaderView.Fixed)
                 t.setColumnWidth(c, w)
         t.itemClicked.connect(self._on_item_clicked)
+        t.itemDoubleClicked.connect(self._on_item_double_clicked)
         t.itemChanged.connect(self._on_checkbox_changed)
         hdr.sectionClicked.connect(self._on_header_click)
         return t
@@ -822,17 +828,39 @@ class VerifyInboxWidget(QWidget):
         asyncio.ensure_future(self._reload())
 
     def _on_item_clicked(self, item: QTableWidgetItem) -> None:
+        # Checkbox column toggles itself; defer other columns so double-click
+        # can cancel the pending select and open the review panel instead.
         if item.column() == _COL_CHK:
-            return  # checkbox only — don't open panel
-        row = item.row()
-        if row < len(self._transactions):
-            tx = self._transactions[row]
-            cashier = self._cashier_names.get(tx.cashier_id, "") if tx.cashier_id else ""
-            tab = self._current_tab
-            mode = "rejected" if tab == 2 else ("edited" if tab == 1 else "new")
-            self._panel.set_mode(mode)
-            self._panel.load(tx, cashier, self._categories)
-            self._panel.show()
+            return
+        self._pending_click_row = item.row()
+        self._click_timer.start()
+
+    def _commit_row_click(self) -> None:
+        row = self._pending_click_row
+        self._pending_click_row = None
+        if row is None:
+            return
+        chk = self._table.item(row, _COL_CHK)
+        if not chk:
+            return
+        new_state = Qt.Unchecked if chk.checkState() == Qt.Checked else Qt.Checked
+        chk.setCheckState(new_state)
+
+    def _on_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        self._click_timer.stop()
+        self._pending_click_row = None
+        self._open_review_panel(item.row())
+
+    def _open_review_panel(self, row: int) -> None:
+        if row < 0 or row >= len(self._transactions):
+            return
+        tx = self._transactions[row]
+        cashier = self._cashier_names.get(tx.cashier_id, "") if tx.cashier_id else ""
+        tab = self._current_tab
+        mode = "rejected" if tab == 2 else ("edited" if tab == 1 else "new")
+        self._panel.set_mode(mode)
+        self._panel.load(tx, cashier, self._categories)
+        self._panel.show()
 
     def _on_checkbox_changed(self, item: QTableWidgetItem) -> None:
         if item.column() == _COL_CHK:
@@ -1157,45 +1185,26 @@ class VerifyInboxWidget(QWidget):
         if not checked:
             return
         tx_rows = [(r, self._transactions[r]) for r in checked if r < len(self._transactions)]
+        if not tx_rows:
+            return
 
-        # Edited tab: these rows were already human-approved once, so skip the
-        # confidence gate and re-approve every checked row.
         if self._current_tab == 1:
             msg = f"Re-approve {len(tx_rows)} edited transaction(s)?"
-            if QMessageBox.question(self, "Re-approve Edited", msg,
-                                    QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-                tx_ids = [tx._id for _, tx in tx_rows if tx._id]
-                asyncio.ensure_future(self._do_bulk_approve(tx_ids))
-            return
+            title = "Re-approve Edited"
+        else:
+            msg = f"Approve {len(tx_rows)} selected transaction(s)?"
+            title = "Bulk Approve"
 
-        auto = [(r, tx) for r, tx in tx_rows if tx.category_confidence >= _AUTO_THRESHOLD]
-        low  = [(r, tx) for r, tx in tx_rows if tx.category_confidence < _AUTO_THRESHOLD]
-
-        if not auto:
-            QMessageBox.warning(
-                self, "Cannot Bulk Approve",
-                f"All {len(low)} selected transaction(s) have low category confidence "
-                f"(< {int(_AUTO_THRESHOLD * 100)}%) and require individual review.\n"
-                "Click each row to review and approve individually.",
-            )
-            return
-
-        msg = f"Approve {len(auto)} auto-matched transaction(s)?"
-        if low:
-            msg += (
-                f"\n\n⚠ {len(low)} transaction(s) with low confidence will be skipped "
-                "and require individual review."
-            )
-        if QMessageBox.question(self, "Bulk Approve", msg,
+        if QMessageBox.question(self, title, msg,
                                 QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            tx_ids = [tx._id for _, tx in auto if tx._id]
+            tx_ids = [tx._id for _, tx in tx_rows if tx._id]
             asyncio.ensure_future(self._do_bulk_approve(tx_ids))
 
     def _on_bulk_reject(self) -> None:
         QMessageBox.information(
             self, "Bulk Reject",
             "Bulk rejection requires individual notes per transaction.\n"
-            "Click each row to review, fill in the note, then press Reject & Return.",
+            "Double-click each row to review, fill in the note, then press Reject & Return.",
         )
 
     # ── Async service calls ─────────────────────────────────────────────────────

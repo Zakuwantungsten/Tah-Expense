@@ -16,6 +16,13 @@ from tahmeed.services.auth import create_user
 from tahmeed.services.user_service import get_all_users, update_user, reset_password, toggle_active
 
 
+def _editable_roles(user: Optional[User]) -> list[str]:
+    roles = ["cashier", "accountant"]
+    if user and user.role == "admin":
+        roles.append("admin")
+    return roles
+
+
 class _UserDialog(QDialog):
     def __init__(self, user: Optional[User] = None, parent=None):
         super().__init__(parent)
@@ -44,14 +51,14 @@ class _UserDialog(QDialog):
 
         self._role = QComboBox()
         self._role.setFixedHeight(32)
-        self._role.addItems(["cashier", "accountant"])
+        self._role.addItems(_editable_roles(self._user))
         form.addRow("Role:", self._role)
 
         self._password = QLineEdit()
         self._password.setFixedHeight(32)
         self._password.setEchoMode(QLineEdit.Password)
         self._password.setPlaceholderText(
-            "Leave blank to keep current" if self._user else "Min 6 characters"
+            "Leave blank to keep current" if self._user else "Min 10 characters"
         )
         form.addRow("Password:", self._password)
 
@@ -95,8 +102,8 @@ class _UserDialog(QDialog):
         if not self._user and not password:
             self._error.setText("Password is required for new users.")
             return
-        if password and len(password) < 6:
-            self._error.setText("Password must be at least 6 characters.")
+        if password and len(password) < 10:
+            self._error.setText("Password must be at least 10 characters.")
             return
 
         self.result_data = {

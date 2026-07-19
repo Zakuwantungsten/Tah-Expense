@@ -4451,329 +4451,438 @@ def _qb_amount_widget(
     return w, val_lbl
 
 
-# ── Main widget ───────────────────────────────────────────────────────────────
+# ── Main widget / persisted upload flow ───────────────────────────────────────
+
+_AF_DETAIL_HEADERS = [
+    "S/NO", "TRUCK", "DAYS", "NON-TRANS", "TRANS", "RATE/DAY",
+    "TOTAL TAHMEED", "TOTAL INVOICE", "VARIANCE", "REMARKS",
+]
+
+
+def _afritrack_rows_to_records(
+    rows: List[List[str]],
+    period: str,
+    source_filename: str,
+    upload_id: str,
+    inst_t: float,
+    inst_i: float,
+    bal_mar: float,
+    vat_rate: float = 15.0,
+) -> List[dict]:
+    records: List[dict] = []
+    for row_idx, row in enumerate(rows, 1):
+        truck = str(row[_AF_COL_TRUCK] or "").strip() if len(row) > _AF_COL_TRUCK else ""
+        if not truck:
+            continue
+        records.append({
+            "feed_type": "afritrack",
+            "upload_id": upload_id,
+            "source_filename": source_filename,
+            "period": period,
+            "row_index": row_idx,
+            "truck": truck,
+            "days": _af_flt(row[_AF_COL_DAYS]) if len(row) > _AF_COL_DAYS else 0.0,
+            "non_trans_days": _af_flt(row[_AF_COL_NTRANS]) if len(row) > _AF_COL_NTRANS else 0.0,
+            "trans_days": _af_flt(row[_AF_COL_TRANS]) if len(row) > _AF_COL_TRANS else 0.0,
+            "rate_per_day": _af_flt(row[_AF_COL_RATE]) if len(row) > _AF_COL_RATE else 0.0,
+            "total_tahmeed": _af_flt(row[_AF_COL_TOTAL_T]) if len(row) > _AF_COL_TOTAL_T else 0.0,
+            "total_invoice": _af_flt(row[_AF_COL_TOTAL_I]) if len(row) > _AF_COL_TOTAL_I else 0.0,
+            "variance": _af_flt(row[_AF_COL_VAR]) if len(row) > _AF_COL_VAR else 0.0,
+            "remarks": str(row[_AF_COL_REMARKS] or "").strip() if len(row) > _AF_COL_REMARKS else "",
+            "installation_tahmeed": inst_t,
+            "installation_invoice": inst_i,
+            "balance_mar": bal_mar,
+            "vat_rate": vat_rate,
+        })
+    return records
+
+
+class _AfritrackUploadBrowse(QWidget):
+    upload_clicked = Signal(object)
+    delete_clicked = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._uploads: List[dict] = []
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        headers = ["UPLOAD DATE", "PERIOD", "FILE", "ROWS", "TAHMEED", "INVOICE", "VARIANCE"]
+        self._table = _make_table(headers)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setColumnWidth(0, 150)
+        self._table.setColumnWidth(1, 95)
+        self._table.setColumnWidth(2, 220)
+        self._table.setColumnWidth(3, 70)
+        self._table.setColumnWidth(4, 110)
+        self._table.setColumnWidth(5, 110)
+        self._table.setColumnWidth(6, 110)
+        self._table.setCursor(Qt.PointingHandCursor)
+        self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_menu)
+        vl.addWidget(self._table, 1)
+
+        self._totals = _TotalsBar([
+            ("t", "Tahmeed "),
+            ("i", "Invoice "),
+            ("v", "Variance "),
+            ("c", "Rows "),
+        ])
+        vl.addWidget(self._totals)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        uploads = await svc.get_afritrack_uploads()
+        self._uploads = uploads
+        self._fill(uploads)
+
+    def _fill(self, uploads: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        total_t = total_i = total_v = 0.0
+        total_c = 0
+        for up in uploads:
+            r = t.rowCount()
+            t.insertRow(r)
+            import_dt = up.get("import_date")
+            date_str = import_dt.strftime("%d %b %Y  %H:%M") if isinstance(import_dt, datetime) else "—"
+            count = int(up.get("record_count", 0))
+            tah = float(up.get("total_tahmeed", 0) or 0)
+            inv = float(up.get("total_invoice", 0) or 0)
+            var = float(up.get("total_variance", 0) or 0)
+            t.setItem(r, 0, _cell(date_str))
+            t.setItem(r, 1, _cell(up.get("period") or "—"))
+            t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 3, _cell(f"{count:,}", Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(_fmt_num(tah, decimals=2), Qt.AlignRight | Qt.AlignVCenter, mono=True))
+            t.setItem(r, 5, _cell(_fmt_num(inv, decimals=2), Qt.AlignRight | Qt.AlignVCenter, mono=True))
+            t.setItem(r, 6, _cell(
+                _fmt_num(var, decimals=2), Qt.AlignRight | Qt.AlignVCenter, mono=True,
+                color=_RED if var < 0 else (_GREEN if var > 0 else ""),
+            ))
+            _finish_table_row(t, r)
+            total_t += tah; total_i += inv; total_v += var; total_c += count
+        self._totals.set_total("t", total_t, "USD ")
+        self._totals.set_total("i", total_i, "USD ")
+        self._totals.set_total("v", total_v, "USD ")
+        self._totals.set_total("c", total_c, "")
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        if 0 <= row < len(self._uploads):
+            self.upload_clicked.emit(self._uploads[row])
+
+    def _on_menu(self, pos) -> None:
+        row = self._table.rowAt(pos.y())
+        if not (0 <= row < len(self._uploads)):
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Delete this upload")
+        if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
+            self.delete_clicked.emit(self._uploads[row])
+
+
+class _AfritrackUploadDetail(QWidget):
+    back_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._upload_id = ""
+        self._page = 1
+        self._page_size = 25
+        self._total = 0
+        self._search = ""
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        nav = QWidget()
+        nav.setStyleSheet("background:transparent;")
+        nh = QHBoxLayout(nav)
+        nh.setContentsMargins(0, 0, 0, 0)
+        nh.setSpacing(8)
+        back_btn = _btn("← All Uploads", primary=False, height=30)
+        back_btn.clicked.connect(self.back_requested)
+        nh.addWidget(back_btn)
+        self._crumb_lbl = _lbl("", size=12, color=_T2)
+        nh.addWidget(self._crumb_lbl)
+        nh.addStretch()
+        self._export_btn = _btn("Export Upload", "mdi.download-outline", primary=False, height=30)
+        self._export_btn.clicked.connect(self._export_current_upload)
+        nh.addWidget(self._export_btn)
+        vl.addWidget(nav)
+
+        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
+        vl.addWidget(self._info_lbl)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tl = QHBoxLayout(tb)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(8)
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search truck or remarks…")
+        self._search_edit.setFixedWidth(280)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tl.addWidget(self._search_edit)
+        tl.addStretch()
+        vl.addWidget(tb)
+
+        self._table = _make_table(_AF_DETAIL_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        widths = [56, 120, 70, 90, 70, 90, 120, 120, 100, 180]
+        for i, w in enumerate(widths):
+            self._table.setColumnWidth(i, w)
+        vl.addWidget(self._table, 1)
+
+        self._totals = _TotalsBar([
+            ("t", "Tahmeed "),
+            ("i", "Invoice "),
+            ("v", "Variance "),
+            ("c", "Rows "),
+        ])
+        vl.addWidget(self._totals)
+
+        self._pager = _PaginationBar()
+        self._pager.page_changed.connect(self._go_page)
+        self._pager.size_changed.connect(self._on_page_size)
+        vl.addWidget(self._pager)
+
+    def load_upload(self, upload_doc: dict) -> None:
+        self._upload_doc = upload_doc
+        self._upload_id = str(upload_doc.get("_id") or "")
+        period = upload_doc.get("period") or "—"
+        filename = upload_doc.get("source_filename") or "Unknown file"
+        count = int(upload_doc.get("record_count", 0))
+        self._crumb_lbl.setText(f"Uploads  ›  {period}")
+        self._info_lbl.setText(f"{filename}   •   {period}   •   {count:,} rows")
+        self._search = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._page = 1
+        asyncio.ensure_future(self._load())
+
+    async def _load(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id:
+            return
+        skip = (self._page - 1) * self._page_size
+        recs, total, totals = await asyncio.gather(
+            svc.get_afritrack_upload_records(self._upload_id, self._search, self._page_size, skip),
+            svc.count_afritrack_upload_records(self._upload_id, self._search),
+            svc.get_afritrack_upload_totals(self._upload_id, self._search),
+        )
+        self._total = total
+        self._fill_table(recs)
+        self._pager.set_total(total, self._page_size, self._page)
+        self._totals.set_total("t", float(totals.get("total_tahmeed", 0) or 0), "USD ")
+        self._totals.set_total("i", float(totals.get("total_invoice", 0) or 0), "USD ")
+        self._totals.set_total("v", float(totals.get("total_variance", 0) or 0), "USD ")
+        self._totals.set_total("c", int(totals.get("count", total) or 0), "")
+
+    def _fill_table(self, recs: List[dict]) -> None:
+        t = self._table
+        t.setRowCount(0)
+        for rec in recs:
+            r = t.rowCount()
+            t.insertRow(r)
+            values = [
+                str(rec.get("row_index", r + 1)),
+                rec.get("truck", ""),
+                _fmt_num(rec.get("days"), decimals=0) if rec.get("days") else "—",
+                _fmt_num(rec.get("non_trans_days"), decimals=0) if rec.get("non_trans_days") else "—",
+                _fmt_num(rec.get("trans_days"), decimals=0) if rec.get("trans_days") else "—",
+                _fmt_num(rec.get("rate_per_day"), decimals=6) if rec.get("rate_per_day") else "—",
+                _fmt_num(rec.get("total_tahmeed"), decimals=2) if rec.get("total_tahmeed") else "—",
+                _fmt_num(rec.get("total_invoice"), decimals=2) if rec.get("total_invoice") else "—",
+                _fmt_num(rec.get("variance"), decimals=2) if rec.get("variance") else "—",
+                rec.get("remarks", ""),
+            ]
+            aligns = [
+                Qt.AlignCenter | Qt.AlignVCenter, Qt.AlignLeft | Qt.AlignVCenter,
+                Qt.AlignRight | Qt.AlignVCenter, Qt.AlignRight | Qt.AlignVCenter,
+                Qt.AlignRight | Qt.AlignVCenter, Qt.AlignRight | Qt.AlignVCenter,
+                Qt.AlignRight | Qt.AlignVCenter, Qt.AlignRight | Qt.AlignVCenter,
+                Qt.AlignRight | Qt.AlignVCenter, Qt.AlignLeft | Qt.AlignVCenter,
+            ]
+            for c, val in enumerate(values):
+                color = ""
+                if c == 8:
+                    variance = float(rec.get("variance", 0) or 0)
+                    color = _RED if variance < 0 else (_GREEN if variance > 0 else "")
+                t.setItem(r, c, _cell(val, aligns[c], mono=(2 <= c <= 8), color=color))
+            _finish_table_row(t, r)
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._page = 1
+        asyncio.ensure_future(self._load())
+
+    def _go_page(self, page: int) -> None:
+        self._page = page
+        asyncio.ensure_future(self._load())
+
+    def _on_page_size(self, size: int) -> None:
+        self._page_size = size
+        self._page = 1
+        asyncio.ensure_future(self._load())
+
+    def _export_current_upload(self) -> None:
+        asyncio.ensure_future(self._do_export_current_upload())
+
+    async def _do_export_current_upload(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Afritrack Upload",
+            f"Afritrack_{(self._upload_doc.get('period') or 'upload').replace(' ', '_')}.xlsx",
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        recs = await svc.get_afritrack_upload_records(self._upload_id, "", 10000, 0)
+        grid = _AfritrackGrid()
+        grid.setRowCount(0)
+        for rec in recs:
+            grid.add_row([
+                str(rec.get("row_index", "")),
+                rec.get("truck", ""),
+                _af_fmt(float(rec.get("days", 0) or 0), 0),
+                _af_fmt(float(rec.get("non_trans_days", 0) or 0), 0),
+                _af_fmt(float(rec.get("trans_days", 0) or 0), 0),
+                _af_fmt(float(rec.get("rate_per_day", 0) or 0), 6),
+                _af_fmt(float(rec.get("total_tahmeed", 0) or 0)),
+                _af_fmt(float(rec.get("total_invoice", 0) or 0)),
+                _af_fmt(float(rec.get("variance", 0) or 0)),
+                rec.get("remarks", ""),
+            ])
+        _export_afritrack_xlsx(
+            path,
+            grid,
+            float(self._upload_doc.get("installation_tahmeed", 0) or 0),
+            float(self._upload_doc.get("installation_invoice", 0) or 0),
+            float(self._upload_doc.get("balance_mar", 0) or 0),
+            15.0,
+            self._upload_doc.get("period") or "Upload",
+        )
+        QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
+
 
 class AfritrackWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._period = "Apr 2026"
         self._build()
+        self.refresh()
 
     def _build(self) -> None:
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 16, 20, 12)
-        vl.setSpacing(8)
+        vl.setContentsMargins(20, 20, 20, 16)
+        vl.setSpacing(12)
 
-        # ── QB Bill-style form card (all metadata above the table) ────────────
-        vl.addWidget(self._build_bill_card())
+        header = _PageHeader("Afritrack Schedule", "mdi.satellite-variant")
+        import_btn = _btn("Import from Excel", "mdi.upload-outline")
+        import_btn.clicked.connect(self._open_import)
+        header.add_right(import_btn)
+        vl.addWidget(header)
+        vl.addWidget(_hsep())
 
-        # ── slim action toolbar ───────────────────────────────────────────────
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background:transparent;")
 
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("Search trucks, remarks…")
-        self._search.setFixedWidth(220)
-        self._search.setStyleSheet(_input_ss())
-        self._search.textChanged.connect(lambda t: self._grid.filter_rows(t))
-        tbl.addWidget(self._search)
-        tbl.addStretch()
+        self._browse = _AfritrackUploadBrowse()
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._stack.addWidget(self._browse)
 
-        self._import_btn = _btn("Import", "mdi.upload-outline", height=32)
-        self._export_btn = _btn("Export", "mdi.download-outline",
-                                primary=False, height=32)
-        recalc_btn = _btn("Recalculate", "mdi.refresh", primary=False, height=32)
-        del_btn    = _btn("Delete Row",  "mdi.delete-outline",
-                          primary=False, height=32)
+        self._detail = _AfritrackUploadDetail()
+        self._detail.back_requested.connect(self._show_browse)
+        self._stack.addWidget(self._detail)
 
-        self._import_btn.clicked.connect(self._do_import)
-        self._export_btn.clicked.connect(self._do_export)
-        recalc_btn.clicked.connect(self._recalculate)
-        del_btn.clicked.connect(lambda: self._grid.delete_selected_rows())
+        self._stack.setCurrentIndex(0)
+        vl.addWidget(self._stack, 1)
 
-        tbl.addWidget(self._import_btn)
-        tbl.addWidget(self._export_btn)
-        tbl.addWidget(recalc_btn)
-        tbl.addWidget(del_btn)
-        vl.addWidget(tb)
+    def refresh(self) -> None:
+        self._show_browse()
 
-        # ── grid card — takes all remaining space ─────────────────────────────
-        card = QFrame()
-        card.setStyleSheet(
-            f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};"
-            "border-radius:6px;}}"
-        )
-        cl = QVBoxLayout(card)
-        cl.setContentsMargins(0, 0, 0, 0)
-        cl.setSpacing(0)
+    def _show_browse(self) -> None:
+        self._stack.setCurrentIndex(0)
+        self._browse.refresh()
 
-        self._grid = _AfritrackGrid()
-        self._grid.data_changed.connect(self._on_data_changed)
-        cl.addWidget(self._grid, 1)
-        vl.addWidget(card, 1)
+    def _show_detail(self, upload_doc: dict) -> None:
+        self._detail.load_upload(upload_doc)
+        self._stack.setCurrentIndex(1)
 
-        # ── status bar ────────────────────────────────────────────────────────
-        self._status = _lbl(
-            "0 trucks  ·  Import an Excel file or add rows manually",
-            11, 400, _T2,
-        )
-        vl.addWidget(self._status)
-
-        self._grid.add_row()
-        self._on_data_changed()
-
-    def _build_bill_card(self) -> QFrame:
-        """
-        QuickBooks Bill-style form card.
-        Left  : SUPPLIER · [PERIOD | VAT%]
-        Right : row 0 — INST. FEES TAHMEED | INST. FEES INVOICE
-                row 1 — BAL MAR | LESS WHT | TOTAL INVOICE | AMOUNT DUE | TOTAL PAYABLE
-        """
-        card = QFrame()
-        card.setObjectName("af_bill_card")
-        card.setStyleSheet(
-            "QFrame#af_bill_card{"
-            f"background:{_WHITE};border:1px solid {_BORDER};border-radius:8px;}}"
-        )
-
-        root = QVBoxLayout(card)
-        root.setContentsMargins(20, 14, 20, 16)
-        root.setSpacing(10)
-
-        # title row
-        title_lbl = QLabel("Afritrack Schedule")
-        title_lbl.setStyleSheet(
-            f"color:{_QB_HDR_FG};font-size:20px;font-weight:700;"
-            f"font-family:'Segoe UI';background:transparent;"
-        )
-        root.addWidget(title_lbl)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(f"background:{_BORDER};")
-        root.addWidget(sep)
-
-        # ── body: left | divider | right ──────────────────────────────────────
-        body = QWidget()
-        body.setStyleSheet("background:transparent;")
-        fl = QHBoxLayout(body)
-        fl.setContentsMargins(0, 4, 0, 4)
-        fl.setSpacing(0)
-
-        # ── LEFT ──────────────────────────────────────────────────────────────
-        left = QWidget()
-        left.setStyleSheet("background:transparent;")
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 24, 0)
-        ll.setSpacing(10)
-
-        supp_lbl = QLineEdit("AFRITRACK")
-        supp_lbl.setReadOnly(True)
-        supp_lbl.setFixedWidth(180)
-        supp_lbl.setStyleSheet(
-            f"QLineEdit{{background:{_BG};border:1px solid {_BORDER};"
-            "border-radius:4px;color:#111827;font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI';padding:0 10px;"
-            "min-height:32px;max-height:32px;}}"
-        )
-        ll.addWidget(_qb_field_widget("SUPPLIER", supp_lbl))
-
-        # PERIOD + VAT% on the same row
-        pv_row = QWidget(); pv_row.setStyleSheet("background:transparent;")
-        pvl = QHBoxLayout(pv_row)
-        pvl.setContentsMargins(0, 0, 0, 0)
-        pvl.setSpacing(14)
-
-        self._period_cb = QComboBox()
-        self._period_cb.setFixedWidth(130)
-        self._period_cb.setStyleSheet(_input_ss())
-        _months = ["Jan","Feb","Mar","Apr","May","Jun",
-                   "Jul","Aug","Sep","Oct","Nov","Dec"]
-        for yr in ["2024", "2025", "2026", "2027"]:
-            for mo in _months:
-                self._period_cb.addItem(f"{mo} {yr}")
-        self._period_cb.setCurrentText("Apr 2026")
-        self._period_cb.currentTextChanged.connect(self._on_period)
-        pvl.addWidget(_qb_field_widget("PERIOD", self._period_cb))
-
-        self._vat_edit = QLineEdit("15")
-        self._vat_edit.setFixedWidth(60)
-        self._vat_edit.setStyleSheet(_input_ss())
-        self._vat_edit.textChanged.connect(self._on_params)
-        pvl.addWidget(_qb_field_widget("VAT %", self._vat_edit))
-        pvl.addStretch()
-
-        ll.addWidget(pv_row)
-        ll.addStretch()
-        fl.addWidget(left)
-
-        # vertical divider
-        vdiv = QFrame()
-        vdiv.setFrameShape(QFrame.VLine)
-        vdiv.setFixedWidth(1)
-        vdiv.setStyleSheet(f"background:{_BORDER};")
-        fl.addWidget(vdiv)
-
-        # ── RIGHT ─────────────────────────────────────────────────────────────
-        right = QWidget()
-        right.setStyleSheet("background:transparent;")
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(24, 0, 0, 0)
-        rl.setSpacing(10)
-
-        # row 0: installation fees
-        inst_row = QWidget(); inst_row.setStyleSheet("background:transparent;")
-        il = QHBoxLayout(inst_row)
-        il.setContentsMargins(0, 0, 0, 0)
-        il.setSpacing(20)
-
-        self._inst_t = QLineEdit("0")
-        self._inst_t.setStyleSheet(_input_ss())
-        self._inst_t.textChanged.connect(self._on_params)
-        il.addWidget(_qb_field_widget("INST. FEES — TAHMEED", self._inst_t))
-
-        self._inst_i = QLineEdit("0")
-        self._inst_i.setStyleSheet(_input_ss())
-        self._inst_i.textChanged.connect(self._on_params)
-        il.addWidget(_qb_field_widget("INST. FEES — INVOICE", self._inst_i))
-        il.addStretch()
-        rl.addWidget(inst_row)
-
-        # row 1: BAL MAR | LESS WHT | TOTAL INVOICE | AMOUNT DUE | TOTAL PAYABLE
-        totals_row = QWidget(); totals_row.setStyleSheet("background:transparent;")
-        tl = QHBoxLayout(totals_row)
-        tl.setContentsMargins(0, 0, 0, 0)
-        tl.setSpacing(20)
-
-        self._bal_mar = QLineEdit("0")
-        self._bal_mar.setFixedWidth(110)
-        self._bal_mar.setStyleSheet(_input_ss())
-        self._bal_mar.textChanged.connect(self._on_params)
-        tl.addWidget(_qb_field_widget("BALANCE MAR (WHT)", self._bal_mar))
-
-        less_wht_w, self._less_wht_val = _qb_amount_widget("LESS WHT", "USD", red=False)
-        tl.addWidget(less_wht_w)
-
-        total_inv_w, self._total_inv_val = _qb_amount_widget("TOTAL INVOICE", "USD", red=False)
-        tl.addWidget(total_inv_w)
-
-        amt_w, self._amount_due_val = _qb_amount_widget("AMOUNT DUE", "USD", red=False)
-        tl.addWidget(amt_w)
-
-        tot_w, self._total_pay_val = _qb_amount_widget("TOTAL PAYABLE", "USD", red=True)
-        tl.addWidget(tot_w)
-        tl.addStretch()
-        rl.addWidget(totals_row)
-
-        fl.addWidget(right, 1)
-        root.addWidget(body)
-        return card
-
-    # ── slots ─────────────────────────────────────────────────────────────────
-
-    def _on_period(self, text: str) -> None:
-        self._period = text
-        self._on_data_changed()
-
-    def _on_params(self) -> None:
-        self._on_data_changed()
-
-    def _on_data_changed(self) -> None:
-        try:
-            it = _af_flt(self._inst_t.text())
-            ii = _af_flt(self._inst_i.text())
-            bm = _af_flt(self._bal_mar.text())
-            vr = float(self._vat_edit.text() or "15")
-        except Exception:
-            it = ii = bm = 0.0; vr = 15.0
-
-        # ── live bill-card totals ──────────────────────────────────────────────
-        tt, ti, _ = self._grid.get_col_totals()
-        # Tahmeed side
-        s2t   = tt + it
-        vat_t = s2t * vr / 100
-        s3t   = s2t + vat_t
-        wht_t = s3t * 0.05
-        pay_t = s3t - wht_t
-        total = pay_t + bm
-        # Invoice side (for TOTAL INVOICE display)
-        s2i   = ti + ii
-        vat_i = s2i * vr / 100
-        s3i   = s2i + vat_i
-        pay_i = s3i * 0.95
-
-        self._less_wht_val.setText(f"{wht_t:,.2f}")
-        self._total_inv_val.setText(f"{pay_i:,.2f}")
-        self._amount_due_val.setText(f"{pay_t:,.2f}")
-        self._total_pay_val.setText(f"{total:,.2f}")
-
-        n = sum(1 for r in range(self._grid.rowCount())
-                if not self._grid.isRowHidden(r))
-        self._status.setText(
-            f"{n:,} truck{'s' if n != 1 else ''}  ·  "
-            f"Tahmeed: {_af_fmt(tt)}  ·  "
-            f"Invoice: {_af_fmt(ti)}  ·  "
-            f"Variance: {_af_fmt(tt - ti)}"
-        )
-
-    def _recalculate(self) -> None:
-        self._grid._recalc_all()
-        self._on_data_changed()
-
-    def _do_import(self) -> None:
+    def _open_import(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Import Afritrack Schedule", "",
             "Excel Files (*.xlsx *.xls);;All Files (*)",
         )
         if not path:
             return
+        asyncio.ensure_future(self._do_import(path))
+
+    async def _do_import(self, path: str) -> None:
+        from tahmeed.services import accountant_service as svc
         try:
             rows, inst_t, inst_i, bal_mar = _read_afritrack_file(path)
         except Exception as exc:
             QMessageBox.critical(self, "Import Error", str(exc))
             return
-        self._grid.setRowCount(0)
-        for rd in rows:
-            self._grid.add_row(rd)
-        if inst_t or inst_i:
-            self._inst_t.setText(f"{inst_t:.2f}")
-            self._inst_i.setText(f"{inst_i:.2f}")
-        if bal_mar:
-            self._bal_mar.setText(f"{bal_mar:.2f}")
-        self._on_data_changed()
-        QMessageBox.information(
-            self, "Import Complete",
-            f"Loaded {self._grid.rowCount():,} truck rows.",
-        )
-
-    def _do_export(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Afritrack Schedule",
-            f"Afritrack_{self._period.replace(' ', '_')}.xlsx",
-            "Excel Files (*.xlsx)",
-        )
-        if not path:
+        if not rows:
+            QMessageBox.warning(self, "Nothing Found", "No Afritrack truck rows were found in that file.")
             return
+        source_filename = Path(path).name
+        period = Path(path).stem.replace("_", " ")
+        upload_id = str(uuid.uuid4())
+        records = _afritrack_rows_to_records(
+            rows, period, source_filename, upload_id, inst_t, inst_i, bal_mar, 15.0
+        )
         try:
-            it = _af_flt(self._inst_t.text())
-            ii = _af_flt(self._inst_i.text())
-            bm = _af_flt(self._bal_mar.text())
-            vr = float(self._vat_edit.text() or "15")
-            _export_afritrack_xlsx(path, self._grid, it, ii, bm, vr, self._period)
-            QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
+            saved = await svc.save_imported_feed(records)
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            QMessageBox.critical(self, "Import Error", str(exc))
+            return
+        QMessageBox.information(self, "Import Complete", f"Imported {saved:,} Afritrack rows.")
+        uploads = await svc.get_afritrack_uploads()
+        doc = next((u for u in uploads if str(u.get("_id")) == upload_id), None)
+        if doc is not None:
+            self._show_detail(doc)
+        else:
+            self._show_browse()
 
-    def refresh(self) -> None:
-        """Called when the sidebar navigates to this page."""
-        self._search.clear()
-        self._grid.filter_rows("")
-        self._on_data_changed()
+    def _on_delete_upload(self, upload_doc: dict) -> None:
+        count = int(upload_doc.get("record_count", 0))
+        if QMessageBox.question(
+            self, "Delete upload",
+            f"Delete this Afritrack upload and its {count:,} rows?",
+        ) != QMessageBox.Yes:
+            return
+        asyncio.ensure_future(self._delete_upload(str(upload_doc.get("_id") or "")))
+
+    async def _delete_upload(self, upload_id: str) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            await svc.delete_afritrack_upload(upload_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete Error", str(exc))
+            return
+        self._show_browse()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

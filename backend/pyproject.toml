@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tahmeed-backend"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.34",
+  "pymongo>=4.9",
+  "pydantic-settings>=2.7",
+  "PyJWT>=2.10",
+  "bcrypt>=4.2",
+  "python-multipart>=0.0.20",
+  "boto3>=1.35",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.25", "httpx>=0.28", "ruff>=0.9"]
+
+[project.scripts]
+tahmeed-api = "app.main:run"
+tahmeed-migrate = "app.cli.migrate:main"
+tahmeed-backup = "app.cli.backup:main"
+tahmeed-scheduler = "app.cli.scheduler:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

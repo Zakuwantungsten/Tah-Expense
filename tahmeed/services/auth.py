@@ -1,61 +1,67 @@
-import bcrypt
-from datetime import datetime
 from typing import Optional
 
-from tahmeed.db.connection import get_db
 from tahmeed.models.user import User
+from tahmeed.services.api_client import ApiAuthenticationError, ApiError, api_client
+from tahmeed.services.api_models import desktop_document
+
+
+def _user(document: dict) -> User:
+    data = desktop_document(document)
+    data.setdefault("password_hash", "")
+    return User.from_doc(data)
 
 
 async def authenticate(username: str, password: str) -> Optional[User]:
-    db = get_db()
-    doc = await db.users.find_one({"username": username, "active": True})
-    if not doc:
+    try:
+        await api_client.login(username, password)
+    except ApiAuthenticationError:
         return None
-    if not bcrypt.checkpw(password.encode(), doc["password_hash"].encode()):
-        return None
-    await db.users.update_one(
-        {"_id": doc["_id"]}, {"$set": {"last_login": datetime.utcnow()}}
-    )
-    return User.from_doc(doc)
+    try:
+        payload = await api_client.request("GET", "v1/auth/me")
+    except Exception:
+        api_client.clear_tokens()
+        raise
+    return _user(payload["user"])
 
 
 async def create_user(
     username: str, password: str, role: str, full_name: str
 ) -> User:
-    db = get_db()
-    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    user = User(
-        username=username,
-        password_hash=password_hash,
-        role=role,
-        full_name=full_name,
-    )
-    result = await db.users.insert_one(user.to_doc())
-    user._id = result.inserted_id
-    return user
+    body = {
+        "username": username,
+        "password": password,
+        "role": role,
+        "full_name": full_name,
+        "active": True,
+    }
+    if api_client.is_authenticated:
+        document = await api_client.request("POST", "v1/users", json=body)
+    else:
+        payload = await api_client.request(
+            "POST", "v1/auth/bootstrap", auth=False, json=body
+        )
+        api_client.set_tokens(payload["tokens"])
+        document = payload["user"]
+    return _user(document)
 
 
 async def change_password(
     username: str, current_password: str, new_password: str
 ) -> bool:
-    """Verify the user's current password and set a new one.
-
-    Returns True on success, False if the current password is incorrect
-    (or the user no longer exists / is inactive).
-    """
-    db = get_db()
-    doc = await db.users.find_one({"username": username, "active": True})
-    if not doc:
-        return False
-    if not bcrypt.checkpw(current_password.encode(), doc["password_hash"].encode()):
-        return False
-    new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-    await db.users.update_one(
-        {"_id": doc["_id"]}, {"$set": {"password_hash": new_hash}}
-    )
+    """Preserve the desktop bool contract for an incorrect current password."""
+    try:
+        await api_client.request(
+            "POST",
+            "v1/auth/change-password",
+            json={"current_password": current_password, "new_password": new_password},
+        )
+    except ApiError as exc:
+        if exc.code == "incorrect_password":
+            return False
+        raise
     return True
 
 
 async def any_user_exists() -> bool:
-    db = get_db()
-    return await db.users.count_documents({}) > 0
+    payload = await api_client.request("GET", "v1/auth/bootstrap-status", auth=False)
+    return bool(payload["has_users"])

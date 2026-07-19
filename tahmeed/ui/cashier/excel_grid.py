@@ -50,7 +50,7 @@ from tahmeed.services.cashier_service import (
     check_for_duplicates,
 )
 from tahmeed.services.category_service import (
-    create_category, get_all_categories, item_key,
+    create_cashier_category, get_all_categories, item_key,
 )
 from tahmeed.services.subtable_service import get_subtables
 from tahmeed.services.settings_service import get_setting
@@ -79,7 +79,8 @@ HEADERS = [
 
 CHECK_COLS       = {COL_NOTES}
 READONLY_COLS    = {COL_SNO}
-_DATA_SKIP_COLS  = READONLY_COLS | {COL_NOTES, COL_RECEIPT}
+# Date alone does not count as entry data (auto-filled / leftover dates).
+_DATA_SKIP_COLS  = READONLY_COLS | {COL_NOTES, COL_RECEIPT, COL_DATE}
 # Columns that should NOT be auto-uppercased (keys/dates/checkboxes/readonly)
 _UPPER_SKIP_COLS = READONLY_COLS | CHECK_COLS | {COL_RECEIPT, COL_DATE}
 DEFAULT_EDITABLE_ROWS = 20
@@ -467,6 +468,9 @@ class _ItemDelegate(_ExcelCellDelegate):
 
     def createEditor(self, parent, option, index):
         ed = CompleterLineEdit(self._items_getter() or [], parent=parent)
+        # Prefix match only — MatchContains made "l" preview "Diesel CSH"
+        # (letter appears mid-name) ahead of LATRA.
+        ed._completer.setFilterMode(Qt.MatchStartsWith)
         ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
         return ed
 
@@ -1466,22 +1470,13 @@ class DailyRegister(QWidget):
         if col not in READONLY_COLS and col not in CHECK_COLS and item.text().strip():
             self._activate_row(row)
 
-        # Auto-fill date with the register's current date the first time
-        # any data cell in this row gets a value.
-        if (
-            col not in (COL_DATE, COL_SNO) and col not in CHECK_COLS
-            and item.text().strip()
-        ):
-            date_it = self._table.item(row, COL_DATE)
-            if date_it is None or not date_it.text().strip():
-                today_str = QDate(
-                    self._current_date.year,
-                    self._current_date.month,
-                    self._current_date.day,
-                ).toString("dd/MM/yyyy")
-                self._table.blockSignals(True)
-                self._table.setItem(row, COL_DATE, QTableWidgetItem(today_str))
-                self._table.blockSignals(False)
+        # Keep Date in sync with whether the row has real entry data.
+        # Skip when the Date cell itself is edited so a manual date is not
+        # immediately cleared on an otherwise empty row.
+        if col not in READONLY_COLS and col not in CHECK_COLS and col != COL_DATE:
+            self._table.blockSignals(True)
+            self._sync_row_date(row)
+            self._table.blockSignals(False)
 
         # Item / Description / Truck validation (canonicalise, restrict, locked lists)
         if col == COL_ITEM and item.text().strip():
@@ -1515,7 +1510,7 @@ class DailyRegister(QWidget):
             return  # already active
         if sno_it:
             sno_it.setText(str(row + 1))
-        self._table.blockSignals(True)
+        prev = self._table.blockSignals(True)
         if not self._table.item(row, COL_NOTES):
             ci = QTableWidgetItem()
             ci.setData(Qt.UserRole, False)
@@ -1525,7 +1520,45 @@ class DailyRegister(QWidget):
             ri = QTableWidgetItem("")
             ri.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
             self._table.setItem(row, COL_RECEIPT, ri)
-        self._table.blockSignals(False)
+        self._table.blockSignals(prev)
+
+    def _deactivate_row(self, row: int) -> None:
+        """Clear S/NO on an emptied editable row so it looks blank again."""
+        if row < self._saved_count:
+            return
+        sno_it = self._table.item(row, COL_SNO)
+        if sno_it and sno_it.text():
+            sno_it.setText("")
+
+    def _register_date_str(self) -> str:
+        d = self._current_date
+        return QDate(d.year, d.month, d.day).toString("dd/MM/yyyy")
+
+    def _sync_row_date(self, row: int) -> None:
+        """Fill Date when the row gains entry data; clear it when the row is emptied.
+
+        Caller should block itemChanged signals when batching writes. Does not
+        overwrite a date that is already set.
+        """
+        if row < self._saved_count:
+            return
+        has_data = self._row_has_data(row)
+        date_it = self._table.item(row, COL_DATE)
+        date_text = date_it.text().strip() if date_it else ""
+
+        if has_data:
+            if not date_text:
+                new_it = QTableWidgetItem(self._register_date_str())
+                new_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                self._table.setItem(row, COL_DATE, new_it)
+            self._activate_row(row)
+        else:
+            if date_text:
+                if date_it is not None:
+                    date_it.setText("")
+                else:
+                    self._table.setItem(row, COL_DATE, QTableWidgetItem(""))
+            self._deactivate_row(row)
 
     def _append_editable_rows(self, n: int = 10) -> None:
         start = self._table.rowCount()
@@ -1719,11 +1752,14 @@ class DailyRegister(QWidget):
                         self._table.setItem(row, col, it)
                     else:
                         self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell_value)))
+            for row in sel_rows:
+                self._sync_row_date(row)
             self._table.blockSignals(False)
             self._renumber()
             return
 
         # Multi-row / multi-column clipboard: paste starting at anchor (TSV layout).
+        touched_rows: set = set()
         self._table.blockSignals(True)
         for r, line in enumerate(lines):
             for c, cell in enumerate(line.split("\t")):
@@ -1735,6 +1771,7 @@ class DailyRegister(QWidget):
                     continue
                 if row < self._saved_count:
                     continue
+                touched_rows.add(row)
                 if col in CHECK_COLS:
                     it = self._table.item(row, col) or QTableWidgetItem()
                     it.setData(Qt.UserRole, cell.strip() in ("1", "true", "True", "YES"))
@@ -1748,21 +1785,28 @@ class DailyRegister(QWidget):
                     self._table.setItem(row, col, it)
                 else:
                     self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell.strip())))
+        for row in touched_rows:
+            self._sync_row_date(row)
         self._table.blockSignals(False)
         self._renumber()
 
     def _clear_selected(self) -> None:
+        cleared_rows: set = set()
         self._table.blockSignals(True)
         for item in self._table.selectedItems():
             row = item.row()
             col = item.column()
             if row < self._saved_count or col in READONLY_COLS:
                 continue
+            cleared_rows.add(row)
             if col in CHECK_COLS:
                 item.setData(Qt.UserRole, False)
             else:
                 item.setText("")
+        for row in cleared_rows:
+            self._sync_row_date(row)
         self._table.blockSignals(False)
+        self._renumber()
 
     def _fill_down(self) -> None:
         """Ctrl+D: copy the top row of the selection into all rows below it."""
@@ -1792,6 +1836,9 @@ class DailyRegister(QWidget):
                     self._table.setItem(row, col, it)
                 else:
                     self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, src.text())))
+        for row in rows[1:]:
+            if row >= self._saved_count:
+                self._sync_row_date(row)
         self._table.blockSignals(False)
         self._renumber()
 
@@ -1817,6 +1864,9 @@ class DailyRegister(QWidget):
                 if col in READONLY_COLS or col in CHECK_COLS:
                     continue
                 self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, src.text())))
+        for row in rows:
+            if row >= self._saved_count:
+                self._sync_row_date(row)
         self._table.blockSignals(False)
         self._renumber()
 
@@ -1950,12 +2000,14 @@ class DailyRegister(QWidget):
 
         start = self._first_empty_editable_row()
         self._table.blockSignals(True)
+        loaded_rows: set = set()
         for r, row_data in enumerate(data):
             target = start + r
             if target >= self._table.rowCount():
                 self._append_editable_rows(20)
             if target < self._saved_count:
                 continue
+            loaded_rows.add(target)
 
             for grid_col, file_col in FILE_MAP.items():
                 if file_col >= len(row_data):
@@ -1987,6 +2039,8 @@ class DailyRegister(QWidget):
                     if raw and raw != "None":
                         self._table.setItem(target, grid_col, QTableWidgetItem(_upper_text(grid_col, raw)))
 
+        for row in loaded_rows:
+            self._sync_row_date(row)
         self._table.blockSignals(False)
         self._renumber()
 
@@ -2004,8 +2058,45 @@ class DailyRegister(QWidget):
     def save_rows(self) -> None:
         asyncio.ensure_future(self._do_save())
 
-    async def _do_save(self) -> None:
+    def has_unsaved_work(self) -> bool:
+        """True when edit-mode dirty rows or typed-but-unsaved new rows exist."""
+        if self._dirty_rows:
+            return True
+        for row in range(self._saved_count, self._table.rowCount()):
+            if self._row_has_data(row):
+                return True
+        return False
+
+    def _commit_open_editor(self) -> None:
+        """Flush the active cell editor into the model before save/leave checks."""
+        w = QApplication.focusWidget()
+        if w is not None and self._table.isAncestorOf(w):
+            self._table.commitData(w)
+            self._table.closeEditor(w, QAbstractItemDelegate.NoHint)
+
+    async def confirm_leave(self) -> bool:
+        """Ask to save/discard before logout or app exit. False = stay put."""
+        self._commit_open_editor()
+        if not self.has_unsaved_work():
+            return True
+        resp = QMessageBox.question(
+            self, "Unsaved changes",
+            "You have unsaved entries in the Daily Register.\n"
+            "Save them before leaving?",
+            QMessageBox.Yes | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if resp == QMessageBox.Cancel:
+            return False
+        if resp == QMessageBox.Discard:
+            return True
+        # Yes — save; if the user cancels mid-save (duplicates / off-date), stay.
+        return await self._do_save()
+
+    async def _do_save(self) -> bool:
+        """Persist dirty + new rows. Returns False if the user cancelled mid-save."""
         saved, updated, errors = 0, 0, []
+        self._commit_open_editor()
 
         # ── Pass 1: commit edits to already-saved rows (UPDATE) ──────────
         for row in sorted(self._dirty_rows):
@@ -2072,7 +2163,7 @@ class DailyRegister(QWidget):
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             ) == QMessageBox.No:
-                return
+                return False
 
         cancel_all = False
         for row in range(self._saved_count, self._table.rowCount()):
@@ -2208,6 +2299,9 @@ class DailyRegister(QWidget):
             except Exception as exc:
                 errors.append(f"Row {row + 1}: {exc}")
 
+        if cancel_all:
+            return False
+
         if errors:
             QMessageBox.warning(
                 self, "Save — partial errors",
@@ -2215,12 +2309,13 @@ class DailyRegister(QWidget):
             )
         elif saved == 0 and updated == 0:
             QMessageBox.information(self, "Nothing to save", "No changes to save.")
-            return
+            return True
         # else: clean save — reload silently, no popup
 
         self._reset_edit_state()
         self.rows_saved.emit(saved)
         await self._load_date(self._current_date)
+        return True
 
     def _row_has_data(self, row: int) -> bool:
         for col in range(self._table.columnCount()):
@@ -2311,7 +2406,7 @@ class DailyRegister(QWidget):
 
     async def _create_item_and_refresh(self, data: dict, row: int) -> None:
         try:
-            await create_category(
+            await create_cashier_category(
                 data["name"], data["color"],
                 data["requires_receipt"], data["requires_truck"],
                 data.get("description", ""),

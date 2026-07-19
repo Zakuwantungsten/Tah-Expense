@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Tahmeed weekly backup
+
+[Timer]
+OnCalendar=Sun *-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=15min
+Unit=tahmeed-backup-weekly.service
+
+[Install]
+WantedBy=timers.target

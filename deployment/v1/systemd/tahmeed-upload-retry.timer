@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry Tahmeed backup uploads every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/30:00
+Persistent=true
+RandomizedDelaySec=5min
+Unit=tahmeed-upload-retry.service
+
+[Install]
+WantedBy=timers.target

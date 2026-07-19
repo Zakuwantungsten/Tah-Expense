@@ -22,6 +22,12 @@ class Category:
     requires_truck: bool = True
     lock_description: bool = False  # if True, cashier may only pick from this item's sub-items
     active: bool = True
+    # QuickBooks Chart of Accounts metadata (populated by CoA import).
+    account_type: str = ""
+    ref_num: str = ""
+    account_number: str = ""
+    currency: str = ""
+    coa_description: str = ""      # CoA "Description" column (distinct from cashier hint)
     _id: Optional[ObjectId] = None
 
     def to_doc(self) -> dict:
@@ -36,6 +42,11 @@ class Category:
             "requires_truck": self.requires_truck,
             "lock_description": self.lock_description,
             "active": self.active,
+            "account_type": self.account_type,
+            "ref_num": self.ref_num,
+            "account_number": self.account_number,
+            "currency": self.currency,
+            "coa_description": self.coa_description,
         }
         if self._id:
             doc["_id"] = self._id
@@ -55,4 +66,9 @@ class Category:
             requires_truck=doc.get("requires_truck", True),
             lock_description=doc.get("lock_description", False),
             active=doc.get("active", True),
+            account_type=doc.get("account_type", ""),
+            ref_num=doc.get("ref_num", ""),
+            account_number=doc.get("account_number", ""),
+            currency=doc.get("currency", ""),
+            coa_description=doc.get("coa_description", ""),
         )

@@ -1,0 +1,4 @@
+tahmeed-api.env
+*.override.yaml
+.deployed-tag
+.previous-tag

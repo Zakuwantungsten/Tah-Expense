@@ -1,67 +1,158 @@
 import re
 from typing import List
+
 from bson import ObjectId
 
-from tahmeed.db.connection import get_db
 from tahmeed.models.category import Category
+from tahmeed.services.api_client import api_client
+from tahmeed.services.api_models import desktop_document, get_all_pages
 
 
 def item_key(name: str) -> str:
-    """Slugify an item name into a stable sidebar / sub-table parent key.
-
-    Used everywhere a key is needed for an item (sidebar nav, sub-tables, stack
-    routing) so the accountant sidebar, Manage Items, and the dashboards all
-    agree on the same key for a given item name.
-    """
     return re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
 
 
+def _category(document: dict) -> Category:
+    return Category.from_doc(desktop_document(document))
+
+
 async def get_all_categories(include_inactive: bool = False) -> List[Category]:
-    db = get_db()
-    query = {} if include_inactive else {"active": True}
-    cursor = db.categories.find(query).sort("name", 1)
-    docs = await cursor.to_list(length=None)
-    return [Category.from_doc(d) for d in docs]
+    documents = await get_all_pages(
+        "v1/categories", params={"include_inactive": include_inactive}
+    )
+    return sorted(
+        (_category(document) for document in documents),
+        key=lambda category: category.name,
+    )
+
+
+async def list_categories(
+    *,
+    search: str = "",
+    include_inactive: bool = False,
+    limit: int = 100,
+    skip: int = 0,
+) -> List[Category]:
+    page = await api_client.request(
+        "GET",
+        "v1/categories",
+        params={
+            "search": search,
+            "include_inactive": include_inactive,
+            "limit": limit,
+            "offset": max(0, skip),
+        },
+    )
+    return [_category(document) for document in page["items"]]
+
+
+async def count_categories(
+    *, search: str = "", include_inactive: bool = False
+) -> int:
+    page = await api_client.request(
+        "GET",
+        "v1/categories",
+        params={
+            "search": search,
+            "include_inactive": include_inactive,
+            "limit": 1,
+        },
+    )
+    return int(page["total"])
 
 
 async def get_sidebar_categories() -> List[Category]:
-    """Active items flagged to appear as their own sidebar tab, ordered."""
-    db = get_db()
-    cursor = db.categories.find(
-        {"active": True, "show_in_sidebar": True}
-    ).sort([("sort_order", 1), ("name", 1)])
-    docs = await cursor.to_list(length=None)
-    return [Category.from_doc(d) for d in docs]
+    categories = await get_all_categories()
+    return sorted(
+        (category for category in categories if category.show_in_sidebar),
+        key=lambda category: (category.sort_order, category.name),
+    )
 
 
-async def create_category(
-    name: str, color: str, requires_receipt: bool, requires_truck: bool,
+async def _create_category(
+    path: str,
+    name: str,
+    color: str,
+    requires_receipt: bool,
+    requires_truck: bool,
     description: str = "",
     icon: str = "mdi.tag-outline",
     show_in_sidebar: bool = False,
     sort_order: int = 0,
     lock_description: bool = False,
 ) -> Category:
-    db = get_db()
-    cat = Category(
-        name=name,
-        description=description,
-        color=color,
-        icon=icon,
-        show_in_sidebar=show_in_sidebar,
-        sort_order=sort_order,
-        requires_receipt=requires_receipt,
-        requires_truck=requires_truck,
-        lock_description=lock_description,
+    document = await api_client.request(
+        "POST",
+        path,
+        json={
+            "name": name,
+            "description": description,
+            "color": color,
+            "icon": icon,
+            "show_in_sidebar": show_in_sidebar,
+            "sort_order": sort_order,
+            "requires_receipt": requires_receipt,
+            "requires_truck": requires_truck,
+            "lock_description": lock_description,
+        },
     )
-    result = await db.categories.insert_one(cat.to_doc())
-    cat._id = result.inserted_id
-    return cat
+    return _category(document)
+
+
+async def create_category(
+    name: str,
+    color: str,
+    requires_receipt: bool,
+    requires_truck: bool,
+    description: str = "",
+    icon: str = "mdi.tag-outline",
+    show_in_sidebar: bool = False,
+    sort_order: int = 0,
+    lock_description: bool = False,
+) -> Category:
+    return await _create_category(
+        "v1/categories",
+        name,
+        color,
+        requires_receipt,
+        requires_truck,
+        description,
+        icon,
+        show_in_sidebar,
+        sort_order,
+        lock_description,
+    )
+
+
+async def create_cashier_category(
+    name: str,
+    color: str,
+    requires_receipt: bool,
+    requires_truck: bool,
+    description: str = "",
+    icon: str = "mdi.tag-outline",
+    show_in_sidebar: bool = False,
+    sort_order: int = 0,
+    lock_description: bool = False,
+) -> Category:
+    return await _create_category(
+        "v1/categories/cashier-create",
+        name,
+        color,
+        requires_receipt,
+        requires_truck,
+        description,
+        icon,
+        show_in_sidebar,
+        sort_order,
+        lock_description,
+    )
 
 
 async def update_category(cat_id: ObjectId, **fields) -> None:
-    db = get_db()
-    await db.categories.update_one({"_id": cat_id}, {"$set": fields})
+    await api_client.request(
+        "PATCH", f"v1/categories/{cat_id}", json={"values": fields}
+    )
 
 
 async def toggle_category(cat_id: ObjectId, active: bool) -> None:
@@ -69,5 +160,4 @@ async def toggle_category(cat_id: ObjectId, active: bool) -> None:
 
 
 async def delete_category(cat_id: ObjectId) -> None:
-    db = get_db()
-    await db.categories.delete_one({"_id": cat_id})
+    await api_client.request("DELETE", f"v1/categories/{cat_id}")

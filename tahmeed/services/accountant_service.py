@@ -4,7 +4,7 @@ import asyncio
 import calendar
 import re
 from datetime import datetime, date
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
 
@@ -1699,3 +1699,575 @@ async def count_congo_upload_records(upload_id: str, search: str = "") -> int:
             {"date_str":    {"$regex": s, "$options": "i"}},
         ]
     return await db.separate_expenses.count_documents(query)
+
+
+# ── Truck Overview — cross-source normalized rollup ───────────────────────────
+
+_TRUCK_OVERVIEW_DIESEL_FEEDS = (
+    ("diesel_infinity", "Infinity Diesel"),
+    ("diesel_lake_zambia", "Lake Zambia Diesel"),
+    ("diesel_lake_tunduma", "Lake Tunduma Diesel"),
+    ("diesel_gbp", "GBP Diesel"),
+)
+
+_TRUCK_OVERVIEW_IMPORTED_FEEDS = (
+    ("toll_plaza", "Toll Plaza"),
+    ("parking_congo", "Parking Congo"),
+    ("zambia_parking", "Zambia Parking"),
+)
+
+_TRUCK_OVERVIEW_SOURCES = {
+    "all",
+    "master",
+    "diesel_cash",
+    "diesel_imports",
+    "afritrack",
+    "toll_plaza",
+    "parking_congo",
+    "zambia_parking",
+    "congo_expenses",
+    "ahmed_kimvi",
+    "rahntech",
+    "comesa",
+    "third_party",
+    "sm_burhani",
+}
+
+
+def _truck_exact(value: str) -> dict:
+    return {"$regex": f"^{re.escape(value.strip())}$", "$options": "i"}
+
+
+def _safe_float_value(value: Any) -> float:
+    try:
+        if value in (None, "", "None"):
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_date_value(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if value in (None, "", "None"):
+        return datetime.min
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%d %b %Y",
+        "%d %b %y",
+    ):
+        try:
+            return datetime.strptime(str(value).strip(), fmt)
+        except ValueError:
+            continue
+    return datetime.min
+
+
+def _truck_row_matches_search(row: dict, search: str) -> bool:
+    if not search.strip():
+        return True
+    needle = search.strip().lower()
+    haystack = " ".join(
+        str(row.get(key, "") or "")
+        for key in (
+            "source",
+            "description",
+            "reference",
+            "truck_value",
+            "station",
+            "currency",
+        )
+    ).lower()
+    return needle in haystack
+
+
+def _truck_row_in_date_range(
+    row: dict,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> bool:
+    row_date = row.get("date")
+    if not isinstance(row_date, datetime) or row_date == datetime.min:
+        return date_from is None and date_to is None
+    if date_from is not None and row_date < date_from:
+        return False
+    if date_to is not None and row_date > date_to:
+        return False
+    return True
+
+
+def _normalized_row(
+    *,
+    source_group: str,
+    source: str,
+    date_value: Any,
+    truck_value: str,
+    description: str,
+    reference: str = "",
+    currency: str = "",
+    amount: Any = None,
+    liters: Any = None,
+    rate: Any = None,
+    station: str = "",
+    receipt_status: str = "",
+) -> dict:
+    amt = _safe_float_value(amount) if amount not in (None, "") else None
+    ltrs = _safe_float_value(liters) if liters not in (None, "") else None
+    unit_rate = _safe_float_value(rate) if rate not in (None, "") else None
+    dt = _as_date_value(date_value)
+    return {
+        "source_group": source_group,
+        "source": source,
+        "date": dt,
+        "truck_value": truck_value or "—",
+        "description": description or "—",
+        "reference": reference or "—",
+        "currency": currency or "",
+        "amount": amt,
+        "liters": ltrs,
+        "rate": unit_rate,
+        "station": station or "—",
+        "receipt_status": receipt_status or "—",
+    }
+
+
+async def _truck_overview_master_rows(truck: str) -> list:
+    db = get_db()
+    docs = await db.transactions.find(
+        {"verified": True, "truck_number": _truck_exact(truck)}
+    ).sort([("date", -1), ("created_at", -1)]).to_list(length=None)
+
+    rows = []
+    for doc in docs:
+        tx = Transaction.from_doc(doc)
+        is_diesel_cash = bool(
+            tx.category_name
+            and re.fullmatch(
+                _diesel_cash_name_filter()["$regex"],
+                str(tx.category_name),
+                re.IGNORECASE,
+            )
+        )
+        rows.append(_normalized_row(
+            source_group="diesel_cash" if is_diesel_cash else "master",
+            source="Diesel Cash" if is_diesel_cash else "Master Expenses",
+            date_value=tx.date,
+            truck_value=tx.truck_number,
+            description=tx.description or tx.item or tx.category_name or "Verified transaction",
+            reference=tx.memo or tx.do_number or tx.lpo_do or tx.category_name or "",
+            currency=tx.currency or "",
+            amount=tx.amount,
+            station=tx.ownership or "",
+            receipt_status=tx.receipt_status or "",
+        ))
+    return rows
+
+
+async def _truck_overview_diesel_rows(truck: str) -> list:
+    db = get_db()
+    rows: list = []
+    for feed_type, label in _TRUCK_OVERVIEW_DIESEL_FEEDS:
+        docs = await db.imported_feeds.find(
+            {"feed_type": feed_type, "truck_no": _truck_exact(truck)}
+        ).sort([("date", -1), ("import_date", -1)]).to_list(length=None)
+        for doc in docs:
+            rows.append(_normalized_row(
+                source_group="diesel_imports",
+                source=label,
+                date_value=doc.get("date"),
+                truck_value=str(doc.get("truck_no", "") or ""),
+                description=doc.get("destinations") or doc.get("clients_name") or "Diesel import",
+                reference=doc.get("lpo_no") or doc.get("do_sdo_no") or doc.get("sheet_label") or "",
+                currency="TZS",
+                amount=doc.get("total_amount"),
+                liters=doc.get("ltrs"),
+                rate=doc.get("price_per_ltr"),
+                station=doc.get("diesel_at") or "",
+            ))
+    return rows
+
+
+async def _truck_overview_imported_feed_rows(truck: str) -> list:
+    db = get_db()
+    rows: list = []
+
+    toll_docs = await db.imported_feeds.find(
+        {"feed_type": "toll_plaza", "vehicle_reg": _truck_exact(truck)}
+    ).sort([("toll_date", -1), ("import_date", -1)]).to_list(length=None)
+    for doc in toll_docs:
+        rows.append(_normalized_row(
+            source_group="toll_plaza",
+            source="Toll Plaza",
+            date_value=doc.get("toll_date"),
+            truck_value=str(doc.get("vehicle_reg", "") or ""),
+            description=doc.get("toll_plaza") or "Toll transaction",
+            reference=doc.get("receipt_no") or doc.get("card_no") or doc.get("device") or "",
+            currency="ZMW",
+            amount=doc.get("tender_amount"),
+            station=doc.get("cashier_name") or "",
+        ))
+
+    parking_docs = await db.imported_feeds.find(
+        {"feed_type": "parking_congo", "vehicle_no": _truck_exact(truck)}
+    ).sort([("payment_date", -1), ("import_date", -1)]).to_list(length=None)
+    for doc in parking_docs:
+        rows.append(_normalized_row(
+            source_group="parking_congo",
+            source="Parking Congo",
+            date_value=doc.get("payment_date"),
+            truck_value=str(doc.get("vehicle_no", "") or ""),
+            description=doc.get("transaction_details") or doc.get("transaction_type") or "Parking transaction",
+            reference=doc.get("ledger_id") or doc.get("direction") or "",
+            amount=doc.get("amount"),
+            station=doc.get("cashier") or "",
+        ))
+
+    zambia_docs = await db.imported_feeds.find(
+        {"feed_type": "zambia_parking", "plate_num": _truck_exact(truck)}
+    ).sort([("transaction_date", -1), ("import_date", -1)]).to_list(length=None)
+    for doc in zambia_docs:
+        debit = _safe_float_value(doc.get("debit"))
+        credit = _safe_float_value(doc.get("credit"))
+        amount = debit if debit else (-credit if credit else None)
+        rows.append(_normalized_row(
+            source_group="zambia_parking",
+            source="Zambia Parking",
+            date_value=doc.get("transaction_date") or doc.get("date"),
+            truck_value=str(doc.get("plate_num", "") or ""),
+            description=doc.get("heading_to") or doc.get("type") or "Zambia parking transaction",
+            reference=doc.get("ticket_no") or doc.get("sheet_label") or "",
+            currency="ZMW",
+            amount=amount,
+        ))
+
+    return rows
+
+
+async def _truck_overview_separate_rows(truck: str) -> list:
+    db = get_db()
+    rows: list = []
+
+    congo_docs = await db.separate_expenses.find(
+        {"expense_type": "congo_expenses", "truck_no": _truck_exact(truck)}
+    ).sort([("expense_date", -1), ("created_at", -1)]).to_list(length=None)
+    for doc in congo_docs:
+        rows.append(_normalized_row(
+            source_group="congo_expenses",
+            source="Congo Expenses",
+            date_value=doc.get("expense_date") or doc.get("date_str"),
+            truck_value=str(doc.get("truck_no", "") or ""),
+            description=doc.get("description") or "Congo expense",
+            reference=doc.get("lpo_no") or doc.get("sheet_label") or "",
+            currency="USD",
+            amount=doc.get("amount_usd"),
+        ))
+
+    kimvi_docs = await db.separate_expenses.find(
+        {"expense_type": "ahmed_kimvi", "truck_no": _truck_exact(truck)}
+    ).sort([("expense_date", -1), ("created_at", -1)]).to_list(length=None)
+    for doc in kimvi_docs:
+        rows.append(_normalized_row(
+            source_group="ahmed_kimvi",
+            source="Ahmed Kimvi",
+            date_value=doc.get("expense_date") or doc.get("date_str"),
+            truck_value=str(doc.get("truck_no", "") or ""),
+            description=doc.get("description") or "Ahmed Kimvi expense",
+            reference=doc.get("sheet_label") or "",
+            currency="USD",
+            amount=doc.get("amount_usd"),
+        ))
+
+    return rows
+
+
+async def _truck_overview_extra_sidebar_rows(truck: str) -> list:
+    db = get_db()
+    rows: list = []
+
+    afritrack_docs = await db.imported_feeds.find(
+        {"feed_type": "afritrack", "truck": _truck_exact(truck)}
+    ).sort([("import_date", -1), ("row_index", 1)]).to_list(length=None)
+    for doc in afritrack_docs:
+        rows.append(_normalized_row(
+            source_group="afritrack",
+            source="Afritrack",
+            date_value=doc.get("import_date"),
+            truck_value=str(doc.get("truck", "") or ""),
+            description=doc.get("remarks") or "Afritrack schedule row",
+            reference=doc.get("period") or doc.get("source_filename") or "",
+            currency="USD",
+            amount=doc.get("total_invoice"),
+            rate=doc.get("rate_per_day"),
+        ))
+
+    rahn_docs = await db.imported_feeds.find(
+        {"feed_type": "rahntech", "truck_number": _truck_exact(truck)}
+    ).sort([("sales_date", -1), ("import_date", -1)]).to_list(length=None)
+    for doc in rahn_docs:
+        rows.append(_normalized_row(
+            source_group="rahntech",
+            source="RahnTech",
+            date_value=doc.get("sales_date"),
+            truck_value=str(doc.get("truck_number", "") or ""),
+            description=doc.get("driver_name") or doc.get("device_number") or "RahnTech transaction",
+            reference=doc.get("trip_number") or doc.get("do_number") or "",
+        ))
+
+    comesa_docs = await db.imported_feeds.find(
+        {"feed_type": "comesa", "truck_reg": _truck_exact(truck)}
+    ).sort([("month", -1), ("import_date", -1)]).to_list(length=None)
+    for doc in comesa_docs:
+        rows.append(_normalized_row(
+            source_group="comesa",
+            source="COMESA",
+            date_value=doc.get("import_date"),
+            truck_value=str(doc.get("truck_reg", "") or ""),
+            description=doc.get("name") or "COMESA cover",
+            reference=doc.get("card_no") or doc.get("month") or "",
+            currency="TZS",
+            amount=doc.get("premium"),
+        ))
+
+    third_party_docs = await db.imported_feeds.find(
+        {"feed_type": "third_party", "reg_no": _truck_exact(truck)}
+    ).sort([("month", -1), ("import_date", -1)]).to_list(length=None)
+    for doc in third_party_docs:
+        rows.append(_normalized_row(
+            source_group="third_party",
+            source="Third Party Covers",
+            date_value=doc.get("import_date"),
+            truck_value=str(doc.get("reg_no", "") or ""),
+            description=(doc.get("name") or "Third Party cover") + (
+                f" [{doc.get('status')}]" if doc.get("status") else ""
+            ),
+            reference=doc.get("month") or "",
+            currency="TZS",
+            amount=doc.get("total_premium"),
+        ))
+
+    recon_docs = await db.reconciliation_entries.find(
+        {"entity": "sm_burhani", "truck_and_trailer": {"$regex": re.escape(truck.strip()), "$options": "i"}}
+    ).sort([("t1_date", -1), ("import_date", -1)]).to_list(length=None)
+    for doc in recon_docs:
+        table = doc.get("table", "bonds")
+        source_label = "SM Burhani Bonds" if table == "bonds" else "SM Burhani RPA"
+        rows.append(_normalized_row(
+            source_group="sm_burhani",
+            source=source_label,
+            date_value=doc.get("t1_date") or doc.get("import_date"),
+            truck_value=str(doc.get("truck_and_trailer", "") or ""),
+            description=doc.get("consignment") or doc.get("importer") or "Reconciliation entry",
+            reference=doc.get("prn_number") or doc.get("entry_reg_no") or doc.get("station") or "",
+            currency="TZS",
+            amount=doc.get("charge"),
+            station=doc.get("station") or "",
+        ))
+
+    return rows
+
+
+async def get_afritrack_uploads() -> list:
+    """Return one summary doc per upload batch for the afritrack feed."""
+    db = get_db()
+    pipeline = [
+        {"$match": {
+            "feed_type": "afritrack",
+            "upload_id": {"$exists": True, "$ne": ""},
+        }},
+        {"$group": {
+            "_id":                  "$upload_id",
+            "source_filename":      {"$first": "$source_filename"},
+            "import_date":          {"$first": "$import_date"},
+            "period":               {"$first": "$period"},
+            "record_count":         {"$sum": 1},
+            "total_tahmeed":        {"$sum": _safe_double("total_tahmeed")},
+            "total_invoice":        {"$sum": _safe_double("total_invoice")},
+            "total_variance":       {"$sum": _safe_double("variance")},
+            "installation_tahmeed": {"$first": _safe_double("installation_tahmeed")},
+            "installation_invoice": {"$first": _safe_double("installation_invoice")},
+            "balance_mar":          {"$first": _safe_double("balance_mar")},
+        }},
+        {"$sort": {"import_date": -1}},
+    ]
+    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+
+
+def _afritrack_record_query(upload_id: str, search: str = "") -> dict:
+    query: dict = {"feed_type": "afritrack", "upload_id": upload_id}
+    if search.strip():
+        s = re.escape(search.strip())
+        query["$or"] = [
+            {"truck": {"$regex": s, "$options": "i"}},
+            {"remarks": {"$regex": s, "$options": "i"}},
+            {"period": {"$regex": s, "$options": "i"}},
+        ]
+    return query
+
+
+async def get_afritrack_upload_records(
+    upload_id: str,
+    search: str = "",
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    db = get_db()
+    cursor = (
+        db.imported_feeds.find(_afritrack_record_query(upload_id, search))
+        .sort([("row_index", 1), ("import_date", 1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_afritrack_upload_records(upload_id: str, search: str = "") -> int:
+    db = get_db()
+    return await db.imported_feeds.count_documents(_afritrack_record_query(upload_id, search))
+
+
+async def get_afritrack_upload_totals(upload_id: str, search: str = "") -> dict:
+    db = get_db()
+    pipeline = [
+        {"$match": _afritrack_record_query(upload_id, search)},
+        {"$group": {
+            "_id": None,
+            "count": {"$sum": 1},
+            "total_tahmeed": {"$sum": _safe_double("total_tahmeed")},
+            "total_invoice": {"$sum": _safe_double("total_invoice")},
+            "total_variance": {"$sum": _safe_double("variance")},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        return result[0]
+    return {"count": 0, "total_tahmeed": 0.0, "total_invoice": 0.0, "total_variance": 0.0}
+
+
+async def delete_afritrack_upload(upload_id: str) -> int:
+    db = get_db()
+    result = await db.imported_feeds.delete_many({"feed_type": "afritrack", "upload_id": upload_id})
+    return result.deleted_count
+
+
+async def _load_truck_overview_rows(truck: str) -> list:
+    master_rows, diesel_rows, imported_rows, separate_rows, extra_rows = await asyncio.gather(
+        _truck_overview_master_rows(truck),
+        _truck_overview_diesel_rows(truck),
+        _truck_overview_imported_feed_rows(truck),
+        _truck_overview_separate_rows(truck),
+        _truck_overview_extra_sidebar_rows(truck),
+    )
+    return master_rows + diesel_rows + imported_rows + separate_rows + extra_rows
+
+
+def _filter_truck_overview_rows(
+    rows: list,
+    search: str = "",
+    source: str = "all",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> list:
+    wanted = source if source in _TRUCK_OVERVIEW_SOURCES else "all"
+    filtered = [
+        row for row in rows
+        if (wanted == "all" or row["source_group"] == wanted)
+        and _truck_row_matches_search(row, search)
+        and _truck_row_in_date_range(row, date_from, date_to)
+    ]
+    filtered.sort(key=lambda row: (row.get("date") or datetime.min), reverse=True)
+    return filtered
+
+
+async def get_truck_overview_records(
+    truck: str,
+    search: str = "",
+    source: str = "all",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    if not truck.strip():
+        return []
+    rows = _filter_truck_overview_rows(
+        await _load_truck_overview_rows(truck.strip()),
+        search=search,
+        source=source,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return rows[skip: skip + limit]
+
+
+async def count_truck_overview_records(
+    truck: str,
+    search: str = "",
+    source: str = "all",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> int:
+    if not truck.strip():
+        return 0
+    rows = _filter_truck_overview_rows(
+        await _load_truck_overview_rows(truck.strip()),
+        search=search,
+        source=source,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return len(rows)
+
+
+async def get_truck_overview_summary(
+    truck: str,
+    search: str = "",
+    source: str = "all",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    if not truck.strip():
+        return {
+            "record_count": 0,
+            "source_count": 0,
+            "tzs_total": 0.0,
+            "usd_total": 0.0,
+            "zmw_total": 0.0,
+            "liters_total": 0.0,
+        }
+    rows = _filter_truck_overview_rows(
+        await _load_truck_overview_rows(truck.strip()),
+        search=search,
+        source=source,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    tzs_total = 0.0
+    usd_total = 0.0
+    zmw_total = 0.0
+    liters_total = 0.0
+    seen_sources: set[str] = set()
+    for row in rows:
+        seen_sources.add(row.get("source", ""))
+        amount = row.get("amount")
+        currency = (row.get("currency") or "").upper()
+        if amount is not None:
+            if currency == "TZS":
+                tzs_total += amount
+            elif currency == "USD":
+                usd_total += amount
+            elif currency == "ZMW":
+                zmw_total += amount
+        liters_total += row.get("liters") or 0.0
+    return {
+        "record_count": len(rows),
+        "source_count": len(seen_sources),
+        "tzs_total": tzs_total,
+        "usd_total": usd_total,
+        "zmw_total": zmw_total,
+        "liters_total": liters_total,
+    }

@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPalette, QPixmap
 
 from tahmeed.services.auth import authenticate, any_user_exists, create_user
+from tahmeed.services.api_client import ApiError
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -172,7 +173,7 @@ class LoginWindow(QWidget):
         layout.addWidget(self._setup_username)
 
         self._setup_password = QLineEdit()
-        self._setup_password.setPlaceholderText("Password (min 6 chars)")
+        self._setup_password.setPlaceholderText("Password (min 10 chars)")
         self._setup_password.setEchoMode(QLineEdit.Password)
         self._setup_password.setFixedHeight(36)
         layout.addWidget(self._setup_password)
@@ -211,7 +212,7 @@ class LoginWindow(QWidget):
             has_users = await any_user_exists()
             self._stack.setCurrentIndex(0 if has_users else 1)
         except Exception as exc:
-            self._login_error.setText(f"Database connection error: {exc}")
+            self._login_error.setText(f"API connection error: {exc}")
             self._stack.setCurrentIndex(0)
         asyncio.ensure_future(self._check_for_updates())
 
@@ -231,6 +232,8 @@ class LoginWindow(QWidget):
         self._username.clear()
         self._password.clear()
         self._login_error.setText("")
+        # Sign In is disabled during authenticate(); re-enable so logout → login works.
+        self._login_btn.setEnabled(True)
 
     # Login flow
     # ------------------------------------------------------------------
@@ -250,7 +253,12 @@ class LoginWindow(QWidget):
             self._login_btn.setEnabled(True)
             return
 
-        user = await authenticate(username, password)
+        try:
+            user = await authenticate(username, password)
+        except ApiError as exc:
+            self._login_error.setText(str(exc))
+            self._login_btn.setEnabled(True)
+            return
         if user is None:
             self._login_error.setText("Invalid username or password.")
             self._password.clear()
@@ -258,6 +266,8 @@ class LoginWindow(QWidget):
             return
 
         self.login_successful.emit(user)
+        # Keep button disabled while this window is hidden; clear_fields()
+        # re-enables it when the user logs out and returns here.
 
     # ------------------------------------------------------------------
     # First-run setup flow
@@ -283,8 +293,8 @@ class LoginWindow(QWidget):
             self._setup_error.setText("Passwords do not match.")
             self._setup_btn.setEnabled(True)
             return
-        if len(password) < 6:
-            self._setup_error.setText("Password must be at least 6 characters.")
+        if len(password) < 10:
+            self._setup_error.setText("Password must be at least 10 characters.")
             self._setup_btn.setEnabled(True)
             return
 

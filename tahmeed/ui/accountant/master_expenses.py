@@ -23,13 +23,15 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
     QLineEdit, QComboBox, QPushButton, QSizePolicy,
-    QMessageBox, QFileDialog, QAbstractItemView,
+    QMessageBox, QFileDialog, QAbstractItemView, QDialog,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QSize
 from PySide6.QtGui import QFont, QColor, QBrush
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.app_state import app_state
+from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.accountant.separate_expenses import (
     _make_table, _cell, _finish_table_row, _stripe_bg,
 )
@@ -315,6 +317,7 @@ class _MonthTabBar(QFrame):
 class _FilterBar(QFrame):
     filter_changed = Signal()
     export_requested = Signal()
+    import_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -369,6 +372,10 @@ class _FilterBar(QFrame):
         hl.addWidget(self._rcpt_cb)
 
         hl.addStretch()
+
+        import_btn = _action_btn("Import Excel", "mdi.file-upload-outline", primary=False)
+        import_btn.clicked.connect(self.import_requested.emit)
+        hl.addWidget(import_btn)
 
         export_btn = _action_btn("Export Excel", "mdi.microsoft-excel", primary=False)
         export_btn.clicked.connect(self.export_requested.emit)
@@ -440,6 +447,11 @@ class _LedgerTable(QFrame):
             self._tbl.setColumnWidth(i, width)
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
         hdr.setStretchLastSection(True)
+        bind_column_width_persistence(
+            self._tbl,
+            "master_expenses",
+            [c[1] for c in _COLS],
+        )
         hdr.sectionClicked.connect(self._on_header_click)
         self._update_sort_indicator()
         vl.addWidget(self._tbl)
@@ -656,8 +668,9 @@ class _PaginationBar(QFrame):
 class MasterExpensesWidget(QWidget):
     """Full verified ledger — Task 5, Master Expenses Table."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, user=None, parent=None) -> None:
         super().__init__(parent)
+        self._user = user
         self._year = app_state.fiscal_year
         self._month = 0
         self._page = 0
@@ -750,6 +763,7 @@ class MasterExpensesWidget(QWidget):
         self._filter_bar = _FilterBar()
         self._filter_bar.filter_changed.connect(self._on_filter_changed)
         self._filter_bar.export_requested.connect(self._on_export)
+        self._filter_bar.import_requested.connect(self._on_import)
         root.addWidget(self._filter_bar)
 
         # ── Table ────────────────────────────────────────────────────────
@@ -766,6 +780,8 @@ class MasterExpensesWidget(QWidget):
         self._pagination.page_changed.connect(self._on_page_changed)
         self._pagination.size_changed.connect(self._on_size_changed)
         root.addWidget(self._pagination)
+
+        self._loading_overlay = LoadingOverlay(self, "Loading master expenses…")
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -816,6 +832,7 @@ class MasterExpensesWidget(QWidget):
         if self._loading:
             return
         self._loading = True
+        self._loading_overlay.show_loading("Loading master expenses…")
         try:
             from tahmeed.services.accountant_service import (
                 get_master_transactions, count_master_transactions,
@@ -878,6 +895,7 @@ class MasterExpensesWidget(QWidget):
             self._table.show_empty(f"Failed to load: {exc}")
         finally:
             self._loading = False
+            self._loading_overlay.hide_loading()
 
     # ── Excel Export ───────────────────────────────────────────────────────
 
@@ -1067,3 +1085,124 @@ class MasterExpensesWidget(QWidget):
                 )
             except Exception as exc:
                 QMessageBox.critical(self, "Save Error", f"Could not save file:\n{exc}")
+
+    # ── Excel Import ─────────────────────────────────────────────────────
+
+    def _on_import(self) -> None:
+        asyncio.ensure_future(self._do_import())
+
+    async def _do_import(self) -> None:
+        from pathlib import Path
+
+        from tahmeed.services.category_service import get_all_categories
+        from tahmeed.services.master_import_service import (
+            apply_mapping_to_preview,
+            commit_master_import,
+            preview_master_import,
+        )
+        from tahmeed.services.description_mapping_service import normalize_description
+        from tahmeed.ui.dialogs.description_mapping_dialog import DescriptionMappingDialog
+
+        default_dir = str(Path(__file__).resolve().parents[3])
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Master Expenses",
+            default_dir,
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+
+        self._loading_overlay.show_loading("Reading master Excel file…")
+        try:
+            categories = await get_all_categories()
+        except Exception as exc:
+            self._loading_overlay.hide_loading()
+            QMessageBox.critical(self, "Import Error", f"Could not load items:\n{exc}")
+            return
+
+        if not categories:
+            self._loading_overlay.hide_loading()
+            QMessageBox.warning(
+                self,
+                "No Items",
+                "Import your Chart of Accounts into Items first\n"
+                "(Manage → Items → Import Chart of Accounts).",
+            )
+            return
+
+        try:
+            preview = await preview_master_import(path)
+        except Exception as exc:
+            self._loading_overlay.hide_loading()
+            QMessageBox.critical(self, "Import Error", f"Could not read workbook:\n{exc}")
+            return
+
+        if not preview.rows:
+            self._loading_overlay.hide_loading()
+            QMessageBox.information(self, "Import", "No expense rows found in the selected file.")
+            return
+
+        # Resolve unmapped descriptions one at a time.
+        while preview.unmapped:
+            key = next(iter(preview.unmapped))
+            count = preview.unmapped[key]
+            display = key
+            for row in preview.rows:
+                if normalize_description(row.description) == key:
+                    display = row.description
+                    break
+
+            self._loading_overlay.hide_loading()
+            dlg = DescriptionMappingDialog(
+                description=display,
+                row_count=count,
+                categories=categories,
+                remaining=len(preview.unmapped),
+                parent=self,
+            )
+            if dlg.exec() != QDialog.Accepted:
+                QMessageBox.information(
+                    self,
+                    "Import Cancelled",
+                    "No records were imported.",
+                )
+                return
+
+            chosen = dlg.selected_category()
+            if chosen is None or chosen._id is None:
+                return
+
+            self._loading_overlay.show_loading("Saving description mapping…")
+            await apply_mapping_to_preview(
+                preview, key, chosen._id, chosen.name,
+            )
+
+        self._loading_overlay.show_loading("Importing master expenses…")
+        verified_by = self._user._id if self._user else None
+        try:
+            result = await commit_master_import(
+                preview,
+                verified_by=verified_by,
+                skip_duplicates=True,
+            )
+        except Exception as exc:
+            self._loading_overlay.hide_loading()
+            QMessageBox.critical(self, "Import Error", f"Import failed:\n{exc}")
+            return
+
+        self._loading_overlay.hide_loading()
+        skipped_note = ""
+        if preview.skipped:
+            skipped_note = f"\nSkipped {preview.skipped:,} blank/invalid rows."
+        dup_note = ""
+        if result["duplicates_skipped"]:
+            dup_note = f"\nSkipped {result['duplicates_skipped']:,} duplicate serial(s)."
+
+        QMessageBox.information(
+            self,
+            "Import Complete",
+            f"Imported {result['inserted']:,} master expense record(s)."
+            f"{dup_note}{skipped_note}",
+        )
+        self.refresh()

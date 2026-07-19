@@ -468,6 +468,10 @@ class CashierDashboard(QWidget):
         self._overview.go_to_browse.connect(self._on_browse)
         self._overview.export_data.connect(self._on_browse)
 
+    async def prepare_to_leave(self) -> bool:
+        """Prompt to save/discard unsaved table entries before logout or exit."""
+        return await self._register.confirm_leave()
+
     # ── Profile menu ────────────────────────────────────────────────────────────
 
     def _on_change_password(self) -> None:
