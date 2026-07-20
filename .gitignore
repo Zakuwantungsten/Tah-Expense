@@ -3,6 +3,10 @@
 .env.build
 installer_output/
 releases/*.zip
+releases/version.json
+releases/version.json.sig
+*.pem
+*.key
 __pycache__/
 *.pyc
 *.pyo

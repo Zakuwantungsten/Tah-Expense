@@ -14,7 +14,7 @@ import qtawesome as qta
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
     QScrollArea, QToolButton, QSizePolicy,
-    QPushButton, QMessageBox, QMenu,
+    QMessageBox, QMenu,
 )
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QIcon
@@ -125,6 +125,7 @@ class _NavItem(QWidget):
         self._expanded = False
         self._has_subtables = False   # chevron only shown after DB confirms sub-tables exist
         self._is_collapsed = False
+        self._badge_count = 0
 
         self.setFixedHeight(36)
         self.setCursor(Qt.PointingHandCursor)
@@ -208,15 +209,18 @@ class _NavItem(QWidget):
         self._icon_lbl.setFixedSize(px, px)
         self._refresh_icon(active=self._active)
         if self._badge_lbl:
-            self._badge_lbl.setVisible(not collapsed)
+            self._badge_lbl.setVisible(not collapsed and self._badge_count > 0)
         if self._chevron_lbl:
             # Only show when expanded AND this item actually has sub-tables
             self._chevron_lbl.setVisible(self._has_subtables and not collapsed)
 
     def set_badge(self, count: int) -> None:
+        self._badge_count = max(0, int(count))
         if self._badge_lbl:
-            self._badge_lbl.setText(str(count))
-            self._badge_lbl.setVisible(count > 0)
+            self._badge_lbl.setText(str(self._badge_count))
+            self._badge_lbl.setVisible(
+                not self._is_collapsed and self._badge_count > 0
+            )
 
     def set_expanded(self, expanded: bool) -> None:
         self._expanded = expanded

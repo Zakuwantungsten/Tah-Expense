@@ -135,11 +135,6 @@ class HeaderBar(QFrame):
             hl.addWidget(search_wrap)
             hl.addSpacing(12)
 
-        # ── Bell with static badge ──
-        bell_wrap = _BellWidget(icon_color=icon_col, hover_bg=hover_bg)
-        hl.addWidget(bell_wrap)
-        hl.addSpacing(10)
-
         # ── Avatar + initials (opens profile menu) ──
         initials = "".join(p[0].upper() for p in self._user.full_name.split()[:2]) or "AC"
         avatar = QToolButton()
@@ -185,41 +180,3 @@ class HeaderBar(QFrame):
 
         avatar.setMenu(menu)
         hl.addWidget(avatar)
-
-
-class _BellWidget(QWidget):
-    """Bell icon with a red badge overlaid in the top-right corner."""
-
-    def __init__(
-        self,
-        icon_color: str = _GRAY,
-        hover_bg: str = "#F4F6F8",
-        parent: Optional[QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setFixedSize(36, 36)
-
-        btn = QToolButton(self)
-        btn.setIcon(qta.icon("mdi.bell-outline", color=icon_color))
-        btn.setIconSize(QSize(20, 20))
-        btn.setFixedSize(36, 36)
-        btn.setStyleSheet(
-            "QToolButton { background: transparent; border: none; border-radius: 18px; }"
-            f"QToolButton:hover {{ background: {hover_bg}; }}"
-        )
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.move(0, 0)
-
-        self._badge = QLabel("3", self)
-        self._badge.setFixedSize(16, 16)
-        self._badge.setAlignment(Qt.AlignCenter)
-        self._badge.setStyleSheet(
-            "background: #DC2626; color: #ffffff; font-size: 9px;"
-            " font-weight: 700; border-radius: 8px;"
-            " font-family:'Segoe UI';"
-        )
-        self._badge.move(19, 2)
-
-    def set_count(self, count: int) -> None:
-        self._badge.setText(str(count))
-        self._badge.setVisible(count > 0)

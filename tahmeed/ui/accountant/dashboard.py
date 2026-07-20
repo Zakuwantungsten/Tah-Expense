@@ -4,11 +4,12 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
+from qasync import asyncSlot
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
     QLabel, QFrame, QDialog, QMessageBox,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 
 from tahmeed.models.user import User
 from tahmeed.ui.dialogs.change_password_dialog import ChangePasswordDialog
@@ -49,7 +50,13 @@ class AccountantDashboard(QWidget):
     def __init__(self, user: User, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._user = user
+        self._notification_poll_in_flight = False
         self._build()
+        self._notification_timer = QTimer(self)
+        self._notification_timer.setInterval(5_000)
+        self._notification_timer.timeout.connect(self._poll_notification_counts)
+        self._notification_timer.start()
+        self._poll_notification_counts()
 
     def _build(self) -> None:
         self.setObjectName("accountantDashboard")
@@ -225,6 +232,24 @@ class AccountantDashboard(QWidget):
 
     def _on_badge_updated(self, count: int) -> None:
         self._sidebar.set_verify_badge(count)
+
+    @asyncSlot()
+    async def _poll_notification_counts(self) -> None:
+        if self._notification_poll_in_flight:
+            return
+        self._notification_poll_in_flight = True
+        try:
+            from tahmeed.services.notification_service import (
+                get_verify_notification_count,
+            )
+
+            count = await get_verify_notification_count()
+            self._sidebar.set_verify_badge(count)
+        except Exception:
+            # A transient API failure must not make a known count disappear.
+            pass
+        finally:
+            self._notification_poll_in_flight = False
 
     def _on_nav(self, key: str) -> None:
         _routes = {

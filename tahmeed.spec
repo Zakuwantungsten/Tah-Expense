@@ -8,7 +8,10 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 block_cipher = None
 root = Path(SPECPATH)
 
-datas = [(".env.build", ".")]
+datas = [
+    (".env.build", "."),
+    ("tahmeed/assets/update_public_keys.json", "tahmeed/assets"),
+]
 datas += collect_data_files("qtawesome")
 
 hiddenimports = (

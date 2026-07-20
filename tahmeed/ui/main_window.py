@@ -17,6 +17,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.user = user
         self._force_close = False
+        self._close_pending = False
         self.setWindowTitle(f"Tahmeed Expense — {user.full_name}")
         self.setMinimumSize(1100, 700)
         self._build_ui()
@@ -52,16 +53,23 @@ class MainWindow(QMainWindow):
             return
         # Defer close until unsaved work is handled (async).
         event.ignore()
+        if self._close_pending:
+            return
+        self._close_pending = True
         asyncio.ensure_future(self._close_after_prepare())
 
     async def _close_after_prepare(self) -> None:
-        if not await self.prepare_to_leave():
-            return
-        self._force_close = True
-        self.close()
-        # Window X / Alt+F4: leave the process. Logout sets _force_close and
-        # closes without going through this path, then shows the login window.
-        from PySide6.QtWidgets import QApplication
-        app = QApplication.instance()
-        if app is not None:
-            app.quit()
+        try:
+            if not await self.prepare_to_leave():
+                return
+            self._force_close = True
+            self.close()
+            # Window X / Alt+F4: leave the process. Logout sets _force_close and
+            # closes without going through this path, then shows the login window.
+            from PySide6.QtWidgets import QApplication
+
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
+        finally:
+            self._close_pending = False

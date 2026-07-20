@@ -47,6 +47,7 @@ rules = APIRouter(prefix="/keyword-rules", tags=["keyword-rules"])
 mappings = APIRouter(prefix="/description-mappings", tags=["description-mappings"])
 fleet = APIRouter(tags=["fleet"])
 backups = APIRouter(prefix="/backups", tags=["backups"])
+accountant = APIRouter(prefix="/accountant", tags=["accountant"])
 
 _OPERATION_LOCK_SECONDS = 60
 
@@ -244,6 +245,17 @@ async def change_password(
         {"$set": {"revoked_at": now}},
     )
     return Response(status_code=204)
+
+
+@accountant.get("/notification-counts")
+async def accountant_notification_counts(
+    request: Request,
+    _manager: Annotated[dict, Depends(require_roles("admin", "accountant"))],
+) -> dict[str, int]:
+    pending = await database(request).transactions.count_documents(
+        {"verified": False, "rejected": {"$ne": True}}
+    )
+    return {"verify": pending}
 
 
 @users.get("")
@@ -652,5 +664,5 @@ async def list_backup_jobs(
     return json_safe(docs)
 
 
-for router in (auth, users, categories, subtables, rules, mappings, fleet, backups):
+for router in (auth, users, categories, subtables, rules, mappings, fleet, backups, accountant):
     api.include_router(router)

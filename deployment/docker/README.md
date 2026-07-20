@@ -137,8 +137,8 @@ On the trusted Windows build workstation, copy `.env.production.example` to
 ```dotenv
 API_BASE_URL=https://HOSTNAME.TAILNET.ts.net
 DB_NAME=tahmeed_expense
-MONGODB_URI=mongodb://TEMPORARY_APP_USER:PASSWORD@TAILSCALE_MONGO_IP:27017/tahmeed_expense?authSource=tahmeed_expense
-UPDATE_MANIFEST_URL=https://YOUR-UPDATE-HOST/tahmeed/version.json
+MONGODB_URI=mongodb://TEMPORARY_APP_USER:PASSWORD@TAILSCALE_MONGO_IP:27017/tahmeed_expense?authSource=tahmeed_expense&directConnection=true
+UPDATE_MANIFEST_URL=https://updates.example.com/tahmeed/version.json
 ```
 
 Never put the server JWT secret, backup MongoDB credential, or S3 credentials in
@@ -153,8 +153,13 @@ Build and test with a small named pilot group:
 
 ```powershell
 .\scripts\build_windows.ps1
-.\scripts\publish_release.ps1 -Version 1.0.0
+.\scripts\publish_release.ps1 -Sequence 1 -KeyId production-2026 `
+  -PrivateKeyPath E:\release-secrets\tahmeed-update.pem
 ```
+
+Use an R2 custom domain for `UPDATE_MANIFEST_URL`; see `releases/README.md` for
+key custody, ordered publishing, rollback, and the Authenticode/SmartScreen
+limitation.
 
 Confirm login, roles, representative reads/writes, Tailscale denial for a
 non-member, update behavior, and API logs. Expand only after a successful daily

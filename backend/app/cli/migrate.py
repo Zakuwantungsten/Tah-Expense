@@ -86,6 +86,10 @@ async def create_indexes(db: Any) -> None:
             IndexModel([("completed_at", DESCENDING)], name="completed_desc"),
         ]
     )
+    await db.transactions.create_index(
+        [("verified", ASCENDING), ("rejected", ASCENDING)],
+        name="pending_verification",
+    )
 
 
 async def migrate(check_only: bool) -> int:

@@ -1,4 +1,5 @@
-from tahmeed.main import _return_to_login
+from tahmeed import main
+from tahmeed.main import _launch_verified_installer, _return_to_login
 
 
 class FakeLogin:
@@ -32,3 +33,30 @@ def test_logout_shows_login_before_closing_last_window() -> None:
     assert events == ["clear", "show", "close"]
     assert window._force_close is True
     assert windows == []
+
+
+def test_installer_launch_uses_argument_list_without_shell(monkeypatch, tmp_path) -> None:
+    installer = tmp_path / "TahmeedExpenseSetup-1.0.1.exe"
+    installer.write_bytes(b"verified")
+    monkeypatch.setattr(main, "recover_ready_update", lambda: installer)
+    calls = []
+    monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    assert _launch_verified_installer(installer) is True
+    command, options = calls[0]
+    assert command[0][0] == str(installer)
+    assert "/RELAUNCH=1" in command[0]
+    assert options["shell"] is False
+    assert options["cwd"] == str(tmp_path)
+
+
+def test_installer_launch_rejects_path_not_in_ready_state(monkeypatch, tmp_path) -> None:
+    verified = tmp_path / "verified.exe"
+    requested = tmp_path / "other.exe"
+    monkeypatch.setattr(main, "recover_ready_update", lambda: verified)
+    monkeypatch.setattr(
+        main.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not launch")),
+    )
+    assert _launch_verified_installer(requested) is False
