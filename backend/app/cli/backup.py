@@ -605,10 +605,149 @@ async def prune(settings: Settings, db: Any) -> int:
     return len(obsolete)
 
 
+async def _resolve_restore_archive(settings: Settings, job: dict[str, Any]) -> Path:
+    """Return a verified local archive path, downloading from object storage if needed."""
+    settings.backup_directory.mkdir(parents=True, exist_ok=True)
+    ensure_free_space(settings.backup_directory, settings.backup_min_free_bytes)
+    expected_sha = job.get("sha256")
+    expected_size = job.get("size")
+    if not expected_sha or expected_size is None:
+        raise RuntimeError("Backup job is missing size or SHA-256 metadata")
+
+    candidates: list[Path] = []
+    recorded = Path(job.get("local_path") or "")
+    if recorded.name == job["filename"]:
+        candidates.append(recorded)
+    candidates.append(settings.backup_directory / job["filename"])
+    restore_dir = settings.backup_directory / "restore"
+    restore_dir.mkdir(parents=True, exist_ok=True)
+    download_target = restore_dir / job["filename"]
+    candidates.append(download_target)
+
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        size = candidate.stat().st_size
+        checksum = await asyncio.to_thread(sha256, candidate)
+        if size == expected_size and checksum == expected_sha:
+            return candidate
+
+    if not settings.backup_s3_bucket:
+        raise RuntimeError(
+            "Local archive is missing or corrupt and BACKUP_S3_BUCKET is not configured"
+        )
+    object_name = job.get("object_key") or object_key(settings, job["filename"])
+    client = s3_client(settings)
+    extra_args = {"VersionId": version_id} if (version_id := job.get("archive_version_id")) else None
+    if extra_args:
+        await asyncio.to_thread(
+            client.download_file,
+            settings.backup_s3_bucket,
+            object_name,
+            str(download_target),
+            extra_args,
+        )
+    else:
+        await asyncio.to_thread(
+            client.download_file,
+            settings.backup_s3_bucket,
+            object_name,
+            str(download_target),
+        )
+    size = download_target.stat().st_size
+    checksum = await asyncio.to_thread(sha256, download_target)
+    if size != expected_size or checksum != expected_sha:
+        download_target.unlink(missing_ok=True)
+        raise RuntimeError("Downloaded archive failed size or SHA-256 verification")
+    return download_target
+
+
+async def restore_database(
+    settings: Settings,
+    db: Any,
+    *,
+    filename: str,
+    confirm_filename: str,
+    actor: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Replace the live database with a verified uploaded archive (admin DR)."""
+    if filename != confirm_filename:
+        raise RuntimeError("Confirmation filename does not match the selected backup")
+    if any(part in filename for part in ("/", "\\", "..")):
+        raise RuntimeError("Invalid backup filename")
+
+    job = await db.backup_jobs.find_one({"filename": filename})
+    if not job:
+        raise RuntimeError(f"Backup job not found: {filename}")
+    if job.get("status") != "uploaded":
+        raise RuntimeError(
+            f"Only uploaded backups can be restored (status is {job.get('status')})"
+        )
+
+    restore_bin = shutil.which(settings.mongorestore_path)
+    if not restore_bin:
+        raise RuntimeError(f"mongorestore executable not found: {settings.mongorestore_path}")
+
+    started_at = datetime.now(UTC)
+    archive = await _resolve_restore_archive(settings, job)
+    restore_uri = settings.mongodb_uri
+    with mongodump_config(restore_uri) as config_path:
+        process = await asyncio.create_subprocess_exec(
+            restore_bin,
+            f"--config={config_path}",
+            f"--archive={archive}",
+            "--gzip",
+            "--drop",
+            "--nsInclude",
+            f"{settings.db_name}.*",
+            stdout=subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=3600)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            raise RuntimeError("mongorestore timed out after 60 minutes") from None
+    if process.returncode:
+        detail = (
+            stderr.decode(errors="replace")
+            .replace(restore_uri, "<redacted>")
+            .strip()
+        )
+        raise RuntimeError(detail or f"mongorestore exited {process.returncode}")
+
+    completed_at = datetime.now(UTC)
+    audit = {
+        "filename": filename,
+        "object_key": job.get("object_key"),
+        "archive_sha256": job.get("sha256"),
+        "archive_size": job.get("size"),
+        "status": "completed",
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "actor_id": str(actor.get("_id")) if actor and actor.get("_id") is not None else None,
+        "actor_username": (actor or {}).get("username"),
+    }
+    # Written after --drop so the audit survives the restored snapshot.
+    await db.restore_audit.insert_one(audit)
+    return {
+        "filename": filename,
+        "status": "completed",
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "archive_sha256": job.get("sha256"),
+        "archive_size": job.get("size"),
+    }
+
+
 async def preflight(settings: Settings, db: Any) -> None:
     executable = shutil.which(settings.mongodump_path)
     if not executable:
         raise RuntimeError(f"mongodump executable not found: {settings.mongodump_path}")
+    restore_bin = shutil.which(settings.mongorestore_path)
+    if not restore_bin:
+        raise RuntimeError(f"mongorestore executable not found: {settings.mongorestore_path}")
     ensure_free_space(settings.backup_directory, settings.backup_min_free_bytes)
     settings.backup_lock_file.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=settings.backup_directory, prefix=".write-test-"):

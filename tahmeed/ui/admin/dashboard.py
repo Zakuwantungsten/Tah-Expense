@@ -5,6 +5,7 @@ from PySide6.QtCore import Qt, Signal
 import qtawesome as qta
 
 from tahmeed.models.user import User
+from tahmeed.ui.accountant.backup import BackupWidget
 from tahmeed.ui.admin.users_tab import UsersTab
 from tahmeed.ui.admin.categories_tab import CategoriesTab
 from tahmeed.ui.admin.rules_tab import RulesTab
@@ -51,4 +52,5 @@ class AdminDashboard(QWidget):
         tabs.addTab(CategoriesTab(), "Categories")
         tabs.addTab(RulesTab(), "Keyword Rules")
         tabs.addTab(SettingsTab(), "Settings")
+        tabs.addTab(BackupWidget(allow_restore=True), "Backups")
         layout.addWidget(tabs)

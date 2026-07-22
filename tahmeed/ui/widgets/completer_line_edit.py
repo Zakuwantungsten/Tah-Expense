@@ -50,6 +50,7 @@ def accept_completion(line_edit: QLineEdit, completer: QCompleter) -> bool:
 
     Returns False when the popup is not visible, or multiple candidates exist
     and none is selected — Tab/Enter then commit whatever is in the field.
+    Always hides the popup when it was visible so focus can move cleanly.
     """
     popup = completer.popup()
     if popup is None or not popup.isVisible():
@@ -58,14 +59,23 @@ def accept_completion(line_edit: QLineEdit, completer: QCompleter) -> bool:
     if not idx.isValid():
         model = completer.completionModel()
         if model is None or model.rowCount() != 1:
+            popup.hide()
             return False
         idx = model.index(0, 0)
     text = idx.data(Qt.DisplayRole)
+    popup.hide()
     if text:
         line_edit.setText(text)
-        popup.hide()
+        line_edit.setCursorPosition(len(text))
         return True
     return False
+
+
+def hide_completion_popup(completer: QCompleter) -> None:
+    """Hide the completer popup if it is still open."""
+    popup = completer.popup()
+    if popup is not None and popup.isVisible():
+        popup.hide()
 
 
 class CompleterLineEdit(QLineEdit):
@@ -190,6 +200,23 @@ class CompleterLineEdit(QLineEdit):
 
         if key in (Qt.Key_Return, Qt.Key_Enter):
             if accept_completion(self, self._completer):
+                self._preview_active = False
                 event.accept()
                 return
+            hide_completion_popup(self._completer)
+            self._preview_active = False
+
+        if key == Qt.Key_Tab:
+            # Accept highlighted suggestion (or commit preview text) and always
+            # dismiss the popup before focus moves to the next widget.
+            if not accept_completion(self, self._completer):
+                hide_completion_popup(self._completer)
+                if self._preview_active:
+                    self.deselect()
+                    self.setCursorPosition(len(self.text()))
+            self._preview_active = False
+            self.focusNextPrevChild(not bool(event.modifiers() & Qt.ShiftModifier))
+            event.accept()
+            return
+
         super().keyPressEvent(event)

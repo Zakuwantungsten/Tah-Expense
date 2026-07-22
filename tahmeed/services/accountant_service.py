@@ -12,6 +12,22 @@ from tahmeed.db.connection import get_db
 from tahmeed.models.transaction import Transaction
 
 
+def _date_range_clause(
+    field: str,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> Optional[dict]:
+    """MongoDB clause for an optional inclusive From/To window on *field*."""
+    if date_from is None and date_to is None:
+        return None
+    rng: dict = {}
+    if date_from is not None:
+        rng["$gte"] = date_from.replace(hour=0, minute=0, second=0, microsecond=0)
+    if date_to is not None:
+        rng["$lte"] = date_to.replace(hour=23, minute=59, second=59, microsecond=0)
+    return {field: rng}
+
+
 # ── transactions ──────────────────────────────────────────────────────────────
 
 async def get_unverified_transactions(limit: int = 50, skip: int = 0) -> List[Transaction]:
@@ -103,12 +119,53 @@ async def get_pending_count() -> int:
     return await db.transactions.count_documents({"verified": False, "rejected": {"$ne": True}})
 
 
-async def get_overview_kpis() -> dict:
-    """Aggregate real counts for the 4 Overview KPI cards."""
+def _sum_amount_if_currency(*codes: str, absolute: bool = False) -> dict:
+    """Mongo $sum that only includes rows whose currency matches one of *codes*."""
+    amount_expr: Any = {"$abs": "$amount"} if absolute else "$amount"
+    return {
+        "$sum": {
+            "$cond": [
+                {
+                    "$in": [
+                        {"$toUpper": {"$ifNull": ["$currency", ""]}},
+                        list(codes),
+                    ]
+                },
+                amount_expr,
+                0,
+            ]
+        }
+    }
+
+
+async def _overview_zmw_feed_month_totals(year: int) -> Dict[int, float]:
+    """Per-month ZMW from Toll Plaza + Zambia Parking (same date filters as feed tabs)."""
+
+    async def _month(m: int) -> tuple[int, float]:
+        toll, zambia = await asyncio.gather(
+            get_toll_plaza_all_totals(year=year, month=m),
+            get_zambia_parking_all_totals(year=year, month=m),
+        )
+        total = float(toll.get("total_zmw", 0) or 0) + float(
+            zambia.get("total_debit", 0) or 0
+        )
+        return m, total
+
+    pairs = await asyncio.gather(*[_month(m) for m in range(1, 13)])
+    return dict(pairs)
+
+
+async def get_overview_kpis(year: Optional[int] = None) -> dict:
+    """Aggregate real counts for the Overview KPI cards (TZS / USD / ZMW).
+
+    ZMW from imported feeds (Toll Plaza / Zambia Parking) is merged by
+    ``get_overview_dashboard`` so feed aggregations run once per refresh.
+    """
     today = date.today()
+    _year = year if year is not None else today.year
     month_start = datetime(today.year, today.month, 1)
-    year_start = datetime(today.year, 1, 1)
-    year_end = datetime(today.year, 12, 31, 23, 59, 59)
+    year_start = datetime(_year, 1, 1)
+    year_end = datetime(_year, 12, 31, 23, 59, 59)
 
     db = get_db()
     pending_count, ytd_res, month_res = await asyncio.gather(
@@ -118,12 +175,9 @@ async def get_overview_kpis() -> dict:
             {"$group": {
                 "_id": None,
                 "count": {"$sum": 1},
-                "tzs_total": {
-                    "$sum": {"$cond": [{"$eq": ["$currency", "TZS"]}, "$amount", 0]}
-                },
-                "usd_total": {
-                    "$sum": {"$cond": [{"$eq": ["$currency", "USD"]}, "$amount", 0]}
-                },
+                "tzs_total": _sum_amount_if_currency("TZS", "TSH", "TZ"),
+                "usd_total": _sum_amount_if_currency("USD"),
+                "zmw_total": _sum_amount_if_currency("ZMW", "ZMB", "ZK"),
             }},
         ]).to_list(1),
         db.transactions.aggregate([
@@ -136,7 +190,9 @@ async def get_overview_kpis() -> dict:
         ]).to_list(1),
     )
 
-    ytd = ytd_res[0] if ytd_res else {"count": 0, "tzs_total": 0.0, "usd_total": 0.0}
+    ytd = ytd_res[0] if ytd_res else {
+        "count": 0, "tzs_total": 0.0, "usd_total": 0.0, "zmw_total": 0.0,
+    }
     month = month_res[0] if month_res else {"verified": 0, "total": 0}
 
     return {
@@ -144,8 +200,143 @@ async def get_overview_kpis() -> dict:
         "master_count": ytd.get("count", 0),
         "verified_this_month": month.get("verified", 0),
         "submitted_this_month": month.get("total", 0),
-        "total_tzs_ytd": ytd.get("tzs_total", 0.0),
-        "total_usd_ytd": ytd.get("usd_total", 0.0),
+        "total_tzs_ytd": float(ytd.get("tzs_total", 0.0) or 0.0),
+        "total_usd_ytd": float(ytd.get("usd_total", 0.0) or 0.0),
+        "total_zmw_ytd": float(ytd.get("zmw_total", 0.0) or 0.0),
+    }
+
+
+async def get_overview_category_breakdown(year: int, top_n: int = 4) -> List[dict]:
+    """Top expense categories with per-currency verified spend for a fiscal year."""
+    db = get_db()
+    year_start = datetime(year, 1, 1)
+    year_end = datetime(year, 12, 31, 23, 59, 59)
+    docs = await db.transactions.aggregate([
+        {"$match": {"verified": True, "date": {"$gte": year_start, "$lte": year_end}}},
+        {"$group": {
+            "_id": {"$ifNull": ["$category_name", "Uncategorised"]},
+            "tzs": _sum_amount_if_currency("TZS", "TSH", "TZ", absolute=True),
+            "usd": _sum_amount_if_currency("USD", absolute=True),
+            "zmw": _sum_amount_if_currency("ZMW", "ZMB", "ZK", absolute=True),
+        }},
+        {"$sort": {"tzs": -1, "usd": -1, "zmw": -1}},
+    ]).to_list(None)
+
+    if not docs:
+        return []
+
+    # Rank by whichever currency has the largest absolute total across categories
+    # so empty TZS years still surface USD/ZMW categories.
+    def _rank_key(doc: dict) -> float:
+        return max(
+            float(doc.get("tzs", 0) or 0),
+            float(doc.get("usd", 0) or 0),
+            float(doc.get("zmw", 0) or 0),
+        )
+
+    ranked = sorted(docs, key=_rank_key, reverse=True)
+    if _rank_key(ranked[0]) <= 0:
+        return []
+
+    top = ranked[:top_n]
+    rest = ranked[top_n:]
+    slices: List[dict] = []
+    for doc in top:
+        name = doc["_id"] or "Uncategorised"
+        slices.append({
+            "name": name,
+            "tzs": float(doc.get("tzs", 0.0) or 0.0),
+            "usd": float(doc.get("usd", 0.0) or 0.0),
+            "zmw": float(doc.get("zmw", 0.0) or 0.0),
+        })
+    if rest:
+        slices.append({
+            "name": "Other",
+            "tzs": sum(float(d.get("tzs", 0) or 0) for d in rest),
+            "usd": sum(float(d.get("usd", 0) or 0) for d in rest),
+            "zmw": sum(float(d.get("zmw", 0) or 0) for d in rest),
+        })
+    return slices
+
+
+async def get_overview_receipt_breakdown(year: int) -> dict:
+    """Receipt status counts for verified transactions in a fiscal year."""
+    db = get_db()
+    year_start = datetime(year, 1, 1)
+    year_end = datetime(year, 12, 31, 23, 59, 59)
+    docs = await db.transactions.aggregate([
+        {"$match": {"verified": True, "date": {"$gte": year_start, "$lte": year_end}}},
+        {"$group": {"_id": "$receipt_status", "count": {"$sum": 1}}},
+    ]).to_list(None)
+
+    received = pending = missing = 0
+    for doc in docs:
+        status = (doc.get("_id") or "pending").lower()
+        count = doc.get("count", 0)
+        if status == "received":
+            received += count
+        elif status in ("missing", "no_receipt"):
+            missing += count
+        else:
+            pending += count
+
+    total = received + pending + missing
+    return {
+        "received": received,
+        "pending": pending,
+        "missing": missing,
+        "total": total,
+    }
+
+
+async def get_overview_month_totals(year: int) -> Dict:
+    """Per-month TZS / USD / ZMW totals for the Overview trend chart.
+
+    Master ledger supplies TZS/USD/(any ZMW on transactions). Toll Plaza and
+    Zambia Parking feeds are added into the ZMW bucket so the chart matches
+    the currencies used across the accountant workspace.
+
+    Returns ``{"months": {1: {...}, ...}, "feed_zmw_ytd": float}``.
+    """
+    master, feed_zmw = await asyncio.gather(
+        get_master_month_totals(year),
+        _overview_zmw_feed_month_totals(year),
+    )
+    months: Dict[int, dict] = {}
+    for month in range(1, 13):
+        row = master.get(month, {"tzs": 0.0, "usd": 0.0, "zmw": 0.0, "count": 0})
+        months[month] = {
+            "tzs": float(row.get("tzs", 0.0) or 0.0),
+            "usd": float(row.get("usd", 0.0) or 0.0),
+            "zmw": float(row.get("zmw", 0.0) or 0.0) + float(feed_zmw.get(month, 0.0) or 0.0),
+            "count": int(row.get("count", 0) or 0),
+        }
+    return {
+        "months": months,
+        "feed_zmw_ytd": float(sum(feed_zmw.values())),
+    }
+
+
+async def get_overview_dashboard(year: int) -> dict:
+    """All data needed by the accountant Overview tab."""
+    kpis, month_payload, categories, receipts, recent = await asyncio.gather(
+        get_overview_kpis(year),
+        get_overview_month_totals(year),
+        get_overview_category_breakdown(year),
+        get_overview_receipt_breakdown(year),
+        get_verified_transactions(year=year, limit=8),
+    )
+    kpis = dict(kpis)
+    kpis["total_zmw_ytd"] = (
+        float(kpis.get("total_zmw_ytd", 0.0) or 0.0)
+        + float(month_payload.get("feed_zmw_ytd", 0.0) or 0.0)
+    )
+    return {
+        "kpis": kpis,
+        "month_totals": month_payload.get("months", {}),
+        "categories": categories,
+        "receipts": receipts,
+        "recent": recent,
     }
 
 
@@ -509,40 +700,61 @@ def _build_master_query(
     category: str,
     receipt: str,
     description: str = "",   # exact-ish sub-route filter (description contains)
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
 ) -> dict:
     _year = year or date.today().year
     if month and 1 <= month <= 12:
         last_day = calendar.monthrange(_year, month)[1]
-        date_filter: dict = {
-            "$gte": datetime(_year, month, 1),
-            "$lte": datetime(_year, month, last_day, 23, 59, 59),
-        }
+        start = datetime(_year, month, 1)
+        end = datetime(_year, month, last_day, 23, 59, 59)
     else:
-        date_filter = {
-            "$gte": datetime(_year, 1, 1),
-            "$lte": datetime(_year, 12, 31, 23, 59, 59),
-        }
+        start = datetime(_year, 1, 1)
+        end = datetime(_year, 12, 31, 23, 59, 59)
 
-    query: dict = {"verified": True, "date": date_filter}
+    if date_from is not None:
+        df = date_from.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = max(start, df)
+    if date_to is not None:
+        dt = date_to.replace(hour=23, minute=59, second=59, microsecond=0)
+        end = min(end, dt)
 
-    # Both `search` and `description` constrain the description field; combine
-    # them with $and so a sub-route filter and a free-text search can coexist.
-    desc_conditions = []
+    query: dict = {"verified": True, "date": {"$gte": start, "$lte": end}}
+
+    and_clauses: list = []
+
+    # Free-text search matches description or truck number.
     if search.strip():
-        desc_conditions.append({"$regex": re.escape(search.strip()), "$options": "i"})
+        s = re.escape(search.strip())
+        and_clauses.append({"$or": [
+            {"description": {"$regex": s, "$options": "i"}},
+            {"truck_number": {"$regex": s, "$options": "i"}},
+        ]})
+
     if description.strip():
-        desc_conditions.append({"$regex": re.escape(description.strip()), "$options": "i"})
-    if len(desc_conditions) == 1:
-        query["description"] = desc_conditions[0]
-    elif len(desc_conditions) == 2:
-        query["$and"] = [{"description": c} for c in desc_conditions]
+        and_clauses.append({
+            "description": {"$regex": re.escape(description.strip()), "$options": "i"},
+        })
+
+    if and_clauses:
+        if len(and_clauses) == 1:
+            query.update(and_clauses[0])
+        else:
+            query["$and"] = and_clauses
 
     if truck.strip():
-        query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
+        query["truck_number"] = truck.strip()
     if category.strip():
-        query["category_name"] = category.strip()
+        query["category_name"] = {
+            "$regex": f"^{re.escape(category.strip())}$",
+            "$options": "i",
+        }
     if receipt.strip() and receipt != "all":
-        query["receipt_status"] = receipt.strip()
+        r = receipt.strip()
+        if r == "missing":
+            query["receipt_status"] = {"$in": ["missing", "no_receipt"]}
+        else:
+            query["receipt_status"] = r
     return query
 
 
@@ -554,13 +766,18 @@ async def get_master_transactions(
     category: str = "",
     receipt: str = "",
     description: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
     sort_field: str = "date",
     sort_asc: bool = False,
     limit: int = 50,
     skip: int = 0,
 ) -> List[Transaction]:
     db = get_db()
-    query = _build_master_query(year, month, search, truck, category, receipt, description)
+    query = _build_master_query(
+        year, month, search, truck, category, receipt, description,
+        date_from, date_to,
+    )
     direction = 1 if sort_asc else -1
     cursor = (
         db.transactions.find(query)
@@ -580,9 +797,14 @@ async def count_master_transactions(
     category: str = "",
     receipt: str = "",
     description: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
 ) -> int:
     db = get_db()
-    query = _build_master_query(year, month, search, truck, category, receipt, description)
+    query = _build_master_query(
+        year, month, search, truck, category, receipt, description,
+        date_from, date_to,
+    )
     return await db.transactions.count_documents(query)
 
 
@@ -594,10 +816,15 @@ async def get_master_totals(
     category: str = "",
     receipt: str = "",
     description: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
 ) -> dict:
     """Aggregate TZS + USD totals for the current filter (all pages, not just current)."""
     db = get_db()
-    query = _build_master_query(year, month, search, truck, category, receipt, description)
+    query = _build_master_query(
+        year, month, search, truck, category, receipt, description,
+        date_from, date_to,
+    )
     result = await db.transactions.aggregate([
         {"$match": query},
         {"$group": {
@@ -612,7 +839,7 @@ async def get_master_totals(
 
 
 async def get_master_month_totals(year: int) -> Dict:
-    """Per-month TZS totals for the year, used by the month tab bar."""
+    """Per-month TZS / USD / ZMW totals for the year (master ledger)."""
     db = get_db()
     _year = year
     pipeline = [
@@ -625,14 +852,22 @@ async def get_master_month_totals(year: int) -> Dict:
         }},
         {"$group": {
             "_id": {"$month": "$date"},
-            "tzs": {"$sum": {"$cond": [{"$eq": ["$currency", "TZS"]}, "$amount", 0]}},
-            "usd": {"$sum": {"$cond": [{"$eq": ["$currency", "USD"]}, "$amount", 0]}},
+            "tzs": _sum_amount_if_currency("TZS", "TSH", "TZ"),
+            "usd": _sum_amount_if_currency("USD"),
+            "zmw": _sum_amount_if_currency("ZMW", "ZMB", "ZK"),
             "count": {"$sum": 1},
         }},
     ]
     docs = await db.transactions.aggregate(pipeline).to_list(12)
-    return {doc["_id"]: {"tzs": doc["tzs"], "usd": doc["usd"], "count": doc["count"]}
-            for doc in docs}
+    return {
+        doc["_id"]: {
+            "tzs": doc.get("tzs", 0.0),
+            "usd": doc.get("usd", 0.0),
+            "zmw": doc.get("zmw", 0.0),
+            "count": doc["count"],
+        }
+        for doc in docs
+    }
 
 
 async def get_master_trucks(year: Optional[int] = None) -> List[str]:
@@ -683,25 +918,33 @@ def _build_diesel_cash_query(
     search: str = "",
     truck: str = "",
     receipt: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
 ) -> dict:
-    _year = year or date.today().year
-    if month and 1 <= month <= 12:
-        last_day = calendar.monthrange(_year, month)[1]
-        date_filter: dict = {
-            "$gte": datetime(_year, month, 1),
-            "$lte": datetime(_year, month, last_day, 23, 59, 59),
-        }
-    else:
-        date_filter = {
-            "$gte": datetime(_year, 1, 1),
-            "$lte": datetime(_year, 12, 31, 23, 59, 59),
-        }
-
     query: dict = {
         "verified": True,
         "category_name": _diesel_cash_name_filter(),
-        "date": date_filter,
     }
+
+    _year = int(year or 0)
+    if _year > 0:
+        if month and 1 <= month <= 12:
+            last_day = calendar.monthrange(_year, month)[1]
+            start = datetime(_year, month, 1)
+            end = datetime(_year, month, last_day, 23, 59, 59)
+        else:
+            start = datetime(_year, 1, 1)
+            end = datetime(_year, 12, 31, 23, 59, 59)
+        if date_from is not None:
+            start = max(start, date_from.replace(hour=0, minute=0, second=0, microsecond=0))
+        if date_to is not None:
+            end = min(end, date_to.replace(hour=23, minute=59, second=59, microsecond=0))
+        query["date"] = {"$gte": start, "$lte": end}
+    else:
+        clause = _date_range_clause("date", date_from, date_to)
+        if clause:
+            query.update(clause)
+
     if search.strip():
         query["description"] = {"$regex": re.escape(search.strip()), "$options": "i"}
     if truck.strip():
@@ -761,13 +1004,17 @@ async def get_diesel_cash_transactions(
     search: str = "",
     truck: str = "",
     receipt: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
     sort_field: str = "date",
     sort_asc: bool = False,
     limit: int = 50,
     skip: int = 0,
 ) -> List[Transaction]:
     db = get_db()
-    query = _build_diesel_cash_query(year, month, search, truck, receipt)
+    query = _build_diesel_cash_query(
+        year, month, search, truck, receipt, date_from, date_to,
+    )
     direction = 1 if sort_asc else -1
     cursor = (
         db.transactions.find(query)
@@ -785,9 +1032,13 @@ async def count_diesel_cash_transactions(
     search: str = "",
     truck: str = "",
     receipt: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
 ) -> int:
     db = get_db()
-    query = _build_diesel_cash_query(year, month, search, truck, receipt)
+    query = _build_diesel_cash_query(
+        year, month, search, truck, receipt, date_from, date_to,
+    )
     return await db.transactions.count_documents(query)
 
 
@@ -797,9 +1048,13 @@ async def get_diesel_cash_totals(
     search: str = "",
     truck: str = "",
     receipt: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
 ) -> dict:
     db = get_db()
-    query = _build_diesel_cash_query(year, month, search, truck, receipt)
+    query = _build_diesel_cash_query(
+        year, month, search, truck, receipt, date_from, date_to,
+    )
     result = await db.transactions.aggregate([
         {"$match": query},
         {"$group": {
@@ -924,6 +1179,216 @@ async def get_existing_feed_keys(keys: List[str]) -> set:
     return found
 
 
+def _parse_toll_date(val) -> Optional[datetime]:
+    """Best-effort parse of a toll_date string or datetime from import."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, date):
+        return datetime(val.year, val.month, val.day)
+    s = str(val).strip()
+    if not s:
+        return None
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y",
+        "%d-%m-%Y", "%d %b %Y", "%d %B %Y", "%m/%d/%Y",
+    ):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _toll_month_regex_patterns(year: int, month: int) -> List[str]:
+    """Regex fragments matching common toll_date string formats for a month."""
+    abbr = calendar.month_abbr[month]
+    full = calendar.month_name[month]
+    y, m2 = str(year), f"{month:02d}"
+    return [
+        rf"{y}-{m2}", rf"{y}/{m2}", rf"{m2}/{y}", rf"{m2}-{y}",
+        rf"\b{abbr}\b.*{y}", rf"\b{full}\b.*{y}",
+        rf"{y}.*\b{abbr}\b", rf"{y}.*\b{full}\b",
+    ]
+
+
+def _toll_date_filter(year: int, month: int) -> dict:
+    """MongoDB clause filtering toll records by calendar year and optional month."""
+    if month >= 1:
+        start = datetime(year, month, 1)
+        end = (
+            datetime(year + 1, 1, 1) if month == 12
+            else datetime(year, month + 1, 1)
+        )
+        legacy = _toll_month_regex_patterns(year, month)
+    else:
+        start = datetime(year, 1, 1)
+        end = datetime(year + 1, 1, 1)
+        legacy = [str(year)]
+
+    return {"$or": [
+        {"transaction_date": {"$gte": start, "$lt": end}},
+        {
+            "$and": [
+                {"$or": [
+                    {"transaction_date": {"$exists": False}},
+                    {"transaction_date": None},
+                ]},
+                {"$or": [{"toll_date": {"$regex": p, "$options": "i"}} for p in legacy]},
+            ],
+        },
+    ]}
+
+
+def _toll_plaza_all_query(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Build a MongoDB query for all Toll Plaza records (cross-upload)."""
+    clauses: List[dict] = [{"feed_type": "toll_plaza"}]
+    if search.strip():
+        s = re.escape(search.strip())
+        clauses.append({"$or": [
+            {"vehicle_reg":  {"$regex": s, "$options": "i"}},
+            {"toll_plaza":   {"$regex": s, "$options": "i"}},
+            {"receipt_no":   {"$regex": s, "$options": "i"}},
+            {"cashier_name": {"$regex": s, "$options": "i"}},
+            {"client_name":  {"$regex": s, "$options": "i"}},
+            {"card_no":      {"$regex": s, "$options": "i"}},
+        ]})
+    if year > 0:
+        clauses.append(_toll_date_filter(year, month))
+    clause = _date_range_clause("transaction_date", date_from, date_to)
+    if clause:
+        clauses.append(clause)
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+async def get_toll_plaza_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated Toll Plaza records across all uploads."""
+    db = get_db()
+    query = _toll_plaza_all_query(search, year, month, date_from, date_to)
+    cursor = (
+        db.imported_feeds
+        .find(query)
+        .sort([("transaction_date", -1), ("toll_date", -1), ("import_date", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_toll_plaza_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> int:
+    """Count Toll Plaza records across all uploads."""
+    db = get_db()
+    return await db.imported_feeds.count_documents(
+        _toll_plaza_all_query(search, year, month, date_from, date_to)
+    )
+
+
+async def get_toll_plaza_all_totals(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Return record count and total ZMW for filtered Toll Plaza records."""
+    db = get_db()
+    pipeline = [
+        {"$match": _toll_plaza_all_query(search, year, month, date_from, date_to)},
+        {"$group": {
+            "_id": None,
+            "count":     {"$sum": 1},
+            "total_zmw": {"$sum": _safe_double("tender_amount")},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        return result[0]
+    return {"count": 0, "total_zmw": 0.0}
+
+
+async def _feed_available_years(feed_type: str, date_field: str) -> List[int]:
+    """Return distinct calendar years present in uploaded records, newest first."""
+    db = get_db()
+    years: set[int] = set()
+
+    pipeline = [
+        {"$match": {
+            "feed_type": feed_type,
+            "transaction_date": {"$exists": True, "$ne": None},
+        }},
+        {"$group": {"_id": {"$year": "$transaction_date"}}},
+    ]
+    for doc in await db.imported_feeds.aggregate(pipeline).to_list(length=None):
+        yr = doc.get("_id")
+        if isinstance(yr, int) and 1990 <= yr <= 2100:
+            years.add(yr)
+
+    legacy_dates = await db.imported_feeds.distinct(
+        date_field,
+        {
+            "feed_type": feed_type,
+            "$or": [
+                {"transaction_date": {"$exists": False}},
+                {"transaction_date": None},
+            ],
+        },
+    )
+    for val in legacy_dates:
+        parsed = _parse_toll_date(val)
+        if parsed and 1990 <= parsed.year <= 2100:
+            years.add(parsed.year)
+
+    return sorted(years, reverse=True)
+
+
+async def get_toll_plaza_available_years() -> List[int]:
+    """Years that appear in uploaded Toll Plaza records."""
+    return await _feed_available_years("toll_plaza", "toll_date")
+
+
+async def get_parking_congo_available_years() -> List[int]:
+    """Years that appear in uploaded Parking Congo records."""
+    return await _feed_available_years("parking_congo", "payment_date")
+
+
+_IMPORT_UPPER_SKIP = frozenset({
+    "feed_type", "upload_id", "source_filename", "import_date", "created_at",
+    "transaction_date", "expense_date", "expense_type", "row_index", "_id",
+})
+
+
+def _uppercase_import_text(doc: dict) -> None:
+    """Uppercase string fields on an imported record (in place)."""
+    for key, val in doc.items():
+        if key in _IMPORT_UPPER_SKIP:
+            continue
+        if isinstance(val, str):
+            doc[key] = val.upper()
+
+
 async def save_imported_feed(records: list) -> int:
     """Insert a batch of imported feed records; returns the count inserted.
 
@@ -939,6 +1404,23 @@ async def save_imported_feed(records: list) -> int:
         doc = dict(rec)
         doc.pop("_raw", None)
         doc["import_date"] = now
+        if doc.get("feed_type") == "toll_plaza":
+            parsed = _parse_toll_date(doc.get("toll_date"))
+            if parsed:
+                doc["transaction_date"] = parsed
+        elif doc.get("feed_type") == "parking_congo":
+            parsed = _parse_toll_date(doc.get("payment_date"))
+            if parsed:
+                doc["transaction_date"] = parsed
+        elif doc.get("feed_type") == "rahntech":
+            parsed = _parse_toll_date(doc.get("sales_date"))
+            if parsed:
+                doc["transaction_date"] = parsed
+        elif str(doc.get("feed_type", "")).startswith("diesel_"):
+            parsed = _parse_toll_date(doc.get("date"))
+            if parsed:
+                doc["transaction_date"] = parsed
+        _uppercase_import_text(doc)
         docs.append(doc)
     result = await db.imported_feeds.insert_many(docs, ordered=False)
     return len(result.inserted_ids)
@@ -1001,6 +1483,17 @@ async def count_toll_plaza_upload_records(upload_id: str, search: str = "") -> i
     return await db.imported_feeds.count_documents(query)
 
 
+async def delete_toll_plaza_upload(upload_id: str) -> int:
+    """Delete every Toll Plaza record belonging to one upload batch."""
+    if not upload_id:
+        return 0
+    db = get_db()
+    result = await db.imported_feeds.delete_many(
+        {"feed_type": "toll_plaza", "upload_id": upload_id}
+    )
+    return result.deleted_count
+
+
 async def get_parking_congo_uploads() -> list:
     """Return one summary doc per upload batch for the parking_congo feed."""
     db = get_db()
@@ -1055,6 +1548,138 @@ async def count_parking_congo_upload_records(upload_id: str, search: str = "") -
             {"transaction_details": {"$regex": s, "$options": "i"}},
         ]
     return await db.imported_feeds.count_documents(query)
+
+
+def _parking_month_regex_patterns(year: int, month: int) -> List[str]:
+    """Regex fragments matching common payment_date string formats for a month."""
+    return _toll_month_regex_patterns(year, month)
+
+
+def _parking_congo_date_filter(year: int, month: int) -> dict:
+    """MongoDB clause filtering Parking Congo records by calendar year/month."""
+    if month >= 1:
+        start = datetime(year, month, 1)
+        end = (
+            datetime(year + 1, 1, 1) if month == 12
+            else datetime(year, month + 1, 1)
+        )
+        legacy = _parking_month_regex_patterns(year, month)
+    else:
+        start = datetime(year, 1, 1)
+        end = datetime(year + 1, 1, 1)
+        legacy = [str(year)]
+
+    return {"$or": [
+        {"transaction_date": {"$gte": start, "$lt": end}},
+        {
+            "$and": [
+                {"$or": [
+                    {"transaction_date": {"$exists": False}},
+                    {"transaction_date": None},
+                ]},
+                {"$or": [{"payment_date": {"$regex": p, "$options": "i"}} for p in legacy]},
+            ],
+        },
+    ]}
+
+
+def _parking_congo_all_query(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Build a MongoDB query for all Parking Congo records (cross-upload)."""
+    clauses: List[dict] = [{"feed_type": "parking_congo"}]
+    if search.strip():
+        s = re.escape(search.strip())
+        clauses.append({"$or": [
+            {"vehicle_no":          {"$regex": s, "$options": "i"}},
+            {"ledger_id":           {"$regex": s, "$options": "i"}},
+            {"transaction_type":    {"$regex": s, "$options": "i"}},
+            {"cashier":             {"$regex": s, "$options": "i"}},
+            {"transaction_details": {"$regex": s, "$options": "i"}},
+            {"direction":           {"$regex": s, "$options": "i"}},
+        ]})
+    if year > 0:
+        clauses.append(_parking_congo_date_filter(year, month))
+    clause = _date_range_clause("transaction_date", date_from, date_to)
+    if clause:
+        clauses.append(clause)
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+async def get_parking_congo_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated Parking Congo records across all uploads."""
+    db = get_db()
+    query = _parking_congo_all_query(search, year, month, date_from, date_to)
+    cursor = (
+        db.imported_feeds
+        .find(query)
+        .sort([("transaction_date", -1), ("payment_date", -1), ("import_date", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_parking_congo_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> int:
+    """Count Parking Congo records across all uploads."""
+    db = get_db()
+    return await db.imported_feeds.count_documents(
+        _parking_congo_all_query(search, year, month, date_from, date_to)
+    )
+
+
+async def get_parking_congo_all_totals(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Return record count and total amount for filtered Parking Congo records."""
+    db = get_db()
+    pipeline = [
+        {"$match": _parking_congo_all_query(search, year, month, date_from, date_to)},
+        {"$group": {
+            "_id": None,
+            "count":  {"$sum": 1},
+            "amount": {"$sum": _safe_double("amount")},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        return result[0]
+    return {"count": 0, "amount": 0.0}
+
+
+async def delete_parking_congo_upload(upload_id: str) -> int:
+    """Delete every Parking Congo record belonging to one upload batch."""
+    if not upload_id:
+        return 0
+    db = get_db()
+    result = await db.imported_feeds.delete_many(
+        {"feed_type": "parking_congo", "upload_id": upload_id}
+    )
+    return result.deleted_count
 
 
 # ── RahnTech — transacted devices import ─────────────────────────────────────
@@ -1116,6 +1741,127 @@ async def count_rahntech_upload_records(upload_id: str, search: str = "") -> int
             {"do_number":     {"$regex": s, "$options": "i"}},
         ]
     return await db.imported_feeds.count_documents(query)
+
+
+def _rahntech_date_filter(year: int, month: int) -> dict:
+    """MongoDB clause filtering RahnTech records by calendar year/month."""
+    if month >= 1:
+        start = datetime(year, month, 1)
+        end = (
+            datetime(year + 1, 1, 1) if month == 12
+            else datetime(year, month + 1, 1)
+        )
+        legacy = _toll_month_regex_patterns(year, month)
+    else:
+        start = datetime(year, 1, 1)
+        end = datetime(year + 1, 1, 1)
+        legacy = [str(year)]
+
+    return {"$or": [
+        {"transaction_date": {"$gte": start, "$lt": end}},
+        {
+            "$and": [
+                {"$or": [
+                    {"transaction_date": {"$exists": False}},
+                    {"transaction_date": None},
+                ]},
+                {"$or": [{"sales_date": {"$regex": p, "$options": "i"}} for p in legacy]},
+            ],
+        },
+    ]}
+
+
+def _rahntech_all_query(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Build a MongoDB query for all RahnTech records (cross-upload)."""
+    clauses: List[dict] = [{"feed_type": "rahntech"}]
+    if search.strip():
+        s = re.escape(search.strip())
+        clauses.append({"$or": [
+            {"truck_number":  {"$regex": s, "$options": "i"}},
+            {"driver_name":   {"$regex": s, "$options": "i"}},
+            {"trip_number":   {"$regex": s, "$options": "i"}},
+            {"device_number": {"$regex": s, "$options": "i"}},
+            {"do_number":     {"$regex": s, "$options": "i"}},
+            {"sales_date":    {"$regex": s, "$options": "i"}},
+        ]})
+    if year > 0:
+        clauses.append(_rahntech_date_filter(year, month))
+    clause = _date_range_clause("transaction_date", date_from, date_to)
+    if clause:
+        clauses.append(clause)
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+async def get_rahntech_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated RahnTech records across all uploads."""
+    db = get_db()
+    query = _rahntech_all_query(search, year, month, date_from, date_to)
+    cursor = (
+        db.imported_feeds
+        .find(query)
+        .sort([("transaction_date", -1), ("sales_date", -1), ("import_date", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_rahntech_all_records(search: str = "", year: int = 0, month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> int:
+    """Count RahnTech records across all uploads."""
+    db = get_db()
+    return await db.imported_feeds.count_documents(_rahntech_all_query(search, year, month, date_from, date_to))
+
+
+async def get_rahntech_all_totals(search: str = "", year: int = 0, month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Return record count for filtered RahnTech records."""
+    db = get_db()
+    pipeline = [
+        {"$match": _rahntech_all_query(search, year, month, date_from, date_to)},
+        {"$group": {
+            "_id": None,
+            "count": {"$sum": 1},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        return result[0]
+    return {"count": 0}
+
+
+async def get_rahntech_available_years() -> List[int]:
+    """Years that appear in uploaded RahnTech records."""
+    return await _feed_available_years("rahntech", "sales_date")
+
+
+async def delete_rahntech_upload(upload_id: str) -> int:
+    """Delete every RahnTech record belonging to one upload batch."""
+    if not upload_id:
+        return 0
+    db = get_db()
+    result = await db.imported_feeds.delete_many({"feed_type": "rahntech", "upload_id": upload_id})
+    return result.deleted_count
 
 
 # ── Zambia Parking — weekly statement import (sheet tab = week label) ─────────
@@ -1213,6 +1959,150 @@ async def count_zambia_parking_upload_records(upload_id: str, search: str = "") 
             {"date":       {"$regex": s, "$options": "i"}},
         ]
     return await db.imported_feeds.count_documents(query)
+
+
+def _zambia_parking_date_filter(year: int, month: int) -> dict:
+    """MongoDB clause filtering Zambia Parking records by calendar year/month."""
+    if month >= 1:
+        start = datetime(year, month, 1)
+        end = (
+            datetime(year + 1, 1, 1) if month == 12
+            else datetime(year, month + 1, 1)
+        )
+        legacy = _toll_month_regex_patterns(year, month)
+    else:
+        start = datetime(year, 1, 1)
+        end = datetime(year + 1, 1, 1)
+        legacy = [str(year)]
+
+    return {"$or": [
+        {"transaction_date": {"$gte": start, "$lt": end}},
+        {
+            "$and": [
+                {"$or": [
+                    {"transaction_date": {"$exists": False}},
+                    {"transaction_date": None},
+                ]},
+                {"$or": [{"date": {"$regex": p, "$options": "i"}} for p in legacy]},
+            ],
+        },
+    ]}
+
+
+def _zambia_parking_all_query(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    credit_only: bool = False,
+) -> dict:
+    """Build a MongoDB query for Zambia Parking rows (cross-upload)."""
+    clauses: List[dict] = [{"feed_type": "zambia_parking"}]
+    if credit_only:
+        clauses.append({"credit": {"$gt": 0}})
+    if search.strip():
+        s = re.escape(search.strip())
+        clauses.append({"$or": [
+            {"plate_num":  {"$regex": s, "$options": "i"}},
+            {"ticket_no":  {"$regex": s, "$options": "i"}},
+            {"heading_to": {"$regex": s, "$options": "i"}},
+            {"type":       {"$regex": s, "$options": "i"}},
+            {"date":       {"$regex": s, "$options": "i"}},
+        ]})
+    if year > 0:
+        clauses.append(_zambia_parking_date_filter(year, month))
+    clause = _date_range_clause("transaction_date", date_from, date_to)
+    if clause:
+        clauses.append(clause)
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+async def get_zambia_parking_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    credit_only: bool = False,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated Zambia Parking rows across all uploads."""
+    db = get_db()
+    query = _zambia_parking_all_query(search, year, month, date_from, date_to, credit_only)
+    cursor = (
+        db.imported_feeds
+        .find(query)
+        .sort([("transaction_date", -1), ("date", -1), ("import_date", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_zambia_parking_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    credit_only: bool = False,
+) -> int:
+    """Count Zambia Parking rows across all uploads."""
+    db = get_db()
+    return await db.imported_feeds.count_documents(
+        _zambia_parking_all_query(search, year, month, date_from, date_to, credit_only)
+    )
+
+
+async def get_zambia_parking_all_totals(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    credit_only: bool = False,
+) -> dict:
+    """Return record count and debit/credit totals for filtered Zambia Parking rows."""
+    db = get_db()
+    pipeline = [
+        {"$match": _zambia_parking_all_query(search, year, month, date_from, date_to, credit_only)},
+        {"$group": {
+            "_id": None,
+            "count":        {"$sum": 1},
+            "total_debit":  {"$sum": _safe_double("debit")},
+            "total_credit": {"$sum": _safe_double("credit")},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        row = result[0]
+        row["balance_zmw"] = (
+            float(row.get("total_credit", 0) or 0)
+            - float(row.get("total_debit", 0) or 0)
+        )
+        return row
+    return {"count": 0, "total_debit": 0.0, "total_credit": 0.0, "balance_zmw": 0.0}
+
+
+async def get_zambia_parking_available_years() -> List[int]:
+    """Years present in uploaded Zambia Parking records."""
+    return await _feed_available_years("zambia_parking", "date")
+
+
+async def delete_zambia_parking_upload(upload_id: str) -> int:
+    """Delete every Zambia Parking row belonging to one upload batch."""
+    if not upload_id:
+        return 0
+    db = get_db()
+    result = await db.imported_feeds.delete_many({
+        "feed_type": "zambia_parking",
+        "upload_id": upload_id,
+    })
+    return result.deleted_count
 
 
 # ── Insurance feeds (comesa / third_party) ────────────────────────────────────
@@ -1451,6 +2341,134 @@ async def delete_diesel_upload(feed_type: str, upload_id: str) -> int:
     return result.deleted_count
 
 
+def _diesel_date_filter(year: int, month: int) -> dict:
+    """MongoDB clause filtering diesel records by calendar year/month."""
+    if month >= 1:
+        start = datetime(year, month, 1)
+        end = (
+            datetime(year + 1, 1, 1) if month == 12
+            else datetime(year, month + 1, 1)
+        )
+        legacy = _toll_month_regex_patterns(year, month)
+    else:
+        start = datetime(year, 1, 1)
+        end = datetime(year + 1, 1, 1)
+        legacy = [str(year)]
+
+    return {"$or": [
+        {"transaction_date": {"$gte": start, "$lt": end}},
+        {
+            "$and": [
+                {"$or": [
+                    {"transaction_date": {"$exists": False}},
+                    {"transaction_date": None},
+                ]},
+                {"$or": [{"date": {"$regex": p, "$options": "i"}} for p in legacy]},
+            ],
+        },
+    ]}
+
+
+def _diesel_all_query(
+    feed_type: str,
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Build a MongoDB query for diesel rows across all uploads."""
+    clauses: List[dict] = [{"feed_type": feed_type}]
+    if search.strip():
+        s = re.escape(search.strip())
+        clauses.append({"$or": [
+            {"truck_no":        {"$regex": s, "$options": "i"}},
+            {"lpo_no":          {"$regex": s, "$options": "i"}},
+            {"do_sdo_no":       {"$regex": s, "$options": "i"}},
+            {"clients_name":    {"$regex": s, "$options": "i"}},
+            {"destinations":    {"$regex": s, "$options": "i"}},
+            {"diesel_at":       {"$regex": s, "$options": "i"}},
+            {"ownership":       {"$regex": s, "$options": "i"}},
+            {"source_filename": {"$regex": s, "$options": "i"}},
+            {"date":            {"$regex": s, "$options": "i"}},
+        ]})
+    if year > 0:
+        clauses.append(_diesel_date_filter(year, month))
+    clause = _date_range_clause("transaction_date", date_from, date_to)
+    if clause:
+        clauses.append(clause)
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+async def get_diesel_all_records(
+    feed_type: str,
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated diesel rows across all uploads."""
+    db = get_db()
+    cursor = (
+        db.imported_feeds
+        .find(_diesel_all_query(feed_type, search, year, month, date_from, date_to))
+        .sort([("transaction_date", -1), ("date", -1), ("import_date", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_diesel_all_records(
+    feed_type: str,
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> int:
+    """Count diesel rows across all uploads."""
+    db = get_db()
+    return await db.imported_feeds.count_documents(
+        _diesel_all_query(feed_type, search, year, month, date_from, date_to)
+    )
+
+
+async def get_diesel_all_totals(
+    feed_type: str,
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Return row count and litre/amount totals for filtered diesel rows."""
+    db = get_db()
+    pipeline = [
+        {"$match": _diesel_all_query(feed_type, search, year, month, date_from, date_to)},
+        {"$group": {
+            "_id":          None,
+            "count":        {"$sum": 1},
+            "ltrs":         {"$sum": _safe_double("ltrs")},
+            "total_amount": {"$sum": _safe_double("total_amount")},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        return result[0]
+    return {"count": 0, "ltrs": 0.0, "total_amount": 0.0}
+
+
+async def get_diesel_available_years(feed_type: str) -> List[int]:
+    """Years that appear in uploaded diesel records."""
+    return await _feed_available_years(feed_type, "date")
+
+
 # ── Ahmed Kimvi — Excel import (last sheet per workbook) ─────────────────────
 
 async def kimvi_sheet_exists(sheet_label: str) -> bool:
@@ -1491,6 +2509,7 @@ async def save_kimvi_import(records: list) -> int:
         doc["expense_type"] = "ahmed_kimvi"
         doc["import_date"]  = now
         doc["created_at"]   = now
+        _uppercase_import_text(doc)
         docs.append(doc)
     result = await db.separate_expenses.insert_many(docs, ordered=False)
     return len(result.inserted_ids)
@@ -1579,6 +2598,187 @@ async def count_kimvi_upload_records(upload_id: str, search: str = "") -> int:
     return await db.separate_expenses.count_documents(query)
 
 
+def _kimvi_date_filter(year: int, month: int) -> dict:
+    """MongoDB clause filtering Ahmed Kimvi rows by calendar year/month."""
+    if month >= 1:
+        start = datetime(year, month, 1)
+        end = (
+            datetime(year + 1, 1, 1) if month == 12
+            else datetime(year, month + 1, 1)
+        )
+        legacy = _toll_month_regex_patterns(year, month)
+    else:
+        start = datetime(year, 1, 1)
+        end = datetime(year + 1, 1, 1)
+        legacy = [str(year)]
+
+    return {"$or": [
+        {"expense_date": {"$gte": start, "$lt": end}},
+        {
+            "$and": [
+                {"$or": [
+                    {"expense_date": {"$exists": False}},
+                    {"expense_date": None},
+                ]},
+                {"$or": [{"date_str": {"$regex": p, "$options": "i"}} for p in legacy]},
+            ],
+        },
+    ]}
+
+
+def _kimvi_entries_query(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    money_in_only: bool = False,
+) -> dict:
+    """Build a MongoDB query for Ahmed Kimvi rows (cross-upload)."""
+    clauses: List[dict] = [{"expense_type": "ahmed_kimvi"}]
+    if money_in_only:
+        clauses.append({"amount_usd": {"$lt": 0}})
+    if search.strip():
+        s = re.escape(search.strip())
+        clauses.append({"$or": [
+            {"description": {"$regex": s, "$options": "i"}},
+            {"truck_no":    {"$regex": s, "$options": "i"}},
+            {"date_str":    {"$regex": s, "$options": "i"}},
+        ]})
+    if year > 0:
+        clauses.append(_kimvi_date_filter(year, month))
+    clause = _date_range_clause("expense_date", date_from, date_to)
+    if clause:
+        clauses.append(clause)
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+async def get_kimvi_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    money_in_only: bool = False,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated Ahmed Kimvi rows across all uploads."""
+    db = get_db()
+    query = _kimvi_entries_query(search, year, month, date_from, date_to, money_in_only)
+    cursor = (
+        db.separate_expenses
+        .find(query)
+        .sort([("expense_date", -1), ("date_str", -1), ("created_at", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_kimvi_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    money_in_only: bool = False,
+) -> int:
+    """Count Ahmed Kimvi rows across all uploads."""
+    db = get_db()
+    return await db.separate_expenses.count_documents(
+        _kimvi_entries_query(search, year, month, date_from, date_to, money_in_only)
+    )
+
+
+async def get_kimvi_all_totals(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    money_in_only: bool = False,
+) -> dict:
+    """Return record count and money in/out totals for filtered Ahmed Kimvi rows."""
+    db = get_db()
+    pipeline = [
+        {"$match": _kimvi_entries_query(search, year, month, date_from, date_to, money_in_only)},
+        {"$group": {
+            "_id": None,
+            "count":     {"$sum": 1},
+            "money_in":  {"$sum": {
+                "$cond": [
+                    {"$lt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
+                    {"$ifNull": ["$amount_usd", 0]},
+                    0,
+                ],
+            }},
+            "money_out": {"$sum": {
+                "$cond": [
+                    {"$gt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
+                    {"$ifNull": ["$amount_usd", 0]},
+                    0,
+                ],
+            }},
+        }},
+    ]
+    result = await db.separate_expenses.aggregate(pipeline).to_list(1)
+    if result:
+        row = result[0]
+        row["balance_usd"] = row.get("money_in", 0) + row.get("money_out", 0)
+        return row
+    return {"count": 0, "money_in": 0.0, "money_out": 0.0, "balance_usd": 0.0}
+
+
+async def get_kimvi_available_years() -> List[int]:
+    """Years present in uploaded Ahmed Kimvi records."""
+    db = get_db()
+    years: set[int] = set()
+
+    pipeline = [
+        {"$match": {
+            "expense_type": "ahmed_kimvi",
+            "expense_date": {"$exists": True, "$ne": None},
+        }},
+        {"$group": {"_id": {"$year": "$expense_date"}}},
+    ]
+    for doc in await db.separate_expenses.aggregate(pipeline).to_list(length=None):
+        yr = doc.get("_id")
+        if isinstance(yr, int) and 1990 <= yr <= 2100:
+            years.add(yr)
+
+    legacy_dates = await db.separate_expenses.distinct(
+        "date_str",
+        {
+            "expense_type": "ahmed_kimvi",
+            "$or": [
+                {"expense_date": {"$exists": False}},
+                {"expense_date": None},
+            ],
+        },
+    )
+    for val in legacy_dates:
+        parsed = _parse_toll_date(val)
+        if parsed and 1990 <= parsed.year <= 2100:
+            years.add(parsed.year)
+
+    return sorted(years, reverse=True)
+
+
+async def delete_kimvi_upload(upload_id: str) -> int:
+    """Delete every Ahmed Kimvi row belonging to one upload batch."""
+    if not upload_id:
+        return 0
+    db = get_db()
+    result = await db.separate_expenses.delete_many({
+        "expense_type": "ahmed_kimvi",
+        "upload_id": upload_id,
+    })
+    return result.deleted_count
+
+
 # ── Congo Expenses — Excel import (last sheet per workbook) ──────────────────
 
 async def congo_sheet_exists(sheet_label: str) -> bool:
@@ -1619,6 +2819,7 @@ async def save_congo_import(records: list) -> int:
         doc["expense_type"] = "congo_expenses"
         doc["import_date"]  = now
         doc["created_at"]   = now
+        _uppercase_import_text(doc)
         docs.append(doc)
     result = await db.separate_expenses.insert_many(docs, ordered=False)
     return len(result.inserted_ids)
@@ -1707,6 +2908,188 @@ async def count_congo_upload_records(upload_id: str, search: str = "") -> int:
             {"date_str":    {"$regex": s, "$options": "i"}},
         ]
     return await db.separate_expenses.count_documents(query)
+
+
+def _congo_date_filter(year: int, month: int) -> dict:
+    """MongoDB clause filtering Congo Expenses by calendar year/month."""
+    if month >= 1:
+        start = datetime(year, month, 1)
+        end = (
+            datetime(year + 1, 1, 1) if month == 12
+            else datetime(year, month + 1, 1)
+        )
+        legacy = _toll_month_regex_patterns(year, month)
+    else:
+        start = datetime(year, 1, 1)
+        end = datetime(year + 1, 1, 1)
+        legacy = [str(year)]
+
+    return {"$or": [
+        {"expense_date": {"$gte": start, "$lt": end}},
+        {
+            "$and": [
+                {"$or": [
+                    {"expense_date": {"$exists": False}},
+                    {"expense_date": None},
+                ]},
+                {"$or": [{"date_str": {"$regex": p, "$options": "i"}} for p in legacy]},
+            ],
+        },
+    ]}
+
+
+def _congo_entries_query(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    money_in_only: bool = False,
+) -> dict:
+    """Build a MongoDB query for Congo Expenses rows (cross-upload)."""
+    clauses: List[dict] = [{"expense_type": "congo_expenses"}]
+    if money_in_only:
+        clauses.append({"amount_usd": {"$lt": 0}})
+    if search.strip():
+        s = re.escape(search.strip())
+        clauses.append({"$or": [
+            {"description": {"$regex": s, "$options": "i"}},
+            {"truck_no":    {"$regex": s, "$options": "i"}},
+            {"lpo_no":      {"$regex": s, "$options": "i"}},
+            {"date_str":    {"$regex": s, "$options": "i"}},
+        ]})
+    if year > 0:
+        clauses.append(_congo_date_filter(year, month))
+    clause = _date_range_clause("expense_date", date_from, date_to)
+    if clause:
+        clauses.append(clause)
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+async def get_congo_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    money_in_only: bool = False,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated Congo Expenses rows across all uploads."""
+    db = get_db()
+    query = _congo_entries_query(search, year, month, date_from, date_to, money_in_only)
+    cursor = (
+        db.separate_expenses
+        .find(query)
+        .sort([("expense_date", -1), ("date_str", -1), ("created_at", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_congo_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    money_in_only: bool = False,
+) -> int:
+    """Count Congo Expenses rows across all uploads."""
+    db = get_db()
+    return await db.separate_expenses.count_documents(
+        _congo_entries_query(search, year, month, date_from, date_to, money_in_only)
+    )
+
+
+async def get_congo_all_totals(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    money_in_only: bool = False,
+) -> dict:
+    """Return record count and money in/out totals for filtered Congo rows."""
+    db = get_db()
+    pipeline = [
+        {"$match": _congo_entries_query(search, year, month, date_from, date_to, money_in_only)},
+        {"$group": {
+            "_id": None,
+            "count":     {"$sum": 1},
+            "money_in":  {"$sum": {
+                "$cond": [
+                    {"$lt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
+                    {"$ifNull": ["$amount_usd", 0]},
+                    0,
+                ],
+            }},
+            "money_out": {"$sum": {
+                "$cond": [
+                    {"$gt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
+                    {"$ifNull": ["$amount_usd", 0]},
+                    0,
+                ],
+            }},
+        }},
+    ]
+    result = await db.separate_expenses.aggregate(pipeline).to_list(1)
+    if result:
+        row = result[0]
+        row["balance_usd"] = row.get("money_in", 0) + row.get("money_out", 0)
+        return row
+    return {"count": 0, "money_in": 0.0, "money_out": 0.0, "balance_usd": 0.0}
+
+
+async def get_congo_available_years() -> List[int]:
+    """Years present in uploaded Congo Expenses records."""
+    db = get_db()
+    years: set[int] = set()
+
+    pipeline = [
+        {"$match": {
+            "expense_type": "congo_expenses",
+            "expense_date": {"$exists": True, "$ne": None},
+        }},
+        {"$group": {"_id": {"$year": "$expense_date"}}},
+    ]
+    for doc in await db.separate_expenses.aggregate(pipeline).to_list(length=None):
+        yr = doc.get("_id")
+        if isinstance(yr, int) and 1990 <= yr <= 2100:
+            years.add(yr)
+
+    legacy_dates = await db.separate_expenses.distinct(
+        "date_str",
+        {
+            "expense_type": "congo_expenses",
+            "$or": [
+                {"expense_date": {"$exists": False}},
+                {"expense_date": None},
+            ],
+        },
+    )
+    for val in legacy_dates:
+        parsed = _parse_toll_date(val)
+        if parsed and 1990 <= parsed.year <= 2100:
+            years.add(parsed.year)
+
+    return sorted(years, reverse=True)
+
+
+async def delete_congo_upload(upload_id: str) -> int:
+    """Delete every Congo Expenses row belonging to one upload batch."""
+    if not upload_id:
+        return 0
+    db = get_db()
+    result = await db.separate_expenses.delete_many({
+        "expense_type": "congo_expenses",
+        "upload_id": upload_id,
+    })
+    return result.deleted_count
 
 
 # ── Truck Overview — cross-source normalized rollup ───────────────────────────
@@ -2103,6 +3486,108 @@ async def get_afritrack_uploads() -> list:
         {"$sort": {"import_date": -1}},
     ]
     return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+
+
+def _afritrack_all_query(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Build a MongoDB query for Afritrack rows across all uploads."""
+    clauses: List[dict] = [{"feed_type": "afritrack"}]
+    if search.strip():
+        s = re.escape(search.strip())
+        clauses.append({"$or": [
+            {"truck": {"$regex": s, "$options": "i"}},
+            {"remarks": {"$regex": s, "$options": "i"}},
+            {"period": {"$regex": s, "$options": "i"}},
+            {"source_filename": {"$regex": s, "$options": "i"}},
+        ]})
+    if year > 0:
+        if month >= 1:
+            start = datetime(year, month, 1)
+            end = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+        else:
+            start = datetime(year, 1, 1)
+            end = datetime(year + 1, 1, 1)
+        clauses.append({"import_date": {"$gte": start, "$lt": end}})
+    clause = _date_range_clause("import_date", date_from, date_to)
+    if clause:
+        clauses.append(clause)
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+async def get_afritrack_all_records(
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated Afritrack rows across all uploads."""
+    db = get_db()
+    cursor = (
+        db.imported_feeds.find(_afritrack_all_query(search, year, month, date_from, date_to))
+        .sort([("import_date", -1), ("period", -1), ("row_index", 1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_afritrack_all_records(search: str = "", year: int = 0, month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> int:
+    """Count Afritrack rows across all uploads."""
+    db = get_db()
+    return await db.imported_feeds.count_documents(_afritrack_all_query(search, year, month, date_from, date_to))
+
+
+async def get_afritrack_all_totals(search: str = "", year: int = 0, month: int = 0,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Return row count and totals for filtered Afritrack rows."""
+    db = get_db()
+    pipeline = [
+        {"$match": _afritrack_all_query(search, year, month, date_from, date_to)},
+        {"$group": {
+            "_id": None,
+            "count": {"$sum": 1},
+            "total_tahmeed": {"$sum": _safe_double("total_tahmeed")},
+            "total_invoice": {"$sum": _safe_double("total_invoice")},
+            "total_variance": {"$sum": _safe_double("variance")},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        return result[0]
+    return {"count": 0, "total_tahmeed": 0.0, "total_invoice": 0.0, "total_variance": 0.0}
+
+
+async def get_afritrack_available_years() -> List[int]:
+    """Years present in uploaded Afritrack records."""
+    db = get_db()
+    years: set[int] = set()
+    pipeline = [
+        {"$match": {
+            "feed_type": "afritrack",
+            "import_date": {"$exists": True, "$ne": None},
+        }},
+        {"$group": {"_id": {"$year": "$import_date"}}},
+    ]
+    for doc in await db.imported_feeds.aggregate(pipeline).to_list(length=None):
+        yr = doc.get("_id")
+        if isinstance(yr, int) and 1990 <= yr <= 2100:
+            years.add(yr)
+    return sorted(years, reverse=True)
 
 
 def _afritrack_record_query(upload_id: str, search: str = "") -> dict:

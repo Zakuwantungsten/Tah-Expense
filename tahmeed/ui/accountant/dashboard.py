@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
-from qasync import asyncSlot
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
     QLabel, QFrame, QDialog, QMessageBox,
@@ -113,6 +112,7 @@ class AccountantDashboard(QWidget):
             f"QStackedWidget#contentStack {{ background: {_APP_BG}; }}"
         )
         self._overview = OverviewWidget()
+        self._overview.navigate.connect(self._on_overview_nav)
         self._stack.addWidget(self._overview)         # index 0 — Overview
 
         self._truck_overview = TruckOverviewWidget()
@@ -244,8 +244,35 @@ class AccountantDashboard(QWidget):
     def _on_badge_updated(self, count: int) -> None:
         self._sidebar.set_verify_badge(count)
 
-    @asyncSlot()
-    async def _poll_notification_counts(self) -> None:
+    def _on_overview_nav(self, key: str) -> None:
+        if key == "browse":
+            self._on_browse()
+            return
+        self._sidebar.select(key)
+        self._on_nav(key)
+
+    def _poll_notification_counts(self) -> None:
+        """QTimer slot — schedule poll without nesting into a running task.
+
+        Using ``@asyncSlot`` here conflicts with Python 3.12+/3.14 when another
+        coroutine (e.g. truck Excel/PDF export) is mid-execution: qasync tries to
+        enter the poll task while that other task is still current.
+
+        Also skip this tick when ``asyncio.current_task()`` is set — that means we
+        are inside another coroutine's nested Qt event loop (e.g. QFileDialog).
+        The next 5s timer tick will retry.
+        """
+        if self._notification_poll_in_flight:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if asyncio.current_task() is not None:
+            return
+        loop.create_task(self._poll_notification_counts_async())
+
+    async def _poll_notification_counts_async(self) -> None:
         if self._notification_poll_in_flight:
             return
         self._notification_poll_in_flight = True

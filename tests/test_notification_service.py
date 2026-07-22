@@ -34,7 +34,7 @@ def test_dashboard_poll_is_overlap_safe_and_updates_badge(monkeypatch) -> None:
     dashboard = type("DashboardState", (), {})()
     dashboard._sidebar = sidebar
     dashboard._notification_poll_in_flight = True
-    poll = AccountantDashboard._poll_notification_counts.__wrapped__
+    poll = AccountantDashboard._poll_notification_counts_async
 
     asyncio.run(poll(dashboard))
     assert sidebar.counts == []
@@ -54,7 +54,7 @@ def test_dashboard_poll_preserves_last_badge_on_network_failure(monkeypatch) -> 
     dashboard = type("DashboardState", (), {})()
     dashboard._sidebar = sidebar
     dashboard._notification_poll_in_flight = False
-    poll = AccountantDashboard._poll_notification_counts.__wrapped__
+    poll = AccountantDashboard._poll_notification_counts_async
 
     async def fail() -> int:
         raise ConnectionError("temporary")
@@ -63,3 +63,31 @@ def test_dashboard_poll_preserves_last_badge_on_network_failure(monkeypatch) -> 
     asyncio.run(poll(dashboard))
     assert sidebar.counts == []
     assert dashboard._notification_poll_in_flight is False
+
+
+def test_dashboard_poll_skips_create_task_during_nested_task(monkeypatch) -> None:
+    """QTimer must not schedule a poll while another asyncio task is current."""
+    created: list[object] = []
+
+    class FakeLoop:
+        def create_task(self, coro):
+            created.append(coro)
+            coro.close()
+            return None
+
+    async def fake_poll_async() -> None:
+        return None
+
+    dashboard = type("DashboardState", (), {})()
+    dashboard._notification_poll_in_flight = False
+    dashboard._poll_notification_counts_async = fake_poll_async
+
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: FakeLoop())
+    monkeypatch.setattr(asyncio, "current_task", lambda: object())
+
+    AccountantDashboard._poll_notification_counts(dashboard)
+    assert created == []
+
+    monkeypatch.setattr(asyncio, "current_task", lambda: None)
+    AccountantDashboard._poll_notification_counts(dashboard)
+    assert len(created) == 1

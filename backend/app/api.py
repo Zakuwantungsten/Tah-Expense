@@ -11,9 +11,10 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from .dependencies import Authenticated, Cashier, Manager, require_roles
+from .dependencies import Admin, Authenticated, Cashier, Manager, require_roles
 from .errors import ApiError
 from .schemas import (
+    BackupRestoreRequest,
     CategoryWrite,
     ChangePasswordRequest,
     FleetWrite,
@@ -662,6 +663,47 @@ async def list_backup_jobs(
 ) -> list[dict]:
     docs = await database(request).backup_jobs.find().sort("created_at", -1).limit(limit).to_list()
     return json_safe(docs)
+
+
+@backups.post("/restore")
+async def restore_backup_job(
+    body: BackupRestoreRequest,
+    request: Request,
+    admin: Admin,
+) -> dict:
+    """Replace the live database with a verified uploaded backup. Admin only."""
+    from .cli.backup import exclusive_lock, distributed_lease, restore_database
+
+    settings = request.app.state.settings
+    db = database(request)
+    try:
+        with exclusive_lock(settings.backup_lock_file):
+            async with distributed_lease(settings, db):
+                result = await restore_database(
+                    settings,
+                    db,
+                    filename=body.filename,
+                    confirm_filename=body.confirm_filename,
+                    actor=admin,
+                )
+    except RuntimeError as exc:
+        message = str(exc)
+        code = "restore_failed"
+        status_code = 409
+        if "not found" in message.lower():
+            code = "backup_not_found"
+            status_code = 404
+        elif "confirmation" in message.lower():
+            code = "confirmation_mismatch"
+            status_code = 422
+        elif "only uploaded" in message.lower():
+            code = "backup_not_ready"
+            status_code = 409
+        elif "lock" in message.lower():
+            code = "backup_busy"
+            status_code = 409
+        raise ApiError(status_code, code, message) from exc
+    return json_safe(result)
 
 
 for router in (auth, users, categories, subtables, rules, mappings, fleet, backups, accountant):

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     cors_origins: list[str] = []
 
     mongodump_path: str = "mongodump"
+    mongorestore_path: str = "mongorestore"
     backup_directory: Path = Path("./var/backups")
     backup_lock_file: Path = Path("./var/backup.lock")
     backup_s3_bucket: str = ""

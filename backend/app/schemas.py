@@ -99,3 +99,17 @@ class PatchDocument(StrictModel):
         if blocked.intersection(value):
             raise ValueError("immutable or sensitive field included")
         return value
+
+
+class BackupRestoreRequest(StrictModel):
+    """Admin confirmation must re-type the exact backup filename."""
+
+    filename: str = Field(min_length=1, max_length=260)
+    confirm_filename: str = Field(min_length=1, max_length=260)
+
+    @field_validator("filename", "confirm_filename")
+    @classmethod
+    def reject_path_components(cls, value: str) -> str:
+        if any(part in value for part in ("/", "\\", "..")):
+            raise ValueError("filename must not contain path components")
+        return value

@@ -395,3 +395,113 @@ async def test_remote_prune_deletes_archive_and_manifest_versions(
         },
     ]
     assert jobs.updates[-1][1]["$set"]["status"] == "pruned"
+
+
+class RestoreBackupJobs:
+    def __init__(self, job: dict | None) -> None:
+        self.job = job
+
+    async def find_one(self, query: dict) -> dict | None:
+        if self.job and all(self.job.get(key) == value for key, value in query.items()):
+            return self.job
+        return None
+
+
+class RestoreAudit:
+    def __init__(self) -> None:
+        self.inserted: list[dict] = []
+
+    async def insert_one(self, document: dict) -> None:
+        self.inserted.append(document)
+
+
+@pytest.mark.asyncio
+async def test_restore_requires_matching_confirmation(tmp_path: Path) -> None:
+    settings = Settings(
+        mongodb_uri="mongodb://localhost:27017",
+        jwt_secret="a-test-secret-that-is-definitely-32-characters",
+        backup_directory=tmp_path,
+        backup_min_free_bytes=0,
+    )
+    db = SimpleNamespace(backup_jobs=RestoreBackupJobs(None), restore_audit=RestoreAudit())
+    with pytest.raises(RuntimeError, match="Confirmation filename"):
+        await backup.restore_database(
+            settings,
+            db,
+            filename="a.archive.gz",
+            confirm_filename="b.archive.gz",
+        )
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_non_uploaded_status(tmp_path: Path) -> None:
+    settings = Settings(
+        mongodb_uri="mongodb://localhost:27017",
+        jwt_secret="a-test-secret-that-is-definitely-32-characters",
+        backup_directory=tmp_path,
+        backup_min_free_bytes=0,
+    )
+    job = {"filename": "db.archive.gz", "status": "pending_upload"}
+    db = SimpleNamespace(backup_jobs=RestoreBackupJobs(job), restore_audit=RestoreAudit())
+    with pytest.raises(RuntimeError, match="Only uploaded"):
+        await backup.restore_database(
+            settings,
+            db,
+            filename="db.archive.gz",
+            confirm_filename="db.archive.gz",
+        )
+
+
+@pytest.mark.asyncio
+async def test_restore_runs_mongorestore_for_local_archive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    archive = tmp_path / "db-daily.archive.gz"
+    archive.write_bytes(b"archive-bytes")
+    checksum = backup.sha256(archive)
+    job = {
+        "filename": archive.name,
+        "status": "uploaded",
+        "local_path": str(archive),
+        "object_key": f"prefix/{archive.name}",
+        "sha256": checksum,
+        "size": archive.stat().st_size,
+    }
+    audit = RestoreAudit()
+    db = SimpleNamespace(backup_jobs=RestoreBackupJobs(job), restore_audit=audit)
+    commands: list[list[str]] = []
+
+    class FakeRestoreProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def fake_exec(*args: str, **_kwargs: object) -> FakeRestoreProcess:
+        commands.append(list(args))
+        return FakeRestoreProcess()
+
+    monkeypatch.setattr(backup.shutil, "which", lambda _: "/usr/bin/mongorestore")
+    monkeypatch.setattr(backup.asyncio, "create_subprocess_exec", fake_exec)
+    settings = Settings(
+        mongodb_uri="mongodb://restore-user@localhost:27017/tahmeed_expense",
+        db_name="tahmeed_expense",
+        jwt_secret="a-test-secret-that-is-definitely-32-characters",
+        backup_directory=tmp_path,
+        backup_min_free_bytes=0,
+        mongorestore_path="mongorestore",
+    )
+
+    result = await backup.restore_database(
+        settings,
+        db,
+        filename=archive.name,
+        confirm_filename=archive.name,
+        actor={"_id": ObjectId(), "username": "admin"},
+    )
+    assert result["status"] == "completed"
+    assert result["filename"] == archive.name
+    assert commands and commands[0][0] == "/usr/bin/mongorestore"
+    assert "--drop" in commands[0]
+    assert f"--archive={archive}" in commands[0]
+    assert audit.inserted and audit.inserted[0]["actor_username"] == "admin"

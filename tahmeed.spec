@@ -10,6 +10,7 @@ root = Path(SPECPATH)
 
 datas = [
     (".env.build", "."),
+    ("logo.png", "."),
     ("tahmeed/assets/update_public_keys.json", "tahmeed/assets"),
 ]
 datas += collect_data_files("qtawesome")
@@ -27,6 +28,7 @@ hiddenimports = (
     "bson",
     "dns",
     "dns.resolver",
+    "fitz",
     ]
 )
 

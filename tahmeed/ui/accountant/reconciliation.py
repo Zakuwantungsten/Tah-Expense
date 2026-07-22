@@ -28,7 +28,7 @@ import qtawesome as qta
 from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFormLayout,
-    QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
+    QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
     QPushButton, QStackedWidget, QVBoxLayout, QWidget,
 )
 
@@ -38,8 +38,9 @@ from tahmeed.ui.accountant.separate_expenses import (
     _WHITE, _BG, _BORDER, _BLUE, _BLUE_L, _GREEN, _GREEN_L, _AMBER, _AMBER_L,
     _RED, _RED_L, _T1, _T2, _TM, _HDR_BG,
     _lbl, _btn, _input_ss, _hsep, _make_table, _cell, _fmt_num,
-    _DropZone, _PageHeader, _PaginationBar, _TotalsBar,
-    _table_style, _finish_table_row,
+    _DropZone, _PageHeader, _TotalsBar, _SegmentTabBar,
+    _table_style, _finish_table_row, _populate_year_combo, _TOLL_MONTHS, _SCROLL_CHUNK,
+    _write_xlsx_template,
 )
 from tahmeed.models.reconciliation import ReconciliationEntry
 from tahmeed.services import reconciliation_service as recon_svc
@@ -423,6 +424,252 @@ _RECON_BROWSE_HEADERS = [
 ]
 
 
+class _ReconAllEntries(QWidget):
+    """Flat, filterable list of every SM Burhani record for one table."""
+
+    def __init__(self, table: str, cols, bonds: bool = False, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._table = table
+        self._cols = cols
+        self._bonds = bonds
+        self._station = ""
+        self._search = ""
+        self._year = 0
+        self._month = 0
+        self._loaded = 0
+        self._total = 0
+        self._loading = False
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        if self._bonds:
+            self._tabs = _StationTabBar()
+            self._tabs.station_changed.connect(self._on_station)
+            self._tabs.add_requested.connect(self._add_station)
+            vl.addWidget(self._tabs)
+
+            self._summary = QFrame()
+            self._summary.setStyleSheet(
+                f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;border-radius:6px;}}"
+            )
+            sl = QHBoxLayout(self._summary)
+            sl.setContentsMargins(16, 10, 16, 10)
+            sl.setSpacing(28)
+            self._inv_lbl = _lbl("Invoiced: —", size=12, weight=600)
+            self._conf_lbl = _lbl("Confirmed: —", size=12, weight=600, color=_GREEN)
+            self._var_lbl = _lbl("Variance: —", size=12, weight=600, color=_AMBER)
+            self._disp_lbl = _lbl("Disputed: 0", size=12, color=_T2)
+            sl.addWidget(self._inv_lbl)
+            sl.addWidget(self._conf_lbl)
+            sl.addWidget(self._var_lbl)
+            sl.addWidget(self._disp_lbl)
+            sl.addStretch()
+            vl.addWidget(self._summary)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search PRN, SM ref, importer, truck…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._year_cb = QComboBox()
+        self._year_cb.addItem("All Years", 0)
+        self._year_cb.setFixedWidth(110)
+        self._year_cb.setStyleSheet(_input_ss())
+        self._year_cb.currentIndexChanged.connect(self._on_year)
+        tbl.addWidget(self._year_cb)
+
+        self._month_cb = QComboBox()
+        for label, val in _TOLL_MONTHS:
+            self._month_cb.addItem(label, val)
+        self._month_cb.setFixedWidth(130)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.setEnabled(False)
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._totals = _TotalsBar([("charge", "$ "), ("count", "Total records: ")])
+        vl.addWidget(self._totals)
+
+        self._tbl = _make_table([c[0] for c in self._cols])
+        hdr = self._tbl.horizontalHeader()
+        for i, (_, _f, width, _a, _m) in enumerate(self._cols):
+            self._tbl.setColumnWidth(i, width)
+            hdr.setSectionResizeMode(i, QHeaderView.Interactive)
+        hdr.setStretchLastSection(True)
+        self._tbl.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        vl.addWidget(self._tbl, 1)
+
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
+
+    def refresh(self) -> None:
+        if self._bonds:
+            asyncio.ensure_future(self._load_stations())
+        else:
+            asyncio.ensure_future(self._reload_years_and_data())
+
+    async def _load_stations(self) -> None:
+        stations = await recon_svc.get_recon_stations("bonds")
+        self._tabs.set_stations(stations, active=self._station or self._tabs.active)
+        self._station = self._tabs.active
+        await self._reload_years_and_data()
+
+    async def _reload_years_and_data(self) -> None:
+        try:
+            years = await recon_svc.get_recon_available_years(self._table, self._station)
+        except Exception:
+            years = []
+        self._year = _populate_year_combo(self._year_cb, years, self._year)
+        if self._year <= 0:
+            self._month = 0
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(False)
+            self._month_cb.blockSignals(False)
+        self._reset_and_load()
+
+    def _effective_month(self) -> int:
+        return self._month if self._year > 0 else 0
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._tbl.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(f"Showing {self._loaded:,} of {self._total:,}{suffix}")
+
+    async def _load_initial(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        month = self._effective_month()
+        try:
+            rows, total, totals = await asyncio.gather(
+                recon_svc.get_recon_all_records(
+                    self._table, self._station, self._search, self._year, month, _SCROLL_CHUNK, 0,
+                ),
+                recon_svc.count_recon_all_records(
+                    self._table, self._station, self._search, self._year, month,
+                ),
+                recon_svc.get_recon_all_totals(
+                    self._table, self._station, self._search, self._year, month,
+                ),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+        self._total = total
+        self._append_rows(rows)
+        self._loaded = len(rows)
+        self._totals.set_total("charge", totals["invoiced"], "$ ")
+        self._totals.set_total("count", totals["count"], "")
+        if self._bonds:
+            self._inv_lbl.setText(f"Invoiced: $ {totals['invoiced']:,.0f}")
+            self._conf_lbl.setText(f"Confirmed: $ {totals['confirmed']:,.0f}")
+            self._var_lbl.setText(f"Variance: $ {totals['variance']:,.0f}")
+            self._disp_lbl.setText(f"Disputed: {totals['disputed']}")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        month = self._effective_month()
+        try:
+            rows = await recon_svc.get_recon_all_records(
+                self._table, self._station, self._search, self._year, month, _SCROLL_CHUNK, self._loaded,
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if rows:
+            self._append_rows(rows)
+            self._loaded += len(rows)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, rows: List[ReconciliationEntry]) -> None:
+        t = self._tbl
+        for e in rows:
+            r = t.rowCount()
+            t.insertRow(r)
+            for c, (_, field, _w, align, mono) in enumerate(self._cols):
+                flag = {"left": Qt.AlignLeft, "right": Qt.AlignRight, "center": Qt.AlignHCenter}[align] | Qt.AlignVCenter
+                color = _RED if (field == "charge" and (e.charge or 0) < 0) else ""
+                t.setItem(r, c, _cell(_fmt_recon_value(e, field), flag, mono=mono, color=color))
+            _finish_table_row(t, r)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._tbl.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._reset_and_load()
+
+    def _on_year(self, _idx: int) -> None:
+        self._year = int(self._year_cb.currentData() or 0)
+        has_year = self._year > 0
+        self._month_cb.setEnabled(has_year)
+        if not has_year:
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.blockSignals(False)
+            self._month = 0
+        self._reset_and_load()
+
+    def _on_month(self, _idx: int) -> None:
+        self._month = int(self._month_cb.currentData() or 0)
+        self._reset_and_load()
+
+    def _on_station(self, slug: str) -> None:
+        self._station = slug
+        self._year = 0
+        self._month = 0
+        asyncio.ensure_future(self._reload_years_and_data())
+
+    def _add_station(self) -> None:
+        dlg = _AddStationDialog(parent=self)
+        dlg.submitted.connect(lambda name, border: asyncio.ensure_future(self._do_add_station(name, border)))
+        dlg.exec()
+
+    async def _do_add_station(self, name: str, border: str) -> None:
+        await recon_svc.add_recon_station(name, border, "bonds")
+        await self._load_stations()
+
+
 class _StationTabBar(QWidget):
     station_changed = Signal(str)   # slug
     add_requested = Signal()
@@ -544,6 +791,7 @@ class _ReconUploadBrowse(QWidget):
     """Table of every import batch for one SM Burhani table type."""
 
     upload_clicked = Signal(object)
+    delete_clicked = Signal(object)
 
     def __init__(self, table: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -570,9 +818,11 @@ class _ReconUploadBrowse(QWidget):
         self._table_w.setStyleSheet(_table_style())
         self._table_w.setCursor(Qt.PointingHandCursor)
         self._table_w.cellClicked.connect(self._on_row_clicked)
+        self._table_w.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table_w.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table_w, 1)
 
-        hint = _lbl("Click any row to view the full records for that upload.", size=11, color=_TM)
+        hint = _lbl("Click any row to view its records · right-click to delete an upload.", size=11, color=_TM)
         hint.setAlignment(Qt.AlignCenter)
         vl.addWidget(hint)
 
@@ -621,11 +871,21 @@ class _ReconUploadBrowse(QWidget):
         if row < len(self._uploads):
             self.upload_clicked.emit(self._uploads[row])
 
+    def _on_menu(self, pos) -> None:
+        row = self._table_w.rowAt(pos.y())
+        if not (0 <= row < len(self._uploads)):
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Delete this upload")
+        if menu.exec(self._table_w.viewport().mapToGlobal(pos)) == act:
+            self.delete_clicked.emit(self._uploads[row])
+
 
 class _ReconUploadDetail(QWidget):
     """Full record table for a single SM Burhani upload batch."""
 
     back_requested = Signal()
+    delete_requested = Signal(object)
 
     def __init__(
         self,
@@ -643,9 +903,10 @@ class _ReconUploadDetail(QWidget):
         self._upload_id = ""
         self._station = ""
         self._search = ""
-        self._page = 1
-        self._page_size = 50
+        self._upload_doc: dict = {}
+        self._loaded = 0
         self._total = 0
+        self._loading = False
         self._build()
 
     def _build(self) -> None:
@@ -665,6 +926,9 @@ class _ReconUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
+        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
+        delete_btn.clicked.connect(self._request_delete)
+        navl.addWidget(delete_btn)
         export_btn = _btn("Export", "mdi.download-outline", primary=False, height=30)
         export_btn.clicked.connect(self._export)
         navl.addWidget(export_btn)
@@ -723,11 +987,11 @@ class _ReconUploadDetail(QWidget):
 
         self._totals = _TotalsBar([("charge", "$ "), ("count", "Records: ")])
         vl.addWidget(self._totals)
+        self._tbl.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
 
     def load_upload(self, upload_doc: dict) -> None:
         self._upload_id = str(upload_doc.get("_id") or "")
@@ -752,43 +1016,65 @@ class _ReconUploadDetail(QWidget):
         self._search_edit.blockSignals(True)
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
-        self._page = 1
 
         if self._bonds:
             asyncio.ensure_future(self._load_stations())
         else:
-            asyncio.ensure_future(self._load())
+            self._reset_and_load()
+
+    def _request_delete(self) -> None:
+        if self._upload_doc:
+            self.delete_requested.emit(self._upload_doc)
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._tbl.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(f"Showing {self._loaded:,} of {self._total:,}{suffix}")
 
     async def _load_stations(self) -> None:
         stations = await recon_svc.get_recon_stations("bonds")
         self._tabs.set_stations(stations, active=self._station or self._tabs.active)
         self._station = self._tabs.active
-        await self._load()
+        self._reset_and_load()
 
     def _on_station(self, slug: str) -> None:
         self._station = slug
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    async def _load(self) -> None:
-        if not self._upload_id:
+    async def _load_initial(self) -> None:
+        if not self._upload_id or self._loading:
             return
-        skip = (self._page - 1) * self._page_size
-        rows, total, totals = await asyncio.gather(
-            recon_svc.get_recon_upload_records(
-                self._upload_id, self._table, self._station,
-                self._search, self._page_size, skip,
-            ),
-            recon_svc.count_recon_upload_records(
-                self._upload_id, self._table, self._station, self._search,
-            ),
-            recon_svc.get_recon_upload_totals(
-                self._upload_id, self._table, self._station,
-            ),
-        )
+        self._loading = True
+        self._update_status()
+        try:
+            rows, total, totals = await asyncio.gather(
+                recon_svc.get_recon_upload_records(
+                    self._upload_id, self._table, self._station, self._search, _SCROLL_CHUNK, 0,
+                ),
+                recon_svc.count_recon_upload_records(
+                    self._upload_id, self._table, self._station, self._search,
+                ),
+                recon_svc.get_recon_upload_totals(
+                    self._upload_id, self._table, self._station,
+                ),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
         self._total = total
-        self._fill_table(rows)
-        self._pager.set_total(total, self._page_size, self._page)
+        self._append_rows(rows)
+        self._loaded = len(rows)
         self._totals.set_total("charge", totals["invoiced"], "$ ")
         self._totals.set_total("count", totals["count"], "")
         if self._bonds:
@@ -796,10 +1082,30 @@ class _ReconUploadDetail(QWidget):
             self._conf_lbl.setText(f"Confirmed: $ {totals['confirmed']:,.0f}")
             self._var_lbl.setText(f"Variance: $ {totals['variance']:,.0f}")
             self._disp_lbl.setText(f"Disputed: {totals['disputed']}")
+        self._loading = False
+        self._update_status()
 
-    def _fill_table(self, rows: List[ReconciliationEntry]) -> None:
+    async def _load_more(self) -> None:
+        if not self._upload_id or self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            rows = await recon_svc.get_recon_upload_records(
+                self._upload_id, self._table, self._station, self._search, _SCROLL_CHUNK, self._loaded,
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if rows:
+            self._append_rows(rows)
+            self._loaded += len(rows)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, rows: List[ReconciliationEntry]) -> None:
         t = self._tbl
-        t.setRowCount(0)
         for e in rows:
             r = t.rowCount()
             t.insertRow(r)
@@ -812,17 +1118,14 @@ class _ReconUploadDetail(QWidget):
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page = 1
-        asyncio.ensure_future(self._load())
+    def _on_scroll(self, value: int) -> None:
+        bar = self._tbl.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
     def _add_station(self) -> None:
         dlg = _AddStationDialog(parent=self)
@@ -909,7 +1212,7 @@ class _ReconUploadDetail(QWidget):
 
 
 class _ReconShellWidget(QWidget):
-    """Browse uploads then drill into per-record detail — Toll Plaza pattern."""
+    """All Entries + Uploads shell for one SM Burhani table."""
 
     def __init__(
         self,
@@ -937,38 +1240,88 @@ class _ReconShellWidget(QWidget):
         vl.setSpacing(12)
 
         header = _PageHeader(self._title, self._icon)
+        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+        tmpl_btn.clicked.connect(self._download_template)
         self._import_btn = _btn(self._import_label, "mdi.upload-outline")
         self._import_btn.clicked.connect(self._open_import)
+        header.add_right(tmpl_btn)
         header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._stack = QStackedWidget()
-        self._stack.setStyleSheet("background:transparent;")
+        self._tabs = _SegmentTabBar(["All Entries", "Uploads"])
+        vl.addWidget(self._tabs)
+
+        self._main_stack = QStackedWidget()
+        self._main_stack.setStyleSheet("background:transparent;")
+
+        self._all_entries = _ReconAllEntries(self._table, self._cols, bonds=self._bonds)
+        self._main_stack.addWidget(self._all_entries)
+
+        upload_host = QWidget()
+        upload_host.setStyleSheet("background:transparent;")
+        upload_vl = QVBoxLayout(upload_host)
+        upload_vl.setContentsMargins(0, 0, 0, 0)
+        upload_vl.setSpacing(0)
+
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
 
         self._browse = _ReconUploadBrowse(self._table)
         self._browse.upload_clicked.connect(self._show_detail)
-        self._stack.addWidget(self._browse)
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._browse)
 
         self._detail = _ReconUploadDetail(
             self._table, self._title, self._cols, bonds=self._bonds,
         )
         self._detail.back_requested.connect(self._show_browse)
-        self._stack.addWidget(self._detail)
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
 
-        self._stack.setCurrentIndex(0)
-        vl.addWidget(self._stack, 1)
+        upload_vl.addWidget(self._upload_stack, 1)
+        self._main_stack.addWidget(upload_host)
+
+        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        vl.addWidget(self._main_stack, 1)
 
     def refresh(self) -> None:
+        self._all_entries.refresh()
         self._show_browse()
 
     def _show_browse(self) -> None:
-        self._stack.setCurrentIndex(0)
+        self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._tabs.set_index(1, emit=False)
+        self._main_stack.setCurrentIndex(1)
+        self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
-        self._stack.setCurrentIndex(1)
+
+    def _template_filename(self) -> str:
+        if self._table == "rpa_schedule":
+            return "SM_Burhani_RPA_Import_Template.xlsx"
+        return "SM_Burhani_Bonds_Import_Template.xlsx"
+
+    def _download_template(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Import Template",
+            self._template_filename(),
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        headers = [c[0] for c in self._cols]
+        try:
+            _write_xlsx_template(path, self._title, headers)
+            QMessageBox.information(
+                self, "Template Saved",
+                f"Empty template saved to:\n{path}\n\n"
+                "Fill in your data using the column headers shown, then import the file.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
         dlg = ReconImportDialog(self._table, self._title, self._cols, parent=self)
@@ -977,6 +1330,37 @@ class _ReconShellWidget(QWidget):
 
     def _on_imported(self, n: int) -> None:
         QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        self._all_entries.refresh()
+        self._tabs.set_index(1)
+        self._show_browse()
+
+    def _on_delete_upload(self, upload_doc: dict) -> None:
+        upload_id = str(upload_doc.get("_id") or "")
+        if not upload_id:
+            return
+        filename = upload_doc.get("source_filename") or "Unknown file"
+        count = int(upload_doc.get("record_count", 0))
+        if QMessageBox.question(
+            self,
+            "Delete Upload",
+            f"Delete upload from \"{filename}\" and all {count:,} records?\n\nThis cannot be undone.",
+        ) != QMessageBox.Yes:
+            return
+        asyncio.ensure_future(self._delete_upload(upload_id))
+
+    async def _delete_upload(self, upload_id: str) -> None:
+        try:
+            deleted = await recon_svc.delete_recon_upload(upload_id, self._table)
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete Error", str(exc))
+            return
+        if deleted <= 0:
+            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
+            return
+        QMessageBox.information(
+            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+        )
+        self._all_entries.refresh()
         self._show_browse()
 
 

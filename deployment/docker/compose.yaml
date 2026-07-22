@@ -48,6 +48,8 @@ services:
       start_period: 15s
       retries: 3
     stop_grace_period: 30s
+    volumes:
+      - tahmeed-backups:/var/lib/tahmeed
 
   scheduler:
     <<: *security

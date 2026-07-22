@@ -6,7 +6,7 @@ from PySide6.QtCore import Qt, QStringListModel, QTimer, QEvent
 from PySide6.QtGui import QKeyEvent
 
 from tahmeed.ui.widgets.completer_line_edit import (
-    accept_completion, show_completion_preview,
+    accept_completion, hide_completion_popup, show_completion_preview,
 )
 
 
@@ -139,6 +139,23 @@ class TruckLineEdit(QLineEdit):
 
         if key in (Qt.Key_Return, Qt.Key_Enter):
             if accept_completion(self, self._completer):
+                self._preview_active = False
                 event.accept()
                 return
+            hide_completion_popup(self._completer)
+            self._preview_active = False
+
+        if key == Qt.Key_Tab:
+            # Accept highlighted suggestion (or commit preview text) and always
+            # dismiss the popup before focus moves to the next widget.
+            if not accept_completion(self, self._completer):
+                hide_completion_popup(self._completer)
+                if self._preview_active:
+                    self.deselect()
+                    self.setCursorPosition(len(self.text()))
+            self._preview_active = False
+            self.focusNextPrevChild(not bool(event.modifiers() & Qt.ShiftModifier))
+            event.accept()
+            return
+
         super().keyPressEvent(event)

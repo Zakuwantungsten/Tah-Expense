@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
     QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QDateEdit,
 )
 
 try:
@@ -37,6 +37,14 @@ try:
     _HAS_OPENPYXL = True
 except ImportError:
     _HAS_OPENPYXL = False
+
+from tahmeed.ui.accountant.date_filters import (
+    add_from_to_editors, read_from_to, sync_from_to,
+)
+from tahmeed.ui.accountant.separate_expenses import (
+    _SegmentTabBar, _populate_year_combo, _TOLL_MONTHS, _SCROLL_CHUNK,
+    _write_xlsx_template,
+)
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE   = "#FFFFFF"
@@ -185,17 +193,22 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400,
 
 
 def _btn(text: str, icon: str = "", primary: bool = True,
-         height: int = 34) -> QPushButton:
+         danger: bool = False, height: int = 34) -> QPushButton:
     b = QPushButton(f"  {text}" if icon else text)
     b.setCursor(Qt.PointingHandCursor)
     b.setFixedHeight(height)
     if icon:
         try:
-            b.setIcon(qta.icon(icon, color="#FFFFFF" if primary else _T1))
+            b.setIcon(qta.icon(icon, color="#FFFFFF" if (primary or danger) else _T1))
             b.setIconSize(QSize(16, 16))
         except Exception:
             pass
-    if primary:
+    if danger:
+        ss = (f"QPushButton{{background:{_RED};color:#FFF;border:none;border-radius:5px;"
+              f"font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
+              f"QPushButton:hover{{background:#B91C1C;}}"
+              f"QPushButton:disabled{{background:#FCA5A5;}}")
+    elif primary:
         ss = (f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:5px;"
               f"font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
               f"QPushButton:hover{{background:#005EA3;}}"
@@ -211,11 +224,11 @@ def _btn(text: str, icon: str = "", primary: bool = True,
 
 def _input_ss() -> str:
     return (
-        f"QLineEdit,QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
+        f"QLineEdit,QComboBox,QDateEdit{{border:1px solid {_BORDER};border-radius:5px;"
         f"background:{_WHITE};color:{_T1};font-size:12px;"
         f"font-family:'Segoe UI';padding:0 8px;"
         f"min-height:32px;max-height:32px;}}"
-        f"QLineEdit:focus,QComboBox:focus{{border-color:{_BLUE};}}"
+        f"QLineEdit:focus,QComboBox:focus,QDateEdit:focus{{border-color:{_BLUE};}}"
         "QComboBox::drop-down{border:none;width:20px;}"
     )
 
@@ -330,6 +343,22 @@ def _fmt_cell(kind: str, value: Any) -> Tuple[str, Qt.AlignmentFlag, bool]:
         return _fmt_num(value, "TZS ", 0), Qt.AlignRight | Qt.AlignVCenter, True
     return (str(value) if value not in (None, "") else "—",
             Qt.AlignLeft | Qt.AlignVCenter, False)
+
+
+def _fill_diesel_row(
+    table: QTableWidget,
+    row: int,
+    rec: dict,
+    columns: List[Tuple[str, str, str]],
+    sn_offset: int = 0,
+) -> None:
+    for c, (_, key, kind) in enumerate(columns):
+        val = rec.get(key, "")
+        if key == "sn" and (val is None or str(val).strip() == ""):
+            val = sn_offset + 1
+        text, align, mono = _fmt_cell(kind, val)
+        table.setItem(row, c, _cell(text, align, mono=mono))
+    _finish_table_row(table, row)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -842,6 +871,227 @@ class _FuelImportDialog(QDialog):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  All entries — cross-upload flat list
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _DieselAllEntries(QWidget):
+    """Flat, filterable list of every diesel record with infinite scroll."""
+
+    def __init__(self, feed_type: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._feed_type = feed_type
+        self._schema = _FUEL_SCHEMAS[feed_type]
+        self._columns = self._schema["columns"]
+        self._has_amount = any(k == "total_amount" for _, k, _ in self._columns)
+        self._search = ""
+        self._year = 0
+        self._month = 0
+        self._loaded = 0
+        self._total = 0
+        self._loading = False
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText(
+            "Search truck, LPO, client, destination, station…"
+        )
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._year_cb = QComboBox()
+        self._year_cb.addItem("All Years", 0)
+        self._year_cb.setFixedWidth(110)
+        self._year_cb.setStyleSheet(_input_ss())
+        self._year_cb.currentIndexChanged.connect(self._on_year)
+        tbl.addWidget(self._year_cb)
+
+        self._month_cb = QComboBox()
+        for label, val in _TOLL_MONTHS:
+            self._month_cb.addItem(label, val)
+        self._month_cb.setFixedWidth(130)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.setEnabled(False)
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+
+        self._from_date, self._to_date = add_from_to_editors(
+            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=True,
+        )
+
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        totals_defs = [("ltrs", "Ltrs: ")]
+        if self._has_amount:
+            totals_defs.append(("amount", "TZS: "))
+        totals_defs.append(("count", "Records: "))
+        self._totals = _TotalsBar(totals_defs)
+        vl.addWidget(self._totals)
+
+        self._table = _make_table([c[0] for c in self._columns])
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        vl.addWidget(self._table, 1)
+
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._reload_years_and_data())
+
+    async def _reload_years_and_data(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            years = await svc.get_diesel_available_years(self._feed_type)
+        except Exception:
+            years = []
+        self._year = _populate_year_combo(self._year_cb, years, self._year)
+        if self._year <= 0:
+            self._month = 0
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(False)
+            self._month_cb.blockSignals(False)
+        self._reset_and_load()
+
+    def _effective_month(self) -> int:
+        return self._month if self._year > 0 else 0
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(f"Showing {self._loaded:,} of {self._total:,}{suffix}")
+
+    async def _load_initial(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            totals, recs, total = await asyncio.gather(
+                svc.get_diesel_all_totals(self._feed_type, self._search, self._year, month, **self._date_kw()),
+                svc.get_diesel_all_records(
+                    self._feed_type, self._search, self._year, month,
+                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                ),
+                svc.count_diesel_all_records(
+                    self._feed_type, self._search, self._year, month, **self._date_kw(),
+                ),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        self._totals.set_total("count", int(totals.get("count", 0) or 0))
+        self._totals.set_total("ltrs", float(totals.get("ltrs", 0) or 0))
+        if self._has_amount:
+            self._totals.set_total("amount", float(totals.get("total_amount", 0) or 0))
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            recs = await svc.get_diesel_all_records(
+                self._feed_type, self._search, self._year, month,
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
+        for i, rec in enumerate(recs):
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _fill_diesel_row(self._table, r, rec, self._columns, self._loaded + i)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._reset_and_load()
+
+    def _date_kw(self) -> dict:
+        if not hasattr(self, "_from_date"):
+            return {}
+        df, dt = read_from_to(self._from_date, self._to_date, optional=True)
+        return {"date_from": df, "date_to": dt}
+
+    def _on_year(self, _idx: int) -> None:
+        self._year = int(self._year_cb.currentData() or 0)
+        has_year = self._year > 0
+        self._month_cb.setEnabled(has_year)
+        if not has_year:
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.blockSignals(False)
+            self._month = 0
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+    def _on_month(self, _idx: int) -> None:
+        self._month = int(self._month_cb.currentData() or 0)
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Upload browse — one row per import batch
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -956,6 +1206,7 @@ class _DieselUploadBrowse(QWidget):
 
 class _DieselUploadDetail(QWidget):
     back_requested = Signal()
+    delete_requested = Signal(object)
 
     def __init__(self, feed_type: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -964,10 +1215,11 @@ class _DieselUploadDetail(QWidget):
         self._columns   = self._schema["columns"]
         self._has_amount = any(k == "total_amount" for _, k, _ in self._columns)
         self._upload_id = ""
+        self._upload_doc: dict = {}
         self._search    = ""
-        self._page      = 1
-        self._page_size = 50
+        self._loaded    = 0
         self._total     = 0
+        self._loading   = False
         self._build()
 
     def _build(self) -> None:
@@ -987,6 +1239,9 @@ class _DieselUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
+        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
+        delete_btn.clicked.connect(self._request_delete)
+        navl.addWidget(delete_btn)
         vl.addWidget(nav)
 
         self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
@@ -1009,6 +1264,7 @@ class _DieselUploadDetail(QWidget):
         self._table = _make_table([c[0] for c in self._columns])
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         vl.addWidget(self._table, 1)
 
         totals_defs = [("ltrs", "Ltrs: ")]
@@ -1018,12 +1274,12 @@ class _DieselUploadDetail(QWidget):
         self._totals = _TotalsBar(totals_defs)
         vl.addWidget(self._totals)
 
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
 
     def load_upload(self, upload_doc: dict) -> None:
+        self._upload_doc = upload_doc
         self._upload_id = str(upload_doc.get("_id") or "")
         filename  = upload_doc.get("source_filename") or "Unknown file"
         sheet     = upload_doc.get("sheet_label") or "—"
@@ -1038,58 +1294,96 @@ class _DieselUploadDetail(QWidget):
         self._search_edit.blockSignals(True)
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    async def _load(self) -> None:
+    def _request_delete(self) -> None:
+        if self._upload_doc:
+            self.delete_requested.emit(self._upload_doc)
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(f"Showing {self._loaded:,} of {self._total:,}{suffix}")
+
+    async def _load_initial(self) -> None:
         from tahmeed.services import accountant_service as svc
-        if not self._upload_id:
+        if not self._upload_id or self._loading:
             return
-        skip = (self._page - 1) * self._page_size
-        recs, total, totals = await asyncio.gather(
-            svc.get_diesel_upload_records(
-                self._feed_type, self._upload_id, self._search, self._page_size, skip),
-            svc.count_diesel_upload_records(
-                self._feed_type, self._upload_id, self._search),
-            svc.get_diesel_upload_totals(
-                self._feed_type, self._upload_id, self._search),
-        )
+        self._loading = True
+        self._update_status()
+        try:
+            recs, total, totals = await asyncio.gather(
+                svc.get_diesel_upload_records(
+                    self._feed_type, self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                ),
+                svc.count_diesel_upload_records(
+                    self._feed_type, self._upload_id, self._search,
+                ),
+                svc.get_diesel_upload_totals(
+                    self._feed_type, self._upload_id, self._search,
+                ),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
         self._total = total
-        self._fill_table(recs, skip)
-        self._pager.set_total(total, self._page_size, self._page)
+        self._append_rows(recs)
+        self._loaded = len(recs)
         self._totals.set_total("count", total)
         self._totals.set_total("ltrs", float(totals.get("ltrs", 0) or 0))
         if self._has_amount:
             self._totals.set_total("amount", float(totals.get("total_amount", 0) or 0))
+        self._loading = False
+        self._update_status()
 
-    def _fill_table(self, recs: List[dict], skip: int = 0) -> None:
-        t = self._table
-        t.setRowCount(0)
+    async def _load_more(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs = await svc.get_diesel_upload_records(
+                self._feed_type, self._upload_id, self._search,
+                _SCROLL_CHUNK, self._loaded,
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
         for i, rec in enumerate(recs):
-            r = t.rowCount()
-            t.insertRow(r)
-            for c, (_, key, kind) in enumerate(self._columns):
-                val = rec.get(key, "")
-                # Auto-number rows when the sheet has no S/No of its own.
-                if key == "sn" and (val is None or str(val).strip() == ""):
-                    val = skip + i + 1
-                text, align, mono = _fmt_cell(kind, val)
-                t.setItem(r, c, _cell(text, align, mono=mono))
-            _finish_table_row(t, r)
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _fill_diesel_row(self._table, r, rec, self._columns, self._loaded + i)
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page = 1
-        asyncio.ensure_future(self._load())
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1097,7 +1391,7 @@ class _DieselUploadDetail(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _BaseDieselWidget(QWidget):
-    """Master/detail page shared by all four fuel stations."""
+    """All Entries + Uploads shell shared by all four fuel stations."""
 
     _FEED_TYPE: str = ""
 
@@ -1114,39 +1408,87 @@ class _BaseDieselWidget(QWidget):
         vl.setSpacing(12)
 
         header = _PageHeader(self._schema["title"], self._schema["icon"])
+        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+        tmpl_btn.clicked.connect(self._download_template)
         self._import_btn = _btn("Import from Excel", "mdi.upload-outline")
         self._import_btn.clicked.connect(self._open_import)
+        header.add_right(tmpl_btn)
         header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._stack = QStackedWidget()
-        self._stack.setStyleSheet("background:transparent;")
+        self._tabs = _SegmentTabBar(["All Entries", "Uploads"])
+        vl.addWidget(self._tabs)
+
+        self._main_stack = QStackedWidget()
+        self._main_stack.setStyleSheet("background:transparent;")
+
+        self._all_entries = _DieselAllEntries(self._FEED_TYPE)
+        self._main_stack.addWidget(self._all_entries)
+
+        upload_host = QWidget()
+        upload_host.setStyleSheet("background:transparent;")
+        upload_vl = QVBoxLayout(upload_host)
+        upload_vl.setContentsMargins(0, 0, 0, 0)
+        upload_vl.setSpacing(0)
+
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
 
         self._browse = _DieselUploadBrowse(self._FEED_TYPE)
         self._browse.upload_clicked.connect(self._show_detail)
         self._browse.delete_clicked.connect(self._on_delete_upload)
-        self._stack.addWidget(self._browse)
+        self._upload_stack.addWidget(self._browse)
 
         self._detail = _DieselUploadDetail(self._FEED_TYPE)
         self._detail.back_requested.connect(self._show_browse)
-        self._stack.addWidget(self._detail)
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
 
-        self._stack.setCurrentIndex(0)
-        vl.addWidget(self._stack, 1)
+        upload_vl.addWidget(self._upload_stack, 1)
+        self._main_stack.addWidget(upload_host)
+
+        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        vl.addWidget(self._main_stack, 1)
 
     # ── Public API ───────────────────────────────────────────────────────────
     def refresh(self) -> None:
+        self._all_entries.refresh()
         self._show_browse()
 
     # ── Internal ───────────────────────────────────────────────────────────────
     def _show_browse(self) -> None:
-        self._stack.setCurrentIndex(0)
+        self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._tabs.set_index(1, emit=False)
+        self._main_stack.setCurrentIndex(1)
+        self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
-        self._stack.setCurrentIndex(1)
+
+    def _template_filename(self) -> str:
+        safe = self._schema["title"].replace(" ", "_")
+        return f"{safe}_Import_Template.xlsx"
+
+    def _download_template(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Import Template",
+            self._template_filename(),
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        headers = [c[0] for c in self._schema["columns"]]
+        try:
+            _write_xlsx_template(path, self._schema["title"], headers)
+            QMessageBox.information(
+                self, "Template Saved",
+                f"Empty template saved to:\n{path}\n\n"
+                "Fill in your data using the column headers shown, then import the file.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
         dlg = _FuelImportDialog(self._FEED_TYPE, parent=self)
@@ -1155,7 +1497,9 @@ class _BaseDieselWidget(QWidget):
 
     def _on_imported(self, n: int) -> None:
         QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        self._all_entries.refresh()
         self._show_browse()
+        self._tabs.set_index(1)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
         count = int(upload_doc.get("record_count", 0))
@@ -1174,6 +1518,7 @@ class _BaseDieselWidget(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Delete Error", str(exc))
             return
+        self._all_entries.refresh()
         self._show_browse()
 
 

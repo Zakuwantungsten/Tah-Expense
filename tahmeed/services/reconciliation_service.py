@@ -8,6 +8,7 @@ so the accountant can add a station before any data is imported for it.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from bson import ObjectId
@@ -134,6 +135,122 @@ async def get_recon_uploads(table: str) -> List[dict]:
     return await db.reconciliation_entries.aggregate(pipeline).to_list(length=None)
 
 
+def _all_records_query(
+    table: str,
+    station: str = "",
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+) -> dict:
+    query = _build_query(table, station, search)
+    if year > 0:
+        if month >= 1:
+            start = datetime(year, month, 1)
+            end = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+        else:
+            start = datetime(year, 1, 1)
+            end = datetime(year + 1, 1, 1)
+        query["$and"] = query.get("$and", [])
+        query["$and"].append({
+            "$or": [
+                {"t1_date": {"$gte": start, "$lt": end}},
+                {
+                    "$and": [
+                        {"$or": [{"t1_date": {"$exists": False}}, {"t1_date": None}]},
+                        {"import_date": {"$gte": start, "$lt": end}},
+                    ]
+                },
+            ]
+        })
+    return query
+
+
+async def get_recon_all_records(
+    table: str,
+    station: str = "",
+    search: str = "",
+    year: int = 0,
+    month: int = 0,
+    limit: int = 50,
+    skip: int = 0,
+) -> List[ReconciliationEntry]:
+    db = get_db()
+    query = _all_records_query(table, station, search, year, month)
+    cursor = (
+        db.reconciliation_entries.find(query)
+        .sort([("t1_date", -1), ("import_date", -1), ("sr_no", 1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    return [ReconciliationEntry.from_doc(d) for d in docs]
+
+
+async def count_recon_all_records(
+    table: str, station: str = "", search: str = "", year: int = 0, month: int = 0
+) -> int:
+    db = get_db()
+    return await db.reconciliation_entries.count_documents(
+        _all_records_query(table, station, search, year, month)
+    )
+
+
+async def get_recon_all_totals(
+    table: str, station: str = "", search: str = "", year: int = 0, month: int = 0
+) -> dict:
+    db = get_db()
+    query = _all_records_query(table, station, search, year, month)
+    result = await db.reconciliation_entries.aggregate([
+        {"$match": query},
+        {"$group": {
+            "_id": None,
+            "count": {"$sum": 1},
+            "charge_total": {"$sum": _safe_double("charge")},
+            "confirmed_total": {
+                "$sum": {"$cond": ["$confirmed", {"$ifNull": ["$charge", 0]}, 0]}
+            },
+            "disputed_count": {"$sum": {"$cond": ["$disputed", 1, 0]}},
+        }},
+    ]).to_list(1)
+    if result:
+        r = result[0]
+        invoiced = r.get("charge_total", 0.0)
+        confirmed = r.get("confirmed_total", 0.0)
+        return {
+            "count": r.get("count", 0),
+            "invoiced": invoiced,
+            "confirmed": confirmed,
+            "variance": invoiced - confirmed,
+            "disputed": r.get("disputed_count", 0),
+        }
+    return {"count": 0, "invoiced": 0.0, "confirmed": 0.0, "variance": 0.0, "disputed": 0}
+
+
+async def get_recon_available_years(table: str, station: str = "") -> List[int]:
+    db = get_db()
+    years: set[int] = set()
+    query = {"entity": ENTITY, "table": table}
+    if station.strip():
+        query["station"] = station.strip()
+    pipeline = [
+        {"$match": {**query, "t1_date": {"$exists": True, "$ne": None}}},
+        {"$group": {"_id": {"$year": "$t1_date"}}},
+    ]
+    for doc in await db.reconciliation_entries.aggregate(pipeline).to_list(length=None):
+        yr = doc.get("_id")
+        if isinstance(yr, int) and 1990 <= yr <= 2100:
+            years.add(yr)
+    import_pipeline = [
+        {"$match": {**query, "import_date": {"$exists": True, "$ne": None}}},
+        {"$group": {"_id": {"$year": "$import_date"}}},
+    ]
+    for doc in await db.reconciliation_entries.aggregate(import_pipeline).to_list(length=None):
+        yr = doc.get("_id")
+        if isinstance(yr, int) and 1990 <= yr <= 2100:
+            years.add(yr)
+    return sorted(years, reverse=True)
+
+
 def _upload_record_query(
     upload_id: str, table: str, station: str = "", search: str = ""
 ) -> dict:
@@ -214,6 +331,16 @@ async def get_recon_upload_totals(
             "disputed": r.get("disputed_count", 0),
         }
     return {"count": 0, "invoiced": 0.0, "confirmed": 0.0, "variance": 0.0, "disputed": 0}
+
+
+async def delete_recon_upload(upload_id: str, table: str) -> int:
+    db = get_db()
+    result = await db.reconciliation_entries.delete_many({
+        "entity": ENTITY,
+        "table": table,
+        "upload_id": upload_id,
+    })
+    return result.deleted_count
 
 
 # ── Dedup + write ────────────────────────────────────────────────────────────────

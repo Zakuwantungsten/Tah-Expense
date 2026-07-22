@@ -21,6 +21,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from tahmeed.ui.accountant.date_filters import (
+    add_from_to_editors, read_from_to, sync_from_to,
+)
+
 import qtawesome as qta
 
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
@@ -30,7 +34,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSizePolicy,
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QWidget, QDateEdit,
 )
 
 # ── openpyxl (optional — fallback to csv-only if missing) ──────────────────────
@@ -130,11 +134,11 @@ def _btn(text: str, icon: str = "", primary: bool = True,
 
 def _input_ss() -> str:
     return (
-        f"QLineEdit,QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
+        f"QLineEdit,QComboBox,QDateEdit{{border:1px solid {_BORDER};border-radius:5px;"
         f"background:{_WHITE};color:{_T1};font-size:12px;"
         f"font-family:'Segoe UI';padding:0 8px;"
         f"min-height:32px;max-height:32px;}}"
-        f"QLineEdit:focus,QComboBox:focus{{border-color:{_BLUE};}}"
+        f"QLineEdit:focus,QComboBox:focus,QDateEdit:focus{{border-color:{_BLUE};}}"
         "QComboBox::drop-down{border:none;width:20px;}"
     )
 
@@ -475,6 +479,64 @@ def _read_file_rows(
         return rows[header_row], rows[header_row + 1:]
 
 
+def _read_workbook_rows(path: str) -> List[List[Any]]:
+    """Return every row from the active worksheet or CSV file."""
+    p = Path(path)
+    if p.suffix.lower() in (".xlsx", ".xls") and _HAS_OPENPYXL:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        return list(wb.active.iter_rows(values_only=True))
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return list(csv.reader(f))
+
+
+def _detect_header_row(
+    rows: List[List[Any]],
+    col_map: Dict[str, List[str]],
+    max_scan: int = 30,
+) -> int:
+    """Pick the row whose cells best match the expected import column headers."""
+    best_idx = 0
+    best_score = -1
+    for i, row in enumerate(rows[:max_scan]):
+        hdr_lower = {
+            str(c).strip().lower()
+            for c in row
+            if c is not None and str(c).strip()
+        }
+        if not hdr_lower:
+            continue
+        score = sum(
+            1 for cands in col_map.values()
+            if any(c.lower() in hdr_lower for c in cands)
+        )
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    return best_idx
+
+
+def _parse_rows_from_workbook(
+    path: str,
+    header_row: int,
+    auto_header_row: bool,
+    col_map: Dict[str, List[str]],
+) -> Tuple[List[str], List[List[Any]]]:
+    """Read a workbook and return (headers, data_rows)."""
+    rows = _read_workbook_rows(path)
+    if not rows:
+        return [], []
+    hdr_idx = _detect_header_row(rows, col_map) if auto_header_row else header_row
+    if len(rows) <= hdr_idx:
+        return [], []
+    headers = [str(c) if c is not None else "" for c in rows[hdr_idx]]
+    data = [
+        [str(c) if c is not None else "" for c in r]
+        for r in rows[hdr_idx + 1:]
+        if any(c is not None and str(c).strip() for c in r)
+    ]
+    return headers, data
+
+
 class ImportDialog(QDialog):
     """
     Generic file-import dialog.
@@ -490,6 +552,10 @@ class ImportDialog(QDialog):
     exist_fn        : coroutine  async fn(keys: list[str]) → set[str]
     header_row      : int   0-based row index of the column headers in the file
                             (default 0; use 1 for files with a title row above headers)
+    auto_header_row : bool  scan the sheet to find the header row automatically
+    template_title  : str   optional title row for downloadable template xlsx
+    template_headers: list  column headers for downloadable template (enables button)
+    template_filename: str  suggested filename for template download
     """
 
     imported = Signal(int)
@@ -503,6 +569,10 @@ class ImportDialog(QDialog):
         save_fn,
         exist_fn,
         header_row: int = 0,
+        auto_header_row: bool = False,
+        template_title: str = "",
+        template_headers: Optional[List[str]] = None,
+        template_filename: str = "import_template.xlsx",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -513,6 +583,10 @@ class ImportDialog(QDialog):
         self._save_fn         = save_fn
         self._exist_fn        = exist_fn
         self._header_row      = header_row
+        self._auto_header_row = auto_header_row
+        self._template_title  = template_title
+        self._template_headers = template_headers or []
+        self._template_filename = template_filename
 
         # A fresh UUID tags every record from this import session so we can
         # later group/browse records by upload batch.
@@ -538,12 +612,16 @@ class ImportDialog(QDialog):
         self._drop.file_dropped.connect(self._on_file)
         vl.addWidget(self._drop)
 
-        # Browse button
+        # Browse + optional template download
         browse_row = QWidget()
         browse_row.setStyleSheet("background:transparent;")
         brl = QHBoxLayout(browse_row)
         brl.setContentsMargins(0, 0, 0, 0)
         brl.setSpacing(8)
+        if self._template_headers:
+            tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+            tmpl_btn.clicked.connect(self._download_template)
+            brl.addWidget(tmpl_btn)
         browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
         browse_btn.clicked.connect(self._browse)
         brl.addStretch()
@@ -593,11 +671,36 @@ class ImportDialog(QDialog):
             self._drop.set_path(path)
             self._on_file(path)
 
+    def _download_template(self) -> None:
+        if not self._template_headers:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Import Template",
+            self._template_filename,
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            _write_xlsx_template(path, self._template_title, self._template_headers)
+            QMessageBox.information(
+                self, "Template Saved",
+                f"Empty template saved to:\n{path}\n\n"
+                "Fill in your data using the column headers shown, then import the file.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Template Error", str(exc))
+
     def _on_file(self, path: str) -> None:
         self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
         try:
-            headers, rows = _read_file_rows(path, self._header_row)
+            if self._auto_header_row:
+                headers, rows = _parse_rows_from_workbook(
+                    path, self._header_row, True, self._col_map,
+                )
+            else:
+                headers, rows = _read_file_rows(path, self._header_row)
         except Exception as exc:
             self._stats_lbl.setText(f"Error reading file: {exc}")
             return
@@ -683,6 +786,19 @@ class ImportDialog(QDialog):
 #  1. TollPlazaWidget
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _write_xlsx_template(path: str, title: str, headers: List[str]) -> None:
+    """Write an empty import template workbook with a title row and header row."""
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required to generate Excel templates.")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Import"
+    if title:
+        ws.append([title])
+    ws.append(headers)
+    wb.save(path)
+
+
 _TOLL_COL_MAP = {
     "toll_date":    ["toll date", "date", "transaction date"],
     "toll_plaza":   ["toll plaza", "plaza", "station"],
@@ -708,6 +824,312 @@ _TOLL_BROWSE_HEADERS = [
     "UPLOAD DATE", "FILE NAME", "RECORDS", "TOTAL (ZMW)", "DATE RANGE",
 ]
 
+_TOLL_TEMPLATE_TITLE = "Dot Com Zambia — Toll Plaza Export"
+
+_TOLL_MONTHS: List[Tuple[str, int]] = [
+    ("All Months", 0),
+    ("January", 1), ("February", 2), ("March", 3), ("April", 4),
+    ("May", 5), ("June", 6), ("July", 7), ("August", 8),
+    ("September", 9), ("October", 10), ("November", 11), ("December", 12),
+]
+
+_TOLL_SCROLL_CHUNK = 50
+_SCROLL_CHUNK = 50
+
+
+def _toll_fill_detail_row(t: QTableWidget, r: int, rec: dict) -> None:
+    """Populate one Toll Plaza record row (shared by detail + all-entries views)."""
+    t.setItem(r,  0, _cell(str(rec.get("toll_date",    "") or "")))
+    t.setItem(r,  1, _cell(str(rec.get("toll_plaza",   "") or "")))
+    t.setItem(r,  2, _cell(str(rec.get("client_name",  "") or "")))
+    t.setItem(r,  3, _cell(str(rec.get("card_no",      "") or "")))
+    t.setItem(r,  4, _cell(str(rec.get("vehicle_reg",  "") or "")))
+    t.setItem(r,  5, _cell(str(rec.get("vehicle_class","") or "")))
+    t.setItem(r,  6, _cell(
+        _fmt_num(rec.get("tender_amount"), "", 0),
+        align=Qt.AlignRight | Qt.AlignVCenter,
+    ))
+    t.setItem(r,  7, _cell(str(rec.get("receipt_no",   "") or "")))
+    t.setItem(r,  8, _cell(str(rec.get("device",       "") or "")))
+    t.setItem(r,  9, _cell(str(rec.get("lane",         "") or ""),
+                           align=Qt.AlignCenter | Qt.AlignVCenter))
+    t.setItem(r, 10, _cell(str(rec.get("cashier_name", "") or "")))
+    _finish_table_row(t, r)
+
+
+class _SegmentTabBar(QWidget):
+    """Two-or-more-option segmented tab control."""
+
+    tab_changed = Signal(int)
+
+    def __init__(self, labels: List[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._index = 0
+        self._buttons: List[QPushButton] = []
+        self.setStyleSheet("background:transparent;")
+        hl = QHBoxLayout(self)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(4)
+        for i, label in enumerate(labels):
+            btn = QPushButton(label)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(32)
+            btn.clicked.connect(lambda checked=False, idx=i: self.set_index(idx))
+            self._buttons.append(btn)
+            hl.addWidget(btn)
+        hl.addStretch()
+        self._apply_styles()
+
+    def set_index(self, idx: int, emit: bool = True) -> None:
+        if idx < 0 or idx >= len(self._buttons):
+            return
+        self._index = idx
+        self._apply_styles()
+        if emit:
+            self.tab_changed.emit(idx)
+
+    def current_index(self) -> int:
+        return self._index
+
+    def _apply_styles(self) -> None:
+        active = (
+            f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:5px;"
+            f"font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 16px;}}"
+            f"QPushButton:hover{{background:#005EA3;}}"
+        )
+        inactive = (
+            f"QPushButton{{background:{_WHITE};color:{_T1};border:1px solid {_BORDER};"
+            f"border-radius:5px;font-size:12px;font-family:'Segoe UI';padding:0 16px;}}"
+            f"QPushButton:hover{{background:{_BG};}}"
+        )
+        for i, btn in enumerate(self._buttons):
+            btn.setStyleSheet(active if i == self._index else inactive)
+
+
+def _populate_year_combo(cb: QComboBox, years: List[int], selected_year: int) -> int:
+    """Rebuild a year filter combo from uploaded data; return the active year."""
+    cb.blockSignals(True)
+    cb.clear()
+    cb.addItem("All Years", 0)
+    for year in years:
+        cb.addItem(str(year), year)
+    active = selected_year
+    if selected_year > 0:
+        idx = cb.findData(selected_year)
+        if idx >= 0:
+            cb.setCurrentIndex(idx)
+        else:
+            active = 0
+            cb.setCurrentIndex(0)
+    cb.blockSignals(False)
+    return active
+
+
+class _TollAllEntries(QWidget):
+    """Flat, filterable list of every Toll Plaza record — infinite scroll."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._search  = ""
+        self._year    = 0
+        self._month   = 0
+        self._loaded  = 0
+        self._total   = 0
+        self._loading = False
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search vehicle, plaza, receipt, cashier…")
+        self._search_edit.setFixedWidth(280)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._year_cb = QComboBox()
+        self._year_cb.addItem("All Years", 0)
+        self._year_cb.setFixedWidth(110)
+        self._year_cb.setStyleSheet(_input_ss())
+        self._year_cb.currentIndexChanged.connect(self._on_year)
+        tbl.addWidget(self._year_cb)
+
+        self._month_cb = QComboBox()
+        for label, val in _TOLL_MONTHS:
+            self._month_cb.addItem(label, val)
+        self._month_cb.setFixedWidth(130)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.setEnabled(False)
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+
+        self._from_date, self._to_date = add_from_to_editors(
+            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=True,
+        )
+
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._totals = _TotalsBar([("zmw", "ZMW "), ("count", "Total records: ")])
+        vl.addWidget(self._totals)
+
+        self._table = _make_table(_TOLL_DETAIL_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        vl.addWidget(self._table, 1)
+
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._reload_years_and_data())
+
+    async def _reload_years_and_data(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            years = await svc.get_toll_plaza_available_years()
+        except Exception:
+            years = []
+        self._year = _populate_year_combo(self._year_cb, years, self._year)
+        if self._year <= 0:
+            self._month = 0
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(False)
+            self._month_cb.blockSignals(False)
+        self._reset_and_load()
+
+    def _effective_month(self) -> int:
+        return self._month if self._year > 0 else 0
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(
+            f"Showing {self._loaded:,} of {self._total:,}{suffix}"
+        )
+
+    async def _load_initial(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            totals, recs, total = await asyncio.gather(
+                svc.get_toll_plaza_all_totals(self._search, self._year, month, **self._date_kw()),
+                svc.get_toll_plaza_all_records(
+                    self._search, self._year, month,
+                    limit=_TOLL_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                ),
+                svc.count_toll_plaza_all_records(self._search, self._year, month, **self._date_kw()),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        self._totals.set_total("zmw",   float(totals.get("total_zmw", 0)), "ZMW ")
+        self._totals.set_total("count", int(totals.get("count", 0)), "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            recs = await svc.get_toll_plaza_all_records(
+                self._search, self._year, month,
+                limit=_TOLL_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
+        for rec in recs:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _toll_fill_detail_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._reset_and_load()
+
+    def _date_kw(self) -> dict:
+        if not hasattr(self, "_from_date"):
+            return {}
+        df, dt = read_from_to(self._from_date, self._to_date, optional=True)
+        return {"date_from": df, "date_to": dt}
+
+    def _on_year(self, _idx: int) -> None:
+        self._year = int(self._year_cb.currentData() or 0)
+        has_year = self._year > 0
+        self._month_cb.setEnabled(has_year)
+        if not has_year:
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.blockSignals(False)
+            self._month = 0
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+    def _on_month(self, _idx: int) -> None:
+        self._month = int(self._month_cb.currentData() or 0)
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Upload Browse sub-widget — one row per import batch
@@ -717,6 +1139,7 @@ class _TollUploadBrowse(QWidget):
     """Table of every Toll Plaza import batch. Clicking a row drills into it."""
 
     upload_clicked = Signal(object)   # emits the upload summary dict
+    delete_clicked = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -743,9 +1166,14 @@ class _TollUploadBrowse(QWidget):
         self._table.setStyleSheet(_table_style())
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table, 1)
 
-        hint = _lbl("Click any row to view the full records for that upload.", size=11, color=_TM)
+        hint = _lbl(
+            "Click any row to view its records · right-click to delete an upload.",
+            size=11, color=_TM,
+        )
         hint.setAlignment(Qt.AlignCenter)
         vl.addWidget(hint)
 
@@ -781,7 +1209,7 @@ class _TollUploadBrowse(QWidget):
             t.setItem(r, 0, _cell(date_str))
             t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
             t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 3, _cell(f"{zmw:,.0f}", mono=True, align=Qt.AlignRight | Qt.AlignVCenter))
+            t.setItem(r, 3, _cell(f"{zmw:,.0f}", align=Qt.AlignRight | Qt.AlignVCenter))
             t.setItem(r, 4, _cell(date_range))
             _finish_table_row(t, r)
             total_zmw  += zmw
@@ -794,6 +1222,15 @@ class _TollUploadBrowse(QWidget):
         if row < len(self._uploads):
             self.upload_clicked.emit(self._uploads[row])
 
+    def _on_menu(self, pos) -> None:
+        row = self._table.rowAt(pos.y())
+        if not (0 <= row < len(self._uploads)):
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Delete this upload")
+        if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
+            self.delete_clicked.emit(self._uploads[row])
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Upload Detail sub-widget — all records for one import batch
@@ -803,14 +1240,16 @@ class _TollUploadDetail(QWidget):
     """Full record table for a single Toll Plaza upload batch."""
 
     back_requested = Signal()
+    delete_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._upload_id = ""
+        self._upload_doc: dict = {}
         self._search    = ""
-        self._page      = 1
-        self._page_size = 50
+        self._loaded    = 0
         self._total     = 0
+        self._loading   = False
         self._build()
 
     def _build(self) -> None:
@@ -833,6 +1272,10 @@ class _TollUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
+
+        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
+        delete_btn.clicked.connect(self._request_delete)
+        navl.addWidget(delete_btn)
         vl.addWidget(nav)
 
         # ── Info strip ────────────────────────────────────────────────────
@@ -859,18 +1302,18 @@ class _TollUploadDetail(QWidget):
         self._table = _make_table(_TOLL_DETAIL_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         vl.addWidget(self._table, 1)
 
-        # ── Footer ───────────────────────────────────────────────────────
         self._totals = _TotalsBar([("zmw", "ZMW "), ("count", "Records: ")])
         vl.addWidget(self._totals)
 
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
 
     def load_upload(self, upload_doc: dict) -> None:
+        self._upload_doc = upload_doc
         self._upload_id = str(upload_doc.get("_id") or "")
         filename   = upload_doc.get("source_filename") or "Unknown file"
         count      = int(upload_doc.get("record_count", 0))
@@ -892,62 +1335,89 @@ class _TollUploadDetail(QWidget):
         self._search_edit.blockSignals(True)
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    async def _load(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        if not self._upload_id:
-            return
-        skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_toll_plaza_upload_records(
-                self._upload_id, self._search, self._page_size, skip
-            ),
-            svc.count_toll_plaza_upload_records(self._upload_id, self._search),
+    def _request_delete(self) -> None:
+        if self._upload_doc:
+            self.delete_requested.emit(self._upload_doc)
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(
+            f"Showing {self._loaded:,} of {self._total:,}{suffix}"
         )
-        self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
-        # Update totals with live search count
-        self._totals.set_total("count", total, "")
 
-    def _fill_table(self, recs: List[dict]) -> None:
-        t = self._table
-        t.setRowCount(0)
+    async def _load_initial(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs, total = await asyncio.gather(
+                svc.get_toll_plaza_upload_records(
+                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                ),
+                svc.count_toll_plaza_upload_records(self._upload_id, self._search),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        self._totals.set_total("count", total, "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs = await svc.get_toll_plaza_upload_records(
+                self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
         for rec in recs:
-            r = t.rowCount()
-            t.insertRow(r)
-            t.setItem(r,  0, _cell(str(rec.get("toll_date",    "") or "")))
-            t.setItem(r,  1, _cell(str(rec.get("toll_plaza",   "") or "")))
-            t.setItem(r,  2, _cell(str(rec.get("client_name",  "") or "")))
-            t.setItem(r,  3, _cell(str(rec.get("card_no",      "") or "")))
-            t.setItem(r,  4, _cell(str(rec.get("vehicle_reg",  "") or "")))
-            t.setItem(r,  5, _cell(str(rec.get("vehicle_class","") or "")))
-            t.setItem(r,  6, _cell(
-                _fmt_num(rec.get("tender_amount"), "", 0),
-                mono=True, align=Qt.AlignRight | Qt.AlignVCenter,
-            ))
-            t.setItem(r,  7, _cell(str(rec.get("receipt_no",   "") or "")))
-            t.setItem(r,  8, _cell(str(rec.get("device",       "") or "")))
-            t.setItem(r,  9, _cell(str(rec.get("lane",         "") or ""),
-                                   align=Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 10, _cell(str(rec.get("cashier_name", "") or "")))
-            _finish_table_row(t, r)
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _toll_fill_detail_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page   = 1
-        asyncio.ensure_future(self._load())
-
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page      = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -958,9 +1428,9 @@ class TollPlazaWidget(QWidget):
     """
     Toll Plaza main page.
 
-    Browse tab (default): one row per import batch — date, filename, record
-    count, total ZMW, date range.  Clicking a row drills into the full
-    per-record detail view for that upload.
+    All Entries tab: every record across uploads with month/year filters and
+    infinite scroll.  Uploads tab: batch browse list; clicking a row drills
+    into the per-record detail view for that upload.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -974,43 +1444,81 @@ class TollPlazaWidget(QWidget):
         vl.setContentsMargins(20, 20, 20, 16)
         vl.setSpacing(12)
 
-        # ── Page header (always visible) ───────────────────────────────────
         header = _PageHeader("Toll Plaza", "mdi.boom-gate")
+        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+        tmpl_btn.clicked.connect(self._download_template)
         self._import_btn = _btn("Import from Dot Com Zambia", "mdi.upload-outline")
         self._import_btn.clicked.connect(self._open_import)
+        header.add_right(tmpl_btn)
         header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        # ── Master / detail stack ──────────────────────────────────────────
-        self._stack = QStackedWidget()
-        self._stack.setStyleSheet("background:transparent;")
+        self._tabs = _SegmentTabBar(["All Entries", "Uploads"])
+        vl.addWidget(self._tabs)
+
+        self._main_stack = QStackedWidget()
+        self._main_stack.setStyleSheet("background:transparent;")
+
+        self._all_entries = _TollAllEntries()
+        self._main_stack.addWidget(self._all_entries)
+
+        upload_host = QWidget()
+        upload_host.setStyleSheet("background:transparent;")
+        upload_vl = QVBoxLayout(upload_host)
+        upload_vl.setContentsMargins(0, 0, 0, 0)
+        upload_vl.setSpacing(0)
+
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
 
         self._browse = _TollUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
-        self._stack.addWidget(self._browse)      # index 0 — Upload list
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._browse)
 
         self._detail = _TollUploadDetail()
         self._detail.back_requested.connect(self._show_browse)
-        self._stack.addWidget(self._detail)      # index 1 — Record detail
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
 
-        self._stack.setCurrentIndex(0)
-        vl.addWidget(self._stack, 1)
+        upload_vl.addWidget(self._upload_stack, 1)
+        self._main_stack.addWidget(upload_host)
 
-    # ── Public API ─────────────────────────────────────────────────────────
+        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        vl.addWidget(self._main_stack, 1)
 
     def refresh(self) -> None:
+        self._all_entries.refresh()
         self._show_browse()
 
-    # ── Internal ───────────────────────────────────────────────────────────
-
     def _show_browse(self) -> None:
-        self._stack.setCurrentIndex(0)
+        self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._tabs.set_index(1, emit=False)
+        self._main_stack.setCurrentIndex(1)
+        self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
-        self._stack.setCurrentIndex(1)
+
+    def _download_template(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Import Template",
+            "Toll_Plaza_Import_Template.xlsx",
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            _write_xlsx_template(path, _TOLL_TEMPLATE_TITLE, _TOLL_DETAIL_HEADERS)
+            QMessageBox.information(
+                self, "Template Saved",
+                f"Empty template saved to:\n{path}\n\n"
+                "Fill in your data using the column headers shown, then import the file.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -1021,7 +1529,10 @@ class TollPlazaWidget(QWidget):
             col_map=_TOLL_COL_MAP,
             save_fn=svc.save_imported_feed,
             exist_fn=svc.get_existing_feed_keys,
-            header_row=1,   # Dot Com Zambia xlsx has a title row above the headers
+            header_row=1,
+            template_title=_TOLL_TEMPLATE_TITLE,
+            template_headers=_TOLL_DETAIL_HEADERS,
+            template_filename="Toll_Plaza_Import_Template.xlsx",
             parent=self,
         )
         dlg.imported.connect(self._on_imported)
@@ -1029,6 +1540,39 @@ class TollPlazaWidget(QWidget):
 
     def _on_imported(self, n: int) -> None:
         QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        self._all_entries.refresh()
+        self._show_browse()
+        self._tabs.set_index(1)
+
+    def _on_delete_upload(self, upload_doc: dict) -> None:
+        upload_id = str(upload_doc.get("_id") or "")
+        if not upload_id:
+            return
+        filename = upload_doc.get("source_filename") or "Unknown file"
+        count = int(upload_doc.get("record_count", 0))
+        if QMessageBox.question(
+            self,
+            "Delete Upload",
+            f"Delete \"{filename}\" and all {count:,} records in this upload?\n\n"
+            "This cannot be undone.",
+        ) != QMessageBox.Yes:
+            return
+        asyncio.ensure_future(self._delete_upload(upload_id))
+
+    async def _delete_upload(self, upload_id: str) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            deleted = await svc.delete_toll_plaza_upload(upload_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete Error", str(exc))
+            return
+        if deleted <= 0:
+            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
+            return
+        QMessageBox.information(
+            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+        )
+        self._all_entries.refresh()
         self._show_browse()
 
 
@@ -1047,7 +1591,7 @@ _PCONGO_COL_MAP = {
     "vehicle_no":          ["vehicle #", "vehicle no", "vehicle", "plate"],
     "direction":           ["direction", "dir"],
     "gate_in":             ["gate in", "in"],
-    "transaction_details": ["transaction details", "details", "trans details"],
+    "transaction_details": ["transaction details", "details", "trans details", "ticket"],
 }
 
 _PCONGO_DETAIL_HEADERS = [
@@ -1055,9 +1599,16 @@ _PCONGO_DETAIL_HEADERS = [
     "CASHIER", "VEHICLE #", "DIRECTION", "GATE IN", "TRANSACTION DETAILS",
 ]
 
+_PCONGO_TEMPLATE_HEADERS = [
+    "#", "LEDGER ID", "PAYMENT DATE", "TYPE", "AMOUNT", "RUNNING BAL",
+    "CASHIER", "VEHICLE #", "DIRECTION", "GATE IN", "TICKET",
+]
+
 _PCONGO_BROWSE_HEADERS = [
     "UPLOAD DATE", "FILE NAME", "RECORDS", "DATE RANGE",
 ]
+
+_PCONGO_SCROLL_CHUNK = 50
 
 
 def _pcongo_amount_color(amt_str: str) -> str:
@@ -1068,6 +1619,240 @@ def _pcongo_amount_color(amt_str: str) -> str:
         return _T1
 
 
+def _pcongo_fill_detail_row(t: QTableWidget, r: int, rec: dict) -> None:
+    """Populate one Parking Congo record row (shared by detail + all-entries views)."""
+    amt_str = str(rec.get("amount", "") or "")
+    amt_color = _pcongo_amount_color(amt_str)
+    try:
+        amt_display = _fmt_num(float(amt_str), "", 2)
+    except (ValueError, TypeError):
+        amt_display = amt_str or "—"
+
+    t.setItem(r,  0, _cell(str(rec.get("sn", "") or "")))
+    t.setItem(r,  1, _cell(str(rec.get("ledger_id", "") or "")))
+    t.setItem(r,  2, _cell(str(rec.get("payment_date", "") or "")))
+    t.setItem(r,  3, _cell(str(rec.get("transaction_type", "") or ""), color=amt_color))
+    t.setItem(r,  4, _cell(
+        amt_display, align=Qt.AlignRight | Qt.AlignVCenter, color=amt_color,
+    ))
+    t.setItem(r,  5, _cell(
+        str(rec.get("running_bal", "") or ""),
+        align=Qt.AlignRight | Qt.AlignVCenter,
+    ))
+    t.setItem(r,  6, _cell(str(rec.get("cashier", "") or "")))
+    t.setItem(r,  7, _cell(str(rec.get("vehicle_no", "") or "")))
+    t.setItem(r,  8, _cell(str(rec.get("direction", "") or "")))
+    t.setItem(r,  9, _cell(str(rec.get("gate_in", "") or "")))
+    t.setItem(r, 10, _cell(str(rec.get("transaction_details", "") or "")))
+    _finish_table_row(t, r)
+
+
+class _ParkingCongoAllEntries(QWidget):
+    """Flat, filterable list of every Parking Congo record — infinite scroll."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._search  = ""
+        self._year    = 0
+        self._month   = 0
+        self._loaded  = 0
+        self._total   = 0
+        self._loading = False
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search vehicle, ledger ID, type, cashier…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._year_cb = QComboBox()
+        self._year_cb.addItem("All Years", 0)
+        self._year_cb.setFixedWidth(110)
+        self._year_cb.setStyleSheet(_input_ss())
+        self._year_cb.currentIndexChanged.connect(self._on_year)
+        tbl.addWidget(self._year_cb)
+
+        self._month_cb = QComboBox()
+        for label, val in _TOLL_MONTHS:
+            self._month_cb.addItem(label, val)
+        self._month_cb.setFixedWidth(130)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.setEnabled(False)
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+
+        self._from_date, self._to_date = add_from_to_editors(
+            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=True,
+        )
+
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._totals = _TotalsBar([("amount", "Total: "), ("count", "Total records: ")])
+        vl.addWidget(self._totals)
+
+        self._table = _make_table(_PCONGO_DETAIL_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        vl.addWidget(self._table, 1)
+
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._reload_years_and_data())
+
+    async def _reload_years_and_data(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            years = await svc.get_parking_congo_available_years()
+        except Exception:
+            years = []
+        self._year = _populate_year_combo(self._year_cb, years, self._year)
+        if self._year <= 0:
+            self._month = 0
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(False)
+            self._month_cb.blockSignals(False)
+        self._reset_and_load()
+
+    def _effective_month(self) -> int:
+        return self._month if self._year > 0 else 0
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(
+            f"Showing {self._loaded:,} of {self._total:,}{suffix}"
+        )
+
+    async def _load_initial(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            totals, recs, total = await asyncio.gather(
+                svc.get_parking_congo_all_totals(self._search, self._year, month, **self._date_kw()),
+                svc.get_parking_congo_all_records(
+                    self._search, self._year, month,
+                    limit=_PCONGO_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                ),
+                svc.count_parking_congo_all_records(self._search, self._year, month, **self._date_kw()),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        self._totals.set_total("amount", float(totals.get("amount", 0)), "")
+        self._totals.set_total("count",  int(totals.get("count", 0)), "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            recs = await svc.get_parking_congo_all_records(
+                self._search, self._year, month,
+                limit=_PCONGO_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
+        for rec in recs:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _pcongo_fill_detail_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._reset_and_load()
+
+    def _date_kw(self) -> dict:
+        if not hasattr(self, "_from_date"):
+            return {}
+        df, dt = read_from_to(self._from_date, self._to_date, optional=True)
+        return {"date_from": df, "date_to": dt}
+
+    def _on_year(self, _idx: int) -> None:
+        self._year = int(self._year_cb.currentData() or 0)
+        has_year = self._year > 0
+        self._month_cb.setEnabled(has_year)
+        if not has_year:
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.blockSignals(False)
+            self._month = 0
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+    def _on_month(self, _idx: int) -> None:
+        self._month = int(self._month_cb.currentData() or 0)
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Upload Browse sub-widget — one row per import batch
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1076,6 +1861,7 @@ class _ParkingCongoUploadBrowse(QWidget):
     """Table of every Parking Congo import batch. Clicking a row drills into it."""
 
     upload_clicked = Signal(object)
+    delete_clicked = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1097,9 +1883,14 @@ class _ParkingCongoUploadBrowse(QWidget):
         self._table.setStyleSheet(_table_style())
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table, 1)
 
-        hint = _lbl("Click any row to view the full records for that upload.", size=11, color=_TM)
+        hint = _lbl(
+            "Click any row to view its records · right-click to delete an upload.",
+            size=11, color=_TM,
+        )
         hint.setAlignment(Qt.AlignCenter)
         vl.addWidget(hint)
 
@@ -1139,6 +1930,15 @@ class _ParkingCongoUploadBrowse(QWidget):
         if row < len(self._uploads):
             self.upload_clicked.emit(self._uploads[row])
 
+    def _on_menu(self, pos) -> None:
+        row = self._table.rowAt(pos.y())
+        if not (0 <= row < len(self._uploads)):
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Delete this upload")
+        if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
+            self.delete_clicked.emit(self._uploads[row])
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Upload Detail sub-widget — all records for one import batch
@@ -1148,10 +1948,12 @@ class _ParkingCongoUploadDetail(QWidget):
     """Full record table for a single Parking Congo upload batch."""
 
     back_requested = Signal()
+    delete_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._upload_id = ""
+        self._upload_doc: dict = {}
         self._search    = ""
         self._page      = 1
         self._page_size = 50
@@ -1177,6 +1979,10 @@ class _ParkingCongoUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
+
+        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
+        delete_btn.clicked.connect(self._request_delete)
+        navl.addWidget(delete_btn)
         vl.addWidget(nav)
 
         self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
@@ -1211,6 +2017,7 @@ class _ParkingCongoUploadDetail(QWidget):
         vl.addWidget(self._pager)
 
     def load_upload(self, upload_doc: dict) -> None:
+        self._upload_doc = upload_doc
         self._upload_id = str(upload_doc.get("_id") or "")
         filename  = upload_doc.get("source_filename") or "Unknown file"
         count     = int(upload_doc.get("record_count", 0))
@@ -1231,6 +2038,10 @@ class _ParkingCongoUploadDetail(QWidget):
         self._search_edit.blockSignals(False)
         self._page = 1
         asyncio.ensure_future(self._load())
+
+    def _request_delete(self) -> None:
+        if self._upload_doc:
+            self.delete_requested.emit(self._upload_doc)
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -1254,27 +2065,7 @@ class _ParkingCongoUploadDetail(QWidget):
         for rec in recs:
             r = t.rowCount()
             t.insertRow(r)
-            amt_str   = str(rec.get("amount", "") or "")
-            amt_color = _pcongo_amount_color(amt_str)
-            try:
-                amt_display = _fmt_num(float(amt_str), "", 0)
-            except (ValueError, TypeError):
-                amt_display = amt_str or "—"
-
-            t.setItem(r,  0, _cell(str(rec.get("sn", "") or "")))
-            t.setItem(r,  1, _cell(str(rec.get("ledger_id", "") or "")))
-            t.setItem(r,  2, _cell(str(rec.get("payment_date", "") or "")))
-            t.setItem(r,  3, _cell(str(rec.get("transaction_type", "") or ""), color=amt_color))
-            t.setItem(r,  4, _cell(amt_display, mono=True,
-                                   align=Qt.AlignRight | Qt.AlignVCenter, color=amt_color))
-            t.setItem(r,  5, _cell(str(rec.get("running_bal", "") or ""), mono=True,
-                                   align=Qt.AlignRight | Qt.AlignVCenter))
-            t.setItem(r,  6, _cell(str(rec.get("cashier", "") or "")))
-            t.setItem(r,  7, _cell(str(rec.get("vehicle_no", "") or "")))
-            t.setItem(r,  8, _cell(str(rec.get("direction", "") or "")))
-            t.setItem(r,  9, _cell(str(rec.get("gate_in", "") or "")))
-            t.setItem(r, 10, _cell(str(rec.get("transaction_details", "") or "")))
-            _finish_table_row(t, r)
+            _pcongo_fill_detail_row(t, r, rec)
 
     def _on_search(self, text: str) -> None:
         self._search = text
@@ -1297,7 +2088,11 @@ class _ParkingCongoUploadDetail(QWidget):
 
 class ParkingCongoWidget(QWidget):
     """
-    Parking Congo main page — browse uploads then drill into per-record detail.
+    Parking Congo main page.
+
+    All Entries tab: every record across uploads with month/year filters and
+    infinite scroll.  Uploads tab: batch browse list; clicking a row drills
+    into the per-record detail view for that upload.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -1312,36 +2107,80 @@ class ParkingCongoWidget(QWidget):
         vl.setSpacing(12)
 
         header = _PageHeader("Parking Congo", "mdi.parking")
+        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+        tmpl_btn.clicked.connect(self._download_template)
         self._import_btn = _btn("Import from Congo Ledger", "mdi.upload-outline")
         self._import_btn.clicked.connect(self._open_import)
+        header.add_right(tmpl_btn)
         header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._stack = QStackedWidget()
-        self._stack.setStyleSheet("background:transparent;")
+        self._tabs = _SegmentTabBar(["All Entries", "Uploads"])
+        vl.addWidget(self._tabs)
+
+        self._main_stack = QStackedWidget()
+        self._main_stack.setStyleSheet("background:transparent;")
+
+        self._all_entries = _ParkingCongoAllEntries()
+        self._main_stack.addWidget(self._all_entries)
+
+        upload_host = QWidget()
+        upload_host.setStyleSheet("background:transparent;")
+        upload_vl = QVBoxLayout(upload_host)
+        upload_vl.setContentsMargins(0, 0, 0, 0)
+        upload_vl.setSpacing(0)
+
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
 
         self._browse = _ParkingCongoUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
-        self._stack.addWidget(self._browse)      # index 0 — Upload list
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._browse)
 
         self._detail = _ParkingCongoUploadDetail()
         self._detail.back_requested.connect(self._show_browse)
-        self._stack.addWidget(self._detail)      # index 1 — Record detail
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
 
-        self._stack.setCurrentIndex(0)
-        vl.addWidget(self._stack, 1)
+        upload_vl.addWidget(self._upload_stack, 1)
+        self._main_stack.addWidget(upload_host)
+
+        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        vl.addWidget(self._main_stack, 1)
 
     def refresh(self) -> None:
+        self._all_entries.refresh()
         self._show_browse()
 
     def _show_browse(self) -> None:
-        self._stack.setCurrentIndex(0)
+        self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._tabs.set_index(1, emit=False)
+        self._main_stack.setCurrentIndex(1)
+        self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
-        self._stack.setCurrentIndex(1)
+
+    def _download_template(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Import Template",
+            "Parking_Congo_Import_Template.xlsx",
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            _write_xlsx_template(path, "", _PCONGO_TEMPLATE_HEADERS)
+            QMessageBox.information(
+                self, "Template Saved",
+                f"Empty template saved to:\n{path}\n\n"
+                "Fill in your data using the column headers shown, then import the file.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -1352,7 +2191,10 @@ class ParkingCongoWidget(QWidget):
             col_map=_PCONGO_COL_MAP,
             save_fn=svc.save_imported_feed,
             exist_fn=svc.get_existing_feed_keys,
-            header_row=8,   # Congo ledger xlsx has 8 title rows before the column headers
+            auto_header_row=True,
+            template_title="",
+            template_headers=_PCONGO_TEMPLATE_HEADERS,
+            template_filename="Parking_Congo_Import_Template.xlsx",
             parent=self,
         )
         dlg.imported.connect(self._on_imported)
@@ -1360,6 +2202,39 @@ class ParkingCongoWidget(QWidget):
 
     def _on_imported(self, n: int) -> None:
         QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        self._all_entries.refresh()
+        self._show_browse()
+        self._tabs.set_index(1)
+
+    def _on_delete_upload(self, upload_doc: dict) -> None:
+        upload_id = str(upload_doc.get("_id") or "")
+        if not upload_id:
+            return
+        filename = upload_doc.get("source_filename") or "Unknown file"
+        count = int(upload_doc.get("record_count", 0))
+        if QMessageBox.question(
+            self,
+            "Delete Upload",
+            f"Delete \"{filename}\" and all {count:,} records in this upload?\n\n"
+            "This cannot be undone.",
+        ) != QMessageBox.Yes:
+            return
+        asyncio.ensure_future(self._delete_upload(upload_id))
+
+    async def _delete_upload(self, upload_id: str) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            deleted = await svc.delete_parking_congo_upload(upload_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete Error", str(exc))
+            return
+        if deleted <= 0:
+            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
+            return
+        QMessageBox.information(
+            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+        )
+        self._all_entries.refresh()
         self._show_browse()
 
 
@@ -1482,12 +2357,277 @@ def _congo_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     t.setItem(r, 4, _cell(rec.get("description", "")))
     t.setItem(r, 5, _cell(
         _kimvi_fmt_amount(amt_f),
-        mono=True,
         color=amt_clr,
         align=Qt.AlignRight | Qt.AlignVCenter,
     ))
     _apply_row_bg(t, r, row_bg)
     t.setRowHeight(r, _ROW_H)
+
+
+def _make_congo_summary_cards() -> Tuple[QFrame, QLabel, QLabel, QLabel]:
+    """Money In / Money Out / Balance summary strip for Congo views."""
+    frame = QFrame()
+    frame.setStyleSheet(
+        f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
+        "border-radius:6px;padding:8px;}}"
+    )
+    sl = QHBoxLayout(frame)
+    sl.setContentsMargins(12, 8, 12, 8)
+    sl.setSpacing(24)
+    in_lbl  = _lbl("Money In: —", size=12, weight=600, color=_GREEN)
+    out_lbl = _lbl("Money Out: —", size=12, color=_T2)
+    bal_lbl = _lbl("Balance: —", size=12, weight=600, color=_T1)
+    sl.addWidget(in_lbl)
+    sl.addWidget(out_lbl)
+    sl.addWidget(bal_lbl)
+    sl.addStretch()
+    return frame, in_lbl, out_lbl, bal_lbl
+
+
+def _set_congo_summary(in_lbl: QLabel, out_lbl: QLabel, bal_lbl: QLabel,
+                       money_in: float, money_out: float) -> None:
+    balance = money_in + money_out
+    in_lbl.setText(f"Money In: USD {_kimvi_fmt_amount(money_in)}")
+    out_lbl.setText(f"Money Out: USD {_kimvi_fmt_amount(money_out)}")
+    bal_color = _CREDIT_FG if balance < 0 else (_RED if balance > 0 else _T1)
+    bal_lbl.setText(f"Balance: USD {_kimvi_fmt_amount(balance)}")
+    bal_lbl.setStyleSheet(
+        f"color:{bal_color};font-size:12px;font-weight:600;"
+        "font-family:'Segoe UI';background:transparent;"
+    )
+
+
+class _CongoEntriesBase(QWidget):
+    """Shared flat-list view for Congo All Entries / Money In tabs."""
+
+    def __init__(self, money_in_only: bool = False, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._money_in_only = money_in_only
+        self._search  = ""
+        self._year    = 0
+        self._month   = 0
+        self._loaded  = 0
+        self._total   = 0
+        self._loading = False
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search LPO, truck, description, date…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._year_cb = QComboBox()
+        self._year_cb.addItem("All Years", 0)
+        self._year_cb.setFixedWidth(110)
+        self._year_cb.setStyleSheet(_input_ss())
+        self._year_cb.currentIndexChanged.connect(self._on_year)
+        tbl.addWidget(self._year_cb)
+
+        self._month_cb = QComboBox()
+        for label, val in _TOLL_MONTHS:
+            self._month_cb.addItem(label, val)
+        self._month_cb.setFixedWidth(130)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.setEnabled(False)
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+
+        self._from_date, self._to_date = add_from_to_editors(
+            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=True,
+        )
+
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
+            _make_congo_summary_cards()
+        )
+        vl.addWidget(self._summary_frame)
+
+        self._totals = _TotalsBar([("count", "Total records: ")])
+        vl.addWidget(self._totals)
+
+        self._table = _make_kimvi_table(_CONGO_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        vl.addWidget(self._table, 1)
+
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._reload_years_and_data())
+
+    async def _reload_years_and_data(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            years = await svc.get_congo_available_years()
+        except Exception:
+            years = []
+        self._year = _populate_year_combo(self._year_cb, years, self._year)
+        if self._year <= 0:
+            self._month = 0
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(False)
+            self._month_cb.blockSignals(False)
+        self._reset_and_load()
+
+    def _effective_month(self) -> int:
+        return self._month if self._year > 0 else 0
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(
+            f"Showing {self._loaded:,} of {self._total:,}{suffix}"
+        )
+
+    async def _load_initial(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            totals, recs, total = await asyncio.gather(
+                svc.get_congo_all_totals(
+                    self._search, self._year, month,
+                    money_in_only=self._money_in_only, **self._date_kw(),
+                ),
+                svc.get_congo_all_records(
+                    self._search, self._year, month,
+                    money_in_only=self._money_in_only,
+                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                ),
+                svc.count_congo_all_records(
+                    self._search, self._year, month,
+                    money_in_only=self._money_in_only, **self._date_kw(),
+                ),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        _set_congo_summary(
+            self._in_lbl, self._out_lbl, self._bal_lbl,
+            float(totals.get("money_in", 0)),
+            float(totals.get("money_out", 0)),
+        )
+        self._totals.set_total("count", int(totals.get("count", 0)), "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            recs = await svc.get_congo_all_records(
+                self._search, self._year, month,
+                money_in_only=self._money_in_only,
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
+        for rec in recs:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _congo_fill_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._reset_and_load()
+
+    def _date_kw(self) -> dict:
+        if not hasattr(self, "_from_date"):
+            return {}
+        df, dt = read_from_to(self._from_date, self._to_date, optional=True)
+        return {"date_from": df, "date_to": dt}
+
+    def _on_year(self, _idx: int) -> None:
+        self._year = int(self._year_cb.currentData() or 0)
+        has_year = self._year > 0
+        self._month_cb.setEnabled(has_year)
+        if not has_year:
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.blockSignals(False)
+            self._month = 0
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+    def _on_month(self, _idx: int) -> None:
+        self._month = int(self._month_cb.currentData() or 0)
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+
+class _CongoAllEntries(_CongoEntriesBase):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(money_in_only=False, parent=parent)
+
+
+class _CongoMoneyInEntries(_CongoEntriesBase):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(money_in_only=True, parent=parent)
 
 
 class CongoImportDialog(QDialog):
@@ -1657,6 +2797,7 @@ class CongoImportDialog(QDialog):
 
 class _CongoExpUploadBrowse(QWidget):
     upload_clicked = Signal(object)
+    delete_clicked = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1685,10 +2826,12 @@ class _CongoExpUploadBrowse(QWidget):
         self._table.setColumnWidth(4, 120)
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click any row to view the full records for that upload.",
+            "Click any row to view its records · right-click to delete an upload.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -1736,7 +2879,6 @@ class _CongoExpUploadBrowse(QWidget):
             bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else "")
             t.setItem(r, 4, _cell(
                 _kimvi_fmt_amount(balance),
-                mono=True,
                 color=bal_color,
                 align=Qt.AlignRight | Qt.AlignVCenter,
             ))
@@ -1753,17 +2895,28 @@ class _CongoExpUploadBrowse(QWidget):
         if row < len(self._uploads):
             self.upload_clicked.emit(self._uploads[row])
 
+    def _on_menu(self, pos) -> None:
+        row = self._table.rowAt(pos.y())
+        if not (0 <= row < len(self._uploads)):
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Delete this upload")
+        if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
+            self.delete_clicked.emit(self._uploads[row])
+
 
 class _CongoExpUploadDetail(QWidget):
     back_requested = Signal()
+    delete_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._upload_id = ""
+        self._upload_doc: dict = {}
         self._search    = ""
-        self._page      = 1
-        self._page_size = 50
+        self._loaded    = 0
         self._total     = 0
+        self._loading   = False
         self._build()
 
     def _build(self) -> None:
@@ -1785,27 +2938,18 @@ class _CongoExpUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
+
+        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
+        delete_btn.clicked.connect(self._request_delete)
+        navl.addWidget(delete_btn)
         vl.addWidget(nav)
 
         self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
         vl.addWidget(self._info_lbl)
 
-        self._summary_frame = QFrame()
-        self._summary_frame.setStyleSheet(
-            f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
-            "border-radius:6px;padding:8px;}}"
+        self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
+            _make_congo_summary_cards()
         )
-        sl = QHBoxLayout(self._summary_frame)
-        sl.setContentsMargins(12, 8, 12, 8)
-        sl.setSpacing(24)
-
-        self._in_lbl  = _lbl("Money In: —", size=12, weight=600, color=_GREEN)
-        self._out_lbl = _lbl("Money Out: —", size=12, color=_T2)
-        self._bal_lbl = _lbl("Balance: —", size=12, weight=600, color=_T1)
-        sl.addWidget(self._in_lbl)
-        sl.addWidget(self._out_lbl)
-        sl.addWidget(self._bal_lbl)
-        sl.addStretch()
         vl.addWidget(self._summary_frame)
 
         tb = QWidget()
@@ -1826,17 +2970,18 @@ class _CongoExpUploadDetail(QWidget):
         self._table = _make_kimvi_table(_CONGO_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])
         vl.addWidget(self._totals)
 
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
 
     def load_upload(self, upload_doc: dict) -> None:
+        self._upload_doc = upload_doc
         self._upload_id = str(upload_doc.get("_id") or "")
         filename    = upload_doc.get("source_filename") or "Unknown file"
         sheet_label = upload_doc.get("sheet_label") or "—"
@@ -1854,58 +2999,97 @@ class _CongoExpUploadDetail(QWidget):
         self._info_lbl.setText(
             f"Sheet {sheet_label}   •   {count:,} rows   •   {date_str}"
         )
-        self._in_lbl.setText(f"Money In: USD {_kimvi_fmt_amount(money_in)}")
-        self._out_lbl.setText(f"Money Out: USD {_kimvi_fmt_amount(money_out)}")
-        bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else _T1)
-        self._bal_lbl.setText(f"Balance: USD {_kimvi_fmt_amount(balance)}")
-        self._bal_lbl.setStyleSheet(
-            f"color:{bal_color};font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI';background:transparent;"
-        )
-
+        _set_congo_summary(self._in_lbl, self._out_lbl, self._bal_lbl, money_in, money_out)
         self._totals.set_total("count", count, "")
 
         self._search = ""
         self._search_edit.blockSignals(True)
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    async def _load(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        if not self._upload_id:
-            return
-        skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_congo_upload_records(
-                self._upload_id, self._search, self._page_size, skip
-            ),
-            svc.count_congo_upload_records(self._upload_id, self._search),
+    def _request_delete(self) -> None:
+        if self._upload_doc:
+            self.delete_requested.emit(self._upload_doc)
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(
+            f"Showing {self._loaded:,} of {self._total:,}{suffix}"
         )
+
+    async def _load_initial(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs, total = await asyncio.gather(
+                svc.get_congo_upload_records(
+                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                ),
+                svc.count_congo_upload_records(self._upload_id, self._search),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
         self._total = total
-        t = self._table
-        t.setRowCount(0)
-        for rec in recs:
-            r = t.rowCount()
-            t.insertRow(r)
-            _congo_fill_row(t, r, rec)
-        self._pager.set_total(total, self._page_size, self._page)
+        self._append_rows(recs)
+        self._loaded = len(recs)
         self._totals.set_total("count", total, "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs = await svc.get_congo_upload_records(
+                self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._totals.set_total("count", self._total, "")
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
+        for rec in recs:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _congo_fill_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page   = 1
-        asyncio.ensure_future(self._load())
-
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page      = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
 
 class CongoExpensesWidget(QWidget):
@@ -1921,39 +3105,87 @@ class CongoExpensesWidget(QWidget):
         vl.setSpacing(12)
 
         header = _PageHeader("Congo Expenses", "mdi.map-marker")
+        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+        tmpl_btn.clicked.connect(self._download_template)
         bulk_btn = _btn("Bulk Import All Sheets", "mdi.file-multiple-outline", primary=False)
         bulk_btn.clicked.connect(self._open_bulk_import)
         self._import_btn = _btn("Import Latest Sheet", "mdi.upload-outline")
         self._import_btn.clicked.connect(self._open_import)
+        header.add_right(tmpl_btn)
         header.add_right(bulk_btn)
         header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._stack = QStackedWidget()
-        self._stack.setStyleSheet("background:transparent;")
+        self._tabs = _SegmentTabBar(["All Entries", "Money In", "Uploads"])
+        vl.addWidget(self._tabs)
+
+        self._main_stack = QStackedWidget()
+        self._main_stack.setStyleSheet("background:transparent;")
+
+        self._all_entries = _CongoAllEntries()
+        self._main_stack.addWidget(self._all_entries)
+
+        self._money_in = _CongoMoneyInEntries()
+        self._main_stack.addWidget(self._money_in)
+
+        upload_host = QWidget()
+        upload_host.setStyleSheet("background:transparent;")
+        upload_vl = QVBoxLayout(upload_host)
+        upload_vl.setContentsMargins(0, 0, 0, 0)
+        upload_vl.setSpacing(0)
+
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
 
         self._browse = _CongoExpUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
-        self._stack.addWidget(self._browse)
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._browse)
 
         self._detail = _CongoExpUploadDetail()
         self._detail.back_requested.connect(self._show_browse)
-        self._stack.addWidget(self._detail)
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
 
-        self._stack.setCurrentIndex(0)
-        vl.addWidget(self._stack, 1)
+        upload_vl.addWidget(self._upload_stack, 1)
+        self._main_stack.addWidget(upload_host)
+
+        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        vl.addWidget(self._main_stack, 1)
 
     def refresh(self) -> None:
+        self._all_entries.refresh()
+        self._money_in.refresh()
         self._show_browse()
 
     def _show_browse(self) -> None:
-        self._stack.setCurrentIndex(0)
+        self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._tabs.set_index(2, emit=False)
+        self._main_stack.setCurrentIndex(2)
+        self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
-        self._stack.setCurrentIndex(1)
+
+    def _download_template(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Import Template",
+            "Congo_Expenses_Import_Template.xlsx",
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            _write_xlsx_template(path, "", _CONGO_HEADERS)
+            QMessageBox.information(
+                self, "Template Saved",
+                f"Empty template saved to:\n{path}\n\n"
+                "Fill in your data using the column headers shown, then import the file.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
         dlg = CongoImportDialog(parent=self)
@@ -1962,7 +3194,10 @@ class CongoExpensesWidget(QWidget):
 
     def _on_imported(self, n: int) -> None:
         QMessageBox.information(self, "Import Complete", f"Imported {n:,} rows.")
+        self._all_entries.refresh()
+        self._money_in.refresh()
         self._show_browse()
+        self._tabs.set_index(2)
 
     def _open_bulk_import(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -1985,6 +3220,42 @@ class CongoExpensesWidget(QWidget):
             self, "Bulk Import Complete",
             f"Imported {sheets:,} sheet{'s' if sheets != 1 else ''} ({rows:,} rows).",
         )
+        self._all_entries.refresh()
+        self._money_in.refresh()
+        self._show_browse()
+        self._tabs.set_index(2)
+
+    def _on_delete_upload(self, upload_doc: dict) -> None:
+        upload_id = str(upload_doc.get("_id") or "")
+        if not upload_id:
+            return
+        filename = upload_doc.get("source_filename") or "Unknown file"
+        sheet_label = upload_doc.get("sheet_label") or "—"
+        count = int(upload_doc.get("record_count", 0))
+        if QMessageBox.question(
+            self,
+            "Delete Upload",
+            f"Delete sheet \"{sheet_label}\" from \"{filename}\" "
+            f"and all {count:,} records?\n\nThis cannot be undone.",
+        ) != QMessageBox.Yes:
+            return
+        asyncio.ensure_future(self._delete_upload(upload_id))
+
+    async def _delete_upload(self, upload_id: str) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            deleted = await svc.delete_congo_upload(upload_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete Error", str(exc))
+            return
+        if deleted <= 0:
+            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
+            return
+        QMessageBox.information(
+            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+        )
+        self._all_entries.refresh()
+        self._money_in.refresh()
         self._show_browse()
 
 
@@ -2507,7 +3778,6 @@ def _kimvi_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     t.setItem(r, 3, _cell(rec.get("description", "")))
     t.setItem(r, 4, _cell(
         _kimvi_fmt_amount(amt_f),
-        mono=True,
         color=amt_clr,
         align=Qt.AlignRight | Qt.AlignVCenter,
     ))
@@ -2515,10 +3785,244 @@ def _kimvi_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     t.setRowHeight(r, _ROW_H)
 
 
+class _KimviEntriesBase(QWidget):
+    """Shared flat-list view for Ahmed Kimvi All Entries / Money In tabs."""
+
+    def __init__(self, money_in_only: bool = False, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._money_in_only = money_in_only
+        self._search  = ""
+        self._year    = 0
+        self._month   = 0
+        self._loaded  = 0
+        self._total   = 0
+        self._loading = False
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search truck, particulars, date…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._year_cb = QComboBox()
+        self._year_cb.addItem("All Years", 0)
+        self._year_cb.setFixedWidth(110)
+        self._year_cb.setStyleSheet(_input_ss())
+        self._year_cb.currentIndexChanged.connect(self._on_year)
+        tbl.addWidget(self._year_cb)
+
+        self._month_cb = QComboBox()
+        for label, val in _TOLL_MONTHS:
+            self._month_cb.addItem(label, val)
+        self._month_cb.setFixedWidth(130)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.setEnabled(False)
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+
+        self._from_date, self._to_date = add_from_to_editors(
+            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=True,
+        )
+
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
+            _make_congo_summary_cards()
+        )
+        vl.addWidget(self._summary_frame)
+
+        self._totals = _TotalsBar([("count", "Total records: ")])
+        vl.addWidget(self._totals)
+
+        self._table = _make_kimvi_table(_KIMVI_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        vl.addWidget(self._table, 1)
+
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._reload_years_and_data())
+
+    async def _reload_years_and_data(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            years = await svc.get_kimvi_available_years()
+        except Exception:
+            years = []
+        self._year = _populate_year_combo(self._year_cb, years, self._year)
+        if self._year <= 0:
+            self._month = 0
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(False)
+            self._month_cb.blockSignals(False)
+        self._reset_and_load()
+
+    def _effective_month(self) -> int:
+        return self._month if self._year > 0 else 0
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(
+            f"Showing {self._loaded:,} of {self._total:,}{suffix}"
+        )
+
+    async def _load_initial(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            totals, recs, total = await asyncio.gather(
+                svc.get_kimvi_all_totals(
+                    self._search, self._year, month,
+                    money_in_only=self._money_in_only, **self._date_kw(),
+                ),
+                svc.get_kimvi_all_records(
+                    self._search, self._year, month,
+                    money_in_only=self._money_in_only,
+                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                ),
+                svc.count_kimvi_all_records(
+                    self._search, self._year, month,
+                    money_in_only=self._money_in_only, **self._date_kw(),
+                ),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        _set_congo_summary(
+            self._in_lbl, self._out_lbl, self._bal_lbl,
+            float(totals.get("money_in", 0)),
+            float(totals.get("money_out", 0)),
+        )
+        self._totals.set_total("count", int(totals.get("count", 0)), "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            recs = await svc.get_kimvi_all_records(
+                self._search, self._year, month,
+                money_in_only=self._money_in_only,
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
+        for rec in recs:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _kimvi_fill_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._reset_and_load()
+
+    def _date_kw(self) -> dict:
+        if not hasattr(self, "_from_date"):
+            return {}
+        df, dt = read_from_to(self._from_date, self._to_date, optional=True)
+        return {"date_from": df, "date_to": dt}
+
+    def _on_year(self, _idx: int) -> None:
+        self._year = int(self._year_cb.currentData() or 0)
+        has_year = self._year > 0
+        self._month_cb.setEnabled(has_year)
+        if not has_year:
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.blockSignals(False)
+            self._month = 0
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+    def _on_month(self, _idx: int) -> None:
+        self._month = int(self._month_cb.currentData() or 0)
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+
+class _KimviAllEntries(_KimviEntriesBase):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(money_in_only=False, parent=parent)
+
+
+class _KimviMoneyInEntries(_KimviEntriesBase):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(money_in_only=True, parent=parent)
+
+
 class _KimviUploadBrowse(QWidget):
     """Table of every Ahmed Kimvi import batch."""
 
     upload_clicked = Signal(object)
+    delete_clicked = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2547,10 +4051,12 @@ class _KimviUploadBrowse(QWidget):
         self._table.setColumnWidth(4, 120)
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click any row to view the full records for that upload.",
+            "Click any row to view its records · right-click to delete an upload.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -2598,7 +4104,6 @@ class _KimviUploadBrowse(QWidget):
             bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else "")
             t.setItem(r, 4, _cell(
                 _kimvi_fmt_amount(balance),
-                mono=True,
                 color=bal_color,
                 align=Qt.AlignRight | Qt.AlignVCenter,
             ))
@@ -2615,19 +4120,30 @@ class _KimviUploadBrowse(QWidget):
         if row < len(self._uploads):
             self.upload_clicked.emit(self._uploads[row])
 
+    def _on_menu(self, pos) -> None:
+        row = self._table.rowAt(pos.y())
+        if not (0 <= row < len(self._uploads)):
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Delete this upload")
+        if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
+            self.delete_clicked.emit(self._uploads[row])
+
 
 class _KimviUploadDetail(QWidget):
     """Full record table for a single Ahmed Kimvi import batch."""
 
     back_requested = Signal()
+    delete_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._upload_id = ""
+        self._upload_doc: dict = {}
         self._search    = ""
-        self._page      = 1
-        self._page_size = 50
+        self._loaded    = 0
         self._total     = 0
+        self._loading   = False
         self._build()
 
     def _build(self) -> None:
@@ -2649,27 +4165,18 @@ class _KimviUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
+
+        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
+        delete_btn.clicked.connect(self._request_delete)
+        navl.addWidget(delete_btn)
         vl.addWidget(nav)
 
         self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
         vl.addWidget(self._info_lbl)
 
-        self._summary_frame = QFrame()
-        self._summary_frame.setStyleSheet(
-            f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
-            "border-radius:6px;padding:8px;}}"
+        self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
+            _make_congo_summary_cards()
         )
-        sl = QHBoxLayout(self._summary_frame)
-        sl.setContentsMargins(12, 8, 12, 8)
-        sl.setSpacing(24)
-
-        self._in_lbl  = _lbl("Money In: —", size=12, weight=600, color=_GREEN)
-        self._out_lbl = _lbl("Money Out: —", size=12, color=_T2)
-        self._bal_lbl = _lbl("Balance: —", size=12, weight=600, color=_T1)
-        sl.addWidget(self._in_lbl)
-        sl.addWidget(self._out_lbl)
-        sl.addWidget(self._bal_lbl)
-        sl.addStretch()
         vl.addWidget(self._summary_frame)
 
         tb = QWidget()
@@ -2690,24 +4197,24 @@ class _KimviUploadDetail(QWidget):
         self._table = _make_kimvi_table(_KIMVI_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])
         vl.addWidget(self._totals)
 
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
 
     def load_upload(self, upload_doc: dict) -> None:
+        self._upload_doc = upload_doc
         self._upload_id = str(upload_doc.get("_id") or "")
         filename    = upload_doc.get("source_filename") or "Unknown file"
         sheet_label = upload_doc.get("sheet_label") or "—"
         count       = int(upload_doc.get("record_count", 0))
         money_in    = float(upload_doc.get("money_in", 0))
         money_out   = float(upload_doc.get("money_out", 0))
-        balance     = float(upload_doc.get("balance_usd", 0))
         import_dt   = upload_doc.get("import_date")
         date_str    = (
             import_dt.strftime("%d %b %Y")
@@ -2718,69 +4225,104 @@ class _KimviUploadDetail(QWidget):
         self._info_lbl.setText(
             f"Sheet {sheet_label}   •   {count:,} rows   •   {date_str}"
         )
-        self._in_lbl.setText(f"Money In: USD {_kimvi_fmt_amount(money_in)}")
-        self._out_lbl.setText(f"Money Out: USD {_kimvi_fmt_amount(money_out)}")
-        bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else _T1)
-        self._bal_lbl.setText(f"Balance: USD {_kimvi_fmt_amount(balance)}")
-        self._bal_lbl.setStyleSheet(
-            f"color:{bal_color};font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI';background:transparent;"
-        )
-
+        _set_congo_summary(self._in_lbl, self._out_lbl, self._bal_lbl, money_in, money_out)
         self._totals.set_total("count", count, "")
 
         self._search = ""
         self._search_edit.blockSignals(True)
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    async def _load(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        if not self._upload_id:
-            return
-        skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_kimvi_upload_records(
-                self._upload_id, self._search, self._page_size, skip
-            ),
-            svc.count_kimvi_upload_records(self._upload_id, self._search),
+    def _request_delete(self) -> None:
+        if self._upload_doc:
+            self.delete_requested.emit(self._upload_doc)
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(
+            f"Showing {self._loaded:,} of {self._total:,}{suffix}"
         )
-        self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
-        self._totals.set_total("count", total, "")
 
-    def _fill_table(self, recs: List[dict]) -> None:
-        t = self._table
-        t.setRowCount(0)
+    async def _load_initial(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs, total = await asyncio.gather(
+                svc.get_kimvi_upload_records(
+                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                ),
+                svc.count_kimvi_upload_records(self._upload_id, self._search),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        self._totals.set_total("count", total, "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs = await svc.get_kimvi_upload_records(
+                self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._totals.set_total("count", self._total, "")
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
         for rec in recs:
-            r = t.rowCount()
-            t.insertRow(r)
-            _kimvi_fill_row(t, r, rec)
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _kimvi_fill_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page   = 1
-        asyncio.ensure_future(self._load())
-
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page      = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
 
 class AhmedKimviWidget(QWidget):
     """
     Ahmed Kimvi (Klesa) main page.
 
-    Browse tab (default): one row per Excel import.  Clicking a row drills into
-    the full per-row detail view for that upload.
+    Three tabs: All Entries, Money In, and Uploads (browse + drill-down).
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -2795,39 +4337,87 @@ class AhmedKimviWidget(QWidget):
         vl.setSpacing(12)
 
         header = _PageHeader("Ahmed Kimvi (Klesa)", "mdi.account-cash")
+        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+        tmpl_btn.clicked.connect(self._download_template)
         bulk_btn = _btn("Bulk Import All Sheets", "mdi.file-multiple-outline", primary=False)
         bulk_btn.clicked.connect(self._open_bulk_import)
         self._import_btn = _btn("Import Latest Sheet", "mdi.upload-outline")
         self._import_btn.clicked.connect(self._open_import)
+        header.add_right(tmpl_btn)
         header.add_right(bulk_btn)
         header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._stack = QStackedWidget()
-        self._stack.setStyleSheet("background:transparent;")
+        self._tabs = _SegmentTabBar(["All Entries", "Money In", "Uploads"])
+        vl.addWidget(self._tabs)
+
+        self._main_stack = QStackedWidget()
+        self._main_stack.setStyleSheet("background:transparent;")
+
+        self._all_entries = _KimviAllEntries()
+        self._main_stack.addWidget(self._all_entries)
+
+        self._money_in = _KimviMoneyInEntries()
+        self._main_stack.addWidget(self._money_in)
+
+        upload_host = QWidget()
+        upload_host.setStyleSheet("background:transparent;")
+        upload_vl = QVBoxLayout(upload_host)
+        upload_vl.setContentsMargins(0, 0, 0, 0)
+        upload_vl.setSpacing(0)
+
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
 
         self._browse = _KimviUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
-        self._stack.addWidget(self._browse)
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._browse)
 
         self._detail = _KimviUploadDetail()
         self._detail.back_requested.connect(self._show_browse)
-        self._stack.addWidget(self._detail)
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
 
-        self._stack.setCurrentIndex(0)
-        vl.addWidget(self._stack, 1)
+        upload_vl.addWidget(self._upload_stack, 1)
+        self._main_stack.addWidget(upload_host)
+
+        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        vl.addWidget(self._main_stack, 1)
 
     def refresh(self) -> None:
+        self._all_entries.refresh()
+        self._money_in.refresh()
         self._show_browse()
 
     def _show_browse(self) -> None:
-        self._stack.setCurrentIndex(0)
+        self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._tabs.set_index(2, emit=False)
+        self._main_stack.setCurrentIndex(2)
+        self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
-        self._stack.setCurrentIndex(1)
+
+    def _download_template(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Import Template",
+            "Ahmed_Kimvi_Import_Template.xlsx",
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            _write_xlsx_template(path, "", _KIMVI_HEADERS)
+            QMessageBox.information(
+                self, "Template Saved",
+                f"Empty template saved to:\n{path}\n\n"
+                "Fill in your data using the column headers shown, then import the file.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
         dlg = KimviImportDialog(parent=self)
@@ -2836,7 +4426,10 @@ class AhmedKimviWidget(QWidget):
 
     def _on_imported(self, n: int) -> None:
         QMessageBox.information(self, "Import Complete", f"Imported {n:,} rows.")
+        self._all_entries.refresh()
+        self._money_in.refresh()
         self._show_browse()
+        self._tabs.set_index(2)
 
     def _open_bulk_import(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -2859,6 +4452,42 @@ class AhmedKimviWidget(QWidget):
             self, "Bulk Import Complete",
             f"Imported {sheets:,} sheet{'s' if sheets != 1 else ''} ({rows:,} rows).",
         )
+        self._all_entries.refresh()
+        self._money_in.refresh()
+        self._show_browse()
+        self._tabs.set_index(2)
+
+    def _on_delete_upload(self, upload_doc: dict) -> None:
+        upload_id = str(upload_doc.get("_id") or "")
+        if not upload_id:
+            return
+        filename = upload_doc.get("source_filename") or "Unknown file"
+        sheet_label = upload_doc.get("sheet_label") or "—"
+        count = int(upload_doc.get("record_count", 0))
+        if QMessageBox.question(
+            self,
+            "Delete Upload",
+            f"Delete sheet \"{sheet_label}\" from \"{filename}\" "
+            f"and all {count:,} records?\n\nThis cannot be undone.",
+        ) != QMessageBox.Yes:
+            return
+        asyncio.ensure_future(self._delete_upload(upload_id))
+
+    async def _delete_upload(self, upload_id: str) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            deleted = await svc.delete_kimvi_upload(upload_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete Error", str(exc))
+            return
+        if deleted <= 0:
+            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
+            return
+        QMessageBox.information(
+            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+        )
+        self._all_entries.refresh()
+        self._money_in.refresh()
         self._show_browse()
 
 
@@ -2997,20 +4626,285 @@ def _zambia_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     t.setItem(r, 3, _cell(rec.get("ticket_no", "")))
     t.setItem(r, 4, _cell(
         _fmt_num(rec.get("debit"), "ZMW ", 0) if rec.get("debit") is not None else "—",
-        mono=True,
     ))
     credit = rec.get("credit")
     t.setItem(r, 5, _cell(
         _fmt_num(credit, "ZMW ", 0) if credit is not None else "—",
-        mono=True,
         color=_GREEN if credit else "",
     ))
     t.setItem(r, 6, _cell(
         _fmt_num(rec.get("balance"), "ZMW ", 0) if rec.get("balance") is not None else "—",
-        mono=True,
     ))
     t.setItem(r, 7, _cell(rec.get("heading_to", "")))
     _finish_table_row(t, r, row_bg)
+
+
+def _make_zambia_summary_cards() -> Tuple[QFrame, QLabel, QLabel, QLabel]:
+    """Money In (credit) / Money Out (debit) / Balance summary strip for Zambia views."""
+    frame = QFrame()
+    frame.setStyleSheet(
+        f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
+        "border-radius:6px;padding:8px;}}"
+    )
+    sl = QHBoxLayout(frame)
+    sl.setContentsMargins(12, 8, 12, 8)
+    sl.setSpacing(24)
+    in_lbl  = _lbl("Money In: —", size=12, weight=600, color=_GREEN)
+    out_lbl = _lbl("Money Out: —", size=12, color=_T2)
+    bal_lbl = _lbl("Balance: —", size=12, weight=600, color=_T1)
+    sl.addWidget(in_lbl)
+    sl.addWidget(out_lbl)
+    sl.addWidget(bal_lbl)
+    sl.addStretch()
+    return frame, in_lbl, out_lbl, bal_lbl
+
+
+def _set_zambia_summary(
+    in_lbl: QLabel, out_lbl: QLabel, bal_lbl: QLabel,
+    total_credit: float, total_debit: float,
+) -> None:
+    balance = total_credit - total_debit
+    in_lbl.setText(f"Money In: ZMW {_fmt_num(total_credit, '', 0)}")
+    out_lbl.setText(f"Money Out: ZMW {_fmt_num(total_debit, '', 0)}")
+    bal_color = _GREEN if balance > 0 else (_RED if balance < 0 else _T1)
+    bal_lbl.setText(f"Balance: ZMW {_fmt_num(balance, '', 0)}")
+    bal_lbl.setStyleSheet(
+        f"color:{bal_color};font-size:12px;font-weight:600;"
+        "font-family:'Segoe UI';background:transparent;"
+    )
+
+
+class _ZambiaParkingEntriesBase(QWidget):
+    """Shared flat-list view for Zambia Parking All Entries / Money In tabs."""
+
+    def __init__(self, credit_only: bool = False, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._credit_only = credit_only
+        self._search  = ""
+        self._year    = 0
+        self._month   = 0
+        self._loaded  = 0
+        self._total   = 0
+        self._loading = False
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search plate, ticket, destination, type…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._year_cb = QComboBox()
+        self._year_cb.addItem("All Years", 0)
+        self._year_cb.setFixedWidth(110)
+        self._year_cb.setStyleSheet(_input_ss())
+        self._year_cb.currentIndexChanged.connect(self._on_year)
+        tbl.addWidget(self._year_cb)
+
+        self._month_cb = QComboBox()
+        for label, val in _TOLL_MONTHS:
+            self._month_cb.addItem(label, val)
+        self._month_cb.setFixedWidth(130)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.setEnabled(False)
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+
+        self._from_date, self._to_date = add_from_to_editors(
+            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=True,
+        )
+
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
+            _make_zambia_summary_cards()
+        )
+        vl.addWidget(self._summary_frame)
+
+        self._totals = _TotalsBar([("count", "Total records: ")])
+        vl.addWidget(self._totals)
+
+        self._table = _make_table(_ZAMBIA_PARK_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        vl.addWidget(self._table, 1)
+
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._reload_years_and_data())
+
+    async def _reload_years_and_data(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            years = await svc.get_zambia_parking_available_years()
+        except Exception:
+            years = []
+        self._year = _populate_year_combo(self._year_cb, years, self._year)
+        if self._year <= 0:
+            self._month = 0
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(False)
+            self._month_cb.blockSignals(False)
+        self._reset_and_load()
+
+    def _effective_month(self) -> int:
+        return self._month if self._year > 0 else 0
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(
+            f"Showing {self._loaded:,} of {self._total:,}{suffix}"
+        )
+
+    async def _load_initial(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            totals, recs, total = await asyncio.gather(
+                svc.get_zambia_parking_all_totals(
+                    self._search, self._year, month,
+                    credit_only=self._credit_only, **self._date_kw(),
+                ),
+                svc.get_zambia_parking_all_records(
+                    self._search, self._year, month,
+                    credit_only=self._credit_only,
+                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                ),
+                svc.count_zambia_parking_all_records(
+                    self._search, self._year, month,
+                    credit_only=self._credit_only, **self._date_kw(),
+                ),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        _set_zambia_summary(
+            self._in_lbl, self._out_lbl, self._bal_lbl,
+            float(totals.get("total_credit", 0)),
+            float(totals.get("total_debit", 0)),
+        )
+        self._totals.set_total("count", int(totals.get("count", 0)), "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            recs = await svc.get_zambia_parking_all_records(
+                self._search, self._year, month,
+                credit_only=self._credit_only,
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
+        for rec in recs:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _zambia_fill_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._reset_and_load()
+
+    def _date_kw(self) -> dict:
+        if not hasattr(self, "_from_date"):
+            return {}
+        df, dt = read_from_to(self._from_date, self._to_date, optional=True)
+        return {"date_from": df, "date_to": dt}
+
+    def _on_year(self, _idx: int) -> None:
+        self._year = int(self._year_cb.currentData() or 0)
+        has_year = self._year > 0
+        self._month_cb.setEnabled(has_year)
+        if not has_year:
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.blockSignals(False)
+            self._month = 0
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+    def _on_month(self, _idx: int) -> None:
+        self._month = int(self._month_cb.currentData() or 0)
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+
+class _ZambiaParkingAllEntries(_ZambiaParkingEntriesBase):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(credit_only=False, parent=parent)
+
+
+class _ZambiaParkingMoneyInEntries(_ZambiaParkingEntriesBase):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(credit_only=True, parent=parent)
 
 
 class ZambiaParkingImportDialog(QDialog):
@@ -3180,6 +5074,7 @@ class ZambiaParkingImportDialog(QDialog):
 
 class _ZambiaParkingUploadBrowse(QWidget):
     upload_clicked = Signal(object)
+    delete_clicked = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -3208,10 +5103,12 @@ class _ZambiaParkingUploadBrowse(QWidget):
         self._table.setColumnWidth(4, 130)
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click any row to view the full records for that upload.",
+            "Click any row to view its records · right-click to delete an upload.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -3257,7 +5154,6 @@ class _ZambiaParkingUploadBrowse(QWidget):
             t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
             t.setItem(r, 4, _cell(
                 _fmt_num(closing_bal, "ZMW ", 0),
-                mono=True,
                 align=Qt.AlignRight | Qt.AlignVCenter,
             ))
             t.setItem(r, 5, _cell(date_range))
@@ -3273,17 +5169,28 @@ class _ZambiaParkingUploadBrowse(QWidget):
         if row < len(self._uploads):
             self.upload_clicked.emit(self._uploads[row])
 
+    def _on_menu(self, pos) -> None:
+        row = self._table.rowAt(pos.y())
+        if not (0 <= row < len(self._uploads)):
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Delete this upload")
+        if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
+            self.delete_clicked.emit(self._uploads[row])
+
 
 class _ZambiaParkingUploadDetail(QWidget):
     back_requested = Signal()
+    delete_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._upload_id = ""
+        self._upload_doc: dict = {}
         self._search    = ""
-        self._page      = 1
-        self._page_size = 50
+        self._loaded    = 0
         self._total     = 0
+        self._loading   = False
         self._build()
 
     def _build(self) -> None:
@@ -3305,27 +5212,18 @@ class _ZambiaParkingUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
+
+        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
+        delete_btn.clicked.connect(self._request_delete)
+        navl.addWidget(delete_btn)
         vl.addWidget(nav)
 
         self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
         vl.addWidget(self._info_lbl)
 
-        self._summary_frame = QFrame()
-        self._summary_frame.setStyleSheet(
-            f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
-            "border-radius:6px;padding:8px;}}"
+        self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
+            _make_zambia_summary_cards()
         )
-        sl = QHBoxLayout(self._summary_frame)
-        sl.setContentsMargins(12, 8, 12, 8)
-        sl.setSpacing(24)
-
-        self._debit_lbl  = _lbl("Total Debit: —", size=12, color=_T2)
-        self._credit_lbl = _lbl("Total Credit: —", size=12, weight=600, color=_GREEN)
-        self._bal_lbl    = _lbl("Closing Balance: —", size=12, weight=600, color=_BLUE)
-        sl.addWidget(self._debit_lbl)
-        sl.addWidget(self._credit_lbl)
-        sl.addWidget(self._bal_lbl)
-        sl.addStretch()
         vl.addWidget(self._summary_frame)
 
         tb = QWidget()
@@ -3346,24 +5244,24 @@ class _ZambiaParkingUploadDetail(QWidget):
         self._table = _make_table(_ZAMBIA_PARK_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("debit", "ZMW "), ("credit", "CR: ZMW ")])
         vl.addWidget(self._totals)
 
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
 
     def load_upload(self, upload_doc: dict) -> None:
+        self._upload_doc = upload_doc
         self._upload_id = str(upload_doc.get("_id") or "")
         filename      = upload_doc.get("source_filename") or "Unknown file"
         sheet_label   = upload_doc.get("sheet_label") or "—"
         count         = int(upload_doc.get("record_count", 0))
         total_debit   = float(upload_doc.get("total_debit", 0) or 0)
         total_credit  = float(upload_doc.get("total_credit", 0) or 0)
-        closing_bal   = float(upload_doc.get("closing_balance", 0) or 0)
         import_dt     = upload_doc.get("import_date")
         date_str      = (
             import_dt.strftime("%d %b %Y")
@@ -3374,9 +5272,7 @@ class _ZambiaParkingUploadDetail(QWidget):
         self._info_lbl.setText(
             f"{sheet_label}   •   {count:,} rows   •   {date_str}"
         )
-        self._debit_lbl.setText(f"Total Debit: ZMW {total_debit:,.0f}")
-        self._credit_lbl.setText(f"Total Credit: ZMW {total_credit:,.0f}")
-        self._bal_lbl.setText(f"Closing Balance: ZMW {closing_bal:,.0f}")
+        _set_zambia_summary(self._in_lbl, self._out_lbl, self._bal_lbl, total_credit, total_debit)
 
         self._totals.set_total("debit",  total_debit,  "ZMW ")
         self._totals.set_total("credit", total_credit, "CR: ZMW ")
@@ -3385,49 +5281,95 @@ class _ZambiaParkingUploadDetail(QWidget):
         self._search_edit.blockSignals(True)
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    async def _load(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        if not self._upload_id:
-            return
-        skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_zambia_parking_upload_records(
-                self._upload_id, self._search, self._page_size, skip
-            ),
-            svc.count_zambia_parking_upload_records(self._upload_id, self._search),
+    def _request_delete(self) -> None:
+        if self._upload_doc:
+            self.delete_requested.emit(self._upload_doc)
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(
+            f"Showing {self._loaded:,} of {self._total:,}{suffix}"
         )
+
+    async def _load_initial(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs, total = await asyncio.gather(
+                svc.get_zambia_parking_upload_records(
+                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                ),
+                svc.count_zambia_parking_upload_records(self._upload_id, self._search),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
         self._total = total
-        t = self._table
-        t.setRowCount(0)
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs = await svc.get_zambia_parking_upload_records(
+                self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
         for rec in recs:
-            r = t.rowCount()
-            t.insertRow(r)
-            _zambia_fill_row(t, r, rec)
-        self._pager.set_total(total, self._page_size, self._page)
-        self._totals.set_total("debit",  sum(r.get("debit") or 0 for r in recs), "ZMW ")
-        self._totals.set_total("credit", sum(r.get("credit") or 0 for r in recs), "CR: ZMW ")
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _zambia_fill_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page   = 1
-        asyncio.ensure_future(self._load())
-
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page      = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
 
 class ZambiaParkingWidget(QWidget):
     """
-    Zambia Parking main page — browse weekly uploads then drill into per-record detail.
+    Zambia Parking main page.
+
+    Three tabs: All Entries, Money In (credit), and Uploads (browse + drill-down).
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -3442,39 +5384,87 @@ class ZambiaParkingWidget(QWidget):
         vl.setSpacing(12)
 
         header = _PageHeader("Zambia Parking", "mdi.map")
+        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+        tmpl_btn.clicked.connect(self._download_template)
         bulk_btn = _btn("Bulk Import All Sheets", "mdi.file-multiple-outline", primary=False)
         bulk_btn.clicked.connect(self._open_bulk_import)
         self._import_btn = _btn("Import Latest Sheet", "mdi.upload-outline")
         self._import_btn.clicked.connect(self._open_import)
+        header.add_right(tmpl_btn)
         header.add_right(bulk_btn)
         header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._stack = QStackedWidget()
-        self._stack.setStyleSheet("background:transparent;")
+        self._tabs = _SegmentTabBar(["All Entries", "Money In", "Uploads"])
+        vl.addWidget(self._tabs)
+
+        self._main_stack = QStackedWidget()
+        self._main_stack.setStyleSheet("background:transparent;")
+
+        self._all_entries = _ZambiaParkingAllEntries()
+        self._main_stack.addWidget(self._all_entries)
+
+        self._money_in = _ZambiaParkingMoneyInEntries()
+        self._main_stack.addWidget(self._money_in)
+
+        upload_host = QWidget()
+        upload_host.setStyleSheet("background:transparent;")
+        upload_vl = QVBoxLayout(upload_host)
+        upload_vl.setContentsMargins(0, 0, 0, 0)
+        upload_vl.setSpacing(0)
+
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
 
         self._browse = _ZambiaParkingUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
-        self._stack.addWidget(self._browse)
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._browse)
 
         self._detail = _ZambiaParkingUploadDetail()
         self._detail.back_requested.connect(self._show_browse)
-        self._stack.addWidget(self._detail)
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
 
-        self._stack.setCurrentIndex(0)
-        vl.addWidget(self._stack, 1)
+        upload_vl.addWidget(self._upload_stack, 1)
+        self._main_stack.addWidget(upload_host)
+
+        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        vl.addWidget(self._main_stack, 1)
 
     def refresh(self) -> None:
+        self._all_entries.refresh()
+        self._money_in.refresh()
         self._show_browse()
 
     def _show_browse(self) -> None:
-        self._stack.setCurrentIndex(0)
+        self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._tabs.set_index(2, emit=False)
+        self._main_stack.setCurrentIndex(2)
+        self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
-        self._stack.setCurrentIndex(1)
+
+    def _download_template(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Import Template",
+            "Zambia_Parking_Import_Template.xlsx",
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            _write_xlsx_template(path, "", _ZAMBIA_PARK_HEADERS)
+            QMessageBox.information(
+                self, "Template Saved",
+                f"Empty template saved to:\n{path}\n\n"
+                "Fill in your data using the column headers shown, then import the file.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
         dlg = ZambiaParkingImportDialog(parent=self)
@@ -3483,7 +5473,10 @@ class ZambiaParkingWidget(QWidget):
 
     def _on_imported(self, n: int) -> None:
         QMessageBox.information(self, "Import Complete", f"Imported {n:,} rows.")
+        self._all_entries.refresh()
+        self._money_in.refresh()
         self._show_browse()
+        self._tabs.set_index(2)
 
     def _open_bulk_import(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -3508,6 +5501,42 @@ class ZambiaParkingWidget(QWidget):
             self, "Bulk Import Complete",
             f"Imported {sheets:,} sheet{'s' if sheets != 1 else ''} ({rows:,} rows).",
         )
+        self._all_entries.refresh()
+        self._money_in.refresh()
+        self._show_browse()
+        self._tabs.set_index(2)
+
+    def _on_delete_upload(self, upload_doc: dict) -> None:
+        upload_id = str(upload_doc.get("_id") or "")
+        if not upload_id:
+            return
+        filename = upload_doc.get("source_filename") or "Unknown file"
+        sheet_label = upload_doc.get("sheet_label") or "—"
+        count = int(upload_doc.get("record_count", 0))
+        if QMessageBox.question(
+            self,
+            "Delete Upload",
+            f"Delete sheet \"{sheet_label}\" from \"{filename}\" "
+            f"and all {count:,} records?\n\nThis cannot be undone.",
+        ) != QMessageBox.Yes:
+            return
+        asyncio.ensure_future(self._delete_upload(upload_id))
+
+    async def _delete_upload(self, upload_id: str) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            deleted = await svc.delete_zambia_parking_upload(upload_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete Error", str(exc))
+            return
+        if deleted <= 0:
+            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
+            return
+        QMessageBox.information(
+            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+        )
+        self._all_entries.refresh()
+        self._money_in.refresh()
         self._show_browse()
 
 
@@ -4457,6 +6486,247 @@ _AF_DETAIL_HEADERS = [
     "S/NO", "TRUCK", "DAYS", "NON-TRANS", "TRANS", "RATE/DAY",
     "TOTAL TAHMEED", "TOTAL INVOICE", "VARIANCE", "REMARKS",
 ]
+_AF_TEMPLATE_TITLE = "Afritrack Schedule — Schedule of Differences"
+_AF_TEMPLATE_FILENAME = "Afritrack_Import_Template.xlsx"
+
+
+def _afritrack_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
+    values = [
+        str(rec.get("row_index", r + 1)),
+        rec.get("truck", ""),
+        _fmt_num(rec.get("days"), decimals=0) if rec.get("days") else "—",
+        _fmt_num(rec.get("non_trans_days"), decimals=0) if rec.get("non_trans_days") else "—",
+        _fmt_num(rec.get("trans_days"), decimals=0) if rec.get("trans_days") else "—",
+        _fmt_num(rec.get("rate_per_day"), decimals=6) if rec.get("rate_per_day") else "—",
+        _fmt_num(rec.get("total_tahmeed"), decimals=2) if rec.get("total_tahmeed") else "—",
+        _fmt_num(rec.get("total_invoice"), decimals=2) if rec.get("total_invoice") else "—",
+        _fmt_num(rec.get("variance"), decimals=2) if rec.get("variance") else "—",
+        rec.get("remarks", ""),
+    ]
+    aligns = [
+        Qt.AlignCenter | Qt.AlignVCenter, Qt.AlignLeft | Qt.AlignVCenter,
+        Qt.AlignRight | Qt.AlignVCenter, Qt.AlignRight | Qt.AlignVCenter,
+        Qt.AlignRight | Qt.AlignVCenter, Qt.AlignRight | Qt.AlignVCenter,
+        Qt.AlignRight | Qt.AlignVCenter, Qt.AlignRight | Qt.AlignVCenter,
+        Qt.AlignRight | Qt.AlignVCenter, Qt.AlignLeft | Qt.AlignVCenter,
+    ]
+    for c, val in enumerate(values):
+        color = ""
+        if c == 8:
+            variance = float(rec.get("variance", 0) or 0)
+            color = _RED if variance < 0 else (_GREEN if variance > 0 else "")
+        t.setItem(r, c, _cell(val, aligns[c], mono=False, color=color))
+    _finish_table_row(t, r)
+
+
+class _AfritrackAllEntries(QWidget):
+    """Flat, filterable list of every Afritrack record with infinite scroll."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._search = ""
+        self._year = 0
+        self._month = 0
+        self._loaded = 0
+        self._total = 0
+        self._loading = False
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search truck, remarks, period, file…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._year_cb = QComboBox()
+        self._year_cb.addItem("All Years", 0)
+        self._year_cb.setFixedWidth(110)
+        self._year_cb.setStyleSheet(_input_ss())
+        self._year_cb.currentIndexChanged.connect(self._on_year)
+        tbl.addWidget(self._year_cb)
+
+        self._month_cb = QComboBox()
+        for label, val in _TOLL_MONTHS:
+            self._month_cb.addItem(label, val)
+        self._month_cb.setFixedWidth(130)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.setEnabled(False)
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+
+        self._from_date, self._to_date = add_from_to_editors(
+            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=True,
+        )
+
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._totals = _TotalsBar([
+            ("t", "Tahmeed "),
+            ("i", "Invoice "),
+            ("v", "Variance "),
+            ("c", "Rows "),
+        ])
+        vl.addWidget(self._totals)
+
+        self._table = _make_table(_AF_DETAIL_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        widths = [56, 120, 70, 90, 70, 90, 120, 120, 100, 180]
+        for i, w in enumerate(widths):
+            self._table.setColumnWidth(i, w)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        vl.addWidget(self._table, 1)
+
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._reload_years_and_data())
+
+    async def _reload_years_and_data(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            years = await svc.get_afritrack_available_years()
+        except Exception:
+            years = []
+        self._year = _populate_year_combo(self._year_cb, years, self._year)
+        if self._year <= 0:
+            self._month = 0
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(False)
+            self._month_cb.blockSignals(False)
+        self._reset_and_load()
+
+    def _effective_month(self) -> int:
+        return self._month if self._year > 0 else 0
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(f"Showing {self._loaded:,} of {self._total:,}{suffix}")
+
+    async def _load_initial(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            totals, recs, total = await asyncio.gather(
+                svc.get_afritrack_all_totals(self._search, self._year, month, **self._date_kw()),
+                svc.get_afritrack_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw()),
+                svc.count_afritrack_all_records(self._search, self._year, month, **self._date_kw()),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        self._totals.set_total("t", float(totals.get("total_tahmeed", 0) or 0), "USD ")
+        self._totals.set_total("i", float(totals.get("total_invoice", 0) or 0), "USD ")
+        self._totals.set_total("v", float(totals.get("total_variance", 0) or 0), "USD ")
+        self._totals.set_total("c", int(totals.get("count", 0) or 0), "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            recs = await svc.get_afritrack_all_records(
+                self._search, self._year, month,
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
+        for rec in recs:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _afritrack_fill_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._reset_and_load()
+
+    def _date_kw(self) -> dict:
+        if not hasattr(self, "_from_date"):
+            return {}
+        df, dt = read_from_to(self._from_date, self._to_date, optional=True)
+        return {"date_from": df, "date_to": dt}
+
+    def _on_year(self, _idx: int) -> None:
+        self._year = int(self._year_cb.currentData() or 0)
+        has_year = self._year > 0
+        self._month_cb.setEnabled(has_year)
+        if not has_year:
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.blockSignals(False)
+            self._month = 0
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+    def _on_month(self, _idx: int) -> None:
+        self._month = int(self._month_cb.currentData() or 0)
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
 
 
 def _afritrack_rows_to_records(
@@ -4593,13 +6863,15 @@ class _AfritrackUploadBrowse(QWidget):
 
 class _AfritrackUploadDetail(QWidget):
     back_requested = Signal()
+    delete_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._upload_id = ""
-        self._page = 1
-        self._page_size = 25
+        self._upload_doc: dict = {}
+        self._loaded = 0
         self._total = 0
+        self._loading = False
         self._search = ""
         self._build()
 
@@ -4620,6 +6892,9 @@ class _AfritrackUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         nh.addWidget(self._crumb_lbl)
         nh.addStretch()
+        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
+        delete_btn.clicked.connect(self._request_delete)
+        nh.addWidget(delete_btn)
         self._export_btn = _btn("Export Upload", "mdi.download-outline", primary=False, height=30)
         self._export_btn.clicked.connect(self._export_current_upload)
         nh.addWidget(self._export_btn)
@@ -4658,10 +6933,9 @@ class _AfritrackUploadDetail(QWidget):
         ])
         vl.addWidget(self._totals)
 
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
 
     def load_upload(self, upload_doc: dict) -> None:
         self._upload_doc = upload_doc
@@ -4675,73 +6949,89 @@ class _AfritrackUploadDetail(QWidget):
         self._search_edit.blockSignals(True)
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    async def _load(self) -> None:
+    def _request_delete(self) -> None:
+        if self._upload_doc:
+            self.delete_requested.emit(self._upload_doc)
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(f"Showing {self._loaded:,} of {self._total:,}{suffix}")
+
+    async def _load_initial(self) -> None:
         from tahmeed.services import accountant_service as svc
-        if not self._upload_id:
+        if not self._upload_id or self._loading:
             return
-        skip = (self._page - 1) * self._page_size
-        recs, total, totals = await asyncio.gather(
-            svc.get_afritrack_upload_records(self._upload_id, self._search, self._page_size, skip),
-            svc.count_afritrack_upload_records(self._upload_id, self._search),
-            svc.get_afritrack_upload_totals(self._upload_id, self._search),
-        )
+        self._loading = True
+        self._update_status()
+        try:
+            recs, total, totals = await asyncio.gather(
+                svc.get_afritrack_upload_records(self._upload_id, self._search, _SCROLL_CHUNK, 0),
+                svc.count_afritrack_upload_records(self._upload_id, self._search),
+                svc.get_afritrack_upload_totals(self._upload_id, self._search),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
         self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
+        self._append_rows(recs)
+        self._loaded = len(recs)
         self._totals.set_total("t", float(totals.get("total_tahmeed", 0) or 0), "USD ")
         self._totals.set_total("i", float(totals.get("total_invoice", 0) or 0), "USD ")
         self._totals.set_total("v", float(totals.get("total_variance", 0) or 0), "USD ")
         self._totals.set_total("c", int(totals.get("count", total) or 0), "")
+        self._loading = False
+        self._update_status()
 
-    def _fill_table(self, recs: List[dict]) -> None:
-        t = self._table
-        t.setRowCount(0)
+    async def _load_more(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs = await svc.get_afritrack_upload_records(
+                self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
         for rec in recs:
-            r = t.rowCount()
-            t.insertRow(r)
-            values = [
-                str(rec.get("row_index", r + 1)),
-                rec.get("truck", ""),
-                _fmt_num(rec.get("days"), decimals=0) if rec.get("days") else "—",
-                _fmt_num(rec.get("non_trans_days"), decimals=0) if rec.get("non_trans_days") else "—",
-                _fmt_num(rec.get("trans_days"), decimals=0) if rec.get("trans_days") else "—",
-                _fmt_num(rec.get("rate_per_day"), decimals=6) if rec.get("rate_per_day") else "—",
-                _fmt_num(rec.get("total_tahmeed"), decimals=2) if rec.get("total_tahmeed") else "—",
-                _fmt_num(rec.get("total_invoice"), decimals=2) if rec.get("total_invoice") else "—",
-                _fmt_num(rec.get("variance"), decimals=2) if rec.get("variance") else "—",
-                rec.get("remarks", ""),
-            ]
-            aligns = [
-                Qt.AlignCenter | Qt.AlignVCenter, Qt.AlignLeft | Qt.AlignVCenter,
-                Qt.AlignRight | Qt.AlignVCenter, Qt.AlignRight | Qt.AlignVCenter,
-                Qt.AlignRight | Qt.AlignVCenter, Qt.AlignRight | Qt.AlignVCenter,
-                Qt.AlignRight | Qt.AlignVCenter, Qt.AlignRight | Qt.AlignVCenter,
-                Qt.AlignRight | Qt.AlignVCenter, Qt.AlignLeft | Qt.AlignVCenter,
-            ]
-            for c, val in enumerate(values):
-                color = ""
-                if c == 8:
-                    variance = float(rec.get("variance", 0) or 0)
-                    color = _RED if variance < 0 else (_GREEN if variance > 0 else "")
-                t.setItem(r, c, _cell(val, aligns[c], mono=(2 <= c <= 8), color=color))
-            _finish_table_row(t, r)
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _afritrack_fill_row(self._table, r, rec)
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page = 1
-        asyncio.ensure_future(self._load())
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
     def _export_current_upload(self) -> None:
         asyncio.ensure_future(self._do_export_current_upload())
@@ -4796,37 +7086,80 @@ class AfritrackWidget(QWidget):
         vl.setSpacing(12)
 
         header = _PageHeader("Afritrack Schedule", "mdi.satellite-variant")
+        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+        tmpl_btn.clicked.connect(self._download_template)
         import_btn = _btn("Import from Excel", "mdi.upload-outline")
         import_btn.clicked.connect(self._open_import)
+        header.add_right(tmpl_btn)
         header.add_right(import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._stack = QStackedWidget()
-        self._stack.setStyleSheet("background:transparent;")
+        self._tabs = _SegmentTabBar(["All Entries", "Uploads"])
+        vl.addWidget(self._tabs)
+
+        self._main_stack = QStackedWidget()
+        self._main_stack.setStyleSheet("background:transparent;")
+
+        self._all_entries = _AfritrackAllEntries()
+        self._main_stack.addWidget(self._all_entries)
+
+        upload_host = QWidget()
+        upload_host.setStyleSheet("background:transparent;")
+        upload_vl = QVBoxLayout(upload_host)
+        upload_vl.setContentsMargins(0, 0, 0, 0)
+        upload_vl.setSpacing(0)
+
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
 
         self._browse = _AfritrackUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
         self._browse.delete_clicked.connect(self._on_delete_upload)
-        self._stack.addWidget(self._browse)
+        self._upload_stack.addWidget(self._browse)
 
         self._detail = _AfritrackUploadDetail()
         self._detail.back_requested.connect(self._show_browse)
-        self._stack.addWidget(self._detail)
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
 
-        self._stack.setCurrentIndex(0)
-        vl.addWidget(self._stack, 1)
+        upload_vl.addWidget(self._upload_stack, 1)
+        self._main_stack.addWidget(upload_host)
+
+        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        vl.addWidget(self._main_stack, 1)
 
     def refresh(self) -> None:
+        self._all_entries.refresh()
         self._show_browse()
 
     def _show_browse(self) -> None:
-        self._stack.setCurrentIndex(0)
+        self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._tabs.set_index(1, emit=False)
+        self._main_stack.setCurrentIndex(1)
+        self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
-        self._stack.setCurrentIndex(1)
+
+    def _download_template(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Import Template",
+            _AF_TEMPLATE_FILENAME,
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            _write_xlsx_template(path, _AF_TEMPLATE_TITLE, _AF_DETAIL_HEADERS)
+            QMessageBox.information(
+                self, "Template Saved",
+                f"Empty template saved to:\n{path}\n\n"
+                "Fill in your data using the column headers shown, then import the file.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -4859,6 +7192,7 @@ class AfritrackWidget(QWidget):
             QMessageBox.critical(self, "Import Error", str(exc))
             return
         QMessageBox.information(self, "Import Complete", f"Imported {saved:,} Afritrack rows.")
+        self._all_entries.refresh()
         uploads = await svc.get_afritrack_uploads()
         doc = next((u for u in uploads if str(u.get("_id")) == upload_id), None)
         if doc is not None:
@@ -4878,10 +7212,14 @@ class AfritrackWidget(QWidget):
     async def _delete_upload(self, upload_id: str) -> None:
         from tahmeed.services import accountant_service as svc
         try:
-            await svc.delete_afritrack_upload(upload_id)
+            deleted = await svc.delete_afritrack_upload(upload_id)
         except Exception as exc:
             QMessageBox.critical(self, "Delete Error", str(exc))
             return
+        QMessageBox.information(
+            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+        )
+        self._all_entries.refresh()
         self._show_browse()
 
 
@@ -5824,6 +8162,8 @@ _RAHNTECH_HEADERS = [
     "S/N", "SALES DATE", "TRIP NUMBER", "DEVICE NUMBER",
     "TRUCK NUMBER", "DRIVER NAME", "DO",
 ]
+_RAHNTECH_TEMPLATE_TITLE = "RahnTech — Transacted Devices"
+_RAHNTECH_TEMPLATE_FILENAME = "RahnTech_Import_Template.xlsx"
 _RAHNTECH_BROWSE_HEADERS = [
     "UPLOAD DATE", "FILE NAME", "RECORDS", "DATE RANGE",
 ]
@@ -5900,10 +8240,220 @@ class _RahnTechImportDialog(ImportDialog):
         asyncio.ensure_future(self._check_dupes(records, dedup_vals))
 
 
+def _rahntech_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
+    t.setItem(r, 0, _cell(rec.get("sn", "")))
+    t.setItem(r, 1, _cell(rec.get("sales_date", "")))
+    t.setItem(r, 2, _cell(rec.get("trip_number", "")))
+    t.setItem(r, 3, _cell(rec.get("device_number", "")))
+    t.setItem(r, 4, _cell(rec.get("truck_number", "")))
+    t.setItem(r, 5, _cell(rec.get("driver_name", "")))
+    t.setItem(r, 6, _cell(rec.get("do_number", "")))
+    _finish_table_row(t, r)
+
+
+class _RahnTechAllEntries(QWidget):
+    """Flat, filterable list of every RahnTech record with infinite scroll."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._search = ""
+        self._year = 0
+        self._month = 0
+        self._loaded = 0
+        self._total = 0
+        self._loading = False
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search truck, driver, trip, device…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._year_cb = QComboBox()
+        self._year_cb.addItem("All Years", 0)
+        self._year_cb.setFixedWidth(110)
+        self._year_cb.setStyleSheet(_input_ss())
+        self._year_cb.currentIndexChanged.connect(self._on_year)
+        tbl.addWidget(self._year_cb)
+
+        self._month_cb = QComboBox()
+        for label, val in _TOLL_MONTHS:
+            self._month_cb.addItem(label, val)
+        self._month_cb.setFixedWidth(130)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.setEnabled(False)
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        tbl.addWidget(self._month_cb)
+
+        self._from_date, self._to_date = add_from_to_editors(
+            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=True,
+        )
+
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._totals = _TotalsBar([("count", "Total records: ")])
+        vl.addWidget(self._totals)
+
+        self._table = _make_table(_RAHNTECH_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        vl.addWidget(self._table, 1)
+
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
+
+    def refresh(self) -> None:
+        asyncio.ensure_future(self._reload_years_and_data())
+
+    async def _reload_years_and_data(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            years = await svc.get_rahntech_available_years()
+        except Exception:
+            years = []
+        self._year = _populate_year_combo(self._year_cb, years, self._year)
+        if self._year <= 0:
+            self._month = 0
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(False)
+            self._month_cb.blockSignals(False)
+        self._reset_and_load()
+
+    def _effective_month(self) -> int:
+        return self._month if self._year > 0 else 0
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(f"Showing {self._loaded:,} of {self._total:,}{suffix}")
+
+    async def _load_initial(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            totals, recs, total = await asyncio.gather(
+                svc.get_rahntech_all_totals(self._search, self._year, month, **self._date_kw()),
+                svc.get_rahntech_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw()),
+                svc.count_rahntech_all_records(self._search, self._year, month, **self._date_kw()),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        self._totals.set_total("count", int(totals.get("count", 0)), "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        try:
+            recs = await svc.get_rahntech_all_records(
+                self._search, self._year, month,
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
+        for rec in recs:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _rahntech_fill_row(self._table, r, rec)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._reset_and_load()
+
+    def _date_kw(self) -> dict:
+        if not hasattr(self, "_from_date"):
+            return {}
+        df, dt = read_from_to(self._from_date, self._to_date, optional=True)
+        return {"date_from": df, "date_to": dt}
+
+    def _on_year(self, _idx: int) -> None:
+        self._year = int(self._year_cb.currentData() or 0)
+        has_year = self._year > 0
+        self._month_cb.setEnabled(has_year)
+        if not has_year:
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.blockSignals(False)
+            self._month = 0
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+    def _on_month(self, _idx: int) -> None:
+        self._month = int(self._month_cb.currentData() or 0)
+        if hasattr(self, "_from_date"):
+            sync_from_to(
+                self._from_date, self._to_date, self._year, self._month, optional=True,
+            )
+        self._reset_and_load()
+
+
 class _RahnTechUploadBrowse(QWidget):
     """Table of every RahnTech import batch. Clicking a row drills into it."""
 
     upload_clicked = Signal(object)
+    delete_clicked = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -5928,9 +8478,11 @@ class _RahnTechUploadBrowse(QWidget):
         self._table.setStyleSheet(_table_style())
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table, 1)
 
-        hint = _lbl("Click any row to view the full records for that upload.", size=11, color=_TM)
+        hint = _lbl("Click any row to view its records · right-click to delete an upload.", size=11, color=_TM)
         hint.setAlignment(Qt.AlignCenter)
         vl.addWidget(hint)
 
@@ -5974,19 +8526,30 @@ class _RahnTechUploadBrowse(QWidget):
         if row < len(self._uploads):
             self.upload_clicked.emit(self._uploads[row])
 
+    def _on_menu(self, pos) -> None:
+        row = self._table.rowAt(pos.y())
+        if not (0 <= row < len(self._uploads)):
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Delete this upload")
+        if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
+            self.delete_clicked.emit(self._uploads[row])
+
 
 class _RahnTechUploadDetail(QWidget):
     """Full record table for a single RahnTech upload batch."""
 
     back_requested = Signal()
+    delete_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._upload_id = ""
+        self._upload_doc: dict = {}
         self._search = ""
-        self._page = 1
-        self._page_size = 50
+        self._loaded = 0
         self._total = 0
+        self._loading = False
         self._build()
 
     def _build(self) -> None:
@@ -6006,6 +8569,9 @@ class _RahnTechUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
+        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
+        delete_btn.clicked.connect(self._request_delete)
+        navl.addWidget(delete_btn)
         vl.addWidget(nav)
 
         self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
@@ -6028,17 +8594,18 @@ class _RahnTechUploadDetail(QWidget):
         self._table = _make_table(_RAHNTECH_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])
         vl.addWidget(self._totals)
 
-        self._pager = _PaginationBar()
-        self._pager.page_changed.connect(self._go_page)
-        self._pager.size_changed.connect(self._on_page_size)
-        vl.addWidget(self._pager)
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
 
     def load_upload(self, upload_doc: dict) -> None:
+        self._upload_doc = upload_doc
         self._upload_id = str(upload_doc.get("_id") or "")
         filename = upload_doc.get("source_filename") or "Unknown file"
         count = int(upload_doc.get("record_count", 0))
@@ -6057,53 +8624,87 @@ class _RahnTechUploadDetail(QWidget):
         self._search_edit.blockSignals(True)
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    async def _load(self) -> None:
+    def _request_delete(self) -> None:
+        if self._upload_doc:
+            self.delete_requested.emit(self._upload_doc)
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(f"Showing {self._loaded:,} of {self._total:,}{suffix}")
+
+    async def _load_initial(self) -> None:
         from tahmeed.services import accountant_service as svc
-        if not self._upload_id:
+        if not self._upload_id or self._loading:
             return
-        skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_rahntech_upload_records(
-                self._upload_id, self._search, self._page_size, skip
-            ),
-            svc.count_rahntech_upload_records(self._upload_id, self._search),
-        )
+        self._loading = True
+        self._update_status()
+        try:
+            recs, total = await asyncio.gather(
+                svc.get_rahntech_upload_records(
+                    self._upload_id, self._search, _SCROLL_CHUNK, 0
+                ),
+                svc.count_rahntech_upload_records(self._upload_id, self._search),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load records.")
+            return
         self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
+        self._append_rows(recs)
+        self._loaded = len(recs)
         self._totals.set_total("count", total, "")
+        self._loading = False
+        self._update_status()
 
-    def _fill_table(self, recs: List[dict]) -> None:
-        t = self._table
-        t.setRowCount(0)
+    async def _load_more(self) -> None:
+        from tahmeed.services import accountant_service as svc
+        if not self._upload_id or self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            recs = await svc.get_rahntech_upload_records(
+                self._upload_id, self._search, _SCROLL_CHUNK, self._loaded
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
         for rec in recs:
-            r = t.rowCount()
-            t.insertRow(r)
-            t.setItem(r, 0, _cell(rec.get("sn", "")))
-            t.setItem(r, 1, _cell(rec.get("sales_date", "")))
-            t.setItem(r, 2, _cell(rec.get("trip_number", ""), mono=True))
-            t.setItem(r, 3, _cell(rec.get("device_number", ""), mono=True))
-            t.setItem(r, 4, _cell(rec.get("truck_number", "")))
-            t.setItem(r, 5, _cell(rec.get("driver_name", "")))
-            t.setItem(r, 6, _cell(rec.get("do_number", "")))
-            _finish_table_row(t, r)
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            _rahntech_fill_row(self._table, r, rec)
 
     def _on_search(self, text: str) -> None:
         self._search = text
-        self._page = 1
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    def _go_page(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._load())
-
-    def _on_page_size(self, size: int) -> None:
-        self._page_size = size
-        self._page = 1
-        asyncio.ensure_future(self._load())
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
 
 class RahnTechWidget(QWidget):
@@ -6123,36 +8724,80 @@ class RahnTechWidget(QWidget):
         vl.setSpacing(12)
 
         header = _PageHeader("RahnTech", "mdi.devices")
+        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+        tmpl_btn.clicked.connect(self._download_template)
         self._import_btn = _btn("Import Transacted Devices", "mdi.upload-outline")
         self._import_btn.clicked.connect(self._open_import)
+        header.add_right(tmpl_btn)
         header.add_right(self._import_btn)
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._stack = QStackedWidget()
-        self._stack.setStyleSheet("background:transparent;")
+        self._tabs = _SegmentTabBar(["All Entries", "Uploads"])
+        vl.addWidget(self._tabs)
+
+        self._main_stack = QStackedWidget()
+        self._main_stack.setStyleSheet("background:transparent;")
+
+        self._all_entries = _RahnTechAllEntries()
+        self._main_stack.addWidget(self._all_entries)
+
+        upload_host = QWidget()
+        upload_host.setStyleSheet("background:transparent;")
+        upload_vl = QVBoxLayout(upload_host)
+        upload_vl.setContentsMargins(0, 0, 0, 0)
+        upload_vl.setSpacing(0)
+
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
 
         self._browse = _RahnTechUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
-        self._stack.addWidget(self._browse)
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._browse)
 
         self._detail = _RahnTechUploadDetail()
         self._detail.back_requested.connect(self._show_browse)
-        self._stack.addWidget(self._detail)
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
 
-        self._stack.setCurrentIndex(0)
-        vl.addWidget(self._stack, 1)
+        upload_vl.addWidget(self._upload_stack, 1)
+        self._main_stack.addWidget(upload_host)
+
+        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        vl.addWidget(self._main_stack, 1)
 
     def refresh(self) -> None:
+        self._all_entries.refresh()
         self._show_browse()
 
     def _show_browse(self) -> None:
-        self._stack.setCurrentIndex(0)
+        self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._tabs.set_index(1, emit=False)
+        self._main_stack.setCurrentIndex(1)
+        self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
-        self._stack.setCurrentIndex(1)
+
+    def _download_template(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Import Template",
+            _RAHNTECH_TEMPLATE_FILENAME,
+            "Excel Files (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            _write_xlsx_template(path, _RAHNTECH_TEMPLATE_TITLE, _RAHNTECH_HEADERS)
+            QMessageBox.information(
+                self, "Template Saved",
+                f"Empty template saved to:\n{path}\n\n"
+                "Fill in your data using the column headers shown, then import the file.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -6170,4 +8815,36 @@ class RahnTechWidget(QWidget):
 
     def _on_imported(self, n: int) -> None:
         QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        self._all_entries.refresh()
+        self._show_browse()
+        self._tabs.set_index(1)
+
+    def _on_delete_upload(self, upload_doc: dict) -> None:
+        upload_id = str(upload_doc.get("_id") or "")
+        if not upload_id:
+            return
+        filename = upload_doc.get("source_filename") or "Unknown file"
+        count = int(upload_doc.get("record_count", 0))
+        if QMessageBox.question(
+            self,
+            "Delete Upload",
+            f"Delete upload from \"{filename}\" and all {count:,} records?\n\nThis cannot be undone.",
+        ) != QMessageBox.Yes:
+            return
+        asyncio.ensure_future(self._delete_upload(upload_id))
+
+    async def _delete_upload(self, upload_id: str) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            deleted = await svc.delete_rahntech_upload(upload_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete Error", str(exc))
+            return
+        if deleted <= 0:
+            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
+            return
+        QMessageBox.information(
+            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+        )
+        self._all_entries.refresh()
         self._show_browse()

@@ -29,14 +29,17 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QLineEdit, QComboBox, QPushButton, QMessageBox, QFileDialog,
-    QAbstractItemView,
+    QAbstractItemView, QDateEdit,
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QSize
+from PySide6.QtCore import Qt, Signal, QTimer, QSize, QDate
 from PySide6.QtGui import QFont, QColor, QBrush
 
 from tahmeed.app_state import app_state
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.category_service import item_key
+from tahmeed.ui.accountant.date_filters import (
+    add_from_to_editors, read_from_to, sync_from_to,
+)
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
@@ -146,12 +149,12 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400, color: str = _T1) ->
 
 def _input_ss() -> str:
     return (
-        f"QLineEdit, QComboBox {{"
+        f"QLineEdit, QComboBox, QDateEdit {{"
         f"  border: 1px solid {_BORDER}; border-radius: 5px;"
         f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
         "  font-family:'Segoe UI'; padding: 0 8px;"
         "  min-height: 32px; max-height: 32px; }}"
-        f"QLineEdit:focus, QComboBox:focus {{ border-color: {_BLUE}; }}"
+        f"QLineEdit:focus, QComboBox:focus, QDateEdit:focus {{ border-color: {_BLUE}; }}"
         "QComboBox::drop-down { border: none; width: 20px; }"
     )
 
@@ -336,6 +339,12 @@ class CategoryTableWidget(QWidget):
         self._month_cb.currentIndexChanged.connect(self._on_month_changed)
         fl.addWidget(self._month_cb)
 
+        self._from_date, self._to_date = add_from_to_editors(
+            fl, self._on_filter_changed, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=False,
+        )
+        sync_from_to(self._from_date, self._to_date, self._year, self._month, optional=False)
+
         self._rcpt_cb = QComboBox()
         for label, val in [("All Receipts", "all"), ("Received", "received"),
                            ("Pending", "pending"), ("No Receipt", "missing")]:
@@ -466,13 +475,18 @@ class CategoryTableWidget(QWidget):
         if yr and yr != self._year:
             self._year = yr
             app_state.fiscal_year = yr
+            sync_from_to(self._from_date, self._to_date, self._year, self._month, optional=False)
             self._page = 0
             asyncio.ensure_future(self._reload())
 
     def _on_month_changed(self) -> None:
         self._month = self._month_cb.currentData() or 0
+        sync_from_to(self._from_date, self._to_date, self._year, self._month, optional=False)
         self._page = 0
         asyncio.ensure_future(self._reload())
+
+    def _date_filters(self):
+        return read_from_to(self._from_date, self._to_date, optional=False)
 
     def _on_filter_changed(self) -> None:
         self._page = 0
@@ -506,11 +520,13 @@ class CategoryTableWidget(QWidget):
             )
             size = self._page_size()
             skip = self._page * size
+            date_from, date_to = self._date_filters()
             kw = dict(
                 year=self._year, month=self._month,
                 search=self._search_text(), truck="",
                 category=self._category, receipt=self._receipt_filter(),
                 description=self._description_filter,
+                date_from=date_from, date_to=date_to,
             )
             txs, total, totals = await asyncio.gather(
                 get_master_transactions(
@@ -595,11 +611,13 @@ class CategoryTableWidget(QWidget):
             return
 
         from tahmeed.services.accountant_service import get_master_transactions
+        date_from, date_to = self._date_filters()
         kw = dict(
             year=self._year, month=self._month,
             search=self._search_text(), truck="",
             category=self._category, receipt=self._receipt_filter(),
             description=self._description_filter,
+            date_from=date_from, date_to=date_to,
         )
         try:
             txs = await get_master_transactions(
