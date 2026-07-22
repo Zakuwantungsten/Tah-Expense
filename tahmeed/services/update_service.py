@@ -387,6 +387,9 @@ def recover_ready_update() -> Path | None:
     metadata_path = root / "ready.json"
     try:
         metadata = json.loads(metadata_path.read_text("utf-8"))
+        # Already handed off to Inno — do not relaunch until cleanup runs.
+        if metadata.get("launched") is True:
+            return None
         installer = Path(metadata["installer"])
         if installer.parent.resolve() != root.resolve() or not installer.is_file():
             raise ValueError
@@ -411,7 +414,6 @@ def recover_ready_update() -> Path | None:
             pass
         return None
 
-
 def set_install_on_exit(enabled: bool) -> None:
     path = update_root() / "ready.json"
     try:
@@ -419,6 +421,7 @@ def set_install_on_exit(enabled: bool) -> None:
     except (OSError, ValueError) as exc:
         raise UpdateError("No verified update is ready") from exc
     metadata["install_on_exit"] = bool(enabled)
+    metadata.pop("launched", None)
     _atomic_json(path, metadata)
 
 
@@ -428,6 +431,80 @@ def install_on_exit_path() -> Path | None:
         return None
     try:
         metadata = json.loads((update_root() / "ready.json").read_text("utf-8"))
+        if metadata.get("launched") is True:
+            return None
         return installer if metadata.get("install_on_exit") is True else None
     except (OSError, ValueError):
         return None
+
+
+def mark_update_launched() -> None:
+    """Prevent a second silent install on the next exit after we hand off to Inno.
+
+    Keeps the installer file on disk so the already-started setup process can
+    finish reading it; ``cleanup_applied_update`` removes it after relaunch.
+    """
+    path = update_root() / "ready.json"
+    try:
+        metadata = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return
+    metadata["install_on_exit"] = False
+    metadata["launched"] = True
+    _atomic_json(path, metadata)
+
+
+def clear_staged_update() -> None:
+    """Delete ready metadata and any staged installer / partial downloads."""
+    root = update_root()
+    if not root.exists():
+        return
+    for path in root.glob("*.part"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    metadata_path = root / "ready.json"
+    installer: Path | None = None
+    try:
+        metadata = json.loads(metadata_path.read_text("utf-8"))
+        candidate = Path(metadata["installer"])
+        if candidate.parent.resolve() == root.resolve():
+            installer = candidate
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        metadata_path.unlink()
+    except FileNotFoundError:
+        pass
+    if installer is not None:
+        try:
+            installer.unlink()
+        except OSError:
+            pass
+    for leftover in root.glob("TahmeedExpenseSetup-*.exe"):
+        try:
+            leftover.unlink()
+        except OSError:
+            pass
+
+
+def cleanup_applied_update() -> None:
+    """Drop staged installers that are already at or below the running version."""
+    root = update_root()
+    metadata_path = root / "ready.json"
+    try:
+        metadata = json.loads(metadata_path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return
+    staged_version = metadata.get("version")
+    launched = metadata.get("launched") is True
+    try:
+        already_applied = (
+            isinstance(staged_version, str)
+            and not is_newer_version(staged_version, APP_VERSION)
+        )
+    except UpdateError:
+        already_applied = True
+    if launched or already_applied:
+        clear_staged_update()

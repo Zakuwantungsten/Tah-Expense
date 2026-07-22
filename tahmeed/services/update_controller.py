@@ -14,7 +14,8 @@ from tahmeed.ui.dialogs.update_dialog import UpdateDialog
 
 
 class UpdateController(QObject):
-    STARTUP_DELAY_MS = 12_000
+    # Short delay so the login UI paints first, then prompt like VS Code / Cursor.
+    STARTUP_DELAY_MS = 2_500
     CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 
     def __init__(self, request_install: Callable[[str], None], parent=None):
@@ -49,13 +50,19 @@ class UpdateController(QObject):
             self._checking = False
         if info is None:
             return
+        if self._dialog is not None:
+            return
         app = QApplication.instance()
         parent = app.activeWindow() if app is not None else None
         self._dialog = UpdateDialog(info, parent)
-        self._dialog.restart_requested.connect(self._request_install)
+        self._dialog.restart_requested.connect(self._on_restart_requested)
         self._dialog.finished.connect(self._dialog_finished)
         self._dialog.show()
 
+    def _on_restart_requested(self, path: str) -> None:
+        if self._dialog is not None:
+            self._dialog.accept()
+        self._request_install(path)
     def _dialog_finished(self) -> None:
         if self._dialog is not None:
             self._dialog.deleteLater()

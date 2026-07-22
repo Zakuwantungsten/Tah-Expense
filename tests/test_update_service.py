@@ -89,6 +89,7 @@ def test_signature_is_checked_before_manifest_json(monkeypatch) -> None:
 
 def test_fetch_rejects_manifest_sequence_rollback(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(updater, "APP_VERSION", "1.0.0")
     monkeypatch.setattr(
         updater, "UPDATE_MANIFEST_URL", "https://updates.example.com/tahmeed/version.json"
     )
@@ -208,3 +209,33 @@ def test_recovery_deletes_tampered_ready_installer(monkeypatch, tmp_path) -> Non
     )
     assert updater.recover_ready_update() is None
     assert not (root / "ready.json").exists()
+
+
+def test_mark_launched_blocks_install_on_exit_and_cleanup(monkeypatch, tmp_path) -> None:
+    payload = b"verified installer bytes"
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(updater, "APP_VERSION", "1.0.1")
+    root = updater.update_root()
+    root.mkdir(parents=True)
+    installer = root / "TahmeedExpenseSetup-1.0.1.exe"
+    installer.write_bytes(payload)
+    (root / "ready.json").write_text(
+        json.dumps(
+            {
+                "version": "1.0.1",
+                "sequence": 2,
+                "installer": str(installer),
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "install_on_exit": True,
+            }
+        ),
+        "utf-8",
+    )
+    assert updater.install_on_exit_path() == installer
+    updater.mark_update_launched()
+    assert updater.install_on_exit_path() is None
+    assert updater.recover_ready_update() is None
+    updater.cleanup_applied_update()
+    assert not (root / "ready.json").exists()
+    assert not installer.exists()

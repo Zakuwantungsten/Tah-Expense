@@ -5706,6 +5706,10 @@ def _read_afritrack_file(path: str) -> Tuple[List[List[str]], float, float, floa
         rate    = _v(row, 5)
         total_t = _v(row, 6) if (len(row) > 6 and row[6] is not None) else trans * rate
         total_i = _v(row, 7)
+        if len(row) > 8 and row[8] is not None:
+            variance = _v(row, 8)
+        else:
+            variance = total_t - total_i
         remarks = str(row[9] or "").strip() if len(row) > 9 else ""
 
         def _int_or_dec(f):
@@ -5720,7 +5724,7 @@ def _read_afritrack_file(path: str) -> Tuple[List[List[str]], float, float, floa
             _s(rate, 6),
             _s(total_t),
             _s(total_i),
-            "",             # variance — auto-computed
+            _s(variance),
             remarks,
         ])
 
@@ -6491,16 +6495,17 @@ _AF_TEMPLATE_FILENAME = "Afritrack_Import_Template.xlsx"
 
 
 def _afritrack_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
+    variance = float(rec.get("variance", 0) or 0)
     values = [
         str(rec.get("row_index", r + 1)),
         rec.get("truck", ""),
-        _fmt_num(rec.get("days"), decimals=0) if rec.get("days") else "—",
-        _fmt_num(rec.get("non_trans_days"), decimals=0) if rec.get("non_trans_days") else "—",
-        _fmt_num(rec.get("trans_days"), decimals=0) if rec.get("trans_days") else "—",
-        _fmt_num(rec.get("rate_per_day"), decimals=6) if rec.get("rate_per_day") else "—",
-        _fmt_num(rec.get("total_tahmeed"), decimals=2) if rec.get("total_tahmeed") else "—",
-        _fmt_num(rec.get("total_invoice"), decimals=2) if rec.get("total_invoice") else "—",
-        _fmt_num(rec.get("variance"), decimals=2) if rec.get("variance") else "—",
+        _fmt_num(rec.get("days"), decimals=0) if rec.get("days") is not None else "—",
+        _fmt_num(rec.get("non_trans_days"), decimals=0) if rec.get("non_trans_days") is not None else "—",
+        _fmt_num(rec.get("trans_days"), decimals=0) if rec.get("trans_days") is not None else "—",
+        _fmt_num(rec.get("rate_per_day"), decimals=6) if rec.get("rate_per_day") is not None else "—",
+        _fmt_num(rec.get("total_tahmeed"), decimals=2) if rec.get("total_tahmeed") is not None else "—",
+        _fmt_num(rec.get("total_invoice"), decimals=2) if rec.get("total_invoice") is not None else "—",
+        _fmt_num(variance, decimals=2),
         rec.get("remarks", ""),
     ]
     aligns = [
@@ -6513,8 +6518,7 @@ def _afritrack_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     for c, val in enumerate(values):
         color = ""
         if c == 8:
-            variance = float(rec.get("variance", 0) or 0)
-            color = _RED if variance < 0 else (_GREEN if variance > 0 else "")
+            color = _RED if variance < -0.005 else (_GREEN if variance > 0.005 else "")
         t.setItem(r, c, _cell(val, aligns[c], mono=False, color=color))
     _finish_table_row(t, r)
 
@@ -6744,6 +6748,12 @@ def _afritrack_rows_to_records(
         truck = str(row[_AF_COL_TRUCK] or "").strip() if len(row) > _AF_COL_TRUCK else ""
         if not truck:
             continue
+        total_t = _af_flt(row[_AF_COL_TOTAL_T]) if len(row) > _AF_COL_TOTAL_T else 0.0
+        total_i = _af_flt(row[_AF_COL_TOTAL_I]) if len(row) > _AF_COL_TOTAL_I else 0.0
+        if len(row) > _AF_COL_VAR and str(row[_AF_COL_VAR] or "").strip() not in ("", "-", "—"):
+            variance = _af_flt(row[_AF_COL_VAR])
+        else:
+            variance = total_t - total_i
         records.append({
             "feed_type": "afritrack",
             "upload_id": upload_id,
@@ -6755,9 +6765,9 @@ def _afritrack_rows_to_records(
             "non_trans_days": _af_flt(row[_AF_COL_NTRANS]) if len(row) > _AF_COL_NTRANS else 0.0,
             "trans_days": _af_flt(row[_AF_COL_TRANS]) if len(row) > _AF_COL_TRANS else 0.0,
             "rate_per_day": _af_flt(row[_AF_COL_RATE]) if len(row) > _AF_COL_RATE else 0.0,
-            "total_tahmeed": _af_flt(row[_AF_COL_TOTAL_T]) if len(row) > _AF_COL_TOTAL_T else 0.0,
-            "total_invoice": _af_flt(row[_AF_COL_TOTAL_I]) if len(row) > _AF_COL_TOTAL_I else 0.0,
-            "variance": _af_flt(row[_AF_COL_VAR]) if len(row) > _AF_COL_VAR else 0.0,
+            "total_tahmeed": total_t,
+            "total_invoice": total_i,
+            "variance": variance,
             "remarks": str(row[_AF_COL_REMARKS] or "").strip() if len(row) > _AF_COL_REMARKS else "",
             "installation_tahmeed": inst_t,
             "installation_invoice": inst_i,

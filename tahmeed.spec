@@ -12,6 +12,8 @@ datas = [
     (".env.build", "."),
     ("logo.png", "."),
     ("tahmeed/assets/update_public_keys.json", "tahmeed/assets"),
+    ("tahmeed/assets/app.ico", "tahmeed/assets"),
+    ("tahmeed/assets/app_icon.png", "tahmeed/assets"),
 ]
 datas += collect_data_files("qtawesome")
 
@@ -66,6 +68,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(root / "tahmeed" / "assets" / "app.ico"),
 )
 
 coll = COLLECT(

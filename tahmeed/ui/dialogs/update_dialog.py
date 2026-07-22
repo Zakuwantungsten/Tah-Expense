@@ -217,6 +217,9 @@ class UpdateDialog(QDialog):
         self.hint.setText("The verified update will install when you exit the app.")
         self.install_exit_btn.setEnabled(False)
         self.install_exit_btn.setText("Will Install on Exit")
+        # Dismiss like VS Code / Cursor — the staged installer runs on quit.
+        if not self._info.required:
+            self.accept()
 
     def reject(self) -> None:
         if self._thread is not None:

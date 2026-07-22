@@ -211,21 +211,11 @@ class LoginWindow(QWidget):
         try:
             has_users = await any_user_exists()
             self._stack.setCurrentIndex(0 if has_users else 1)
-        except Exception as exc:
-            self._login_error.setText(f"API connection error: {exc}")
-            self._stack.setCurrentIndex(0)
-        asyncio.ensure_future(self._check_for_updates())
-
-    async def _check_for_updates(self) -> None:
-        try:
-            from tahmeed.services.update_service import check_for_update
-            from tahmeed.ui.dialogs.update_dialog import UpdateDialog
-
-            info = await check_for_update()
-            if info:
-                UpdateDialog(info, self).exec()
         except Exception:
-            pass
+            self._login_error.setText(
+                "Cannot reach the server. Check your connection and try again."
+            )
+            self._stack.setCurrentIndex(0)
 
     # ------------------------------------------------------------------
     def clear_fields(self) -> None:
@@ -256,7 +246,11 @@ class LoginWindow(QWidget):
         try:
             user = await authenticate(username, password)
         except ApiError as exc:
-            self._login_error.setText(str(exc))
+            # Prefer short auth messages over raw transport dumps in the login UI.
+            detail = str(exc).strip()
+            if len(detail) > 120 or "\n" in detail or "Traceback" in detail:
+                detail = "Sign-in failed. Please try again."
+            self._login_error.setText(detail or "Sign-in failed. Please try again.")
             self._login_btn.setEnabled(True)
             return
         if user is None:

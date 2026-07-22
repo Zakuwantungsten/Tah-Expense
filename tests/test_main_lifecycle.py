@@ -35,6 +35,18 @@ def test_logout_shows_login_before_closing_last_window() -> None:
     assert windows == []
 
 
+def test_installer_launch_marks_update_launched(monkeypatch, tmp_path) -> None:
+    installer = tmp_path / "TahmeedExpenseSetup-1.0.1.exe"
+    installer.write_bytes(b"verified")
+    monkeypatch.setattr(main, "recover_ready_update", lambda: installer)
+    marked = []
+    monkeypatch.setattr(main, "mark_update_launched", lambda: marked.append(True))
+    monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: None)
+
+    assert _launch_verified_installer(installer) is True
+    assert marked == [True]
+
+
 def test_installer_launch_uses_argument_list_without_shell(monkeypatch, tmp_path) -> None:
     installer = tmp_path / "TahmeedExpenseSetup-1.0.1.exe"
     installer.write_bytes(b"verified")

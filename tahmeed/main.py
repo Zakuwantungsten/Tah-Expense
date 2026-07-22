@@ -13,7 +13,9 @@ from tahmeed.db.connection import close as close_db
 from tahmeed.services.api_client import api_client, close_api
 from tahmeed.services.update_controller import UpdateController
 from tahmeed.services.update_service import (
+    cleanup_applied_update,
     install_on_exit_path,
+    mark_update_launched,
     recover_ready_update,
     update_root,
 )
@@ -82,7 +84,38 @@ def _launch_verified_installer(installer: Path) -> bool:
         shell=False,
         close_fds=True,
     )
+    # Clear install-on-exit so the upgraded app cannot re-run this installer
+    # on its next normal exit (which looked like "new then old" reinstalls).
+    mark_update_launched()
     return True
+
+
+def _set_app_icon(app: QApplication) -> None:
+    from PySide6.QtGui import QIcon
+
+    candidates = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        meipass = Path(sys._MEIPASS)
+        candidates.extend(
+            [
+                meipass / "tahmeed" / "assets" / "app.ico",
+                meipass / "tahmeed" / "assets" / "app_icon.png",
+            ]
+        )
+    root = Path(__file__).resolve().parent
+    candidates.extend(
+        [
+            root / "assets" / "app.ico",
+            root / "assets" / "app_icon.png",
+            root.parent / "logo.png",
+        ]
+    )
+    for path in candidates:
+        if path.is_file():
+            icon = QIcon(str(path))
+            if not icon.isNull():
+                app.setWindowIcon(icon)
+                return
 
 
 def main() -> None:
@@ -90,6 +123,8 @@ def main() -> None:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setStyle("Fusion")
+    _set_app_icon(app)
+    cleanup_applied_update()
 
     lock_path = update_root().parent / "desktop.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)

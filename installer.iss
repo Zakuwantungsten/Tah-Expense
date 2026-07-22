@@ -28,6 +28,7 @@ OutputBaseFilename=TahmeedExpenseSetup-{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=tahmeed\assets\app.ico
 ; Install per-user so no admin rights are required. Change to "admin" if you
 ; prefer installing into Program Files for all users.
 PrivilegesRequired=lowest
@@ -46,8 +47,8 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "dist\Tahmeed Expense\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Flags: nowait; Check: ShouldRelaunch
