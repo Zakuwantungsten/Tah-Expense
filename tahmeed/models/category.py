@@ -16,6 +16,7 @@ class Category:
     description: str = ""          # hint shown to cashier; auto-fills their description field
     color: str = "#4A90D9"
     icon: str = "mdi.tag-outline"  # qtawesome mdi.* glyph for the sidebar tab
+    sidebar_name: str = ""         # optional short label for the sidebar tab
     show_in_sidebar: bool = False  # if True, item gets its own sidebar tab
     sort_order: int = 0
     requires_receipt: bool = False
@@ -30,12 +31,19 @@ class Category:
     coa_description: str = ""      # CoA "Description" column (distinct from cashier hint)
     _id: Optional[ObjectId] = None
 
+    @property
+    def sidebar_label(self) -> str:
+        """Short sidebar tab label; falls back to the canonical item name."""
+        label = (self.sidebar_name or "").strip()
+        return label or self.name
+
     def to_doc(self) -> dict:
         doc = {
             "name": self.name,
             "description": self.description,
             "color": self.color,
             "icon": self.icon,
+            "sidebar_name": self.sidebar_name,
             "show_in_sidebar": self.show_in_sidebar,
             "sort_order": self.sort_order,
             "requires_receipt": self.requires_receipt,
@@ -60,6 +68,7 @@ class Category:
             description=doc.get("description", ""),
             color=doc.get("color", "#4A90D9"),
             icon=doc.get("icon", "mdi.tag-outline"),
+            sidebar_name=doc.get("sidebar_name", ""),
             show_in_sidebar=doc.get("show_in_sidebar", False),
             sort_order=doc.get("sort_order", 0),
             requires_receipt=doc.get("requires_receipt", False),

@@ -66,4 +66,4 @@ def require_roles(*roles: str) -> Callable:
 Authenticated = Annotated[dict[str, Any], Depends(current_user)]
 Admin = Annotated[dict[str, Any], Depends(require_roles("admin"))]
 Manager = Annotated[dict[str, Any], Depends(require_roles("admin", "accountant"))]
-Cashier = Annotated[dict[str, Any], Depends(require_roles("cashier"))]
+Cashier = Annotated[dict[str, Any], Depends(require_roles("cashier", "accountant"))]

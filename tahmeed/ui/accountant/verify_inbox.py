@@ -13,13 +13,14 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QLineEdit, QComboBox, QPushButton, QTextEdit,
     QMessageBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView,
+    QHeaderView, QAbstractItemView, QDialog,
 )
 from PySide6.QtCore import Qt, Signal, QSize, QTimer
 from PySide6.QtGui import QColor, QFont
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
+from tahmeed.models.category import Category
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE     = "#FFFFFF"
@@ -405,7 +406,7 @@ class _PaginationBar(QFrame):
 
 class _ActionPanel(QFrame):
     """Pinned review panel that slides in below the table when a row is double-clicked."""
-    approved  = Signal(object)       # tx._id
+    approved  = Signal(object, str)  # tx._id, selected category (may be empty)
     rejected  = Signal(object, str)  # tx._id, reason
     saved_cat = Signal(object, str)  # tx._id, category
     returned  = Signal(object)       # tx._id — return rejected entry to inbox
@@ -536,10 +537,8 @@ class _ActionPanel(QFrame):
     def _on_approve(self) -> None:
         if not self._tx:
             return
-        cat = self._cat_combo.currentText()
-        if cat and cat != self._tx.category_name:
-            self.saved_cat.emit(self._tx._id, cat)
-        self.approved.emit(self._tx._id)
+        cat = self._cat_combo.currentText().strip()
+        self.approved.emit(self._tx._id, cat)
 
     def _on_reject(self) -> None:
         if not self._tx:
@@ -646,6 +645,7 @@ class VerifyInboxWidget(QWidget):
         super().__init__(parent)
         self._user = user
         self._categories: List[str] = []
+        self._category_objects: List[Category] = []
         self._transactions: List[Transaction] = []
         self._cashier_names: Dict = {}
         self._page = 0
@@ -854,7 +854,18 @@ class VerifyInboxWidget(QWidget):
     def _open_review_panel(self, row: int) -> None:
         if row < 0 or row >= len(self._transactions):
             return
+        asyncio.ensure_future(self._open_review_panel_async(row))
+
+    async def _open_review_panel_async(self, row: int) -> None:
         tx = self._transactions[row]
+        if self._tx_needs_item(tx) and tx.description:
+            from tahmeed.services.description_mapping_service import resolve_category_for_description
+
+            resolved = await resolve_category_for_description(tx.description)
+            if resolved:
+                _, cat_name = resolved
+                tx.category_name = cat_name
+                tx.item = cat_name
         cashier = self._cashier_names.get(tx.cashier_id, "") if tx.cashier_id else ""
         tab = self._current_tab
         mode = "rejected" if tab == 2 else ("edited" if tab == 1 else "new")
@@ -931,6 +942,7 @@ class VerifyInboxWidget(QWidget):
                         get_unverified_cashier_ids(),
                     )
                 self._categories = [c.name for c in cats]
+                self._category_objects = cats
                 cname_map = await get_cashier_names(cashier_ids)
                 self._filter_bar.populate_trucks(trucks)
                 clist = sorted(
@@ -1164,8 +1176,8 @@ class VerifyInboxWidget(QWidget):
 
     # ── Action callbacks ────────────────────────────────────────────────────────
 
-    def _on_approved(self, tx_id: ObjectId) -> None:
-        asyncio.ensure_future(self._do_approve(tx_id))
+    def _on_approved(self, tx_id: ObjectId, category: str = "") -> None:
+        asyncio.ensure_future(self._do_approve(tx_id, category))
 
     def _on_rejected(self, tx_id: ObjectId, reason: str) -> None:
         asyncio.ensure_future(self._do_reject(tx_id, reason))
@@ -1207,15 +1219,173 @@ class VerifyInboxWidget(QWidget):
             "Double-click each row to review, fill in the note, then press Reject & Return.",
         )
 
+    # ── Item resolution (description → item mappings) ───────────────────────────
+
+    @staticmethod
+    def _tx_needs_item(tx: Transaction) -> bool:
+        from tahmeed.services.description_mapping_service import transaction_needs_item
+
+        return transaction_needs_item(tx.item, tx.category_name)
+
+    def _category_by_name(self, name: str) -> Optional[Category]:
+        key = (name or "").strip().lower()
+        if not key:
+            return None
+        return next((c for c in self._category_objects if c.name.lower() == key), None)
+
+    async def _assign_item_and_remember(
+        self,
+        tx_id: ObjectId,
+        description: str,
+        category: Category,
+    ) -> None:
+        from tahmeed.services.accountant_service import update_transaction_category
+        from tahmeed.services.description_mapping_service import save_mapping
+
+        await update_transaction_category(tx_id, category.name, category._id)
+        if description.strip():
+            await save_mapping(description, category._id, category.name)
+
+    async def _resolve_items_for_transactions(self, txs: List[Transaction]) -> bool:
+        """Ensure each transaction has an item; prompt when mapping is unknown."""
+        from tahmeed.services.category_service import get_all_categories
+        from tahmeed.services.description_mapping_service import (
+            get_mappings_for_descriptions,
+            normalize_description,
+            save_mapping,
+            transaction_needs_item,
+        )
+        from tahmeed.services.accountant_service import update_transaction_category
+        from tahmeed.ui.dialogs.description_mapping_dialog import DescriptionMappingDialog
+
+        pending = [tx for tx in txs if transaction_needs_item(tx.item, tx.category_name)]
+        if not pending:
+            return True
+
+        categories = self._category_objects
+        if not categories:
+            categories = await get_all_categories()
+            self._category_objects = categories
+            self._categories = [c.name for c in categories]
+
+        if not categories:
+            QMessageBox.warning(
+                self,
+                "No Items",
+                "Add items in Manage → Items before approving description-only entries.",
+            )
+            return False
+
+        descriptions = [tx.description for tx in pending if tx.description]
+        mappings = await get_mappings_for_descriptions(descriptions)
+
+        still_need: List[Transaction] = []
+        for tx in pending:
+            if not tx._id:
+                continue
+            key = normalize_description(tx.description or "")
+            mapping = mappings.get(key)
+            if mapping:
+                await update_transaction_category(
+                    tx._id, mapping.category_name, mapping.category_id,
+                )
+            elif not (tx.description or "").strip():
+                QMessageBox.warning(
+                    self,
+                    "Missing Item",
+                    "One or more selected entries have no item and no description.\n"
+                    "Assign a category manually before approving.",
+                )
+                return False
+            else:
+                still_need.append(tx)
+
+        if not still_need:
+            return True
+
+        groups: Dict[str, List[Transaction]] = {}
+        display: Dict[str, str] = {}
+        for tx in still_need:
+            key = normalize_description(tx.description or "")
+            groups.setdefault(key, []).append(tx)
+            display[key] = tx.description or key
+
+        remaining = len(groups)
+        for key in list(groups.keys()):
+            dlg = DescriptionMappingDialog(
+                description=display[key],
+                row_count=len(groups[key]),
+                categories=categories,
+                remaining=remaining,
+                parent=self,
+                scope_label="in verify inbox",
+                cancel_label="Cancel",
+            )
+            if dlg.exec() != QDialog.Accepted:
+                return False
+            cat = dlg.selected_category()
+            if cat is None:
+                return False
+            await save_mapping(display[key], cat._id, cat.name)
+            for tx in groups[key]:
+                if tx._id:
+                    await update_transaction_category(tx._id, cat.name, cat._id)
+            remaining -= 1
+
+        return True
+
+    async def _prepare_transactions_for_approval(
+        self,
+        txs: List[Transaction],
+        category_overrides: Optional[Dict[ObjectId, str]] = None,
+    ) -> bool:
+        """Apply panel selections and description mappings before approval."""
+        category_overrides = category_overrides or {}
+        manual: List[Transaction] = []
+        for tx in txs:
+            if not tx._id:
+                continue
+            chosen = category_overrides.get(tx._id, "").strip()
+            if chosen:
+                current = (tx.category_name or tx.item or "").strip()
+                if chosen.lower() != current.lower():
+                    cat = self._category_by_name(chosen)
+                    if cat is None:
+                        QMessageBox.warning(
+                            self,
+                            "Invalid Item",
+                            f'"{chosen}" is not a known item. Pick one from the category list.',
+                        )
+                        return False
+                    if self._tx_needs_item(tx):
+                        await self._assign_item_and_remember(
+                            tx._id, tx.description or "", cat,
+                        )
+                    else:
+                        from tahmeed.services.accountant_service import update_transaction_category
+                        await update_transaction_category(tx._id, cat.name, cat._id)
+            elif self._tx_needs_item(tx):
+                manual.append(tx)
+        if manual:
+            return await self._resolve_items_for_transactions(manual)
+        return True
+
     # ── Async service calls ─────────────────────────────────────────────────────
 
-    async def _do_approve(self, tx_id: ObjectId) -> None:
+    async def _do_approve(self, tx_id: ObjectId, category_override: str = "") -> None:
         from tahmeed.services.accountant_service import (
             approve_transaction, re_approve_transaction, get_pending_count,
+            get_transactions_by_ids,
         )
         try:
+            txs = await get_transactions_by_ids([tx_id])
+            if not txs:
+                QMessageBox.warning(self, "Not Found", "Transaction could not be loaded.")
+                return
+            overrides = {tx_id: category_override} if category_override else {}
+            if not await self._prepare_transactions_for_approval(txs, overrides):
+                return
             if self._current_tab == 1:
-                # Edited tab — re-approval also clears edited_after_verification.
                 await re_approve_transaction(tx_id, self._user._id)
             else:
                 await approve_transaction(tx_id, self._user._id)
@@ -1247,8 +1417,12 @@ class VerifyInboxWidget(QWidget):
     async def _do_bulk_approve(self, tx_ids: List[ObjectId]) -> None:
         from tahmeed.services.accountant_service import (
             bulk_approve_transactions, bulk_re_approve_transactions, get_pending_count,
+            get_transactions_by_ids,
         )
         try:
+            txs = await get_transactions_by_ids(tx_ids)
+            if not await self._prepare_transactions_for_approval(txs):
+                return
             if self._current_tab == 1:
                 n = await bulk_re_approve_transactions(tx_ids, self._user._id)
             else:

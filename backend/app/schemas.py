@@ -41,6 +41,7 @@ class CategoryWrite(StrictModel):
     description: str = ""
     color: str = "#4A90D9"
     icon: str = "mdi.tag-outline"
+    sidebar_name: str = ""
     show_in_sidebar: bool = False
     sort_order: int = 0
     requires_receipt: bool = False

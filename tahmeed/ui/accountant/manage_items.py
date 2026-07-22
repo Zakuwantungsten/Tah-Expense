@@ -556,6 +556,24 @@ class _ItemDialog(QDialog):
         icl.addWidget(self._choose_icon_btn)
         icl.addStretch()
         form.addRow(_lbl("Sidebar icon", size=12, weight=500, color=_T2), icon_col)
+
+        self._sidebar_name = QLineEdit()
+        self._sidebar_name.setPlaceholderText("e.g. Mileage — leave blank to use item name")
+        self._sidebar_name.setStyleSheet(_input_ss())
+        sidebar_name_note = _lbl(
+            "Optional short label shown on the sidebar tab instead of the full item name.",
+            size=11, color=_TM,
+        )
+        sidebar_name_note.setWordWrap(True)
+        sidebar_name_col = QWidget()
+        sidebar_name_col.setStyleSheet("background: transparent;")
+        snc = QVBoxLayout(sidebar_name_col)
+        snc.setContentsMargins(0, 0, 0, 0)
+        snc.setSpacing(4)
+        snc.addWidget(self._sidebar_name)
+        snc.addWidget(sidebar_name_note)
+        form.addRow(_lbl("Sidebar name", size=12, weight=500, color=_T2), sidebar_name_col)
+
         self._refresh_icon_btn()
         self._on_sidebar_toggled(False)
 
@@ -614,6 +632,7 @@ class _ItemDialog(QDialog):
         self._show_sidebar.setChecked(item.show_in_sidebar)
         self._lock_desc.setChecked(item.lock_description)
         self._icon = item.icon or "mdi.tag-outline"
+        self._sidebar_name.setText(item.sidebar_name or "")
         self._refresh_icon_btn()
         self._on_sidebar_toggled(item.show_in_sidebar)
 
@@ -632,6 +651,7 @@ class _ItemDialog(QDialog):
     def _on_sidebar_toggled(self, on: bool) -> None:
         self._icon_btn.setEnabled(on)
         self._choose_icon_btn.setEnabled(on)
+        self._sidebar_name.setEnabled(on)
 
     def _pick_icon(self) -> None:
         dlg = _IconPickerDialog(self._icon, parent=self)
@@ -662,6 +682,7 @@ class _ItemDialog(QDialog):
             "description":      self._description.text().strip(),
             "color":            self._color,
             "icon":             self._icon,
+            "sidebar_name":     self._sidebar_name.text().strip(),
             "show_in_sidebar":  self._show_sidebar.isChecked(),
             "requires_receipt": self._req_receipt.isChecked(),
             "requires_truck":   self._req_truck.isChecked(),
@@ -1164,6 +1185,30 @@ class ManageItemsWidget(QWidget):
         self._restrict_btn.toggled.connect(self._on_restrict_toggled)
         hl.addWidget(self._restrict_btn)
 
+        self._defer_item_btn = QPushButton("  Description-only entries: Off")
+        self._defer_item_btn.setFixedHeight(32)
+        self._defer_item_btn.setCheckable(True)
+        self._defer_item_btn.setCursor(Qt.PointingHandCursor)
+        self._defer_item_btn.setToolTip(
+            "When on, cashiers may save register rows with a description only.\n"
+            "Items are assigned on verify; repeated descriptions are remembered."
+        )
+        try:
+            self._defer_item_btn.setIcon(qta.icon("mdi.text-box-outline", color=_T2))
+            self._defer_item_btn.setIconSize(QSize(15, 15))
+        except Exception:
+            pass
+        self._defer_item_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T2};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            f"QPushButton:checked {{ background: {_GREEN_L}; color: {_GREEN};"
+            f" border-color: {_GREEN}; }}"
+            f"QPushButton:hover:!checked {{ background: {_BG}; }}"
+        )
+        self._defer_item_btn.toggled.connect(self._on_defer_item_toggled)
+        hl.addWidget(self._defer_item_btn)
+
         self._inactive_btn = QPushButton("Show Inactive")
         self._inactive_btn.setFixedHeight(32)
         self._inactive_btn.setCheckable(True)
@@ -1273,7 +1318,7 @@ class ManageItemsWidget(QWidget):
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load())
-        asyncio.ensure_future(self._load_restrict_setting())
+        asyncio.ensure_future(self._load_cashier_settings())
 
     # ── Data ───────────────────────────────────────────────────────────────────
 
@@ -1350,27 +1395,52 @@ class ManageItemsWidget(QWidget):
             self._loading = False
             self._loading_overlay.hide_loading()
 
-    # ── Restrict-items global toggle ───────────────────────────────────────────
+    # ── Cashier register settings ────────────────────────────────────────────────
 
-    async def _load_restrict_setting(self) -> None:
+    async def _load_cashier_settings(self) -> None:
         try:
-            on = bool(await get_setting("restrict_items"))
+            restrict_on = bool(await get_setting("restrict_items"))
         except Exception:
-            on = False
+            restrict_on = False
         self._restrict_btn.blockSignals(True)
-        self._restrict_btn.setChecked(on)
-        self._restrict_btn.setText("  Restrict items: On" if on else "  Restrict items: Off")
+        self._restrict_btn.setChecked(restrict_on)
+        self._restrict_btn.setText("  Restrict items: On" if restrict_on else "  Restrict items: Off")
         self._restrict_btn.blockSignals(False)
+
+        try:
+            defer_on = bool(await get_setting("defer_item_to_verify"))
+        except Exception:
+            defer_on = False
+        self._defer_item_btn.blockSignals(True)
+        self._defer_item_btn.setChecked(defer_on)
+        self._defer_item_btn.setText(
+            "  Description-only entries: On" if defer_on else "  Description-only entries: Off"
+        )
+        self._defer_item_btn.blockSignals(False)
 
     def _on_restrict_toggled(self, on: bool) -> None:
         self._restrict_btn.setText("  Restrict items: On" if on else "  Restrict items: Off")
         asyncio.ensure_future(self._save_restrict_setting(on))
+
+    def _on_defer_item_toggled(self, on: bool) -> None:
+        self._defer_item_btn.setText(
+            "  Description-only entries: On" if on else "  Description-only entries: Off"
+        )
+        asyncio.ensure_future(self._save_defer_item_setting(on))
 
     async def _save_restrict_setting(self, on: bool) -> None:
         try:
             await set_setting("restrict_items", on)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
+
+    async def _save_defer_item_setting(self, on: bool) -> None:
+        try:
+            await set_setting("defer_item_to_verify", on)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
+
+    # ── Restrict-items global toggle (legacy section header) ─────────────────────
 
     def _populate(self) -> None:
         total = self._total
@@ -1547,6 +1617,7 @@ class ManageItemsWidget(QWidget):
                 data["requires_receipt"], data["requires_truck"],
                 data.get("description", ""),
                 icon=data.get("icon", "mdi.tag-outline"),
+                sidebar_name=data.get("sidebar_name", ""),
                 show_in_sidebar=data.get("show_in_sidebar", False),
                 lock_description=data.get("lock_description", False),
             )
@@ -1641,7 +1712,7 @@ class ManageItemsWidget(QWidget):
             pass
         hl.addWidget(icon_lbl)
 
-        on = QLabel("On")
+        on = QLabel(item.sidebar_label if item.sidebar_name else "On")
         on.setStyleSheet(
             f"color: {_GREEN}; background: transparent;"
             " font-size: 11px; font-weight: 400; font-family:'Segoe UI';"

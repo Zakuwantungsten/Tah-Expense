@@ -30,10 +30,15 @@ class DescriptionMappingDialog(QDialog):
         categories: List[Category],
         remaining: int,
         parent=None,
+        *,
+        scope_label: str = "in this import",
+        cancel_label: str = "Cancel Import",
     ) -> None:
         super().__init__(parent)
         self._categories = categories
         self._selected: Optional[Category] = None
+        self._scope_label = scope_label
+        self._cancel_label = cancel_label
         self.setWindowTitle("Map Description to Item")
         self.setMinimumWidth(560)
         self.setModal(True)
@@ -73,7 +78,7 @@ class DescriptionMappingDialog(QDialog):
         cvl.addWidget(desc_lbl)
 
         count_lbl = QLabel(
-            f"Applies to {row_count:,} row{'s' if row_count != 1 else ''} in this import"
+            f"Applies to {row_count:,} row{'s' if row_count != 1 else ''} {self._scope_label}"
         )
         count_lbl.setStyleSheet(f"color: {_T2}; font-size: 12px; font-family:'Segoe UI';")
         cvl.addWidget(count_lbl)
@@ -105,7 +110,7 @@ class DescriptionMappingDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
 
-        cancel_btn = QPushButton("Cancel Import")
+        cancel_btn = QPushButton(self._cancel_label)
         cancel_btn.setCursor(Qt.PointingHandCursor)
         cancel_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"

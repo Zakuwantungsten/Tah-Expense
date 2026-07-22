@@ -65,7 +65,7 @@ async def get_sidebar_categories() -> List[Category]:
     categories = await get_all_categories()
     return sorted(
         (category for category in categories if category.show_in_sidebar),
-        key=lambda category: (category.sort_order, category.name),
+        key=lambda category: (category.sort_order, category.sidebar_label.lower()),
     )
 
 
@@ -77,6 +77,7 @@ async def _create_category(
     requires_truck: bool,
     description: str = "",
     icon: str = "mdi.tag-outline",
+    sidebar_name: str = "",
     show_in_sidebar: bool = False,
     sort_order: int = 0,
     lock_description: bool = False,
@@ -89,6 +90,7 @@ async def _create_category(
             "description": description,
             "color": color,
             "icon": icon,
+            "sidebar_name": sidebar_name,
             "show_in_sidebar": show_in_sidebar,
             "sort_order": sort_order,
             "requires_receipt": requires_receipt,
@@ -106,6 +108,7 @@ async def create_category(
     requires_truck: bool,
     description: str = "",
     icon: str = "mdi.tag-outline",
+    sidebar_name: str = "",
     show_in_sidebar: bool = False,
     sort_order: int = 0,
     lock_description: bool = False,
@@ -118,6 +121,7 @@ async def create_category(
         requires_truck,
         description,
         icon,
+        sidebar_name,
         show_in_sidebar,
         sort_order,
         lock_description,
@@ -131,6 +135,7 @@ async def create_cashier_category(
     requires_truck: bool,
     description: str = "",
     icon: str = "mdi.tag-outline",
+    sidebar_name: str = "",
     show_in_sidebar: bool = False,
     sort_order: int = 0,
     lock_description: bool = False,
@@ -143,6 +148,7 @@ async def create_cashier_category(
         requires_truck,
         description,
         icon,
+        sidebar_name,
         show_in_sidebar,
         sort_order,
         lock_description,

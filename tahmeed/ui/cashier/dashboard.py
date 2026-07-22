@@ -524,12 +524,13 @@ class CashierDashboard(QWidget):
             d = self._sidebar.item_def(key)
             if d is None:
                 return
-            label, icon = d
+            name, icon, label = d
             widget = CashierCategoryView(
                 user=self._user,
                 category_key=key,
-                category_name=label,
+                category_name=name,
                 icon_name=icon,
+                title=label,
             )
             self._category_indices[key] = self._stack.addWidget(widget)
         idx = self._category_indices[key]

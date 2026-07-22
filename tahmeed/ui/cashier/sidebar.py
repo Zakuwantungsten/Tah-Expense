@@ -320,7 +320,7 @@ class CashierSidebarWidget(QFrame):
         self._loaded: set[str] = set()
         self._active_obj = None                  # active _NavItem or _SubNavItem
         self._item_keys: set[str] = set()        # keys of dynamic ITEMS rows
-        self._item_defs: Dict[str, tuple] = {}   # key -> (name, icon)
+        self._item_defs: Dict[str, tuple] = {}   # key -> (name, icon, sidebar_label)
         self._items_host_vl = None
         self._build()
         self.select("overview")
@@ -591,9 +591,10 @@ class CashierSidebarWidget(QFrame):
             if not key or key in self._item_keys:
                 continue
             icon = cat.icon or "mdi.tag-outline"
-            self._item_defs[key] = (cat.name, icon)
+            label = cat.sidebar_label
+            self._item_defs[key] = (cat.name, icon, label)
             self._item_keys.add(key)
-            self._add_item_row(key, cat.name, icon)
+            self._add_item_row(key, label, icon)
 
         if self._collapsed:
             for key in self._item_keys:

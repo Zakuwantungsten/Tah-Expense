@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QTimer
 
 from tahmeed.models.user import User
+from tahmeed.services.category_service import get_all_categories
 from tahmeed.ui.dialogs.change_password_dialog import ChangePasswordDialog
 from tahmeed.ui.accountant.header_bar import HeaderBar
 from tahmeed.ui.accountant.sidebar import SidebarWidget
@@ -40,6 +41,9 @@ from tahmeed.ui.accountant.fleet_registry import TrucksRegistryWidget, TrailersR
 from tahmeed.ui.accountant.manage_items import ManageItemsWidget
 from tahmeed.ui.accountant.backup import BackupWidget
 from tahmeed.ui.admin.users_tab import UsersTab
+from tahmeed.ui.cashier.excel_grid import DailyRegister
+from tahmeed.ui.cashier.transactions_table import TransactionBrowser
+from tahmeed.ui.cashier.dashboard import _TablePage
 
 _APP_BG = "#F4F6F8"
 
@@ -50,8 +54,10 @@ class AccountantDashboard(QWidget):
     def __init__(self, user: User, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._user = user
+        self._browser: Optional[TransactionBrowser] = None
         self._notification_poll_in_flight = False
         self._build()
+        asyncio.ensure_future(self._load_categories())
         self._notification_timer = QTimer(self)
         self._notification_timer.setInterval(5_000)
         self._notification_timer.timeout.connect(self._poll_notification_counts)
@@ -184,6 +190,11 @@ class AccountantDashboard(QWidget):
         self._backup = BackupWidget()
         self._stack.addWidget(self._backup)              # index 23
 
+        # Cashier daily register (Table) — same widget the cashier uses
+        self._register = DailyRegister(user=self._user, categories=[])
+        self._table_page = _TablePage(self._register)
+        self._stack.addWidget(self._table_page)          # index 24 — Cashier Table
+
         # Live-refresh a single item's sub-item strip when its sub-items change.
         self._manage_items.subitems_changed.connect(self._sidebar.refresh_subitems)
 
@@ -252,6 +263,9 @@ class AccountantDashboard(QWidget):
             self._notification_poll_in_flight = False
 
     def _on_nav(self, key: str) -> None:
+        if key == "browse":
+            self._on_browse()
+            return
         _routes = {
             "overview":       (0,  self._overview),
             "truck_overview": (1,  self._truck_overview),
@@ -276,10 +290,14 @@ class AccountantDashboard(QWidget):
             "manage_categories":(21, self._manage_items),
             "manage_users":     (22, self._users_tab),
             "backup":           (23, self._backup),
+            "table":            (24, self._register),
         }
         if key in _routes:
             idx, widget = _routes[key]
             self._stack.setCurrentIndex(idx)
+            if key == "table":
+                self._register.reload_settings()
+                return
             refresh = getattr(widget, "refresh", None)
             if callable(refresh):
                 refresh()
@@ -291,6 +309,29 @@ class AccountantDashboard(QWidget):
         else:
             self._stack.setCurrentIndex(12)
 
+    def _on_browse(self) -> None:
+        if self._browser is None:
+            self._browser = TransactionBrowser(parent=self)
+            self._browser.go_to_date.connect(self._on_go_to_date)
+            self._browser.finished.connect(lambda: setattr(self, "_browser", None))
+        self._browser.show_and_search()
+
+    def _on_go_to_date(self, d, term: str = "") -> None:
+        self._sidebar.select("table")
+        self._on_nav("table")
+        self._register.navigate_to_date(d, highlight_term=term)
+
+    async def prepare_to_leave(self) -> bool:
+        """Prompt to save/discard unsaved table entries before logout or exit."""
+        return await self._register.confirm_leave()
+
+    async def _load_categories(self) -> None:
+        try:
+            cats = await get_all_categories()
+            self._register.update_categories(cats)
+        except Exception:
+            pass
+
     def _show_category(self, key: str) -> None:
         """Lazily create (and cache) the item table for this dynamic sidebar key."""
         if key not in self._category_indices:
@@ -298,8 +339,8 @@ class AccountantDashboard(QWidget):
             if d is None:
                 self._stack.setCurrentIndex(11)
                 return
-            title, icon = d
-            widget = CategoryTableWidget(category_name=title, title=title, icon_name=icon)
+            title, icon, label = d
+            widget = CategoryTableWidget(category_name=title, title=label, icon_name=icon)
             self._category_indices[key] = self._stack.addWidget(widget)
         idx = self._category_indices[key]
         self._stack.setCurrentIndex(idx)
@@ -324,9 +365,10 @@ class AccountantDashboard(QWidget):
         if cache_key not in self._subtable_indices:
             d = self._sidebar.item_def(parent_key)
             icon = d[1] if d else "mdi.tag-outline"
+            parent_label = d[2] if d else parent_category
             widget = CategoryTableWidget(
                 category_name=parent_category,
-                title=f"{parent_category} · {name}",
+                title=f"{parent_label} · {name}",
                 icon_name=icon,
                 description_filter=match or name,
             )

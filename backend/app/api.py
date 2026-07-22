@@ -333,7 +333,7 @@ def valid_id(value: str) -> ObjectId:
 
 _PATCH_FIELDS = {
     "categories": {
-        "name", "description", "color", "icon", "show_in_sidebar", "sort_order",
+        "name", "description", "color", "icon", "sidebar_name", "show_in_sidebar", "sort_order",
         "requires_receipt", "requires_truck", "lock_description", "active",
         "account_type", "ref_num", "account_number", "currency", "coa_description",
     },
@@ -422,7 +422,7 @@ async def insert_category(body: CategoryWrite, request: Request) -> dict:
 async def cashier_create_category(
     body: CategoryWrite, request: Request, _cashier: Cashier
 ) -> dict:
-    """Allow only the cashier's unknown-item creation workflow."""
+    """Allow cashier/accountant unknown-item creation from the daily register."""
     return await insert_category(body, request)
 
 

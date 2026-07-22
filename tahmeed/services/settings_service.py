@@ -7,6 +7,9 @@ DEFAULTS = {
     # When True the cashier register's Item column only accepts existing items
     # (unknown entries prompt to add). When False the column accepts free text.
     "restrict_items": False,
+    # When True cashiers may save table rows with description only (no item).
+    # The accountant assigns items on verify; mappings are remembered.
+    "defer_item_to_verify": False,
     # When True the cashier register's Truck No. column only accepts numbers that
     # exist in the accountant's truck/trailer registries.
     "restrict_trucks": False,

@@ -1,1 +1,2 @@
-Describe user-visible changes here before signing a release.
+- Fix MongoDB connection for cashier saves and item imports
+- Correct production database credentials in the installer

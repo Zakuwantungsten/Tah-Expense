@@ -357,6 +357,23 @@ def test_cashier_has_only_narrow_category_creation_permission() -> None:
     assert len(categories.documents) == 1
 
 
+def test_accountant_can_use_cashier_category_creation() -> None:
+    categories = FakeCategories()
+    database = SimpleNamespace(db=SimpleNamespace(categories=categories))
+    app = create_app(settings=settings(), database=database)
+    app.dependency_overrides[current_user] = lambda: {"role": "accountant"}
+    body = {
+        "name": "Road Expense",
+        "color": "#123456",
+        "requires_receipt": False,
+        "requires_truck": True,
+    }
+    with TestClient(app) as client:
+        narrow = client.post("/v1/categories/cashier-create", json=body)
+    assert narrow.status_code == 201
+    assert len(categories.documents) == 1
+
+
 class FakeCursor:
     def __init__(self, documents: list[dict] | None = None) -> None:
         self.sort_spec: list[tuple[str, int]] = []

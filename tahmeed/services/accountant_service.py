@@ -63,6 +63,14 @@ async def get_verified_transactions(
     return [Transaction.from_doc(d) for d in docs]
 
 
+async def get_transactions_by_ids(tx_ids: List[ObjectId]) -> List[Transaction]:
+    if not tx_ids:
+        return []
+    db = get_db()
+    docs = await db.transactions.find({"_id": {"$in": tx_ids}}).to_list(length=len(tx_ids))
+    return [Transaction.from_doc(d) for d in docs]
+
+
 async def approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bool:
     db = get_db()
     result = await db.transactions.update_one(

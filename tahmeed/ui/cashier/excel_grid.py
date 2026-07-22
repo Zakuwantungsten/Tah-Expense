@@ -724,6 +724,7 @@ class DailyRegister(QWidget):
         self._cat_by_name: dict = {c.name.lower(): c for c in categories}
         self._locked_subitems: dict = {}   # item name (lower) -> [sub-item names]
         self._restrict_items: bool = False
+        self._defer_item_to_verify: bool = False
         self._restrict_trucks: bool = False
         self._fleet_numbers: set = set()   # uppercased valid truck/trailer numbers
         self._current_date: date = date.today()
@@ -737,7 +738,7 @@ class DailyRegister(QWidget):
         self._pending_highlight: str = ""  # set by navigate_to_date; consumed in _populate
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
-        asyncio.ensure_future(self._load_restrict_setting())
+        asyncio.ensure_future(self._load_cashier_settings())
         asyncio.ensure_future(self._load_locked_subitems())
         asyncio.ensure_future(self._load_fleet_numbers())
 
@@ -895,13 +896,13 @@ class DailyRegister(QWidget):
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load_date(self._current_date))
-        asyncio.ensure_future(self._load_restrict_setting())
+        asyncio.ensure_future(self._load_cashier_settings())
 
     def reload_settings(self) -> None:
         """Re-read the restrict toggles, locked sub-items and fleet list without
         touching the grid rows (so unsaved entries survive). Called on entering
         the table tab."""
-        asyncio.ensure_future(self._load_restrict_setting())
+        asyncio.ensure_future(self._load_cashier_settings())
         asyncio.ensure_future(self._load_locked_subitems())
         asyncio.ensure_future(self._load_fleet_numbers())
 
@@ -1077,6 +1078,9 @@ class DailyRegister(QWidget):
         rcpt_status = rcpt_raw if rcpt_raw in _VALID_RCPT else "pending"
 
         item_name = txt(COL_ITEM)
+        if not item_name and not self._defer_item_to_verify:
+            raise ValueError("Item is required. Enter an item or ask the accountant to enable description-only entries.")
+
         cat = self._cat_by_name.get(item_name.lower()) if item_name else None
         if cat is not None:
             item_name = cat.name
@@ -1483,6 +1487,10 @@ class DailyRegister(QWidget):
             self._validate_item_cell(row, item)
         elif col == COL_DESC and item.text().strip():
             self._validate_locked_description(row, item)
+            if self._defer_item_to_verify:
+                asyncio.ensure_future(
+                    self._auto_fill_item_from_mapping(row, item.text().strip())
+                )
         elif col == COL_TRUCK and item.text().strip():
             self._validate_truck_cell(row, item)
 
@@ -2204,6 +2212,10 @@ class DailyRegister(QWidget):
                 rcpt_status = rcpt_raw if rcpt_raw in _VALID_RCPT else "pending"
 
                 item_name = txt(COL_ITEM)
+                if not item_name and not self._defer_item_to_verify:
+                    errors.append(f"Row {row + 1}: Item is required.")
+                    continue
+
                 cat = self._cat_by_name.get(item_name.lower()) if item_name else None
                 if cat is not None:
                     item_name = cat.name  # canonical casing
@@ -2339,15 +2351,41 @@ class DailyRegister(QWidget):
     # Settings / locked sub-item cache
     # ------------------------------------------------------------------
 
-    async def _load_restrict_setting(self) -> None:
+    async def _load_cashier_settings(self) -> None:
         try:
             self._restrict_items = bool(await get_setting("restrict_items"))
         except Exception:
             self._restrict_items = False
         try:
+            self._defer_item_to_verify = bool(await get_setting("defer_item_to_verify"))
+        except Exception:
+            self._defer_item_to_verify = False
+        try:
             self._restrict_trucks = bool(await get_setting("restrict_trucks"))
         except Exception:
             self._restrict_trucks = False
+
+    async def _auto_fill_item_from_mapping(self, row: int, description: str) -> None:
+        """When description-only mode is on, pre-fill Item from saved mappings."""
+        if not self._defer_item_to_verify or not description.strip():
+            return
+        item_it = self._table.item(row, COL_ITEM)
+        if item_it and item_it.text().strip():
+            return
+        from tahmeed.services.description_mapping_service import resolve_category_for_description
+
+        resolved = await resolve_category_for_description(description)
+        if not resolved:
+            return
+        _, cat_name = resolved
+        self._table.blockSignals(True)
+        if item_it is None:
+            item_it = QTableWidgetItem(cat_name)
+            item_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            self._table.setItem(row, COL_ITEM, item_it)
+        else:
+            item_it.setText(cat_name)
+        self._table.blockSignals(False)
 
     async def _load_fleet_numbers(self) -> None:
         try:
@@ -2411,6 +2449,7 @@ class DailyRegister(QWidget):
                 data["requires_receipt"], data["requires_truck"],
                 data.get("description", ""),
                 icon=data.get("icon", "mdi.tag-outline"),
+                sidebar_name=data.get("sidebar_name", ""),
                 show_in_sidebar=data.get("show_in_sidebar", False),
                 lock_description=data.get("lock_description", False),
             )

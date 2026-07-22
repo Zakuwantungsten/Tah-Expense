@@ -43,7 +43,9 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     ]),
     ("CASHIER FLOW", [
         ("verify",          "Verify",            "mdi.inbox-arrow-down",             {"badge": True}),
-        ("master_expenses", "Master Expenses",   "mdi.table-large",                  {}),
+        ("table",           "Table",             "mdi.table-large",                  {}),
+        ("browse",          "Browse",            "mdi.magnify",                      {}),
+        ("master_expenses", "Master Expenses",   "mdi.table-multiple",               {}),
     ]),
     # ITEMS are loaded dynamically from the DB (accountant-managed). The header
     # is rendered statically; the rows below it are built by _load_items().
@@ -451,7 +453,7 @@ class SidebarWidget(QFrame):
         self._active_obj = None            # active _NavItem or _SubNavItem
         self._active_key: Optional[str] = None
         self._item_keys: set[str] = set()          # keys of dynamic ITEMS rows
-        self._item_defs: Dict[str, tuple] = {}     # key -> (name, icon)
+        self._item_defs: Dict[str, tuple] = {}     # key -> (name, icon, sidebar_label)
         self._items_host_vl = None                 # layout hosting dynamic rows
         self._build()
         self.select("overview")
@@ -845,9 +847,10 @@ class SidebarWidget(QFrame):
             if not key or key in self._item_keys:
                 continue
             icon = cat.icon or "mdi.tag-outline"
-            self._item_defs[key] = (cat.name, icon)
+            label = cat.sidebar_label
+            self._item_defs[key] = (cat.name, icon, label)
             self._item_keys.add(key)
-            self._add_item_row(key, cat.name, icon)
+            self._add_item_row(key, label, icon)
 
         if self._collapsed:
             for key in self._item_keys:

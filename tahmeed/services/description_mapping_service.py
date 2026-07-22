@@ -81,3 +81,8 @@ async def resolve_category_for_description(
     if mapping is None:
         return None
     return mapping.category_id, mapping.category_name
+
+
+def transaction_needs_item(item: str = "", category_name: Optional[str] = None) -> bool:
+    """True when a transaction still needs an item/category assigned."""
+    return not (item or "").strip() and not (category_name or "").strip()
