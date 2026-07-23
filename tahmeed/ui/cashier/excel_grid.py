@@ -560,8 +560,9 @@ class _ReceiptDelegate(_ExcelCellDelegate):
 class _ItemDelegate(_ExcelCellDelegate):
     """Live popup of accountant-managed items for the Item column.
 
-    Behaves like the Truck No. field: the list narrows in real time as the
-    cashier types, and Tab accepts the highlighted suggestion — writing the
+    QuickBooks-style contains match: the list narrows to names that contain the
+    typed text anywhere (start/middle/end), ranked so exact and prefix hits
+    come first. Tab accepts the highlighted suggestion — writing the
     *canonical* item name (so "m" + Tab gives "MILEAGE", not "mILEAGE"). The
     list is read live via ``items_getter`` so newly-created items appear at once.
     Whether unknown entries are allowed is enforced at the grid level.
@@ -572,10 +573,13 @@ class _ItemDelegate(_ExcelCellDelegate):
         self._items_getter = items_getter
 
     def createEditor(self, parent, option, index):
-        ed = CompleterLineEdit(self._items_getter() or [], parent=parent)
-        # Prefix match only — MatchContains made "l" preview "Diesel CSH"
-        # (letter appears mid-name) ahead of LATRA.
-        ed._completer.setFilterMode(Qt.MatchStartsWith)
+        # Ranked contains: "csh" finds "Diesel CSH"; prefix hits still rank first
+        # and own the inline preview so "l" previews LATRA, not Diesel CSH.
+        ed = CompleterLineEdit(
+            self._items_getter() or [],
+            parent=parent,
+            ranked_contains=True,
+        )
         ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
         return ed
 
