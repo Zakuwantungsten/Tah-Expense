@@ -6,7 +6,7 @@ from bson import ObjectId
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QDateEdit, QDoubleSpinBox, QComboBox, QCheckBox,
-    QPushButton, QLabel, QMessageBox, QFrame,
+    QPushButton, QLabel, QMessageBox, QFrame, QDialog,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QStyledItemDelegate, QSizePolicy, QSplitter,
 )
@@ -16,12 +16,18 @@ from PySide6.QtGui import QColor, QBrush, QPainter
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.category import Category
 from tahmeed.models.user import User
-from tahmeed.services.truck_service import search_trucks
+from tahmeed.services.truck_service import get_fleet_numbers
+from tahmeed.services.truck_format import (
+    normalize_truck_number, try_match_fleet, normalize_place_label,
+    is_allowed_place_label, DEFAULT_PLACE_LABELS, merge_allowed_labels,
+)
 from tahmeed.services.rule_service import test_description
 from tahmeed.services.category_service import get_all_categories
-from tahmeed.services.settings_service import get_setting
+from tahmeed.services.settings_service import get_setting, set_setting
 from tahmeed.services.cashier_service import save_transaction, get_transactions_by_date, check_for_duplicates
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
+from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
+from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,15 +102,26 @@ _HEADERS = [
 ]
 
 _SAVED_BG = QColor("#fff8f0")
-_SNO_BG   = QColor("#f1f5f9")
 _NEG_COL  = QColor("#dc2626")
 
 _RCPT_COLORS = {
     "received": ("#dcfce7", "#16a34a"),
     "pending":  ("#fff7ed", "#ea580c"),
     "missing":  ("#fef2f2", "#dc2626"),
+    "no_receipt": ("#f3f4f6", "#6b7280"),
 }
-_RCPT_LABEL = {"received": "Received", "pending": "Pending", "missing": "Missing"}
+_RCPT_LABEL = {
+    "received": "RECEIPT",
+    "pending": "PENDING",
+    "missing": "MISSING",
+    "no_receipt": "NO RECEIPT",
+}
+_RCPT_FORM_OPTS = [
+    ("PENDING", "pending"),
+    ("RECEIPT", "received"),
+    ("MISSING", "missing"),
+    ("NO RECEIPT", "no_receipt"),
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,7 +131,7 @@ _RCPT_LABEL = {"received": "Received", "pending": "Pending", "missing": "Missing
 class _ReceiptDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index) -> None:
         status = index.data(Qt.UserRole) or "pending"
-        label  = _RCPT_LABEL.get(status, status.capitalize())
+        label  = _RCPT_LABEL.get(status, status.upper() if status else status)
         bg, fg = _RCPT_COLORS.get(status, ("#f3f4f6", "#6b7280"))
         rect   = option.rect.adjusted(6, 5, -6, -5)
         painter.save()
@@ -162,7 +179,10 @@ class EntryForm(QWidget):
         super().__init__(parent)
         self._user        = user
         self._categories: List[Category] = []
+        self._people_names: List[str] = []
         self._confidence_threshold: int  = 75
+        self._fleet_numbers: set = set()
+        self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
         self._rcpt_delegate = _ReceiptDelegate()
 
         self._build_ui()
@@ -186,10 +206,35 @@ class EntryForm(QWidget):
             self._categories = await get_all_categories()
         except Exception:
             pass
+        try:
+            from tahmeed.services.people_service import get_people_names
+            self.update_people(await get_people_names())
+        except Exception:
+            pass
+        try:
+            self._fleet_numbers = await get_fleet_numbers()
+        except Exception:
+            self._fleet_numbers = set()
+        try:
+            raw = await get_setting("allowed_truck_labels")
+            if isinstance(raw, list) and raw:
+                self._allowed_truck_labels = merge_allowed_labels(raw, DEFAULT_PLACE_LABELS)
+            else:
+                self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
+        except Exception:
+            self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
         await self._refresh_table()
 
     def update_categories(self, cats: List[Category]) -> None:
         self._categories = cats
+
+    def update_people(self, names: List[str]) -> None:
+        self._people_names = [str(n).strip().upper() for n in (names or []) if str(n).strip()]
+        for ed in (getattr(self, "_ownership", None), getattr(self, "_approver", None)):
+            if ed is None:
+                continue
+            ed._values = list(self._people_names)
+            ed._model.setStringList(ed._values)
 
     async def _fetch_cat_names(self, prefix: str) -> List[str]:
         """Autocomplete fetch_fn for the Category TruckLineEdit."""
@@ -274,7 +319,7 @@ class EntryForm(QWidget):
         hh.setStretchLastSection(False)
         hh.setSectionResizeMode(_DESC, QHeaderView.Stretch)
 
-        self._day_table.setColumnWidth(_SNO,   38)
+        self._day_table.setColumnWidth(_SNO,   52)
         self._day_table.setColumnWidth(_DATE,  95)
         self._day_table.setColumnWidth(_ITEM,  100)
         self._day_table.setColumnWidth(_TRUCK, 90)
@@ -326,7 +371,8 @@ class EntryForm(QWidget):
         QWidget.setTabOrder(self._receipt,     self._description)
         QWidget.setTabOrder(self._description, self._notes)
         QWidget.setTabOrder(self._notes,       self._truck)
-        QWidget.setTabOrder(self._truck,       self._approver)
+        QWidget.setTabOrder(self._truck,       self._ownership)
+        QWidget.setTabOrder(self._ownership,   self._approver)
 
         # Buttons
         btn_row = QHBoxLayout()
@@ -377,7 +423,7 @@ class EntryForm(QWidget):
 
         lay.addSpacing(10)
         lay.addWidget(_lbl("Truck No."))
-        self._truck = TruckLineEdit(fetch_fn=search_trucks)
+        self._truck = TruckLineEdit(local_numbers=lambda: sorted(self._fleet_numbers))
         self._truck.setPlaceholderText("e.g., T688 EAF")
         self._truck.setStyleSheet(_INPUT)
         lay.addWidget(self._truck)
@@ -428,7 +474,8 @@ class EntryForm(QWidget):
         lay.addSpacing(10)
         lay.addWidget(_lbl("Receipt"))
         self._receipt = QComboBox()
-        self._receipt.addItems(["Pending", "Received", "Missing"])
+        for label, key in _RCPT_FORM_OPTS:
+            self._receipt.addItem(label, key)
         self._receipt.setStyleSheet(_INPUT)
         lay.addWidget(self._receipt)
 
@@ -440,15 +487,17 @@ class EntryForm(QWidget):
 
         lay.addSpacing(10)
         lay.addWidget(_lbl("Ownership"))
-        self._ownership = QLineEdit()
+        self._ownership = CompleterLineEdit(list(self._people_names))
         self._ownership.setPlaceholderText("Owner / department")
+        self._ownership._completer.setFilterMode(Qt.MatchStartsWith)
         self._ownership.setStyleSheet(_INPUT)
         lay.addWidget(self._ownership)
 
         lay.addSpacing(10)
         lay.addWidget(_lbl("APR BY"))
-        self._approver = QLineEdit()
+        self._approver = CompleterLineEdit(list(self._people_names))
         self._approver.setPlaceholderText("Approver name")
+        self._approver._completer.setFilterMode(Qt.MatchStartsWith)
         self._approver.setStyleSheet(_INPUT)
         lay.addWidget(self._approver)
 
@@ -491,7 +540,6 @@ class EntryForm(QWidget):
                 return it
 
             sno = _it(str(row + 1), Qt.AlignCenter)
-            sno.setBackground(QBrush(_SNO_BG))
             self._day_table.setItem(row, _SNO, sno)
 
             self._day_table.setItem(row, _DATE,  _it(tx.date.strftime("%d/%m/%Y") if tx.date else ""))
@@ -616,6 +664,78 @@ class EntryForm(QWidget):
         qdate   = self._date.date()
         tx_date = datetime(qdate.year(), qdate.month(), qdate.day())
 
+        # ── Truck number: format + registry / place labels ─────────────
+        truck_number = ""
+        truck_raw = self._truck.text().strip()
+        if truck_raw:
+            if is_allowed_place_label(truck_raw, self._allowed_truck_labels):
+                truck_number = normalize_place_label(truck_raw)
+                self._truck.setText(truck_number)
+            else:
+                matched = try_match_fleet(truck_raw, self._fleet_numbers)
+                if matched is None:
+                    norm = normalize_truck_number(
+                        truck_raw, allowed_labels=self._allowed_truck_labels
+                    )
+                    if norm.status == "place_label":
+                        truck_number = norm.value
+                        self._truck.setText(truck_number)
+                    else:
+                        kind = (
+                            "invalid_format"
+                            if norm.status == "invalid"
+                            else "not_in_registry"
+                        )
+                        display = norm.value if norm.status != "empty" else truck_raw
+                        self._truck.setText(display)
+                        can_add = getattr(self._user, "role", "") in ("admin", "accountant")
+                        dlg = TruckCorrectionDialog(
+                            [TruckIssue(row=0, original=display, kind=kind)],
+                            self._fleet_numbers,
+                            can_add=can_add,
+                            allowed_labels=self._allowed_truck_labels,
+                            parent=self,
+                        )
+                        if dlg.exec() != QDialog.Accepted or not dlg.issues or dlg.issues[0].skip:
+                            self._truck.clear()
+                            self._submit_btn.setEnabled(True)
+                            return
+                        truck_number = dlg.issues[0].corrected
+                        if getattr(dlg.issues[0], "is_place_label", False):
+                            self._allowed_truck_labels.add(normalize_place_label(truck_number))
+                        else:
+                            self._fleet_numbers.add(truck_number)
+                        pending_adds = list(getattr(dlg, "pending_registry_adds", None) or [])
+                        if pending_adds:
+                            from tahmeed.services.truck_service import add_trailer, add_truck
+                            for kind, number in pending_adds:
+                                try:
+                                    if kind == "trucks":
+                                        await add_truck(number)
+                                    else:
+                                        await add_trailer(number)
+                                    self._fleet_numbers.add(number)
+                                except Exception as exc:
+                                    QMessageBox.critical(
+                                        self, "Error",
+                                        f"Failed to add {number} to registry:\n{exc}",
+                                    )
+                                    self._submit_btn.setEnabled(True)
+                                    return
+                        if getattr(dlg, "new_labels", None):
+                            try:
+                                merged = merge_allowed_labels(
+                                    self._allowed_truck_labels, dlg.new_labels, DEFAULT_PLACE_LABELS
+                                )
+                                self._allowed_truck_labels = merged
+                                await set_setting("allowed_truck_labels", sorted(merged))
+                            except Exception:
+                                pass
+                        self._truck.setText(truck_number)
+                else:
+                    truck_number = matched
+                    self._truck.setText(truck_number)
+
         # ── Off-date warning ──────────────────────────────────────────────
         if tx_date.date() != date.today():
             if QMessageBox.warning(
@@ -639,7 +759,7 @@ class EntryForm(QWidget):
         possible_dup = False
         try:
             dupes = await check_for_duplicates(
-                truck_number=self._truck.text().strip().upper(),
+                truck_number=truck_number,
                 amount=self._amount.value(),
                 item=self._item.text().strip(),
                 description=description,
@@ -675,16 +795,22 @@ class EntryForm(QWidget):
             date=tx_date,
             description=description,
             item=self._item.text().strip(),
-            truck_number=self._truck.text().strip().upper(),
+            truck_number=truck_number,
             amount=self._amount.value(),
             currency="TZS",
             category_id=cat_id,
             category_name=cat_name,
             memo=self._memo.text().strip(),
-            receipt_status=self._receipt.currentText().lower(),
+            receipt_status=self._receipt.currentData() or "pending",
             notes_flag=self._notes.isChecked(),
-            ownership=self._ownership.text().strip(),
-            approver=self._approver.text().strip(),
+            ownership=(
+                self._ownership.canonical(self._ownership.text().strip())
+                or self._ownership.text().strip()
+            ).upper(),
+            approver=(
+                self._approver.canonical(self._approver.text().strip())
+                or self._approver.text().strip()
+            ).upper(),
             cashier_id=self._user._id,
             possible_duplicate=possible_dup,
         )

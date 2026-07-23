@@ -16,9 +16,10 @@ _PALETTE = [
 
 
 def _cell_str(val) -> str:
+    """Strip and uppercase text cells (same as Toll Plaza import)."""
     if val is None:
         return ""
-    return str(val).strip()
+    return str(val).strip().upper()
 
 
 def _parse_chart_of_accounts(path: str | Path) -> List[dict]:

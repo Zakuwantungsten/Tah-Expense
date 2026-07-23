@@ -38,6 +38,7 @@ from tahmeed.ui.accountant.fuel_consumption import (
 from tahmeed.ui.accountant.diesel_cash import DieselCashWidget
 from tahmeed.ui.accountant.fleet_registry import TrucksRegistryWidget, TrailersRegistryWidget
 from tahmeed.ui.accountant.manage_items import ManageItemsWidget
+from tahmeed.ui.accountant.manage_people import PeopleRegistryWidget
 from tahmeed.ui.accountant.backup import BackupWidget
 from tahmeed.ui.admin.users_tab import UsersTab
 from tahmeed.ui.cashier.excel_grid import DailyRegister
@@ -184,16 +185,19 @@ class AccountantDashboard(QWidget):
         # Rebuild the sidebar's dynamic ITEMS whenever the accountant changes them.
         self._manage_items.items_changed.connect(self._sidebar.refresh_items)
 
+        self._people_registry = PeopleRegistryWidget()
+        self._stack.addWidget(self._people_registry)     # index 22
+
         self._users_tab = UsersTab()
-        self._stack.addWidget(self._users_tab)           # index 22
+        self._stack.addWidget(self._users_tab)           # index 23
 
         self._backup = BackupWidget()
-        self._stack.addWidget(self._backup)              # index 23
+        self._stack.addWidget(self._backup)              # index 24
 
         # Cashier daily register (Table) — same widget the cashier uses
         self._register = DailyRegister(user=self._user, categories=[])
         self._table_page = _TablePage(self._register)
-        self._stack.addWidget(self._table_page)          # index 24 — Cashier Table
+        self._stack.addWidget(self._table_page)          # index 25 — Cashier Table
 
         # Live-refresh a single item's sub-item strip when its sub-items change.
         self._manage_items.subitems_changed.connect(self._sidebar.refresh_subitems)
@@ -315,9 +319,10 @@ class AccountantDashboard(QWidget):
             "manage_trucks":    (19, self._trucks_registry),
             "manage_trailers":  (20, self._trailers_registry),
             "manage_categories":(21, self._manage_items),
-            "manage_users":     (22, self._users_tab),
-            "backup":           (23, self._backup),
-            "table":            (24, self._register),
+            "manage_people":    (22, self._people_registry),
+            "manage_users":     (23, self._users_tab),
+            "backup":           (24, self._backup),
+            "table":            (25, self._register),
         }
         if key in _routes:
             idx, widget = _routes[key]
@@ -356,6 +361,11 @@ class AccountantDashboard(QWidget):
         try:
             cats = await get_all_categories()
             self._register.update_categories(cats)
+        except Exception:
+            pass
+        try:
+            from tahmeed.services.people_service import get_people_names
+            self._register.update_people(await get_people_names())
         except Exception:
             pass
 

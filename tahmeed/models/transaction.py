@@ -18,10 +18,14 @@ class Transaction:
     lpo_do: str = ""
     do_number: str = ""
     memo: str = ""
-    receipt_status: str = "pending"    # "pending" | "received" | "missing"
-    notes_flag: bool = False           # NOTES checkbox
+    receipt_status: str = "pending"    # "pending" | "received" | "missing" | "no_receipt"
+    notes_flag: bool = False           # True when Ref_Float is "REFUND TO FLOAT"
+    ref_float: str = ""                # free-text Ref_Float (autocomplete suggests REFUND TO FLOAT)
     ownership: str = ""
     approver: str = ""
+    payee: str = ""
+    cheque: str = ""
+    reported_date: Optional[datetime] = None
     cashier_id: Optional[ObjectId] = None
     verified: bool = False
     verified_by: Optional[ObjectId] = None
@@ -36,6 +40,10 @@ class Transaction:
     year: Optional[int] = None    # e.g. 2025
     created_at: datetime = field(default_factory=datetime.utcnow)
     possible_duplicate: bool = False   # set True when cashier overrides a duplicate warning
+    daily_import_id: Optional[str] = None       # shared id for one Excel upload batch
+    daily_import_source: Optional[str] = None   # original filename
+    date_discrepancy: bool = False              # row date differs from import primary date
+    import_primary_date: Optional[datetime] = None
     _id: Optional[ObjectId] = None
 
     def to_doc(self) -> dict:
@@ -54,8 +62,12 @@ class Transaction:
             "memo": self.memo,
             "receipt_status": self.receipt_status,
             "notes_flag": self.notes_flag,
+            "ref_float": self.ref_float,
             "ownership": self.ownership,
             "approver": self.approver,
+            "payee": self.payee,
+            "cheque": self.cheque,
+            "reported_date": self.reported_date,
             "cashier_id": self.cashier_id,
             "verified": self.verified,
             "verified_by": self.verified_by,
@@ -70,6 +82,10 @@ class Transaction:
             "year": self.year,
             "created_at": self.created_at,
             "possible_duplicate": self.possible_duplicate,
+            "daily_import_id": self.daily_import_id,
+            "daily_import_source": self.daily_import_source,
+            "date_discrepancy": self.date_discrepancy,
+            "import_primary_date": self.import_primary_date,
         }
         if self._id:
             doc["_id"] = self._id
@@ -93,8 +109,12 @@ class Transaction:
             memo=doc.get("memo", ""),
             receipt_status=doc.get("receipt_status", "pending"),
             notes_flag=doc.get("notes_flag", False),
+            ref_float=doc.get("ref_float", ""),
             ownership=doc.get("ownership", ""),
             approver=doc.get("approver", ""),
+            payee=doc.get("payee", ""),
+            cheque=doc.get("cheque", ""),
+            reported_date=doc.get("reported_date"),
             cashier_id=doc.get("cashier_id"),
             verified=doc.get("verified", False),
             verified_by=doc.get("verified_by"),
@@ -109,4 +129,8 @@ class Transaction:
             year=doc.get("year"),
             created_at=doc.get("created_at", datetime.utcnow()),
             possible_duplicate=doc.get("possible_duplicate", False),
+            daily_import_id=doc.get("daily_import_id"),
+            daily_import_source=doc.get("daily_import_source"),
+            date_discrepancy=doc.get("date_discrepancy", False),
+            import_primary_date=doc.get("import_primary_date"),
         )

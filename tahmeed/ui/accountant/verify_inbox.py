@@ -573,9 +573,9 @@ class _ActionPanel(QFrame):
 # ── Sub-tab bar (New | Edited | Rejected) ────────────────────────────────────
 
 class _SubTabBar(QFrame):
-    """Segmented New | Edited | Rejected switcher with live count badges."""
+    """Segmented New | Edited | Rejected | Issues switcher with live count badges."""
 
-    tab_changed = Signal(int)   # 0 = New, 1 = Edited, 2 = Rejected
+    tab_changed = Signal(int)   # 0 = New, 1 = Edited, 2 = Rejected, 3 = Issues
 
     _TAB_SS = (
         "QPushButton{background:transparent;border:none;"
@@ -593,6 +593,14 @@ class _SubTabBar(QFrame):
         "QPushButton:checked{color:%s;border-bottom:2px solid %s;}"
     ) % (_T2, _RED, _RED, _RED)
 
+    _ISSUES_SS = (
+        "QPushButton{background:transparent;border:none;"
+        "border-bottom:2px solid transparent;color:%s;font-size:13px;font-weight:600;"
+        "font-family:'Segoe UI';padding:0 4px;}"
+        "QPushButton:hover{color:%s;}"
+        "QPushButton:checked{color:%s;border-bottom:2px solid %s;}"
+    ) % (_T2, _AMBER, _AMBER, _AMBER)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedHeight(42)
@@ -600,7 +608,7 @@ class _SubTabBar(QFrame):
             f"QFrame{{background:{_WHITE};border-bottom:1px solid {_BORDER};}}"
         )
         self._current = 0
-        self._labels = ["New", "Edited", "Rejected"]
+        self._labels = ["New", "Edited", "Rejected", "Issues"]
 
         hl = QHBoxLayout(self)
         hl.setContentsMargins(20, 0, 20, 0)
@@ -612,7 +620,13 @@ class _SubTabBar(QFrame):
             btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFixedHeight(42)
-            btn.setStyleSheet(self._REJECTED_SS if i == 2 else self._TAB_SS)
+            if i == 2:
+                ss = self._REJECTED_SS
+            elif i == 3:
+                ss = self._ISSUES_SS
+            else:
+                ss = self._TAB_SS
+            btn.setStyleSheet(ss)
             btn.clicked.connect(lambda _checked, idx=i: self._select(idx))
             self._buttons.append(btn)
             hl.addWidget(btn)
@@ -630,10 +644,17 @@ class _SubTabBar(QFrame):
     def current_tab(self) -> int:
         return self._current
 
-    def set_counts(self, new_count: int, edited_count: int, rejected_count: int = 0) -> None:
+    def set_counts(
+        self,
+        new_count: int,
+        edited_count: int,
+        rejected_count: int = 0,
+        issues_count: int = 0,
+    ) -> None:
         self._buttons[0].setText(f"New ({new_count})")
         self._buttons[1].setText(f"Edited ({edited_count})")
         self._buttons[2].setText(f"Rejected ({rejected_count})")
+        self._buttons[3].setText(f"Issues ({issues_count})")
 
 
 # ── Main widget ────────────────────────────────────────────────────────────────
@@ -650,7 +671,7 @@ class VerifyInboxWidget(QWidget):
         self._cashier_names: Dict = {}
         self._page = 0
         self._total = 0
-        self._current_tab = 0   # 0 = New, 1 = Edited, 2 = Rejected
+        self._current_tab = 0   # 0 = New, 1 = Edited, 2 = Rejected, 3 = Issues
         self._filters_tab = -1  # which tab's filters are currently loaded
         self._loading = False
         self._debounce = QTimer(self)
@@ -804,7 +825,13 @@ class VerifyInboxWidget(QWidget):
         self._current_tab = idx
         self._page = 0
         self._panel.hide()
-        self._panel.set_mode("rejected" if idx == 2 else ("edited" if idx == 1 else "new"))
+        if idx == 2:
+            mode = "rejected"
+        elif idx == 1:
+            mode = "edited"
+        else:
+            mode = "new"
+        self._panel.set_mode(mode)
         self._set_tab_header(idx)
         self._filter_bar.set_bulk_visible(idx != 2)
         self._filters_tab = -1  # force filter reload when tab changes
@@ -813,7 +840,14 @@ class VerifyInboxWidget(QWidget):
     def _set_tab_header(self, tab: int) -> None:
         item = self._table.horizontalHeaderItem(_COL_APP)
         if item:
-            item.setText("EDITED" if tab == 1 else ("REASON" if tab == 2 else "APP BY"))
+            if tab == 1:
+                item.setText("EDITED")
+            elif tab == 2:
+                item.setText("REASON")
+            elif tab == 3:
+                item.setText("ISSUE")
+            else:
+                item.setText("APP BY")
 
     def _on_filter_changed(self) -> None:
         self._page = 0
@@ -868,7 +902,12 @@ class VerifyInboxWidget(QWidget):
                 tx.item = cat_name
         cashier = self._cashier_names.get(tx.cashier_id, "") if tx.cashier_id else ""
         tab = self._current_tab
-        mode = "rejected" if tab == 2 else ("edited" if tab == 1 else "new")
+        if tab == 2:
+            mode = "rejected"
+        elif tab == 1:
+            mode = "edited"
+        else:
+            mode = "new"
         self._panel.set_mode(mode)
         self._panel.load(tx, cashier, self._categories)
         self._panel.show()
@@ -918,6 +957,9 @@ class VerifyInboxWidget(QWidget):
                 get_cashier_names, get_pending_count, get_rejected_count,
             )
             from tahmeed.services.category_service import get_all_categories
+            from tahmeed.services.daily_import_service import (
+                get_issue_transactions, count_issue_transactions,
+            )
 
             size = self._pagination.current_size()
             skip = self._page * size
@@ -925,7 +967,7 @@ class VerifyInboxWidget(QWidget):
             truck  = self._filter_bar.truck_filter()
             cid    = self._filter_bar.cashier_id_filter()
             df, dt = self._filter_bar.date_filter()
-            tab = self._current_tab  # 0=New, 1=Edited, 2=Rejected
+            tab = self._current_tab  # 0=New, 1=Edited, 2=Rejected, 3=Issues
 
             # Reload filter dropdowns whenever the tab changes.
             if self._filters_tab != tab:
@@ -965,6 +1007,8 @@ class VerifyInboxWidget(QWidget):
                     search=search, truck=truck, cashier_id=cid,
                     date_from=df, date_to=dt, limit=size, skip=skip,
                 )
+            elif tab == 3:
+                txs_coro = get_issue_transactions(skip=skip, limit=size)
             else:
                 txs_coro = get_unverified_filtered(
                     search=search, truck=truck, cashier_id=cid,
@@ -972,27 +1016,32 @@ class VerifyInboxWidget(QWidget):
                     edited=False,
                 )
 
-            txs, new_count, edited_count, rejected_count, pending = await asyncio.gather(
-                txs_coro,
-                count_unverified_filtered(
-                    search=search, truck=truck, cashier_id=cid,
-                    date_from=df, date_to=dt, edited=False,
-                ),
-                count_edited_transactions(
-                    search=search, truck=truck, cashier_id=cid,
-                    date_from=df, date_to=dt,
-                ),
-                count_rejected_transactions(
-                    search=search, truck=truck, cashier_id=cid,
-                    date_from=df, date_to=dt,
-                ),
-                get_pending_count(),
+            txs, new_count, edited_count, rejected_count, issues_count, pending = (
+                await asyncio.gather(
+                    txs_coro,
+                    count_unverified_filtered(
+                        search=search, truck=truck, cashier_id=cid,
+                        date_from=df, date_to=dt, edited=False,
+                    ),
+                    count_edited_transactions(
+                        search=search, truck=truck, cashier_id=cid,
+                        date_from=df, date_to=dt,
+                    ),
+                    count_rejected_transactions(
+                        search=search, truck=truck, cashier_id=cid,
+                        date_from=df, date_to=dt,
+                    ),
+                    count_issue_transactions(),
+                    get_pending_count(),
+                )
             )
 
             if tab == 2:
                 total = rejected_count
             elif tab == 1:
                 total = edited_count
+            elif tab == 3:
+                total = issues_count
             else:
                 total = new_count
 
@@ -1005,7 +1054,7 @@ class VerifyInboxWidget(QWidget):
 
             self._cashier_names = cname_map
             self._total = total
-            self._subtabs.set_counts(new_count, edited_count, rejected_count)
+            self._subtabs.set_counts(new_count, edited_count, rejected_count, issues_count)
             self._fill_table(txs, cname_map, skip)
             self._pagination.update_state(self._page, total, size)
             self._pending_badge.setText(str(pending))
@@ -1032,6 +1081,7 @@ class VerifyInboxWidget(QWidget):
             t.blockSignals(False)
             msg = (
                 "No rejected entries." if tab == 2 else
+                "No issue entries (duplicates or mixed dates)." if tab == 3 else
                 "No pending transactions match the current filters."
             )
             self._show_empty(msg)
@@ -1146,6 +1196,31 @@ class VerifyInboxWidget(QWidget):
                     cell = t.item(r, c)
                     if cell:
                         cell.setBackground(QColor("#FFF7ED"))
+            elif tab == 3:
+                bits = []
+                if getattr(tx, "possible_duplicate", False):
+                    bits.append("Duplicate")
+                if getattr(tx, "date_discrepancy", False):
+                    primary = getattr(tx, "import_primary_date", None)
+                    if primary and hasattr(primary, "strftime"):
+                        bits.append(f"Date ≠ {primary.strftime('%d/%m/%Y')}")
+                    else:
+                        bits.append("Mixed date")
+                issue_item = _cell(" · ".join(bits) if bits else "Issue", color=_AMBER)
+                tip_parts = []
+                if getattr(tx, "possible_duplicate", False):
+                    tip_parts.append("Cashier overrode a duplicate warning.")
+                if getattr(tx, "date_discrepancy", False):
+                    tip_parts.append(
+                        "Row date differs from the Excel upload's main date."
+                    )
+                if tip_parts:
+                    issue_item.setToolTip(" ".join(tip_parts))
+                t.setItem(r, _COL_APP, issue_item)
+                for c in range(_NCOLS):
+                    cell = t.item(r, c)
+                    if cell:
+                        cell.setBackground(QColor("#FFFBEB"))
             else:
                 t.setItem(r, _COL_APP, _cell(tx.approver or "—", color=_T2))
                 # Amber row tint when the transaction date differs from submission date

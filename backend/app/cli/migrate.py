@@ -26,6 +26,7 @@ UNIQUE_KEYS = (
     UniqueKey("description_mappings", ("description_key",)),
     UniqueKey("trucks", ("number",)),
     UniqueKey("trailers", ("number",)),
+    UniqueKey("people", ("name",)),
     UniqueKey("system_settings", ("key",)),
 )
 

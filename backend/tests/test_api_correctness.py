@@ -14,6 +14,7 @@ from app.api import (
     create_user,
     list_collection,
     list_fleet,
+    list_people,
     release_operation_lock,
     update_user,
 )
@@ -446,3 +447,20 @@ async def test_fleet_endpoint_returns_page_metadata_and_stable_sort() -> None:
     assert page["offset"] == 50
     assert page["items"][0]["number"] == "T050"
     assert db["trucks"].cursor.sort_spec == [("number", 1), ("_id", 1)]
+
+
+@pytest.mark.asyncio
+async def test_people_endpoint_returns_page_metadata_and_stable_sort() -> None:
+    db = FakeCollections()
+    db.collections["people"] = FakePagedCollection(
+        [{"_id": ObjectId(), "name": "JOHN DOE", "active": True}],
+        total=12,
+    )
+
+    page = await list_people(request_for(db), "JOHN", True, 10, 0)
+
+    assert page["total"] == 12
+    assert page["limit"] == 10
+    assert page["offset"] == 0
+    assert page["items"][0]["name"] == "JOHN DOE"
+    assert db["people"].cursor.sort_spec == [("name", 1), ("_id", 1)]

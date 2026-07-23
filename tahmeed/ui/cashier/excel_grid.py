@@ -37,13 +37,20 @@ from PySide6.QtWidgets import (
     QMessageBox, QAbstractItemView, QHeaderView, QDateEdit, QLineEdit,
     QStyle, QComboBox, QDialog,
 )
-from PySide6.QtCore import Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer
+from PySide6.QtCore import (
+    Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer,
+    QItemSelection, QItemSelectionModel,
+)
 from PySide6.QtGui import QAction, QKeyEvent, QColor, QBrush, QFont, QPen, QPainter
 
 from tahmeed.models.category import Category
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
-from tahmeed.services.truck_service import search_fleet, get_fleet_numbers
+from tahmeed.services.truck_service import get_fleet_numbers
+from tahmeed.services.truck_format import (
+    normalize_truck_number, try_match_fleet, normalize_place_label,
+    is_allowed_place_label, DEFAULT_PLACE_LABELS, merge_allowed_labels,
+)
 from tahmeed.services.cashier_service import (
     get_transactions_by_date, save_transaction, delete_transaction,
     search_descriptions, update_transaction, insert_pending_edit,
@@ -53,44 +60,113 @@ from tahmeed.services.category_service import (
     create_cashier_category, get_all_categories, item_key,
 )
 from tahmeed.services.subtable_service import get_subtables
-from tahmeed.services.settings_service import get_setting
+from tahmeed.services.settings_service import get_setting, set_setting
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_completion
+from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
 
 # ---------------------------------------------------------------------------
 # Column indices
 # ---------------------------------------------------------------------------
-COL_SNO     = 0
-COL_DATE    = 1
-COL_ITEM    = 2
-COL_DESC    = 3
-COL_TRUCK   = 4
-COL_MEMO    = 5
-COL_NOTES   = 6
-COL_TZS     = 7
-COL_RECEIPT = 8
-COL_OWN     = 9
-COL_APR     = 10
+COL_SNO      = 0
+COL_DATE     = 1
+COL_REPORTED = 2
+COL_ITEM     = 3
+COL_DESC     = 4
+COL_TRUCK    = 5
+COL_MEMO     = 6
+COL_REF      = 7   # Ref_Float (free text; was checkbox NOTES)
+COL_TZS      = 8
+COL_RECEIPT  = 9
+COL_OWN      = 10
+COL_APR      = 11
+COL_PAYEE    = 12
+COL_CHEQUE   = 13
 
 HEADERS = [
-    "S/NO", "Date", "Item", "Description", "Truck No.",
+    "S/NO", "Date", "Reported Date", "Item", "Description", "Truck No.",
     "Memo", "Ref_Float", "TZS", "Receipt", "Ownership", "APR BY",
+    "Payee", "Cheque",
 ]
 
-CHECK_COLS       = {COL_NOTES}
+CHECK_COLS       = set()   # legacy; Ref_Float is free text now
 READONLY_COLS    = {COL_SNO}
-# Date alone does not count as entry data (auto-filled / leftover dates).
-_DATA_SKIP_COLS  = READONLY_COLS | {COL_NOTES, COL_RECEIPT, COL_DATE}
-# Columns that should NOT be auto-uppercased (keys/dates/checkboxes/readonly)
-_UPPER_SKIP_COLS = READONLY_COLS | CHECK_COLS | {COL_RECEIPT, COL_DATE}
+# Date / reported date alone do not count as entry data.
+_DATA_SKIP_COLS  = READONLY_COLS | {COL_RECEIPT, COL_DATE, COL_REPORTED}
+# Columns that should NOT be auto-uppercased
+_UPPER_SKIP_COLS = READONLY_COLS | {COL_RECEIPT, COL_DATE, COL_REPORTED}
 DEFAULT_EDITABLE_ROWS = 20
+
+_REF_FLOAT_OPTS = ["REFUND TO FLOAT"]
+
+# Preferred column widths — Description stretches to fill leftover viewport space.
+_COL_PREFERRED = {
+    COL_SNO: 48,
+    COL_DATE: 92,
+    COL_REPORTED: 92,
+    COL_ITEM: 100,
+    COL_DESC: 200,
+    COL_TRUCK: 72,
+    COL_MEMO: 90,
+    COL_REF: 100,
+    COL_TZS: 96,
+    COL_RECEIPT: 88,
+    COL_OWN: 80,
+    COL_APR: 72,
+    COL_PAYEE: 90,
+    COL_CHEQUE: 80,
+}
+# Columns that shrink first when the viewport is tighter than the preferred sum.
+_COL_FLEX = (
+    COL_DESC, COL_MEMO, COL_PAYEE, COL_ITEM, COL_REF,
+    COL_REPORTED, COL_DATE, COL_OWN, COL_APR, COL_CHEQUE, COL_RECEIPT,
+)
+_COL_MIN = {
+    COL_SNO: 40,
+    COL_DATE: 78,
+    COL_REPORTED: 78,
+    COL_ITEM: 70,
+    COL_DESC: 120,
+    COL_TRUCK: 60,
+    COL_MEMO: 60,
+    COL_REF: 70,
+    COL_TZS: 72,
+    COL_RECEIPT: 70,
+    COL_OWN: 60,
+    COL_APR: 56,
+    COL_PAYEE: 60,
+    COL_CHEQUE: 56,
+}
+
+
+def _is_refund_float(text: str) -> bool:
+    return (text or "").strip().lower() == "refund to float"
+
+
+def _ref_float_text(tx: "Transaction") -> str:
+    """Display Ref_Float; backfill from legacy notes_flag when needed."""
+    if getattr(tx, "ref_float", None):
+        return str(tx.ref_float).strip().upper()
+    if tx.notes_flag:
+        return "REFUND TO FLOAT"
+    return ""
+
+
+def _parse_optional_date(text: str):
+    """Parse dd/MM/yyyy → datetime, or None when blank/invalid."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%d/%m/%Y")
+    except ValueError:
+        return None
 
 # Colors
 SAVED_BG  = QColor("#fff8f0")
 NEW_BG    = QColor("#ffffff")
 EMPTY_BG  = QColor("#fafafa")
 NEG_COLOR = QColor("#dc2626")
-SNO_BG    = QColor("#f1f5f9")
 EDIT_BG   = QColor("#FFFBEB")   # warm yellow — saved rows unlocked for editing
 DIRTY_BG  = QColor("#FEF3C7")   # stronger amber — a saved row that was modified
 DUP_BG    = QColor("#FEE2E2")   # light red — possible duplicate flag
@@ -175,7 +251,29 @@ class _ExcelCellDelegate(QStyledItemDelegate):
         """Copy of option with selection/focus flags removed so Qt won't repaint bg."""
         opt = QStyleOptionViewItem(option)
         opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
+        opt.backgroundBrush = QBrush(Qt.NoBrush)
         return opt
+
+    def _paint_text(self, painter: QPainter, option, index) -> None:
+        """Draw cell text only — never paints background (selection stays visible)."""
+        text = option.text if option.text is not None else ""
+        if text == "" and index.data() is not None:
+            text = str(index.data())
+        fg = index.data(Qt.ForegroundRole)
+        if isinstance(fg, QBrush) and fg.style() != Qt.NoBrush:
+            painter.setPen(fg.color())
+        elif isinstance(fg, QColor):
+            painter.setPen(fg)
+        else:
+            painter.setPen(QColor("#111827"))
+        align = index.data(Qt.TextAlignmentRole)
+        if align is None:
+            align = int(option.displayAlignment) if option.displayAlignment else int(
+                Qt.AlignLeft | Qt.AlignVCenter
+            )
+        else:
+            align = int(align)
+        painter.drawText(option.rect.adjusted(6, 0, -6, 0), align, text)
 
     def eventFilter(self, obj, event) -> bool:
         """Intercept Tab/Enter in editors: accept autocomplete, commit, navigate."""
@@ -208,7 +306,7 @@ class _ExcelCellDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option, index) -> None:
         self.initStyleOption(option, index)
         self._paint_bg(painter, option, index)
-        super().paint(painter, self._stripped_option(option), index)
+        self._paint_text(painter, option, index)
         self._draw_active_border(painter, option, index)
 
 
@@ -255,8 +353,13 @@ class _DescriptionDelegate(_ExcelCellDelegate):
 
 
 class _TruckDelegate(_ExcelCellDelegate):
+    def __init__(self, get_fleet, parent=None):
+        super().__init__(parent)
+        self._get_fleet = get_fleet
+
     def createEditor(self, parent, option, index):
-        ed = TruckLineEdit(fetch_fn=search_fleet, parent=parent)
+        # Sync local filter — safe during import modals / nested asyncio.
+        ed = TruckLineEdit(local_numbers=self._get_fleet, parent=parent)
         ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
         return ed
 
@@ -264,7 +367,15 @@ class _TruckDelegate(_ExcelCellDelegate):
         editor.setText(index.data() or "")
 
     def setModelData(self, editor, model, index):
-        model.setData(index, editor.text().strip().upper())
+        text = editor.text().strip()
+        if not text:
+            model.setData(index, "")
+            return
+        result = normalize_truck_number(text)
+        if result.status in ("ok", "normalized"):
+            model.setData(index, result.value)
+        else:
+            model.setData(index, result.value or text.upper())
 
     def updateEditorGeometry(self, editor, option, index):
         editor.setGeometry(option.rect)
@@ -295,7 +406,7 @@ class _DateDelegate(_ExcelCellDelegate):
             )
             painter.restore()
         else:
-            QStyledItemDelegate.paint(self, painter, self._stripped_option(option), index)
+            self._paint_text(painter, option, index)
 
         # Calendar icon — only when cell has data or is selected
         if value or is_sel:
@@ -335,46 +446,24 @@ class _DateDelegate(_ExcelCellDelegate):
 
 
 class _RefFloatDelegate(_ExcelCellDelegate):
-    """Blank or 'Refund to Float' orange badge; toggles via click/Space/Return."""
-
-    def paint(self, painter, option, index) -> None:
-        value = index.data(Qt.UserRole)
-        if value is None:
-            return  # uninitialised blank row
-
-        self.initStyleOption(option, index)
-        self._paint_bg(painter, option, index)
-
-        if value is True:
-            rect = option.rect.adjusted(4, 5, -4, -5)
-            painter.save()
-            painter.setRenderHint(QPainter.Antialiasing)
-            painter.setBrush(QColor("#FFF7ED"))
-            painter.setPen(QPen(QColor("#EA580C"), 1))
-            painter.drawRoundedRect(rect, 3, 3)
-            painter.setPen(QColor("#EA580C"))
-            f = painter.font()
-            f.setPointSize(8)
-            f.setBold(True)
-            painter.setFont(f)
-            painter.drawText(rect, Qt.AlignCenter, "Refund to Float")
-            painter.restore()
-
-        self._draw_active_border(painter, option, index)
-
-    def editorEvent(self, event, model, option, index) -> bool:
-        if not (index.flags() & Qt.ItemIsEditable):
-            return False
-        if event.type() == QEvent.MouseButtonRelease:
-            model.setData(index, not (index.data(Qt.UserRole) is True), Qt.UserRole)
-            return True
-        if event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Space, Qt.Key_Return):
-            model.setData(index, not (index.data(Qt.UserRole) is True), Qt.UserRole)
-            return True
-        return False
+    """Ref_Float free-text editor with Item-like autocomplete (REFUND TO FLOAT)."""
 
     def createEditor(self, parent, option, index):
-        return None
+        ed = CompleterLineEdit(list(_REF_FLOAT_OPTS), parent=parent)
+        ed._completer.setFilterMode(Qt.MatchStartsWith)
+        ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
+        return ed
+
+    def setEditorData(self, editor, index):
+        editor.setText(index.data() or "")
+        editor.selectAll()
+
+    def setModelData(self, editor, model, index):
+        text = (editor.canonical(editor.text().strip()) or editor.text().strip()).upper()
+        model.setData(index, text)
+
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
 
 
 _RCPT_COLORS = {
@@ -383,54 +472,67 @@ _RCPT_COLORS = {
     "missing":    ("#fef2f2", "#dc2626"),
     "no_receipt": ("#f3f4f6", "#6b7280"),
 }
+# Display labels are uppercase (RECEIPT, not Received).
 _RCPT_LABEL = {
-    "received": "Received", "pending": "Pending",
-    "missing": "Missing", "no_receipt": "No Receipt",
+    "received": "RECEIPT",
+    "pending": "PENDING",
+    "missing": "MISSING",
+    "no_receipt": "NO RECEIPT",
 }
-_RECEIPT_OPTS = ["Pending", "Received", "Missing", "No Receipt"]
+_RECEIPT_OPTS = ["PENDING", "RECEIPT", "MISSING", "NO RECEIPT"]
 # Display label (lowercased) -> stored status key
 _RCPT_OPT_KEY = {
-    "pending": "pending", "received": "received",
-    "missing": "missing", "no receipt": "no_receipt",
+    "pending": "pending",
+    "receipt": "received",
+    "received": "received",
+    "missing": "missing",
+    "no receipt": "no_receipt",
 }
 # Any incoming text (paste / import) -> stored status key
 _RCPT_NORM = {
-    "received": "received", "1": "received", "yes": "received",
+    "received": "received",
+    "receipt": "received",
+    "1": "received",
+    "yes": "received",
+    "rcvd": "received",
     "missing": "missing",
-    "pending": "pending", "0": "pending",
-    "no receipt": "no_receipt", "no_receipt": "no_receipt", "none": "no_receipt",
+    "pending": "pending",
+    "0": "pending",
+    "no receipt": "no_receipt",
+    "no_receipt": "no_receipt",
+    "none": "no_receipt",
+    "n/a": "no_receipt",
+    "na": "no_receipt",
 }
 _VALID_RCPT = {"pending", "received", "missing", "no_receipt"}
 
 
+def _norm_receipt_text(raw: str) -> str:
+    key = " ".join((raw or "").strip().lower().split())
+    if key in _RCPT_NORM:
+        return _RCPT_NORM[key]
+    if "no receipt" in key:
+        return "no_receipt"
+    if key == "receipt" or "received" in key:
+        return "received"
+    return "pending"
+
+
+def _parse_amount_text(raw: str) -> float:
+    from tahmeed.services.daily_import_service import parse_amount
+    val = parse_amount(raw)
+    return float(val) if val is not None else 0.0
+
+
 class _ReceiptDelegate(_ExcelCellDelegate):
-    """Colored badge painter + QComboBox editor for the Receipt column."""
+    """Receipt status — normal cell font + autocomplete (same interaction as Item)."""
 
     def paint(self, painter, option, index) -> None:
         self.initStyleOption(option, index)
         status = (index.data() or "").strip().lower()
-
+        option.text = _RCPT_LABEL.get(status, status.upper() if status else "")
         self._paint_bg(painter, option, index)
-
-        if status:
-            label  = _RCPT_LABEL.get(status, status.capitalize())
-            bg, fg = _RCPT_COLORS.get(status, ("#f3f4f6", "#6b7280"))
-            rect   = option.rect.adjusted(4, 4, -4, -4)
-            painter.save()
-            painter.setRenderHint(QPainter.Antialiasing)
-            painter.setBrush(QColor(bg))
-            painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(rect, rect.height() // 2, rect.height() // 2)
-            painter.setPen(QColor(fg))
-            f = painter.font()
-            f.setPointSize(9)
-            f.setBold(True)
-            painter.setFont(f)
-            painter.drawText(rect, Qt.AlignCenter, label)
-            painter.restore()
-        else:
-            QStyledItemDelegate.paint(self, painter, self._stripped_option(option), index)
-
+        self._paint_text(painter, option, index)
         self._draw_active_border(painter, option, index)
 
     def createEditor(self, parent, option, index):
@@ -446,7 +548,10 @@ class _ReceiptDelegate(_ExcelCellDelegate):
 
     def setModelData(self, editor, model, index):
         disp = editor.canonical(editor.text().strip()) or editor.text().strip()
-        model.setData(index, _RCPT_OPT_KEY.get(disp.lower(), ""))
+        key = _RCPT_OPT_KEY.get(disp.lower())
+        if key is None:
+            key = _norm_receipt_text(disp)
+        model.setData(index, key if key in _VALID_RCPT else "")
 
     def updateEditorGeometry(self, editor, option, index):
         editor.setGeometry(option.rect)
@@ -575,6 +680,69 @@ class _TableKeyFilter(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Table with Excel-like S/NO row selection
+# ---------------------------------------------------------------------------
+
+class _ExcelTableWidget(QTableWidget):
+    """QTableWidget that selects full rows when the S/NO column is clicked.
+
+    Other columns keep normal contiguous cell-range selection (copy/paste).
+    Clicking or dragging S/NO behaves like Excel's row-number gutter.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sn_dragging = False
+        self._sn_anchor_row = -1
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            index = self.indexAt(event.pos())
+            if index.isValid() and index.column() == COL_SNO:
+                row = index.row()
+                self._sn_dragging = True
+                if (event.modifiers() & Qt.ShiftModifier) and self._sn_anchor_row >= 0:
+                    self._select_sn_rows(self._sn_anchor_row, row)
+                else:
+                    self._sn_anchor_row = row
+                    self._select_sn_rows(row, row)
+                return
+        self._sn_dragging = False
+        super().mousePressEvent(event)
+        cur = self.currentIndex()
+        if cur.isValid() and not (event.modifiers() & Qt.ShiftModifier):
+            self._sn_anchor_row = cur.row()
+
+    def mouseMoveEvent(self, event):
+        if self._sn_dragging and (event.buttons() & Qt.LeftButton):
+            index = self.indexAt(event.pos())
+            if index.isValid() and self._sn_anchor_row >= 0:
+                self._select_sn_rows(self._sn_anchor_row, index.row())
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._sn_dragging = False
+        super().mouseReleaseEvent(event)
+
+    def _select_sn_rows(self, row_a: int, row_b: int) -> None:
+        """Select every column in the contiguous row range (Excel row gutter)."""
+        r0, r1 = min(row_a, row_b), max(row_a, row_b)
+        model = self.model()
+        selection = QItemSelection(
+            model.index(r0, 0),
+            model.index(r1, self.columnCount() - 1),
+        )
+        self.selectionModel().select(
+            selection, QItemSelectionModel.ClearAndSelect
+        )
+        self.selectionModel().setCurrentIndex(
+            model.index(row_b, COL_SNO),
+            QItemSelectionModel.NoUpdate,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Column filter header
 # ---------------------------------------------------------------------------
 
@@ -645,9 +813,14 @@ class _FilterHeaderView(QHeaderView):
             it = table.item(row, col)
             if not it:
                 continue
-            if col == COL_NOTES:
-                if it.data(Qt.UserRole) is True:
-                    values.add("Refund to Float")
+            if col == COL_REF:
+                v = it.text().strip()
+                if v:
+                    values.add(v)
+            elif col == COL_RECEIPT:
+                v = (it.text() or "").strip().lower()
+                if v:
+                    values.add(_RCPT_LABEL.get(v, v))
             else:
                 v = it.text().strip()
                 if v:
@@ -725,8 +898,10 @@ class DailyRegister(QWidget):
         self._locked_subitems: dict = {}   # item name (lower) -> [sub-item names]
         self._restrict_items: bool = False
         self._defer_item_to_verify: bool = False
-        self._restrict_trucks: bool = False
+        self._restrict_trucks: bool = True  # always on — only registered fleet numbers
         self._fleet_numbers: set = set()   # uppercased valid truck/trailer numbers
+        self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
+        self._people_names: list = []      # Ownership / APR BY suggestions (unrestricted)
         self._current_date: date = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
@@ -736,11 +911,23 @@ class DailyRegister(QWidget):
         self._col_filters: dict   = {}   # col -> set of accepted values
         self._search_text: str    = ""
         self._pending_highlight: str = ""  # set by navigate_to_date; consumed in _populate
+        # row_index -> import metadata stamped onto Transaction at save time
+        self._pending_row_meta: dict = {}
+        # When True, skip async side-effects from itemChanged (bulk paste/import).
+        self._bulk_mutating: bool = False
+        # When True, queue truck issues but do not open the correction dialog yet
+        # (avoids nested asyncio during daily import modals on Python 3.14).
+        self._suppress_truck_dialog: bool = False
+        # Coalesce truck issues into one combined dialog (paste / import / edit).
+        self._pending_truck_issues: dict = {}  # row -> TruckIssue
+        self._truck_dialog_scheduled: bool = False
+        self._open_truck_dialog: object = None
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_cashier_settings())
         asyncio.ensure_future(self._load_locked_subitems())
         asyncio.ensure_future(self._load_fleet_numbers())
+        asyncio.ensure_future(self._load_people_names())
 
     # ------------------------------------------------------------------
     # UI construction
@@ -752,11 +939,14 @@ class DailyRegister(QWidget):
         root.setSpacing(0)
 
         # ── Table ──────────────────────────────────────────────────────
-        self._table = QTableWidget(DEFAULT_EDITABLE_ROWS, len(HEADERS))
+        self._table = _ExcelTableWidget(DEFAULT_EDITABLE_ROWS, len(HEADERS))
         _fhv = _FilterHeaderView(self._table)
         _fhv.filter_changed.connect(self._on_col_filter_changed)
         self._table.setHorizontalHeader(_fhv)
         self._table.setHorizontalHeaderLabels(HEADERS)
+        sno_hdr = self._table.horizontalHeaderItem(COL_SNO)
+        if sno_hdr is not None:
+            sno_hdr.setTextAlignment(Qt.AlignCenter)
         self._table.setStyleSheet("""
             QTableWidget {
                 background: #ffffff;
@@ -770,7 +960,7 @@ class DailyRegister(QWidget):
                 color: #F9FAFB;
                 font-weight: 600;
                 font-size: 11px;
-                padding: 5px 8px;
+                padding: 5px 4px;
                 border: none;
                 border-right: 1px solid #1B2B4B;
                 border-bottom: 2px solid #0077C5;
@@ -784,23 +974,16 @@ class DailyRegister(QWidget):
         hh = self._table.horizontalHeader()
         hh.setSectionsMovable(False)
         hh.setStretchLastSection(False)
-        # All columns interactive (user-draggable) except fixed checkbox cols and S/NO
+        hh.setMinimumSectionSize(50)
+        # Interactive columns; S/NO fixed; Description stretches to fill the viewport.
         for col in range(len(HEADERS)):
             hh.setSectionResizeMode(col, QHeaderView.Interactive)
-        hh.setSectionResizeMode(COL_SNO,   QHeaderView.Fixed)
-        hh.setSectionResizeMode(COL_NOTES, QHeaderView.Fixed)
+        hh.setSectionResizeMode(COL_SNO,  QHeaderView.Fixed)
+        hh.setSectionResizeMode(COL_DESC, QHeaderView.Stretch)
 
-        self._table.setColumnWidth(COL_SNO,     38)
-        self._table.setColumnWidth(COL_DATE,    110)
-        self._table.setColumnWidth(COL_ITEM,    120)
-        self._table.setColumnWidth(COL_DESC,    360)
-        self._table.setColumnWidth(COL_TRUCK,   82)
-        self._table.setColumnWidth(COL_MEMO,    130)
-        self._table.setColumnWidth(COL_NOTES,   96)
-        self._table.setColumnWidth(COL_TZS,     120)
-        self._table.setColumnWidth(COL_RECEIPT, 60)
-        self._table.setColumnWidth(COL_OWN,     90)
-        self._table.setColumnWidth(COL_APR,     80)
+        for col, width in _COL_PREFERRED.items():
+            self._table.setColumnWidth(col, width)
+        QTimer.singleShot(0, self._fit_table_columns)
 
         self._table.setSelectionMode(QAbstractItemView.ContiguousSelection)
         self._table.verticalHeader().setDefaultSectionSize(28)
@@ -809,17 +992,25 @@ class DailyRegister(QWidget):
 
         # Excel selection model on every column; per-column delegates override as needed
         self._table.setItemDelegate(_ExcelCellDelegate(self._table))
-        self._table.setItemDelegateForColumn(COL_ITEM,    _ItemDelegate(lambda: [c.name for c in self._categories], self._table))
-        self._table.setItemDelegateForColumn(COL_DESC,    _DescriptionDelegate(
+        self._table.setItemDelegateForColumn(COL_ITEM,     _ItemDelegate(lambda: [c.name for c in self._categories], self._table))
+        self._table.setItemDelegateForColumn(COL_DESC,     _DescriptionDelegate(
             cat_getter=lambda name: self._cat_by_name.get(name.lower()),
             subs_getter=lambda name: self._locked_subitems.get(name.lower(), []),
             parent=self._table,
         ))
-        self._table.setItemDelegateForColumn(COL_TRUCK,   _TruckDelegate(self._table))
-        self._table.setItemDelegateForColumn(COL_DATE,    _DateDelegate(lambda: self._current_date, self._table))
-        self._table.setItemDelegateForColumn(COL_NOTES,   _RefFloatDelegate(self._table))
-        self._table.setItemDelegateForColumn(COL_TZS,     _TZSDelegate(self._table))
-        self._table.setItemDelegateForColumn(COL_RECEIPT, _ReceiptDelegate(self._table))
+        self._table.setItemDelegateForColumn(COL_TRUCK,    _TruckDelegate(
+            lambda: sorted(self._fleet_numbers), self._table
+        ))
+        date_del = _DateDelegate(lambda: self._current_date, self._table)
+        self._table.setItemDelegateForColumn(COL_DATE,     date_del)
+        self._table.setItemDelegateForColumn(COL_REPORTED, date_del)
+        self._table.setItemDelegateForColumn(COL_REF,      _RefFloatDelegate(self._table))
+        self._table.setItemDelegateForColumn(COL_TZS,      _TZSDelegate(self._table))
+        self._table.setItemDelegateForColumn(COL_RECEIPT,  _ReceiptDelegate(self._table))
+        # Ownership + APR BY — same Item-style autocomplete/preview; free text always allowed.
+        people_del = _ItemDelegate(lambda: list(self._people_names), self._table)
+        self._table.setItemDelegateForColumn(COL_OWN, people_del)
+        self._table.setItemDelegateForColumn(COL_APR, people_del)
 
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.model().dataChanged.connect(self._on_model_data_changed)
@@ -852,6 +1043,42 @@ class DailyRegister(QWidget):
         # Init blank rows
         self._init_editable_rows(0, DEFAULT_EDITABLE_ROWS)
         self._install_key_handler()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_table_columns()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._fit_table_columns)
+
+    def _fit_table_columns(self) -> None:
+        """Scale columns to the viewport so the register fits without H-scroll."""
+        if not hasattr(self, "_table") or self._table is None:
+            return
+        vp = self._table.viewport().width()
+        if vp <= 0:
+            return
+
+        widths = dict(_COL_PREFERRED)
+        total = sum(widths.values())
+        if total > vp:
+            deficit = total - vp
+            for col in _COL_FLEX:
+                if deficit <= 0:
+                    break
+                floor = _COL_MIN.get(col, 50)
+                cut = min(max(0, widths[col] - floor), deficit)
+                widths[col] -= cut
+                deficit -= cut
+
+        hh = self._table.horizontalHeader()
+        # Apply concrete widths, then let Description absorb any leftover slack.
+        hh.setSectionResizeMode(COL_DESC, QHeaderView.Interactive)
+        for col, width in widths.items():
+            self._table.setColumnWidth(col, width)
+        hh.setSectionResizeMode(COL_SNO,  QHeaderView.Fixed)
+        hh.setSectionResizeMode(COL_DESC, QHeaderView.Stretch)
 
     def navigate_to_date(self, d: date, highlight_term: str = "") -> None:
         """Called by dashboard when TransactionBrowser 'Go To' is used.
@@ -890,6 +1117,7 @@ class DailyRegister(QWidget):
     async def _load_date(self, d: date) -> None:
         try:
             txs = await get_transactions_by_date(d, cashier_id=self._user._id)
+            self._pending_row_meta.clear()
             self._populate(txs)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
@@ -905,6 +1133,18 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._load_cashier_settings())
         asyncio.ensure_future(self._load_locked_subitems())
         asyncio.ensure_future(self._load_fleet_numbers())
+        asyncio.ensure_future(self._load_people_names())
+
+    def update_people(self, names: list) -> None:
+        """Refresh Ownership / APR BY suggestion list (free text still allowed)."""
+        self._people_names = [str(n).strip().upper() for n in (names or []) if str(n).strip()]
+
+    async def _load_people_names(self) -> None:
+        try:
+            from tahmeed.services.people_service import get_people_names
+            self.update_people(await get_people_names())
+        except Exception:
+            self._people_names = []
 
     def _populate(self, transactions: List[Transaction]) -> None:
         # A fresh load always returns the grid to read-only state.
@@ -953,9 +1193,8 @@ class DailyRegister(QWidget):
             it.setTextAlignment(align)
             return it
 
-        # S/NO
+        # S/NO — same row background as siblings (Excel-style continuous row)
         sno = saved_item(str(row + 1), Qt.AlignCenter)
-        sno.setBackground(QBrush(SNO_BG))
         self._table.setItem(row, COL_SNO, sno)
 
         date_str = tx.date.strftime("%d/%m/%Y") if tx.date else ""
@@ -968,6 +1207,10 @@ class DailyRegister(QWidget):
             )
         self._table.setItem(row, COL_DATE, date_item)
 
+        reported = getattr(tx, "reported_date", None)
+        reported_str = reported.strftime("%d/%m/%Y") if reported else ""
+        self._table.setItem(row, COL_REPORTED, saved_item(reported_str))
+
         self._table.setItem(row, COL_ITEM, saved_item(tx.item or ""))
 
         desc_item = saved_item(tx.description)
@@ -977,13 +1220,7 @@ class DailyRegister(QWidget):
         self._table.setItem(row, COL_DESC, desc_item)
         self._table.setItem(row, COL_TRUCK, saved_item(tx.truck_number or ""))
         self._table.setItem(row, COL_MEMO,  saved_item(tx.memo or ""))
-
-        # Notes checkbox
-        notes_it = QTableWidgetItem()
-        notes_it.setData(Qt.UserRole, tx.notes_flag)
-        notes_it.setFlags(ro)
-        notes_it.setBackground(bg)
-        self._table.setItem(row, COL_NOTES, notes_it)
+        self._table.setItem(row, COL_REF,   saved_item(_ref_float_text(tx)))
 
         # TZS
         tzs_str = f"{tx.amount:,.2f}" if tx.amount else ""
@@ -992,46 +1229,49 @@ class DailyRegister(QWidget):
             tzs_it.setForeground(NEG_COLOR)
         self._table.setItem(row, COL_TZS, tzs_it)
 
-        # Receipt badge
+        # Receipt
         rcpt_it = saved_item(tx.receipt_status or "pending")
         self._table.setItem(row, COL_RECEIPT, rcpt_it)
 
-        self._table.setItem(row, COL_OWN, saved_item(tx.ownership or ""))
-        self._table.setItem(row, COL_APR, saved_item(tx.approver or ""))
+        self._table.setItem(row, COL_OWN,    saved_item(tx.ownership or ""))
+        self._table.setItem(row, COL_APR,    saved_item(tx.approver or ""))
+        self._table.setItem(row, COL_PAYEE,  saved_item(getattr(tx, "payee", "") or ""))
+        self._table.setItem(row, COL_CHEQUE, saved_item(getattr(tx, "cheque", "") or ""))
 
     def _init_editable_rows(self, start: int, end: int) -> None:
-        self._table.blockSignals(True)
+        # Preserve caller's blockSignals state — never force-unblock mid bulk load.
+        prev = self._table.blockSignals(True)
         for row in range(start, end):
             # S/NO — blank until row is activated by data entry or Tab wrap
             sno = QTableWidgetItem("")
             sno.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            sno.setBackground(QBrush(SNO_BG))
             sno.setTextAlignment(Qt.AlignCenter)
             self._table.setItem(row, COL_SNO, sno)
             # Checkbox items are created lazily in _activate_row
-        self._table.blockSignals(False)
+        self._table.blockSignals(prev)
 
     # ------------------------------------------------------------------
     # Footer
     # ------------------------------------------------------------------
 
     def _update_footer(self) -> None:
+        """Recompute entries / total / refund from the live grid (saved + unsaved)."""
         n, tzs, refund = 0, 0.0, 0.0
         for row in range(self._table.rowCount()):
             tzs_it = self._table.item(row, COL_TZS)
             if not tzs_it:
                 continue
-            raw = tzs_it.text().strip().replace(",", "")
+            raw = tzs_it.text().strip()
             if not raw:
                 continue
-            try:
-                amount = float(raw)
-            except ValueError:
+            amount = _parse_amount_text(raw)
+            # Skip non-numeric leftovers that parse as 0
+            if amount == 0.0 and not any(ch.isdigit() for ch in raw):
                 continue
             n += 1
             tzs += amount
-            notes_it = self._table.item(row, COL_NOTES)
-            if notes_it and notes_it.data(Qt.UserRole) is True:
+            ref_it = self._table.item(row, COL_REF)
+            if ref_it and _is_refund_float(ref_it.text()):
                 refund += amount
 
         amount_str = f"TZS {tzs:,.0f}" if tzs else "—"
@@ -1053,10 +1293,6 @@ class DailyRegister(QWidget):
             it = self._table.item(row, col)
             return it.text().strip() if it else ""
 
-        def checked(col: int) -> bool:
-            it = self._table.item(row, col)
-            return it.data(Qt.UserRole) is True if it else False
-
         description = txt(COL_DESC)
         if not description:
             return None
@@ -1071,14 +1307,17 @@ class DailyRegister(QWidget):
                 self._current_date.day,
             )
 
-        raw_tzs = txt(COL_TZS).replace(",", "")
-        amount = float(raw_tzs) if raw_tzs else 0.0
+        raw_tzs = txt(COL_TZS)
+        amount = _parse_amount_text(raw_tzs)
 
-        rcpt_raw = txt(COL_RECEIPT).lower()
-        rcpt_status = rcpt_raw if rcpt_raw in _VALID_RCPT else "pending"
+        rcpt_status = _norm_receipt_text(txt(COL_RECEIPT))
+        if rcpt_status not in _VALID_RCPT:
+            rcpt_status = "pending"
 
         item_name = txt(COL_ITEM)
-        if not item_name and not self._defer_item_to_verify:
+        meta = self._pending_row_meta.get(row) or {}
+        allow_blank_item = self._defer_item_to_verify or bool(meta.get("daily_import_id"))
+        if not item_name and not allow_blank_item:
             raise ValueError("Item is required. Enter an item or ask the accountant to enable description-only entries.")
 
         cat = self._cat_by_name.get(item_name.lower()) if item_name else None
@@ -1099,25 +1338,58 @@ class DailyRegister(QWidget):
                     )
                 description = match
 
-        truck_number = txt(COL_TRUCK).upper()
-        if (truck_number and self._restrict_trucks
-                and truck_number not in self._fleet_numbers):
-            raise ValueError(f'"{truck_number}" is not a registered truck/trailer.')
+        truck_raw = txt(COL_TRUCK)
+        truck_number = ""
+        if truck_raw:
+            if is_allowed_place_label(truck_raw, self._allowed_truck_labels):
+                truck_number = normalize_place_label(truck_raw)
+            else:
+                matched = try_match_fleet(truck_raw, self._fleet_numbers)
+                if matched is None:
+                    norm = normalize_truck_number(
+                        truck_raw, allowed_labels=self._allowed_truck_labels
+                    )
+                    label = norm.value if norm.status != "empty" else truck_raw
+                    if norm.status == "invalid":
+                        raise ValueError(
+                            f'"{label}" is not a valid truck number '
+                            f"(expected T + number + space + suffix, e.g. T688 EAF)."
+                        )
+                    if norm.status == "place_label":
+                        truck_number = norm.value
+                    else:
+                        raise ValueError(
+                            f'"{norm.value}" is not a registered truck/trailer.'
+                        )
+                else:
+                    truck_number = matched
 
+        ref_text = txt(COL_REF)
         return Transaction(
             date=tx_date,
+            reported_date=_parse_optional_date(txt(COL_REPORTED)),
             description=description,
             item=item_name,
             category_name=item_name or None,
+            category_id=meta.get("category_id"),
             truck_number=truck_number,
             amount=amount,
-            currency="TZS",
+            currency=meta.get("currency") or "TZS",
             memo=txt(COL_MEMO),
             receipt_status=rcpt_status,
-            notes_flag=checked(COL_NOTES),
+            ref_float=ref_text,
+            notes_flag=_is_refund_float(ref_text),
             ownership=txt(COL_OWN),
             approver=txt(COL_APR),
+            payee=txt(COL_PAYEE),
+            cheque=txt(COL_CHEQUE),
             cashier_id=self._user._id,
+            daily_import_id=meta.get("daily_import_id"),
+            daily_import_source=meta.get("daily_import_source"),
+            date_discrepancy=bool(meta.get("date_discrepancy")),
+            import_primary_date=meta.get("import_primary_date"),
+            lpo_do=meta.get("lpo_do") or "",
+            do_number=meta.get("do_number") or "",
         )
 
     # ------------------------------------------------------------------
@@ -1149,12 +1421,11 @@ class DailyRegister(QWidget):
         self._table.blockSignals(True)
         for row in range(self._saved_count):
             for col in range(self._table.columnCount()):
-                if col in READONLY_COLS:
-                    continue
                 it = self._table.item(row, col)
                 if it is None:
                     continue
-                it.setFlags(editable)
+                if col not in READONLY_COLS:
+                    it.setFlags(editable)
                 it.setBackground(QBrush(EDIT_BG))
         self._table.blockSignals(False)
         self.edit_state_changed.emit(True, 0)
@@ -1178,8 +1449,6 @@ class DailyRegister(QWidget):
         self._dirty_rows.add(row)
         self._table.blockSignals(True)
         for col in range(self._table.columnCount()):
-            if col in READONLY_COLS:
-                continue
             it = self._table.item(row, col)
             if it is not None:
                 it.setBackground(QBrush(DIRTY_BG))
@@ -1195,6 +1464,7 @@ class DailyRegister(QWidget):
             return None
         return {
             "date": tx.date,
+            "reported_date": tx.reported_date,
             "description": tx.description,
             "item": tx.item,
             "category_name": tx.category_name,
@@ -1204,8 +1474,11 @@ class DailyRegister(QWidget):
             "memo": tx.memo,
             "receipt_status": tx.receipt_status,
             "notes_flag": tx.notes_flag,
+            "ref_float": tx.ref_float,
             "ownership": tx.ownership,
             "approver": tx.approver,
+            "payee": tx.payee,
+            "cheque": tx.cheque,
         }
 
     # ------------------------------------------------------------------
@@ -1213,8 +1486,8 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
 
     _EXPORT_COLS = [
-        COL_DATE, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
-        COL_NOTES, COL_TZS, COL_RECEIPT, COL_OWN, COL_APR,
+        COL_DATE, COL_REPORTED, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
+        COL_REF, COL_TZS, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
     ]
 
     def export_xlsx(self) -> None:
@@ -1275,10 +1548,7 @@ class DailyRegister(QWidget):
             rec: list = []
             for col in self._EXPORT_COLS:
                 it = self._table.item(row, col)
-                if col == COL_NOTES:
-                    rec.append("Refund to Float"
-                               if (it and it.data(Qt.UserRole) is True) else "")
-                elif col == COL_RECEIPT:
+                if col == COL_RECEIPT:
                     val = (it.text().strip() if it else "")
                     rec.append(_RCPT_LABEL.get(val.lower(), val))
                 else:
@@ -1375,14 +1645,16 @@ class DailyRegister(QWidget):
                 matched = False
                 for col in range(self._table.columnCount()):
                     it = self._table.item(row, col)
-                    if col == COL_NOTES:
-                        if it and it.data(Qt.UserRole) is True and search in "refund to float":
+                    if not it:
+                        continue
+                    if col == COL_RECEIPT:
+                        label = _RCPT_LABEL.get(it.text().strip().lower(), it.text())
+                        if search in label.lower() or search in it.text().lower():
                             matched = True
                             break
-                    else:
-                        if it and search in it.text().lower():
-                            matched = True
-                            break
+                    elif search in it.text().lower():
+                        matched = True
+                        break
                 if not matched:
                     self._table.setRowHidden(row, True)
                     continue
@@ -1393,8 +1665,9 @@ class DailyRegister(QWidget):
                 if not accepted:
                     continue
                 it = self._table.item(row, col)
-                if col == COL_NOTES:
-                    val = "Refund to Float" if (it and it.data(Qt.UserRole) is True) else ""
+                if col == COL_RECEIPT:
+                    raw = it.text().strip().lower() if it else ""
+                    val = _RCPT_LABEL.get(raw, raw)
                 else:
                     val = it.text().strip() if it else ""
                 if val not in accepted:
@@ -1427,16 +1700,14 @@ class DailyRegister(QWidget):
             if is_saved or is_active:
                 it.setText(str(row + 1))
                 if not is_saved:
-                    if not self._table.item(row, COL_NOTES):
-                        ci = QTableWidgetItem()
-                        ci.setData(Qt.UserRole, False)
-                        ci.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                        self._table.setItem(row, COL_NOTES, ci)
                     if not self._table.item(row, COL_RECEIPT):
                         ri = QTableWidgetItem("")
                         ri.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                         self._table.setItem(row, COL_RECEIPT, ri)
         self._table.blockSignals(False)
+        # Keep header KPIs (entries / refund / total) in sync after row ops
+        # that block itemChanged (delete, clear, paste, import).
+        self._update_footer()
 
     # ------------------------------------------------------------------
     # Dynamic row expansion
@@ -1477,7 +1748,7 @@ class DailyRegister(QWidget):
         # Keep Date in sync with whether the row has real entry data.
         # Skip when the Date cell itself is edited so a manual date is not
         # immediately cleared on an otherwise empty row.
-        if col not in READONLY_COLS and col not in CHECK_COLS and col != COL_DATE:
+        if col not in READONLY_COLS and col not in CHECK_COLS and col not in (COL_DATE, COL_REPORTED):
             self._table.blockSignals(True)
             self._sync_row_date(row)
             self._table.blockSignals(False)
@@ -1487,9 +1758,12 @@ class DailyRegister(QWidget):
             self._validate_item_cell(row, item)
         elif col == COL_DESC and item.text().strip():
             self._validate_locked_description(row, item)
-            if self._defer_item_to_verify:
-                asyncio.ensure_future(
-                    self._auto_fill_item_from_mapping(row, item.text().strip())
+            if self._defer_item_to_verify and not self._bulk_mutating:
+                # Defer off the current asyncio task so qasync/Py3.14 does not
+                # try to nest _auto_fill inside an active import coroutine.
+                desc = item.text().strip()
+                QTimer.singleShot(
+                    0, lambda r=row, d=desc: self._kick_auto_fill_item(r, d)
                 )
         elif col == COL_TRUCK and item.text().strip():
             self._validate_truck_cell(row, item)
@@ -1498,16 +1772,12 @@ class DailyRegister(QWidget):
         if row >= self._table.rowCount() - 5 and item.text().strip():
             self._append_editable_rows(10)
 
-        if col == COL_TZS:
+        if col in (COL_TZS, COL_REF):
             self._update_footer()
 
     def _on_model_data_changed(self, top_left, bottom_right, roles=()) -> None:
-        if top_left.column() == COL_NOTES and Qt.UserRole in roles:
-            self._update_footer()
-            # Ref_Float toggles go through the model (not itemChanged); mark the
-            # saved row dirty when toggled in edit mode.
-            if self._edit_mode and top_left.row() < self._saved_count:
-                self._mark_dirty(top_left.row())
+        # Kept for receipt/other UserRole updates if added later.
+        pass
 
     def _activate_row(self, row: int) -> None:
         """Make a blank editable row visible: set S/NO number and create input items."""
@@ -1519,11 +1789,6 @@ class DailyRegister(QWidget):
         if sno_it:
             sno_it.setText(str(row + 1))
         prev = self._table.blockSignals(True)
-        if not self._table.item(row, COL_NOTES):
-            ci = QTableWidgetItem()
-            ci.setData(Qt.UserRole, False)
-            ci.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-            self._table.setItem(row, COL_NOTES, ci)
         if not self._table.item(row, COL_RECEIPT):
             ri = QTableWidgetItem("")
             ri.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
@@ -1658,11 +1923,11 @@ class DailyRegister(QWidget):
         self._table.installEventFilter(self._key_filter)
 
     def _commit_date_suggestion(self) -> None:
-        """If the focused cell is an empty Date cell, write the register date into it."""
+        """If the focused cell is an empty Date/Reported Date cell, write the register date."""
         row, col = self._table.currentRow(), self._table.currentColumn()
-        if col != COL_DATE or row < self._saved_count:
+        if col not in (COL_DATE, COL_REPORTED) or row < self._saved_count:
             return
-        it = self._table.item(row, COL_DATE)
+        it = self._table.item(row, col)
         if it is not None and it.text().strip():
             return
         cur = self._current_date
@@ -1670,7 +1935,7 @@ class DailyRegister(QWidget):
         new_it = QTableWidgetItem(today_str)
         new_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
         self._table.blockSignals(True)
-        self._table.setItem(row, COL_DATE, new_it)
+        self._table.setItem(row, col, new_it)
         self._table.blockSignals(False)
         self._activate_row(row)
 
@@ -1736,67 +2001,99 @@ class DailyRegister(QWidget):
             sel_rows = []
             sel_cols = []
 
-        # Single clipboard value pasted onto a multi-cell selection: fill every
-        # selected editable cell with that value (Excel behaviour).
-        if len(lines) == 1 and "\t" not in lines[0] and sel_rows and (
-            len(sel_rows) > 1 or len(sel_cols) > 1
-        ):
-            cell_value = lines[0].strip()
-            self._table.blockSignals(True)
-            for row in sel_rows:
-                for col in sel_cols:
-                    if col in READONLY_COLS:
+        truck_cells: list = []  # (row, raw_text)
+        self._bulk_mutating = True
+        try:
+            # Single clipboard value pasted onto a multi-cell selection: fill every
+            # selected editable cell with that value (Excel behaviour).
+            if len(lines) == 1 and "\t" not in lines[0] and sel_rows and (
+                len(sel_rows) > 1 or len(sel_cols) > 1
+            ):
+                cell_value = lines[0].strip()
+                prev = self._table.blockSignals(True)
+                for row in sel_rows:
+                    for col in sel_cols:
+                        if col in READONLY_COLS:
+                            continue
+                        if col in CHECK_COLS:
+                            it = self._table.item(row, col) or QTableWidgetItem()
+                            it.setData(Qt.UserRole, cell_value in ("1", "true", "True", "YES"))
+                            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                            self._table.setItem(row, col, it)
+                        elif col == COL_RECEIPT:
+                            norm = _norm_receipt_text(cell_value)
+                            it = self._table.item(row, col) or QTableWidgetItem()
+                            it.setText(norm)
+                            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                            self._table.setItem(row, col, it)
+                        elif col == COL_TZS:
+                            amt = _parse_amount_text(cell_value)
+                            text = f"{amt:,.2f}" if cell_value.strip() else ""
+                            it = QTableWidgetItem(text)
+                            it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                            if amt < 0:
+                                it.setForeground(NEG_COLOR)
+                            self._table.setItem(row, col, it)
+                        elif col == COL_TRUCK:
+                            self._table.setItem(row, col, QTableWidgetItem(cell_value.upper()))
+                            if cell_value:
+                                truck_cells.append((row, cell_value))
+                        else:
+                            self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell_value)))
+                for row in sel_rows:
+                    self._sync_row_date(row)
+                self._table.blockSignals(prev)
+                self._renumber()
+                self._finalize_truck_cells(truck_cells)
+                return
+
+            # Multi-row / multi-column clipboard: paste starting at anchor (TSV layout).
+            touched_rows: set = set()
+            prev = self._table.blockSignals(True)
+            for r, line in enumerate(lines):
+                for c, cell in enumerate(line.split("\t")):
+                    row = start_row + r
+                    col = start_col + c
+                    if row >= self._table.rowCount():
+                        self._append_editable_rows(20)
+                    if col >= self._table.columnCount() or col in READONLY_COLS:
                         continue
+                    if row < self._saved_count:
+                        continue
+                    touched_rows.add(row)
                     if col in CHECK_COLS:
                         it = self._table.item(row, col) or QTableWidgetItem()
-                        it.setData(Qt.UserRole, cell_value in ("1", "true", "True", "YES"))
+                        it.setData(Qt.UserRole, cell.strip() in ("1", "true", "True", "YES"))
                         it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                         self._table.setItem(row, col, it)
                     elif col == COL_RECEIPT:
-                        norm = _RCPT_NORM.get(cell_value.lower(), "pending")
+                        norm = _norm_receipt_text(cell)
                         it = self._table.item(row, col) or QTableWidgetItem()
                         it.setText(norm)
                         it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                         self._table.setItem(row, col, it)
+                    elif col == COL_TZS:
+                        amt = _parse_amount_text(cell)
+                        text = f"{amt:,.2f}" if cell.strip() else ""
+                        it = QTableWidgetItem(text)
+                        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                        if amt < 0:
+                            it.setForeground(NEG_COLOR)
+                        self._table.setItem(row, col, it)
+                    elif col == COL_TRUCK:
+                        raw = cell.strip()
+                        self._table.setItem(row, col, QTableWidgetItem(raw.upper() if raw else ""))
+                        if raw:
+                            truck_cells.append((row, raw))
                     else:
-                        self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell_value)))
-            for row in sel_rows:
+                        self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell.strip())))
+            for row in touched_rows:
                 self._sync_row_date(row)
-            self._table.blockSignals(False)
+            self._table.blockSignals(prev)
             self._renumber()
-            return
-
-        # Multi-row / multi-column clipboard: paste starting at anchor (TSV layout).
-        touched_rows: set = set()
-        self._table.blockSignals(True)
-        for r, line in enumerate(lines):
-            for c, cell in enumerate(line.split("\t")):
-                row = start_row + r
-                col = start_col + c
-                if row >= self._table.rowCount():
-                    self._append_editable_rows(20)
-                if col >= self._table.columnCount() or col in READONLY_COLS:
-                    continue
-                if row < self._saved_count:
-                    continue
-                touched_rows.add(row)
-                if col in CHECK_COLS:
-                    it = self._table.item(row, col) or QTableWidgetItem()
-                    it.setData(Qt.UserRole, cell.strip() in ("1", "true", "True", "YES"))
-                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                    self._table.setItem(row, col, it)
-                elif col == COL_RECEIPT:
-                    norm = _RCPT_NORM.get(cell.strip().lower(), "pending")
-                    it = self._table.item(row, col) or QTableWidgetItem()
-                    it.setText(norm)
-                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                    self._table.setItem(row, col, it)
-                else:
-                    self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell.strip())))
-        for row in touched_rows:
-            self._sync_row_date(row)
-        self._table.blockSignals(False)
-        self._renumber()
+            self._finalize_truck_cells(truck_cells)
+        finally:
+            self._bulk_mutating = False
 
     def _clear_selected(self) -> None:
         cleared_rows: set = set()
@@ -1827,6 +2124,7 @@ class DailyRegister(QWidget):
             return
         source_row = rows[0]
         cell_map = {(it.row(), it.column()): it for it in items}
+        truck_cells: list = []
         self._table.blockSignals(True)
         for col in cols:
             if col in READONLY_COLS:
@@ -1842,6 +2140,11 @@ class DailyRegister(QWidget):
                     it.setData(Qt.UserRole, src.data(Qt.UserRole))
                     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                     self._table.setItem(row, col, it)
+                elif col == COL_TRUCK:
+                    raw = src.text().strip()
+                    self._table.setItem(row, col, QTableWidgetItem(raw.upper() if raw else ""))
+                    if raw:
+                        truck_cells.append((row, raw))
                 else:
                     self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, src.text())))
         for row in rows[1:]:
@@ -1849,6 +2152,7 @@ class DailyRegister(QWidget):
                 self._sync_row_date(row)
         self._table.blockSignals(False)
         self._renumber()
+        self._finalize_truck_cells(truck_cells)
 
     def _fill_right(self) -> None:
         """Ctrl+R: copy the leftmost column of the selection into all cols to its right."""
@@ -1969,46 +2273,171 @@ class DailyRegister(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to delete:\n{exc}")
 
     # ------------------------------------------------------------------
-    # Import from Excel / CSV
+    # Import from Excel (daily MATUMIZI)
     # ------------------------------------------------------------------
 
     def import_from_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import from Excel or CSV", "",
-            "Spreadsheets (*.xlsx *.xls *.csv);;All files (*)",
-        )
-        if path:
-            asyncio.ensure_future(self._do_import(path))
+        asyncio.ensure_future(self._run_daily_import())
 
-    async def _do_import(self, path: str) -> None:
+    async def _run_daily_import(self) -> None:
+        from tahmeed.ui.cashier.daily_import_flow import run_daily_import_flow
+
+        preview = await run_daily_import_flow(self)
+        if preview is None:
+            return
+        await self.apply_daily_import_preview(preview)
+
+    async def apply_daily_import_preview(self, preview) -> None:
+        """Navigate to the Excel main date and stage rows for the user to Save."""
+        from tahmeed.services.daily_import_service import staged_row_payload
+
+        primary = preview.primary_date or self._current_date
+        if primary != self._current_date:
+            if self.has_unsaved_work():
+                ok = await self.confirm_leave()
+                if not ok:
+                    return
+            self._reset_edit_state()
+            self._current_date = primary
+            await self._load_date(primary)
+
+        payloads = [staged_row_payload(row, preview) for row in preview.rows]
+        # Queue truck issues now, but open the correction dialog only after this
+        # async import task finishes — nested dialog.exec() + ensure_future crashes
+        # under Python 3.14 / qasync.
+        self._suppress_truck_dialog = True
         try:
-            rows = await asyncio.get_event_loop().run_in_executor(
-                None, _read_spreadsheet, path
+            self._load_staged_import_rows(payloads)
+            QMessageBox.information(
+                self,
+                "Import ready",
+                f"Loaded {len(payloads):,} row(s) from \"{preview.source_filename}\" "
+                f"onto {primary.strftime('%d/%m/%Y')}.\n\n"
+                "Review the Table, make any edits, then click Save.\n"
+                "Saved entries go to the accountant Verify inbox.",
             )
-            self._load_rows(rows)
-        except Exception as exc:
-            QMessageBox.critical(self, "Import Error", f"Could not read file:\n{exc}")
+        finally:
+            self._suppress_truck_dialog = False
+        QTimer.singleShot(0, self._flush_truck_correction)
+
+    def _kick_auto_fill_item(self, row: int, description: str) -> None:
+        if self._bulk_mutating or not description.strip():
+            return
+        asyncio.ensure_future(self._auto_fill_item_from_mapping(row, description))
+
+    def _load_staged_import_rows(self, payloads: list) -> None:
+        if not payloads:
+            return
+        self._bulk_mutating = True
+        start = self._first_empty_editable_row()
+        prev = self._table.blockSignals(True)
+        truck_cells: list = []
+        loaded_rows: set = set()
+        try:
+            for r, data in enumerate(payloads):
+                target = start + r
+                if target >= self._table.rowCount():
+                    self._append_editable_rows(max(20, len(payloads) - r + 5))
+                if target < self._saved_count:
+                    continue
+                loaded_rows.add(target)
+                self._pending_row_meta[target] = {
+                    "daily_import_id": data.get("daily_import_id"),
+                    "daily_import_source": data.get("daily_import_source"),
+                    "date_discrepancy": data.get("date_discrepancy"),
+                    "import_primary_date": data.get("import_primary_date"),
+                    "category_id": data.get("category_id"),
+                    "currency": data.get("currency") or "TZS",
+                    "lpo_do": data.get("lpo_do") or "",
+                    "do_number": data.get("do_number") or "",
+                }
+
+                dt = data.get("date")
+                date_str = dt.strftime("%d/%m/%Y") if dt else ""
+                self._table.setItem(target, COL_DATE, QTableWidgetItem(date_str))
+
+                item_name = data.get("item") or data.get("category_name") or ""
+                if item_name:
+                    self._table.setItem(
+                        target, COL_ITEM, QTableWidgetItem(_upper_text(COL_ITEM, item_name))
+                    )
+
+                desc = data.get("description") or ""
+                self._table.setItem(
+                    target, COL_DESC, QTableWidgetItem(_upper_text(COL_DESC, desc))
+                )
+
+                truck = data.get("truck_number") or ""
+                if truck:
+                    self._table.setItem(target, COL_TRUCK, QTableWidgetItem(truck.upper()))
+                    truck_cells.append((target, truck))
+
+                memo = data.get("memo") or ""
+                if memo:
+                    self._table.setItem(
+                        target, COL_MEMO, QTableWidgetItem(_upper_text(COL_MEMO, memo))
+                    )
+
+                ref = data.get("ref_float") or ""
+                if ref:
+                    self._table.setItem(target, COL_REF, QTableWidgetItem(ref))
+
+                amount = float(data.get("amount") or 0)
+                tzs_it = QTableWidgetItem(f"{amount:,.2f}" if amount else "")
+                tzs_it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if amount < 0:
+                    tzs_it.setForeground(NEG_COLOR)
+                self._table.setItem(target, COL_TZS, tzs_it)
+
+                rcpt = data.get("receipt_status") or "pending"
+                rcpt_it = QTableWidgetItem(
+                    rcpt if rcpt in _VALID_RCPT else _norm_receipt_text(str(rcpt))
+                )
+                rcpt_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                self._table.setItem(target, COL_RECEIPT, rcpt_it)
+
+                own = data.get("ownership") or ""
+                if own:
+                    self._table.setItem(
+                        target, COL_OWN, QTableWidgetItem(_upper_text(COL_OWN, own))
+                    )
+                apr = data.get("approver") or ""
+                if apr:
+                    self._table.setItem(
+                        target, COL_APR, QTableWidgetItem(_upper_text(COL_APR, apr))
+                    )
+
+            for row in loaded_rows:
+                self._sync_row_date(row)
+        finally:
+            self._table.blockSignals(prev)
+            self._bulk_mutating = False
+        self._renumber()
+        self._finalize_truck_cells(truck_cells)
+        self._update_footer()
 
     def _load_rows(self, file_rows: List[List]) -> None:
+        """Legacy positional loader kept for CSV paste-compat helpers."""
         if not file_rows:
             return
         data = file_rows[1:] if _is_header(file_rows[0]) else file_rows
 
         FILE_MAP = {
-            COL_DATE:    1,
-            COL_DESC:    3,
-            COL_TRUCK:   4,
-            COL_MEMO:    9,
-            COL_NOTES:   10,
-            COL_TZS:     11,
-            COL_RECEIPT: 13,
-            COL_OWN:     14,
-            COL_APR:     15,
+            COL_DATE:     1,
+            COL_DESC:     3,
+            COL_TRUCK:    4,
+            COL_MEMO:     9,
+            COL_REF:      10,
+            COL_TZS:      11,
+            COL_RECEIPT:  13,
+            COL_OWN:      14,
+            COL_APR:      15,
         }
 
         start = self._first_empty_editable_row()
         self._table.blockSignals(True)
         loaded_rows: set = set()
+        truck_cells: list = []
         for r, row_data in enumerate(data):
             target = start + r
             if target >= self._table.rowCount():
@@ -2022,17 +2451,23 @@ class DailyRegister(QWidget):
                     continue
                 raw = str(row_data[file_col]).strip() if row_data[file_col] is not None else ""
 
-                if grid_col in CHECK_COLS:
-                    it = self._table.item(target, grid_col) or QTableWidgetItem()
-                    it.setData(Qt.UserRole, bool(raw) and raw != "None")
-                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                    self._table.setItem(target, grid_col, it)
-                elif grid_col == COL_RECEIPT:
-                    norm = _RCPT_NORM.get(raw.lower(), "pending")
+                if grid_col == COL_RECEIPT:
+                    norm = _norm_receipt_text(raw)
                     it = self._table.item(target, grid_col) or QTableWidgetItem()
                     it.setText(norm)
                     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                     self._table.setItem(target, grid_col, it)
+                elif grid_col == COL_REF:
+                    low = raw.lower()
+                    if low in ("1", "true", "yes", "refund to float") or (
+                        "refund" in low and "float" in low
+                    ):
+                        text = "REFUND TO FLOAT"
+                    elif raw and raw != "None":
+                        text = raw
+                    else:
+                        text = ""
+                    self._table.setItem(target, grid_col, QTableWidgetItem(text))
                 elif grid_col == COL_DATE:
                     try:
                         from datetime import datetime as _dt
@@ -2043,14 +2478,29 @@ class DailyRegister(QWidget):
                     except Exception:
                         formatted = raw
                     self._table.setItem(target, grid_col, QTableWidgetItem(formatted))
+                elif grid_col == COL_TZS:
+                    amt = _parse_amount_text(raw if raw != "None" else "")
+                    if raw and raw != "None":
+                        it = QTableWidgetItem(f"{amt:,.2f}")
+                        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                        if amt < 0:
+                            it.setForeground(NEG_COLOR)
+                        self._table.setItem(target, grid_col, it)
+                elif grid_col == COL_TRUCK:
+                    if raw and raw != "None":
+                        self._table.setItem(target, grid_col, QTableWidgetItem(raw.upper()))
+                        truck_cells.append((target, raw))
                 else:
                     if raw and raw != "None":
-                        self._table.setItem(target, grid_col, QTableWidgetItem(_upper_text(grid_col, raw)))
+                        self._table.setItem(
+                            target, grid_col, QTableWidgetItem(_upper_text(grid_col, raw))
+                        )
 
         for row in loaded_rows:
             self._sync_row_date(row)
         self._table.blockSignals(False)
         self._renumber()
+        self._finalize_truck_cells(truck_cells)
 
     def _first_empty_editable_row(self) -> int:
         last = self._saved_count - 1
@@ -2184,10 +2634,6 @@ class DailyRegister(QWidget):
                 it = self._table.item(_row, col)
                 return it.text().strip() if it else ""
 
-            def checked(col: int, _row: int = row) -> bool:
-                it = self._table.item(_row, col)
-                return it.data(Qt.UserRole) is True if it else False
-
             description = txt(COL_DESC)
             if not description:
                 continue
@@ -2203,16 +2649,18 @@ class DailyRegister(QWidget):
                         self._current_date.day,
                     )
 
-                def parse_num(s: str) -> float:
-                    return float(s.replace(",", "")) if s else 0.0
+                amount = _parse_amount_text(txt(COL_TZS))
 
-                amount = parse_num(txt(COL_TZS))
-
-                rcpt_raw = txt(COL_RECEIPT).lower()
-                rcpt_status = rcpt_raw if rcpt_raw in _VALID_RCPT else "pending"
+                rcpt_status = _norm_receipt_text(txt(COL_RECEIPT))
+                if rcpt_status not in _VALID_RCPT:
+                    rcpt_status = "pending"
 
                 item_name = txt(COL_ITEM)
-                if not item_name and not self._defer_item_to_verify:
+                meta_pre = self._pending_row_meta.get(row) or {}
+                allow_blank_item = self._defer_item_to_verify or bool(
+                    meta_pre.get("daily_import_id")
+                )
+                if not item_name and not allow_blank_item:
                     errors.append(f"Row {row + 1}: Item is required.")
                     continue
 
@@ -2237,13 +2685,39 @@ class DailyRegister(QWidget):
                             continue
                         description = match  # canonical casing
 
-                truck_number = txt(COL_TRUCK).upper()
-                if (truck_number and self._restrict_trucks
-                        and truck_number not in self._fleet_numbers):
-                    errors.append(
-                        f'Row {row + 1}: "{truck_number}" is not a registered truck/trailer.'
-                    )
-                    continue
+                truck_raw = txt(COL_TRUCK)
+                truck_number = ""
+                if truck_raw:
+                    if is_allowed_place_label(truck_raw, self._allowed_truck_labels):
+                        truck_number = normalize_place_label(truck_raw)
+                    else:
+                        matched = try_match_fleet(truck_raw, self._fleet_numbers)
+                        if matched is None:
+                            norm = normalize_truck_number(
+                                truck_raw, allowed_labels=self._allowed_truck_labels
+                            )
+                            label = norm.value if norm.status != "empty" else truck_raw
+                            if norm.status == "invalid":
+                                errors.append(
+                                    f'Row {row + 1}: "{label}" is not a valid truck number '
+                                    f"(expected T + number + space + suffix, e.g. T688 EAF)."
+                                )
+                                continue
+                            if norm.status == "place_label":
+                                truck_number = norm.value
+                            else:
+                                errors.append(
+                                    f'Row {row + 1}: "{norm.value}" is not a registered truck/trailer.'
+                                )
+                                continue
+                        else:
+                            truck_number = matched
+                    # Snap cell to canonical registry / label form
+                    it_truck = self._table.item(row, COL_TRUCK)
+                    if it_truck and it_truck.text() != truck_number:
+                        self._table.blockSignals(True)
+                        it_truck.setText(truck_number)
+                        self._table.blockSignals(False)
 
                 # ── Duplicate check ──────────────────────────────────────
                 is_dup = False
@@ -2288,26 +2762,40 @@ class DailyRegister(QWidget):
                     else:
                         is_dup = True   # "Save Anyway" — mark as duplicate
 
+                ref_text = txt(COL_REF)
+                meta = self._pending_row_meta.get(row) or {}
                 tx = Transaction(
                     date=tx_date,
+                    reported_date=_parse_optional_date(txt(COL_REPORTED)),
                     description=description,
                     item=item_name,
                     # The chosen item *is* the category — keep them in sync so the
                     # item's sidebar tab (which filters on category_name) shows it.
                     category_name=item_name or None,
+                    category_id=meta.get("category_id"),
                     truck_number=truck_number,
                     amount=amount,
-                    currency="TZS",
+                    currency=meta.get("currency") or "TZS",
                     memo=txt(COL_MEMO),
                     receipt_status=rcpt_status,
-                    notes_flag=checked(COL_NOTES),
+                    ref_float=ref_text,
+                    notes_flag=_is_refund_float(ref_text),
                     ownership=txt(COL_OWN),
                     approver=txt(COL_APR),
+                    payee=txt(COL_PAYEE),
+                    cheque=txt(COL_CHEQUE),
                     cashier_id=self._user._id,
                     possible_duplicate=is_dup,
+                    daily_import_id=meta.get("daily_import_id"),
+                    daily_import_source=meta.get("daily_import_source"),
+                    date_discrepancy=bool(meta.get("date_discrepancy")),
+                    import_primary_date=meta.get("import_primary_date"),
+                    lpo_do=meta.get("lpo_do") or "",
+                    do_number=meta.get("do_number") or "",
                 )
                 await save_transaction(tx)
                 saved += 1
+                self._pending_row_meta.pop(row, None)
             except Exception as exc:
                 errors.append(f"Row {row + 1}: {exc}")
 
@@ -2361,9 +2849,13 @@ class DailyRegister(QWidget):
         except Exception:
             self._defer_item_to_verify = False
         try:
-            self._restrict_trucks = bool(await get_setting("restrict_trucks"))
+            self._restrict_trucks = True
+            # Persist intended default so accountant UI / other clients stay in sync.
+            current = await get_setting("restrict_trucks")
+            if current is not True:
+                await set_setting("restrict_trucks", True)
         except Exception:
-            self._restrict_trucks = False
+            self._restrict_trucks = True
 
     async def _auto_fill_item_from_mapping(self, row: int, description: str) -> None:
         """When description-only mode is on, pre-fill Item from saved mappings."""
@@ -2378,20 +2870,40 @@ class DailyRegister(QWidget):
         if not resolved:
             return
         _, cat_name = resolved
-        self._table.blockSignals(True)
+        prev = self._table.blockSignals(True)
         if item_it is None:
             item_it = QTableWidgetItem(cat_name)
             item_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
             self._table.setItem(row, COL_ITEM, item_it)
         else:
             item_it.setText(cat_name)
-        self._table.blockSignals(False)
+        self._table.blockSignals(prev)
 
     async def _load_fleet_numbers(self) -> None:
         try:
             self._fleet_numbers = await get_fleet_numbers()
         except Exception:
             self._fleet_numbers = set()
+        try:
+            raw = await get_setting("allowed_truck_labels")
+            if isinstance(raw, list) and raw:
+                self._allowed_truck_labels = merge_allowed_labels(raw, DEFAULT_PLACE_LABELS)
+            else:
+                self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
+        except Exception:
+            self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
+
+    async def _remember_truck_labels(self, labels: list) -> None:
+        if not labels:
+            return
+        try:
+            merged = merge_allowed_labels(
+                self._allowed_truck_labels, labels, DEFAULT_PLACE_LABELS
+            )
+            self._allowed_truck_labels = merged
+            await set_setting("allowed_truck_labels", sorted(merged))
+        except Exception:
+            pass
 
     async def _load_locked_subitems(self) -> None:
         """Cache the allowed sub-item names for every lock-description item."""
@@ -2465,36 +2977,211 @@ class DailyRegister(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to add item:\n{exc}")
 
     # ------------------------------------------------------------------
-    # Truck-column validation (restrict to truck/trailer registry)
+    # Truck-column validation (format + restrict to truck/trailer registry)
     # ------------------------------------------------------------------
 
+    def _can_add_fleet(self) -> bool:
+        return getattr(self._user, "role", "") in ("admin", "accountant")
+
+    def _set_truck_cell(self, row: int, value: str) -> None:
+        it = self._table.item(row, COL_TRUCK)
+        prev = self._table.blockSignals(True)
+        if it is None:
+            it = QTableWidgetItem(value)
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            self._table.setItem(row, COL_TRUCK, it)
+        else:
+            it.setText(value)
+        self._table.blockSignals(prev)
+
+    def _resolve_truck_text(self, raw: str) -> tuple[str, Optional[str]]:
+        """
+        Return (status, value) where status is:
+          'empty' | 'ok' | 'invalid_format' | 'not_in_registry'
+        and value is the canonical / display string.
+        """
+        norm = normalize_truck_number(raw, allowed_labels=self._allowed_truck_labels)
+        if norm.status == "empty":
+            return "empty", ""
+        if norm.status == "place_label":
+            return "ok", norm.value
+        if norm.status == "invalid":
+            return "invalid_format", norm.value or raw.strip().upper()
+        matched = try_match_fleet(norm.value, self._fleet_numbers)
+        if matched is None:
+            return "not_in_registry", norm.value
+        return "ok", matched
+
+    def _finalize_truck_cells(self, cells: list) -> None:
+        """Normalize / validate truck cells; queue one combined correction dialog.
+
+        ``cells`` is a list of (row, raw_text) for truck values just written.
+        """
+        if not cells:
+            return
+
+        for row, raw in cells:
+            status, value = self._resolve_truck_text(raw)
+            if status == "empty":
+                self._set_truck_cell(row, "")
+                self._pending_truck_issues.pop(row, None)
+            elif status == "ok":
+                self._set_truck_cell(row, value)
+                self._pending_truck_issues.pop(row, None)
+            elif status == "invalid_format":
+                self._set_truck_cell(row, value)
+                self._pending_truck_issues[row] = TruckIssue(
+                    row=row, original=raw, kind="invalid_format"
+                )
+            else:
+                self._set_truck_cell(row, value)
+                self._pending_truck_issues[row] = TruckIssue(
+                    row=row, original=raw, kind="not_in_registry"
+                )
+
+        self._schedule_truck_correction()
+
+    def _schedule_truck_correction(self) -> None:
+        """Debounce so paste/import opens one combined dialog, not one per truck."""
+        if not self._pending_truck_issues:
+            return
+        if self._suppress_truck_dialog:
+            # Issues stay queued; caller flushes after the enclosing async work.
+            return
+        # If a dialog is already open, push new issues into it immediately.
+        dlg = self._open_truck_dialog
+        if dlg is not None and getattr(dlg, "isVisible", lambda: False)():
+            batch = list(self._pending_truck_issues.values())
+            self._pending_truck_issues.clear()
+            try:
+                dlg.add_issues(batch)
+            except Exception:
+                for issue in batch:
+                    self._pending_truck_issues[issue.row] = issue
+            return
+        if self._truck_dialog_scheduled:
+            return
+        self._truck_dialog_scheduled = True
+        QTimer.singleShot(0, self._flush_truck_correction)
+
+    def _flush_truck_correction(self) -> None:
+        self._truck_dialog_scheduled = False
+        if not self._pending_truck_issues:
+            return
+        batch = list(self._pending_truck_issues.values())
+        self._pending_truck_issues.clear()
+        self._show_truck_correction(batch)
+
+    def _show_truck_correction(self, issues: list) -> None:
+        # Drop issues whose cell was cleared/changed already
+        live: list[TruckIssue] = []
+        for issue in issues:
+            it = self._table.item(issue.row, COL_TRUCK)
+            current = (it.text().strip() if it else "")
+            if not current:
+                continue
+            status, value = self._resolve_truck_text(current)
+            if status == "ok":
+                self._set_truck_cell(issue.row, value)
+                continue
+            issue.kind = "invalid_format" if status == "invalid_format" else "not_in_registry"
+            issue.original = current
+            live.append(issue)
+        if not live:
+            return
+
+        # Merge with any dialog already open (should be rare after schedule coalesce)
+        dlg = self._open_truck_dialog
+        if dlg is not None and getattr(dlg, "isVisible", lambda: False)():
+            dlg.add_issues(live)
+            return
+
+        dlg = TruckCorrectionDialog(
+            live,
+            self._fleet_numbers,
+            can_add=self._can_add_fleet(),
+            allowed_labels=self._allowed_truck_labels,
+            on_resolved=self._on_truck_issue_resolved_live,
+            parent=self,
+        )
+        self._open_truck_dialog = dlg
+        result = dlg.exec()
+        self._open_truck_dialog = None
+
+        pending_adds = list(getattr(dlg, "pending_registry_adds", None) or [])
+        if pending_adds:
+            asyncio.ensure_future(self._persist_truck_registry_adds(pending_adds))
+        # Live callback already wrote resolved rows to the grid. On cancel,
+        # remaining unresolved issues still need clearing.
+        if getattr(dlg, "new_labels", None):
+            asyncio.ensure_future(self._remember_truck_labels(dlg.new_labels))
+        asyncio.ensure_future(self._load_fleet_numbers())
+        if result != QDialog.Accepted:
+            resolved_rows = {i.row for i in dlg.issues}
+            for issue in live:
+                if issue.row not in resolved_rows:
+                    self._set_truck_cell(issue.row, "")
+
+    async def _persist_truck_registry_adds(self, adds: list) -> None:
+        from tahmeed.services.truck_service import add_trailer, add_truck
+
+        for kind, number in adds:
+            try:
+                if kind == "trucks":
+                    await add_truck(number)
+                else:
+                    await add_trailer(number)
+                self._fleet_numbers.add(number)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Error", f"Failed to add {number} to registry:\n{exc}"
+                )
+        await self._load_fleet_numbers()
+
+    def _on_truck_issue_resolved_live(self, issue: TruckIssue) -> None:
+        """Apply one resolved truck to the grid as soon as it leaves the dialog list."""
+        if issue.skip or not issue.corrected:
+            self._set_truck_cell(issue.row, "")
+            return
+        if getattr(issue, "is_place_label", False):
+            self._allowed_truck_labels.add(normalize_place_label(issue.corrected))
+        else:
+            self._fleet_numbers.add(issue.corrected)
+        self._set_truck_cell(issue.row, issue.corrected)
+
     def _validate_truck_cell(self, row: int, item: QTableWidgetItem) -> None:
-        if not self._restrict_trucks:
+        raw = item.text().strip()
+        if not raw:
             return
-        number = item.text().strip().upper()
-        if not number:
+        status, value = self._resolve_truck_text(raw)
+        if status == "ok":
+            if item.text() != value:
+                prev = self._table.blockSignals(True)
+                item.setText(value)
+                self._table.blockSignals(prev)
+            self._pending_truck_issues.pop(row, None)
             return
-        if number in self._fleet_numbers:
-            if item.text() != number:
-                self._table.blockSignals(True)
-                item.setText(number)
-                self._table.blockSignals(False)
+        if status == "empty":
             return
-        QTimer.singleShot(0, lambda: self._reject_truck(row, number))
+        kind = "invalid_format" if status == "invalid_format" else "not_in_registry"
+        if item.text() != value:
+            prev = self._table.blockSignals(True)
+            item.setText(value)
+            self._table.blockSignals(prev)
+        self._pending_truck_issues[row] = TruckIssue(
+            row=row, original=value or raw, kind=kind
+        )
+        self._schedule_truck_correction()
 
     def _reject_truck(self, row: int, number: str) -> None:
+        # Kept for compatibility; correction dialog handles messaging.
         it = self._table.item(row, COL_TRUCK)
-        if it is None or it.text().strip().upper() != number:
+        if it is None or it.text().strip().upper() != number.upper():
             return
-        QMessageBox.information(
-            self, "Not in registry",
-            f'"{number}" is not in the truck or trailer registry.\n\n'
-            "Only registered trucks/trailers can be entered. Ask the accountant "
-            "to add it under Manage → Trucks / Trailers.",
+        self._pending_truck_issues[row] = TruckIssue(
+            row=row, original=number, kind="not_in_registry"
         )
-        self._table.blockSignals(True)
-        it.setText("")
-        self._table.blockSignals(False)
+        self._schedule_truck_correction()
 
     # ------------------------------------------------------------------
     # Description-lock validation

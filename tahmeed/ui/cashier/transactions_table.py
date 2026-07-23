@@ -111,8 +111,17 @@ _A_COL_APR       = 9
 
 _MODE_SIMPLE   = 0
 _MODE_ADVANCED = 1
+_MODE_UPLOADS  = 2
 
 _ONE_MONTH_AGO = date.today() - timedelta(days=30)
+
+_U_COL_FILE    = 0
+_U_COL_DATE    = 1
+_U_COL_COUNT   = 2
+_U_COL_CASHIER = 3
+_U_COL_ISSUES  = 4
+_U_COL_WHEN    = 5
+_U_COL_ACT     = 6
 
 
 # ── Main dialog ───────────────────────────────────────────────────────────────
@@ -131,6 +140,7 @@ class TransactionBrowser(QDialog):
         self.setStyleSheet("QDialog { background: #ffffff; }")
         self._results_simple: List[dict] = []
         self._results_advanced: List[Transaction] = []
+        self._results_uploads: list = []
         self._cats_loaded = False
         self._months_loaded = False
         self._current_mode = _MODE_SIMPLE
@@ -156,7 +166,7 @@ class TransactionBrowser(QDialog):
         t = QLabel("Transaction Browser")
         t.setStyleSheet("color:#ffffff;font-size:14px;font-weight:700;")
         hl.addWidget(t)
-        s = QLabel("Daily summary (Simple) · Individual rows (Advanced)")
+        s = QLabel("Daily summary · Individual rows · Excel uploads")
         s.setStyleSheet("color:#a8a29e;font-size:11px;margin-left:12px;")
         hl.addWidget(s)
         hl.addStretch()
@@ -177,7 +187,9 @@ class TransactionBrowser(QDialog):
         mode_row = QHBoxLayout()
         mode_row.setSpacing(0)
         self._mode_btns: List[QPushButton] = []
-        for i, (txt, pos) in enumerate(zip(["Simple", "Advanced"], ["left", "right"])):
+        for i, (txt, pos) in enumerate(
+            zip(["Simple", "Advanced", "Uploads"], ["left", "mid", "right"])
+        ):
             btn = QPushButton(txt)
             btn.setCheckable(True)
             btn.setAutoDefault(False)  # prevent Enter key from triggering mode switch
@@ -194,6 +206,7 @@ class TransactionBrowser(QDialog):
         self._filter_stack = QStackedWidget()
         self._filter_stack.addWidget(self._build_simple_panel())
         self._filter_stack.addWidget(self._build_advanced_panel())
+        self._filter_stack.addWidget(self._build_uploads_panel())
         self._filter_stack.setCurrentIndex(_MODE_SIMPLE)
         self._filter_stack.setFixedHeight(52)
         vl.addWidget(self._filter_stack)
@@ -283,6 +296,25 @@ class TransactionBrowser(QDialog):
         hl.addLayout(_btn_col(a_find, a_reset))
         return w
 
+    def _build_uploads_panel(self) -> QWidget:
+        w = QWidget()
+        w.setStyleSheet("background:transparent;")
+        hl = QHBoxLayout(w)
+        hl.setContentsMargins(0, 4, 0, 4)
+        hl.setSpacing(8)
+        tip = QLabel("Excel daily imports from all cashiers — delete a wrong upload here.")
+        tip.setStyleSheet("color:#6b7280;font-size:12px;")
+        hl.addWidget(tip)
+        hl.addStretch()
+        refresh = QPushButton("Refresh")
+        refresh.setFixedSize(80, 28)
+        refresh.setAutoDefault(False)
+        refresh.setStyleSheet(_PRIMARY_BTN)
+        refresh.clicked.connect(self._do_find)
+        self._find_btns.append(refresh)
+        hl.addWidget(refresh)
+        return w
+
     def _make_find_reset(self):
         find = QPushButton("Find")
         find.setFixedSize(66, 28)
@@ -302,14 +334,44 @@ class TransactionBrowser(QDialog):
         self._table_stack = QStackedWidget()
         self._simple_table  = self._build_simple_table()
         self._adv_table     = self._build_adv_table()
+        self._uploads_table = self._build_uploads_table()
         self._table_stack.addWidget(self._simple_table)
         self._table_stack.addWidget(self._adv_table)
+        self._table_stack.addWidget(self._uploads_table)
         return self._table_stack
+
+    def _build_uploads_table(self) -> QTableWidget:
+        t = QTableWidget()
+        t.setColumnCount(7)
+        t.setHorizontalHeaderLabels([
+            "Filename", "Primary Date", "Rows", "Cashier",
+            "Issues", "Imported", "",
+        ])
+        t.setStyleSheet(_TABLE_SS)
+        t.setAlternatingRowColors(True)
+        hh = t.horizontalHeader()
+        for i in range(7):
+            hh.setSectionResizeMode(i, QHeaderView.Interactive)
+        hh.setStretchLastSection(False)
+        hh.setSectionResizeMode(_U_COL_FILE, QHeaderView.Stretch)
+        t.setColumnWidth(_U_COL_DATE, 110)
+        t.setColumnWidth(_U_COL_COUNT, 60)
+        t.setColumnWidth(_U_COL_CASHIER, 120)
+        t.setColumnWidth(_U_COL_ISSUES, 90)
+        t.setColumnWidth(_U_COL_WHEN, 140)
+        t.setColumnWidth(_U_COL_ACT, 110)
+        t.verticalHeader().setVisible(False)
+        t.setSelectionBehavior(QAbstractItemView.SelectRows)
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.verticalHeader().setDefaultSectionSize(32)
+        t.itemSelectionChanged.connect(self._on_selection_changed)
+        return t
 
     def _build_simple_table(self) -> QTableWidget:
         t = QTableWidget()
         t.setColumnCount(5)
         t.setHorizontalHeaderLabels(
+# Simple mode headers
             ["Date", "Transaction ID", "Entries", "Refund to Float", "Total Amount"]
         )
         t.setStyleSheet(_TABLE_SS)
@@ -408,18 +470,23 @@ class TransactionBrowser(QDialog):
         self._table_stack.setCurrentIndex(mode)
         for i, btn in enumerate(self._mode_btns):
             btn.setChecked(i == mode)
-        if not self._months_loaded:
+        if not self._months_loaded and mode != _MODE_UPLOADS:
             asyncio.ensure_future(self._load_months())
         if mode == _MODE_ADVANCED:
             if not self._cats_loaded:
                 asyncio.ensure_future(self._load_categories())
             self._do_find()
+        elif mode == _MODE_UPLOADS:
+            self._do_find()
         # update count label phrasing
-        self._count_label.setText(
-            "Days shown: —" if mode == _MODE_SIMPLE else "Transactions: —"
-        )
+        if mode == _MODE_SIMPLE:
+            self._count_label.setText("Days shown: —")
+        elif mode == _MODE_UPLOADS:
+            self._count_label.setText("Uploads: —")
+        else:
+            self._count_label.setText("Transactions: —")
         self._goto_btn.setEnabled(False)
-        self._export_btn.setEnabled(False)
+        self._export_btn.setEnabled(mode != _MODE_UPLOADS and False)
 
     # ── Async loaders ─────────────────────────────────────────────────────────
 
@@ -505,6 +572,9 @@ class TransactionBrowser(QDialog):
 
     async def _async_find(self) -> None:
         try:
+            if self._current_mode == _MODE_UPLOADS:
+                await self._load_uploads()
+                return
             params = self._get_search_params()
             if self._current_mode == _MODE_SIMPLE:
                 self._results_simple = await get_daily_summaries(**params)
@@ -518,6 +588,95 @@ class TransactionBrowser(QDialog):
         finally:
             for btn in self._find_btns:
                 btn.setEnabled(True)
+
+    async def _load_uploads(self) -> None:
+        from tahmeed.services.daily_import_service import list_daily_uploads
+        from tahmeed.services.accountant_service import get_cashier_names
+
+        uploads = await list_daily_uploads(limit=200)
+        self._results_uploads = uploads
+        cashier_ids = [u.get("cashier_id") for u in uploads if u.get("cashier_id")]
+        names = await get_cashier_names(cashier_ids) if cashier_ids else {}
+        self._populate_uploads(uploads, names)
+
+    def _populate_uploads(self, uploads: list, names: dict) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        t = self._uploads_table
+        t.setRowCount(len(uploads))
+        for i, u in enumerate(uploads):
+            upload_id = str(u.get("_id") or "")
+            fname = u.get("source_filename") or "—"
+            t.setItem(i, _U_COL_FILE, _ro(fname))
+
+            primary = u.get("primary_date") or u.get("min_date")
+            if hasattr(primary, "strftime"):
+                date_str = primary.strftime("%d/%m/%Y")
+            else:
+                date_str = "—"
+            t.setItem(i, _U_COL_DATE, _ro(date_str))
+
+            count = int(u.get("count") or 0)
+            t.setItem(i, _U_COL_COUNT, _ro(str(count), Qt.AlignCenter))
+
+            cid = u.get("cashier_id")
+            t.setItem(i, _U_COL_CASHIER, _ro(names.get(cid, "—") if cid else "—"))
+
+            outliers = int(u.get("outlier_count") or 0)
+            dupes = int(u.get("duplicate_count") or 0)
+            issue_bits = []
+            if outliers:
+                issue_bits.append(f"{outliers} date")
+            if dupes:
+                issue_bits.append(f"{dupes} dup")
+            t.setItem(i, _U_COL_ISSUES, _ro(", ".join(issue_bits) if issue_bits else "—"))
+
+            created = u.get("created_at")
+            when = created.strftime("%d/%m/%Y %H:%M") if hasattr(created, "strftime") else "—"
+            t.setItem(i, _U_COL_WHEN, _ro(when))
+
+            btn = QPushButton("Delete")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(
+                "QPushButton{background:#fff;color:#b91c1c;border:1px solid #fecaca;"
+                "border-radius:4px;padding:2px 10px;font-size:11px;font-weight:600;}"
+                "QPushButton:hover{background:#fef2f2;}"
+            )
+            btn.clicked.connect(
+                lambda _c=False, uid=upload_id, fn=fname, n=count: self._confirm_delete_upload(uid, fn, n)
+            )
+            t.setCellWidget(i, _U_COL_ACT, btn)
+
+        self._count_label.setText(f"Uploads: {len(uploads)}")
+        self._goto_btn.setEnabled(False)
+        self._export_btn.setEnabled(False)
+
+    def _confirm_delete_upload(self, upload_id: str, filename: str, count: int) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        if not upload_id:
+            return
+        resp = QMessageBox.warning(
+            self,
+            "Delete Upload",
+            f'Delete upload "{filename}" and all {count:,} saved transaction(s)?\n\n'
+            "This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if resp == QMessageBox.Yes:
+            asyncio.ensure_future(self._delete_upload(upload_id))
+
+    async def _delete_upload(self, upload_id: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        from tahmeed.services.daily_import_service import delete_daily_upload
+        try:
+            deleted = await delete_daily_upload(upload_id)
+            QMessageBox.information(
+                self, "Upload Deleted", f"Removed {deleted:,} transaction(s)."
+            )
+            await self._load_uploads()
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete Failed", str(exc))
 
     # ── Populate ──────────────────────────────────────────────────────────────
 
@@ -564,7 +723,7 @@ class TransactionBrowser(QDialog):
             t.setItem(i, _A_COL_MEMO, _ro(tx.memo or ""))
 
             if tx.notes_flag:
-                ref_it = _ro("Refund to Float", Qt.AlignCenter)
+                ref_it = _ro("REFUND TO FLOAT", Qt.AlignCenter)
                 ref_it.setForeground(QColor("#EA580C"))
                 ref_it.setFont(QFont("Segoe UI", 9, QFont.Bold))
                 t.setItem(i, _A_COL_REFUND, ref_it)
@@ -577,10 +736,21 @@ class TransactionBrowser(QDialog):
                 amt_it.setForeground(QColor("#dc2626"))
             t.setItem(i, _A_COL_TZS, amt_it)
 
-            status = tx.receipt_status or "pending"
-            rec_it = _ro(status.capitalize(), Qt.AlignCenter)
+            status = (tx.receipt_status or "pending").strip().lower()
+            _rcpt_lbl = {
+                "received": "RECEIPT",
+                "pending": "PENDING",
+                "missing": "MISSING",
+                "no_receipt": "NO RECEIPT",
+            }.get(status, status.upper() if status else "—")
+            rec_it = _ro(_rcpt_lbl, Qt.AlignCenter)
             rec_it.setForeground(QColor(
-                {"received": "#16a34a", "missing": "#dc2626", "pending": "#d97706"}.get(status, "#6b7280")
+                {
+                    "received": "#16a34a",
+                    "missing": "#dc2626",
+                    "pending": "#d97706",
+                    "no_receipt": "#6b7280",
+                }.get(status, "#6b7280")
             ))
             t.setItem(i, _A_COL_RECEIPT, rec_it)
             t.setItem(i, _A_COL_OWNERSHIP, _ro(tx.ownership or ""))
@@ -593,6 +763,9 @@ class TransactionBrowser(QDialog):
     # ── Reset ─────────────────────────────────────────────────────────────────
 
     def _reset_filters(self) -> None:
+        if self._current_mode == _MODE_UPLOADS:
+            self._do_find()
+            return
         if self._current_mode == _MODE_SIMPLE:
             self._kw_edit.clear()
             self._s_month.setCurrentIndex(0)
@@ -614,10 +787,15 @@ class TransactionBrowser(QDialog):
     # ── Selection / navigation ────────────────────────────────────────────────
 
     def _on_selection_changed(self) -> None:
+        if self._current_mode == _MODE_UPLOADS:
+            self._goto_btn.setEnabled(False)
+            return
         active = self._simple_table if self._current_mode == _MODE_SIMPLE else self._adv_table
         self._goto_btn.setEnabled(bool(active.selectedItems()))
 
     def _on_go_to(self) -> None:
+        if self._current_mode == _MODE_UPLOADS:
+            return
         if self._current_mode == _MODE_SIMPLE:
             row = self._simple_table.currentRow()
             if row < 0 or row >= len(self._results_simple):
@@ -665,7 +843,7 @@ class TransactionBrowser(QDialog):
                     tx.description or "",
                     tx.truck_number or "",
                     tx.memo or "",
-                    "Refund to Float" if tx.notes_flag else "",
+                    "REFUND TO FLOAT" if tx.notes_flag else "",
                     f"{tx.amount:.0f}" if tx.amount else "0",
                     (tx.receipt_status or "").capitalize(),
                     tx.ownership or "",

@@ -189,6 +189,7 @@ class _ActionBar(QFrame):
     edit_clicked   = Signal()
     save_clicked   = Signal()
     export_clicked = Signal()
+    import_clicked = Signal()
     today_clicked  = Signal()
     search_changed = Signal(str)
 
@@ -265,6 +266,10 @@ class _ActionBar(QFrame):
         self._export_btn.clicked.connect(self.export_clicked)
         hl.addWidget(self._export_btn)
 
+        self._import_btn = self._make_btn("Import", "mdi.tray-arrow-up", "secondary")
+        self._import_btn.clicked.connect(self.import_clicked)
+        hl.addWidget(self._import_btn)
+
         self._today_btn = self._make_btn("Today", "mdi.calendar-today", "secondary")
         self._today_btn.clicked.connect(self.today_clicked)
         hl.addWidget(self._today_btn)
@@ -328,6 +333,7 @@ class _TablePage(QWidget):
         self._action_bar.edit_clicked.connect(register.toggle_edit_mode)
         self._action_bar.save_clicked.connect(register.save_rows)
         self._action_bar.export_clicked.connect(register.export_xlsx)
+        self._action_bar.import_clicked.connect(register.import_from_file)
         self._action_bar.search_changed.connect(register.set_search)
         self._action_bar.today_clicked.connect(
             lambda: register.navigate_to_date(date.today())
@@ -467,6 +473,11 @@ class CashierDashboard(QWidget):
         self._overview.go_to_form.connect(lambda: self._on_nav("form"))
         self._overview.go_to_browse.connect(self._on_browse)
         self._overview.export_data.connect(self._on_browse)
+        self._overview.import_data.connect(self._on_import)
+
+    def _on_import(self) -> None:
+        self._on_nav("table")
+        asyncio.ensure_future(self._register._run_daily_import())
 
     async def prepare_to_leave(self) -> bool:
         """Prompt to save/discard unsaved table entries before logout or exit."""
@@ -558,5 +569,12 @@ class CashierDashboard(QWidget):
             self._register.update_categories(cats)
             self._form.update_categories(cats)
             self._overview.refresh()
+        except Exception:
+            pass
+        try:
+            from tahmeed.services.people_service import get_people_names
+            names = await get_people_names()
+            self._register.update_people(names)
+            self._form.update_people(names)
         except Exception:
             pass

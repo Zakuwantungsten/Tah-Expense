@@ -167,11 +167,23 @@ class _AddVehicleDialog(QDialog):
         vl.addLayout(btn_row)
 
     def _accept(self) -> None:
-        val = self._inp.text().strip().upper()
+        from tahmeed.services.truck_format import normalize_truck_number
+
+        val = self._inp.text().strip()
         if not val:
             QMessageBox.warning(self, "Validation", "Registration number is required.")
             return
-        self.result_number = val
+        result = normalize_truck_number(val)
+        if result.status == "invalid":
+            QMessageBox.warning(
+                self, "Validation",
+                f'"{val}" is not a valid registration number.\n\n'
+                "Use format T + number + space + suffix, e.g. T880 CUL.\n"
+                "Compact forms like T880CUL are auto-corrected.",
+            )
+            return
+        self.result_number = result.value
+        self._inp.setText(result.value)
         self.accept()
 
 
@@ -375,28 +387,35 @@ class _FleetRegistryBase(QWidget):
     # ── Restrict-in-cashier toggle ──────────────────────────────────────────────
 
     async def _load_restrict_setting(self) -> None:
-        from tahmeed.services.settings_service import get_setting
+        from tahmeed.services.settings_service import get_setting, set_setting
+        # Restriction is always on — keep DB setting aligned and lock the toggle.
         try:
             on = bool(await get_setting("restrict_trucks"))
+            if not on:
+                await set_setting("restrict_trucks", True)
         except Exception:
-            on = False
+            pass
         self._restrict_btn.blockSignals(True)
-        self._restrict_btn.setChecked(on)
-        self._restrict_btn.setText(
-            "  Restrict in cashier: On" if on else "  Restrict in cashier: Off"
+        self._restrict_btn.setChecked(True)
+        self._restrict_btn.setEnabled(False)
+        self._restrict_btn.setText("  Restrict in cashier: On (required)")
+        self._restrict_btn.setToolTip(
+            "Cashiers may only enter trucks/trailers that exist in this registry."
         )
         self._restrict_btn.blockSignals(False)
 
     def _on_restrict_toggled(self, on: bool) -> None:
-        self._restrict_btn.setText(
-            "  Restrict in cashier: On" if on else "  Restrict in cashier: Off"
-        )
-        asyncio.ensure_future(self._save_restrict_setting(on))
+        # Restriction is always required — ignore attempts to turn it off.
+        self._restrict_btn.blockSignals(True)
+        self._restrict_btn.setChecked(True)
+        self._restrict_btn.setText("  Restrict in cashier: On (required)")
+        self._restrict_btn.blockSignals(False)
+        asyncio.ensure_future(self._save_restrict_setting(True))
 
     async def _save_restrict_setting(self, on: bool) -> None:
         from tahmeed.services.settings_service import set_setting
         try:
-            await set_setting("restrict_trucks", on)
+            await set_setting("restrict_trucks", True)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
 

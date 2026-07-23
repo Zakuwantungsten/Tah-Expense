@@ -96,6 +96,8 @@ async def approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bool:
             "verified_by": accountant_id,
             "verified_at": datetime.utcnow(),
             "rejection_reason": None,
+            "possible_duplicate": False,
+            "date_discrepancy": False,
         }},
     )
     return result.modified_count == 1
@@ -535,7 +537,8 @@ async def return_to_inbox(tx_id: ObjectId) -> bool:
 _CASCADE_FIELDS = {
     "date", "description", "truck_number", "amount", "currency",
     "lpo_do", "do_number", "memo", "receipt_status", "notes_flag",
-    "ownership", "approver", "category_name", "category_id", "item",
+    "ref_float", "ownership", "approver", "payee", "cheque", "reported_date",
+    "category_name", "category_id", "item",
     "category_confidence", "month", "year",
 }
 

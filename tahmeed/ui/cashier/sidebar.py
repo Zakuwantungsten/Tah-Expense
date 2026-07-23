@@ -14,7 +14,7 @@ from typing import Optional, Dict, List
 import qtawesome as qta
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
-    QScrollArea, QToolButton, QSizePolicy,
+    QScrollArea, QToolButton, QSizePolicy, QSpacerItem,
 )
 from PySide6.QtCore import Qt, Signal, QSize
 
@@ -29,7 +29,7 @@ _WHITE      = "#F9FAFB"
 _MUTED      = "#94A3B8"
 
 EXPANDED_W  = 220
-COLLAPSED_W = 56
+COLLAPSED_W = 64
 
 # ── Nav sections ──────────────────────────────────────────────────────────────────
 #  ITEMS is loaded dynamically from the DB; the list here is intentionally empty.
@@ -78,16 +78,22 @@ class _NavItem(QWidget):
         self._paint(hover=False)
 
     def _build(self, label: str, expandable: bool) -> None:
+        self._label = label
         hl = QHBoxLayout(self)
         hl.setContentsMargins(0, 0, 8, 0)
         hl.setSpacing(0)
+
+        # Stretches activate only while collapsed (centers the icon in the rail).
+        self._left_stretch = QSpacerItem(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        hl.addSpacerItem(self._left_stretch)
 
         self._indicator = QFrame()
         self._indicator.setFixedWidth(3)
         self._indicator.setStyleSheet("background: transparent;")
         hl.addWidget(self._indicator)
 
-        hl.addSpacing(10)
+        self._gap1 = QSpacerItem(10, 1, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        hl.addSpacerItem(self._gap1)
 
         self._icon_lbl = QLabel()
         self._icon_lbl.setFixedSize(18, 18)
@@ -95,7 +101,8 @@ class _NavItem(QWidget):
         self._icon_lbl.setStyleSheet("background: transparent;")
         hl.addWidget(self._icon_lbl)
 
-        hl.addSpacing(10)
+        self._gap2 = QSpacerItem(10, 1, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        hl.addSpacerItem(self._gap2)
 
         self._text_lbl = QLabel(label)
         self._text_lbl.setStyleSheet(
@@ -115,6 +122,9 @@ class _NavItem(QWidget):
             self._chevron_lbl.setVisible(False)   # hidden until sub-items confirmed
             hl.addWidget(self._chevron_lbl)
 
+        self._right_stretch = QSpacerItem(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        hl.addSpacerItem(self._right_stretch)
+
         self._refresh_icon(active=False)
 
     def set_active(self, active: bool) -> None:
@@ -128,13 +138,43 @@ class _NavItem(QWidget):
             self._chevron_lbl.setVisible(has and not self._is_collapsed)
 
     def set_collapsed(self, collapsed: bool) -> None:
+        """Icon-rail mode: hide chrome/labels and center a single icon."""
         self._is_collapsed = collapsed
         self._text_lbl.setVisible(not collapsed)
-        px = 26 if collapsed else 18
-        self._icon_lbl.setFixedSize(px, px)
-        self._refresh_icon(active=self._active)
+        self._indicator.setVisible(not collapsed)
         if self._chevron_lbl:
             self._chevron_lbl.setVisible(self._has_subtables and not collapsed)
+
+        px = 22 if collapsed else 18
+        self._icon_lbl.setFixedSize(px, px)
+        self._refresh_icon(active=self._active)
+
+        lay = self.layout()
+        if collapsed:
+            # Force a narrow sizeHint so QScrollArea cannot keep a 220px min width.
+            self._text_lbl.setMaximumWidth(0)
+            self._text_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lay.setContentsMargins(0, 0, 0, 0)
+            self._gap1.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._gap2.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._left_stretch.changeSize(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum)
+            self._right_stretch.changeSize(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum)
+            self.setFixedWidth(COLLAPSED_W)
+            self.setToolTip(self._label)
+        else:
+            self._text_lbl.setMaximumWidth(16777215)
+            self._text_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            lay.setContentsMargins(0, 0, 8, 0)
+            self._gap1.changeSize(10, 1, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._gap2.changeSize(10, 1, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._left_stretch.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._right_stretch.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(16777215)
+            self.setToolTip("")
+        lay.invalidate()
+        lay.activate()
+        self.updateGeometry()
 
     def set_expanded(self, expanded: bool) -> None:
         self._expanded = expanded
@@ -144,7 +184,7 @@ class _NavItem(QWidget):
 
     def _refresh_icon(self, active: bool) -> None:
         color = _WHITE if active else _MUTED
-        px = 26 if self._is_collapsed else 18
+        px = 22 if self._is_collapsed else 18
         self._icon_lbl.setPixmap(_qta(self._icon_name, color=color).pixmap(px, px))
 
     def _paint(self, hover: bool) -> None:
@@ -322,6 +362,9 @@ class CashierSidebarWidget(QFrame):
         self._item_keys: set[str] = set()        # keys of dynamic ITEMS rows
         self._item_defs: Dict[str, tuple] = {}   # key -> (name, icon, sidebar_label)
         self._items_host_vl = None
+        self._items_empty_hint: Optional[QLabel] = None
+        self._scroll: Optional[QScrollArea] = None
+        self._nav_container: Optional[QWidget] = None
         self._build()
         self.select("overview")
         asyncio.ensure_future(self._load_items())
@@ -339,13 +382,14 @@ class CashierSidebarWidget(QFrame):
 
         # ── Scrollable nav ────────────────────────────────────────────────────
         scroll = QScrollArea()
+        self._scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet(f"""
             QScrollArea {{ background: {_NAVY}; border: none; }}
-            QWidget      {{ background: {_NAVY}; }}
+            QScrollArea > QWidget > QWidget {{ background: {_NAVY}; }}
             QScrollBar:vertical {{
                 background: {_NAVY}; width: 4px; margin: 0;
             }}
@@ -357,6 +401,8 @@ class CashierSidebarWidget(QFrame):
         """)
 
         container = QWidget()
+        self._nav_container = container
+        container.setStyleSheet(f"background: {_NAVY};")
         vl = QVBoxLayout(container)
         vl.setContentsMargins(0, 6, 0, 6)
         vl.setSpacing(0)
@@ -443,12 +489,29 @@ class CashierSidebarWidget(QFrame):
         self._collapsed = not self._collapsed
         w = COLLAPSED_W if self._collapsed else EXPANDED_W
         self.setFixedWidth(w)
+
+        # Keep scroll content locked to the rail width so icons are not clipped.
+        if self._nav_container is not None:
+            if self._collapsed:
+                self._nav_container.setFixedWidth(w)
+            else:
+                self._nav_container.setMinimumWidth(0)
+                self._nav_container.setMaximumWidth(16777215)
+        if self._scroll is not None:
+            if self._collapsed:
+                self._scroll.setFixedWidth(w)
+            else:
+                self._scroll.setMinimumWidth(0)
+                self._scroll.setMaximumWidth(16777215)
+
         for item in self._items.values():
             item.set_collapsed(self._collapsed)
         for lbl in self._section_labels:
             lbl.setVisible(not self._collapsed)
         for sep in self._separators:
             sep.setVisible(not self._collapsed)
+        if self._items_empty_hint is not None:
+            self._items_empty_hint.setVisible(not self._collapsed)
         # Hide sub-item strips while collapsed; restore expanded ones after.
         for key, child in self._child_containers.items():
             child.setVisible(not self._collapsed and key in self._expanded)
@@ -456,10 +519,26 @@ class CashierSidebarWidget(QFrame):
             self._collapse_btn.setText("")
             self._collapse_btn.setIcon(_qta("mdi.chevron-right", color=_MUTED))
             self._collapse_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            self._collapse_btn.setStyleSheet(f"""
+                QToolButton {{
+                    background: transparent; border: none;
+                    color: {_MUTED}; padding: 0;
+                }}
+                QToolButton:hover {{ background: {_ACTIVE_BG}; color: {_WHITE}; }}
+            """)
         else:
             self._collapse_btn.setText("  Collapse")
             self._collapse_btn.setIcon(_qta("mdi.chevron-left", color=_MUTED))
             self._collapse_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            self._collapse_btn.setStyleSheet(f"""
+                QToolButton {{
+                    background: transparent; border: none;
+                    color: {_MUTED}; font-size: 12px;
+                    font-family: 'Segoe UI', sans-serif;
+                    padding: 0 14px; text-align: left;
+                }}
+                QToolButton:hover {{ background: {_ACTIVE_BG}; color: {_WHITE}; }}
+            """)
 
     # ── Internal: top-level nav ────────────────────────────────────────────────
 
@@ -583,8 +662,12 @@ class CashierSidebarWidget(QFrame):
                 " font-family: 'Segoe UI', sans-serif; background: transparent;"
                 " padding: 4px 16px;"
             )
+            hint.setVisible(not self._collapsed)
+            self._items_empty_hint = hint
             self._items_host_vl.addWidget(hint)
             return
+
+        self._items_empty_hint = None
 
         for cat in cats:
             key = _ik(cat.name)

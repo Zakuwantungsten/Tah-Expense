@@ -89,6 +89,16 @@ class FleetWrite(StrictModel):
         return " ".join(value.upper().split())
 
 
+class PeopleWrite(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    active: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return " ".join(value.upper().split())
+
+
 class PatchDocument(StrictModel):
     values: dict[str, Any]
 

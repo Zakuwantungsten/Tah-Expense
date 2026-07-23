@@ -13,7 +13,7 @@ from typing import Optional, Dict, List
 import qtawesome as qta
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
-    QScrollArea, QToolButton, QSizePolicy,
+    QScrollArea, QToolButton, QSizePolicy, QSpacerItem,
     QMessageBox, QMenu,
 )
 from PySide6.QtCore import Qt, Signal, QSize
@@ -30,7 +30,7 @@ _MUTED      = "#94A3B8"
 _RED        = "#DC2626"
 
 EXPANDED_W  = 220
-COLLAPSED_W = 56
+COLLAPSED_W = 64
 
 # ── Nav data ──────────────────────────────────────────────────────────────────
 #  Each entry: (key, label, mdi_icon, options_dict)
@@ -71,6 +71,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     ]),
     ("MANAGE", [
         ("manage_categories", "Items",             "mdi.tag-multiple-outline", {}),
+        ("manage_people",     "People",           "mdi.account-outline", {}),
         ("manage_trucks",     "Trucks",           "mdi.truck",           {}),
         ("manage_trailers",   "Trailers",         "mdi.truck-trailer",   {}),
         ("manage_users",      "Users",            "mdi.account-multiple-outline", {}),
@@ -137,16 +138,21 @@ class _NavItem(QWidget):
     # ── Build ──────────────────────────────────────────────────────────────
 
     def _build(self, label: str, badge: bool, expandable: bool) -> None:
+        self._label = label
         hl = QHBoxLayout(self)
         hl.setContentsMargins(0, 0, 8, 0)
         hl.setSpacing(0)
+
+        self._left_stretch = QSpacerItem(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        hl.addSpacerItem(self._left_stretch)
 
         self._indicator = QFrame()
         self._indicator.setFixedWidth(3)
         self._indicator.setStyleSheet("background: transparent;")
         hl.addWidget(self._indicator)
 
-        hl.addSpacing(10)
+        self._gap1 = QSpacerItem(10, 1, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        hl.addSpacerItem(self._gap1)
 
         self._icon_lbl = QLabel()
         self._icon_lbl.setFixedSize(18, 18)
@@ -154,7 +160,8 @@ class _NavItem(QWidget):
         self._icon_lbl.setStyleSheet("background: transparent;")
         hl.addWidget(self._icon_lbl)
 
-        hl.addSpacing(10)
+        self._gap2 = QSpacerItem(10, 1, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        hl.addSpacerItem(self._gap2)
 
         self._text_lbl = QLabel(label)
         self._text_lbl.setStyleSheet(
@@ -177,7 +184,10 @@ class _NavItem(QWidget):
             )
             self._badge_lbl.setVisible(False)
             hl.addWidget(self._badge_lbl)
-            hl.addSpacing(4)
+            self._badge_gap = QSpacerItem(4, 1, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            hl.addSpacerItem(self._badge_gap)
+        else:
+            self._badge_gap = None
 
         self._chevron_lbl: Optional[QLabel] = None
         if expandable:
@@ -188,6 +198,9 @@ class _NavItem(QWidget):
             self._chevron_lbl.setPixmap(_qta("mdi.chevron-right", color=_MUTED).pixmap(14, 14))
             self._chevron_lbl.setVisible(False)   # hidden until sub-tables confirmed
             hl.addWidget(self._chevron_lbl)
+
+        self._right_stretch = QSpacerItem(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        hl.addSpacerItem(self._right_stretch)
 
         self._refresh_icon(active=False)
 
@@ -207,7 +220,8 @@ class _NavItem(QWidget):
     def set_collapsed(self, collapsed: bool) -> None:
         self._is_collapsed = collapsed
         self._text_lbl.setVisible(not collapsed)
-        px = 26 if collapsed else 18
+        self._indicator.setVisible(not collapsed)
+        px = 22 if collapsed else 18
         self._icon_lbl.setFixedSize(px, px)
         self._refresh_icon(active=self._active)
         if self._badge_lbl:
@@ -215,6 +229,36 @@ class _NavItem(QWidget):
         if self._chevron_lbl:
             # Only show when expanded AND this item actually has sub-tables
             self._chevron_lbl.setVisible(self._has_subtables and not collapsed)
+
+        lay = self.layout()
+        if collapsed:
+            self._text_lbl.setMaximumWidth(0)
+            self._text_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lay.setContentsMargins(0, 0, 0, 0)
+            self._gap1.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._gap2.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            if self._badge_gap is not None:
+                self._badge_gap.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._left_stretch.changeSize(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum)
+            self._right_stretch.changeSize(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum)
+            self.setFixedWidth(COLLAPSED_W)
+            self.setToolTip(self._label)
+        else:
+            self._text_lbl.setMaximumWidth(16777215)
+            self._text_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            lay.setContentsMargins(0, 0, 8, 0)
+            self._gap1.changeSize(10, 1, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._gap2.changeSize(10, 1, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            if self._badge_gap is not None:
+                self._badge_gap.changeSize(4, 1, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._left_stretch.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._right_stretch.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(16777215)
+            self.setToolTip("")
+        lay.invalidate()
+        lay.activate()
+        self.updateGeometry()
 
     def set_badge(self, count: int) -> None:
         self._badge_count = max(0, int(count))
@@ -234,7 +278,7 @@ class _NavItem(QWidget):
 
     def _refresh_icon(self, active: bool) -> None:
         color = _WHITE if active else _MUTED
-        px = 26 if self._is_collapsed else 18
+        px = 22 if self._is_collapsed else 18
         self._icon_lbl.setPixmap(_qta(self._icon_name, color=color).pixmap(px, px))
 
     def _paint(self, hover: bool) -> None:
@@ -479,13 +523,14 @@ class SidebarWidget(QFrame):
         root.setSpacing(0)
 
         scroll = QScrollArea()
+        self._scroll = scroll
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet(f"""
             QScrollArea      {{ background: {_NAVY}; border: none; }}
-            QWidget          {{ background: {_NAVY}; }}
+            QScrollArea > QWidget > QWidget {{ background: {_NAVY}; }}
             QScrollBar:vertical {{
                 background: {_NAVY};
                 width: 4px;
@@ -502,6 +547,8 @@ class SidebarWidget(QFrame):
         """)
 
         container = QWidget()
+        self._nav_container = container
+        container.setStyleSheet(f"background: {_NAVY};")
         vl = QVBoxLayout(container)
         vl.setContentsMargins(0, 6, 0, 12)
         vl.setSpacing(0)
@@ -612,6 +659,20 @@ class SidebarWidget(QFrame):
         self._collapsed = not self._collapsed
         target_w = COLLAPSED_W if self._collapsed else EXPANDED_W
         self.setFixedWidth(target_w)
+
+        if getattr(self, "_nav_container", None) is not None:
+            if self._collapsed:
+                self._nav_container.setFixedWidth(target_w)
+            else:
+                self._nav_container.setMinimumWidth(0)
+                self._nav_container.setMaximumWidth(16777215)
+        if getattr(self, "_scroll", None) is not None:
+            if self._collapsed:
+                self._scroll.setFixedWidth(target_w)
+            else:
+                self._scroll.setMinimumWidth(0)
+                self._scroll.setMaximumWidth(16777215)
+
         for item in self._items.values():
             item.set_collapsed(self._collapsed)
         for lbl in self._section_labels:

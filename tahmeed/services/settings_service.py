@@ -11,10 +11,12 @@ DEFAULTS = {
     # The accountant assigns items on verify; mappings are remembered.
     "defer_item_to_verify": False,
     # When True the cashier register's Truck No. column only accepts numbers that
-    # exist in the accountant's truck/trailer registries.
-    "restrict_trucks": False,
+    # exist in the accountant's truck/trailer registries. Default On — always intended.
+    "restrict_trucks": True,
     # How many days back to scan when checking for duplicate transactions.
     "duplicate_check_days": 5,
+    # Free-text Truck No. place labels (YARD, GARAGE, …) accepted without fleet match.
+    "allowed_truck_labels": ["YARD", "GARAGE"],
 }
 
 

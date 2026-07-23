@@ -21,6 +21,7 @@ from .schemas import (
     LoginRequest,
     MappingWrite,
     PatchDocument,
+    PeopleWrite,
     RefreshRequest,
     RuleWrite,
     SubtableWrite,
@@ -47,6 +48,7 @@ subtables = APIRouter(prefix="/subtables", tags=["subtables"])
 rules = APIRouter(prefix="/keyword-rules", tags=["keyword-rules"])
 mappings = APIRouter(prefix="/description-mappings", tags=["description-mappings"])
 fleet = APIRouter(tags=["fleet"])
+people = APIRouter(prefix="/people", tags=["people"])
 backups = APIRouter(prefix="/backups", tags=["backups"])
 accountant = APIRouter(prefix="/accountant", tags=["accountant"])
 
@@ -655,6 +657,68 @@ async def delete_trailer(number: str, request: Request, _manager: Manager) -> Re
     return Response(status_code=204)
 
 
+async def list_people(
+    request: Request,
+    search: str,
+    active: bool | None,
+    limit: int,
+    offset: int,
+) -> dict:
+    query: dict[str, Any] = {}
+    if search:
+        query["name"] = {"$regex": re.escape(search), "$options": "i"}
+    if active is not None:
+        query["active"] = active
+    collection = database(request)["people"]
+    total = await collection.count_documents(query)
+    docs = (
+        await collection.find(query)
+        .sort([("name", 1), ("_id", 1)])
+        .skip(offset)
+        .limit(limit)
+        .to_list()
+    )
+    return {
+        "items": json_safe(docs),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@people.get("")
+async def get_people(
+    request: Request,
+    _user: Authenticated,
+    search: str = "",
+    active: bool | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    return await list_people(request, search, active, limit, offset)
+
+
+@people.put("/{name}")
+async def upsert_person(name: str, body: PeopleWrite, request: Request, _manager: Manager) -> dict:
+    normalized = " ".join(name.upper().split())
+    if normalized != body.name:
+        raise ApiError(422, "name_mismatch", "Path and body names must match")
+    return json_safe(
+        await database(request)["people"].find_one_and_update(
+            {"name": body.name},
+            {"$set": body.model_dump()},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    )
+
+
+@people.delete("/{name}", status_code=204)
+async def delete_person(name: str, request: Request, _manager: Manager) -> Response:
+    await database(request)["people"].delete_one({"name": " ".join(name.upper().split())})
+    return Response(status_code=204)
+
+
 @backups.get("")
 async def list_backup_jobs(
     request: Request,
@@ -706,5 +770,5 @@ async def restore_backup_job(
     return json_safe(result)
 
 
-for router in (auth, users, categories, subtables, rules, mappings, fleet, backups, accountant):
+for router in (auth, users, categories, subtables, rules, mappings, fleet, people, backups, accountant):
     api.include_router(router)
