@@ -17,6 +17,15 @@ async def get_transactions_by_date(target_date: date, cashier_id=None) -> List[T
         query["cashier_id"] = cashier_id
     cursor = db.transactions.find(query).sort("created_at", 1)
     docs = await cursor.to_list(length=None)
+    # Prefer open pending-edit clones over their master originals so the
+    # register does not show both after a verified row was edited.
+    pending_original_ids = {
+        d.get("original_transaction_id")
+        for d in docs
+        if d.get("original_transaction_id") and not d.get("verified")
+    }
+    if pending_original_ids:
+        docs = [d for d in docs if d.get("_id") not in pending_original_ids]
     return [Transaction.from_doc(d) for d in docs]
 
 
@@ -269,16 +278,133 @@ async def get_rejected_transactions_for_cashier(
     cashier_id: ObjectId,
     limit: int = 200,
 ) -> List[Transaction]:
-    """All entries that an accountant has rejected for this cashier, newest first."""
+    """Active rejected entries for this cashier (excludes discarded), newest first."""
     db = get_db()
     cursor = (
         db.transactions
-        .find({"cashier_id": cashier_id, "rejected": True})
+        .find({
+            "cashier_id": cashier_id,
+            "rejected": True,
+            "discarded": {"$ne": True},
+        })
         .sort([("date", -1), ("created_at", -1)])
         .limit(limit)
     )
     docs = await cursor.to_list(length=limit)
     return [Transaction.from_doc(d) for d in docs]
+
+
+async def get_discarded_transactions_for_cashier(
+    cashier_id: ObjectId,
+    limit: int = 200,
+) -> List[Transaction]:
+    """Soft-discarded rejected entries for this cashier, newest first."""
+    db = get_db()
+    cursor = (
+        db.transactions
+        .find({
+            "cashier_id": cashier_id,
+            "discarded": True,
+        })
+        .sort([("date", -1), ("created_at", -1)])
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
+
+
+async def discard_transactions(
+    tx_ids: List[ObjectId],
+    cashier_id: ObjectId,
+) -> int:
+    """Soft-discard rejected entries owned by this cashier. Returns modified count."""
+    if not tx_ids:
+        return 0
+    db = get_db()
+    result = await db.transactions.update_many(
+        {
+            "_id": {"$in": list(tx_ids)},
+            "cashier_id": cashier_id,
+            "rejected": True,
+            "discarded": {"$ne": True},
+        },
+        {"$set": {"discarded": True}},
+    )
+    return result.modified_count
+
+
+async def restore_discarded_transactions(
+    tx_ids: List[ObjectId],
+    cashier_id: ObjectId,
+) -> int:
+    """Move discarded entries back to the active Rejected list. Returns modified count."""
+    if not tx_ids:
+        return 0
+    db = get_db()
+    result = await db.transactions.update_many(
+        {
+            "_id": {"$in": list(tx_ids)},
+            "cashier_id": cashier_id,
+            "discarded": True,
+        },
+        {"$set": {"discarded": False}},
+    )
+    return result.modified_count
+
+
+async def delete_discarded_transactions(
+    tx_ids: List[ObjectId],
+    cashier_id: ObjectId,
+) -> int:
+    """Permanently delete discarded entries owned by this cashier. Returns deleted count."""
+    if not tx_ids:
+        return 0
+    db = get_db()
+    result = await db.transactions.delete_many(
+        {
+            "_id": {"$in": list(tx_ids)},
+            "cashier_id": cashier_id,
+            "discarded": True,
+        },
+    )
+    return result.deleted_count
+
+
+async def resubmit_rejected_transactions(
+    cashier_id: ObjectId,
+    updates_by_id: dict,
+) -> int:
+    """Apply field updates and clear rejection/discard flags for owned rejected rows.
+
+    ``updates_by_id`` maps ObjectId → field updates dict (may be empty for
+    resubmit-without-edit). Returns number of successfully updated documents.
+    """
+    if not updates_by_id:
+        return 0
+    db = get_db()
+    now = datetime.utcnow()
+    updated = 0
+    for tx_id, field_updates in updates_by_id.items():
+        payload = dict(field_updates or {})
+        payload.update({
+            "rejected": False,
+            "rejection_reason": None,
+            "discarded": False,
+            "last_edited_at": now,
+            "last_edited_by": cashier_id,
+        })
+        result = await db.transactions.update_one(
+            {
+                "_id": tx_id,
+                "cashier_id": cashier_id,
+                "rejected": True,
+                "discarded": {"$ne": True},
+            },
+            {"$set": payload},
+        )
+        if result.modified_count:
+            updated += 1
+    return updated
 
 
 async def check_for_duplicates(
@@ -316,30 +442,49 @@ async def insert_pending_edit(
     updates: dict,
     cashier_id: ObjectId,
 ) -> ObjectId:
-    """Insert a new pending-edit document instead of modifying the original in-place.
+    """Insert (or refresh) a pending-edit document instead of modifying the original.
 
     The original approved transaction stays untouched in Master Expenses.
     The pending doc carries original_transaction_id so the accountant's
     re_approve_transaction can cascade the new values back to the original.
+    Re-editing the same original updates the existing pending doc in place.
     """
     db = get_db()
     original_doc = await db.transactions.find_one({"_id": original_tx_id})
     if not original_doc:
         raise ValueError(f"Original transaction {original_tx_id} not found")
 
+    now = datetime.utcnow()
+    meta = {
+        "original_transaction_id": original_tx_id,
+        "edited_after_verification": True,
+        "verified": False,
+        "verified_by": None,
+        "verified_at": None,
+        "rejection_reason": None,
+        "rejected": False,
+        "discarded": False,
+        "last_edited_at": now,
+        "last_edited_by": cashier_id,
+    }
+
+    existing = await db.transactions.find_one({
+        "original_transaction_id": original_tx_id,
+        "verified": False,
+        "edited_after_verification": True,
+        "rejected": {"$ne": True},
+    })
+    if existing:
+        patch = dict(updates)
+        patch.update(meta)
+        await db.transactions.update_one({"_id": existing["_id"]}, {"$set": patch})
+        return existing["_id"]
+
     pending = dict(original_doc)
     pending.pop("_id", None)
     pending.update(updates)
-    pending["original_transaction_id"] = original_tx_id
-    pending["edited_after_verification"] = True
-    pending["verified"] = False
-    pending["verified_by"] = None
-    pending["verified_at"] = None
-    pending["rejection_reason"] = None
-    pending["rejected"] = False
-    pending["last_edited_at"] = datetime.utcnow()
-    pending["last_edited_by"] = cashier_id
-    pending["created_at"] = datetime.utcnow()
+    pending.update(meta)
+    pending["created_at"] = now
 
     result = await db.transactions.insert_one(pending)
     return result.inserted_id

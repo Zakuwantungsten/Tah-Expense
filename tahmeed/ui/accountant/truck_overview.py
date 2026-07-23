@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional, Sequence
 
 import qtawesome as qta
 
-from PySide6.QtCore import Qt, QTimer, QSize, QDate
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QTimer, QSize, QDate, QEvent, Signal
+from PySide6.QtGui import QColor, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
@@ -112,7 +112,129 @@ def _input_ss() -> str:
         f"QLineEdit:focus, QComboBox:focus, QDateEdit:focus {{ border-color: {_BLUE}; }}"
         "QComboBox::drop-down { border: none; width: 20px; }"
         "QDateEdit::drop-down { border: none; width: 20px; }"
+        "QComboBox QAbstractItemView {"
+        f"  border: 1px solid {_BORDER}; background: {_WHITE}; selection-background-color: {_BLUE_L};"
+        "  outline: none; padding: 2px;"
+        "}"
     )
+
+
+class _SourceMultiCombo(QComboBox):
+    """Checkable source filter — pick one or many sources, or All Sources."""
+
+    selectionChanged = Signal()
+
+    def __init__(self, options: Sequence[tuple[str, str]], parent=None) -> None:
+        super().__init__(parent)
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("All Sources")
+        self.setInsertPolicy(QComboBox.NoInsert)
+
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        self._updating = False
+
+        all_item = QStandardItem("All Sources")
+        all_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+        all_item.setData("all", Qt.UserRole)
+        all_item.setCheckState(Qt.Checked)
+        self._model.appendRow(all_item)
+
+        for label, key in options:
+            if key == "all":
+                continue
+            item = QStandardItem(label)
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            item.setData(key, Qt.UserRole)
+            item.setCheckState(Qt.Unchecked)
+            self._model.appendRow(item)
+
+        self.view().viewport().installEventFilter(self)
+        self._model.itemChanged.connect(self._on_item_changed)
+        self._refresh_label()
+
+    def hidePopup(self) -> None:
+        super().hidePopup()
+        # Editable combo can snap the line edit back to a row label on close.
+        self._refresh_label()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.view().viewport() and event.type() == QEvent.MouseButtonRelease:
+            index = self.view().indexAt(event.pos())
+            if index.isValid():
+                item = self._model.itemFromIndex(index)
+                if item is not None and item.flags() & Qt.ItemIsUserCheckable:
+                    item.setCheckState(
+                        Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
+                    )
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _on_item_changed(self, item: QStandardItem) -> None:
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            key = item.data(Qt.UserRole)
+            if key == "all" and item.checkState() == Qt.Checked:
+                for row in range(1, self._model.rowCount()):
+                    self._model.item(row).setCheckState(Qt.Unchecked)
+            elif key != "all" and item.checkState() == Qt.Checked:
+                self._model.item(0).setCheckState(Qt.Unchecked)
+            # If nothing is checked, fall back to All Sources.
+            if not any(
+                self._model.item(row).checkState() == Qt.Checked
+                for row in range(self._model.rowCount())
+            ):
+                self._model.item(0).setCheckState(Qt.Checked)
+        finally:
+            self._updating = False
+        self._refresh_label()
+        self.selectionChanged.emit()
+
+    def selected_keys(self) -> List[str]:
+        """Return selected source keys, or ``[]`` meaning all sources."""
+        if self._model.item(0).checkState() == Qt.Checked:
+            return []
+        keys: List[str] = []
+        for row in range(1, self._model.rowCount()):
+            item = self._model.item(row)
+            if item.checkState() == Qt.Checked:
+                keys.append(str(item.data(Qt.UserRole)))
+        return keys
+
+    def summary_text(self) -> str:
+        if self._model.item(0).checkState() == Qt.Checked:
+            return "All Sources"
+        labels = [
+            self._model.item(row).text()
+            for row in range(1, self._model.rowCount())
+            if self._model.item(row).checkState() == Qt.Checked
+        ]
+        if not labels:
+            return "All Sources"
+        if len(labels) == 1:
+            return labels[0]
+        if len(labels) == 2:
+            return f"{labels[0]}, {labels[1]}"
+        return f"{len(labels)} sources"
+
+    def _refresh_label(self) -> None:
+        text = self.summary_text()
+        self.setCurrentText(text)
+        self.lineEdit().setToolTip(text)
+
+    def reset_to_all(self) -> None:
+        self._updating = True
+        try:
+            self._model.item(0).setCheckState(Qt.Checked)
+            for row in range(1, self._model.rowCount()):
+                self._model.item(row).setCheckState(Qt.Unchecked)
+        finally:
+            self._updating = False
+        self._refresh_label()
+        self.selectionChanged.emit()
 
 
 _CARD_SS = (
@@ -604,21 +726,22 @@ class TruckOverviewWidget(QWidget):
         filter_row.addWidget(self._truck_edit)
 
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search description, station, reference…")
-        self._search.setFixedWidth(240)
+        self._search.setPlaceholderText("Search description…")
+        self._search.setFixedWidth(150)
         self._search.setFixedHeight(_CTRL_H)
         self._search.setStyleSheet(_input_ss())
+        self._search.setToolTip("Search description, station, reference…")
         self._search.textEdited.connect(lambda _t: self._on_filter_changed())
         filter_row.addWidget(self._search)
+        QWidget.setTabOrder(self._truck_edit, self._search)
 
-        self._source_cb = QComboBox()
-        for label, key in _SOURCE_OPTIONS:
-            self._source_cb.addItem(label, key)
-        self._source_cb.setFixedWidth(150)
+        self._source_cb = _SourceMultiCombo(_SOURCE_OPTIONS)
+        self._source_cb.setFixedWidth(160)
         self._source_cb.setFixedHeight(_CTRL_H)
         self._source_cb.setStyleSheet(_input_ss())
-        self._source_cb.currentIndexChanged.connect(self._on_filter_changed)
+        self._source_cb.selectionChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self._source_cb)
+        QWidget.setTabOrder(self._search, self._source_cb)
 
         self._from_date = QDateEdit()
         self._from_date.setCalendarPopup(True)
@@ -666,7 +789,7 @@ class TruckOverviewWidget(QWidget):
         export_pdf_btn.clicked.connect(self._export_pdf)
         filter_row.addWidget(export_pdf_btn)
 
-        filter_inner.setMinimumWidth(1180)
+        filter_inner.setMinimumWidth(1120)
         filter_inner.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         filter_scroll.setWidget(filter_inner)
         toolbar_v.addWidget(filter_scroll)
@@ -699,8 +822,24 @@ class TruckOverviewWidget(QWidget):
     def _selected_truck(self) -> str:
         return self._truck_edit.text().strip().upper()
 
-    def _selected_source(self) -> str:
-        return self._source_cb.currentData() or "all"
+    def _selected_sources(self) -> List[str]:
+        """Selected source keys; empty list means all sources."""
+        return self._source_cb.selected_keys()
+
+    def _source_filter_param(self):
+        keys = self._selected_sources()
+        return keys if keys else "all"
+
+    def _source_filter_label(self) -> str:
+        return self._source_cb.summary_text()
+
+    def _source_filter_tag(self) -> str:
+        keys = self._selected_sources()
+        if not keys:
+            return "all"
+        if len(keys) == 1:
+            return keys[0]
+        return "multi"
 
     def _search_text(self) -> str:
         return self._search.text().strip()
@@ -780,7 +919,7 @@ class TruckOverviewWidget(QWidget):
                 get_truck_overview_records(
                     truck=truck,
                     search=self._search_text(),
-                    source=self._selected_source(),
+                    source=self._source_filter_param(),
                     date_from=date_from,
                     date_to=date_to,
                     limit=size,
@@ -789,14 +928,14 @@ class TruckOverviewWidget(QWidget):
                 count_truck_overview_records(
                     truck=truck,
                     search=self._search_text(),
-                    source=self._selected_source(),
+                    source=self._source_filter_param(),
                     date_from=date_from,
                     date_to=date_to,
                 ),
                 get_truck_overview_summary(
                     truck=truck,
                     search=self._search_text(),
-                    source=self._selected_source(),
+                    source=self._source_filter_param(),
                     date_from=date_from,
                     date_to=date_to,
                 ),
@@ -923,7 +1062,7 @@ class TruckOverviewWidget(QWidget):
             rows = await get_truck_overview_records(
                 truck=truck,
                 search=self._search_text(),
-                source=self._selected_source(),
+                source=self._source_filter_param(),
                 date_from=date_from,
                 date_to=date_to,
                 limit=100000,
@@ -932,7 +1071,7 @@ class TruckOverviewWidget(QWidget):
             summary = await get_truck_overview_summary(
                 truck=truck,
                 search=self._search_text(),
-                source=self._selected_source(),
+                source=self._source_filter_param(),
                 date_from=date_from,
                 date_to=date_to,
             )
@@ -944,7 +1083,7 @@ class TruckOverviewWidget(QWidget):
             QMessageBox.information(self, "Export", "No records match the current truck and filters.")
             return
 
-        source_tag = self._selected_source()
+        source_tag = self._source_filter_tag()
         default_name = f"Truck_Overview_{truck}_{source_tag}.xlsx".replace(" ", "_")
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Truck Overview", default_name, "Excel Files (*.xlsx)"
@@ -960,7 +1099,7 @@ class TruckOverviewWidget(QWidget):
                 _write_truck_overview_excel,
                 path,
                 truck,
-                self._source_cb.currentText(),
+                self._source_filter_label(),
                 self._search_text(),
                 self._format_date_range_label(),
                 rows,
@@ -993,7 +1132,7 @@ class TruckOverviewWidget(QWidget):
             rows = await get_truck_overview_records(
                 truck=truck,
                 search=self._search_text(),
-                source=self._selected_source(),
+                source=self._source_filter_param(),
                 date_from=date_from,
                 date_to=date_to,
                 limit=5000,
@@ -1002,7 +1141,7 @@ class TruckOverviewWidget(QWidget):
             summary = await get_truck_overview_summary(
                 truck=truck,
                 search=self._search_text(),
-                source=self._selected_source(),
+                source=self._source_filter_param(),
                 date_from=date_from,
                 date_to=date_to,
             )
@@ -1035,7 +1174,7 @@ class TruckOverviewWidget(QWidget):
                 summary=summary,
                 date_from=date_from,
                 date_to=date_to,
-                source_label=self._source_cb.currentText(),
+                source_label=self._source_filter_label(),
             )
             QMessageBox.information(self, "Export Complete", f"PDF report saved to:\n{path}")
             self._status.setText(f"PDF export saved for {truck}.")
@@ -1074,7 +1213,7 @@ class TruckOverviewWidget(QWidget):
         self._page = 0
         self._total = 0
         self._truck_edit.clear()
-        self._source_cb.setCurrentIndex(0)
+        self._source_cb.reset_to_all()
         self._from_date.setDate(_MIN_FILTER_DATE)
         self._to_date.setDate(_MIN_FILTER_DATE)
         self._search.clear()

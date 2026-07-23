@@ -45,7 +45,7 @@ _STRIPE    = "#F1F5F9"
 _HDR_H     = 28
 _ROW_H     = 28
 
-_PAGE_SIZES     = [25, 50, 100]
+_SCROLL_CHUNK   = 50
 _DATE_OPTS      = ["All Dates", "Today", "Last 7 Days", "Last 30 Days", "This Month"]
 
 _RECEIPT_DISPLAY: Dict[str, str] = {
@@ -190,6 +190,31 @@ def _fmt_date(dt) -> str:
     return str(dt) if dt else "—"
 
 
+def _fmt_num(v, prefix: str = "", decimals: int = 0) -> str:
+    """Toll-plaza-style amount formatting; keeps a currency prefix (e.g. TZS)."""
+    if v is None or v == "":
+        return "—"
+    try:
+        if isinstance(v, (int, float)):
+            amount = float(v)
+        else:
+            from tahmeed.services.daily_import_service import parse_amount
+            parsed = parse_amount(v)
+            if parsed is None:
+                return str(v)
+            amount = float(parsed)
+        return f"{prefix}{amount:,.{decimals}f}"
+    except Exception:
+        return str(v)
+
+
+def _fmt_amount(tx: Transaction) -> str:
+    currency = (tx.currency or "TZS").upper()
+    decimals = 0 if currency in {"TZS", "TSH", "TZ", "ZMW", "ZMB", "ZK"} else 2
+    prefix = f"{currency} "
+    return _fmt_num(tx.amount, prefix, decimals)
+
+
 def _fmt_relative(dt) -> str:
     """Short human-friendly age, e.g. '2h ago' / '3d ago'. Falls back to a date."""
     if not isinstance(dt, datetime):
@@ -233,7 +258,7 @@ class _FilterBar(QFrame):
     def _build(self) -> None:
         hl = QHBoxLayout(self)
         hl.setContentsMargins(16, 0, 16, 0)
-        hl.setSpacing(10)
+        hl.setSpacing(8)
 
         try:
             icon = QLabel()
@@ -246,21 +271,35 @@ class _FilterBar(QFrame):
 
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search description, item, truck…")
-        self._search.setFixedWidth(230)
+        self._search.setFixedWidth(180)
         self._search.setStyleSheet(_input_ss())
         self._search.textChanged.connect(self.filter_changed)
         hl.addWidget(self._search)
 
+        self._item_cb = QComboBox()
+        self._item_cb.addItem("All Items")
+        self._item_cb.setFixedWidth(120)
+        self._item_cb.setStyleSheet(_input_ss())
+        self._item_cb.currentTextChanged.connect(self.filter_changed)
+        hl.addWidget(self._item_cb)
+
+        self._desc = QLineEdit()
+        self._desc.setPlaceholderText("Filter description…")
+        self._desc.setFixedWidth(140)
+        self._desc.setStyleSheet(_input_ss())
+        self._desc.textChanged.connect(self.filter_changed)
+        hl.addWidget(self._desc)
+
         self._truck_cb = QComboBox()
         self._truck_cb.addItem("All Trucks")
-        self._truck_cb.setFixedWidth(130)
+        self._truck_cb.setFixedWidth(110)
         self._truck_cb.setStyleSheet(_input_ss())
         self._truck_cb.currentTextChanged.connect(self.filter_changed)
         hl.addWidget(self._truck_cb)
 
         self._cashier_cb = QComboBox()
         self._cashier_cb.addItem("All Cashiers", None)
-        self._cashier_cb.setFixedWidth(130)
+        self._cashier_cb.setFixedWidth(120)
         self._cashier_cb.setStyleSheet(_input_ss())
         self._cashier_cb.currentTextChanged.connect(self.filter_changed)
         hl.addWidget(self._cashier_cb)
@@ -268,7 +307,7 @@ class _FilterBar(QFrame):
         self._date_cb = QComboBox()
         for opt in _DATE_OPTS:
             self._date_cb.addItem(opt)
-        self._date_cb.setFixedWidth(120)
+        self._date_cb.setFixedWidth(110)
         self._date_cb.setStyleSheet(_input_ss())
         self._date_cb.currentTextChanged.connect(self.filter_changed)
         hl.addWidget(self._date_cb)
@@ -297,6 +336,17 @@ class _FilterBar(QFrame):
         self._truck_cb.setCurrentIndex(max(0, idx))
         self._truck_cb.blockSignals(False)
 
+    def populate_items(self, items: List[str]) -> None:
+        cur = self._item_cb.currentText()
+        self._item_cb.blockSignals(True)
+        self._item_cb.clear()
+        self._item_cb.addItem("All Items")
+        for name in items:
+            self._item_cb.addItem(name)
+        idx = self._item_cb.findText(cur)
+        self._item_cb.setCurrentIndex(max(0, idx))
+        self._item_cb.blockSignals(False)
+
     def populate_cashiers(self, items: List[Tuple[str, Optional[ObjectId]]]) -> None:
         cur = self._cashier_cb.currentText()
         self._cashier_cb.blockSignals(True)
@@ -319,6 +369,13 @@ class _FilterBar(QFrame):
     def search_text(self) -> str:
         return self._search.text().strip()
 
+    def item_filter(self) -> str:
+        t = self._item_cb.currentText()
+        return "" if t == "All Items" else t
+
+    def description_filter(self) -> str:
+        return self._desc.text().strip()
+
     def truck_filter(self) -> str:
         t = self._truck_cb.currentText()
         return "" if t == "All Trucks" else t
@@ -330,76 +387,23 @@ class _FilterBar(QFrame):
         return _resolve_date_filter(self._date_cb.currentText())
 
 
-# ── Pagination bar ─────────────────────────────────────────────────────────────
+# ── Status / scroll footer ─────────────────────────────────────────────────────
 
-class _PaginationBar(QFrame):
-    page_changed = Signal(int)
-    size_changed = Signal(int)
-
+class _StatusBar(QFrame):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setFixedHeight(44)
+        self.setFixedHeight(36)
         self.setStyleSheet(
             f"QFrame{{background:{_WHITE};border-top:1px solid {_BORDER};}}"
         )
-        self._page = 0
-        self._total = 0
-        self._size = _PAGE_SIZES[0]
-        self._build()
-
-    def _build(self) -> None:
         hl = QHBoxLayout(self)
         hl.setContentsMargins(16, 0, 16, 0)
-        hl.setSpacing(10)
-
-        self._size_cb = QComboBox()
-        for sz in _PAGE_SIZES:
-            self._size_cb.addItem(f"Show {sz}", sz)
-        self._size_cb.setFixedWidth(100)
-        self._size_cb.setStyleSheet(_input_ss())
-        self._size_cb.currentIndexChanged.connect(self._on_size)
-        hl.addWidget(self._size_cb)
-
         self._info = _lbl("—", size=12, color=_T2)
         hl.addWidget(self._info)
         hl.addStretch()
 
-        self._prev = _btn("← Prev", "", primary=False)
-        self._prev.setFixedWidth(90)
-        self._prev.clicked.connect(self._go_prev)
-        hl.addWidget(self._prev)
-
-        self._next = _btn("Next →", "", primary=False)
-        self._next.setFixedWidth(90)
-        self._next.clicked.connect(self._go_next)
-        hl.addWidget(self._next)
-
-    def update_state(self, page: int, total: int, size: int) -> None:
-        self._page, self._total, self._size = page, total, size
-        max_p = max(0, (total - 1) // size) if total else 0
-        self._prev.setEnabled(page > 0)
-        self._next.setEnabled(page < max_p)
-        s = page * size + 1 if total else 0
-        e = min((page + 1) * size, total)
-        self._info.setText(
-            f"Showing {s}–{e} of {total}  ·  Page {page + 1} of {max_p + 1}"
-        )
-
-    def current_size(self) -> int:
-        return self._size_cb.currentData() or _PAGE_SIZES[0]
-
-    def _on_size(self) -> None:
-        self._page = 0
-        self.size_changed.emit(self._size_cb.currentData())
-
-    def _go_prev(self) -> None:
-        if self._page > 0:
-            self.page_changed.emit(self._page - 1)
-
-    def _go_next(self) -> None:
-        max_p = max(0, (self._total - 1) // self._size) if self._total else 0
-        if self._page < max_p:
-            self.page_changed.emit(self._page + 1)
+    def set_text(self, text: str) -> None:
+        self._info.setText(text)
 
 
 # ── Action panel ───────────────────────────────────────────────────────────────
@@ -517,7 +521,7 @@ class _ActionPanel(QFrame):
         currency = tx.currency or "TZS"
         self._info_lbl.setText(
             f"{tx.truck_number or '—'}  ·  {_fmt_date(tx.date)}  ·  "
-            f"{tx.description or '—'}  ·  {currency} {tx.amount:,.0f}"
+            f"{tx.description or '—'}  ·  {_fmt_amount(tx)}"
             f"  ·  Cashier: {cashier_name or '—'}"
         )
         self._cat_combo.blockSignals(True)
@@ -669,15 +673,17 @@ class VerifyInboxWidget(QWidget):
         self._category_objects: List[Category] = []
         self._transactions: List[Transaction] = []
         self._cashier_names: Dict = {}
-        self._page = 0
+        self._loaded = 0
         self._total = 0
         self._current_tab = 0   # 0 = New, 1 = Edited, 2 = Rejected, 3 = Issues
         self._filters_tab = -1  # which tab's filters are currently loaded
         self._loading = False
+        self._scroll_loading = False
+        self._reload_generation = 0
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(350)
-        self._debounce.timeout.connect(self._reload)
+        self._debounce.timeout.connect(self._reset_and_load)
         # Distinguish single-click (select) from double-click (open panel)
         self._click_timer = QTimer(self)
         self._click_timer.setSingleShot(True)
@@ -738,7 +744,7 @@ class VerifyInboxWidget(QWidget):
         tbl.addWidget(refresh_btn)
         root.addWidget(title_bar)
 
-        # Sub-tab bar (New | Edited)
+        # Sub-tab bar (New | Edited | Rejected | Issues)
         self._subtabs = _SubTabBar()
         self._subtabs.tab_changed.connect(self._on_subtab_changed)
         root.addWidget(self._subtabs)
@@ -780,11 +786,9 @@ class VerifyInboxWidget(QWidget):
 
         root.addWidget(content, 1)
 
-        # Pagination
-        self._pagination = _PaginationBar()
-        self._pagination.page_changed.connect(self._on_page_changed)
-        self._pagination.size_changed.connect(self._on_size_changed)
-        root.addWidget(self._pagination)
+        # Infinite-scroll status footer (Master-style)
+        self._status = _StatusBar()
+        root.addWidget(self._status)
 
     def _build_table(self) -> QTableWidget:
         t = QTableWidget(0, _NCOLS)
@@ -812,18 +816,53 @@ class VerifyInboxWidget(QWidget):
         t.itemDoubleClicked.connect(self._on_item_double_clicked)
         t.itemChanged.connect(self._on_checkbox_changed)
         hdr.sectionClicked.connect(self._on_header_click)
+        t.verticalScrollBar().valueChanged.connect(self._on_scroll)
         return t
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._reload())
+        self._filters_tab = -1
+        self._reset_and_load()
+
+    def _filter_kw(self) -> dict:
+        df, dt = self._filter_bar.date_filter()
+        return dict(
+            search=self._filter_bar.search_text(),
+            truck=self._filter_bar.truck_filter(),
+            cashier_id=self._filter_bar.cashier_id_filter(),
+            date_from=df,
+            date_to=dt,
+            item=self._filter_bar.item_filter(),
+            description=self._filter_bar.description_filter(),
+        )
+
+    def _reset_and_load(self) -> None:
+        self._reload_generation += 1
+        self._loaded = 0
+        self._total = 0
+        self._transactions = []
+        self._panel.hide()
+        self._table.setRowCount(0)
+        self._update_status()
+        asyncio.ensure_future(self._load_initial(self._reload_generation))
+
+    def _update_status(self) -> None:
+        if self._loading and self._loaded == 0:
+            self._status.set_text("Loading…")
+        elif self._total == 0:
+            self._status.set_text("No records match the current filters.")
+        elif self._loaded >= self._total:
+            self._status.set_text(f"Showing all {self._total:,} records")
+        else:
+            self._status.set_text(
+                f"Showing {self._loaded:,} of {self._total:,}  •  Scroll down for more"
+            )
 
     # ── Event handlers ──────────────────────────────────────────────────────────
 
     def _on_subtab_changed(self, idx: int) -> None:
         self._current_tab = idx
-        self._page = 0
         self._panel.hide()
         if idx == 2:
             mode = "rejected"
@@ -835,7 +874,7 @@ class VerifyInboxWidget(QWidget):
         self._set_tab_header(idx)
         self._filter_bar.set_bulk_visible(idx != 2)
         self._filters_tab = -1  # force filter reload when tab changes
-        asyncio.ensure_future(self._reload())
+        self._reset_and_load()
 
     def _set_tab_header(self, tab: int) -> None:
         item = self._table.horizontalHeaderItem(_COL_APP)
@@ -850,16 +889,14 @@ class VerifyInboxWidget(QWidget):
                 item.setText("APP BY")
 
     def _on_filter_changed(self) -> None:
-        self._page = 0
         self._debounce.start()
 
-    def _on_page_changed(self, page: int) -> None:
-        self._page = page
-        asyncio.ensure_future(self._reload())
-
-    def _on_size_changed(self, size: int) -> None:
-        self._page = 0
-        asyncio.ensure_future(self._reload())
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
     def _on_item_clicked(self, item: QTableWidgetItem) -> None:
         # Checkbox column toggles itself; defer other columns so double-click
@@ -943,99 +980,106 @@ class VerifyInboxWidget(QWidget):
 
     # ── Data load ───────────────────────────────────────────────────────────────
 
-    async def _reload(self) -> None:
-        if self._loading:
-            return
+    async def _load_filter_options(self, tab: int) -> Dict:
+        from tahmeed.services.accountant_service import (
+            get_unverified_trucks, get_unverified_cashier_ids, get_unverified_items,
+            get_rejected_trucks, get_rejected_cashier_ids, get_rejected_items,
+            get_cashier_names,
+        )
+        from tahmeed.services.category_service import get_all_categories
+
+        if tab == 2:
+            cats, trucks, cashier_ids, items = await asyncio.gather(
+                get_all_categories(),
+                get_rejected_trucks(),
+                get_rejected_cashier_ids(),
+                get_rejected_items(),
+            )
+        else:
+            cats, trucks, cashier_ids, items = await asyncio.gather(
+                get_all_categories(),
+                get_unverified_trucks(),
+                get_unverified_cashier_ids(),
+                get_unverified_items(),
+            )
+        self._categories = [c.name for c in cats]
+        self._category_objects = cats
+        cname_map = await get_cashier_names(cashier_ids) if cashier_ids else {}
+        self._filter_bar.populate_trucks(trucks)
+        self._filter_bar.populate_items(items)
+        clist = sorted(
+            [(cname_map.get(ci, str(ci)), ci) for ci in cashier_ids],
+            key=lambda x: x[0],
+        )
+        self._filter_bar.populate_cashiers(clist)
+        self._filters_tab = tab
+        return cname_map
+
+    async def _fetch_page(self, *, skip: int, limit: int, kw: dict):
+        from tahmeed.services.accountant_service import (
+            get_unverified_filtered, get_edited_transactions,
+            get_rejected_transactions,
+        )
+        from tahmeed.services.daily_import_service import get_issue_transactions
+
+        tab = self._current_tab
+        if tab == 2:
+            return await get_rejected_transactions(
+                **kw, limit=limit, skip=skip,
+            )
+        if tab == 1:
+            return await get_edited_transactions(
+                **kw, limit=limit, skip=skip,
+            )
+        if tab == 3:
+            return await get_issue_transactions(
+                skip=skip, limit=limit, **kw,
+            )
+        return await get_unverified_filtered(
+            **kw, limit=limit, skip=skip, edited=False,
+        )
+
+    async def _fetch_counts(self, kw: dict) -> Tuple[int, int, int, int, int]:
+        from tahmeed.services.accountant_service import (
+            count_unverified_filtered, count_edited_transactions,
+            count_rejected_transactions, get_pending_count,
+        )
+        from tahmeed.services.daily_import_service import count_issue_transactions
+
+        new_count, edited_count, rejected_count, issues_count, pending = (
+            await asyncio.gather(
+                count_unverified_filtered(**kw, edited=False),
+                count_edited_transactions(**kw),
+                count_rejected_transactions(**kw),
+                count_issue_transactions(**kw),
+                get_pending_count(),
+            )
+        )
+        return new_count, edited_count, rejected_count, issues_count, pending
+
+    async def _load_initial(self, generation: int) -> None:
         self._loading = True
+        self._update_status()
         try:
-            from tahmeed.services.accountant_service import (
-                get_unverified_filtered, count_unverified_filtered,
-                get_edited_transactions, count_edited_transactions,
-                get_rejected_transactions, count_rejected_transactions,
-                get_unverified_trucks, get_unverified_cashier_ids,
-                get_rejected_trucks, get_rejected_cashier_ids,
-                get_cashier_names, get_pending_count, get_rejected_count,
-            )
-            from tahmeed.services.category_service import get_all_categories
-            from tahmeed.services.daily_import_service import (
-                get_issue_transactions, count_issue_transactions,
-            )
+            from tahmeed.services.accountant_service import get_cashier_names
 
-            size = self._pagination.current_size()
-            skip = self._page * size
-            search = self._filter_bar.search_text()
-            truck  = self._filter_bar.truck_filter()
-            cid    = self._filter_bar.cashier_id_filter()
-            df, dt = self._filter_bar.date_filter()
-            tab = self._current_tab  # 0=New, 1=Edited, 2=Rejected, 3=Issues
+            kw = self._filter_kw()
+            tab = self._current_tab
 
-            # Reload filter dropdowns whenever the tab changes.
+            cname_map: Dict = {}
             if self._filters_tab != tab:
-                if tab == 2:
-                    cats, trucks, cashier_ids = await asyncio.gather(
-                        get_all_categories(),
-                        get_rejected_trucks(),
-                        get_rejected_cashier_ids(),
-                    )
-                else:
-                    cats, trucks, cashier_ids = await asyncio.gather(
-                        get_all_categories(),
-                        get_unverified_trucks(),
-                        get_unverified_cashier_ids(),
-                    )
-                self._categories = [c.name for c in cats]
-                self._category_objects = cats
-                cname_map = await get_cashier_names(cashier_ids)
-                self._filter_bar.populate_trucks(trucks)
-                clist = sorted(
-                    [(cname_map.get(ci, str(ci)), ci) for ci in cashier_ids],
-                    key=lambda x: x[0],
-                )
-                self._filter_bar.populate_cashiers(clist)
-                self._filters_tab = tab
-            else:
-                cname_map = {}
+                cname_map = await self._load_filter_options(tab)
+                if generation != self._reload_generation:
+                    return
 
-            # Choose the right query based on active tab.
-            if tab == 2:
-                txs_coro = get_rejected_transactions(
-                    search=search, truck=truck, cashier_id=cid,
-                    date_from=df, date_to=dt, limit=size, skip=skip,
-                )
-            elif tab == 1:
-                txs_coro = get_edited_transactions(
-                    search=search, truck=truck, cashier_id=cid,
-                    date_from=df, date_to=dt, limit=size, skip=skip,
-                )
-            elif tab == 3:
-                txs_coro = get_issue_transactions(skip=skip, limit=size)
-            else:
-                txs_coro = get_unverified_filtered(
-                    search=search, truck=truck, cashier_id=cid,
-                    date_from=df, date_to=dt, limit=size, skip=skip,
-                    edited=False,
-                )
-
-            txs, new_count, edited_count, rejected_count, issues_count, pending = (
-                await asyncio.gather(
-                    txs_coro,
-                    count_unverified_filtered(
-                        search=search, truck=truck, cashier_id=cid,
-                        date_from=df, date_to=dt, edited=False,
-                    ),
-                    count_edited_transactions(
-                        search=search, truck=truck, cashier_id=cid,
-                        date_from=df, date_to=dt,
-                    ),
-                    count_rejected_transactions(
-                        search=search, truck=truck, cashier_id=cid,
-                        date_from=df, date_to=dt,
-                    ),
-                    count_issue_transactions(),
-                    get_pending_count(),
-                )
+            txs, counts = await asyncio.gather(
+                self._fetch_page(skip=0, limit=_SCROLL_CHUNK, kw=kw),
+                self._fetch_counts(kw),
             )
+            if generation != self._reload_generation:
+                return
 
+            new_count, edited_count, rejected_count, issues_count, pending = counts
             if tab == 2:
                 total = rejected_count
             elif tab == 1:
@@ -1045,7 +1089,6 @@ class VerifyInboxWidget(QWidget):
             else:
                 total = new_count
 
-            # Resolve cashier names for everyone on the current page.
             page_ids = {tx.cashier_id for tx in txs if tx.cashier_id}
             page_ids |= {tx.last_edited_by for tx in txs if tx.last_edited_by}
             if page_ids:
@@ -1055,58 +1098,103 @@ class VerifyInboxWidget(QWidget):
             self._cashier_names = cname_map
             self._total = total
             self._subtabs.set_counts(new_count, edited_count, rejected_count, issues_count)
-            self._fill_table(txs, cname_map, skip)
-            self._pagination.update_state(self._page, total, size)
+            self._fill_table(txs, cname_map, 0, append=False)
+            self._loaded = len(txs)
             self._pending_badge.setText(str(pending))
             self.badge_updated.emit(pending)
-
         except Exception as exc:
-            self._show_empty(f"Failed to load: {exc}")
+            if generation == self._reload_generation:
+                self._show_empty(f"Failed to load: {exc}")
         finally:
             self._loading = False
+            if generation == self._reload_generation:
+                self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._scroll_loading or self._loading:
+            return
+        if self._loaded >= self._total:
+            return
+        self._scroll_loading = True
+        self._update_status()
+        try:
+            from tahmeed.services.accountant_service import get_cashier_names
+
+            kw = self._filter_kw()
+            gen = self._reload_generation
+            txs = await self._fetch_page(
+                skip=self._loaded, limit=_SCROLL_CHUNK, kw=kw,
+            )
+            if gen != self._reload_generation:
+                return
+
+            page_ids = {tx.cashier_id for tx in txs if tx.cashier_id}
+            page_ids |= {tx.last_edited_by for tx in txs if tx.last_edited_by}
+            cname_map = dict(self._cashier_names)
+            if page_ids:
+                page_names = await get_cashier_names(list(page_ids))
+                cname_map.update(page_names)
+                self._cashier_names = cname_map
+
+            if txs:
+                self._fill_table(txs, cname_map, self._loaded, append=True)
+                self._loaded += len(txs)
+        except Exception:
+            pass
+        finally:
+            self._scroll_loading = False
+            self._update_status()
 
     # ── Table fill ──────────────────────────────────────────────────────────────
 
-    def _fill_table(self, txs: List[Transaction], cnames: Dict, skip: int) -> None:
-        self._transactions = txs
-        self._panel.hide()
-        tab = self._current_tab  # 0=New, 1=Edited, 2=Rejected
-
+    def _fill_table(
+        self,
+        txs: List[Transaction],
+        cnames: Dict,
+        skip: int,
+        *,
+        append: bool = False,
+    ) -> None:
+        tab = self._current_tab  # 0=New, 1=Edited, 2=Rejected, 3=Issues
         t = self._table
-        t.clearSpans()
-        t.blockSignals(True)
-        t.setRowCount(0)
 
-        if not txs:
-            t.blockSignals(False)
-            msg = (
-                "No rejected entries." if tab == 2 else
-                "No issue entries (duplicates or mixed dates)." if tab == 3 else
-                "No pending transactions match the current filters."
-            )
-            self._show_empty(msg)
-            self._update_bulk_buttons()
-            return
+        if not append:
+            self._transactions = list(txs)
+            self._panel.hide()
+            t.clearSpans()
+            t.blockSignals(True)
+            t.setRowCount(0)
+            if not txs:
+                t.blockSignals(False)
+                msg = (
+                    "No rejected entries." if tab == 2 else
+                    "No issue entries (duplicates or mixed dates)." if tab == 3 else
+                    "No edited transactions match the current filters." if tab == 1 else
+                    "No pending transactions match the current filters."
+                )
+                self._show_empty(msg)
+                self._update_bulk_buttons()
+                return
+        else:
+            self._transactions.extend(txs)
+            t.blockSignals(True)
 
         for i, tx in enumerate(txs):
             r = t.rowCount()
             t.insertRow(r)
 
-            # Col 0: Checkbox
             chk = QTableWidgetItem()
             chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
             chk.setCheckState(Qt.Unchecked)
             chk.setTextAlignment(Qt.AlignCenter)
             t.setItem(r, _COL_CHK, chk)
 
-            # Col 1: S/N
             sn = QTableWidgetItem(str(skip + i + 1))
             sn.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
             sn.setForeground(QColor(_T2))
             sn.setFlags(sn.flags() & ~Qt.ItemIsEditable)
             t.setItem(r, _COL_SN, sn)
 
-            # Col 2: Date — flag if the transaction date differs from submission date
             date_item = _cell(_fmt_date(tx.date), color=_T2)
             if isinstance(tx.date, datetime) and isinstance(tx.created_at, datetime):
                 if tx.date.date() != tx.created_at.date():
@@ -1118,14 +1206,11 @@ class VerifyInboxWidget(QWidget):
                     )
             t.setItem(r, _COL_DATE, date_item)
 
-            # Col 3: Cashier
             cashier = cnames.get(tx.cashier_id, "") if tx.cashier_id else ""
             t.setItem(r, _COL_CASH, _cell(_short_name(cashier)))
 
-            # Col 4: Item
-            t.setItem(r, _COL_ITEM, _cell(tx.item or "—"))
+            t.setItem(r, _COL_ITEM, _cell(tx.item or tx.category_name or "—"))
 
-            # Col 5: Description — flag possible duplicates
             desc_item = _cell(tx.description or "—")
             if tx.possible_duplicate:
                 desc_item.setBackground(QColor("#FEE2E2"))
@@ -1135,28 +1220,22 @@ class VerifyInboxWidget(QWidget):
                 )
             t.setItem(r, _COL_DESC, desc_item)
 
-            # Col 6: Truck
             t.setItem(r, _COL_TRUCK, _cell(tx.truck_number or "—", color=_T2))
 
-            # Col 7: Amount  (monospace, right-aligned)
-            currency = tx.currency or "TZS"
-            amt = QTableWidgetItem(f"{currency} {tx.amount:,.0f}")
+            amt = QTableWidgetItem(_fmt_amount(tx))
             amt.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             amt.setFont(QFont("Cascadia Code", 11))
             amt.setFlags(amt.flags() & ~Qt.ItemIsEditable)
             t.setItem(r, _COL_AMT, amt)
 
-            # Col 8: Memo
             t.setItem(r, _COL_MEO, _cell(tx.memo or "—", color=_T2))
 
-            # Col 9: Notes — "Refund to my float" or blank
             notes_text = "Refund to my float" if tx.notes_flag else ""
             n_item = _cell(notes_text)
             if tx.notes_flag:
                 n_item.setForeground(QColor(_AMBER))
             t.setItem(r, _COL_NOTES, n_item)
 
-            # Col 10: Receipt
             rs = (tx.receipt_status or "pending").lower()
             rcpt_text = _RECEIPT_DISPLAY.get(rs, "Pending")
             r_item = _cell(rcpt_text)
@@ -1168,21 +1247,17 @@ class VerifyInboxWidget(QWidget):
                 r_item.setForeground(QColor(_AMBER))
             t.setItem(r, _COL_RCPT, r_item)
 
-            # Col 11: context column varies by tab
             if tab == 2:
-                # Rejected tab — show truncated rejection reason
                 reason = (tx.rejection_reason or "—")[:60]
                 reason_item = _cell(reason, color=_RED)
                 if tx.rejection_reason:
                     reason_item.setToolTip(tx.rejection_reason)
                 t.setItem(r, _COL_APP, reason_item)
-                # Red tint for rejected rows
                 for c in range(_NCOLS):
                     cell = t.item(r, c)
                     if cell:
                         cell.setBackground(QColor("#FFF0F0"))
             elif tab == 1:
-                # Edited tab — show relative edit timestamp
                 rel = _fmt_relative(tx.last_edited_at)
                 ed_item = _cell(rel or "—", color=_AMBER)
                 editor = cnames.get(tx.last_edited_by, "") if tx.last_edited_by else ""
@@ -1191,7 +1266,6 @@ class VerifyInboxWidget(QWidget):
                         f"Edited by {editor or '—'} on {_fmt_date(tx.last_edited_at)}"
                     )
                 t.setItem(r, _COL_APP, ed_item)
-                # Subtle orange tint for edited rows
                 for c in range(_NCOLS):
                     cell = t.item(r, c)
                     if cell:
@@ -1223,7 +1297,6 @@ class VerifyInboxWidget(QWidget):
                         cell.setBackground(QColor("#FFFBEB"))
             else:
                 t.setItem(r, _COL_APP, _cell(tx.approver or "—", color=_T2))
-                # Amber row tint when the transaction date differs from submission date
                 if isinstance(tx.date, datetime) and isinstance(tx.created_at, datetime):
                     if tx.date.date() != tx.created_at.date():
                         for _c in range(_NCOLS):
@@ -1467,7 +1540,7 @@ class VerifyInboxWidget(QWidget):
             count = await get_pending_count()
             self.badge_updated.emit(count)
             self._panel.hide()
-            asyncio.ensure_future(self._reload())
+            self._reset_and_load()
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to approve: {exc}")
 
@@ -1478,7 +1551,7 @@ class VerifyInboxWidget(QWidget):
             count = await get_pending_count()
             self.badge_updated.emit(count)
             self._panel.hide()
-            asyncio.ensure_future(self._reload())
+            self._reset_and_load()
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to reject: {exc}")
 
@@ -1504,7 +1577,7 @@ class VerifyInboxWidget(QWidget):
                 n = await bulk_approve_transactions(tx_ids, self._user._id)
             count = await get_pending_count()
             self.badge_updated.emit(count)
-            asyncio.ensure_future(self._reload())
+            self._reset_and_load()
             QMessageBox.information(self, "Done", f"Approved {n} transaction(s) successfully.")
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Bulk approve failed: {exc}")
@@ -1517,7 +1590,7 @@ class VerifyInboxWidget(QWidget):
                 count = await get_pending_count()
                 self.badge_updated.emit(count)
                 self._panel.hide()
-                asyncio.ensure_future(self._reload())
+                self._reset_and_load()
             else:
                 QMessageBox.warning(self, "Not Found",
                                     "Could not return this entry — it may have already been updated.")

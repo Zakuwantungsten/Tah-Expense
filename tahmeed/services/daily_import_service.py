@@ -499,20 +499,84 @@ async def delete_daily_upload(upload_id: str) -> int:
     return result.deleted_count
 
 
+def _build_issue_query(
+    *,
+    search: str = "",
+    truck: str = "",
+    cashier_id=None,
+    date_from=None,
+    date_to=None,
+    item: str = "",
+    description: str = "",
+) -> dict:
+    issue_or = {"$or": [
+        {"possible_duplicate": True},
+        {"date_discrepancy": True},
+    ]}
+    and_clauses: list = [issue_or]
+    if search.strip():
+        s = re.escape(search.strip())
+        and_clauses.append({"$or": [
+            {"description": {"$regex": s, "$options": "i"}},
+            {"item": {"$regex": s, "$options": "i"}},
+            {"category_name": {"$regex": s, "$options": "i"}},
+            {"truck_number": {"$regex": s, "$options": "i"}},
+        ]})
+    if description.strip():
+        and_clauses.append({
+            "description": {
+                "$regex": re.escape(description.strip()),
+                "$options": "i",
+            },
+        })
+    if item.strip():
+        it = re.escape(item.strip())
+        and_clauses.append({"$or": [
+            {"item": {"$regex": f"^{it}$", "$options": "i"}},
+            {"category_name": {"$regex": f"^{it}$", "$options": "i"}},
+        ]})
+
+    query: dict = {
+        "verified": {"$ne": True},
+        "rejected": {"$ne": True},
+        "$and": and_clauses,
+    }
+    if truck.strip():
+        query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
+    if cashier_id:
+        query["cashier_id"] = cashier_id
+    if date_from or date_to:
+        df: dict = {}
+        if date_from:
+            df["$gte"] = date_from
+        if date_to:
+            df["$lte"] = date_to
+        query["date"] = df
+    return query
+
+
 async def get_issue_transactions(
     *,
     skip: int = 0,
     limit: int = 50,
+    search: str = "",
+    truck: str = "",
+    cashier_id=None,
+    date_from=None,
+    date_to=None,
+    item: str = "",
+    description: str = "",
 ) -> List[Transaction]:
     db = get_db()
-    query = {
-        "verified": {"$ne": True},
-        "rejected": {"$ne": True},
-        "$or": [
-            {"possible_duplicate": True},
-            {"date_discrepancy": True},
-        ],
-    }
+    query = _build_issue_query(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        item=item,
+        description=description,
+    )
     cursor = (
         db.transactions.find(query)
         .sort([("date", -1), ("created_at", -1)])
@@ -523,18 +587,27 @@ async def get_issue_transactions(
     return [Transaction.from_doc(d) for d in docs]
 
 
-async def count_issue_transactions() -> int:
+async def count_issue_transactions(
+    *,
+    search: str = "",
+    truck: str = "",
+    cashier_id=None,
+    date_from=None,
+    date_to=None,
+    item: str = "",
+    description: str = "",
+) -> int:
     db = get_db()
-    return await db.transactions.count_documents(
-        {
-            "verified": {"$ne": True},
-            "rejected": {"$ne": True},
-            "$or": [
-                {"possible_duplicate": True},
-                {"date_discrepancy": True},
-            ],
-        }
+    query = _build_issue_query(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        item=item,
+        description=description,
     )
+    return await db.transactions.count_documents(query)
 
 
 async def clear_issue_flags(tx_id: ObjectId) -> bool:

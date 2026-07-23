@@ -38,6 +38,9 @@ class TruckLineEdit(QLineEdit):
         self._typed = ""
         self._suppress_preview = False
         self._preview_active = False
+        # True after Tab / focus-out until the next keystroke — blocks late
+        # debounce/async completions from reopening the popup.
+        self._block_suggestions = False
 
         self._model = QStringListModel(self)
         self._completer = QCompleter(self._model, self)
@@ -48,7 +51,13 @@ class TruckLineEdit(QLineEdit):
         self.setCompleter(self._completer)
 
         self._completer.highlighted[str].connect(self._on_highlighted)
+        # Popup steals key events while open; re-route Tab/Enter to us.
         self._completer.popup().installEventFilter(self)
+        # setCompleter() also installs a Qt filter on *this* widget that eats
+        # Tab before keyPressEvent. Install ours last so we run first and can
+        # accept the preview + hide the popup (same idea as the excel-grid
+        # delegate filter).
+        self.installEventFilter(self)
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -64,25 +73,69 @@ class TruckLineEdit(QLineEdit):
         self._local_numbers = numbers
 
     def eventFilter(self, obj, event) -> bool:
-        if obj is self._completer.popup() and event.type() == QEvent.KeyPress:
-            if event.key() in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter):
-                QApplication.sendEvent(
-                    self, QKeyEvent(event.type(), event.key(), event.modifiers())
-                )
-                return True
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Tab, Qt.Key_Backtab, Qt.Key_Return, Qt.Key_Enter):
+                if obj is self or obj is self._completer.popup():
+                    self.keyPressEvent(event)
+                    return True
         return super().eventFilter(obj, event)
+
+    def focusOutEvent(self, event) -> None:
+        # Opening the completer popup temporarily moves focus with PopupFocusReason;
+        # do not cancel suggestions in that case.
+        if event.reason() != Qt.FocusReason.PopupFocusReason:
+            self._cancel_pending_suggestions(hide_popup=True)
+        super().focusOutEvent(event)
+
+    def _cancel_pending_suggestions(self, *, hide_popup: bool = False) -> None:
+        """Stop debounce / deferred preview so they cannot reappear after Tab."""
+        self._debounce.stop()
+        self._block_suggestions = True
+        self._suppress_preview = True
+        self._preview_active = False
+        if hide_popup:
+            hide_completion_popup(self._completer)
+
+    def _accept_current_suggestion(self) -> None:
+        """Commit popup highlight or inline preview text, then hide the popup.
+
+        Mirrors excel-grid behaviour: whatever is shown as the current preview
+        becomes the field value when Tab/Enter is pressed.
+        """
+        if accept_completion(self, self._completer):
+            return
+        hide_completion_popup(self._completer)
+        if self._preview_active or self.hasSelectedText():
+            text = self.text()
+            self.setText(text)
+            self._typed = text
+            self.setCursorPosition(len(text))
+            return
+        model = self._completer.completionModel()
+        if model is not None and model.rowCount() > 0:
+            suggestion = model.index(0, 0).data(Qt.DisplayRole)
+            if suggestion:
+                text = str(suggestion)
+                self.setText(text)
+                self._typed = text
+                self.setCursorPosition(len(text))
 
     def _on_text_edited(self, text: str) -> None:
         self._typed = text
         self._suppress_preview = False
         self._preview_active = False
+        self._block_suggestions = False
         self._debounce.stop()
         if len(text.strip()) >= 1:
             self._debounce.start()
         else:
             self._model.setStringList([])
+            hide_completion_popup(self._completer)
 
     def _on_highlighted(self, suggestion: str) -> None:
+        if self._block_suggestions:
+            return
         current = self.text()
         typed = current[:self.selectionStart()] if self.hasSelectedText() else current
         self._typed = typed
@@ -124,6 +177,8 @@ class TruckLineEdit(QLineEdit):
             return None
 
     def _trigger_fetch(self) -> None:
+        if self._block_suggestions:
+            return
         typed = self._typed
         sync = self._sync_suggestions(typed)
         if sync is not None:
@@ -135,6 +190,8 @@ class TruckLineEdit(QLineEdit):
 
     def _kick_async_fetch(self, text: str) -> None:
         if self._fetch_fn is None:
+            return
+        if self._block_suggestions:
             return
         # Prefer warm cache again in case it filled between debounce and kick.
         sync = self._sync_suggestions(text)
@@ -155,6 +212,9 @@ class TruckLineEdit(QLineEdit):
 
     def _apply_suggestions(self, suggestions: List[str]) -> None:
         self._model.setStringList(suggestions)
+        if self._block_suggestions:
+            hide_completion_popup(self._completer)
+            return
         if suggestions:
             self._completer.complete()
             if not self._suppress_preview:
@@ -167,12 +227,14 @@ class TruckLineEdit(QLineEdit):
             suggestions = await self._fetch_fn(text)
             if text != self._typed:
                 return
+            if self._block_suggestions:
+                return
             self._apply_suggestions(suggestions)
         except Exception:
             pass
 
     def _apply_first_suggestion_preview(self) -> None:
-        if self._suppress_preview:
+        if self._suppress_preview or self._block_suggestions:
             return
         model = self._completer.completionModel()
         if model is None or model.rowCount() == 0:
@@ -198,21 +260,27 @@ class TruckLineEdit(QLineEdit):
             return
 
         if key in (Qt.Key_Return, Qt.Key_Enter):
-            if accept_completion(self, self._completer):
-                self._preview_active = False
-                event.accept()
-                return
-            hide_completion_popup(self._completer)
+            self._debounce.stop()
+            self._accept_current_suggestion()
+            self._block_suggestions = True
+            self._suppress_preview = True
             self._preview_active = False
+            event.accept()
+            return
 
-        if key == Qt.Key_Tab:
-            if not accept_completion(self, self._completer):
-                hide_completion_popup(self._completer)
-                if self._preview_active:
-                    self.deselect()
-                    self.setCursorPosition(len(self.text()))
+        if key in (Qt.Key_Tab, Qt.Key_Backtab):
+            # Cancel pending debounce, commit preview (excel-style), hide popup,
+            # then move focus — Qt's completer filter never sees this Tab.
+            self._debounce.stop()
+            self._accept_current_suggestion()
+            self._block_suggestions = True
+            self._suppress_preview = True
             self._preview_active = False
-            self.focusNextPrevChild(not bool(event.modifiers() & Qt.ShiftModifier))
+            forward = key == Qt.Key_Tab and not bool(
+                event.modifiers() & Qt.ShiftModifier
+            )
+            # Defer focus move so popup hide settles (same pattern as excel grid).
+            QTimer.singleShot(0, lambda f=forward: self.focusNextPrevChild(f))
             event.accept()
             return
 

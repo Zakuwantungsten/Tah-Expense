@@ -25,9 +25,10 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
-    QFrame, QLabel, QLineEdit, QPushButton, QDialog, QMessageBox,
+    QFrame, QLabel, QLineEdit, QPushButton, QDialog, QMessageBox, QMenu,
 )
 from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtGui import QAction
 
 import qtawesome as qta
 
@@ -188,7 +189,7 @@ class _ActionBar(QFrame):
 
     edit_clicked   = Signal()
     save_clicked   = Signal()
-    export_clicked = Signal()
+    export_clicked = Signal(str)  # "xlsx" | "csv" | "pdf"
     import_clicked = Signal()
     today_clicked  = Signal()
     search_changed = Signal(str)
@@ -263,7 +264,27 @@ class _ActionBar(QFrame):
         hl.addStretch()
 
         self._export_btn = self._make_btn("Export", "mdi.tray-arrow-down", "secondary")
-        self._export_btn.clicked.connect(self.export_clicked)
+        export_menu = QMenu(self._export_btn)
+        export_menu.setStyleSheet(
+            "QMenu {"
+            "  background: #FFFFFF; border: 1px solid #D1D5DB; border-radius: 6px;"
+            "  padding: 4px;"
+            "}"
+            "QMenu::item {"
+            "  padding: 8px 18px; border-radius: 4px;"
+            "  font-size: 12px; color: #111827;"
+            "}"
+            "QMenu::item:selected { background: #EFF6FF; color: #1D4ED8; }"
+        )
+        for label, fmt in (
+            ("Excel workbook (.xlsx)", "xlsx"),
+            ("CSV spreadsheet (.csv)", "csv"),
+            ("PDF report (.pdf)", "pdf"),
+        ):
+            act = QAction(label, export_menu)
+            act.triggered.connect(lambda _checked=False, f=fmt: self.export_clicked.emit(f))
+            export_menu.addAction(act)
+        self._export_btn.setMenu(export_menu)
         hl.addWidget(self._export_btn)
 
         self._import_btn = self._make_btn("Import", "mdi.tray-arrow-up", "secondary")
@@ -332,7 +353,7 @@ class _TablePage(QWidget):
         self._action_bar = _ActionBar()
         self._action_bar.edit_clicked.connect(register.toggle_edit_mode)
         self._action_bar.save_clicked.connect(register.save_rows)
-        self._action_bar.export_clicked.connect(register.export_xlsx)
+        self._action_bar.export_clicked.connect(register.export_as)
         self._action_bar.import_clicked.connect(register.import_from_file)
         self._action_bar.search_changed.connect(register.set_search)
         self._action_bar.today_clicked.connect(

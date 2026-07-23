@@ -4,7 +4,7 @@ import asyncio
 import calendar
 import re
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
 from bson import ObjectId
 
@@ -111,6 +111,7 @@ async def reject_transaction(tx_id: ObjectId, reason: str) -> bool:
             "verified": False,
             "rejection_reason": reason,
             "rejected": True,
+            "discarded": False,
         }},
     )
     return result.modified_count == 1
@@ -344,6 +345,36 @@ async def get_overview_dashboard(year: int) -> dict:
 
 # ── Inbox filtered queries ────────────────────────────────────────────────────
 
+def _append_text_filters(
+    and_clauses: list,
+    *,
+    search: str = "",
+    item: str = "",
+    description: str = "",
+) -> None:
+    if search.strip():
+        s = re.escape(search.strip())
+        and_clauses.append({"$or": [
+            {"description": {"$regex": s, "$options": "i"}},
+            {"item": {"$regex": s, "$options": "i"}},
+            {"category_name": {"$regex": s, "$options": "i"}},
+            {"truck_number": {"$regex": s, "$options": "i"}},
+        ]})
+    if description.strip():
+        and_clauses.append({
+            "description": {
+                "$regex": re.escape(description.strip()),
+                "$options": "i",
+            },
+        })
+    if item.strip():
+        it = re.escape(item.strip())
+        and_clauses.append({"$or": [
+            {"item": {"$regex": f"^{it}$", "$options": "i"}},
+            {"category_name": {"$regex": f"^{it}$", "$options": "i"}},
+        ]})
+
+
 def _build_inbox_query(
     search: str = "",
     truck: str = "",
@@ -351,18 +382,26 @@ def _build_inbox_query(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     edited: Optional[bool] = None,
+    item: str = "",
+    description: str = "",
 ) -> dict:
     query: dict = {"verified": False, "rejected": {"$ne": True}}
-    # edited=False  → "New" tab: fresh entries never edited-after-verification
+    # edited=False  → "New" tab: fresh entries never flagged as edited
     #                 (matches both False and missing field on legacy docs)
-    # edited=True   → "Edited" tab: rows the cashier changed after approval
+    # edited=True   → "Edited" tab: rows the cashier changed after save
     # edited=None   → no edited filter (all unverified)
     if edited is True:
         query["edited_after_verification"] = True
     elif edited is False:
         query["edited_after_verification"] = {"$ne": True}
-    if search.strip():
-        query["description"] = {"$regex": re.escape(search.strip()), "$options": "i"}
+
+    and_clauses: list = []
+    _append_text_filters(
+        and_clauses, search=search, item=item, description=description,
+    )
+    if and_clauses:
+        query["$and"] = and_clauses
+
     if truck.strip():
         query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
     if cashier_id:
@@ -373,7 +412,9 @@ def _build_inbox_query(
             df["$gte"] = date_from
         if date_to:
             df["$lte"] = date_to
-        query["date"] = df
+        # Edited tab: filter by when the cashier edited, so any-date rows still show.
+        date_field = "last_edited_at" if edited is True else "date"
+        query[date_field] = df
     return query
 
 
@@ -386,9 +427,13 @@ async def get_unverified_filtered(
     limit: int = 25,
     skip: int = 0,
     edited: Optional[bool] = None,
+    item: str = "",
+    description: str = "",
 ) -> List[Transaction]:
     db = get_db()
-    query = _build_inbox_query(search, truck, cashier_id, date_from, date_to, edited)
+    query = _build_inbox_query(
+        search, truck, cashier_id, date_from, date_to, edited, item, description,
+    )
     cursor = (
         db.transactions.find(query)
         .sort([("date", -1), ("created_at", -1)])
@@ -406,9 +451,13 @@ async def count_unverified_filtered(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     edited: Optional[bool] = None,
+    item: str = "",
+    description: str = "",
 ) -> int:
     db = get_db()
-    query = _build_inbox_query(search, truck, cashier_id, date_from, date_to, edited)
+    query = _build_inbox_query(
+        search, truck, cashier_id, date_from, date_to, edited, item, description,
+    )
     return await db.transactions.count_documents(query)
 
 
@@ -422,11 +471,16 @@ async def get_edited_transactions(
     date_to: Optional[datetime] = None,
     limit: int = 25,
     skip: int = 0,
+    item: str = "",
+    description: str = "",
 ) -> List[Transaction]:
-    """Rows the cashier edited after they had been approved (verified=False AND
+    """Rows the cashier edited after save (verified=False AND
     edited_after_verification=True). Sorted by most-recently-edited first."""
     db = get_db()
-    query = _build_inbox_query(search, truck, cashier_id, date_from, date_to, edited=True)
+    query = _build_inbox_query(
+        search, truck, cashier_id, date_from, date_to,
+        edited=True, item=item, description=description,
+    )
     cursor = (
         db.transactions.find(query)
         .sort([("last_edited_at", -1), ("date", -1)])
@@ -443,14 +497,19 @@ async def count_edited_transactions(
     cashier_id: Optional[ObjectId] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    item: str = "",
+    description: str = "",
 ) -> int:
     db = get_db()
-    query = _build_inbox_query(search, truck, cashier_id, date_from, date_to, edited=True)
+    query = _build_inbox_query(
+        search, truck, cashier_id, date_from, date_to,
+        edited=True, item=item, description=description,
+    )
     return await db.transactions.count_documents(query)
 
 
 async def get_edited_count() -> int:
-    """Total edited-after-verification rows awaiting re-approval (for the badge)."""
+    """Total edited rows awaiting re-approval (for the badge)."""
     db = get_db()
     return await db.transactions.count_documents(
         {"verified": False, "edited_after_verification": True, "rejected": {"$ne": True}}
@@ -465,10 +524,16 @@ def _build_rejected_query(
     cashier_id: Optional[ObjectId] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    item: str = "",
+    description: str = "",
 ) -> dict:
-    query: dict = {"rejected": True}
-    if search.strip():
-        query["description"] = {"$regex": re.escape(search.strip()), "$options": "i"}
+    query: dict = {"rejected": True, "discarded": {"$ne": True}}
+    and_clauses: list = []
+    _append_text_filters(
+        and_clauses, search=search, item=item, description=description,
+    )
+    if and_clauses:
+        query["$and"] = and_clauses
     if truck.strip():
         query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
     if cashier_id:
@@ -491,9 +556,13 @@ async def get_rejected_transactions(
     date_to: Optional[datetime] = None,
     limit: int = 25,
     skip: int = 0,
+    item: str = "",
+    description: str = "",
 ) -> List[Transaction]:
     db = get_db()
-    query = _build_rejected_query(search, truck, cashier_id, date_from, date_to)
+    query = _build_rejected_query(
+        search, truck, cashier_id, date_from, date_to, item, description,
+    )
     cursor = (
         db.transactions.find(query)
         .sort([("date", -1), ("created_at", -1)])
@@ -510,16 +579,23 @@ async def count_rejected_transactions(
     cashier_id: Optional[ObjectId] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    item: str = "",
+    description: str = "",
 ) -> int:
     db = get_db()
-    query = _build_rejected_query(search, truck, cashier_id, date_from, date_to)
+    query = _build_rejected_query(
+        search, truck, cashier_id, date_from, date_to, item, description,
+    )
     return await db.transactions.count_documents(query)
 
 
 async def get_rejected_count() -> int:
     """Total rejected entries across all cashiers (for the badge)."""
     db = get_db()
-    return await db.transactions.count_documents({"rejected": True})
+    return await db.transactions.count_documents({
+        "rejected": True,
+        "discarded": {"$ne": True},
+    })
 
 
 async def return_to_inbox(tx_id: ObjectId) -> bool:
@@ -527,7 +603,7 @@ async def return_to_inbox(tx_id: ObjectId) -> bool:
     db = get_db()
     result = await db.transactions.update_one(
         {"_id": tx_id, "rejected": True},
-        {"$set": {"rejected": False, "rejection_reason": None}},
+        {"$set": {"rejected": False, "rejection_reason": None, "discarded": False}},
     )
     return result.modified_count == 1
 
@@ -631,6 +707,16 @@ async def get_unverified_trucks() -> List[str]:
     return sorted(v for v in vals if v)
 
 
+async def get_unverified_items() -> List[str]:
+    """Distinct item / category names for Verify filter dropdowns."""
+    db = get_db()
+    base = {"verified": False, "rejected": {"$ne": True}}
+    items = await db.transactions.distinct("item", base)
+    cats = await db.transactions.distinct("category_name", base)
+    names = {*(v for v in items if v), *(v for v in cats if v)}
+    return sorted(names, key=str.lower)
+
+
 async def get_unverified_cashier_ids() -> List[ObjectId]:
     db = get_db()
     vals = await db.transactions.distinct("cashier_id", {"verified": False, "rejected": {"$ne": True}})
@@ -639,13 +725,28 @@ async def get_unverified_cashier_ids() -> List[ObjectId]:
 
 async def get_rejected_trucks() -> List[str]:
     db = get_db()
-    vals = await db.transactions.distinct("truck_number", {"rejected": True})
+    vals = await db.transactions.distinct(
+        "truck_number",
+        {"rejected": True, "discarded": {"$ne": True}},
+    )
     return sorted(v for v in vals if v)
+
+
+async def get_rejected_items() -> List[str]:
+    db = get_db()
+    base = {"rejected": True, "discarded": {"$ne": True}}
+    items = await db.transactions.distinct("item", base)
+    cats = await db.transactions.distinct("category_name", base)
+    names = {*(v for v in items if v), *(v for v in cats if v)}
+    return sorted(names, key=str.lower)
 
 
 async def get_rejected_cashier_ids() -> List[ObjectId]:
     db = get_db()
-    vals = await db.transactions.distinct("cashier_id", {"rejected": True})
+    vals = await db.transactions.distinct(
+        "cashier_id",
+        {"rejected": True, "discarded": {"$ne": True}},
+    )
     return [v for v in vals if v is not None]
 
 
@@ -3661,17 +3762,33 @@ async def _load_truck_overview_rows(truck: str) -> list:
     return master_rows + diesel_rows + imported_rows + separate_rows + extra_rows
 
 
+def _normalize_truck_overview_sources(
+    source: Union[str, Sequence[str], None],
+) -> Optional[Set[str]]:
+    """Return ``None`` for all sources, else the selected ``source_group`` keys."""
+    if source is None or source == "" or source == "all":
+        return None
+    if isinstance(source, str):
+        keys = [source]
+    else:
+        keys = [str(k) for k in source]
+    if not keys or "all" in keys:
+        return None
+    wanted = {k for k in keys if k in _TRUCK_OVERVIEW_SOURCES and k != "all"}
+    return wanted or None
+
+
 def _filter_truck_overview_rows(
     rows: list,
     search: str = "",
-    source: str = "all",
+    source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> list:
-    wanted = source if source in _TRUCK_OVERVIEW_SOURCES else "all"
+    wanted = _normalize_truck_overview_sources(source)
     filtered = [
         row for row in rows
-        if (wanted == "all" or row["source_group"] == wanted)
+        if (wanted is None or row["source_group"] in wanted)
         and _truck_row_matches_search(row, search)
         and _truck_row_in_date_range(row, date_from, date_to)
     ]
@@ -3682,7 +3799,7 @@ def _filter_truck_overview_rows(
 async def get_truck_overview_records(
     truck: str,
     search: str = "",
-    source: str = "all",
+    source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     limit: int = 50,
@@ -3703,7 +3820,7 @@ async def get_truck_overview_records(
 async def count_truck_overview_records(
     truck: str,
     search: str = "",
-    source: str = "all",
+    source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> int:
@@ -3722,7 +3839,7 @@ async def count_truck_overview_records(
 async def get_truck_overview_summary(
     truck: str,
     search: str = "",
-    source: str = "all",
+    source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> dict:

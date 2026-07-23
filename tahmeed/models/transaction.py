@@ -31,10 +31,11 @@ class Transaction:
     verified_by: Optional[ObjectId] = None
     verified_at: Optional[datetime] = None
     rejection_reason: Optional[str] = None
-    edited_after_verification: bool = False    # True if cashier edited a previously verified row
+    edited_after_verification: bool = False    # True if cashier edited a saved row awaiting re-approval
     last_edited_at: Optional[datetime] = None  # Timestamp of last cashier edit
     last_edited_by: Optional[ObjectId] = None  # Cashier who made the edit
     rejected: bool = False                     # True when accountant explicitly rejects the entry
+    discarded: bool = False                    # True when cashier soft-discards a rejected entry
     original_transaction_id: Optional[ObjectId] = None  # Points to the original approved doc when this is a pending edit
     month: Optional[str] = None   # e.g. "Jan 25"
     year: Optional[int] = None    # e.g. 2025
@@ -77,6 +78,7 @@ class Transaction:
             "last_edited_at": self.last_edited_at,
             "last_edited_by": self.last_edited_by,
             "rejected": self.rejected,
+            "discarded": self.discarded,
             "original_transaction_id": self.original_transaction_id,
             "month": self.month,
             "year": self.year,
@@ -124,6 +126,7 @@ class Transaction:
             last_edited_at=doc.get("last_edited_at"),
             last_edited_by=doc.get("last_edited_by"),
             rejected=doc.get("rejected", False),
+            discarded=doc.get("discarded", False),
             original_transaction_id=doc.get("original_transaction_id"),
             month=doc.get("month"),
             year=doc.get("year"),
