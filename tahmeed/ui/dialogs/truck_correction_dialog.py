@@ -77,12 +77,14 @@ _BTN_PRIMARY = (
 
 @dataclass
 class TruckIssue:
-    row: int                 # 0-based grid row
+    row: int                 # 0-based grid / import row
     original: str
     kind: IssueKind
     corrected: str = ""      # filled when resolved
-    skip: bool = False       # clear the cell
+    skip: bool = False       # clear the cell (cashier) or empty
     is_place_label: bool = False
+    omit_row: bool = False   # import mode: park row for later (Skipped tab)
+    allow_anyway: bool = False  # import mode: save even if not in fleet
 
 
 @dataclass
@@ -94,6 +96,8 @@ class _RowWidgets:
     add_btn: Optional[QPushButton] = None
     kind_choice: Optional[QComboBox] = None
     accept_label_btn: Optional[QPushButton] = None
+    allow_btn: Optional[QPushButton] = None
+    skip_row_btn: Optional[QPushButton] = None
 
 
 class TruckCorrectionDialog(QDialog):
@@ -107,15 +111,17 @@ class TruckCorrectionDialog(QDialog):
         can_add: bool = False,
         allowed_labels: Optional[Set[str]] = None,
         on_resolved=None,
+        import_mode: bool = False,
         parent=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Correct truck numbers")
-        self.setMinimumWidth(640)
+        self.setMinimumWidth(720 if import_mode else 640)
         self.setMinimumHeight(380)
         self.setModal(True)
         self._fleet = set(fleet)
         self._can_add = can_add
+        self._import_mode = import_mode
         self._on_resolved = on_resolved  # optional callback(TruckIssue) per resolved row
         self._allowed_labels: Set[str] = {
             normalize_place_label(x) for x in (allowed_labels or set()) if x
@@ -150,16 +156,24 @@ class TruckCorrectionDialog(QDialog):
         )
         root.addWidget(title)
 
-        intro = QLabel(
-            "All flagged trucks are listed here. Fix one, accept a place label "
-            "(YARD / GARAGE), or clear it — it will leave the list. "
-            "When nothing remains, this window closes."
-            + (
-                " You can also add a missing truck/trailer to the registry."
-                if self._can_add
-                else ""
+        if self._import_mode:
+            intro_text = (
+                "These truck numbers are not in your fleet (or need a format fix). "
+                "Apply a correction, allow a row anyway, or skip it for follow-up — "
+                "skipped rows go to the Skipped tab and can rejoin this upload later. "
+                "Matching rows continue importing."
             )
-        )
+            if self._can_add:
+                intro_text += " You can also add a missing truck/trailer to the registry."
+        else:
+            intro_text = (
+                "All flagged trucks are listed here. Fix one, accept a place label "
+                "(YARD / GARAGE), or clear it — it will leave the list. "
+                "When nothing remains, this window closes."
+            )
+            if self._can_add:
+                intro_text += " You can also add a missing truck/trailer to the registry."
+        intro = QLabel(intro_text)
         intro.setWordWrap(True)
         intro.setStyleSheet(
             f"color: {_T2}; font-size: 12px; border: none; background: transparent;"
@@ -188,9 +202,28 @@ class TruckCorrectionDialog(QDialog):
         scroll.setWidget(body)
         root.addWidget(scroll, 1)
 
+        if self._import_mode:
+            bulk = QHBoxLayout()
+            bulk.setSpacing(8)
+            skip_all = QPushButton("Skip all remaining")
+            skip_all.setCursor(Qt.PointingHandCursor)
+            skip_all.setStyleSheet(_BTN_SECONDARY)
+            skip_all.clicked.connect(self._skip_all_remaining)
+            bulk.addWidget(skip_all)
+            allow_all = QPushButton("Allow all remaining")
+            allow_all.setCursor(Qt.PointingHandCursor)
+            allow_all.setStyleSheet(_BTN_ORANGE)
+            allow_all.clicked.connect(self._allow_all_remaining)
+            bulk.addWidget(allow_all)
+            bulk.addStretch()
+            root.addLayout(bulk)
+
         buttons = QDialogButtonBox()
         done_btn = buttons.addButton("Done", QDialogButtonBox.AcceptRole)
-        cancel_btn = buttons.addButton("Cancel remaining", QDialogButtonBox.RejectRole)
+        cancel_btn = buttons.addButton(
+            "Skip remaining" if self._import_mode else "Cancel remaining",
+            QDialogButtonBox.RejectRole,
+        )
         done_btn.setDefault(True)
         done_btn.setStyleSheet(_BTN_PRIMARY)
         cancel_btn.setStyleSheet(_BTN_SECONDARY)
@@ -322,11 +355,28 @@ class TruckCorrectionDialog(QDialog):
         apply_btn.setStyleSheet(_BTN_PRIMARY)
         edit_row.addWidget(apply_btn)
 
-        clear_btn = QPushButton("Clear")
-        clear_btn.setCursor(Qt.PointingHandCursor)
-        clear_btn.setFixedHeight(_CTRL_H)
-        clear_btn.setStyleSheet(_BTN_SECONDARY)
-        edit_row.addWidget(clear_btn)
+        allow_btn = None
+        skip_row_btn = None
+        if self._import_mode:
+            allow_btn = QPushButton("Allow anyway")
+            allow_btn.setToolTip("Import this row even if the truck is not in the fleet")
+            allow_btn.setCursor(Qt.PointingHandCursor)
+            allow_btn.setFixedHeight(_CTRL_H)
+            allow_btn.setStyleSheet(_BTN_ORANGE)
+            edit_row.addWidget(allow_btn)
+
+            skip_row_btn = QPushButton("Skip row")
+            skip_row_btn.setToolTip("Park this row in Skipped — other rows still import")
+            skip_row_btn.setCursor(Qt.PointingHandCursor)
+            skip_row_btn.setFixedHeight(_CTRL_H)
+            skip_row_btn.setStyleSheet(_BTN_SECONDARY)
+            edit_row.addWidget(skip_row_btn)
+        else:
+            clear_btn = QPushButton("Clear")
+            clear_btn.setCursor(Qt.PointingHandCursor)
+            clear_btn.setFixedHeight(_CTRL_H)
+            clear_btn.setStyleSheet(_BTN_SECONDARY)
+            edit_row.addWidget(clear_btn)
         lay.addLayout(edit_row)
 
         rw = _RowWidgets(
@@ -337,6 +387,8 @@ class TruckCorrectionDialog(QDialog):
             add_btn=add_btn,
             kind_choice=kind_choice,
             accept_label_btn=accept_btn,
+            allow_btn=allow_btn,
+            skip_row_btn=skip_row_btn,
         )
         self._refresh_kind_label(rw)
         accept_btn.setVisible(
@@ -347,7 +399,12 @@ class TruckCorrectionDialog(QDialog):
         edit.textChanged.connect(lambda _t, r=rw: self._on_edit_changed(r))
         apply_btn.clicked.connect(lambda _=False, r=rw: self._apply_row(r))
         accept_btn.clicked.connect(lambda _=False, r=rw: self._accept_label_row(r))
-        clear_btn.clicked.connect(lambda _=False, r=rw: self._clear_row(r))
+        if allow_btn is not None:
+            allow_btn.clicked.connect(lambda _=False, r=rw: self._allow_anyway_row(r))
+        if skip_row_btn is not None:
+            skip_row_btn.clicked.connect(lambda _=False, r=rw: self._omit_row(r))
+        else:
+            clear_btn.clicked.connect(lambda _=False, r=rw: self._clear_row(r))
         if add_btn is not None and kind_choice is not None:
             add_btn.clicked.connect(
                 lambda _=False, r=rw: self._add_to_registry_row(r)
@@ -407,8 +464,54 @@ class TruckCorrectionDialog(QDialog):
         issue = rw.issue
         issue.corrected = ""
         issue.skip = True
+        issue.omit_row = False
+        issue.allow_anyway = False
         issue.is_place_label = False
         self._remove_row(rw, issue)
+
+    def _omit_row(self, rw: _RowWidgets) -> None:
+        """Import mode: park this row for the Skipped tab; do not import it now."""
+        issue = rw.issue
+        text = rw.edit.text().strip()
+        issue.corrected = text or issue.original
+        issue.skip = False
+        issue.omit_row = True
+        issue.allow_anyway = False
+        issue.is_place_label = False
+        self._remove_row(rw, issue)
+
+    def _allow_anyway_row(self, rw: _RowWidgets) -> None:
+        """Import mode: accept truck even when not in fleet / odd format."""
+        text = rw.edit.text().strip() or rw.issue.original
+        if not text:
+            QMessageBox.warning(self, "Allow anyway", "Enter a truck value first.")
+            return
+        norm = normalize_truck_number(text, allowed_labels=self._allowed_labels)
+        if norm.status in ("ok", "normalized"):
+            value = norm.value
+            matched = try_match_fleet(value, self._fleet)
+            if matched is not None:
+                value = matched
+        elif norm.status == "place_label":
+            value = norm.value
+        else:
+            value = " ".join(text.upper().split())
+        rw.edit.setText(value)
+        issue = rw.issue
+        issue.corrected = value
+        issue.skip = False
+        issue.omit_row = False
+        issue.allow_anyway = True
+        issue.is_place_label = norm.status == "place_label"
+        self._remove_row(rw, issue)
+
+    def _skip_all_remaining(self) -> None:
+        for rw in list(self._rows):
+            self._omit_row(rw)
+
+    def _allow_all_remaining(self) -> None:
+        for rw in list(self._rows):
+            self._allow_anyway_row(rw)
 
     def _accept_label_row(self, rw: _RowWidgets) -> None:
         text = normalize_place_label(rw.edit.text())
@@ -431,19 +534,26 @@ class TruckCorrectionDialog(QDialog):
         issue = rw.issue
         issue.corrected = text
         issue.skip = False
+        issue.omit_row = False
+        issue.allow_anyway = False
         issue.is_place_label = True
         self._remove_row(rw, issue)
 
     def _apply_row(self, rw: _RowWidgets) -> None:
         text = rw.edit.text().strip()
         if not text:
-            self._clear_row(rw)
+            if self._import_mode:
+                self._omit_row(rw)
+            else:
+                self._clear_row(rw)
             return
 
         if is_allowed_place_label(text, self._allowed_labels):
             issue = rw.issue
             issue.corrected = normalize_place_label(text)
             issue.skip = False
+            issue.omit_row = False
+            issue.allow_anyway = False
             issue.is_place_label = True
             self._remove_row(rw, issue)
             return
@@ -453,18 +563,29 @@ class TruckCorrectionDialog(QDialog):
             issue = rw.issue
             issue.corrected = norm.value
             issue.skip = False
+            issue.omit_row = False
+            issue.allow_anyway = False
             issue.is_place_label = True
             self._remove_row(rw, issue)
             return
 
         if norm.status == "invalid":
-            QMessageBox.warning(
-                self,
-                "Invalid format",
-                f'"{text}" is not a valid truck number.\n\n'
-                "Use T + digits + space + suffix, e.g. T688 EAF,\n"
-                "or click “Accept label” for YARD / GARAGE.",
-            )
+            if self._import_mode:
+                QMessageBox.warning(
+                    self,
+                    "Invalid format",
+                    f'"{text}" is not a recognized truck format yet.\n\n'
+                    "Use “Allow anyway” to import as-is, “Skip row” to park it, "
+                    "or enter a T + digits + suffix number (e.g. T688 EAF).",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Invalid format",
+                    f'"{text}" is not a valid truck number.\n\n'
+                    "Use T + digits + space + suffix, e.g. T688 EAF,\n"
+                    "or click “Accept label” for YARD / GARAGE.",
+                )
             rw.edit.setFocus()
             return
 
@@ -477,9 +598,17 @@ class TruckCorrectionDialog(QDialog):
                 "Not in registry",
                 f'"{number}" is not in the truck/trailer registry.\n\n'
                 + (
-                    "Use “Add to registry”, or enter a registered number."
-                    if self._can_add
-                    else "Enter a registered number, or ask an admin/accountant to add it."
+                    "Use “Add to registry”, “Allow anyway”, or “Skip row”."
+                    if self._import_mode and self._can_add
+                    else (
+                        "Use “Allow anyway” or “Skip row”, or enter a registered number."
+                        if self._import_mode
+                        else (
+                            "Use “Add to registry”, or enter a registered number."
+                            if self._can_add
+                            else "Enter a registered number, or ask an admin/accountant to add it."
+                        )
+                    )
                 ),
             )
             rw.edit.setFocus()
@@ -488,6 +617,8 @@ class TruckCorrectionDialog(QDialog):
         issue = rw.issue
         issue.corrected = matched
         issue.skip = False
+        issue.omit_row = False
+        issue.allow_anyway = False
         issue.is_place_label = False
         self._remove_row(rw, issue)
 
@@ -512,6 +643,8 @@ class TruckCorrectionDialog(QDialog):
         issue = rw.issue
         issue.corrected = number
         issue.skip = False
+        issue.omit_row = False
+        issue.allow_anyway = False
         issue.is_place_label = False
         self._remove_row(rw, issue)
 
@@ -552,11 +685,15 @@ class TruckCorrectionDialog(QDialog):
                     self._remove_row(rw, issue)
                     continue
         if self._rows:
+            tip = (
+                "Skip row / Allow anyway, or fix with Apply."
+                if self._import_mode
+                else "Resolve them in the list, or Cancel remaining."
+            )
             QMessageBox.information(
                 self,
                 "Still need attention",
-                f"{len(self._rows)} truck(s) still need a fix, Accept label, or Clear.\n"
-                "Resolve them in the list, or Cancel remaining.",
+                f"{len(self._rows)} truck(s) still need attention.\n{tip}",
             )
             self._rows[0].edit.setFocus()
             return
@@ -566,21 +703,29 @@ class TruckCorrectionDialog(QDialog):
             self.accept()
 
     def _on_cancel(self) -> None:
-        """Clear every still-open issue and close."""
+        """Skip/clear every still-open issue and close."""
         for rw in list(self._rows):
-            issue = rw.issue
-            issue.corrected = ""
-            issue.skip = True
-            issue.is_place_label = False
-            self.issues.append(issue)
-            if rw in self._rows:
-                self._rows.remove(rw)
-            rw.card.setParent(None)
-            rw.card.deleteLater()
-            if callable(self._on_resolved):
-                try:
-                    self._on_resolved(issue)
-                except Exception:
-                    pass
+            if self._import_mode:
+                self._omit_row(rw)
+            else:
+                issue = rw.issue
+                issue.corrected = ""
+                issue.skip = True
+                issue.omit_row = False
+                issue.allow_anyway = False
+                issue.is_place_label = False
+                self.issues.append(issue)
+                if rw in self._rows:
+                    self._rows.remove(rw)
+                rw.card.setParent(None)
+                rw.card.deleteLater()
+                if callable(self._on_resolved):
+                    try:
+                        self._on_resolved(issue)
+                    except Exception:
+                        pass
         self._update_count()
-        self.reject()
+        if self._import_mode:
+            self.accept()
+        else:
+            self.reject()

@@ -14,6 +14,7 @@ from tahmeed.services.truck_format import normalize_truck_number
 from tahmeed.services.cashier_service import search_descriptions
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_completion
+from tahmeed.ui.accountant.date_filters import style_calendar_popup
 
 # ---------------------------------------------------------------------------
 # Column indices
@@ -377,6 +378,7 @@ class _DateDelegate(_ExcelCellDelegate):
             "QDateEdit { color: #111827; background: #ffffff; }"
             "QDateEdit::drop-down { width: 20px; }"
         )
+        style_calendar_popup(ed)
         return ed
 
     def setEditorData(self, editor, index):

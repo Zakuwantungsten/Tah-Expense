@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from time import monotonic
 from typing import List, Optional, Sequence
 
 import qtawesome as qta
@@ -36,6 +37,8 @@ from PySide6.QtWidgets import (
 
 from tahmeed.services.truck_service import search_fleet
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import _make_table, _cell, _finish_table_row
 
 _WHITE = "#FFFFFF"
@@ -51,7 +54,7 @@ _T2 = "#6B7280"
 _TM = "#9CA3AF"
 _HDR_BG = "#F1F5F9"
 
-_PAGE_SIZES = [25, 50, 100]
+_SCROLL_CHUNK = 50
 _ROW_H = 32
 _MIN_FILTER_DATE = QDate(2000, 1, 1)
 
@@ -129,7 +132,10 @@ class _SourceMultiCombo(QComboBox):
         self.setEditable(True)
         self.lineEdit().setReadOnly(True)
         self.lineEdit().setPlaceholderText("All Sources")
+        self.lineEdit().setCursor(Qt.PointingHandCursor)
         self.setInsertPolicy(QComboBox.NoInsert)
+        self.setMaxVisibleItems(14)
+        self.setFocusPolicy(Qt.StrongFocus)
 
         self._model = QStandardItemModel(self)
         self.setModel(self._model)
@@ -150,25 +156,50 @@ class _SourceMultiCombo(QComboBox):
             item.setCheckState(Qt.Unchecked)
             self._model.appendRow(item)
 
+        self.lineEdit().installEventFilter(self)
         self.view().viewport().installEventFilter(self)
         self._model.itemChanged.connect(self._on_item_changed)
         self._refresh_label()
 
+    def showPopup(self) -> None:
+        # Keep the popup at least as wide as the combo for readable checkboxes.
+        self.view().setMinimumWidth(max(self.width(), 200))
+        self._popup_shown_at = monotonic()
+        super().showPopup()
+
     def hidePopup(self) -> None:
+        # QScrollArea toolbars often fire an immediate hide right after show.
+        if monotonic() - getattr(self, "_popup_shown_at", 0) < 0.2:
+            return
         super().hidePopup()
         # Editable combo can snap the line edit back to a row label on close.
         self._refresh_label()
 
+    def mousePressEvent(self, event) -> None:
+        # Whole control opens the list (not only the tiny arrow).
+        self.showPopup()
+
     def eventFilter(self, obj, event) -> bool:
-        if obj is self.view().viewport() and event.type() == QEvent.MouseButtonRelease:
-            index = self.view().indexAt(event.pos())
-            if index.isValid():
-                item = self._model.itemFromIndex(index)
-                if item is not None and item.flags() & Qt.ItemIsUserCheckable:
-                    item.setCheckState(
-                        Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
-                    )
+        # Line-edit is read-only; without this, clicks on the text do nothing.
+        if obj is self.lineEdit() and event.type() == QEvent.MouseButtonPress:
+            self.showPopup()
+            return True
+        if obj is self.view().viewport():
+            # Swallow press so Qt does not select-and-close before we toggle.
+            if event.type() == QEvent.MouseButtonPress:
+                index = self.view().indexAt(event.position().toPoint())
+                if index.isValid():
                     return True
+            if event.type() == QEvent.MouseButtonRelease:
+                index = self.view().indexAt(event.position().toPoint())
+                if index.isValid():
+                    item = self._model.itemFromIndex(index)
+                    if item is not None and item.flags() & Qt.ItemIsUserCheckable:
+                        item.setCheckState(
+                            Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
+                        )
+                        # Keep popup open for multi-select / bulk toggling.
+                        return True
         return super().eventFilter(obj, event)
 
     def _on_item_changed(self, item: QStandardItem) -> None:
@@ -222,7 +253,8 @@ class _SourceMultiCombo(QComboBox):
 
     def _refresh_label(self) -> None:
         text = self.summary_text()
-        self.setCurrentText(text)
+        # Avoid setCurrentText — it can change currentIndex and fight the popup.
+        self.lineEdit().setText(text)
         self.lineEdit().setToolTip(text)
 
     def reset_to_all(self) -> None:
@@ -359,62 +391,26 @@ class _SummaryCard(QFrame):
         )
 
 
-class _PaginationBar(QFrame):
+class _StatusFooter(QFrame):
+    """Footer that shows infinite-scroll progress (Master / Verify style)."""
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._page = 0
-        self._total = 0
-        self._size = _PAGE_SIZES[0]
-        self.setObjectName("truckPager")
-        self.setFixedHeight(44)
+        self.setObjectName("truckStatusFooter")
+        self.setFixedHeight(36)
         self.setStyleSheet(
-            f"QFrame#truckPager {{"
-            f"  background: {_WHITE};"
-            f"  border: none;"
-            f"  border-top: 1px solid {_BORDER};"
+            f"QFrame#truckStatusFooter {{"
+            f"  background: {_WHITE}; border: none; border-top: 1px solid {_BORDER};"
             f"}}"
         )
-
         hl = QHBoxLayout(self)
         hl.setContentsMargins(16, 0, 16, 0)
-        hl.setSpacing(10)
-        self._size_cb = QComboBox()
-        for size in _PAGE_SIZES:
-            self._size_cb.addItem(f"Show {size}", size)
-        self._size_cb.setFixedWidth(100)
-        self._size_cb.setStyleSheet(_input_ss())
-        hl.addWidget(self._size_cb)
-
         self._info = _lbl("Select a truck to load records", size=12, color=_T2)
         hl.addWidget(self._info)
         hl.addStretch()
 
-        self._prev = _btn("← Prev", primary=False)
-        self._next = _btn("Next →", primary=False)
-        self._prev.setFixedWidth(88)
-        self._next.setFixedWidth(88)
-        hl.addWidget(self._prev)
-        hl.addWidget(self._next)
-
-    def bind(self, on_prev, on_next, on_size) -> None:
-        self._prev.clicked.connect(on_prev)
-        self._next.clicked.connect(on_next)
-        self._size_cb.currentIndexChanged.connect(on_size)
-
-    def page_size(self) -> int:
-        return self._size_cb.currentData() or _PAGE_SIZES[0]
-
-    def update_state(self, page: int, total: int, size: int) -> None:
-        self._page, self._total, self._size = page, total, size
-        max_page = max(0, (total - 1) // size) if total else 0
-        self._prev.setEnabled(page > 0)
-        self._next.setEnabled(page < max_page)
-        start = page * size + 1 if total else 0
-        end = min((page + 1) * size, total)
-        self._info.setText(
-            f"Showing {start:,}–{end:,} of {total:,}  ·  Page {page + 1} of {max_page + 1}"
-            if total else "No matching records"
-        )
+    def set_text(self, text: str) -> None:
+        self._info.setText(text)
 
 
 def _write_truck_overview_excel(
@@ -615,15 +611,17 @@ def _write_truck_overview_excel(
 class TruckOverviewWidget(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._page = 0
+        self._loaded = 0
         self._total = 0
         self._active_truck = ""
         self._loading = False
+        self._scroll_loading = False
+        self._reload_generation = 0
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(300)
-        self._debounce.timeout.connect(lambda: asyncio.ensure_future(self._reload()))
+        self._debounce.timeout.connect(self._reset_and_load)
 
         self._build()
 
@@ -680,11 +678,13 @@ class TruckOverviewWidget(QWidget):
                 hdr.setSectionResizeMode(idx, QHeaderView.Stretch)
             else:
                 hdr.setSectionResizeMode(idx, QHeaderView.Interactive)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         root.addWidget(self._table, 1)
 
-        self._pager = _PaginationBar()
-        self._pager.bind(self._on_prev, self._on_next, self._on_page_size_changed)
-        root.addWidget(self._pager)
+        self._footer = _StatusFooter()
+        root.addWidget(self._footer)
+
+        self._loading_overlay = LoadingOverlay(self, "Loading truck overview…")
 
     def _build_toolbar(self) -> QFrame:
         toolbar = QFrame()
@@ -752,6 +752,7 @@ class TruckOverviewWidget(QWidget):
         self._from_date.setFixedWidth(130)
         self._from_date.setFixedHeight(_CTRL_H)
         self._from_date.setStyleSheet(_input_ss())
+        style_calendar_popup(self._from_date)
         self._from_date.dateChanged.connect(lambda _d: self._on_filter_changed())
         filter_row.addWidget(self._from_date)
 
@@ -764,6 +765,7 @@ class TruckOverviewWidget(QWidget):
         self._to_date.setFixedWidth(130)
         self._to_date.setFixedHeight(_CTRL_H)
         self._to_date.setStyleSheet(_input_ss())
+        style_calendar_popup(self._to_date)
         self._to_date.dateChanged.connect(lambda _d: self._on_filter_changed())
         filter_row.addWidget(self._to_date)
 
@@ -817,7 +819,7 @@ class TruckOverviewWidget(QWidget):
 
     def refresh(self) -> None:
         if self._active_truck:
-            asyncio.ensure_future(self._reload())
+            self._reset_and_load()
 
     def _selected_truck(self) -> str:
         return self._truck_edit.text().strip().upper()
@@ -862,49 +864,74 @@ class TruckOverviewWidget(QWidget):
             QMessageBox.warning(self, "Invalid Date Range", "'From' date cannot be later than 'To' date.")
         return valid
 
-    def _on_load_clicked(self) -> None:
-        truck = self._selected_truck()
-        self._active_truck = truck
-        self._page = 0
-        asyncio.ensure_future(self._reload())
+    def _filter_kw(self) -> dict:
+        date_from, date_to = self._date_filters()
+        return dict(
+            truck=self._active_truck or self._selected_truck(),
+            search=self._search_text(),
+            source=self._source_filter_param(),
+            date_from=date_from,
+            date_to=date_to,
+        )
 
-    def _on_filter_changed(self) -> None:
+    def _update_footer(self) -> None:
         if not self._active_truck:
-            return
-        self._page = 0
-        self._debounce.start()
+            self._footer.set_text("Select a truck to load records")
+        elif self._loading and self._loaded == 0:
+            self._footer.set_text("Loading…")
+        elif self._total == 0:
+            self._footer.set_text("No matching records")
+        elif self._loaded >= self._total:
+            self._footer.set_text(f"Showing all {self._total:,} records")
+        else:
+            self._footer.set_text(
+                f"Showing {self._loaded:,} of {self._total:,}  •  Scroll down for more"
+            )
 
-    def _on_page_size_changed(self) -> None:
-        if not self._active_truck:
-            return
-        self._page = 0
-        asyncio.ensure_future(self._reload())
-
-    def _on_prev(self) -> None:
-        if self._page > 0:
-            self._page -= 1
-            asyncio.ensure_future(self._reload())
-
-    def _on_next(self) -> None:
-        size = self._pager.page_size()
-        max_page = max(0, (self._total - 1) // size) if self._total else 0
-        if self._page < max_page:
-            self._page += 1
-            asyncio.ensure_future(self._reload())
-
-    async def _reload(self) -> None:
-        if self._loading:
-            return
+    def _reset_and_load(self) -> None:
         if not self._has_valid_date_range(warn=True):
             return
         truck = self._active_truck or self._selected_truck()
         if not truck:
             self._status.setText("Enter a truck number to load the overview.")
             self._table.setRowCount(0)
+            self._footer.set_text("Select a truck to load records")
+            return
+        self._active_truck = truck
+        self._reload_generation += 1
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        self._update_footer()
+        asyncio.ensure_future(self._load_initial(self._reload_generation))
+
+    def _on_load_clicked(self) -> None:
+        self._active_truck = self._selected_truck()
+        self._reset_and_load()
+
+    def _on_filter_changed(self) -> None:
+        if not self._active_truck:
+            return
+        self._debounce.start()
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    async def _load_initial(self, generation: int) -> None:
+        if self._loading:
+            return
+        truck = self._active_truck or self._selected_truck()
+        if not truck:
             return
 
         self._loading = True
+        self._loading_overlay.show_loading(f"Loading data for {truck}…")
         self._status.setText(f"Loading data for {truck}…")
+        self._update_footer()
         try:
             from tahmeed.services.accountant_service import (
                 get_truck_overview_records,
@@ -912,34 +939,15 @@ class TruckOverviewWidget(QWidget):
                 get_truck_overview_summary,
             )
 
-            size = self._pager.page_size()
-            skip = self._page * size
-            date_from, date_to = self._date_filters()
+            kw = self._filter_kw()
             records, total, summary = await asyncio.gather(
-                get_truck_overview_records(
-                    truck=truck,
-                    search=self._search_text(),
-                    source=self._source_filter_param(),
-                    date_from=date_from,
-                    date_to=date_to,
-                    limit=size,
-                    skip=skip,
-                ),
-                count_truck_overview_records(
-                    truck=truck,
-                    search=self._search_text(),
-                    source=self._source_filter_param(),
-                    date_from=date_from,
-                    date_to=date_to,
-                ),
-                get_truck_overview_summary(
-                    truck=truck,
-                    search=self._search_text(),
-                    source=self._source_filter_param(),
-                    date_from=date_from,
-                    date_to=date_to,
-                ),
+                get_truck_overview_records(**kw, limit=_SCROLL_CHUNK, skip=0),
+                count_truck_overview_records(**kw),
+                get_truck_overview_summary(**kw),
             )
+            if generation != self._reload_generation:
+                return
+
             self._active_truck = truck
             self._total = total
             self._subtitle.setText(f"Cross-source view for {truck}")
@@ -949,20 +957,51 @@ class TruckOverviewWidget(QWidget):
             self._usd_card.set_value(_fmt_amount("USD", summary["usd_total"]))
             self._zmw_card.set_value(_fmt_amount("ZMW", summary["zmw_total"]))
             self._liters_card.set_value(_fmt_num(summary["liters_total"], 0))
-            self._fill_table(records)
-            self._pager.update_state(self._page, total, size)
+            self._fill_table(records, append=False)
+            self._loaded = len(records)
             self._status.setText(
                 f"Loaded {total:,} cross-source row(s) for {truck}. "
                 "Zambia entries are summarized under ZMW."
             )
         except Exception as exc:
-            self._table.setRowCount(0)
-            self._status.setText(f"Failed to load truck overview: {exc}")
+            if generation == self._reload_generation:
+                self._table.setRowCount(0)
+                self._status.setText(f"Failed to load truck overview: {exc}")
         finally:
             self._loading = False
+            self._loading_overlay.hide_loading()
+            if generation == self._reload_generation:
+                self._update_footer()
 
-    def _fill_table(self, rows: list) -> None:
-        self._table.setRowCount(0)
+    async def _load_more(self) -> None:
+        if self._scroll_loading or self._loading:
+            return
+        if self._loaded >= self._total:
+            return
+        self._scroll_loading = True
+        self._update_footer()
+        try:
+            from tahmeed.services.accountant_service import get_truck_overview_records
+
+            kw = self._filter_kw()
+            gen = self._reload_generation
+            records = await get_truck_overview_records(
+                **kw, limit=_SCROLL_CHUNK, skip=self._loaded,
+            )
+            if gen != self._reload_generation:
+                return
+            if records:
+                self._fill_table(records, append=True)
+                self._loaded += len(records)
+        except Exception:
+            pass
+        finally:
+            self._scroll_loading = False
+            self._update_footer()
+
+    def _fill_table(self, rows: list, *, append: bool = False) -> None:
+        if not append:
+            self._table.setRowCount(0)
         for idx, row in enumerate(rows):
             r = self._table.rowCount()
             self._table.insertRow(r)
@@ -1210,8 +1249,9 @@ class TruckOverviewWidget(QWidget):
     def _clear_results(self) -> None:
         self._debounce.stop()
         self._active_truck = ""
-        self._page = 0
+        self._loaded = 0
         self._total = 0
+        self._reload_generation += 1
         self._truck_edit.clear()
         self._source_cb.reset_to_all()
         self._from_date.setDate(_MIN_FILTER_DATE)
@@ -1220,7 +1260,7 @@ class TruckOverviewWidget(QWidget):
         self._subtitle.setText("Select a truck to gather cross-source expenses and fuel.")
         self._status.setText("No truck selected yet.")
         self._table.setRowCount(0)
-        self._pager.update_state(0, 0, self._pager.page_size())
+        self._footer.set_text("Select a truck to load records")
         self._records_card.set_value("—")
         self._sources_card.set_value("—")
         self._tzs_card.set_value("—")

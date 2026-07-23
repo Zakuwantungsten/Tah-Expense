@@ -3884,3 +3884,152 @@ async def get_truck_overview_summary(
         "zmw_total": zmw_total,
         "liters_total": liters_total,
     }
+
+
+# ── Skipped import rows (fleet check park-for-follow-up) ──────────────────────
+
+async def save_skipped_import_rows(docs: list) -> int:
+    """Persist rows skipped during fleet validation for later edit / re-upload."""
+    if not docs:
+        return 0
+    db = get_db()
+    now = datetime.utcnow()
+    payload = []
+    for doc in docs:
+        item = dict(doc)
+        item["skipped_at"] = now
+        payload.append(item)
+    result = await db.skipped_import_rows.insert_many(payload, ordered=False)
+    return len(result.inserted_ids)
+
+
+async def list_skipped_import_rows(
+    feed_key: str,
+    *,
+    search: str = "",
+    limit: int = 200,
+    skip: int = 0,
+) -> list:
+    db = get_db()
+    query: dict = {"feed_key": feed_key}
+    term = (search or "").strip()
+    if term:
+        rx = {"$regex": term, "$options": "i"}
+        query["$or"] = [
+            {"truck_value": rx},
+            {"original_truck": rx},
+            {"source_filename": rx},
+            {"sheet_label": rx},
+            {"target_upload_id": rx},
+        ]
+    cursor = (
+        db.skipped_import_rows.find(query)
+        .sort("skipped_at", -1)
+        .skip(max(0, skip))
+        .limit(max(1, limit))
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_skipped_import_rows(feed_key: str, search: str = "") -> int:
+    db = get_db()
+    query: dict = {"feed_key": feed_key}
+    term = (search or "").strip()
+    if term:
+        rx = {"$regex": term, "$options": "i"}
+        query["$or"] = [
+            {"truck_value": rx},
+            {"original_truck": rx},
+            {"source_filename": rx},
+            {"sheet_label": rx},
+            {"target_upload_id": rx},
+        ]
+    return await db.skipped_import_rows.count_documents(query)
+
+
+async def update_skipped_import_truck(doc_id: str, truck_value: str) -> bool:
+    """Update the parked truck value (and nested record field) before re-upload."""
+    from bson import ObjectId
+
+    db = get_db()
+    try:
+        oid = ObjectId(doc_id)
+    except Exception:
+        return False
+    doc = await db.skipped_import_rows.find_one({"_id": oid})
+    if not doc:
+        return False
+    field = doc.get("truck_field") or "truck_no"
+    record = dict(doc.get("record") or {})
+    record[field] = truck_value
+    result = await db.skipped_import_rows.update_one(
+        {"_id": oid},
+        {"$set": {"truck_value": truck_value, "record": record}},
+    )
+    return result.modified_count > 0 or result.matched_count > 0
+
+
+async def delete_skipped_import_rows(ids: list[str]) -> int:
+    from bson import ObjectId
+
+    db = get_db()
+    oids = []
+    for raw in ids:
+        try:
+            oids.append(ObjectId(raw))
+        except Exception:
+            continue
+    if not oids:
+        return 0
+    result = await db.skipped_import_rows.delete_many({"_id": {"$in": oids}})
+    return int(result.deleted_count)
+
+
+async def reupload_skipped_import_rows(ids: list[str]) -> int:
+    """Insert parked records into their original upload batch, then delete skips.
+
+    Uses each doc's ``target_upload_id`` and ``save_target`` so rows join the
+    upload they were skipped from (not a new batch).
+    """
+    from bson import ObjectId
+
+    db = get_db()
+    oids = []
+    for raw in ids:
+        try:
+            oids.append(ObjectId(raw))
+        except Exception:
+            continue
+    if not oids:
+        return 0
+    docs = await db.skipped_import_rows.find({"_id": {"$in": oids}}).to_list(length=None)
+    if not docs:
+        return 0
+
+    feed_records: dict[str, list] = {}
+    for doc in docs:
+        rec = dict(doc.get("record") or {})
+        rec.pop("_raw", None)
+        upload_id = doc.get("target_upload_id") or rec.get("upload_id") or ""
+        rec["upload_id"] = upload_id
+        if doc.get("source_filename") and not rec.get("source_filename"):
+            rec["source_filename"] = doc["source_filename"]
+        if doc.get("sheet_label") and not rec.get("sheet_label"):
+            rec["sheet_label"] = doc["sheet_label"]
+        field = doc.get("truck_field")
+        if field:
+            rec[field] = doc.get("truck_value") or rec.get(field, "")
+        feed_key = doc.get("feed_key") or ""
+        feed_records.setdefault(feed_key, []).append(rec)
+
+    saved = 0
+    for feed_key, records in feed_records.items():
+        if feed_key == "congo_expenses":
+            saved += await save_congo_import(records)
+        elif feed_key == "ahmed_kimvi":
+            saved += await save_kimvi_import(records)
+        else:
+            saved += await save_imported_feed(records)
+
+    await db.skipped_import_rows.delete_many({"_id": {"$in": oids}})
+    return saved

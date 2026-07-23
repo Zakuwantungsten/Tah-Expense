@@ -31,6 +31,7 @@ from tahmeed.services.cashier_service import (
 )
 from tahmeed.services.category_service import get_all_categories, item_key
 from tahmeed.services.subtable_service import get_subtables
+from tahmeed.ui.accountant.date_filters import style_calendar_popup
 
 
 # ── Styles ────────────────────────────────────────────────────────────────────
@@ -926,6 +927,7 @@ def _date_edit(d: date) -> QDateEdit:
     de.setFixedHeight(28)
     de.setDate(QDate(d.year, d.month, d.day))
     de.setStyleSheet(_FIELD_SS)
+    style_calendar_popup(de)
     return de
 
 

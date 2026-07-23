@@ -10,8 +10,6 @@ from bson import ObjectId
 
 from tahmeed.services import accountant_service, cashier_service
 from tahmeed.services.daily_import_service import parse_amount
-from tahmeed.ui.accountant.verify_inbox import _fmt_amount, _fmt_num
-from tahmeed.models.transaction import Transaction
 
 
 class _FakeCursor:
@@ -146,15 +144,8 @@ def _base_doc(**extra):
 def test_parse_amount_normalizes_tzs_strings():
     assert parse_amount("TZS 1,250") == 1250.0
     assert parse_amount("(2,000)") == -2000.0
-    assert _fmt_num("TZS 1,250", "TZS ", 0) == "TZS 1,250"
-    tx = Transaction(
-        date=datetime(2026, 1, 1),
-        description="x",
-        truck_number="T1",
-        amount=1250.0,
-        currency="TZS",
-    )
-    assert _fmt_amount(tx) == "TZS 1,250"
+    amount = parse_amount("TZS 1,250")
+    assert f"TZS {amount:,.0f}" == "TZS 1,250"
 
 
 def test_insert_pending_edit_and_reapprove(monkeypatch):

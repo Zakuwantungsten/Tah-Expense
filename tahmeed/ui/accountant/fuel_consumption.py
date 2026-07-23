@@ -39,7 +39,7 @@ except ImportError:
     _HAS_OPENPYXL = False
 
 from tahmeed.ui.accountant.date_filters import (
-    add_from_to_editors, read_from_to, sync_from_to,
+    add_from_to_editors, read_from_to, sync_from_to, clear_list_filters,
 )
 from tahmeed.ui.accountant.separate_expenses import (
     _SegmentTabBar, _populate_year_combo, _TOLL_MONTHS, _SCROLL_CHUNK,
@@ -851,6 +851,8 @@ class _FuelImportDialog(QDialog):
 
     async def _async_import(self) -> None:
         from tahmeed.services import accountant_service as svc
+        from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
+
         upload_id = str(uuid.uuid4())
         sheet_label = (self._sheet_cb.currentData() or "") if self._wb is not None else ""
         docs = []
@@ -861,7 +863,34 @@ class _FuelImportDialog(QDialog):
             doc["sheet_label"] = sheet_label
             docs.append(doc)
         try:
-            saved = await svc.save_imported_feed(docs)
+            gate = await run_import_truck_gate(
+                self,
+                docs,
+                feed_key=self._feed_type,
+                upload_id=upload_id,
+                source_filename=self._source_filename,
+                sheet_label=sheet_label,
+                can_add=True,
+            )
+            if gate.aborted:
+                self._set_import_enabled(True)
+                self._import_btn.setText(f"Import {len(self._rows):,} Records")
+                return
+            self._last_skipped = gate.skipped_count
+            if not gate.rows:
+                if gate.skipped_count:
+                    QMessageBox.information(
+                        self,
+                        "Import",
+                        f"No rows imported. {gate.skipped_count:,} parked in Skipped.",
+                    )
+                    self.imported.emit(0)
+                    self.accept()
+                else:
+                    self._set_import_enabled(True)
+                    self._import_btn.setText(f"Import {len(self._rows):,} Records")
+                return
+            saved = await svc.save_imported_feed(gate.rows)
             self.imported.emit(saved)
             self.accept()
         except Exception as exc:
@@ -932,6 +961,10 @@ class _DieselAllEntries(QWidget):
             tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
             optional=True,
         )
+
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(self._clear_filters)
+        tbl.addWidget(clear_btn)
 
         tbl.addStretch()
         vl.addWidget(tb)
@@ -1088,6 +1121,16 @@ class _DieselAllEntries(QWidget):
             sync_from_to(
                 self._from_date, self._to_date, self._year, self._month, optional=True,
             )
+        self._reset_and_load()
+
+    def _clear_filters(self) -> None:
+        self._year, self._month = clear_list_filters(
+            search_edit=self._search_edit,
+            year_cb=self._year_cb,
+            month_cb=self._month_cb,
+            from_edit=self._from_date,
+            to_edit=self._to_date,
+        )
         self._reset_and_load()
 
 
@@ -1417,7 +1460,7 @@ class _BaseDieselWidget(QWidget):
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._tabs = _SegmentTabBar(["All Entries", "Uploads"])
+        self._tabs = _SegmentTabBar(["All Entries", "Uploads", "Skipped"])
         vl.addWidget(self._tabs)
 
         self._main_stack = QStackedWidget()
@@ -1448,13 +1491,24 @@ class _BaseDieselWidget(QWidget):
         upload_vl.addWidget(self._upload_stack, 1)
         self._main_stack.addWidget(upload_host)
 
-        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
+        self._skipped = SkippedTrucksTab(self._FEED_TYPE)
+        self._main_stack.addWidget(self._skipped)
+
+        self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+
+    def _on_main_tab(self, idx: int) -> None:
+        self._main_stack.setCurrentIndex(idx)
+        if idx == 2:
+            self._skipped.refresh()
 
     # ── Public API ───────────────────────────────────────────────────────────
     def refresh(self) -> None:
         self._all_entries.refresh()
         self._show_browse()
+        if hasattr(self, "_skipped"):
+            self._skipped.refresh()
 
     # ── Internal ───────────────────────────────────────────────────────────────
     def _show_browse(self) -> None:
@@ -1496,10 +1550,18 @@ class _BaseDieselWidget(QWidget):
         dlg.exec()
 
     def _on_imported(self, n: int) -> None:
-        QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        skipped = int(getattr(self.sender(), "_last_skipped", 0) or 0)
+        msg = f"Imported {n:,} new records."
+        if skipped:
+            msg += f"\n{skipped:,} parked in Skipped for follow-up."
+        QMessageBox.information(self, "Import Complete", msg)
         self._all_entries.refresh()
         self._show_browse()
-        self._tabs.set_index(1)
+        if skipped:
+            self._tabs.set_index(2)
+            self._skipped.refresh()
+        else:
+            self._tabs.set_index(1)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
         count = int(upload_doc.get("record_count", 0))

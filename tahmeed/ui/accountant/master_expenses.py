@@ -7,7 +7,8 @@ QuickBooks-style full verified ledger with:
     from the approved cashier entry's category
   - Sort on any column (server-side, DB re-query)
   - ReceiptBadge color pill
-  - TZS / USD footer totals bar
+  - AMOUNT column (Verify-style currency prefix) + TZS / USD footer totals
+  - Ref_Float column (cashier free-text; empty when unset)
   - Export to Excel (openpyxl, QuickBooks-like layout)
 """
 
@@ -33,6 +34,7 @@ from tahmeed.models.transaction import Transaction
 from tahmeed.app_state import app_state
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
     _make_table, _cell, _finish_table_row, _stripe_bg, _fmt_num, _SCROLL_CHUNK,
 )
@@ -57,6 +59,7 @@ _ALT_ROW = "#F9FAFB"
 _NAVY    = "#1B2B4B"
 
 _ROW_H = 28
+_MIN_FILTER_DATE = QDate(2000, 1, 1)
 
 # (label, mongo sort field or None)
 _COLS = [
@@ -66,9 +69,8 @@ _COLS = [
     ("DESCRIPTION",    "left",   "description"),
     ("TRUCK NO",       "left",   "truck_number"),
     ("MEMO",           "left",   "memo"),
-    ("NOTES",          "center", None),
-    ("TZS",            "right",  None),
-    ("USD",            "right",  None),
+    ("REF_FLOAT",      "left",   "ref_float"),
+    ("AMOUNT",         "right",  "amount"),
     ("RECEIPT",        "center", "receipt_status"),
     ("OWNERSHIP",      "left",   "ownership"),
     ("APPROVED BY",    "left",   "approver"),
@@ -76,8 +78,11 @@ _COLS = [
 ]
 
 # Default pixel widths; 0 = stretch (DESCRIPTION fills remaining space).
-_COL_DEFAULTS = [52, 72, 110, 0, 95, 130, 48, 100, 80, 100, 90, 100, 100]
+_COL_DEFAULTS = [52, 72, 110, 0, 95, 130, 120, 120, 100, 90, 100, 100]
 _DESC_COL = 3
+_COL_REF = 6
+_COL_AMT = 7
+_COL_RCPT = 8
 
 _MONTHS = [
     (0,  "All"),
@@ -227,6 +232,23 @@ def _fmt_tx_date(dt: Optional[datetime]) -> str:
     return dt.strftime("%d %b") if dt else "—"
 
 
+def _fmt_amount(tx: Transaction) -> str:
+    """Verify-inbox style: ``TZS 1,234`` / ``USD 12.34`` in one cell."""
+    currency = (tx.currency or "TZS").upper()
+    decimals = 0 if currency in {"TZS", "TSH", "TZ", "ZMW", "ZMB", "ZK"} else 2
+    return _fmt_num(tx.amount, f"{currency} ", decimals)
+
+
+def _ref_float_display(tx: Transaction) -> str:
+    """Show cashier Ref_Float text; fall back for older notes_flag-only rows."""
+    text = (getattr(tx, "ref_float", None) or "").strip()
+    if text:
+        return text.upper()
+    if tx.notes_flag:
+        return "REFUND TO FLOAT"
+    return ""
+
+
 def _short_name(name: str) -> str:
     parts = (name or "").strip().split()
     if len(parts) >= 2:
@@ -324,6 +346,8 @@ class _FilterBar(QFrame):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._sync_year = 0
+        self._sync_month = 0
         self.setStyleSheet(
             f"QFrame {{ background: {_WHITE}; border-bottom: 1px solid {_BORDER}; }}"
         )
@@ -347,21 +371,22 @@ class _FilterBar(QFrame):
         self._search.setPlaceholderText("Search description or truck…")
         self._search.setMinimumWidth(180)
         self._search.setStyleSheet(_input_ss())
-        self._search.textChanged.connect(self.filter_changed.emit)
+        # Drop signal args — filter_changed / import/export are zero-arg Signals.
+        self._search.textChanged.connect(lambda *_: self.filter_changed.emit())
         hl.addWidget(self._search, 1)
 
         self._truck_cb = QComboBox()
         self._truck_cb.addItem("All Trucks")
         self._truck_cb.setMinimumWidth(110)
         self._truck_cb.setStyleSheet(_input_ss())
-        self._truck_cb.currentTextChanged.connect(self.filter_changed.emit)
+        self._truck_cb.currentTextChanged.connect(lambda *_: self.filter_changed.emit())
         hl.addWidget(self._truck_cb)
 
         self._cat_cb = QComboBox()
         self._cat_cb.addItem("All Categories")
         self._cat_cb.setMinimumWidth(130)
         self._cat_cb.setStyleSheet(_input_ss())
-        self._cat_cb.currentTextChanged.connect(self.filter_changed.emit)
+        self._cat_cb.currentTextChanged.connect(lambda *_: self.filter_changed.emit())
         hl.addWidget(self._cat_cb)
 
         self._rcpt_cb = QComboBox()
@@ -370,37 +395,51 @@ class _FilterBar(QFrame):
             self._rcpt_cb.addItem(item[0], item[1])
         self._rcpt_cb.setMinimumWidth(110)
         self._rcpt_cb.setStyleSheet(_input_ss())
-        self._rcpt_cb.currentIndexChanged.connect(self.filter_changed.emit)
+        self._rcpt_cb.currentIndexChanged.connect(lambda *_: self.filter_changed.emit())
         hl.addWidget(self._rcpt_cb)
 
         hl.addWidget(_lbl("From", size=12, color=_T2))
         self._from_date = QDateEdit()
         self._from_date.setCalendarPopup(True)
         self._from_date.setDisplayFormat("dd MMM yyyy")
+        self._from_date.setMinimumDate(_MIN_FILTER_DATE)
+        self._from_date.setSpecialValueText("From")
+        self._from_date.setDate(_MIN_FILTER_DATE)
         self._from_date.setFixedWidth(120)
         self._from_date.setStyleSheet(_input_ss())
-        self._from_date.dateChanged.connect(self.filter_changed.emit)
+        style_calendar_popup(self._from_date)
+        self._from_date.dateChanged.connect(lambda *_: self.filter_changed.emit())
         hl.addWidget(self._from_date)
 
         hl.addWidget(_lbl("To", size=12, color=_T2))
         self._to_date = QDateEdit()
         self._to_date.setCalendarPopup(True)
         self._to_date.setDisplayFormat("dd MMM yyyy")
+        self._to_date.setMinimumDate(_MIN_FILTER_DATE)
+        self._to_date.setSpecialValueText("To")
+        self._to_date.setDate(_MIN_FILTER_DATE)
         self._to_date.setFixedWidth(120)
         self._to_date.setStyleSheet(_input_ss())
-        self._to_date.dateChanged.connect(self.filter_changed.emit)
+        style_calendar_popup(self._to_date)
+        self._to_date.dateChanged.connect(lambda *_: self.filter_changed.emit())
         hl.addWidget(self._to_date)
 
+        clear_btn = _action_btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(lambda *_: self.clear_filters())
+        hl.addWidget(clear_btn)
+
         import_btn = _action_btn("Import Excel", "mdi.file-upload-outline", primary=False)
-        import_btn.clicked.connect(self.import_requested.emit)
+        import_btn.clicked.connect(lambda *_: self.import_requested.emit())
         hl.addWidget(import_btn)
 
         export_btn = _action_btn("Export Excel", "mdi.microsoft-excel", primary=False)
-        export_btn.clicked.connect(self.export_requested.emit)
+        export_btn.clicked.connect(lambda *_: self.export_requested.emit())
         hl.addWidget(export_btn)
 
     def set_date_range(self, year: int, month: int = 0) -> None:
         """Sync date pickers to FY or month selection without firing filters."""
+        self._sync_year = year
+        self._sync_month = month
         if month and 1 <= month <= 12:
             last = calendar.monthrange(year, month)[1]
             start = QDate(year, month, 1)
@@ -414,6 +453,30 @@ class _FilterBar(QFrame):
         self._to_date.setDate(end)
         self._from_date.blockSignals(False)
         self._to_date.blockSignals(False)
+
+    def clear_filters(self) -> None:
+        """Reset search/combos and clear From/To back to unset placeholders."""
+        self._search.blockSignals(True)
+        self._truck_cb.blockSignals(True)
+        self._cat_cb.blockSignals(True)
+        self._rcpt_cb.blockSignals(True)
+        self._from_date.blockSignals(True)
+        self._to_date.blockSignals(True)
+        try:
+            self._search.clear()
+            self._truck_cb.setCurrentIndex(0)
+            self._cat_cb.setCurrentIndex(0)
+            self._rcpt_cb.setCurrentIndex(0)
+            self._from_date.setDate(_MIN_FILTER_DATE)
+            self._to_date.setDate(_MIN_FILTER_DATE)
+        finally:
+            self._search.blockSignals(False)
+            self._truck_cb.blockSignals(False)
+            self._cat_cb.blockSignals(False)
+            self._rcpt_cb.blockSignals(False)
+            self._from_date.blockSignals(False)
+            self._to_date.blockSignals(False)
+        self.filter_changed.emit()
 
     def populate_trucks(self, trucks: List[str]) -> None:
         cur = self._truck_cb.currentText()
@@ -451,10 +514,14 @@ class _FilterBar(QFrame):
     def receipt_filter(self) -> str:
         return self._rcpt_cb.currentData() or "all"
 
-    def date_from(self) -> datetime:
+    def date_from(self) -> Optional[datetime]:
+        if self._from_date.date() <= _MIN_FILTER_DATE:
+            return None
         return _qdate_to_dt_start(self._from_date.date())
 
-    def date_to(self) -> datetime:
+    def date_to(self) -> Optional[datetime]:
+        if self._to_date.date() <= _MIN_FILTER_DATE:
+            return None
         return _qdate_to_dt_end(self._to_date.date())
 
 
@@ -548,32 +615,24 @@ class _LedgerTable(QFrame):
         t.setItem(r, 3, _cell(tx.description or "—"))
         t.setItem(r, 4, _cell(tx.truck_number or "—"))
         t.setItem(r, 5, _cell(tx.memo or "—"))
-        t.setItem(r, 6, _cell("✓" if tx.notes_flag else "—", self._flag("center"),
-                              color=_BLUE if tx.notes_flag else _TM))
 
-        if tx.currency == "TZS":
-            tzs_txt = _fmt_num(tx.amount, "", 0)
-            tzs_col = _RED if tx.amount < 0 else _T1
-        else:
-            tzs_txt, tzs_col = "—", _TM
-        t.setItem(r, 7, _cell(
-            tzs_txt, self._flag("right"), mono=True, color=tzs_col,
-        ))
+        ref_text = _ref_float_display(tx)
+        t.setItem(
+            r, _COL_REF,
+            _cell(ref_text or "—", color=_AMBER if ref_text else _TM),
+        )
 
-        if tx.currency == "USD":
-            usd_txt = _fmt_num(tx.amount, "$", 2)
-            usd_col = _RED if tx.amount < 0 else _T1
-        else:
-            usd_txt, usd_col = "—", _TM
-        t.setItem(r, 8, _cell(
-            usd_txt, self._flag("right"), mono=True, color=usd_col,
-        ))
+        amt_color = _RED if tx.amount < 0 else _T1
+        t.setItem(
+            r, _COL_AMT,
+            _cell(_fmt_amount(tx), self._flag("right"), color=amt_color),
+        )
 
         rcpt_text, rcpt_fg = _receipt_text(tx.receipt_status)
-        t.setItem(r, 9, _cell(rcpt_text, self._flag("center"), color=rcpt_fg))
-        t.setItem(r, 10, _cell(tx.ownership or "—"))
-        t.setItem(r, 11, _cell(tx.approver or "—", color=_T2))
-        t.setItem(r, 12, _cell(cashier_name))
+        t.setItem(r, _COL_RCPT, _cell(rcpt_text, self._flag("center"), color=rcpt_fg))
+        t.setItem(r, 9, _cell(tx.ownership or "—"))
+        t.setItem(r, 10, _cell(tx.approver or "—", color=_T2))
+        t.setItem(r, 11, _cell(cashier_name))
         _finish_table_row(t, r, row_bg)
 
     def populate(self, txs: List[Transaction], skip: int,
@@ -784,7 +843,6 @@ class MasterExpensesWidget(QWidget):
 
     def refresh(self) -> None:
         self._filters_loaded = False
-        self._filter_bar.set_date_range(self._year, self._month)
         self._reset_and_load()
 
     def _filter_kw(self) -> dict:
@@ -1053,7 +1111,6 @@ class MasterExpensesWidget(QWidget):
         alt_fill = PatternFill("solid", fgColor="F9FAFB")
         white_fill = PatternFill("solid", fgColor="FFFFFF")
         red_font = Font(name="Cascadia Code", size=10, color="DC2626")
-        grn_font = Font(name="Cascadia Code", size=10, color="16A34A")
         mono_font = Font(name="Cascadia Code", size=10)
         amber_font = Font(name="Segoe UI", bold=True, size=10, color="D97706")
         rcpt_green = Font(name="Segoe UI", bold=True, size=10, color="16A34A")
@@ -1062,21 +1119,20 @@ class MasterExpensesWidget(QWidget):
         for i, tx in enumerate(txs):
             date_str    = _fmt_tx_date(tx.date)
             item_str    = tx.item or tx.category_name or ""
-            notes_str   = "Yes" if tx.notes_flag else ""
+            ref_str     = _ref_float_display(tx)
             cashier_str = _short_name(export_cashier_names.get(tx.cashier_id, "")) if tx.cashier_id else ""
             rcpt_text, _ = _receipt_text(tx.receipt_status)
+            amount_str  = _fmt_amount(tx)
 
-            if tx.currency == "TZS":
-                tzs_val, usd_val = tx.amount, None
+            if (tx.currency or "TZS").upper() in {"TZS", "TSH", "TZ"}:
                 tzs_total += tx.amount
-            else:
-                tzs_val, usd_val = None, tx.amount
+            elif (tx.currency or "").upper() == "USD":
                 usd_total += tx.amount
 
             row_data = [
                 i + 1, date_str, item_str, tx.description or "",
-                tx.truck_number or "", tx.memo or "", notes_str,
-                tzs_val, usd_val,
+                tx.truck_number or "", tx.memo or "", ref_str,
+                amount_str,
                 rcpt_text, tx.ownership or "", tx.approver or "", cashier_str,
             ]
             ws.append(row_data)
@@ -1087,30 +1143,31 @@ class MasterExpensesWidget(QWidget):
                 cell.fill = fill
                 cell.alignment = Alignment(vertical="center")
 
-            # Amount formatting (TZS=col 8, USD=col 9)
-            if tzs_val is not None:
-                c = ws.cell(r, 8)
-                c.font = red_font if tzs_val < 0 else mono_font
-                c.number_format = '#,##0'
-                c.alignment = Alignment(horizontal="right", vertical="center")
-            if usd_val is not None:
-                c = ws.cell(r, 9)
-                c.font = red_font if usd_val < 0 else mono_font
-                c.number_format = '#,##0.00'
-                c.alignment = Alignment(horizontal="right", vertical="center")
+            # Amount (col 8)
+            c = ws.cell(r, 8)
+            c.font = red_font if tx.amount < 0 else mono_font
+            c.alignment = Alignment(horizontal="right", vertical="center")
 
-            # Receipt font color (col 10)
+            # Ref_Float highlight when set (col 7)
+            if ref_str:
+                ws.cell(r, 7).font = amber_font
+
+            # Receipt font color (col 9)
             rcpt_fonts = {"Received": rcpt_green, "Pending": amber_font, "No Receipt": rcpt_red}
             rf = rcpt_fonts.get(rcpt_text)
             if rf:
-                ws.cell(r, 10).font = rf
-            ws.cell(r, 10).alignment = Alignment(horizontal="center", vertical="center")
+                ws.cell(r, 9).font = rf
+            ws.cell(r, 9).alignment = Alignment(horizontal="center", vertical="center")
 
         # ── Totals row ────────────────────────────────────────────────
         ws.append([])
         ws.append([
             "", "", "", "TOTAL", "", "", "",
-            tzs_total or "", usd_total or "", "", "", "", "",
+            (
+                f"TZS {_fmt_num(tzs_total, '', 0)}"
+                + (f"  |  USD {_fmt_num(usd_total, '', 2)}" if usd_total else "")
+            ) if (tzs_total or usd_total) else "",
+            "", "", "", "",
         ])
         total_r = ws.max_row
         ws.row_dimensions[total_r].height = 18
@@ -1118,21 +1175,14 @@ class MasterExpensesWidget(QWidget):
         for cell in ws[total_r]:
             cell.fill = total_fill
         ws.cell(total_r, 4).font = Font(name="Segoe UI", bold=True, size=11)
-        if tzs_total:
+        if tzs_total or usd_total:
             c = ws.cell(total_r, 8)
             c.font = Font(name="Cascadia Code", bold=True, size=11,
-                          color="DC2626" if tzs_total < 0 else "111827")
-            c.number_format = '#,##0'
-            c.alignment = Alignment(horizontal="right", vertical="center")
-        if usd_total:
-            c = ws.cell(total_r, 9)
-            c.font = Font(name="Cascadia Code", bold=True, size=11,
-                          color="DC2626" if usd_total < 0 else "111827")
-            c.number_format = '#,##0.00'
+                          color="DC2626" if (tzs_total < 0 or usd_total < 0) else "111827")
             c.alignment = Alignment(horizontal="right", vertical="center")
 
         # ── Column widths ─────────────────────────────────────────────
-        col_widths = [7, 10, 16, 35, 13, 22, 7, 16, 13, 14, 14, 14, 14]
+        col_widths = [7, 10, 16, 35, 13, 22, 16, 16, 14, 14, 14, 14]
         for idx, w in enumerate(col_widths, 1):
             ws.column_dimensions[ws.cell(1, idx).column_letter].width = w
 

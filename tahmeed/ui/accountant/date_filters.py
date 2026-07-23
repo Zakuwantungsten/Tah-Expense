@@ -7,9 +7,59 @@ from datetime import datetime
 from typing import Callable, Optional, Tuple
 
 from PySide6.QtCore import QDate
-from PySide6.QtWidgets import QDateEdit, QHBoxLayout, QLabel
+from PySide6.QtWidgets import QComboBox, QDateEdit, QHBoxLayout, QLabel, QLineEdit
 
 _MIN_FILTER_DATE = QDate(2000, 1, 1)
+
+# Explicit light calendar colors — Fusion + system light mode otherwise yields
+# white day text on a white popup background.
+_CALENDAR_SS = """
+QCalendarWidget QWidget {
+    alternate-background-color: #F4F6F8;
+    background-color: #FFFFFF;
+    color: #111827;
+}
+QCalendarWidget QAbstractItemView:enabled {
+    background-color: #FFFFFF;
+    color: #111827;
+    selection-background-color: #0077C5;
+    selection-color: #FFFFFF;
+    outline: 0;
+}
+QCalendarWidget QAbstractItemView:disabled {
+    color: #9CA3AF;
+}
+QCalendarWidget QToolButton {
+    color: #111827;
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 4px;
+    margin: 2px;
+    font-weight: 600;
+}
+QCalendarWidget QToolButton:hover {
+    background-color: #EFF6FF;
+}
+QCalendarWidget QMenu {
+    background-color: #FFFFFF;
+    color: #111827;
+}
+QCalendarWidget QSpinBox {
+    background-color: #FFFFFF;
+    color: #111827;
+    selection-background-color: #0077C5;
+    selection-color: #FFFFFF;
+}
+"""
+
+
+def style_calendar_popup(edit: QDateEdit) -> None:
+    """Force readable light-mode colors on a QDateEdit calendar popup."""
+    cal = edit.calendarWidget()
+    if cal is None:
+        return
+    cal.setStyleSheet(_CALENDAR_SS)
 
 
 def _qdate_to_dt_start(qd: QDate) -> datetime:
@@ -36,6 +86,7 @@ def add_from_to_editors(
     from_edit.setDisplayFormat("dd MMM yyyy")
     from_edit.setFixedWidth(width)
     from_edit.setStyleSheet(input_ss)
+    style_calendar_popup(from_edit)
     if optional:
         from_edit.setMinimumDate(_MIN_FILTER_DATE)
         from_edit.setSpecialValueText("From")
@@ -51,6 +102,7 @@ def add_from_to_editors(
     to_edit.setDisplayFormat("dd MMM yyyy")
     to_edit.setFixedWidth(width)
     to_edit.setStyleSheet(input_ss)
+    style_calendar_popup(to_edit)
     if optional:
         to_edit.setMinimumDate(_MIN_FILTER_DATE)
         to_edit.setSpecialValueText("To")
@@ -110,3 +162,31 @@ def sync_from_to(
     finally:
         from_edit.blockSignals(False)
         to_edit.blockSignals(False)
+
+
+def clear_list_filters(
+    *,
+    search_edit: QLineEdit,
+    year_cb: QComboBox,
+    month_cb: QComboBox,
+    from_edit: QDateEdit,
+    to_edit: QDateEdit,
+) -> Tuple[int, int]:
+    """Reset search, year/month, and optional From/To without emitting change signals.
+
+    Returns ``(0, 0)`` for the cleared year/month state.
+    """
+    search_edit.blockSignals(True)
+    year_cb.blockSignals(True)
+    month_cb.blockSignals(True)
+    try:
+        search_edit.clear()
+        year_cb.setCurrentIndex(0)
+        month_cb.setCurrentIndex(0)
+        month_cb.setEnabled(False)
+    finally:
+        search_edit.blockSignals(False)
+        year_cb.blockSignals(False)
+        month_cb.blockSignals(False)
+    sync_from_to(from_edit, to_edit, 0, 0, optional=True)
+    return 0, 0

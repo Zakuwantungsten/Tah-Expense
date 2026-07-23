@@ -21,6 +21,7 @@ from PySide6.QtGui import QColor, QFont
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
 from tahmeed.models.category import Category
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE     = "#FFFFFF"
@@ -790,6 +791,8 @@ class VerifyInboxWidget(QWidget):
         self._status = _StatusBar()
         root.addWidget(self._status)
 
+        self._loading_overlay = LoadingOverlay(self, "Loading verify inbox…")
+
     def _build_table(self) -> QTableWidget:
         t = QTableWidget(0, _NCOLS)
         t.setHorizontalHeaderLabels(_HEADERS)
@@ -1059,6 +1062,9 @@ class VerifyInboxWidget(QWidget):
 
     async def _load_initial(self, generation: int) -> None:
         self._loading = True
+        tab_labels = ("New", "Edited", "Rejected", "Issues")
+        label = tab_labels[self._current_tab] if 0 <= self._current_tab < 4 else "Verify"
+        self._loading_overlay.show_loading(f"Loading {label}…")
         self._update_status()
         try:
             from tahmeed.services.accountant_service import get_cashier_names
@@ -1107,6 +1113,7 @@ class VerifyInboxWidget(QWidget):
                 self._show_empty(f"Failed to load: {exc}")
         finally:
             self._loading = False
+            self._loading_overlay.hide_loading()
             if generation == self._reload_generation:
                 self._update_status()
 
@@ -1222,11 +1229,11 @@ class VerifyInboxWidget(QWidget):
 
             t.setItem(r, _COL_TRUCK, _cell(tx.truck_number or "—", color=_T2))
 
-            amt = QTableWidgetItem(_fmt_amount(tx))
-            amt.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            amt.setFont(QFont("Cascadia Code", 11))
-            amt.setFlags(amt.flags() & ~Qt.ItemIsEditable)
-            t.setItem(r, _COL_AMT, amt)
+            t.setItem(
+                r,
+                _COL_AMT,
+                _cell(_fmt_amount(tx), align=Qt.AlignRight | Qt.AlignVCenter),
+            )
 
             t.setItem(r, _COL_MEO, _cell(tx.memo or "—", color=_T2))
 

@@ -28,6 +28,7 @@ from tahmeed.services.cashier_service import save_transaction, get_transactions_
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
+from tahmeed.ui.accountant.date_filters import style_calendar_popup
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -404,6 +405,7 @@ class EntryForm(QWidget):
         self._date.setDate(QDate.currentDate())
         self._date.setDisplayFormat("dd/MM/yyyy")
         self._date.setStyleSheet(_INPUT)
+        style_calendar_popup(self._date)
         lay.addWidget(self._date)
 
         lay.addSpacing(10)
