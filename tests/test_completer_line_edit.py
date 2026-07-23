@@ -74,3 +74,24 @@ def test_ranked_contains_reorders_model_on_type() -> None:
     model_values = [ed._model.data(ed._model.index(i)) for i in range(ed._model.rowCount())]
     assert model_values[0] == "Diesel CSH"
     assert _app is not None
+
+
+def test_ranked_contains_does_not_autofill_on_highlight() -> None:
+    _app = QApplication.instance() or QApplication([])
+    ed = CompleterLineEdit(["Diesel CSH", "LATRA"], ranked_contains=True)
+    ed.setText("csh")
+    ed._typed = "csh"
+    ed._on_highlighted("Diesel CSH")
+    assert ed.text() == "csh"
+    ed._apply_first_suggestion_preview()
+    assert ed.text() == "csh"
+    assert _app is not None
+
+
+def test_ranked_contains_uses_setwidget_not_setcompleter() -> None:
+    """Item mode must not wire QLineEdit.setCompleter (that auto-inserts)."""
+    _app = QApplication.instance() or QApplication([])
+    ed = CompleterLineEdit(["LATRA"], ranked_contains=True)
+    assert ed.completer() is None
+    assert ed._completer.widget() is ed
+    assert _app is not None

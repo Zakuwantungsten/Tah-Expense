@@ -114,8 +114,17 @@ def accept_completion(line_edit: QLineEdit, completer: QCompleter) -> bool:
     text = idx.data(Qt.DisplayRole)
     popup.hide()
     if text:
-        line_edit.setText(text)
-        line_edit.setCursorPosition(len(text))
+        committing = getattr(line_edit, "_committing", None)
+        if committing is not None:
+            line_edit._committing = True  # type: ignore[attr-defined]
+        try:
+            line_edit.setText(text)
+            if hasattr(line_edit, "_typed"):
+                line_edit._typed = text  # type: ignore[attr-defined]
+            line_edit.setCursorPosition(len(text))
+        finally:
+            if committing is not None:
+                line_edit._committing = False  # type: ignore[attr-defined]
         return True
     return False
 
@@ -135,11 +144,10 @@ class CompleterLineEdit(QLineEdit):
     - As the user types, a dropdown shows all values that *contain* the typed
       text (case-insensitive). The first match is highlighted automatically.
     - With ``ranked_contains=True`` (Item column), matches are ordered exact →
-      prefix → word-boundary → mid-string, and inline auto-preview only applies
-      to prefix matches so a mid-name hit cannot steal the field.
-    - The highlighted suggestion also appears inline for prefix matches: the
-      auto-completed part is shown as a selection, so the next keystroke
-      replaces it and the user keeps typing naturally.
+      prefix → word-boundary → mid-string. The field is **never** auto-filled
+      while typing (popup only); Tab / Enter / click commits the highlight.
+    - Without ``ranked_contains``, prefix matches also get an inline preview
+      (auto-completed suffix selected) so the next keystroke replaces it.
     - Down / Up navigate the popup; Tab / Enter accept the highlighted item
       (writing the canonical value). If multiple matches exist and none is
       selected, Tab / Enter commit the typed text as-is.
@@ -160,6 +168,7 @@ class CompleterLineEdit(QLineEdit):
         self._typed = ""          # last text the user actually typed (not from the preview)
         self._suppress_preview = False  # True after Delete dismisses preview
         self._preview_active   = False  # True while a preview suggestion is displayed
+        self._committing = False  # True while Tab/click writes a chosen suggestion
 
         self._model = QStringListModel(self._values, self)
         self._completer = QCompleter(self._model, self)
@@ -167,11 +176,18 @@ class CompleterLineEdit(QLineEdit):
         self._completer.setFilterMode(Qt.MatchContains)
         self._completer.setCompletionMode(QCompleter.PopupCompletion)
         self._completer.setMaxVisibleItems(8)
-        self.setCompleter(self._completer)
 
-        # Connect after setCompleter() so our handler fires last and wins over any
-        # Qt-internal highlighted→setText that lacks a selection.
-        self._completer.highlighted[str].connect(self._on_highlighted)
+        if ranked_contains:
+            # setWidget only — do NOT call setCompleter(). QLineEdit.setCompleter
+            # wires Qt slots that insert the highlighted completion into the field
+            # as you type; we want popup suggestions with commit on Tab/Enter only.
+            self._completer.setWidget(self)
+            self._completer.activated[str].connect(self._commit_suggestion)
+        else:
+            self.setCompleter(self._completer)
+            # Connect after setCompleter() so our handler fires last and wins over any
+            # Qt-internal highlighted→setText that lacks a selection.
+            self._completer.highlighted[str].connect(self._on_highlighted)
 
         # While the popup is open it grabs the keyboard, so Tab/Enter never reach
         # the table delegate's "accept + move to next cell" filter installed on
@@ -181,7 +197,10 @@ class CompleterLineEdit(QLineEdit):
         self._completer.popup().installEventFilter(self)
 
         self.textEdited.connect(self._on_text_edited)
-        self.textEdited.connect(self._schedule_highlight)
+        if ranked_contains:
+            self.textEdited.connect(self._schedule_popup)
+        else:
+            self.textEdited.connect(self._schedule_highlight)
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self._completer.popup() and event.type() == QEvent.KeyPress:
@@ -200,6 +219,19 @@ class CompleterLineEdit(QLineEdit):
                 return v
         return None
 
+    def _commit_suggestion(self, text: str) -> None:
+        """Write a chosen suggestion (popup click / activated)."""
+        if not text:
+            return
+        self._committing = True
+        try:
+            self.setText(text)
+            self._typed = text
+            self.setCursorPosition(len(text))
+        finally:
+            self._committing = False
+        self._preview_active = False
+
     def _reorder_model_for_query(self, text: str) -> None:
         """Put best contains-matches first so row 0 is the QuickBooks-style pick."""
         ranked = rank_completion_matches(text, self._values)
@@ -217,14 +249,36 @@ class CompleterLineEdit(QLineEdit):
         if self._ranked_contains:
             self._reorder_model_for_query(text)
 
+    def _schedule_popup(self, text: str) -> None:
+        """Show the ranked popup without rewriting the line edit."""
+        QTimer.singleShot(0, lambda: self._show_ranked_popup(text))
+
+    def _show_ranked_popup(self, typed: str) -> None:
+        if not self._ranked_contains:
+            return
+        # typed may be stale if another keystroke landed; prefer live _typed.
+        query = self._typed if self._typed else typed
+        if not (query or "").strip():
+            hide_completion_popup(self._completer)
+            return
+        self._completer.setCompletionPrefix(query)
+        if self._completer.completionCount() == 0:
+            hide_completion_popup(self._completer)
+            return
+        self._completer.complete()
+        popup = self._completer.popup()
+        model = self._completer.completionModel()
+        if popup is not None and model is not None and model.rowCount() > 0:
+            popup.setCurrentIndex(model.index(0, 0))
+
     def _on_highlighted(self, suggestion: str) -> None:
-        # Fired when user navigates the popup (Down/Up). Re-derive the typed
-        # prefix from field state because the field may currently be showing a
-        # previous preview (the suffix is a text selection beyond the real cursor).
+        # Fired when user navigates the popup (Down/Up), or when Qt highlights
+        # the first row. Ranked Item mode never rewrites the field here.
+        if self._ranked_contains:
+            return
         current = self.text()
         typed = current[:self.selectionStart()] if self.hasSelectedText() else current
         self._typed = typed
-        # User explicitly moved selection — allow full contains replace.
         shown = show_completion_preview(
             self, typed, suggestion, replace_on_contains=True
         )
@@ -236,7 +290,7 @@ class CompleterLineEdit(QLineEdit):
         QTimer.singleShot(0, self._apply_first_suggestion_preview)
 
     def _apply_first_suggestion_preview(self) -> None:
-        """Show the first matching suggestion as an inline preview.
+        """Show the first matching suggestion as an inline preview (non-ranked mode).
 
         Called via QTimer so _typed is already up-to-date with what the user
         typed.  Reads the suggestion directly from the completion model instead
@@ -247,7 +301,7 @@ class CompleterLineEdit(QLineEdit):
         Auto-preview only applies for prefix matches. Mid-string hits stay in the
         popup (highlighted) without rewriting the field.
         """
-        if self._suppress_preview:
+        if self._suppress_preview or self._ranked_contains:
             return
         model = self._completer.completionModel()
         if model is None or model.rowCount() == 0:

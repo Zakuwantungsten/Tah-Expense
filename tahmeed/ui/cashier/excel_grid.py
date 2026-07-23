@@ -562,9 +562,10 @@ class _ItemDelegate(_ExcelCellDelegate):
 
     QuickBooks-style contains match: the list narrows to names that contain the
     typed text anywhere (start/middle/end), ranked so exact and prefix hits
-    come first. Tab accepts the highlighted suggestion — writing the
-    *canonical* item name (so "m" + Tab gives "MILEAGE", not "mILEAGE"). The
-    list is read live via ``items_getter`` so newly-created items appear at once.
+    come first. The field is not auto-filled while typing; Tab/Enter commits the
+    highlighted suggestion as the *canonical* item name (so "m" + Tab gives
+    "MILEAGE"). The list is read live via ``items_getter`` so newly-created
+    items appear at once.
     Whether unknown entries are allowed is enforced at the grid level.
     """
 
@@ -573,8 +574,8 @@ class _ItemDelegate(_ExcelCellDelegate):
         self._items_getter = items_getter
 
     def createEditor(self, parent, option, index):
-        # Ranked contains: "csh" finds "Diesel CSH"; prefix hits still rank first
-        # and own the inline preview so "l" previews LATRA, not Diesel CSH.
+        # Ranked contains: "csh" finds "Diesel CSH". Popup only — field stays
+        # as typed until Tab/Enter/click commits the highlighted item.
         ed = CompleterLineEdit(
             self._items_getter() or [],
             parent=parent,
