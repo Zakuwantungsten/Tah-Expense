@@ -54,7 +54,6 @@ class AccountantDashboard(QWidget):
     def __init__(self, user: User, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._user = user
-        self._browser: Optional[TransactionBrowser] = None
         self._notification_poll_in_flight = False
         self._build()
         asyncio.ensure_future(self._load_categories())
@@ -191,13 +190,17 @@ class AccountantDashboard(QWidget):
         self._users_tab = UsersTab()
         self._stack.addWidget(self._users_tab)           # index 23
 
-        self._backup = BackupWidget()
+        self._backup = BackupWidget(allow_restore=True)
         self._stack.addWidget(self._backup)              # index 24
 
         # Cashier daily register (Table) — same widget the cashier uses
         self._register = DailyRegister(user=self._user, categories=[])
         self._table_page = _TablePage(self._register)
         self._stack.addWidget(self._table_page)          # index 25 — Cashier Table
+
+        self._browser = TransactionBrowser()
+        self._browser.go_to_date.connect(self._on_go_to_date)
+        self._stack.addWidget(self._browser)             # index 26 — Browse
 
         # Live-refresh a single item's sub-item strip when its sub-items change.
         self._manage_items.subitems_changed.connect(self._sidebar.refresh_subitems)
@@ -249,9 +252,6 @@ class AccountantDashboard(QWidget):
         self._sidebar.set_verify_badge(count)
 
     def _on_overview_nav(self, key: str) -> None:
-        if key == "browse":
-            self._on_browse()
-            return
         self._sidebar.select(key)
         self._on_nav(key)
 
@@ -294,9 +294,6 @@ class AccountantDashboard(QWidget):
             self._notification_poll_in_flight = False
 
     def _on_nav(self, key: str) -> None:
-        if key == "browse":
-            self._on_browse()
-            return
         _routes = {
             "overview":       (0,  self._overview),
             "truck_overview": (1,  self._truck_overview),
@@ -323,6 +320,7 @@ class AccountantDashboard(QWidget):
             "manage_users":     (23, self._users_tab),
             "backup":           (24, self._backup),
             "table":            (25, self._register),
+            "browse":           (26, self._browser),
         }
         if key in _routes:
             idx, widget = _routes[key]
@@ -340,13 +338,6 @@ class AccountantDashboard(QWidget):
             pass
         else:
             self._stack.setCurrentIndex(12)
-
-    def _on_browse(self) -> None:
-        if self._browser is None:
-            self._browser = TransactionBrowser(parent=self)
-            self._browser.go_to_date.connect(self._on_go_to_date)
-            self._browser.finished.connect(lambda: setattr(self, "_browser", None))
-        self._browser.show_and_search()
 
     def _on_go_to_date(self, d, term: str = "") -> None:
         self._sidebar.select("table")

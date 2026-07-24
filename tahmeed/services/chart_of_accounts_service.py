@@ -88,6 +88,7 @@ async def import_chart_of_accounts(
             currency=row["currency"],
             coa_description=row["coa_description"],
             show_in_sidebar=False,
+            show_in_cashier_sidebar=False,
             requires_truck=False,
             requires_receipt=False,
         )

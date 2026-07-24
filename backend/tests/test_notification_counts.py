@@ -10,12 +10,15 @@ from app.main import create_app
 
 
 class FakeTransactions:
-    def __init__(self, count: int = 0) -> None:
+    def __init__(self, count: int = 0, deletion_count: int = 0) -> None:
         self.count = count
+        self.deletion_count = deletion_count
         self.queries: list[dict] = []
 
     async def count_documents(self, query: dict) -> int:
         self.queries.append(query)
+        if query.get("deletion_requested") is True:
+            return self.deletion_count
         return self.count
 
 
@@ -50,7 +53,7 @@ def settings() -> Settings:
 
 @pytest.mark.parametrize("role", ["admin", "accountant"])
 def test_notification_counts_uses_pending_inbox_predicate(role: str) -> None:
-    transactions = FakeTransactions(count=7)
+    transactions = FakeTransactions(count=7, deletion_count=3)
     database = SimpleNamespace(db=SimpleNamespace(transactions=transactions))
     app = create_app(settings=settings(), database=database)
     app.dependency_overrides[current_user] = lambda: {"role": role}
@@ -59,11 +62,11 @@ def test_notification_counts_uses_pending_inbox_predicate(role: str) -> None:
         response = client.get("/v1/accountant/notification-counts")
 
     assert response.status_code == 200
-    assert response.json() == {"verify": 7}
+    assert response.json() == {"verify": 10}
     assert transactions.queries == [
-        {"verified": False, "rejected": {"$ne": True}}
+        {"verified": False, "rejected": {"$ne": True}},
+        {"deletion_requested": True},
     ]
-
 
 def test_notification_counts_rejects_cashier() -> None:
     transactions = FakeTransactions(count=7)

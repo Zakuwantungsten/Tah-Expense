@@ -506,35 +506,19 @@ def _build_issue_query(
     cashier_id=None,
     date_from=None,
     date_to=None,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> dict:
+    from tahmeed.services.accountant_service import _append_text_filters
+
     issue_or = {"$or": [
         {"possible_duplicate": True},
         {"date_discrepancy": True},
     ]}
     and_clauses: list = [issue_or]
-    if search.strip():
-        s = re.escape(search.strip())
-        and_clauses.append({"$or": [
-            {"description": {"$regex": s, "$options": "i"}},
-            {"item": {"$regex": s, "$options": "i"}},
-            {"category_name": {"$regex": s, "$options": "i"}},
-            {"truck_number": {"$regex": s, "$options": "i"}},
-        ]})
-    if description.strip():
-        and_clauses.append({
-            "description": {
-                "$regex": re.escape(description.strip()),
-                "$options": "i",
-            },
-        })
-    if item.strip():
-        it = re.escape(item.strip())
-        and_clauses.append({"$or": [
-            {"item": {"$regex": f"^{it}$", "$options": "i"}},
-            {"category_name": {"$regex": f"^{it}$", "$options": "i"}},
-        ]})
+    _append_text_filters(
+        and_clauses, search=search, item=item, description=description,
+    )
 
     query: dict = {
         "verified": {"$ne": True},
@@ -564,8 +548,8 @@ async def get_issue_transactions(
     cashier_id=None,
     date_from=None,
     date_to=None,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> List[Transaction]:
     db = get_db()
     query = _build_issue_query(
@@ -594,8 +578,8 @@ async def count_issue_transactions(
     cashier_id=None,
     date_from=None,
     date_to=None,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> int:
     db = get_db()
     query = _build_issue_query(

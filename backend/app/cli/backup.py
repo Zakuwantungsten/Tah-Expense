@@ -670,7 +670,7 @@ async def restore_database(
     confirm_filename: str,
     actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Replace the live database with a verified uploaded archive (admin DR)."""
+    """Replace the live database with a verified uploaded archive (admin/accountant DR)."""
     if filename != confirm_filename:
         raise RuntimeError("Confirmation filename does not match the selected backup")
     if any(part in filename for part in ("/", "\\", "..")):

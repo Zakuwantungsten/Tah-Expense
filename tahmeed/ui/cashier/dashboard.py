@@ -48,16 +48,17 @@ _APP_BG = "#F4F6F8"
 _BORDER = "#E5E7EB"
 _WHITE  = "#FFFFFF"
 _BLUE   = "#0077C5"
+_NAVY   = "#1B2B4B"
+_GOLD   = "#B18E5E"
 _T1     = "#111827"
 _T2     = "#6B7280"
+_BTN_H  = 30  # slim professional control height
 
 # ── Button styles ────────────────────────────────────────────────────────────────
-# Mirrors the filled / outlined / tonal hierarchy used by Material 3, Stripe and
-# Microsoft Fluent: one high-emphasis filled action (Save), neutral outlined
-# secondaries (Edit / Export), and a warm tonal "active" state for the toggle.
+# Filled primary (Save), outlined secondaries, warm cancel, gold submit.
 _BTN_BASE = (
-    "border-radius:6px;font-size:13px;font-weight:600;"
-    "font-family:'Segoe UI',sans-serif;padding:0 16px;"
+    f"border-radius:5px;font-size:12px;font-weight:600;"
+    f"font-family:'Segoe UI',sans-serif;padding:0 12px;min-height:{_BTN_H}px;"
 )
 _BTN_STYLES = {
     "primary": (
@@ -77,43 +78,53 @@ _BTN_STYLES = {
         "QPushButton:hover{background:#B45309;border-color:#B45309;}"
         "QPushButton:pressed{background:#92400E;border-color:#92400E;}"
     ),
+    "submit": (
+        f"QPushButton{{background:{_GOLD};color:#FFFFFF;border:1px solid {_GOLD};{_BTN_BASE}}}"
+        "QPushButton:hover{background:#9A784C;border-color:#9A784C;}"
+        "QPushButton:pressed{background:#84653F;border-color:#84653F;}"
+        "QPushButton:disabled{background:#D6C4A8;border-color:#D6C4A8;color:#FFF8EF;}"
+    ),
 }
 
 
 # ── QuickBooks-style document header ─────────────────────────────────────────────
 
 class _QBDocHeader(QFrame):
-    """QuickBooks-style document summary header with 4 KPI stat tiles."""
+    """Document summary header: title + Merged badge + 4 KPI tiles."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("qbDocHeader")
-        self.setFixedHeight(68)
+        self.setFixedHeight(72)
         self.setStyleSheet(
             "QFrame#qbDocHeader {"
             "  background: #ffffff;"
             "  border-bottom: 2px solid #0077C5;"
             "}"
         )
+        self._view_date: date = date.today()
 
         hl = QHBoxLayout(self)
-        hl.setContentsMargins(0, 0, 20, 0)
+        hl.setContentsMargins(0, 0, 16, 0)
         hl.setSpacing(0)
 
-        # Left accent strip
         accent = QFrame()
         accent.setFixedWidth(5)
         accent.setStyleSheet("background: #0077C5; border: none;")
         hl.addWidget(accent)
         hl.addSpacing(14)
 
-        # Title block
+        # Title block + optional Merged badge
+        title_row = QHBoxLayout()
+        title_row.setSpacing(10)
+        title_row.setContentsMargins(0, 0, 0, 0)
+
         title_vl = QVBoxLayout()
         title_vl.setSpacing(2)
         title_vl.setContentsMargins(0, 10, 0, 10)
         title_lbl = QLabel("Daily Register")
         title_lbl.setStyleSheet(
-            "font-size: 18px; font-weight: 700; color: #1B2B4B;"
+            f"font-size: 18px; font-weight: 700; color: {_NAVY};"
             " font-family: 'Segoe UI', sans-serif; background: transparent;"
         )
         sub_lbl = QLabel("Cashier  ·  Expense Entry")
@@ -123,24 +134,38 @@ class _QBDocHeader(QFrame):
         )
         title_vl.addWidget(title_lbl)
         title_vl.addWidget(sub_lbl)
-        hl.addLayout(title_vl)
-        hl.addStretch()
 
-        # Separator before tile strip
+        title_row.addLayout(title_vl)
+
+        self._merged_badge = QLabel("MERGED VIEW")
+        self._merged_badge.setAlignment(Qt.AlignCenter)
+        self._merged_badge.setFixedHeight(22)
+        self._merged_badge.setStyleSheet(
+            f"QLabel{{background:transparent;color:{_GOLD};border:1.5px solid {_GOLD};"
+            "border-radius:11px;padding:0 10px;font-size:10px;font-weight:700;"
+            "letter-spacing:0.6px;font-family:'Segoe UI',sans-serif;}}"
+        )
+        self._merged_badge.hide()
+        title_row.addWidget(self._merged_badge, 0, Qt.AlignVCenter)
+        title_row.addStretch()
+
+        hl.addLayout(title_row, 1)
+
         sep0 = QFrame()
         sep0.setFrameShape(QFrame.VLine)
         sep0.setStyleSheet("color: #E5E7EB;")
         hl.addWidget(sep0)
 
-        # 4 KPI tiles: label, initial value, label color
+        # 4 KPI tiles — date label switches TODAY ↔ DATE for past/future days
         tiles_cfg = [
-            ("ENTRIES",         "—",                              "#6B7280"),
-            ("TODAY",           date.today().strftime("%d %b %Y"), "#6B7280"),
-            ("REFUND TO FLOAT", "—",                              "#EA580C"),
-            ("TOTAL",           "—",                              "#6B7280"),
+            ("ENTRIES",         "—",                              "#6B7280", "bold"),
+            ("TODAY",           date.today().strftime("%d %b %Y"), "#6B7280", "bold"),
+            ("REFUND TO FLOAT", "—",                              "#EA580C", "normal"),
+            ("TOTAL",           "—",                              "#6B7280", "bold"),
         ]
+        self._lbl_date = None
         val_labels = []
-        for i, (label, init_val, lbl_color) in enumerate(tiles_cfg):
+        for i, (label, init_val, lbl_color, weight) in enumerate(tiles_cfg):
             if i > 0:
                 sep = QFrame()
                 sep.setFrameShape(QFrame.VLine)
@@ -148,7 +173,7 @@ class _QBDocHeader(QFrame):
                 hl.addWidget(sep)
 
             tile = QWidget()
-            tile.setFixedWidth(140)
+            tile.setFixedWidth(148)
             tile_vl = QVBoxLayout(tile)
             tile_vl.setContentsMargins(14, 10, 14, 10)
             tile_vl.setSpacing(3)
@@ -160,12 +185,16 @@ class _QBDocHeader(QFrame):
                 " background: transparent;"
             )
             val = QLabel(init_val)
+            fw = "700" if weight == "bold" else "500"
+            val_color = "#EA580C" if label == "REFUND TO FLOAT" else "#111827"
             val.setStyleSheet(
-                "font-size: 13px; color: #111827; font-weight: 700;"
+                f"font-size: 13px; color: {val_color}; font-weight: {fw};"
                 " font-family: 'Segoe UI', sans-serif; background: transparent;"
             )
             tile_vl.addWidget(lbl)
             tile_vl.addWidget(val)
+            if label == "TODAY":
+                self._lbl_date = lbl
             val_labels.append(val)
             hl.addWidget(tile)
 
@@ -176,10 +205,34 @@ class _QBDocHeader(QFrame):
             self._val_total,
         ) = val_labels
 
-    def update_stats(self, n_entries: int, total_tzs: float, refund_total: float) -> None:
+    def set_merged(self, merged: bool) -> None:
+        self._merged_badge.setVisible(bool(merged))
+
+    def update_stats(
+        self,
+        n_entries: int,
+        total_tzs: float,
+        refund_total: float,
+        register_date=None,
+    ) -> None:
         self._val_entries.setText(f"{n_entries} entr{'y' if n_entries == 1 else 'ies'}")
         self._val_total.setText(f"TZS {total_tzs:,.0f}" if total_tzs else "—")
         self._val_refund.setText(f"TZS {refund_total:,.0f}" if refund_total else "—")
+        if register_date is not None:
+            self.set_view_date(register_date)
+
+    def set_view_date(self, d: date) -> None:
+        """Show the register's calendar day — label is TODAY only when it is today."""
+        if hasattr(d, "date"):
+            d = d.date()
+        self._view_date = d
+        self._val_today.setText(d.strftime("%d %b %Y"))
+        if self._lbl_date is not None:
+            if d == date.today():
+                self._lbl_date.setText("TODAY")
+            else:
+                # Weekday + DATE so past/future days never read as "today"
+                self._lbl_date.setText(d.strftime("%a").upper())
 
 
 # ── Action bar (Edit / Save / Export) ────────────────────────────────────────────
@@ -193,11 +246,13 @@ class _ActionBar(QFrame):
     import_clicked = Signal()
     today_clicked  = Signal()
     search_changed = Signal(str)
+    mode_changed   = Signal(bool)  # True = Merged
+    submit_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("registerActionBar")
-        self.setFixedHeight(52)
+        self.setFixedHeight(44)
         self.setStyleSheet(
             "QFrame#registerActionBar {"
             f"  background: {_WHITE}; border-bottom: 1px solid {_BORDER};"
@@ -205,14 +260,55 @@ class _ActionBar(QFrame):
         )
 
         hl = QHBoxLayout(self)
-        hl.setContentsMargins(16, 8, 16, 8)
-        hl.setSpacing(10)
+        hl.setContentsMargins(16, 6, 16, 6)
+        hl.setSpacing(8)
 
-        # Search bar — left end, opposite the action buttons
+        # My / Merged segmented toggle (design: outlined inactive, filled active)
+        toggle = QFrame()
+        toggle.setObjectName("modeToggle")
+        toggle.setStyleSheet(
+            "QFrame#modeToggle{background:transparent;border:none;}"
+        )
+        tg = QHBoxLayout(toggle)
+        tg.setContentsMargins(0, 0, 0, 0)
+        tg.setSpacing(0)
+
+        self._my_btn = QPushButton("My entries")
+        self._merged_btn = QPushButton("Merged")
+        _toggle_ss = (
+            "QPushButton{"
+            " background:#FFFFFF;border:1px solid #D1D5DB;"
+            " padding:0 14px;font-size:12px;font-weight:600;color:#6B7280;"
+            f" min-height:{_BTN_H}px;"
+            "}"
+            f"QPushButton:checked{{background:{_NAVY};border-color:{_NAVY};color:#FFFFFF;}}"
+            "QPushButton:hover:!checked{background:#F9FAFB;color:#374151;}"
+        )
+        self._my_btn.setCheckable(True)
+        self._merged_btn.setCheckable(True)
+        self._my_btn.setCursor(Qt.PointingHandCursor)
+        self._merged_btn.setCursor(Qt.PointingHandCursor)
+        self._my_btn.setFixedHeight(_BTN_H)
+        self._merged_btn.setFixedHeight(_BTN_H)
+        self._my_btn.setStyleSheet(
+            _toggle_ss + "QPushButton{border-radius:5px 0 0 5px;}"
+        )
+        self._merged_btn.setStyleSheet(
+            _toggle_ss
+            + "QPushButton{border-radius:0 5px 5px 0;border-left:none;}"
+        )
+        self._my_btn.setChecked(True)
+        self._my_btn.clicked.connect(lambda: self._set_mode(False))
+        self._merged_btn.clicked.connect(lambda: self._set_mode(True))
+        tg.addWidget(self._my_btn)
+        tg.addWidget(self._merged_btn)
+        hl.addWidget(toggle)
+
+        # Search bar
         search = QLineEdit()
         search.setPlaceholderText("Search entries…")
         search.setFixedWidth(220)
-        search.setFixedHeight(34)
+        search.setFixedHeight(_BTN_H)
         search.setStyleSheet(
             "QLineEdit {"
             "  border: 1px solid #D1D5DB; border-radius: 5px;"
@@ -223,20 +319,17 @@ class _ActionBar(QFrame):
             "  border-color: #0077C5; background: #ffffff;"
             "}"
         )
-        search.textChanged.connect(self.search_changed)
         hl.addWidget(search)
 
-        # Search / Clear toggle button
         self._search_clear_btn = QPushButton("Search")
-        self._search_clear_btn.setFixedHeight(34)
-        self._search_clear_btn.setFixedWidth(72)
+        self._search_clear_btn.setFixedHeight(_BTN_H)
+        self._search_clear_btn.setFixedWidth(68)
         self._search_clear_btn.setCursor(Qt.PointingHandCursor)
         self._search_clear_btn.setStyleSheet(_BTN_STYLES["secondary"])
 
         def _on_search_clear_clicked():
             if search.text():
                 search.clear()
-            # no-op when empty — auto-search already fires on textChanged
 
         def _on_text_changed(text: str):
             self.search_changed.emit(text)
@@ -245,17 +338,14 @@ class _ActionBar(QFrame):
                 _BTN_STYLES["active"] if text else _BTN_STYLES["secondary"]
             )
 
-        # rewire: textChanged now goes through _on_text_changed
-        search.textChanged.disconnect(self.search_changed)
         search.textChanged.connect(_on_text_changed)
         self._search_clear_btn.clicked.connect(_on_search_clear_clicked)
         hl.addWidget(self._search_clear_btn)
 
-        # Edit-mode status pill — hidden unless editing
         self._status = QLabel("")
         self._status.setStyleSheet(
             "QLabel{background:#FEF3C7;color:#92400E;border:1px solid #FDE68A;"
-            "border-radius:5px;padding:4px 10px;font-size:12px;font-weight:600;"
+            "border-radius:5px;padding:2px 10px;font-size:11px;font-weight:600;"
             "font-family:'Segoe UI',sans-serif;}"
         )
         self._status.hide()
@@ -271,7 +361,7 @@ class _ActionBar(QFrame):
             "  padding: 4px;"
             "}"
             "QMenu::item {"
-            "  padding: 8px 18px; border-radius: 4px;"
+            "  padding: 6px 16px; border-radius: 4px;"
             "  font-size: 12px; color: #111827;"
             "}"
             "QMenu::item:selected { background: #EFF6FF; color: #1D4ED8; }"
@@ -303,14 +393,35 @@ class _ActionBar(QFrame):
         self._save_btn.clicked.connect(self.save_clicked)
         hl.addWidget(self._save_btn)
 
+        self._submit_btn = self._make_btn("Submit day", "mdi.send-check-outline", "submit")
+        self._submit_btn.setToolTip(
+            "Submit all draft entries for this calendar day to Verify (whole day)."
+        )
+        self._submit_btn.clicked.connect(self.submit_clicked)
+        hl.addWidget(self._submit_btn)
+
+    def _set_mode(self, merged: bool) -> None:
+        self._my_btn.setChecked(not merged)
+        self._merged_btn.setChecked(merged)
+        self.mode_changed.emit(merged)
+
+    def sync_mode(self, merged: bool) -> None:
+        """Reflect register mode without emitting (e.g. after cancel)."""
+        self._my_btn.blockSignals(True)
+        self._merged_btn.blockSignals(True)
+        self._my_btn.setChecked(not merged)
+        self._merged_btn.setChecked(merged)
+        self._my_btn.blockSignals(False)
+        self._merged_btn.blockSignals(False)
+
     def _make_btn(self, text: str, icon: str, kind: str) -> QPushButton:
         b = QPushButton(f"  {text}")
         b.setCursor(Qt.PointingHandCursor)
-        b.setFixedHeight(36)
+        b.setFixedHeight(_BTN_H)
         try:
-            color = "#FFFFFF" if kind == "primary" else "#374151"
+            color = "#FFFFFF" if kind in ("primary", "submit", "active") else "#374151"
             b.setIcon(qta.icon(icon, color=color))
-            b.setIconSize(QSize(16, 16))
+            b.setIconSize(QSize(14, 14))
         except Exception:
             pass
         b.setStyleSheet(_BTN_STYLES[kind])
@@ -359,7 +470,11 @@ class _TablePage(QWidget):
         self._action_bar.today_clicked.connect(
             lambda: register.navigate_to_date(date.today())
         )
+        self._action_bar.mode_changed.connect(register.set_merged_mode)
+        self._action_bar.submit_clicked.connect(register.submit_for_verify)
         register.edit_state_changed.connect(self._action_bar.set_edit_state)
+        register.mode_changed.connect(self._action_bar.sync_mode)
+        register.mode_changed.connect(self._doc_header.set_merged)
 
         vl.addWidget(self._doc_header)
         vl.addWidget(self._action_bar)
@@ -412,7 +527,6 @@ class CashierDashboard(QWidget):
     def __init__(self, user: User, parent=None):
         super().__init__(parent)
         self._user = user
-        self._browser: Optional[TransactionBrowser] = None
         self._category_indices: dict[str, int] = {}
         self._build_ui()
         asyncio.ensure_future(self._load_categories())
@@ -482,6 +596,11 @@ class CashierDashboard(QWidget):
         self._rejected_view = RejectedView(user=self._user)
         self._stack.addWidget(self._rejected_view)
 
+        # index 4 — Browse (embedded)
+        self._browser = TransactionBrowser()
+        self._browser.go_to_date.connect(self._on_go_to_date)
+        self._stack.addWidget(self._browser)
+
         self._stack.setCurrentIndex(0)
         body_hl.addWidget(self._stack, 1)
 
@@ -492,8 +611,8 @@ class CashierDashboard(QWidget):
         self._form.transaction_saved.connect(lambda _: self._register.refresh())
         self._overview.go_to_register.connect(lambda: self._on_nav("table"))
         self._overview.go_to_form.connect(lambda: self._on_nav("form"))
-        self._overview.go_to_browse.connect(self._on_browse)
-        self._overview.export_data.connect(self._on_browse)
+        self._overview.go_to_browse.connect(lambda: self._on_nav("browse"))
+        self._overview.export_data.connect(lambda: self._on_nav("browse"))
         self._overview.import_data.connect(self._on_import)
 
     def _on_import(self) -> None:
@@ -533,9 +652,6 @@ class CashierDashboard(QWidget):
     # ── Routing ───────────────────────────────────────────────────────────────────
 
     def _on_nav(self, key: str) -> None:
-        if key == "browse":
-            self._on_browse()
-            return
         self._sidebar.select(key)
         if key == "overview":
             self._stack.setCurrentIndex(0)
@@ -548,6 +664,9 @@ class CashierDashboard(QWidget):
         elif key == "rejected":
             self._stack.setCurrentIndex(3)
             self._rejected_view.refresh()
+        elif key == "browse":
+            self._stack.setCurrentIndex(4)
+            self._browser.refresh()
         elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
 
@@ -569,14 +688,7 @@ class CashierDashboard(QWidget):
         self._stack.setCurrentIndex(idx)
         self._stack.widget(idx).refresh()
 
-    # ── Actions ───────────────────────────────────────────────────────────────────
-
-    def _on_browse(self) -> None:
-        if self._browser is None:
-            self._browser = TransactionBrowser(parent=self)
-            self._browser.go_to_date.connect(self._on_go_to_date)
-            self._browser.finished.connect(lambda: setattr(self, "_browser", None))
-        self._browser.show_and_search()
+    # ── Actions ───────────────────────────────────────────────────────────────
 
     def _on_go_to_date(self, d, term: str = "") -> None:
         self._on_nav("table")

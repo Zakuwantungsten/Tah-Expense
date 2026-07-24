@@ -1,10 +1,12 @@
 """
-TransactionBrowser — two-tab search dialog.
+TransactionBrowser — embedded browse page (Simple / Advanced / Uploads).
 
 Simple   — daily summary (one row per day): Date | TXN ID | Entries | Refund to Float | Total
            keyword searches description OR truck OR memo across all matched days
 Advanced — individual transaction rows with full register columns
-           category / sub-item / date range + keyword filters
+           multi-select Item + Description (description = former Sub-Item) filters,
+           cascading from entries in the selected date range
+Uploads  — Excel daily imports list
 
 Month combo is populated from real DB data (distinct months that have transactions).
 Double-click or "Go To Date" navigates the register to that day/transaction.
@@ -16,7 +18,7 @@ from datetime import date, timedelta
 from typing import List
 
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout,
+    QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QDateEdit,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QWidget, QStackedWidget,
@@ -28,10 +30,10 @@ from PySide6.QtGui import QColor, QFont
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.cashier_service import (
     get_daily_summaries, get_transactions_flat, get_available_months,
+    get_browse_items, get_browse_descriptions,
 )
-from tahmeed.services.category_service import get_all_categories, item_key
-from tahmeed.services.subtable_service import get_subtables
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
+from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
 
 
 # ── Styles ────────────────────────────────────────────────────────────────────
@@ -94,8 +96,9 @@ def _seg_style(position: str) -> str:
 _S_COL_DATE    = 0
 _S_COL_TXN_ID  = 1
 _S_COL_ENTRIES = 2
-_S_COL_REFUND  = 3
-_S_COL_TOTAL   = 4
+_S_COL_STATUS  = 3
+_S_COL_REFUND  = 4
+_S_COL_TOTAL   = 5
 
 # ── Column indices — Advanced (individual) ────────────────────────────────────
 
@@ -109,6 +112,8 @@ _A_COL_TZS       = 6
 _A_COL_RECEIPT   = 7
 _A_COL_OWNERSHIP = 8
 _A_COL_APR       = 9
+_A_COL_CASHIER   = 10
+_A_COL_EDITED_BY = 11
 
 _MODE_SIMPLE   = 0
 _MODE_ADVANCED = 1
@@ -125,26 +130,21 @@ _U_COL_WHEN    = 5
 _U_COL_ACT     = 6
 
 
-# ── Main dialog ───────────────────────────────────────────────────────────────
+# ── Main page ─────────────────────────────────────────────────────────────────
 
-class TransactionBrowser(QDialog):
+class TransactionBrowser(QWidget):
     go_to_date = Signal(object, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Transaction Browser")
-        self.setMinimumSize(1050, 640)
-        self.setWindowFlags(
-            Qt.Dialog | Qt.WindowMinimizeButtonHint
-            | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint
-        )
-        self.setStyleSheet("QDialog { background: #ffffff; }")
+        self.setStyleSheet("QWidget { background: #ffffff; }")
         self._results_simple: List[dict] = []
         self._results_advanced: List[Transaction] = []
         self._results_uploads: list = []
-        self._cats_loaded = False
+        self._filter_opts_loaded = False
         self._months_loaded = False
         self._current_mode = _MODE_SIMPLE
+        self._cascade_busy = False
         self._build_ui()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -268,21 +268,31 @@ class TransactionBrowser(QDialog):
         self._a_month.currentIndexChanged.connect(
             lambda idx: _apply_month(self._a_month, self._a_from, self._a_to, idx)
         )
+        self._a_from.dateChanged.connect(lambda *_: self._on_adv_dates_changed())
+        self._a_to.dateChanged.connect(lambda *_: self._on_adv_dates_changed())
         hl.addLayout(_field("Month", self._a_month))
 
         hl.addLayout(_field("Date From", self._a_from))
         hl.addLayout(_field("Date To",   self._a_to))
 
-        # Item
-        self._item_combo = _combo(148)
-        self._item_combo.addItem("— Loading… —", None)
-        self._item_combo.currentIndexChanged.connect(self._on_item_changed)
+        # Item — multi-select from entries in the date window
+        self._item_combo = CheckableMultiCombo(
+            "All Items", noun_plural="items", parent=self,
+        )
+        self._item_combo.setFixedHeight(28)
+        self._item_combo.setFixedWidth(160)
+        self._item_combo.setStyleSheet(_FIELD_SS)
+        self._item_combo.selectionChanged.connect(self._on_items_changed)
         hl.addLayout(_field("Item", self._item_combo))
 
-        # Sub-Item
-        self._subitem_combo = _combo(162)
-        self._subitem_combo.addItem("— Any Sub-Item —", None)
-        self._subitem_combo.setEnabled(False)
+        # Sub-Item = description name — multi-select, cascades with Item
+        self._subitem_combo = CheckableMultiCombo(
+            "All Descriptions", noun_plural="descriptions", parent=self,
+        )
+        self._subitem_combo.setFixedHeight(28)
+        self._subitem_combo.setFixedWidth(180)
+        self._subitem_combo.setStyleSheet(_FIELD_SS)
+        self._subitem_combo.selectionChanged.connect(self._on_descs_changed)
         hl.addLayout(_field("Sub-Item", self._subitem_combo))
 
         hl.addStretch()
@@ -370,21 +380,24 @@ class TransactionBrowser(QDialog):
 
     def _build_simple_table(self) -> QTableWidget:
         t = QTableWidget()
-        t.setColumnCount(5)
+        t.setColumnCount(6)
         t.setHorizontalHeaderLabels(
-# Simple mode headers
-            ["Date", "Transaction ID", "Entries", "Refund to Float", "Total Amount"]
+            ["Date", "Transaction ID", "Entries", "Merged / Status",
+             "Refund to Float", "Total Amount"]
         )
         t.setStyleSheet(_TABLE_SS)
         t.setAlternatingRowColors(True)
         hh = t.horizontalHeader()
-        for i in range(5):
+        for i in range(6):
             hh.setSectionResizeMode(i, QHeaderView.Interactive)
-        hh.setStretchLastSection(True)
+        hh.setStretchLastSection(False)
+        hh.setSectionResizeMode(_S_COL_STATUS, QHeaderView.Stretch)
         t.setColumnWidth(_S_COL_DATE,    130)
-        t.setColumnWidth(_S_COL_TXN_ID,  160)
+        t.setColumnWidth(_S_COL_TXN_ID,  150)
         t.setColumnWidth(_S_COL_ENTRIES,  70)
-        t.setColumnWidth(_S_COL_REFUND,  160)
+        t.setColumnWidth(_S_COL_STATUS,  260)
+        t.setColumnWidth(_S_COL_REFUND,  140)
+        t.setColumnWidth(_S_COL_TOTAL,   130)
         t.verticalHeader().setVisible(False)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -395,17 +408,19 @@ class TransactionBrowser(QDialog):
 
     def _build_adv_table(self) -> QTableWidget:
         t = QTableWidget()
-        t.setColumnCount(10)
+        t.setColumnCount(12)
         t.setHorizontalHeaderLabels([
             "Date", "Item", "Description", "Truck No.",
             "Memo", "Ref_Float", "TZS", "Receipt", "Ownership", "APR BY",
+            "Cashier", "Edited by",
         ])
         t.setStyleSheet(_TABLE_SS)
         t.setAlternatingRowColors(True)
         hh = t.horizontalHeader()
-        for i in range(10):
+        for i in range(12):
             hh.setSectionResizeMode(i, QHeaderView.Interactive)
-        hh.setStretchLastSection(True)
+        hh.setStretchLastSection(False)
+        hh.setSectionResizeMode(_A_COL_DESC, QHeaderView.Stretch)
         t.setColumnWidth(_A_COL_DATE,      108)
         t.setColumnWidth(_A_COL_ITEM,      110)
         t.setColumnWidth(_A_COL_DESC,      220)
@@ -415,6 +430,9 @@ class TransactionBrowser(QDialog):
         t.setColumnWidth(_A_COL_TZS,       105)
         t.setColumnWidth(_A_COL_RECEIPT,    82)
         t.setColumnWidth(_A_COL_OWNERSHIP,  95)
+        t.setColumnWidth(_A_COL_APR,        90)
+        t.setColumnWidth(_A_COL_CASHIER,   110)
+        t.setColumnWidth(_A_COL_EDITED_BY, 110)
         t.verticalHeader().setVisible(False)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -450,17 +468,10 @@ class TransactionBrowser(QDialog):
         self._export_btn.setEnabled(False)
         self._export_btn.clicked.connect(self._on_export)
 
-        close_btn = QPushButton("Close")
-        close_btn.setFixedWidth(80)
-        close_btn.setAutoDefault(False)
-        close_btn.setStyleSheet(_BTN_STYLE)
-        close_btn.clicked.connect(self.close)
-
         al.addWidget(self._count_label)
         al.addStretch()
         al.addWidget(self._goto_btn)
         al.addWidget(self._export_btn)
-        al.addWidget(close_btn)
         return bar
 
     # ── Mode switching ────────────────────────────────────────────────────────
@@ -474,8 +485,7 @@ class TransactionBrowser(QDialog):
         if not self._months_loaded and mode != _MODE_UPLOADS:
             asyncio.ensure_future(self._load_months())
         if mode == _MODE_ADVANCED:
-            if not self._cats_loaded:
-                asyncio.ensure_future(self._load_categories())
+            asyncio.ensure_future(self._ensure_filter_options())
             self._do_find()
         elif mode == _MODE_UPLOADS:
             self._do_find()
@@ -512,40 +522,62 @@ class TransactionBrowser(QDialog):
         except Exception:
             pass
 
-    async def _load_categories(self) -> None:
-        try:
-            cats = await get_all_categories()
-            self._cats_loaded = True
-            self._item_combo.blockSignals(True)
-            self._item_combo.clear()
-            self._item_combo.addItem("— Any Item —", None)
-            for cat in cats:
-                self._item_combo.addItem(cat.name, cat)
-            self._item_combo.blockSignals(False)
-        except Exception:
-            self._item_combo.clear()
-            self._item_combo.addItem("— Load error —", None)
+    async def _ensure_filter_options(self) -> None:
+        await self._reload_cascade_options(from_items=True, from_descs=True)
+        self._filter_opts_loaded = True
 
-    def _on_item_changed(self, _index: int) -> None:
-        cat = self._item_combo.currentData()
-        self._subitem_combo.clear()
-        self._subitem_combo.addItem("— Any Sub-Item —", None)
-        self._subitem_combo.setEnabled(False)
-        if cat is not None:
-            asyncio.ensure_future(self._load_subtables(cat))
+    def _adv_date_range(self):
+        return _qdate_to_py(self._a_from.date()), _qdate_to_py(self._a_to.date())
 
-    async def _load_subtables(self, cat) -> None:
+    def _on_adv_dates_changed(self) -> None:
+        if self._current_mode != _MODE_ADVANCED:
+            return
+        asyncio.ensure_future(self._reload_cascade_options(from_items=True, from_descs=True))
+
+    def _on_items_changed(self) -> None:
+        if self._cascade_busy:
+            return
+        asyncio.ensure_future(self._cascade_from_items())
+
+    def _on_descs_changed(self) -> None:
+        if self._cascade_busy:
+            return
+        asyncio.ensure_future(self._cascade_from_descs())
+
+    async def _cascade_from_items(self) -> None:
+        await self._reload_cascade_options(from_items=False, from_descs=True)
+        self._do_find()
+
+    async def _cascade_from_descs(self) -> None:
+        await self._reload_cascade_options(from_items=True, from_descs=False)
+        self._do_find()
+
+    async def _reload_cascade_options(
+        self, *, from_items: bool, from_descs: bool,
+    ) -> None:
+        date_from, date_to = self._adv_date_range()
+        items_sel = self._item_combo.selected_values()
+        self._cascade_busy = True
         try:
-            subs = await get_subtables(item_key(cat.name))
-            self._subitem_combo.blockSignals(True)
-            self._subitem_combo.clear()
-            self._subitem_combo.addItem("— Any Sub-Item —", None)
-            for sub in subs:
-                self._subitem_combo.addItem(sub.name, sub)
-            self._subitem_combo.blockSignals(False)
-            self._subitem_combo.setEnabled(len(subs) > 0)
+            if from_descs:
+                descs = await get_browse_descriptions(
+                    date_from=date_from,
+                    date_to=date_to,
+                    category_name=items_sel or None,
+                )
+                self._subitem_combo.set_options(descs, keep_selected=True, emit=False)
+            if from_items:
+                descs_sel = self._subitem_combo.selected_values()
+                items = await get_browse_items(
+                    date_from=date_from,
+                    date_to=date_to,
+                    descriptions=descs_sel or None,
+                )
+                self._item_combo.set_options(items, keep_selected=True, emit=False)
         except Exception:
-            self._subitem_combo.setEnabled(False)
+            pass
+        finally:
+            self._cascade_busy = False
 
     # ── Search ────────────────────────────────────────────────────────────────
 
@@ -556,12 +588,10 @@ class TransactionBrowser(QDialog):
                 date_from=_qdate_to_py(self._s_from.date()),
                 date_to=_qdate_to_py(self._s_to.date()),
             )
-        cat = self._item_combo.currentData()
-        sub = self._subitem_combo.currentData()
         return dict(
             keyword=self._adv_kw_edit.text().strip(),
-            category_name=cat.name if cat else "",
-            sub_item_match=sub.match if sub else "",
+            category_name=self._item_combo.selected_values(),
+            descriptions=self._subitem_combo.selected_values(),
             date_from=_qdate_to_py(self._a_from.date()),
             date_to=_qdate_to_py(self._a_to.date()),
         )
@@ -579,9 +609,22 @@ class TransactionBrowser(QDialog):
             params = self._get_search_params()
             if self._current_mode == _MODE_SIMPLE:
                 self._results_simple = await get_daily_summaries(**params)
+                from tahmeed.services.accountant_service import get_cashier_names
+                ids = []
+                for s in self._results_simple:
+                    ids.extend(s.get("cashier_ids") or [])
+                self._user_names = await get_cashier_names(ids) if ids else {}
                 self._populate_simple(self._results_simple)
             else:
                 self._results_advanced = await get_transactions_flat(**params)
+                from tahmeed.services.accountant_service import get_cashier_names
+                ids = []
+                for tx in self._results_advanced:
+                    if tx.cashier_id:
+                        ids.append(tx.cashier_id)
+                    if tx.last_edited_by:
+                        ids.append(tx.last_edited_by)
+                self._user_names = await get_cashier_names(ids) if ids else {}
                 self._populate_advanced(self._results_advanced)
         except Exception as exc:
             from PySide6.QtWidgets import QMessageBox
@@ -684,6 +727,7 @@ class TransactionBrowser(QDialog):
     def _populate_simple(self, rows: List[dict]) -> None:
         t = self._simple_table
         t.setRowCount(len(rows))
+        names = getattr(self, "_user_names", {}) or {}
         for i, s in enumerate(rows):
             d = s["date"]
             t.setItem(i, _S_COL_DATE, _ro(d.strftime("%a, %d %b %Y")))
@@ -694,6 +738,9 @@ class TransactionBrowser(QDialog):
             t.setItem(i, _S_COL_TXN_ID, txn)
 
             t.setItem(i, _S_COL_ENTRIES, _ro(str(s["entries_count"]), Qt.AlignCenter))
+
+            status_it = _ro(self._simple_status_text(s, names))
+            t.setItem(i, _S_COL_STATUS, status_it)
 
             refund = s["total_refund"]
             ref_it = _ro(f"TZS {refund:,.0f}" if refund else "—", Qt.AlignRight | Qt.AlignVCenter)
@@ -711,9 +758,54 @@ class TransactionBrowser(QDialog):
         self._count_label.setText(f"Days shown: {n}")
         self._export_btn.setEnabled(n > 0)
 
+    @staticmethod
+    def _simple_status_text(summary: dict, names: dict) -> str:
+        """e.g. 'Merged by Aisha, John · All submitted' or 'Aisha · 2 draft, 3 submitted'."""
+        cashier_ids = summary.get("cashier_ids") or []
+        people = []
+        for cid in cashier_ids:
+            label = names.get(cid)
+            if label:
+                people.append(label)
+            else:
+                people.append(str(cid)[:8])
+        people = sorted(set(people), key=str.lower)
+
+        draft = int(summary.get("draft_count") or 0)
+        submitted = int(summary.get("submitted_count") or 0)
+        total = int(summary.get("entries_count") or 0)
+        # Legacy rows without register_status count as submitted in the pipeline.
+        if draft + submitted < total:
+            submitted = total - draft
+
+        if draft and submitted:
+            state = f"{submitted} submitted, {draft} draft"
+        elif draft:
+            state = "All draft" if draft == total else f"{draft} draft"
+        else:
+            state = "All submitted"
+
+        if not people:
+            return state
+        if len(people) == 1:
+            return f"{people[0]} · {state}"
+        if len(people) <= 3:
+            return f"Merged by {', '.join(people)} · {state}"
+        return f"Merged by {len(people)} users · {state}"
+
     def _populate_advanced(self, txs: List[Transaction]) -> None:
         t = self._adv_table
         t.setRowCount(len(txs))
+
+        ids = []
+        for tx in txs:
+            if tx.cashier_id:
+                ids.append(tx.cashier_id)
+            if tx.last_edited_by:
+                ids.append(tx.last_edited_by)
+        # Names filled async in _async_find; use cached map when present.
+        names = getattr(self, "_user_names", {}) or {}
+
         for i, tx in enumerate(txs):
             d = tx.date
             date_str = d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
@@ -726,7 +818,6 @@ class TransactionBrowser(QDialog):
             if tx.notes_flag:
                 ref_it = _ro("REFUND TO FLOAT", Qt.AlignCenter)
                 ref_it.setForeground(QColor("#EA580C"))
-                ref_it.setFont(QFont("Segoe UI", 9, QFont.Bold))
                 t.setItem(i, _A_COL_REFUND, ref_it)
             else:
                 t.setItem(i, _A_COL_REFUND, _ro(""))
@@ -756,6 +847,10 @@ class TransactionBrowser(QDialog):
             t.setItem(i, _A_COL_RECEIPT, rec_it)
             t.setItem(i, _A_COL_OWNERSHIP, _ro(tx.ownership or ""))
             t.setItem(i, _A_COL_APR, _ro(tx.approver or ""))
+            cashier = names.get(tx.cashier_id, "—") if tx.cashier_id else "—"
+            edited = names.get(tx.last_edited_by, "—") if tx.last_edited_by else "—"
+            t.setItem(i, _A_COL_CASHIER, _ro(cashier))
+            t.setItem(i, _A_COL_EDITED_BY, _ro(edited))
 
         n = len(txs)
         self._count_label.setText(f"Transactions: {n}")
@@ -775,12 +870,15 @@ class TransactionBrowser(QDialog):
         else:
             self._adv_kw_edit.clear()
             self._a_month.setCurrentIndex(0)
-            self._item_combo.setCurrentIndex(0)
-            self._subitem_combo.clear()
-            self._subitem_combo.addItem("— Any Sub-Item —", None)
-            self._subitem_combo.setEnabled(False)
+            self._cascade_busy = True
+            try:
+                self._item_combo.reset_to_all(emit=False)
+                self._subitem_combo.reset_to_all(emit=False)
+            finally:
+                self._cascade_busy = False
             self._a_from.setDate(QDate(_ONE_MONTH_AGO.year, _ONE_MONTH_AGO.month, _ONE_MONTH_AGO.day))
             self._a_to.setDate(QDate.currentDate())
+            asyncio.ensure_future(self._reload_cascade_options(from_items=True, from_descs=True))
         self._goto_btn.setEnabled(False)
         self._export_btn.setEnabled(False)
         self._do_find()
@@ -811,22 +909,26 @@ class TransactionBrowser(QDialog):
             d  = tx.date
             if hasattr(d, "date"):
                 d = d.date()
-            sub  = self._subitem_combo.currentData()
-            term = sub.match.strip() if sub else self._adv_kw_edit.text().strip()
+            descs = self._subitem_combo.selected_values()
+            term = descs[0] if len(descs) == 1 else self._adv_kw_edit.text().strip()
         self.go_to_date.emit(d, term)
-        self.close()
 
     # ── Export ────────────────────────────────────────────────────────────────
 
     def _on_export(self) -> None:
         if self._current_mode == _MODE_SIMPLE:
-            lines = ["Date\tTransaction ID\tEntries\tRefund to Float (TZS)\tTotal Amount (TZS)"]
+            names = getattr(self, "_user_names", {}) or {}
+            lines = [
+                "Date\tTransaction ID\tEntries\tMerged / Status"
+                "\tRefund to Float (TZS)\tTotal Amount (TZS)"
+            ]
             for s in self._results_simple:
                 d = s["date"]
                 lines.append("\t".join([
                     d.strftime("%d/%m/%Y"),
                     f"TXN-{d.strftime('%Y%m%d')}",
                     str(s["entries_count"]),
+                    self._simple_status_text(s, names),
                     f"{s['total_refund']:.0f}" if s["total_refund"] else "0",
                     f"{s['total_tzs']:.0f}"    if s["total_tzs"]    else "0",
                 ]))
@@ -835,7 +937,9 @@ class TransactionBrowser(QDialog):
             lines = ["\t".join([
                 "Date", "Item", "Description", "Truck No.", "Memo",
                 "Ref Float", "TZS", "Receipt", "Ownership", "APR BY",
+                "Cashier", "Edited by",
             ])]
+            names = getattr(self, "_user_names", {}) or {}
             for tx in self._results_advanced:
                 d = tx.date
                 lines.append("\t".join([
@@ -849,6 +953,8 @@ class TransactionBrowser(QDialog):
                     (tx.receipt_status or "").capitalize(),
                     tx.ownership or "",
                     tx.approver or "",
+                    names.get(tx.cashier_id, "") if tx.cashier_id else "",
+                    names.get(tx.last_edited_by, "") if tx.last_edited_by else "",
                 ]))
             n = len(self._results_advanced)
 
@@ -859,12 +965,17 @@ class TransactionBrowser(QDialog):
 
     # ── Public ────────────────────────────────────────────────────────────────
 
-    def show_and_search(self) -> None:
-        self.show()
-        self.raise_()
+    def refresh(self) -> None:
+        """Called when the Browse sidebar page is shown."""
         if not self._months_loaded:
             asyncio.ensure_future(self._load_months())
+        if self._current_mode == _MODE_ADVANCED:
+            asyncio.ensure_future(self._ensure_filter_options())
         self._do_find()
+
+    def show_and_search(self) -> None:
+        """Backward-compatible alias for embedded refresh."""
+        self.refresh()
 
 
 # ── Module helpers ────────────────────────────────────────────────────────────

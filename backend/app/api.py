@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from .dependencies import Admin, Authenticated, Cashier, Manager, require_roles
+from .dependencies import Authenticated, Cashier, Manager, require_roles
 from .errors import ApiError
 from .schemas import (
     BackupRestoreRequest,
@@ -255,10 +255,12 @@ async def accountant_notification_counts(
     request: Request,
     _manager: Annotated[dict, Depends(require_roles("admin", "accountant"))],
 ) -> dict[str, int]:
-    pending = await database(request).transactions.count_documents(
+    db = database(request)
+    pending = await db.transactions.count_documents(
         {"verified": False, "rejected": {"$ne": True}}
     )
-    return {"verify": pending}
+    deletions = await db.transactions.count_documents({"deletion_requested": True})
+    return {"verify": int(pending) + int(deletions)}
 
 
 @users.get("")
@@ -336,7 +338,8 @@ def valid_id(value: str) -> ObjectId:
 
 _PATCH_FIELDS = {
     "categories": {
-        "name", "description", "color", "icon", "sidebar_name", "show_in_sidebar", "sort_order",
+        "name", "description", "color", "icon", "sidebar_name", "show_in_sidebar",
+        "show_in_cashier_sidebar", "sort_order",
         "requires_receipt", "requires_truck", "lock_description", "active",
         "account_type", "ref_num", "account_number", "currency", "coa_description",
     },
@@ -733,9 +736,9 @@ async def list_backup_jobs(
 async def restore_backup_job(
     body: BackupRestoreRequest,
     request: Request,
-    admin: Admin,
+    manager: Manager,
 ) -> dict:
-    """Replace the live database with a verified uploaded backup. Admin only."""
+    """Replace the live database with a verified uploaded backup (admin/accountant)."""
     from .cli.backup import exclusive_lock, distributed_lease, restore_database
 
     settings = request.app.state.settings
@@ -748,7 +751,7 @@ async def restore_backup_job(
                     db,
                     filename=body.filename,
                     confirm_filename=body.confirm_filename,
-                    actor=admin,
+                    actor=manager,
                 )
     except RuntimeError as exc:
         message = str(exc)

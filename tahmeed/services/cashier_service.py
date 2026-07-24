@@ -8,14 +8,31 @@ from tahmeed.db.connection import get_db
 from tahmeed.models.transaction import Transaction
 
 
-async def get_transactions_by_date(target_date: date, cashier_id=None) -> List[Transaction]:
+async def get_transactions_by_date(
+    target_date: date,
+    cashier_id=None,
+    *,
+    merged: bool = False,
+) -> List[Transaction]:
+    """Load a calendar day's register rows.
+
+    ``merged=True`` returns every cashier's rows for that day (Shared/Merged mode).
+    Otherwise ``cashier_id`` scopes to one user when provided.
+    Sorted by ``day_order`` then ``created_at``.
+    """
     db = get_db()
     start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
     end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
-    query: dict = {"date": {"$gte": start, "$lte": end}, "rejected": {"$ne": True}}
-    if cashier_id is not None:
+    query: dict = {
+        "date": {"$gte": start, "$lte": end},
+        "rejected": {"$ne": True},
+        "deletion_requested": {"$ne": True},
+    }
+    if not merged and cashier_id is not None:
         query["cashier_id"] = cashier_id
-    cursor = db.transactions.find(query).sort("created_at", 1)
+    cursor = db.transactions.find(query).sort(
+        [("day_order", 1), ("created_at", 1)]
+    )
     docs = await cursor.to_list(length=None)
     # Prefer open pending-edit clones over their master originals so the
     # register does not show both after a verified row was edited.
@@ -27,6 +44,43 @@ async def get_transactions_by_date(target_date: date, cashier_id=None) -> List[T
     if pending_original_ids:
         docs = [d for d in docs if d.get("_id") not in pending_original_ids]
     return [Transaction.from_doc(d) for d in docs]
+
+
+async def submit_day_for_verify(target_date: date) -> int:
+    """Mark all draft (and legacy) unverified rows for *target_date* as submitted.
+
+    Returns the number of documents updated.
+    """
+    db = get_db()
+    start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
+    end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
+    result = await db.transactions.update_many(
+        {
+            "date": {"$gte": start, "$lte": end},
+            "verified": {"$ne": True},
+            "rejected": {"$ne": True},
+            "discarded": {"$ne": True},
+            "$or": [
+                {"register_status": "draft"},
+                {"register_status": {"$exists": False}},
+            ],
+        },
+        {"$set": {"register_status": "submitted"}},
+    )
+    return int(result.modified_count)
+
+
+async def recount_day_order(target_date: date, ordered_ids: List[ObjectId]) -> None:
+    """Persist ``day_order`` = index for each id in *ordered_ids*."""
+    if not ordered_ids:
+        return
+    db = get_db()
+    ops = []
+    from pymongo import UpdateOne
+    for i, oid in enumerate(ordered_ids):
+        ops.append(UpdateOne({"_id": oid}, {"$set": {"day_order": i}}))
+    if ops:
+        await db.transactions.bulk_write(ops, ordered=False)
 
 
 async def save_transaction(tx: Transaction) -> Transaction:
@@ -50,8 +104,42 @@ async def update_transaction(tx_id: ObjectId, updates: dict) -> bool:
 
 
 async def delete_transaction(tx_id: ObjectId) -> None:
+    """Hard-delete a transaction by id (no status guards). Prefer
+    ``request_or_delete_transaction`` from the cashier register UI."""
     db = get_db()
     await db.transactions.delete_one({"_id": tx_id})
+
+
+async def request_or_delete_transaction(
+    tx_id: ObjectId,
+    cashier_id: Optional[ObjectId] = None,
+) -> str:
+    """Delete or request deletion of a register row.
+
+    Returns one of:
+      - ``"deleted"`` — hard-deleted (unverified, or pending-edit clone)
+      - ``"deletion_requested"`` — approved row flagged for accountant confirm
+      - ``"not_found"`` — no matching document
+    """
+    db = get_db()
+    doc = await db.transactions.find_one({"_id": tx_id})
+    if not doc:
+        return "not_found"
+
+    is_pending_edit = bool(doc.get("original_transaction_id")) and not doc.get("verified")
+    if is_pending_edit or not doc.get("verified"):
+        await db.transactions.delete_one({"_id": tx_id})
+        return "deleted"
+
+    await db.transactions.update_one(
+        {"_id": tx_id},
+        {"$set": {
+            "deletion_requested": True,
+            "deletion_requested_at": datetime.utcnow(),
+            "deletion_requested_by": cashier_id or doc.get("cashier_id"),
+        }},
+    )
+    return "deletion_requested"
 
 
 async def search_transactions(
@@ -136,8 +224,9 @@ async def get_daily_summaries(
     date_to: date = None,
     keyword: str = "",
     truck: str = "",
-    category_name: str = "",
-    sub_item_match: str = "",
+    category_name="",
+    sub_item_match="",
+    descriptions="",
     limit: int = 365,
 ) -> list:
     """Aggregate transactions by calendar day, returning one summary dict per day.
@@ -145,32 +234,20 @@ async def get_daily_summaries(
     Each dict has: date (date), entries_count (int), total_tzs (float), total_refund (float).
     Filters narrow which *entries* are counted before the group-by, so a truck
     filter returns days that contain that truck with counts/totals for that truck only.
-    sub_item_match filters on description and takes priority over keyword when both are set.
+
+    ``category_name`` / ``descriptions`` accept a string or list (multi-select).
+    ``sub_item_match`` is kept for backward compatibility (maps into descriptions).
     """
     db = get_db()
-    match: dict = {}
-    if date_from or date_to:
-        date_filter: dict = {}
-        if date_from:
-            date_filter["$gte"] = datetime(date_from.year, date_from.month, date_from.day)
-        if date_to:
-            date_filter["$lte"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59)
-        match["date"] = date_filter
-    if category_name.strip():
-        match["category_name"] = category_name.strip()
-    if truck.strip():
-        match["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
-    if sub_item_match.strip():
-        # advanced exact-match on description only
-        match["description"] = {"$regex": re.escape(sub_item_match.strip()), "$options": "i"}
-    elif keyword.strip():
-        # simple keyword: OR across description, truck_number, memo
-        kw_re = {"$regex": re.escape(keyword.strip()), "$options": "i"}
-        match["$or"] = [
-            {"description":  kw_re},
-            {"truck_number": kw_re},
-            {"memo":         kw_re},
-        ]
+    desc_filter = descriptions if descriptions not in ("", None, []) else sub_item_match
+    match = _browse_match(
+        date_from=date_from,
+        date_to=date_to,
+        keyword=keyword,
+        truck=truck,
+        category_name=category_name,
+        descriptions=desc_filter,
+    )
 
     pipeline = [
         {"$match": match},
@@ -185,6 +262,20 @@ async def get_daily_summaries(
             "total_refund":  {"$sum": {
                 "$cond": [{"$eq": ["$notes_flag", True]}, "$amount", 0]
             }},
+            "cashier_ids": {"$addToSet": "$cashier_id"},
+            "draft_count": {"$sum": {
+                "$cond": [{"$eq": ["$register_status", "draft"]}, 1, 0]
+            }},
+            "submitted_count": {"$sum": {
+                "$cond": [
+                    {"$or": [
+                        {"$eq": ["$register_status", "submitted"]},
+                        {"$eq": [{"$type": "$register_status"}, "missing"]},
+                    ]},
+                    1,
+                    0,
+                ]
+            }},
         }},
         {"$sort": {"_id.year": -1, "_id.month": -1, "_id.day": -1}},
         {"$limit": limit},
@@ -194,26 +285,46 @@ async def get_daily_summaries(
     result = []
     for d in docs:
         g = d["_id"]
+        cashier_ids = [cid for cid in (d.get("cashier_ids") or []) if cid is not None]
         result.append({
-            "date":          date(g["year"], g["month"], g["day"]),
-            "entries_count": d["entries_count"],
-            "total_tzs":     d["total_tzs"],
-            "total_refund":  d["total_refund"],
+            "date":             date(g["year"], g["month"], g["day"]),
+            "entries_count":    d["entries_count"],
+            "total_tzs":        d["total_tzs"],
+            "total_refund":     d["total_refund"],
+            "cashier_ids":      cashier_ids,
+            "draft_count":      int(d.get("draft_count") or 0),
+            "submitted_count":  int(d.get("submitted_count") or 0),
         })
     return result
 
 
-async def get_transactions_flat(
+def _normalize_multi_filter(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        s = value.strip()
+        return [s] if s else []
+    out: List[str] = []
+    for v in value:
+        s = str(v).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _browse_match(
+    *,
     date_from: date = None,
     date_to: date = None,
     keyword: str = "",
-    category_name: str = "",
-    sub_item_match: str = "",
-    limit: int = 1000,
-) -> List[Transaction]:
-    """Return individual transactions matching all supplied filters."""
-    db = get_db()
+    truck: str = "",
+    category_name="",
+    descriptions="",
+) -> dict:
+    """Shared match clause for browse list / distinct-option queries."""
     match: dict = {}
+    and_clauses: list = []
+
     if date_from or date_to:
         date_filter: dict = {}
         if date_from:
@@ -221,20 +332,102 @@ async def get_transactions_flat(
         if date_to:
             date_filter["$lte"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59)
         match["date"] = date_filter
-    if category_name.strip():
-        match["category_name"] = category_name.strip()
-    if sub_item_match.strip():
-        match["description"] = {"$regex": re.escape(sub_item_match.strip()), "$options": "i"}
+
+    cats = _normalize_multi_filter(category_name)
+    if cats:
+        cat_ors: list = []
+        for c in cats:
+            esc = re.escape(c)
+            cat_ors.append({"category_name": {"$regex": f"^{esc}$", "$options": "i"}})
+            cat_ors.append({"item": {"$regex": f"^{esc}$", "$options": "i"}})
+        and_clauses.append({"$or": cat_ors})
+
+    descs = _normalize_multi_filter(descriptions)
+    if descs:
+        if isinstance(descriptions, str):
+            and_clauses.append({
+                "description": {
+                    "$regex": re.escape(descs[0]),
+                    "$options": "i",
+                },
+            })
+        else:
+            and_clauses.append({"$or": [
+                {"description": {"$regex": f"^{re.escape(d)}$", "$options": "i"}}
+                for d in descs
+            ]})
     elif keyword.strip():
         kw_re = {"$regex": re.escape(keyword.strip()), "$options": "i"}
-        match["$or"] = [
+        and_clauses.append({"$or": [
             {"description":  kw_re},
             {"truck_number": kw_re},
             {"memo":         kw_re},
-        ]
+        ]})
+
+    if truck.strip():
+        match["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
+
+    if and_clauses:
+        match["$and"] = and_clauses
+    return match
+
+
+async def get_transactions_flat(
+    date_from: date = None,
+    date_to: date = None,
+    keyword: str = "",
+    category_name="",
+    sub_item_match="",
+    descriptions="",
+    limit: int = 1000,
+) -> List[Transaction]:
+    """Return individual transactions matching all supplied filters."""
+    db = get_db()
+    desc_filter = descriptions if descriptions not in ("", None, []) else sub_item_match
+    match = _browse_match(
+        date_from=date_from,
+        date_to=date_to,
+        keyword=keyword,
+        category_name=category_name,
+        descriptions=desc_filter,
+    )
     cursor = db.transactions.find(match).sort([("date", -1), ("created_at", -1)]).limit(limit)
     docs = await cursor.to_list(length=limit)
     return [Transaction.from_doc(d) for d in docs]
+
+
+async def get_browse_items(
+    date_from: date = None,
+    date_to: date = None,
+    descriptions=None,
+) -> List[str]:
+    """Distinct item / category names in the browse date window (cascading)."""
+    db = get_db()
+    match = _browse_match(
+        date_from=date_from,
+        date_to=date_to,
+        descriptions=descriptions or [],
+    )
+    items = await db.transactions.distinct("item", match)
+    cats = await db.transactions.distinct("category_name", match)
+    names = {*(v for v in items if v), *(v for v in cats if v)}
+    return sorted(names, key=str.lower)
+
+
+async def get_browse_descriptions(
+    date_from: date = None,
+    date_to: date = None,
+    category_name=None,
+) -> List[str]:
+    """Distinct descriptions in the browse date window (cascading by items)."""
+    db = get_db()
+    match = _browse_match(
+        date_from=date_from,
+        date_to=date_to,
+        category_name=category_name or [],
+    )
+    vals = await db.transactions.distinct("description", match)
+    return sorted((v for v in vals if v), key=str.lower)
 
 
 async def get_available_months() -> list:

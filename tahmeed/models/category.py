@@ -8,8 +8,9 @@ class Category:
     """An accountant-managed expense *item*.
 
     (Stored in the ``categories`` collection for backward compatibility; the UI
-    refers to these as "items".) When ``show_in_sidebar`` is True the item gets
-    its own dedicated sidebar tab, using ``icon`` as its glyph.
+    refers to these as "items".) ``show_in_sidebar`` controls the accountant
+    ITEMS sidebar; ``show_in_cashier_sidebar`` controls the cashier ITEMS
+    sidebar. Both use ``icon`` / ``sidebar_name`` for the tab glyph and label.
     """
 
     name: str
@@ -17,7 +18,8 @@ class Category:
     color: str = "#4A90D9"
     icon: str = "mdi.tag-outline"  # qtawesome mdi.* glyph for the sidebar tab
     sidebar_name: str = ""         # optional short label for the sidebar tab
-    show_in_sidebar: bool = False  # if True, item gets its own sidebar tab
+    show_in_sidebar: bool = False  # accountant sidebar tab
+    show_in_cashier_sidebar: bool = False  # cashier sidebar tab
     sort_order: int = 0
     requires_receipt: bool = False
     requires_truck: bool = True
@@ -45,6 +47,7 @@ class Category:
             "icon": self.icon,
             "sidebar_name": self.sidebar_name,
             "show_in_sidebar": self.show_in_sidebar,
+            "show_in_cashier_sidebar": self.show_in_cashier_sidebar,
             "sort_order": self.sort_order,
             "requires_receipt": self.requires_receipt,
             "requires_truck": self.requires_truck,
@@ -70,6 +73,12 @@ class Category:
             icon=doc.get("icon", "mdi.tag-outline"),
             sidebar_name=doc.get("sidebar_name", ""),
             show_in_sidebar=doc.get("show_in_sidebar", False),
+            # Older docs only had show_in_sidebar (used by both sidebars).
+            show_in_cashier_sidebar=(
+                doc["show_in_cashier_sidebar"]
+                if "show_in_cashier_sidebar" in doc
+                else doc.get("show_in_sidebar", False)
+            ),
             sort_order=doc.get("sort_order", 0),
             requires_receipt=doc.get("requires_receipt", False),
             requires_truck=doc.get("requires_truck", True),

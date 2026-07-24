@@ -1,55 +1,68 @@
 import asyncio
-import os
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QLineEdit,
-    QPushButton, QStackedWidget, QApplication,
+    QPushButton, QStackedWidget,
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPalette, QPixmap
+from PySide6.QtCore import Qt, QTimer, Signal
 
 from tahmeed.services.auth import authenticate, any_user_exists, create_user
 from tahmeed.services.api_client import ApiError
+from tahmeed.ui.branding import is_dark_theme, load_brand_logo
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_LOGO_LIGHT = os.path.join(_ROOT, "logo.png")
-_LOGO_DARK = os.path.join(_ROOT, "ChatGPT_Image_Jun_10__2026__09_07_13_AM-removebg-preview.png")
+# App brand blues (match accountant / cashier UI)
+_BLUE = "#0077C5"
+_BLUE_HOVER = "#005EA3"
+_BLUE_PRESS = "#004B82"
+_BLUE_LIGHT = "#E8F4FD"
+_NAVY = "#1B2B4B"
 
-_BTN_STYLE = """
-    QPushButton {
-        background-color: #E85D04;
+_BTN_STYLE = f"""
+    QPushButton {{
+        background-color: {_BLUE};
         color: white;
         border: none;
         border-radius: 6px;
         font-size: 14px;
         font-weight: bold;
-    }
-    QPushButton:hover { background-color: #F48C06; }
-    QPushButton:pressed { background-color: #DC2F02; }
-    QPushButton:disabled { background-color: #888; color: #ccc; }
+    }}
+    QPushButton:hover {{ background-color: {_BLUE_HOVER}; }}
+    QPushButton:pressed {{ background-color: {_BLUE_PRESS}; }}
+    QPushButton:disabled {{ background-color: #94A3B8; color: #E2E8F0; }}
+"""
+
+_FIELD_STYLE = f"""
+    QLineEdit {{
+        border: 1px solid #CBD5E1;
+        border-radius: 6px;
+        padding: 0 12px;
+        font-size: 14px;
+        background: #FFFFFF;
+        color: {_NAVY};
+    }}
+    QLineEdit:focus {{
+        border-color: {_BLUE};
+    }}
 """
 
 
 def _is_dark() -> bool:
-    app = QApplication.instance()
-    return app is not None and app.palette().color(QPalette.Window).lightness() < 128
+    return is_dark_theme()
 
 
-def _logo_pixmap(width: int = 200) -> QPixmap:
-    path = _LOGO_DARK if _is_dark() else _LOGO_LIGHT
-    pix = QPixmap(path)
-    return pix.scaledToWidth(width, Qt.SmoothTransformation) if not pix.isNull() else pix
+def _logo_pixmap(width: int = 200):
+    return load_brand_logo(width)
 
 
 def _title_html(text: str, size_pt: int) -> str:
-    """Returns HTML for the title with the trailing 's' in brand orange."""
+    """Title with trailing letter in brand blue."""
     base = text[:-1]
     s = text[-1]
-    style = f"font-size:{size_pt}pt; font-weight:700; font-family:'Segoe UI';"
+    base_color = "#F1F5F9" if _is_dark() else _NAVY
+    style = f"font-size:{size_pt}pt; font-weight:700; font-family:'Segoe UI'; color:{base_color};"
     return (
         f'<span style="{style}">{base}</span>'
-        f'<span style="{style} color:#E85D04;">{s}</span>'
+        f'<span style="{style} color:{_BLUE};">{s}</span>'
     )
 
 
@@ -73,7 +86,13 @@ class LoginWindow(QWidget):
     def _page_bg_style(self, name: str) -> str:
         if _is_dark():
             return ""
-        return f"#{name} {{ background-color: #ffffff; }}"
+        # Soft blue wash so login matches the in-app blue theme
+        return (
+            f"#{name} {{"
+            f" background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            f" stop:0 {_BLUE_LIGHT}, stop:0.35 #FFFFFF, stop:1 #FFFFFF);"
+            f" }}"
+        )
 
     def _build_login_page(self) -> QWidget:
         page = QWidget()
@@ -88,6 +107,8 @@ class LoginWindow(QWidget):
 
         logo = QLabel()
         logo.setAlignment(Qt.AlignCenter)
+        logo.setAttribute(Qt.WA_TranslucentBackground, True)
+        logo.setStyleSheet("background: transparent;")
         pix = _logo_pixmap(200)
         if not pix.isNull():
             logo.setPixmap(pix)
@@ -100,19 +121,21 @@ class LoginWindow(QWidget):
 
         sub = QLabel("Sign in to continue")
         sub.setAlignment(Qt.AlignCenter)
-        sub.setStyleSheet("color: #888; font-size: 13px;")
+        sub.setStyleSheet("color: #64748B; font-size: 13px;")
         layout.addWidget(sub)
         layout.addSpacing(14)
 
         self._username = QLineEdit()
         self._username.setPlaceholderText("Username")
         self._username.setFixedHeight(40)
+        self._username.setStyleSheet(_FIELD_STYLE)
         layout.addWidget(self._username)
 
         self._password = QLineEdit()
         self._password.setPlaceholderText("Password")
         self._password.setEchoMode(QLineEdit.Password)
         self._password.setFixedHeight(40)
+        self._password.setStyleSheet(_FIELD_STYLE)
         self._password.returnPressed.connect(self._on_login)
         layout.addWidget(self._password)
 
@@ -145,6 +168,8 @@ class LoginWindow(QWidget):
 
         logo = QLabel()
         logo.setAlignment(Qt.AlignCenter)
+        logo.setAttribute(Qt.WA_TranslucentBackground, True)
+        logo.setStyleSheet("background: transparent;")
         pix = _logo_pixmap(160)
         if not pix.isNull():
             logo.setPixmap(pix)
@@ -157,7 +182,7 @@ class LoginWindow(QWidget):
 
         sub = QLabel("No accounts found — create the admin account to get started.")
         sub.setAlignment(Qt.AlignCenter)
-        sub.setStyleSheet("color: #888; font-size: 13px;")
+        sub.setStyleSheet("color: #64748B; font-size: 13px;")
         sub.setWordWrap(True)
         layout.addWidget(sub)
         layout.addSpacing(6)
@@ -165,23 +190,27 @@ class LoginWindow(QWidget):
         self._setup_fullname = QLineEdit()
         self._setup_fullname.setPlaceholderText("Full Name")
         self._setup_fullname.setFixedHeight(36)
+        self._setup_fullname.setStyleSheet(_FIELD_STYLE)
         layout.addWidget(self._setup_fullname)
 
         self._setup_username = QLineEdit()
         self._setup_username.setPlaceholderText("Username")
         self._setup_username.setFixedHeight(36)
+        self._setup_username.setStyleSheet(_FIELD_STYLE)
         layout.addWidget(self._setup_username)
 
         self._setup_password = QLineEdit()
         self._setup_password.setPlaceholderText("Password (min 10 chars)")
         self._setup_password.setEchoMode(QLineEdit.Password)
         self._setup_password.setFixedHeight(36)
+        self._setup_password.setStyleSheet(_FIELD_STYLE)
         layout.addWidget(self._setup_password)
 
         self._setup_password2 = QLineEdit()
         self._setup_password2.setPlaceholderText("Confirm Password")
         self._setup_password2.setEchoMode(QLineEdit.Password)
         self._setup_password2.setFixedHeight(36)
+        self._setup_password2.setStyleSheet(_FIELD_STYLE)
         layout.addWidget(self._setup_password2)
 
         self._setup_error = QLabel("")
@@ -205,6 +234,15 @@ class LoginWindow(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        # Defer off any active asyncio task (splash reveal / logout return).
+        # Python 3.14 + qasync forbids create_task while another Task is running.
+        QTimer.singleShot(0, self._kick_first_run_check)
+
+    def _kick_first_run_check(self) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
         asyncio.ensure_future(self._check_first_run())
 
     async def _check_first_run(self) -> None:

@@ -61,11 +61,26 @@ async def count_categories(
     return int(page["total"])
 
 
-async def get_sidebar_categories() -> List[Category]:
-    categories = await get_all_categories()
+def _sorted_sidebar(categories: List[Category]) -> List[Category]:
     return sorted(
-        (category for category in categories if category.show_in_sidebar),
+        categories,
         key=lambda category: (category.sort_order, category.sidebar_label.lower()),
+    )
+
+
+async def get_sidebar_categories() -> List[Category]:
+    """Items shown in the accountant ITEMS sidebar."""
+    categories = await get_all_categories()
+    return _sorted_sidebar(
+        [category for category in categories if category.show_in_sidebar]
+    )
+
+
+async def get_cashier_sidebar_categories() -> List[Category]:
+    """Items shown in the cashier ITEMS sidebar."""
+    categories = await get_all_categories()
+    return _sorted_sidebar(
+        [category for category in categories if category.show_in_cashier_sidebar]
     )
 
 
@@ -79,6 +94,7 @@ async def _create_category(
     icon: str = "mdi.tag-outline",
     sidebar_name: str = "",
     show_in_sidebar: bool = False,
+    show_in_cashier_sidebar: bool = False,
     sort_order: int = 0,
     lock_description: bool = False,
 ) -> Category:
@@ -92,6 +108,7 @@ async def _create_category(
             "icon": icon,
             "sidebar_name": sidebar_name,
             "show_in_sidebar": show_in_sidebar,
+            "show_in_cashier_sidebar": show_in_cashier_sidebar,
             "sort_order": sort_order,
             "requires_receipt": requires_receipt,
             "requires_truck": requires_truck,
@@ -110,6 +127,7 @@ async def create_category(
     icon: str = "mdi.tag-outline",
     sidebar_name: str = "",
     show_in_sidebar: bool = False,
+    show_in_cashier_sidebar: bool = False,
     sort_order: int = 0,
     lock_description: bool = False,
 ) -> Category:
@@ -123,6 +141,7 @@ async def create_category(
         icon,
         sidebar_name,
         show_in_sidebar,
+        show_in_cashier_sidebar,
         sort_order,
         lock_description,
     )
@@ -137,6 +156,7 @@ async def create_cashier_category(
     icon: str = "mdi.tag-outline",
     sidebar_name: str = "",
     show_in_sidebar: bool = False,
+    show_in_cashier_sidebar: bool = False,
     sort_order: int = 0,
     lock_description: bool = False,
 ) -> Category:
@@ -150,6 +170,7 @@ async def create_cashier_category(
         icon,
         sidebar_name,
         show_in_sidebar,
+        show_in_cashier_sidebar,
         sort_order,
         lock_description,
     )

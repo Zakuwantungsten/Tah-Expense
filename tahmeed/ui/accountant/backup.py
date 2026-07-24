@@ -1,4 +1,4 @@
-"""Backend backup job history, with admin-only restore."""
+"""Backend backup job history, with admin/accountant restore."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ class BackupWidget(QWidget):
             "Backups are created and stored by the server. This page shows "
             "their current status and recent history."
             + (
-                " Admins can restore an Uploaded backup into the live database."
+                " You can restore an Uploaded backup into the live database."
                 if self._allow_restore
                 else ""
             )

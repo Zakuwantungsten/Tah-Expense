@@ -36,7 +36,12 @@ class Transaction:
     last_edited_by: Optional[ObjectId] = None  # Cashier who made the edit
     rejected: bool = False                     # True when accountant explicitly rejects the entry
     discarded: bool = False                    # True when cashier soft-discards a rejected entry
+    deletion_requested: bool = False           # True when cashier requested delete of an approved row
+    deletion_requested_at: Optional[datetime] = None
+    deletion_requested_by: Optional[ObjectId] = None
     original_transaction_id: Optional[ObjectId] = None  # Points to the original approved doc when this is a pending edit
+    day_order: Optional[int] = None            # Sequence within the calendar day (Merged register)
+    register_status: str = "draft"             # "draft" | "submitted" — gate before Verify
     month: Optional[str] = None   # e.g. "Jan 25"
     year: Optional[int] = None    # e.g. 2025
     created_at: datetime = field(default_factory=datetime.utcnow)
@@ -79,7 +84,12 @@ class Transaction:
             "last_edited_by": self.last_edited_by,
             "rejected": self.rejected,
             "discarded": self.discarded,
+            "deletion_requested": self.deletion_requested,
+            "deletion_requested_at": self.deletion_requested_at,
+            "deletion_requested_by": self.deletion_requested_by,
             "original_transaction_id": self.original_transaction_id,
+            "day_order": self.day_order,
+            "register_status": self.register_status or "draft",
             "month": self.month,
             "year": self.year,
             "created_at": self.created_at,
@@ -95,6 +105,8 @@ class Transaction:
 
     @classmethod
     def from_doc(cls, doc: dict) -> "Transaction":
+        # Legacy docs without register_status were already in the Verify queue.
+        status = doc.get("register_status") or "submitted"
         return cls(
             _id=doc.get("_id"),
             date=doc["date"],
@@ -127,7 +139,12 @@ class Transaction:
             last_edited_by=doc.get("last_edited_by"),
             rejected=doc.get("rejected", False),
             discarded=doc.get("discarded", False),
+            deletion_requested=doc.get("deletion_requested", False),
+            deletion_requested_at=doc.get("deletion_requested_at"),
+            deletion_requested_by=doc.get("deletion_requested_by"),
             original_transaction_id=doc.get("original_transaction_id"),
+            day_order=doc.get("day_order"),
+            register_status=status,
             month=doc.get("month"),
             year=doc.get("year"),
             created_at=doc.get("created_at", datetime.utcnow()),

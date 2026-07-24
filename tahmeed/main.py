@@ -2,25 +2,18 @@ import sys
 import asyncio
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import qasync
-from PySide6.QtCore import QLockFile
+from PySide6.QtCore import QLockFile, QTimer
 from PySide6.QtWidgets import QApplication
 from PySide6.QtWidgets import QMessageBox
 
 from tahmeed.config import APP_NAME, APP_VERSION
-from tahmeed.db.connection import close as close_db
-from tahmeed.services.api_client import api_client, close_api
-from tahmeed.services.update_controller import UpdateController
-from tahmeed.services.update_service import (
-    cleanup_applied_update,
-    install_on_exit_path,
-    mark_update_launched,
-    recover_ready_update,
-    update_root,
-)
-from tahmeed.ui.login import LoginWindow
-from tahmeed.ui.main_window import MainWindow
+
+if TYPE_CHECKING:
+    from tahmeed.ui.login import LoginWindow
+    from tahmeed.ui.main_window import MainWindow
 
 WINDOWS_APP_MUTEX = "TahmeedExpense.A3F1C2D4-5E6F-4A7B-8C9D-0E1F2A3B4C5D"
 
@@ -56,7 +49,7 @@ def _release_windows_app_mutex(handle: object | None) -> None:
         kernel32.CloseHandle(handle)
 
 
-def _return_to_login(login: LoginWindow, window: MainWindow, open_windows: list) -> None:
+def _return_to_login(login: "LoginWindow", window: "MainWindow", open_windows: list) -> None:
     login.clear_fields()
     # Keep a top-level window visible before closing the dashboard; otherwise
     # Qt's default last-window behavior exits the process.
@@ -69,6 +62,11 @@ def _return_to_login(login: LoginWindow, window: MainWindow, open_windows: list)
 
 def _launch_verified_installer(installer: Path) -> bool:
     """Launch only the installer currently represented by valid ready metadata."""
+    from tahmeed.services.update_service import (
+        mark_update_launched,
+        recover_ready_update,
+    )
+
     verified = recover_ready_update()
     if verified is None or verified.resolve() != installer.resolve():
         return False
@@ -124,6 +122,26 @@ def main() -> None:
     app.setApplicationVersion(APP_VERSION)
     app.setStyle("Fusion")
     _set_app_icon(app)
+
+    # Show brand splash immediately so the desktop icon click isn't a blank wait.
+    from tahmeed.ui.splash import SplashScreen
+
+    splash = SplashScreen()
+    splash.show_centered()
+    splash.set_status("Starting…")
+
+    from tahmeed.db.connection import close as close_db
+    from tahmeed.services.api_client import api_client, close_api
+    from tahmeed.services.update_controller import UpdateController
+    from tahmeed.services.update_service import (
+        cleanup_applied_update,
+        install_on_exit_path,
+        recover_ready_update,
+        update_root,
+    )
+    from tahmeed.ui.login import LoginWindow
+
+    splash.set_status("Preparing…")
     cleanup_applied_update()
 
     lock_path = update_root().parent / "desktop.lock"
@@ -131,6 +149,7 @@ def main() -> None:
     app_lock = QLockFile(str(lock_path))
     app_lock.setStaleLockTime(30_000)
     if not app_lock.tryLock(100):
+        splash.close()
         QMessageBox.information(
             None,
             APP_NAME,
@@ -139,6 +158,7 @@ def main() -> None:
         return
     windows_mutex, already_running = _acquire_windows_app_mutex()
     if already_running:
+        splash.close()
         app_lock.unlock()
         QMessageBox.information(
             None,
@@ -155,6 +175,7 @@ def main() -> None:
     pending_installer: list[Path] = []
     install_request_running = False
 
+    splash.set_status("Loading sign-in…")
     login = LoginWindow()
 
     async def _prepare_and_exit(path: str) -> None:
@@ -184,6 +205,9 @@ def main() -> None:
     update_controller.start()
 
     def on_login_success(user):
+        # Defer the heavy dashboard import until after a successful sign-in.
+        from tahmeed.ui.main_window import MainWindow
+
         login.hide()
         win = MainWindow(user)
         _open_windows.append(win)
@@ -207,9 +231,16 @@ def main() -> None:
         win.show()
 
     login.login_successful.connect(on_login_success)
-    login.show()
+
+    def _reveal_login() -> None:
+        # Must run after the qasync loop is running; LoginWindow.showEvent
+        # schedules async work (first-run check) that needs an active loop.
+        # Use QTimer (not an asyncio Task) so showEvent is not nested inside
+        # another Task — Python 3.14 forbids that nesting.
+        splash.finish(login)
 
     with loop:
+        QTimer.singleShot(0, _reveal_login)
         loop.run_forever()
         # Clean up the DB client while the loop is still open (exiting the
         # `with` block closes the loop, so this must run inside it).

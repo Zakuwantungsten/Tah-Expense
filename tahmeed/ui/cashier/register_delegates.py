@@ -1,7 +1,7 @@
 """Shared DailyRegister column constants, colors, and cell delegates."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemDelegate, QStyledItemDelegate, QStyleOptionViewItem,
@@ -33,15 +33,16 @@ COL_OWN      = 10
 COL_APR      = 11
 COL_PAYEE    = 12
 COL_CHEQUE   = 13
+COL_CASHIER  = 14
 
 HEADERS = [
     "S/NO", "Date", "Reported Date", "Item", "Description", "Truck No.",
     "Memo", "Ref_Float", "TZS", "Receipt", "Ownership", "APR BY",
-    "Payee", "Cheque",
+    "Payee", "Cheque", "Cashier",
 ]
 
 CHECK_COLS       = set()   # legacy; Ref_Float is free text now
-READONLY_COLS    = {COL_SNO}
+READONLY_COLS    = {COL_SNO, COL_CASHIER}
 # Date / reported date alone do not count as entry data.
 _DATA_SKIP_COLS  = READONLY_COLS | {COL_RECEIPT, COL_DATE, COL_REPORTED}
 # Columns that should NOT be auto-uppercased
@@ -53,8 +54,8 @@ _REF_FLOAT_OPTS = ["REFUND TO FLOAT"]
 # Preferred column widths — Description stretches to fill leftover viewport space.
 _COL_PREFERRED = {
     COL_SNO: 48,
-    COL_DATE: 92,
-    COL_REPORTED: 92,
+    COL_DATE: 70,
+    COL_REPORTED: 70,
     COL_ITEM: 100,
     COL_DESC: 200,
     COL_TRUCK: 72,
@@ -66,16 +67,17 @@ _COL_PREFERRED = {
     COL_APR: 72,
     COL_PAYEE: 90,
     COL_CHEQUE: 80,
+    COL_CASHIER: 100,
 }
 # Columns that shrink first when the viewport is tighter than the preferred sum.
 _COL_FLEX = (
     COL_DESC, COL_MEMO, COL_PAYEE, COL_ITEM, COL_REF,
-    COL_REPORTED, COL_DATE, COL_OWN, COL_APR, COL_CHEQUE, COL_RECEIPT,
+    COL_OWN, COL_APR, COL_CHEQUE, COL_RECEIPT, COL_CASHIER,
 )
 _COL_MIN = {
     COL_SNO: 40,
-    COL_DATE: 78,
-    COL_REPORTED: 78,
+    COL_DATE: 62,
+    COL_REPORTED: 62,
     COL_ITEM: 70,
     COL_DESC: 120,
     COL_TRUCK: 60,
@@ -87,6 +89,7 @@ _COL_MIN = {
     COL_APR: 56,
     COL_PAYEE: 60,
     COL_CHEQUE: 56,
+    COL_CASHIER: 70,
 }
 
 
@@ -103,15 +106,37 @@ def _ref_float_text(tx: "Transaction") -> str:
     return ""
 
 
-def _parse_optional_date(text: str):
-    """Parse dd/MM/yyyy → datetime, or None when blank/invalid."""
+def format_register_date(value) -> str:
+    """Short register date for Date / Reported Date cells: ``18 Jul``."""
+    if value is None:
+        return ""
+    if hasattr(value, "date") and not isinstance(value, date):
+        try:
+            value = value.date()
+        except Exception:
+            pass
+    if isinstance(value, datetime):
+        value = value.date()
+    if not isinstance(value, date):
+        return ""
+    return value.strftime("%d %b")
+
+
+def _parse_optional_date(text: str, default_year: int = None):
+    """Parse short ``18 Jul`` / ``18 Jul 2026`` / legacy ``dd/MM/yyyy`` → datetime."""
     raw = (text or "").strip()
     if not raw:
         return None
-    try:
-        return datetime.strptime(raw, "%d/%m/%Y")
-    except ValueError:
-        return None
+    year = default_year or date.today().year
+    for fmt in ("%d/%m/%Y", "%d %b %Y", "%d %B %Y", "%d %b", "%d %B"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            if fmt in ("%d %b", "%d %B"):
+                dt = dt.replace(year=year)
+            return dt
+        except ValueError:
+            continue
+    return None
 
 # Colors
 SAVED_BG  = QColor("#fff8f0")
@@ -165,14 +190,26 @@ class _ExcelCellDelegate(QStyledItemDelegate):
       - current + selected  → white background + 2 px QB-blue border
       - selected (not current) → #cde0f5 fill
       - normal              → item's own background (saved warm, new white)
+      - cut marquee         → dashed QB-blue border (Excel cut)
     All specialised delegates inherit from this.
     """
     _ACTIVE_PEN  = QColor("#0077C5")
     _SELECT_FILL = QColor("#cde0f5")
+    _CUT_PEN     = QColor("#0077C5")
 
     def _is_current(self, index) -> bool:
         t = self.parent()
         return t is not None and t.currentIndex() == index
+
+    def _is_cut_cell(self, index) -> bool:
+        table = self.parent()
+        if table is None:
+            return False
+        owner = getattr(table, "_grid_owner", None)
+        cut = getattr(owner, "_cut_cells", None) if owner is not None else None
+        if not cut:
+            return False
+        return (index.row(), index.column()) in cut
 
     def _paint_bg(self, painter: QPainter, option, index) -> None:
         """Fill cell background only — no border."""
@@ -189,14 +226,20 @@ class _ExcelCellDelegate(QStyledItemDelegate):
             # else: table stylesheet background (#ffffff) shows through
 
     def _draw_active_border(self, painter: QPainter, option, index) -> None:
-        """Draw the thick QB-blue border when this is the active/current cell."""
-        if self._is_current(index) and bool(option.state & QStyle.State_Selected):
+        """Draw thick current-cell border and/or Excel cut marquee."""
+        painter.save()
+        if self._is_cut_cell(index):
+            pen = QPen(self._CUT_PEN, 1.5, Qt.DashLine)
+            pen.setJoinStyle(Qt.MiterJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(option.rect.adjusted(1, 1, -2, -2))
+        elif self._is_current(index) and bool(option.state & QStyle.State_Selected):
             pen = QPen(self._ACTIVE_PEN, 2)
             pen.setJoinStyle(Qt.MiterJoin)
-            painter.save()
             painter.setPen(pen)
             painter.drawRect(option.rect.adjusted(1, 1, -2, -2))
-            painter.restore()
+        painter.restore()
 
     def _stripped_option(self, option) -> QStyleOptionViewItem:
         """Copy of option with selection/focus flags removed so Qt won't repaint bg."""
@@ -347,7 +390,7 @@ class _DateDelegate(_ExcelCellDelegate):
         if not value and is_sel:
             # Empty selected date cell — overlay suggestion text in QB blue
             cur = self._get_current_date()
-            suggestion = QDate(cur.year, cur.month, cur.day).toString("dd/MM/yyyy")
+            suggestion = format_register_date(cur)
             painter.save()
             painter.setPen(QColor("#0077C5"))
             painter.drawText(
@@ -372,7 +415,7 @@ class _DateDelegate(_ExcelCellDelegate):
     def createEditor(self, parent, option, index):
         ed = QDateEdit(parent)
         ed.setCalendarPopup(True)
-        ed.setDisplayFormat("dd/MM/yyyy")
+        ed.setDisplayFormat("d MMM")
         ed.lineEdit().setReadOnly(True)  # calendar-only — no manual typing
         ed.setStyleSheet(
             "QDateEdit { color: #111827; background: #ffffff; }"
@@ -383,15 +426,16 @@ class _DateDelegate(_ExcelCellDelegate):
 
     def setEditorData(self, editor, index):
         text = index.data() or ""
-        try:
-            dt = datetime.strptime(text, "%d/%m/%Y")
+        cur = self._get_current_date()
+        year = cur.year if cur is not None else date.today().year
+        dt = _parse_optional_date(text, default_year=year)
+        if dt is not None:
             editor.setDate(QDate(dt.year, dt.month, dt.day))
-        except ValueError:
-            cur = self._get_current_date()
+        else:
             editor.setDate(QDate(cur.year, cur.month, cur.day))
 
     def setModelData(self, editor, model, index):
-        model.setData(index, editor.date().toString("dd/MM/yyyy"))
+        model.setData(index, format_register_date(editor.date().toPython()))
 
     def updateEditorGeometry(self, editor, option, index):
         editor.setGeometry(option.rect)
@@ -461,6 +505,8 @@ _VALID_RCPT = {"pending", "received", "missing", "no_receipt"}
 
 def _norm_receipt_text(raw: str) -> str:
     key = " ".join((raw or "").strip().lower().split())
+    if not key:
+        return ""
     if key in _RCPT_NORM:
         return _RCPT_NORM[key]
     if "no receipt" in key:
@@ -468,6 +514,15 @@ def _norm_receipt_text(raw: str) -> str:
     if key == "receipt" or "received" in key:
         return "received"
     return "pending"
+
+
+def _receipt_paste_value(raw: str) -> str:
+    """Preserve clipboard receipt as-is when valid; do not invent pending for blank."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    norm = _norm_receipt_text(raw)
+    return norm if norm else raw
 
 
 def _parse_amount_text(raw: str) -> float:

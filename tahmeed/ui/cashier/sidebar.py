@@ -629,9 +629,9 @@ class CashierSidebarWidget(QFrame):
         asyncio.ensure_future(self._load_items())
 
     async def _load_items(self) -> None:
-        from tahmeed.services.category_service import get_sidebar_categories
+        from tahmeed.services.category_service import get_cashier_sidebar_categories
         try:
-            cats = await get_sidebar_categories()
+            cats = await get_cashier_sidebar_categories()
         except Exception:
             cats = []
         self._rebuild_items(cats)

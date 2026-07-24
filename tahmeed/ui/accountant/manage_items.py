@@ -519,6 +519,9 @@ class _ItemDialog(QDialog):
         self._show_sidebar = QCheckBox("Show as its own sidebar tab")
         self._show_sidebar.setStyleSheet(f"color: {_T1}; font-size: 13px;")
         self._show_sidebar.toggled.connect(self._on_sidebar_toggled)
+        self._show_cashier_sidebar = QCheckBox("Show in the cashier's sidebar")
+        self._show_cashier_sidebar.setStyleSheet(f"color: {_T1}; font-size: 13px;")
+        self._show_cashier_sidebar.toggled.connect(self._on_sidebar_toggled)
         self._lock_desc = QCheckBox("Lock description to sub-items")
         self._lock_desc.setStyleSheet(f"color: {_T1}; font-size: 13px;")
         self._lock_desc.setToolTip(
@@ -528,10 +531,11 @@ class _ItemDialog(QDialog):
         checks_vl.addWidget(self._req_receipt)
         checks_vl.addWidget(self._req_truck)
         checks_vl.addWidget(self._show_sidebar)
+        checks_vl.addWidget(self._show_cashier_sidebar)
         checks_vl.addWidget(self._lock_desc)
         form.addRow(_lbl("Options", size=12, weight=500, color=_T2), checks_w)
 
-        # Sidebar icon picker — only relevant when "Show as its own sidebar tab"
+        # Sidebar icon picker — relevant when either sidebar option is on
         icon_col = QWidget()
         icon_col.setStyleSheet("background: transparent;")
         icl = QHBoxLayout(icon_col)
@@ -630,11 +634,12 @@ class _ItemDialog(QDialog):
         self._req_receipt.setChecked(item.requires_receipt)
         self._req_truck.setChecked(item.requires_truck)
         self._show_sidebar.setChecked(item.show_in_sidebar)
+        self._show_cashier_sidebar.setChecked(item.show_in_cashier_sidebar)
         self._lock_desc.setChecked(item.lock_description)
         self._icon = item.icon or "mdi.tag-outline"
         self._sidebar_name.setText(item.sidebar_name or "")
         self._refresh_icon_btn()
-        self._on_sidebar_toggled(item.show_in_sidebar)
+        self._on_sidebar_toggled()
 
     def _pick_color(self) -> None:
         c = QColorDialog.getColor(QColor(self._color), self, "Pick Item Colour")
@@ -648,7 +653,8 @@ class _ItemDialog(QDialog):
         )
         self._color_hex.setText(self._color)
 
-    def _on_sidebar_toggled(self, on: bool) -> None:
+    def _on_sidebar_toggled(self, _on: bool = False) -> None:
+        on = self._show_sidebar.isChecked() or self._show_cashier_sidebar.isChecked()
         self._icon_btn.setEnabled(on)
         self._choose_icon_btn.setEnabled(on)
         self._sidebar_name.setEnabled(on)
@@ -684,6 +690,7 @@ class _ItemDialog(QDialog):
             "icon":             self._icon,
             "sidebar_name":     self._sidebar_name.text().strip(),
             "show_in_sidebar":  self._show_sidebar.isChecked(),
+            "show_in_cashier_sidebar": self._show_cashier_sidebar.isChecked(),
             "requires_receipt": self._req_receipt.isChecked(),
             "requires_truck":   self._req_truck.isChecked(),
             "lock_description": self._lock_desc.isChecked(),
@@ -1619,6 +1626,7 @@ class ManageItemsWidget(QWidget):
                 icon=data.get("icon", "mdi.tag-outline"),
                 sidebar_name=data.get("sidebar_name", ""),
                 show_in_sidebar=data.get("show_in_sidebar", False),
+                show_in_cashier_sidebar=data.get("show_in_cashier_sidebar", False),
                 lock_description=data.get("lock_description", False),
             )
             self._selected_id = cat._id

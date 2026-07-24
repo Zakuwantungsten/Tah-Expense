@@ -43,6 +43,7 @@ class CategoryWrite(StrictModel):
     icon: str = "mdi.tag-outline"
     sidebar_name: str = ""
     show_in_sidebar: bool = False
+    show_in_cashier_sidebar: bool = False
     sort_order: int = 0
     requires_receipt: bool = False
     requires_truck: bool = True

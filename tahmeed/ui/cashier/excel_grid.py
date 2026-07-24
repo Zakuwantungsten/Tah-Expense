@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QApplication,
     QAbstractItemDelegate, QStyledItemDelegate, QStyleOptionViewItem, QMenu, QFileDialog,
     QMessageBox, QAbstractItemView, QHeaderView, QDateEdit, QLineEdit,
-    QStyle, QComboBox, QDialog,
+    QStyle, QComboBox, QDialog, QFrame, QListWidget, QListWidgetItem, QPushButton,
 )
 from PySide6.QtCore import (
     Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer,
@@ -52,9 +52,9 @@ from tahmeed.services.truck_format import (
     is_allowed_place_label, DEFAULT_PLACE_LABELS, merge_allowed_labels,
 )
 from tahmeed.services.cashier_service import (
-    get_transactions_by_date, save_transaction, delete_transaction,
+    get_transactions_by_date, save_transaction, request_or_delete_transaction,
     search_descriptions, update_transaction, insert_pending_edit,
-    check_for_duplicates,
+    check_for_duplicates, submit_day_for_verify, recount_day_order,
 )
 from tahmeed.services.category_service import (
     create_cashier_category, get_all_categories, item_key,
@@ -71,17 +71,20 @@ from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, Tr
 from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
     COL_SNO, COL_DATE, COL_REPORTED, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
     COL_REF, COL_TZS, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
+    COL_CASHIER,
     HEADERS, CHECK_COLS, READONLY_COLS, _DATA_SKIP_COLS, _UPPER_SKIP_COLS,
     DEFAULT_EDITABLE_ROWS, _REF_FLOAT_OPTS, _COL_PREFERRED, _COL_FLEX, _COL_MIN,
-    _is_refund_float, _ref_float_text, _parse_optional_date,
+    _is_refund_float, _ref_float_text, _parse_optional_date, format_register_date,
     SAVED_BG, NEW_BG, EMPTY_BG, NEG_COLOR, EDIT_BG, DIRTY_BG, DUP_BG, MISMATCH_BG,
     _FOOTER_BTN_STYLE,
     _accept_editor_completion, _upper_text,
     _ExcelCellDelegate, _DescriptionDelegate, _TruckDelegate, _DateDelegate,
-    _RefFloatDelegate, _norm_receipt_text, _parse_amount_text, _ReceiptDelegate,
+    _RefFloatDelegate, _norm_receipt_text, _receipt_paste_value, _parse_amount_text, _ReceiptDelegate,
     _ItemDelegate, _CurrencyLineEdit, _TZSDelegate,
     _RCPT_COLORS, _RCPT_LABEL, _RECEIPT_OPTS, _RCPT_OPT_KEY, _RCPT_NORM, _VALID_RCPT,
 )
+
+_ROWS_CLIP_PREFIX = "TAHMEED_ROWS_V1\n"
 
 
 
@@ -171,30 +174,156 @@ class _ExcelTableWidget(QTableWidget):
 _FILTER_COLS = set(range(len(HEADERS))) - {COL_SNO}
 
 
-class _FilterMenu(QMenu):
-    """QMenu that stays open when the user clicks checkable (filter) items,
-    so they can tick multiple values before closing."""
+def cascade_column_values(
+    rows: List[dict],
+    *,
+    target_col: int,
+    active_filters: dict,
+) -> set:
+    """Distinct values for *target_col* from rows that pass every *other* filter.
 
-    def mouseReleaseEvent(self, event):
-        action = self.activeAction()
-        if action and action.isCheckable():
-            action.setChecked(not action.isChecked())
-            # Do NOT call super — that would close the menu
-        else:
-            super().mouseReleaseEvent(event)
+    ``rows`` is a list of ``{col_index: cell_text}`` maps (empty strings omitted).
+    ``active_filters`` maps col_index -> accepted value set (empty set = no filter).
+    """
+    values: set = set()
+    for row in rows:
+        ok = True
+        for col, accepted in (active_filters or {}).items():
+            if col == target_col or not accepted:
+                continue
+            if (row.get(col) or "") not in accepted:
+                ok = False
+                break
+        if not ok:
+            continue
+        v = (row.get(target_col) or "").strip()
+        if v:
+            values.add(v)
+    return values
+
+
+class _ColumnFilterPopup(QFrame):
+    """Excel-style checklist popup: values from the table only, with search + Apply."""
+
+    applied = Signal(object)  # set[str] | empty set = Show All
+
+    def __init__(self, values: set, current: set, parent=None):
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+        self.setObjectName("colFilterPopup")
+        self.setStyleSheet(
+            "QFrame#colFilterPopup{"
+            " background:#ffffff;border:1px solid #D1D5DB;border-radius:6px;}"
+        )
+        self._all_values = sorted(values, key=lambda v: v.lower())
+        self._current = set(current or [])
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        hint = QLabel(f"{len(self._all_values)} value(s) in this table")
+        hint.setStyleSheet(
+            "font-size:10px;color:#6B7280;background:transparent;border:none;"
+        )
+        root.addWidget(hint)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search…")
+        self._search.setClearButtonEnabled(True)
+        self._search.setStyleSheet(
+            "QLineEdit{border:1px solid #D1D5DB;border-radius:4px;"
+            "padding:4px 8px;font-size:12px;}"
+        )
+        self._search.textChanged.connect(self._refilter)
+        root.addWidget(self._search)
+
+        self._list = QListWidget()
+        self._list.setMinimumWidth(220)
+        self._list.setMaximumHeight(260)
+        self._list.setStyleSheet(
+            "QListWidget{border:1px solid #E5E7EB;border-radius:4px;font-size:12px;}"
+            "QListWidget::item{padding:3px 6px;}"
+        )
+        root.addWidget(self._list, 1)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(6)
+        show_all = QPushButton("Show All")
+        show_all.setCursor(Qt.PointingHandCursor)
+        show_all.setEnabled(bool(self._current))
+        show_all.clicked.connect(self._on_show_all)
+        apply_btn = QPushButton("Apply")
+        apply_btn.setCursor(Qt.PointingHandCursor)
+        apply_btn.setStyleSheet(
+            "QPushButton{background:#0077C5;color:#fff;border:none;"
+            "border-radius:4px;padding:5px 12px;font-weight:600;}"
+        )
+        apply_btn.clicked.connect(self._on_apply)
+        btns.addWidget(show_all)
+        btns.addStretch()
+        btns.addWidget(apply_btn)
+        root.addLayout(btns)
+
+        self._refilter("")
+        self._search.setFocus()
+
+    def _refilter(self, text: str = "") -> None:
+        needle = (text or self._search.text() or "").strip().lower()
+        self._list.clear()
+        for val in self._all_values:
+            if needle and needle not in val.lower():
+                continue
+            it = QListWidgetItem(val)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(
+                Qt.Checked if val in self._current else Qt.Unchecked
+            )
+            self._list.addItem(it)
+
+    def _checked(self) -> set:
+        # Start from prior selection, then sync visible rows' check states
+        # (so search doesn't wipe hidden checked values).
+        result = set(self._current)
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it.checkState() == Qt.Checked:
+                result.add(it.text())
+            else:
+                result.discard(it.text())
+        return result
+
+    def _on_show_all(self) -> None:
+        self.applied.emit(set())
+        self.close()
+
+    def _on_apply(self) -> None:
+        self.applied.emit(self._checked())
+        self.close()
 
 
 class _FilterHeaderView(QHeaderView):
-    """Horizontal header that paints a ▾ chevron on filterable columns and
-    opens a multi-select filter menu on click in the chevron area."""
+    """Horizontal header ▾ filters — options only from table rows, with chaining."""
 
     filter_changed = Signal(int, set)   # (col_index, accepted_values); empty = cleared
 
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
         self._active: dict = {}   # col -> set of accepted values
+        self._value_provider = None  # optional callable(col) -> set[str]
+        self._popup = None
 
-    # ── Painting ──────────────────────────────────────────────────────────
+    def set_value_provider(self, provider) -> None:
+        self._value_provider = provider
+
+    def clear_filters(self) -> None:
+        self._active.clear()
+        self.viewport().update()
+
+    def sync_active(self, filters: dict) -> None:
+        """Mirror DailyRegister._col_filters onto the chevron paint state."""
+        self._active = {c: set(v) for c, v in (filters or {}).items() if v}
+        self.viewport().update()
+
     def paintSection(self, painter, rect, logical_index):
         super().paintSection(painter, rect, logical_index)
         if logical_index not in _FILTER_COLS or rect.width() < 28:
@@ -212,7 +341,6 @@ class _FilterHeaderView(QHeaderView):
         )
         painter.restore()
 
-    # ── Click handling ────────────────────────────────────────────────────
     def mousePressEvent(self, event):
         col = self.logicalIndexAt(event.pos())
         if col in _FILTER_COLS:
@@ -225,80 +353,36 @@ class _FilterHeaderView(QHeaderView):
         super().mousePressEvent(event)
 
     def _open_menu(self, col: int, global_pos) -> None:
-        table = self.parent()
-        if not isinstance(table, QTableWidget):
+        if not callable(self._value_provider):
+            return
+        values = set(self._value_provider(col) or [])
+        current = set(self._active.get(col, set()) or [])
+        # Keep currently selected values visible so they can be unchecked.
+        values |= current
+        if not values and not current:
             return
 
-        # Collect unique non-empty values visible in this column
-        values: set = set()
-        for row in range(table.rowCount()):
-            it = table.item(row, col)
-            if not it:
-                continue
-            if col == COL_REF:
-                v = it.text().strip()
-                if v:
-                    values.add(v)
-            elif col == COL_RECEIPT:
-                v = (it.text() or "").strip().lower()
-                if v:
-                    values.add(_RCPT_LABEL.get(v, v))
+        if self._popup is not None:
+            self._popup.close()
+            self._popup = None
+
+        popup = _ColumnFilterPopup(values, current, parent=self)
+        self._popup = popup
+
+        def _on_applied(new_filter):
+            new_filter = set(new_filter or [])
+            if new_filter:
+                self._active[col] = new_filter
             else:
-                v = it.text().strip()
-                if v:
-                    values.add(v)
+                self._active.pop(col, None)
+            self.filter_changed.emit(col, new_filter)
+            self.viewport().update()
 
-        if not values:
-            return
-
-        current = self._active.get(col, set())
-
-        menu = _FilterMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background: #ffffff;
-                border: 1px solid #D1D5DB;
-                border-radius: 6px;
-                padding: 4px 0;
-                min-width: 190px;
-            }
-            QMenu::item {
-                padding: 5px 16px 5px 30px;
-                font-size: 12px;
-                color: #111827;
-            }
-            QMenu::item:selected { background: #EFF6FF; color: #0077C5; }
-            QMenu::item:checked  { font-weight: 600; }
-            QMenu::separator     { height: 1px; background: #E5E7EB; margin: 4px 0; }
-        """)
-
-        clear_act = menu.addAction("Show All")
-        clear_act.setEnabled(bool(current))
-        menu.addSeparator()
-
-        for val in sorted(values, key=lambda v: v.lower()):
-            act = QAction(val, menu)
-            act.setCheckable(True)
-            act.setChecked(val in current)
-            menu.addAction(act)
-
-        chosen = menu.exec(global_pos)
-
-        if chosen is clear_act:
-            new_filter: set = set()
-        else:
-            new_filter = {
-                act.text() for act in menu.actions()
-                if act.isCheckable() and act.isChecked()
-            }
-
-        if new_filter:
-            self._active[col] = new_filter
-        else:
-            self._active.pop(col, None)
-
-        self.filter_changed.emit(col, new_filter)
-        self.viewport().update()
+        popup.applied.connect(_on_applied)
+        # Position under the chevron
+        popup.adjustSize()
+        popup.move(global_pos)
+        popup.show()
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +393,9 @@ class DailyRegister(QWidget):
     """Unified daily expense register (replaces ExcelGrid + TransactionsTable)."""
 
     rows_saved        = Signal(int)
-    stats_updated     = Signal(int, float, float)  # (n_entries, total_tzs, refund_total)
+    stats_updated     = Signal(int, float, float, object)  # n, total_tzs, refund, register_date
     edit_state_changed = Signal(bool, int)         # (edit_mode_active, dirty_row_count)
+    mode_changed      = Signal(bool)               # merged mode on/off
 
     def __init__(self, user: User, categories: List[Category], parent=None):
         super().__init__(parent)
@@ -324,6 +409,8 @@ class DailyRegister(QWidget):
         self._fleet_numbers: set = set()   # uppercased valid truck/trailer numbers
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
         self._people_names: list = []      # Ownership / APR BY suggestions (unrestricted)
+        self._cashier_names: dict = {}     # ObjectId -> display name
+        self._merged_mode: bool = False    # Shared/Merged day (all cashiers)
         self._current_date: date = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
@@ -344,6 +431,13 @@ class DailyRegister(QWidget):
         self._pending_truck_issues: dict = {}  # row -> TruckIssue
         self._truck_dialog_scheduled: bool = False
         self._open_truck_dialog: object = None
+        # Excel cut marquee (cells stay until paste / Insert Cut Cells / Esc)
+        self._cut_cells: set = set()          # {(row, col), ...}
+        self._cut_payload: dict = {}          # serialized cut buffer
+        self._cut_is_rows: bool = False
+        # Undo stack of cell snapshots
+        self._undo_stack: list = []           # [{(r,c): text}, ...]
+        self._undo_limit: int = 40
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_cashier_settings())
@@ -362,7 +456,9 @@ class DailyRegister(QWidget):
 
         # ── Table ──────────────────────────────────────────────────────
         self._table = _ExcelTableWidget(DEFAULT_EDITABLE_ROWS, len(HEADERS))
+        self._table._grid_owner = self
         _fhv = _FilterHeaderView(self._table)
+        _fhv.set_value_provider(self._filter_menu_values)
         _fhv.filter_changed.connect(self._on_col_filter_changed)
         self._table.setHorizontalHeader(_fhv)
         self._table.setHorizontalHeaderLabels(HEADERS)
@@ -406,6 +502,7 @@ class DailyRegister(QWidget):
         for col, width in _COL_PREFERRED.items():
             self._table.setColumnWidth(col, width)
         QTimer.singleShot(0, self._fit_table_columns)
+        self._table.setColumnHidden(COL_CASHIER, True)
 
         self._table.setSelectionMode(QAbstractItemView.ContiguousSelection)
         self._table.verticalHeader().setDefaultSectionSize(28)
@@ -538,11 +635,89 @@ class DailyRegister(QWidget):
 
     async def _load_date(self, d: date) -> None:
         try:
-            txs = await get_transactions_by_date(d, cashier_id=self._user._id)
+            if self._merged_mode:
+                txs = await get_transactions_by_date(d, merged=True)
+            else:
+                txs = await get_transactions_by_date(d, cashier_id=self._user._id)
+            ids = [tx.cashier_id for tx in txs if tx.cashier_id]
+            if ids:
+                from tahmeed.services.accountant_service import get_cashier_names
+                self._cashier_names = await get_cashier_names(ids)
+            else:
+                self._cashier_names = {}
             self._pending_row_meta.clear()
             self._populate(txs)
+            self._table.setColumnHidden(COL_CASHIER, not self._merged_mode)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
+
+    def set_merged_mode(self, merged: bool) -> None:
+        """Switch My entries ↔ Merged (all cashiers for the day)."""
+        if bool(merged) == self._merged_mode:
+            return
+        if self._edit_mode and self._dirty_rows:
+            resp = QMessageBox.question(
+                self, "Unsaved changes",
+                "You have unsaved changes.\nSave them before switching mode?",
+                QMessageBox.Yes | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if resp == QMessageBox.Cancel:
+                self.mode_changed.emit(self._merged_mode)
+                return
+            if resp == QMessageBox.Yes:
+                asyncio.ensure_future(self._save_then_switch_mode(bool(merged)))
+                return
+        self._merged_mode = bool(merged)
+        self._reset_edit_state()
+        self.mode_changed.emit(self._merged_mode)
+        asyncio.ensure_future(self._load_date(self._current_date))
+
+    async def _save_then_switch_mode(self, merged: bool) -> None:
+        ok = await self._do_save()
+        if not ok:
+            self.mode_changed.emit(self._merged_mode)
+            return
+        self._merged_mode = merged
+        self.mode_changed.emit(self._merged_mode)
+        await self._load_date(self._current_date)
+
+    def submit_for_verify(self) -> None:
+        """Submit every draft row for the current calendar day to Verify."""
+        asyncio.ensure_future(self._do_submit_for_verify())
+
+    async def _do_submit_for_verify(self) -> None:
+        if self._edit_mode and self._dirty_rows:
+            resp = QMessageBox.question(
+                self, "Unsaved changes",
+                "Save changes before submitting this day for verify?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if resp != QMessageBox.Yes:
+                return
+            if not await self._do_save():
+                return
+        d = self._current_date
+        label = d.strftime("%d %b %Y")
+        resp = QMessageBox.question(
+            self, "Submit for Verify",
+            f"Submit all draft entries for {label} to the Verify inbox?\n\n"
+            "This sends the whole day's transactions (all cashiers).",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if resp != QMessageBox.Yes:
+            return
+        try:
+            n = await submit_day_for_verify(d)
+            QMessageBox.information(
+                self, "Submitted",
+                f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for {label}.",
+            )
+            await self._load_date(d)
+        except Exception as exc:
+            QMessageBox.critical(self, "Submit Failed", str(exc))
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load_date(self._current_date))
@@ -590,6 +765,9 @@ class DailyRegister(QWidget):
         self._init_editable_rows(self._saved_count, total_rows)
         self._table.blockSignals(False)
         self._renumber()
+        self._clear_column_filters()
+        self._clear_cut_marquee()
+        self._undo_stack.clear()
         self._update_footer()
         self._apply_filters()
         self.edit_state_changed.emit(False, 0)
@@ -619,7 +797,7 @@ class DailyRegister(QWidget):
         sno = saved_item(str(row + 1), Qt.AlignCenter)
         self._table.setItem(row, COL_SNO, sno)
 
-        date_str = tx.date.strftime("%d/%m/%Y") if tx.date else ""
+        date_str = format_register_date(tx.date) if tx.date else ""
         date_item = saved_item(date_str)
         if tx.date and tx.created_at and tx.date.date() != tx.created_at.date():
             date_item.setBackground(QBrush(MISMATCH_BG))
@@ -630,7 +808,7 @@ class DailyRegister(QWidget):
         self._table.setItem(row, COL_DATE, date_item)
 
         reported = getattr(tx, "reported_date", None)
-        reported_str = reported.strftime("%d/%m/%Y") if reported else ""
+        reported_str = format_register_date(reported) if reported else ""
         self._table.setItem(row, COL_REPORTED, saved_item(reported_str))
 
         self._table.setItem(row, COL_ITEM, saved_item(tx.item or ""))
@@ -659,6 +837,8 @@ class DailyRegister(QWidget):
         self._table.setItem(row, COL_APR,    saved_item(tx.approver or ""))
         self._table.setItem(row, COL_PAYEE,  saved_item(getattr(tx, "payee", "") or ""))
         self._table.setItem(row, COL_CHEQUE, saved_item(getattr(tx, "cheque", "") or ""))
+        cashier = self._cashier_names.get(tx.cashier_id, "—") if tx.cashier_id else "—"
+        self._table.setItem(row, COL_CASHIER, saved_item(cashier))
 
     def _init_editable_rows(self, start: int, end: int) -> None:
         # Preserve caller's blockSignals state — never force-unblock mid bulk load.
@@ -700,7 +880,7 @@ class DailyRegister(QWidget):
         self._totals_label.setText(
             f"{n} entr{'y' if n == 1 else 'ies'}   ·   {amount_str}"
         )
-        self.stats_updated.emit(n, tzs, refund)
+        self.stats_updated.emit(n, tzs, refund, self._current_date)
 
     # ------------------------------------------------------------------
     # Row → Transaction
@@ -720,9 +900,8 @@ class DailyRegister(QWidget):
             return None
 
         date_str = txt(COL_DATE)
-        try:
-            tx_date = datetime.strptime(date_str, "%d/%m/%Y")
-        except ValueError:
+        tx_date = _parse_optional_date(date_str, default_year=self._current_date.year)
+        if tx_date is None:
             tx_date = datetime(
                 self._current_date.year,
                 self._current_date.month,
@@ -789,7 +968,9 @@ class DailyRegister(QWidget):
         ref_text = txt(COL_REF)
         return Transaction(
             date=tx_date,
-            reported_date=_parse_optional_date(txt(COL_REPORTED)),
+            reported_date=_parse_optional_date(
+                txt(COL_REPORTED), default_year=self._current_date.year
+            ),
             description=description,
             item=item_name,
             category_name=item_name or None,
@@ -805,14 +986,16 @@ class DailyRegister(QWidget):
             approver=txt(COL_APR),
             payee=txt(COL_PAYEE),
             cheque=txt(COL_CHEQUE),
-            cashier_id=self._user._id,
-            daily_import_id=meta.get("daily_import_id"),
-            daily_import_source=meta.get("daily_import_source"),
-            date_discrepancy=bool(meta.get("date_discrepancy")),
-            import_primary_date=meta.get("import_primary_date"),
-            lpo_do=meta.get("lpo_do") or "",
-            do_number=meta.get("do_number") or "",
-        )
+                    cashier_id=self._user._id,
+                    day_order=row,
+                    register_status="draft",
+                    daily_import_id=meta.get("daily_import_id"),
+                    daily_import_source=meta.get("daily_import_source"),
+                    date_discrepancy=bool(meta.get("date_discrepancy")),
+                    import_primary_date=meta.get("import_primary_date"),
+                    lpo_do=meta.get("lpo_do") or "",
+                    do_number=meta.get("do_number") or "",
+                )
 
     # ------------------------------------------------------------------
     # Edit mode
@@ -1062,10 +1245,102 @@ class DailyRegister(QWidget):
 
     def _on_col_filter_changed(self, col: int, accepted: set) -> None:
         if accepted:
-            self._col_filters[col] = accepted
+            self._col_filters[col] = set(accepted)
         else:
             self._col_filters.pop(col, None)
+        self._prune_stale_column_filters(changed_col=col)
+        self._sync_filter_header()
         self._apply_filters()
+
+    def _clear_column_filters(self) -> None:
+        self._col_filters.clear()
+        hdr = self._table.horizontalHeader()
+        if isinstance(hdr, _FilterHeaderView):
+            hdr.clear_filters()
+
+    def _sync_filter_header(self) -> None:
+        hdr = self._table.horizontalHeader()
+        if isinstance(hdr, _FilterHeaderView):
+            hdr.sync_active(self._col_filters)
+
+    def _prune_stale_column_filters(self, *, changed_col: int) -> None:
+        """Drop selections on other columns that no longer appear after chaining."""
+        if not self._col_filters:
+            return
+        # Iterate until stable — narrowing one column can invalidate another.
+        for _ in range(len(self._col_filters) + 1):
+            changed = False
+            for col in list(self._col_filters.keys()):
+                if col == changed_col:
+                    continue
+                available = self._filter_menu_values(col)
+                kept = {v for v in self._col_filters.get(col, set()) if v in available}
+                if not kept:
+                    self._col_filters.pop(col, None)
+                    changed = True
+                elif kept != self._col_filters[col]:
+                    self._col_filters[col] = kept
+                    changed = True
+            if not changed:
+                break
+
+    def _cell_filter_value(self, row: int, col: int) -> str:
+        it = self._table.item(row, col)
+        if col == COL_RECEIPT:
+            raw = it.text().strip().lower() if it else ""
+            return _RCPT_LABEL.get(raw, raw)
+        return it.text().strip() if it else ""
+
+    def _iter_filter_source_indices(self):
+        for row in range(self._table.rowCount()):
+            if row < self._saved_count or self._row_has_data(row):
+                yield row
+
+    def _row_matches_other_filters(self, row: int, *, exclude_col: int) -> bool:
+        """True if *row* matches search + every active column filter except *exclude_col*."""
+        search = self._search_text
+        if search:
+            matched = False
+            for c in range(self._table.columnCount()):
+                it = self._table.item(row, c)
+                if not it:
+                    continue
+                if c == COL_RECEIPT:
+                    label = _RCPT_LABEL.get(it.text().strip().lower(), it.text())
+                    if search in label.lower() or search in it.text().lower():
+                        matched = True
+                        break
+                elif search in it.text().lower():
+                    matched = True
+                    break
+            if not matched:
+                return False
+
+        for c, accepted in self._col_filters.items():
+            if c == exclude_col or not accepted:
+                continue
+            if self._cell_filter_value(row, c) not in accepted:
+                return False
+        return True
+
+    def _filter_menu_values(self, col: int) -> set:
+        """Distinct values present in the table for *col*, chained through other filters."""
+        rows: List[dict] = []
+        for row in self._iter_filter_source_indices():
+            if not self._row_matches_other_filters(row, exclude_col=col):
+                continue
+            m: dict = {}
+            for c in range(self._table.columnCount()):
+                if c == COL_SNO:
+                    continue
+                v = self._cell_filter_value(row, c)
+                if v:
+                    m[c] = v
+            if m:
+                rows.append(m)
+        # active_filters already applied via _row_matches_other_filters; pass empty
+        # here so cascade_column_values just collects target_col values.
+        return cascade_column_values(rows, target_col=col, active_filters={})
 
     def _apply_filters(self) -> None:
         search = self._search_text
@@ -1099,13 +1374,7 @@ class DailyRegister(QWidget):
             for col, accepted in self._col_filters.items():
                 if not accepted:
                     continue
-                it = self._table.item(row, col)
-                if col == COL_RECEIPT:
-                    raw = it.text().strip().lower() if it else ""
-                    val = _RCPT_LABEL.get(raw, raw)
-                else:
-                    val = it.text().strip() if it else ""
-                if val not in accepted:
+                if self._cell_filter_value(row, col) not in accepted:
                     visible = False
                     break
 
@@ -1239,8 +1508,7 @@ class DailyRegister(QWidget):
             sno_it.setText("")
 
     def _register_date_str(self) -> str:
-        d = self._current_date
-        return QDate(d.year, d.month, d.day).toString("dd/MM/yyyy")
+        return format_register_date(self._current_date)
 
     def _sync_row_date(self, row: int) -> None:
         """Fill Date when the row gains entry data; clear it when the row is emptied.
@@ -1289,11 +1557,17 @@ class DailyRegister(QWidget):
             if key == Qt.Key_C:    self._copy();                               return
             if key == Qt.Key_X:    self._cut();                                return
             if key == Qt.Key_V:    self._paste();                              return
+            if key == Qt.Key_Z:    self._undo();                               return
             if key == Qt.Key_A:    self._table.selectAll();                    return
             if key == Qt.Key_D:    self._fill_down();                          return
             if key == Qt.Key_R:    self._fill_right();                         return
             if key == Qt.Key_Home: self._table.setCurrentCell(0, 0);          return
             if key == Qt.Key_End:  self._go_to_last_cell();                   return
+
+        if key == Qt.Key_Escape:
+            if self._cut_cells:
+                self._clear_cut_marquee()
+                return
 
         if mod == Qt.ShiftModifier:
             if key in (Qt.Key_Return, Qt.Key_Enter): self._step(-1, 0);      return
@@ -1366,7 +1640,7 @@ class DailyRegister(QWidget):
         if it is not None and it.text().strip():
             return
         cur = self._current_date
-        today_str = QDate(cur.year, cur.month, cur.day).toString("dd/MM/yyyy")
+        today_str = format_register_date(cur)
         new_it = QTableWidgetItem(today_str)
         new_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
         self._table.blockSignals(True)
@@ -1390,18 +1664,81 @@ class DailyRegister(QWidget):
     # Clipboard
     # ------------------------------------------------------------------
 
-    def _copy(self) -> None:
-        items = self._table.selectedItems()
-        if not items:
+    def _push_undo_cells(self, cells: dict) -> None:
+        """Snapshot {(row, col): text} before a mutating edit."""
+        if not cells:
             return
-        rows = sorted(set(it.row() for it in items))
-        cols = sorted(set(it.column() for it in items))
-        cell_map = {(it.row(), it.column()): it for it in items}
+        self._undo_stack.append(dict(cells))
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack = self._undo_stack[-self._undo_limit:]
+
+    def _snapshot_selection(self) -> dict:
+        snap = {}
+        for it in self._table.selectedItems():
+            if it.column() in READONLY_COLS:
+                continue
+            snap[(it.row(), it.column())] = it.text()
+        return snap
+
+    def _snapshot_rows(self, rows: list) -> dict:
+        snap = {}
+        for row in rows:
+            for col in range(self._table.columnCount()):
+                if col in READONLY_COLS:
+                    continue
+                it = self._table.item(row, col)
+                snap[(row, col)] = it.text() if it else ""
+        return snap
+
+    def _undo(self) -> None:
+        if not self._undo_stack:
+            return
+        snap = self._undo_stack.pop()
+        self._clear_cut_marquee()
+        self._table.blockSignals(True)
+        try:
+            for (row, col), text in snap.items():
+                if row < 0 or row >= self._table.rowCount():
+                    continue
+                if col in READONLY_COLS:
+                    continue
+                if row < self._saved_count and not self._edit_mode:
+                    continue
+                it = self._table.item(row, col)
+                if it is None:
+                    it = QTableWidgetItem("")
+                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                    self._table.setItem(row, col, it)
+                it.setText(text)
+                if row < self._saved_count and self._edit_mode:
+                    self._dirty_rows.add(row)
+        finally:
+            self._table.blockSignals(False)
+        self._renumber()
+        self._update_footer()
+        self._table.viewport().update()
+
+    def _clear_cut_marquee(self) -> None:
+        self._cut_cells = set()
+        self._cut_payload = {}
+        self._cut_is_rows = False
+        self._table.viewport().update()
+
+    def _has_cut_buffer(self) -> bool:
+        return bool(self._cut_cells and self._cut_payload)
+
+    def _copy(self) -> None:
+        # Use selectedIndexes so blank cells stay in the rectangle (Excel-aligned TSV).
+        indexes = self._table.selectedIndexes()
+        if not indexes:
+            return
+        rows = sorted({i.row() for i in indexes})
+        cols = sorted({i.column() for i in indexes})
         lines = []
         for row in rows:
             row_cells = []
             for col in cols:
-                it = cell_map.get((row, col))
+                it = self._table.item(row, col)
                 if it is None:
                     row_cells.append("")
                 elif col in CHECK_COLS:
@@ -1412,13 +1749,382 @@ class DailyRegister(QWidget):
         QApplication.clipboard().setText("\n".join(lines))
 
     def _cut(self) -> None:
+        """Excel-style cut: copy + dashed marquee; content stays until paste/insert."""
+        sel_rows = sorted({i.row() for i in self._table.selectedIndexes()})
+        if sel_rows and self._selection_is_full_rows(sel_rows):
+            self._cut_rows(sel_rows)
+            return
+
+        items = self._table.selectedItems()
+        if not items:
+            return
+        editable = []
+        for it in items:
+            row, col = it.row(), it.column()
+            if col in READONLY_COLS:
+                continue
+            if row < self._saved_count and not self._edit_mode:
+                continue
+            editable.append(it)
+        if not editable:
+            return
+
+        self._push_undo_cells(self._snapshot_selection())
         self._copy()
-        self._clear_selected()
+
+        rows = sorted({it.row() for it in editable})
+        cols = sorted({it.column() for it in editable})
+        cell_map = {(it.row(), it.column()): it for it in editable}
+        grid = []
+        cut_cells = set()
+        for row in rows:
+            line = []
+            for col in cols:
+                it = cell_map.get((row, col))
+                text = it.text() if it else ""
+                line.append(text)
+                if it is not None:
+                    cut_cells.add((row, col))
+            grid.append(line)
+
+        self._cut_cells = cut_cells
+        self._cut_is_rows = False
+        self._cut_payload = {
+            "kind": "cells",
+            "rows": rows,
+            "cols": cols,
+            "grid": grid,
+        }
+        self._table.viewport().update()
+
+    def _selection_is_full_rows(self, rows: list) -> bool:
+        """True when the selection covers every data column for each row."""
+        ncols = self._table.columnCount()
+        data_cols = {c for c in range(ncols) if c not in READONLY_COLS}
+        if not data_cols:
+            return False
+        selected = {(i.row(), i.column()) for i in self._table.selectedIndexes()}
+        for row in rows:
+            for col in data_cols:
+                if (row, col) not in selected:
+                    return False
+        return True
+
+    def _serialize_row(self, row: int) -> list:
+        cells = []
+        for col in range(self._table.columnCount()):
+            if col in READONLY_COLS:
+                cells.append("")
+                continue
+            it = self._table.item(row, col)
+            if it is None:
+                cells.append("")
+            elif col in CHECK_COLS:
+                cells.append("1" if it.data(Qt.UserRole) else "0")
+            else:
+                cells.append(it.text())
+        return cells
+
+    def _row_value_map(self, row: int) -> dict:
+        """Column index → exact cell text for cut/insert (preserves Receipt as-is)."""
+        values = {}
+        for col in range(self._table.columnCount()):
+            if col in READONLY_COLS:
+                continue
+            it = self._table.item(row, col)
+            if it is None:
+                values[col] = ""
+            elif col in CHECK_COLS:
+                values[col] = "1" if it.data(Qt.UserRole) else "0"
+            else:
+                values[col] = it.text()
+        return values
+
+    def _cut_rows(self, rows: list) -> None:
+        """Mark whole rows as cut (marquee) — do not delete until paste/insert."""
+        movable = []
+        for row in rows:
+            if row >= self._saved_count:
+                movable.append(row)
+            elif self._merged_mode and self._edit_mode:
+                tx = self._saved_txs.get(row)
+                if tx is not None and (getattr(tx, "register_status", "") or "") == "draft":
+                    movable.append(row)
+        if not movable:
+            self._copy()
+            return
+
+        self._push_undo_cells(self._snapshot_rows(movable))
+        maps = [self._row_value_map(r) for r in movable]
+        lines = ["\t".join(self._serialize_row(r)) for r in movable]
+        QApplication.clipboard().setText(_ROWS_CLIP_PREFIX + "\n".join(lines))
+
+        cut_cells = set()
+        for row in movable:
+            for col in range(self._table.columnCount()):
+                if col in READONLY_COLS:
+                    continue
+                cut_cells.add((row, col))
+
+        self._cut_cells = cut_cells
+        self._cut_is_rows = True
+        self._cut_payload = {
+            "kind": "rows",
+            "rows": list(movable),
+            "lines": lines,
+            "maps": maps,
+        }
+        self._table.viewport().update()
+
+    def _write_row_values(self, row: int, values: dict) -> list:
+        """Write a column→text map onto *row*. Returns truck cells to finalize."""
+        truck_cells: list = []
+        for col, cell in values.items():
+            if col >= self._table.columnCount() or col in READONLY_COLS:
+                continue
+            if col in CHECK_COLS:
+                it = QTableWidgetItem()
+                it.setData(Qt.UserRole, str(cell).strip() in ("1", "true", "True", "YES"))
+                it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                self._table.setItem(row, col, it)
+            elif col == COL_RECEIPT:
+                it = QTableWidgetItem(_receipt_paste_value(str(cell)))
+                it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                self._table.setItem(row, col, it)
+            elif col == COL_TZS:
+                amt = _parse_amount_text(str(cell))
+                text = f"{amt:,.2f}" if str(cell).strip() else ""
+                it = QTableWidgetItem(text)
+                it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if amt < 0:
+                    it.setForeground(NEG_COLOR)
+                self._table.setItem(row, col, it)
+            elif col == COL_TRUCK:
+                raw = str(cell).strip()
+                self._table.setItem(
+                    row, col, QTableWidgetItem(raw.upper() if raw else "")
+                )
+                if raw:
+                    truck_cells.append((row, raw))
+            else:
+                self._table.setItem(
+                    row, col, QTableWidgetItem(_upper_text(col, str(cell).strip()))
+                )
+        return truck_cells
+
+    def _insert_cut_cells(self) -> None:
+        """Insert Cut Cells — move the cut buffer to the current position."""
+        if not self._has_cut_buffer():
+            return
+        if self._cut_payload.get("kind") == "rows":
+            maps = self._cut_payload.get("maps")
+            if maps:
+                self._paste_row_maps(maps, clear_cut_after=True)
+            else:
+                lines = list(self._cut_payload.get("lines") or [])
+                self._paste_rows("\n".join(lines), clear_cut_after=True)
+            return
+        self._paste()
+
+    def _paste_row_maps(self, maps: list, clear_cut_after: bool = True) -> None:
+        """Insert rows from exact column→value maps (preserves Receipt etc.)."""
+        if not maps:
+            return
+        cur = self._table.currentRow()
+        if self._merged_mode and self._edit_mode:
+            insert_at = max(cur, 0)
+        else:
+            insert_at = max(cur, self._saved_count)
+
+        truck_cells: list = []
+        self._bulk_mutating = True
+        prev = self._table.blockSignals(True)
+        try:
+            for values in maps:
+                self._shift_row_maps_on_insert(insert_at)
+                self._table.insertRow(insert_at)
+                self._init_editable_rows(insert_at, insert_at + 1)
+                truck_cells.extend(self._write_row_values(insert_at, values))
+                self._sync_row_date(insert_at)
+                if insert_at < self._saved_count:
+                    self._saved_count += 1
+                insert_at += 1
+        finally:
+            self._table.blockSignals(prev)
+            self._bulk_mutating = False
+        self._renumber()
+        self._update_footer()
+        self._finalize_truck_cells(truck_cells)
+        if clear_cut_after and self._has_cut_buffer() and self._cut_is_rows:
+            self._clear_cut_source_cells()
+
+    def _clear_cut_source_cells(self) -> None:
+        """After a successful paste/insert, clear/remove the original cut source."""
+        if not self._cut_cells:
+            return
+        rows_touched = set()
+        self._table.blockSignals(True)
+        try:
+            if self._cut_is_rows and self._cut_payload.get("kind") == "rows":
+                for row in sorted(self._cut_payload.get("rows") or [], reverse=True):
+                    if row < 0 or row >= self._table.rowCount():
+                        continue
+                    self._shift_row_maps_on_remove(row)
+                    self._table.removeRow(row)
+                    if row < self._saved_count:
+                        self._saved_count -= 1
+                min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+                if self._table.rowCount() < min_rows:
+                    start = self._table.rowCount()
+                    self._table.setRowCount(min_rows)
+                    self._init_editable_rows(start, min_rows)
+            else:
+                for row, col in list(self._cut_cells):
+                    if row < 0 or row >= self._table.rowCount():
+                        continue
+                    if row < self._saved_count and not self._edit_mode:
+                        continue
+                    it = self._table.item(row, col)
+                    if it is not None:
+                        it.setText("")
+                        rows_touched.add(row)
+                        if row < self._saved_count:
+                            self._dirty_rows.add(row)
+                for row in rows_touched:
+                    self._sync_row_date(row)
+        finally:
+            self._table.blockSignals(False)
+        self._clear_cut_marquee()
+        self._renumber()
+        self._update_footer()
+
+    def _shift_row_maps_on_insert(self, at_row: int) -> None:
+        def _shift(mapping: dict) -> dict:
+            return {
+                (k + 1 if k >= at_row else k): v
+                for k, v in mapping.items()
+            }
+        self._pending_row_meta = _shift(self._pending_row_meta)
+        self._saved_ids = _shift(self._saved_ids)
+        self._saved_txs = _shift(self._saved_txs)
+        self._dirty_rows = {(r + 1 if r >= at_row else r) for r in self._dirty_rows}
+        if self._cut_cells:
+            self._cut_cells = {
+                (r + 1 if r >= at_row else r, c) for r, c in self._cut_cells
+            }
+        if self._cut_is_rows and self._cut_payload.get("rows"):
+            self._cut_payload["rows"] = [
+                r + 1 if r >= at_row else r for r in self._cut_payload["rows"]
+            ]
+
+    def _shift_row_maps_on_remove(self, at_row: int) -> None:
+        def _shift(mapping: dict) -> dict:
+            out = {}
+            for k, v in mapping.items():
+                if k == at_row:
+                    continue
+                out[k - 1 if k > at_row else k] = v
+            return out
+        self._pending_row_meta = _shift(self._pending_row_meta)
+        self._saved_ids = _shift(self._saved_ids)
+        self._saved_txs = _shift(self._saved_txs)
+        self._dirty_rows = {
+            (r - 1 if r > at_row else r)
+            for r in self._dirty_rows
+            if r != at_row
+        }
+        if self._cut_cells:
+            self._cut_cells = {
+                (r - 1 if r > at_row else r, c)
+                for r, c in self._cut_cells
+                if r != at_row
+            }
+        if self._cut_is_rows and self._cut_payload.get("rows"):
+            self._cut_payload["rows"] = [
+                r - 1 if r > at_row else r
+                for r in self._cut_payload["rows"]
+                if r != at_row
+            ]
+
+    def _paste_rows(self, body: str, clear_cut_after: bool = True) -> None:
+        """Insert cut/copied rows at the current position."""
+        lines = [ln for ln in body.splitlines() if ln.strip() != "" or "\t" in ln]
+        if not lines:
+            return
+        cur = self._table.currentRow()
+        if self._merged_mode and self._edit_mode:
+            insert_at = max(cur, 0)
+        else:
+            insert_at = max(cur, self._saved_count)
+
+        truck_cells: list = []
+        self._bulk_mutating = True
+        prev = self._table.blockSignals(True)
+        try:
+            for line in lines:
+                self._shift_row_maps_on_insert(insert_at)
+                self._table.insertRow(insert_at)
+                self._init_editable_rows(insert_at, insert_at + 1)
+                cells = line.split("\t")
+                for col, cell in enumerate(cells):
+                    if col >= self._table.columnCount() or col in READONLY_COLS:
+                        continue
+                    if col in CHECK_COLS:
+                        it = QTableWidgetItem()
+                        it.setData(Qt.UserRole, cell.strip() in ("1", "true", "True", "YES"))
+                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                        self._table.setItem(insert_at, col, it)
+                    elif col == COL_RECEIPT:
+                        it = QTableWidgetItem(_receipt_paste_value(cell))
+                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                        self._table.setItem(insert_at, col, it)
+                    elif col == COL_TZS:
+                        amt = _parse_amount_text(cell)
+                        text = f"{amt:,.2f}" if cell.strip() else ""
+                        it = QTableWidgetItem(text)
+                        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                        if amt < 0:
+                            it.setForeground(NEG_COLOR)
+                        self._table.setItem(insert_at, col, it)
+                    elif col == COL_TRUCK:
+                        raw = cell.strip()
+                        self._table.setItem(
+                            insert_at, col, QTableWidgetItem(raw.upper() if raw else "")
+                        )
+                        if raw:
+                            truck_cells.append((insert_at, raw))
+                    else:
+                        self._table.setItem(
+                            insert_at, col, QTableWidgetItem(_upper_text(col, cell.strip()))
+                        )
+                self._sync_row_date(insert_at)
+                if insert_at < self._saved_count:
+                    self._saved_count += 1
+                insert_at += 1
+        finally:
+            self._table.blockSignals(prev)
+            self._bulk_mutating = False
+        self._renumber()
+        self._update_footer()
+        self._finalize_truck_cells(truck_cells)
+        if clear_cut_after and self._has_cut_buffer() and self._cut_is_rows:
+            self._clear_cut_source_cells()
 
     def _paste(self) -> None:
         text = QApplication.clipboard().text()
         if not text:
             return
+
+        if text.startswith(_ROWS_CLIP_PREFIX):
+            if self._has_cut_buffer() and self._cut_payload.get("maps"):
+                self._paste_row_maps(
+                    self._cut_payload["maps"], clear_cut_after=True
+                )
+            else:
+                self._paste_rows(text[len(_ROWS_CLIP_PREFIX):])
+            return
+
+        self._push_undo_cells(self._snapshot_selection())
 
         lines = text.splitlines()
 
@@ -1456,7 +2162,7 @@ class DailyRegister(QWidget):
                             it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                             self._table.setItem(row, col, it)
                         elif col == COL_RECEIPT:
-                            norm = _norm_receipt_text(cell_value)
+                            norm = _receipt_paste_value(cell_value)
                             it = self._table.item(row, col) or QTableWidgetItem()
                             it.setText(norm)
                             it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
@@ -1480,57 +2186,61 @@ class DailyRegister(QWidget):
                 self._table.blockSignals(prev)
                 self._renumber()
                 self._finalize_truck_cells(truck_cells)
-                return
-
-            # Multi-row / multi-column clipboard: paste starting at anchor (TSV layout).
-            touched_rows: set = set()
-            prev = self._table.blockSignals(True)
-            for r, line in enumerate(lines):
-                for c, cell in enumerate(line.split("\t")):
-                    row = start_row + r
-                    col = start_col + c
-                    if row >= self._table.rowCount():
-                        self._append_editable_rows(20)
-                    if col >= self._table.columnCount() or col in READONLY_COLS:
-                        continue
-                    if row < self._saved_count:
-                        continue
-                    touched_rows.add(row)
-                    if col in CHECK_COLS:
-                        it = self._table.item(row, col) or QTableWidgetItem()
-                        it.setData(Qt.UserRole, cell.strip() in ("1", "true", "True", "YES"))
-                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                        self._table.setItem(row, col, it)
-                    elif col == COL_RECEIPT:
-                        norm = _norm_receipt_text(cell)
-                        it = self._table.item(row, col) or QTableWidgetItem()
-                        it.setText(norm)
-                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                        self._table.setItem(row, col, it)
-                    elif col == COL_TZS:
-                        amt = _parse_amount_text(cell)
-                        text = f"{amt:,.2f}" if cell.strip() else ""
-                        it = QTableWidgetItem(text)
-                        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                        if amt < 0:
-                            it.setForeground(NEG_COLOR)
-                        self._table.setItem(row, col, it)
-                    elif col == COL_TRUCK:
-                        raw = cell.strip()
-                        self._table.setItem(row, col, QTableWidgetItem(raw.upper() if raw else ""))
-                        if raw:
-                            truck_cells.append((row, raw))
-                    else:
-                        self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell.strip())))
-            for row in touched_rows:
-                self._sync_row_date(row)
-            self._table.blockSignals(prev)
-            self._renumber()
-            self._finalize_truck_cells(truck_cells)
+            else:
+                # Multi-row / multi-column clipboard: paste starting at anchor (TSV layout).
+                touched_rows: set = set()
+                prev = self._table.blockSignals(True)
+                for r, line in enumerate(lines):
+                    for c, cell in enumerate(line.split("\t")):
+                        row = start_row + r
+                        col = start_col + c
+                        if row >= self._table.rowCount():
+                            self._append_editable_rows(20)
+                        if col >= self._table.columnCount() or col in READONLY_COLS:
+                            continue
+                        if row < self._saved_count:
+                            continue
+                        touched_rows.add(row)
+                        if col in CHECK_COLS:
+                            it = self._table.item(row, col) or QTableWidgetItem()
+                            it.setData(Qt.UserRole, cell.strip() in ("1", "true", "True", "YES"))
+                            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                            self._table.setItem(row, col, it)
+                        elif col == COL_RECEIPT:
+                            norm = _receipt_paste_value(cell)
+                            it = self._table.item(row, col) or QTableWidgetItem()
+                            it.setText(norm)
+                            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                            self._table.setItem(row, col, it)
+                        elif col == COL_TZS:
+                            amt = _parse_amount_text(cell)
+                            text = f"{amt:,.2f}" if cell.strip() else ""
+                            it = QTableWidgetItem(text)
+                            it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                            if amt < 0:
+                                it.setForeground(NEG_COLOR)
+                            self._table.setItem(row, col, it)
+                        elif col == COL_TRUCK:
+                            raw = cell.strip()
+                            self._table.setItem(row, col, QTableWidgetItem(raw.upper() if raw else ""))
+                            if raw:
+                                truck_cells.append((row, raw))
+                        else:
+                            self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell.strip())))
+                for row in touched_rows:
+                    self._sync_row_date(row)
+                self._table.blockSignals(prev)
+                self._renumber()
+                self._finalize_truck_cells(truck_cells)
         finally:
             self._bulk_mutating = False
 
+        if self._has_cut_buffer() and not self._cut_is_rows:
+            self._clear_cut_source_cells()
+        self._update_footer()
+
     def _clear_selected(self) -> None:
+        snap = self._snapshot_selection()
         cleared_rows: set = set()
         self._table.blockSignals(True)
         for item in self._table.selectedItems():
@@ -1546,13 +2256,17 @@ class DailyRegister(QWidget):
         for row in cleared_rows:
             self._sync_row_date(row)
         self._table.blockSignals(False)
+        if snap:
+            self._push_undo_cells(snap)
         self._renumber()
+        self._update_footer()
 
     def _fill_down(self) -> None:
         """Ctrl+D: copy the top row of the selection into all rows below it."""
         items = self._table.selectedItems()
         if not items:
             return
+        self._push_undo_cells(self._snapshot_selection())
         rows = sorted(set(it.row() for it in items))
         cols = sorted(set(it.column() for it in items))
         if len(rows) < 2:
@@ -1594,6 +2308,7 @@ class DailyRegister(QWidget):
         items = self._table.selectedItems()
         if not items:
             return
+        self._push_undo_cells(self._snapshot_selection())
         rows = sorted(set(it.row() for it in items))
         cols = sorted(set(it.column() for it in items))
         if len(cols) < 2:
@@ -1640,27 +2355,34 @@ class DailyRegister(QWidget):
     def _show_context_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
         menu = QMenu(self._table)
-        if 0 <= row < self._saved_count:
+        if 0 <= row < self._saved_count and not self._edit_mode:
             act = menu.addAction("Delete Saved Entry")
             act.triggered.connect(lambda: self._delete_saved_row(row))
         else:
             menu.addAction("Copy",  self._copy)
             menu.addAction("Cut",   self._cut)
             menu.addAction("Paste", self._paste)
+            if self._has_cut_buffer():
+                menu.addAction("Insert Cut Cells", self._insert_cut_cells)
             menu.addSeparator()
             menu.addAction("Insert Row Above",       self._insert_above)
             menu.addAction("Insert Row Below",       self._insert_below)
             menu.addAction("Delete Selected Row(s)", self._delete_rows)
+            if self._undo_stack:
+                menu.addSeparator()
+                menu.addAction("Undo", self._undo)
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
     def _insert_above(self) -> None:
         row = max(self._table.currentRow(), self._saved_count)
+        self._shift_row_maps_on_insert(row)
         self._table.insertRow(row)
         self._init_editable_rows(row, row + 1)
         self._renumber()
 
     def _insert_below(self) -> None:
         row = max(self._table.currentRow() + 1, self._saved_count)
+        self._shift_row_maps_on_insert(row)
         self._table.insertRow(row)
         self._init_editable_rows(row, row + 1)
         self._renumber()
@@ -1672,6 +2394,7 @@ class DailyRegister(QWidget):
             reverse=True,
         )
         for row in rows:
+            self._shift_row_maps_on_remove(row)
             self._table.removeRow(row)
         min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
         if self._table.rowCount() < min_rows:
@@ -1688,12 +2411,42 @@ class DailyRegister(QWidget):
         tx_id = self._saved_ids.get(row)
         if not tx_id:
             return
+        tx = self._saved_txs.get(row)
         it = self._table.item(row, COL_DESC)
         desc = it.text() if it else "?"
+        is_pending_edit = bool(
+            tx is not None
+            and getattr(tx, "original_transaction_id", None)
+            and not getattr(tx, "verified", False)
+        )
+        is_verified = bool(tx is not None and getattr(tx, "verified", False))
+        is_submitted = (
+            tx is not None
+            and not is_verified
+            and (getattr(tx, "register_status", "") or "submitted") != "draft"
+        )
+        if is_verified:
+            msg = (
+                f'Request deletion of approved expense:\n"{desc}"?\n\n'
+                "It will leave Master Expenses immediately and appear in the "
+                "accountant's Verify → Deleted tab for confirm or restore."
+            )
+        elif is_pending_edit:
+            msg = (
+                f'Delete pending edit:\n"{desc}"?\n\n'
+                "This undoes the edit. The original approved expense stays in Master."
+            )
+        elif is_submitted:
+            msg = (
+                f'Delete submitted transaction:\n"{desc}"?\n\n'
+                "It will be removed from the Verify inbox."
+            )
+        else:
+            msg = f'Delete saved transaction:\n"{desc}"?'
         if (
             QMessageBox.question(
                 self, "Delete Entry",
-                f'Delete saved transaction:\n"{desc}"?',
+                msg,
                 QMessageBox.Yes | QMessageBox.No,
             )
             == QMessageBox.Yes
@@ -1702,7 +2455,19 @@ class DailyRegister(QWidget):
 
     async def _do_delete_saved(self, tx_id) -> None:
         try:
-            await delete_transaction(tx_id)
+            cashier_id = getattr(self._user, "_id", None)
+            result = await request_or_delete_transaction(tx_id, cashier_id)
+            if result == "not_found":
+                QMessageBox.warning(
+                    self, "Not Found",
+                    "That entry was already removed.",
+                )
+            elif result == "deletion_requested":
+                QMessageBox.information(
+                    self, "Deletion Requested",
+                    "The approved expense was sent to Verify → Deleted.\n"
+                    "An accountant must confirm permanent removal or restore it.",
+                )
             await self._load_date(self._current_date)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to delete:\n{exc}")
@@ -1788,7 +2553,7 @@ class DailyRegister(QWidget):
                 }
 
                 dt = data.get("date")
-                date_str = dt.strftime("%d/%m/%Y") if dt else ""
+                date_str = format_register_date(dt) if dt else ""
                 self._table.setItem(target, COL_DATE, QTableWidgetItem(date_str))
 
                 item_name = data.get("item") or data.get("category_name") or ""
@@ -1907,7 +2672,7 @@ class DailyRegister(QWidget):
                     try:
                         from datetime import datetime as _dt
                         if isinstance(row_data[file_col], _dt):
-                            formatted = row_data[file_col].strftime("%d/%m/%Y")
+                            formatted = format_register_date(row_data[file_col])
                         else:
                             formatted = raw
                     except Exception:
@@ -2005,6 +2770,7 @@ class DailyRegister(QWidget):
                 continue
             updates["last_edited_at"] = datetime.utcnow()
             updates["last_edited_by"] = self._user._id
+            updates["day_order"] = row
             orig = self._saved_txs.get(row)
             try:
                 if orig is not None and getattr(orig, "original_transaction_id", None):
@@ -2017,6 +2783,9 @@ class DailyRegister(QWidget):
                     # Edited tab. On re-approval the new values cascade to the
                     # original in-place.
                     await insert_pending_edit(tx_id, updates, self._user._id)
+                elif orig is not None and (getattr(orig, "register_status", "") or "") == "draft":
+                    # Still in Merged draft — update in place; do not send to Edited yet.
+                    await update_transaction(tx_id, updates)
                 elif orig is not None:
                     # Option B: any edit of a saved (unverified / rejected) row
                     # moves it to Verify → Edited for accountant re-approval.
@@ -2045,9 +2814,10 @@ class DailyRegister(QWidget):
                 continue
             _it = self._table.item(_s, COL_DATE)
             _ds = _it.text().strip() if _it else ""
-            try:
-                _td = datetime.strptime(_ds, "%d/%m/%Y").date()
-            except ValueError:
+            _parsed = _parse_optional_date(_ds, default_year=self._current_date.year)
+            if _parsed is not None:
+                _td = _parsed.date()
+            else:
                 _td = self._current_date
             if _td != date.today():
                 _off_date += 1
@@ -2082,9 +2852,10 @@ class DailyRegister(QWidget):
 
             try:
                 date_str = txt(COL_DATE)
-                try:
-                    tx_date = datetime.strptime(date_str, "%d/%m/%Y")
-                except ValueError:
+                tx_date = _parse_optional_date(
+                    date_str, default_year=self._current_date.year
+                )
+                if tx_date is None:
                     tx_date = datetime(
                         self._current_date.year,
                         self._current_date.month,
@@ -2208,7 +2979,9 @@ class DailyRegister(QWidget):
                 meta = self._pending_row_meta.get(row) or {}
                 tx = Transaction(
                     date=tx_date,
-                    reported_date=_parse_optional_date(txt(COL_REPORTED)),
+                    reported_date=_parse_optional_date(
+                txt(COL_REPORTED), default_year=self._current_date.year
+            ),
                     description=description,
                     item=item_name,
                     # The chosen item *is* the category — keep them in sync so the
@@ -2227,6 +3000,8 @@ class DailyRegister(QWidget):
                     payee=txt(COL_PAYEE),
                     cheque=txt(COL_CHEQUE),
                     cashier_id=self._user._id,
+                    day_order=row,
+                    register_status="draft",
                     possible_duplicate=is_dup,
                     daily_import_id=meta.get("daily_import_id"),
                     daily_import_source=meta.get("daily_import_source"),
@@ -2257,6 +3032,17 @@ class DailyRegister(QWidget):
         self._reset_edit_state()
         self.rows_saved.emit(saved)
         await self._load_date(self._current_date)
+        # Lock in visual sequence after reload.
+        try:
+            ordered_ids = [
+                self._saved_ids[r]
+                for r in range(self._saved_count)
+                if r in self._saved_ids and self._saved_ids[r]
+            ]
+            if ordered_ids:
+                await recount_day_order(self._current_date, ordered_ids)
+        except Exception:
+            pass
         return True
 
     def _row_has_data(self, row: int) -> bool:
@@ -2405,6 +3191,7 @@ class DailyRegister(QWidget):
                 icon=data.get("icon", "mdi.tag-outline"),
                 sidebar_name=data.get("sidebar_name", ""),
                 show_in_sidebar=data.get("show_in_sidebar", False),
+                show_in_cashier_sidebar=data.get("show_in_cashier_sidebar", False),
                 lock_description=data.get("lock_description", False),
             )
             cats = await get_all_categories()

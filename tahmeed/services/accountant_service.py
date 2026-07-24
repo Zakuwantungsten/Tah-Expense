@@ -118,8 +118,18 @@ async def reject_transaction(tx_id: ObjectId, reason: str) -> bool:
 
 
 async def get_pending_count() -> int:
+    """Sidebar / inbox badge: submitted unverified + deletion requests."""
     db = get_db()
-    return await db.transactions.count_documents({"verified": False, "rejected": {"$ne": True}})
+    inbox = await db.transactions.count_documents({
+        "verified": False,
+        "rejected": {"$ne": True},
+        "$or": [
+            {"register_status": "submitted"},
+            {"register_status": {"$exists": False}},
+        ],
+    })
+    deletions = await db.transactions.count_documents({"deletion_requested": True})
+    return int(inbox) + int(deletions)
 
 
 def _sum_amount_if_currency(*codes: str, absolute: bool = False) -> dict:
@@ -345,12 +355,27 @@ async def get_overview_dashboard(year: int) -> dict:
 
 # ── Inbox filtered queries ────────────────────────────────────────────────────
 
+def _normalize_multi_filter(value) -> List[str]:
+    """Accept a single string or a list of strings; empty → no filter."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        s = value.strip()
+        return [s] if s else []
+    out: List[str] = []
+    for v in value:
+        s = str(v).strip()
+        if s:
+            out.append(s)
+    return out
+
+
 def _append_text_filters(
     and_clauses: list,
     *,
     search: str = "",
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> None:
     if search.strip():
         s = re.escape(search.strip())
@@ -360,19 +385,30 @@ def _append_text_filters(
             {"category_name": {"$regex": s, "$options": "i"}},
             {"truck_number": {"$regex": s, "$options": "i"}},
         ]})
-    if description.strip():
-        and_clauses.append({
-            "description": {
-                "$regex": re.escape(description.strip()),
-                "$options": "i",
-            },
-        })
-    if item.strip():
-        it = re.escape(item.strip())
-        and_clauses.append({"$or": [
-            {"item": {"$regex": f"^{it}$", "$options": "i"}},
-            {"category_name": {"$regex": f"^{it}$", "$options": "i"}},
-        ]})
+    descs = _normalize_multi_filter(description)
+    if descs:
+        if isinstance(description, str):
+            # Legacy free-text: substring match
+            and_clauses.append({
+                "description": {
+                    "$regex": re.escape(descs[0]),
+                    "$options": "i",
+                },
+            })
+        else:
+            # Multi-select: exact match on any selected description
+            and_clauses.append({"$or": [
+                {"description": {"$regex": f"^{re.escape(d)}$", "$options": "i"}}
+                for d in descs
+            ]})
+    items = _normalize_multi_filter(item)
+    if items:
+        item_ors: list = []
+        for it in items:
+            esc = re.escape(it)
+            item_ors.append({"item": {"$regex": f"^{esc}$", "$options": "i"}})
+            item_ors.append({"category_name": {"$regex": f"^{esc}$", "$options": "i"}})
+        and_clauses.append({"$or": item_ors})
 
 
 def _build_inbox_query(
@@ -382,10 +418,18 @@ def _build_inbox_query(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     edited: Optional[bool] = None,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> dict:
-    query: dict = {"verified": False, "rejected": {"$ne": True}}
+    # Only rows submitted from the register (or legacy docs without the field).
+    query: dict = {
+        "verified": False,
+        "rejected": {"$ne": True},
+        "$or": [
+            {"register_status": "submitted"},
+            {"register_status": {"$exists": False}},
+        ],
+    }
     # edited=False  → "New" tab: fresh entries never flagged as edited
     #                 (matches both False and missing field on legacy docs)
     # edited=True   → "Edited" tab: rows the cashier changed after save
@@ -427,8 +471,8 @@ async def get_unverified_filtered(
     limit: int = 25,
     skip: int = 0,
     edited: Optional[bool] = None,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> List[Transaction]:
     db = get_db()
     query = _build_inbox_query(
@@ -451,8 +495,8 @@ async def count_unverified_filtered(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     edited: Optional[bool] = None,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> int:
     db = get_db()
     query = _build_inbox_query(
@@ -471,8 +515,8 @@ async def get_edited_transactions(
     date_to: Optional[datetime] = None,
     limit: int = 25,
     skip: int = 0,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> List[Transaction]:
     """Rows the cashier edited after save (verified=False AND
     edited_after_verification=True). Sorted by most-recently-edited first."""
@@ -497,8 +541,8 @@ async def count_edited_transactions(
     cashier_id: Optional[ObjectId] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> int:
     db = get_db()
     query = _build_inbox_query(
@@ -512,8 +556,195 @@ async def get_edited_count() -> int:
     """Total edited rows awaiting re-approval (for the badge)."""
     db = get_db()
     return await db.transactions.count_documents(
-        {"verified": False, "edited_after_verification": True, "rejected": {"$ne": True}}
+        {
+            "verified": False,
+            "edited_after_verification": True,
+            "rejected": {"$ne": True},
+            "$or": [
+                {"register_status": "submitted"},
+                {"register_status": {"$exists": False}},
+            ],
+        }
     )
+
+
+# ── Deletion-request queries (accountant "Deleted" sub-tab) ───────────────────
+
+def _build_deletion_query(
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    item="",
+    description="",
+) -> dict:
+    query: dict = {"deletion_requested": True}
+    and_clauses: list = []
+    _append_text_filters(
+        and_clauses, search=search, item=item, description=description,
+    )
+    if and_clauses:
+        query["$and"] = and_clauses
+    if truck.strip():
+        query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
+    if cashier_id:
+        query["cashier_id"] = cashier_id
+    if date_from or date_to:
+        df: dict = {}
+        if date_from:
+            df["$gte"] = date_from
+        if date_to:
+            df["$lte"] = date_to
+        # Prefer when the cashier requested deletion so any-date rows still show.
+        query["deletion_requested_at"] = df
+    return query
+
+
+async def get_deletion_requested_filtered(
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 25,
+    skip: int = 0,
+    item="",
+    description="",
+) -> List[Transaction]:
+    """Approved rows the cashier asked to permanently remove."""
+    db = get_db()
+    query = _build_deletion_query(
+        search, truck, cashier_id, date_from, date_to, item, description,
+    )
+    cursor = (
+        db.transactions.find(query)
+        .sort([("deletion_requested_at", -1), ("date", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
+
+
+async def count_deletion_requested_filtered(
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    item="",
+    description="",
+) -> int:
+    db = get_db()
+    query = _build_deletion_query(
+        search, truck, cashier_id, date_from, date_to, item, description,
+    )
+    return await db.transactions.count_documents(query)
+
+
+async def get_deletion_requested_count() -> int:
+    """Total deletion requests awaiting accountant confirm/restore."""
+    db = get_db()
+    return await db.transactions.count_documents({"deletion_requested": True})
+
+
+async def get_deletion_requested_trucks() -> List[str]:
+    db = get_db()
+    vals = await db.transactions.distinct("truck_number", {"deletion_requested": True})
+    return sorted(v for v in vals if v)
+
+
+async def get_deletion_requested_cashier_ids() -> List[ObjectId]:
+    db = get_db()
+    vals = await db.transactions.distinct("cashier_id", {"deletion_requested": True})
+    return [v for v in vals if v]
+
+
+async def get_deletion_requested_items(
+    descriptions: Optional[List[str]] = None,
+) -> List[str]:
+    db = get_db()
+    base: dict = {"deletion_requested": True}
+    descs = _normalize_multi_filter(descriptions or "")
+    if descs:
+        base["$or"] = [
+            {"description": {"$regex": re.escape(d), "$options": "i"}} for d in descs
+        ]
+    items = await db.transactions.distinct("item", base)
+    cats = await db.transactions.distinct("category_name", base)
+    return sorted({*(v for v in items if v), *(v for v in cats if v)})
+
+
+async def get_deletion_requested_descriptions(
+    items: Optional[List[str]] = None,
+) -> List[str]:
+    db = get_db()
+    base: dict = {"deletion_requested": True}
+    item_list = _normalize_multi_filter(items or "")
+    if item_list:
+        ors: list = []
+        for it in item_list:
+            esc = re.escape(it)
+            ors.append({"item": {"$regex": f"^{esc}$", "$options": "i"}})
+            ors.append({"category_name": {"$regex": f"^{esc}$", "$options": "i"}})
+        base["$or"] = ors
+    vals = await db.transactions.distinct("description", base)
+    return sorted(v for v in vals if v)
+
+
+async def confirm_deletion(tx_id: ObjectId) -> bool:
+    """Permanently delete an approved row flagged for removal.
+
+    Also removes any pending-edit clones that still point at this original.
+    """
+    db = get_db()
+    doc = await db.transactions.find_one({"_id": tx_id, "deletion_requested": True})
+    if not doc:
+        return False
+    await db.transactions.delete_many({"original_transaction_id": tx_id})
+    result = await db.transactions.delete_one({"_id": tx_id, "deletion_requested": True})
+    return result.deleted_count == 1
+
+
+async def bulk_confirm_deletions(tx_ids: List[ObjectId]) -> int:
+    if not tx_ids:
+        return 0
+    db = get_db()
+    await db.transactions.delete_many({"original_transaction_id": {"$in": tx_ids}})
+    result = await db.transactions.delete_many(
+        {"_id": {"$in": tx_ids}, "deletion_requested": True},
+    )
+    return int(result.deleted_count)
+
+
+async def restore_deletion(tx_id: ObjectId) -> bool:
+    """Clear deletion request flags so the row returns to Master / register."""
+    db = get_db()
+    result = await db.transactions.update_one(
+        {"_id": tx_id, "deletion_requested": True},
+        {"$set": {
+            "deletion_requested": False,
+            "deletion_requested_at": None,
+            "deletion_requested_by": None,
+        }},
+    )
+    return result.modified_count == 1
+
+
+async def bulk_restore_deletions(tx_ids: List[ObjectId]) -> int:
+    if not tx_ids:
+        return 0
+    db = get_db()
+    result = await db.transactions.update_many(
+        {"_id": {"$in": tx_ids}, "deletion_requested": True},
+        {"$set": {
+            "deletion_requested": False,
+            "deletion_requested_at": None,
+            "deletion_requested_by": None,
+        }},
+    )
+    return int(result.modified_count)
 
 
 # ── Rejected queries ──────────────────────────────────────────────────────────
@@ -524,8 +755,8 @@ def _build_rejected_query(
     cashier_id: Optional[ObjectId] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> dict:
     query: dict = {"rejected": True, "discarded": {"$ne": True}}
     and_clauses: list = []
@@ -556,8 +787,8 @@ async def get_rejected_transactions(
     date_to: Optional[datetime] = None,
     limit: int = 25,
     skip: int = 0,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> List[Transaction]:
     db = get_db()
     query = _build_rejected_query(
@@ -579,8 +810,8 @@ async def count_rejected_transactions(
     cashier_id: Optional[ObjectId] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
-    item: str = "",
-    description: str = "",
+    item="",
+    description="",
 ) -> int:
     db = get_db()
     query = _build_rejected_query(
@@ -707,14 +938,67 @@ async def get_unverified_trucks() -> List[str]:
     return sorted(v for v in vals if v)
 
 
-async def get_unverified_items() -> List[str]:
+def _inbox_base_query(*, rejected: bool = False) -> dict:
+    if rejected:
+        return {"rejected": True, "discarded": {"$ne": True}}
+    return {
+        "verified": False,
+        "rejected": {"$ne": True},
+        "$or": [
+            {"register_status": "submitted"},
+            {"register_status": {"$exists": False}},
+        ],
+    }
+
+
+def _apply_cascade_filters(
+    base: dict,
+    *,
+    items: Optional[List[str]] = None,
+    descriptions: Optional[List[str]] = None,
+) -> dict:
+    """Narrow a distinct-options query by the other cascading filter."""
+    query = dict(base)
+    and_clauses: list = []
+    _append_text_filters(
+        and_clauses,
+        item=items or [],
+        description=descriptions or [],
+    )
+    if and_clauses:
+        existing = query.pop("$and", None)
+        if existing:
+            and_clauses = list(existing) + and_clauses
+        query["$and"] = and_clauses
+    return query
+
+
+async def get_unverified_items(
+    descriptions: Optional[List[str]] = None,
+) -> List[str]:
     """Distinct item / category names for Verify filter dropdowns."""
     db = get_db()
-    base = {"verified": False, "rejected": {"$ne": True}}
+    base = _apply_cascade_filters(
+        _inbox_base_query(rejected=False),
+        descriptions=descriptions,
+    )
     items = await db.transactions.distinct("item", base)
     cats = await db.transactions.distinct("category_name", base)
     names = {*(v for v in items if v), *(v for v in cats if v)}
     return sorted(names, key=str.lower)
+
+
+async def get_unverified_descriptions(
+    items: Optional[List[str]] = None,
+) -> List[str]:
+    """Distinct descriptions on unverified inbox rows (optionally scoped by items)."""
+    db = get_db()
+    base = _apply_cascade_filters(
+        _inbox_base_query(rejected=False),
+        items=items,
+    )
+    vals = await db.transactions.distinct("description", base)
+    return sorted((v for v in vals if v), key=str.lower)
 
 
 async def get_unverified_cashier_ids() -> List[ObjectId]:
@@ -732,13 +1016,30 @@ async def get_rejected_trucks() -> List[str]:
     return sorted(v for v in vals if v)
 
 
-async def get_rejected_items() -> List[str]:
+async def get_rejected_items(
+    descriptions: Optional[List[str]] = None,
+) -> List[str]:
     db = get_db()
-    base = {"rejected": True, "discarded": {"$ne": True}}
+    base = _apply_cascade_filters(
+        _inbox_base_query(rejected=True),
+        descriptions=descriptions,
+    )
     items = await db.transactions.distinct("item", base)
     cats = await db.transactions.distinct("category_name", base)
     names = {*(v for v in items if v), *(v for v in cats if v)}
     return sorted(names, key=str.lower)
+
+
+async def get_rejected_descriptions(
+    items: Optional[List[str]] = None,
+) -> List[str]:
+    db = get_db()
+    base = _apply_cascade_filters(
+        _inbox_base_query(rejected=True),
+        items=items,
+    )
+    vals = await db.transactions.distinct("description", base)
+    return sorted((v for v in vals if v), key=str.lower)
 
 
 async def get_rejected_cashier_ids() -> List[ObjectId]:
@@ -823,7 +1124,11 @@ def _build_master_query(
         dt = date_to.replace(hour=23, minute=59, second=59, microsecond=0)
         end = min(end, dt)
 
-    query: dict = {"verified": True, "date": {"$gte": start, "$lte": end}}
+    query: dict = {
+        "verified": True,
+        "deletion_requested": {"$ne": True},
+        "date": {"$gte": start, "$lte": end},
+    }
 
     and_clauses: list = []
 
