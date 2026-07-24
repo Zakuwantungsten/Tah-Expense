@@ -1,3 +1,3 @@
 """The single authoritative desktop application version."""
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "4.0.0"

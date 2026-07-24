@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import qtawesome as qta
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -20,11 +20,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tahmeed.services.api_client import api_client
 from tahmeed.services.backup_service import BackupJob, list_backup_jobs, restore_backup
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 
 class BackupWidget(QWidget):
+    """Emits logout_requested after a successful restore (sessions are wiped)."""
+
+    logout_requested = Signal()
+
     def __init__(self, parent=None, *, allow_restore: bool = False) -> None:
         super().__init__(parent)
         self._allow_restore = allow_restore
@@ -179,26 +184,37 @@ class BackupWidget(QWidget):
         self._update_restore_enabled()
         self._overlay.show_loading("Restoring database from backup…")
         try:
+            # A 200 from restore means mongorestore already ran with --drop.
+            # auth_sessions are gone; do not call other APIs or treat follow-up
+            # auth errors as a failed restore.
             result = await restore_backup(filename)
-            completed = result.get("completed_at", "")
-            QMessageBox.information(
-                self,
-                "Restore completed",
-                (
-                    f"Restored {filename}.\n"
-                    f"Finished at {completed or 'now'}.\n\n"
-                    "Sign out and sign back in, then verify recent data."
-                ),
-            )
-            self._jobs = await list_backup_jobs()
-            self._render()
         except Exception as exc:
-            QMessageBox.critical(self, "Restore failed", str(exc))
-        finally:
             self._busy = False
             self._refresh_button.setEnabled(True)
             self._overlay.hide_loading()
             self._update_restore_enabled()
+            QMessageBox.critical(self, "Restore failed", str(exc))
+            return
+
+        self._busy = False
+        self._refresh_button.setEnabled(True)
+        self._overlay.hide_loading()
+        self._update_restore_enabled()
+
+        completed = result.get("completed_at", "")
+        # Drop local tokens immediately so background polls stop and logout
+        # skips unsaved-register prompts (pre-restore drafts are obsolete).
+        api_client.clear_tokens()
+        QMessageBox.information(
+            self,
+            "Restore completed",
+            (
+                f"Restored {filename}.\n"
+                f"Finished at {completed or 'now'}.\n\n"
+                "You will be signed out. Sign back in to verify restored data."
+            ),
+        )
+        self.logout_requested.emit()
 
     def _render(self) -> None:
         self._table.setRowCount(len(self._jobs))

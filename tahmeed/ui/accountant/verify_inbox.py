@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QLineEdit, QComboBox, QPushButton, QTextEdit,
     QMessageBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QDialog,
+    QHeaderView, QAbstractItemView, QDialog, QInputDialog,
 )
 from PySide6.QtCore import Qt, Signal, QSize, QTimer
 from PySide6.QtGui import QColor, QFont
@@ -320,6 +320,10 @@ class _FilterBar(QFrame):
         self._date_cb.currentTextChanged.connect(self.filter_changed)
         hl.addWidget(self._date_cb)
 
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(self.clear_filters)
+        hl.addWidget(clear_btn)
+
         hl.addStretch()
 
         self._approve_btn = _btn("Approve Selected", "mdi.check-all")
@@ -459,6 +463,28 @@ class _FilterBar(QFrame):
     def date_filter(self) -> Tuple[Optional[datetime], Optional[datetime]]:
         return _resolve_date_filter(self._date_cb.currentText())
 
+    def clear_filters(self) -> None:
+        """Reset search, multi-combos, truck, cashier, and date to defaults."""
+        self._search.blockSignals(True)
+        self._truck_cb.blockSignals(True)
+        self._cashier_cb.blockSignals(True)
+        self._date_cb.blockSignals(True)
+        self._cascade_busy = True
+        try:
+            self._search.clear()
+            self._item_cb.reset_to_all(emit=False)
+            self._desc_cb.reset_to_all(emit=False)
+            self._truck_cb.setCurrentIndex(0)
+            self._cashier_cb.setCurrentIndex(0)
+            self._date_cb.setCurrentIndex(0)
+        finally:
+            self._search.blockSignals(False)
+            self._truck_cb.blockSignals(False)
+            self._cashier_cb.blockSignals(False)
+            self._date_cb.blockSignals(False)
+            self._cascade_busy = False
+        self.filter_changed.emit()
+
 
 # ── Status / scroll footer ─────────────────────────────────────────────────────
 
@@ -526,6 +552,8 @@ class _ActionPanel(QFrame):
         self._cat_combo = QComboBox()
         self._cat_combo.setFixedWidth(220)
         self._cat_combo.setStyleSheet(_input_ss())
+        self._cat_combo.currentIndexChanged.connect(self._on_category_changed)
+        self._category_user_selected = False
         cvl.addWidget(self._cat_combo)
         hl.addWidget(cat_w)
 
@@ -613,8 +641,20 @@ class _ActionPanel(QFrame):
             self._notes_lbl.setText("NOTES FOR CASHIER  (required to reject)")
             self._notes.setPlaceholderText("Leave a reason if rejecting this entry…")
 
+    @staticmethod
+    def _needs_item(tx: Transaction) -> bool:
+        from tahmeed.services.description_mapping_service import transaction_needs_item
+
+        return transaction_needs_item(tx.item, tx.category_name)
+
+    def _on_category_changed(self, _index: int) -> None:
+        if self._cat_combo.signalsBlocked():
+            return
+        self._category_user_selected = True
+
     def load(self, tx: Transaction, cashier_name: str, categories: List[str]) -> None:
         self._tx = tx
+        self._category_user_selected = False
         currency = tx.currency or "TZS"
         self._info_lbl.setText(
             f"{tx.truck_number or '—'}  ·  {_fmt_date(tx.date)}  ·  "
@@ -625,13 +665,21 @@ class _ActionPanel(QFrame):
         self._cat_combo.clear()
         for cat in categories:
             self._cat_combo.addItem(cat)
-        if tx.category_name:
+        if self._needs_item(tx) and categories:
+            self._cat_combo.insertItem(0, "— map on approve —")
+            self._cat_combo.setCurrentIndex(0)
+        elif tx.category_name:
             idx = self._cat_combo.findText(tx.category_name)
             if idx >= 0:
                 self._cat_combo.setCurrentIndex(idx)
+                self._category_user_selected = True
             else:
                 self._cat_combo.insertItem(0, tx.category_name)
                 self._cat_combo.setCurrentIndex(0)
+                self._category_user_selected = True
+        elif categories:
+            self._cat_combo.setCurrentIndex(0)
+            self._category_user_selected = True
         self._cat_combo.blockSignals(False)
         if self._mode == "deleted":
             requester = cashier_name or "—"
@@ -647,6 +695,10 @@ class _ActionPanel(QFrame):
         if not self._tx:
             return
         cat = self._cat_combo.currentText().strip()
+        if cat == "— map on approve —":
+            cat = ""
+        elif self._needs_item(self._tx) and not self._category_user_selected:
+            cat = ""
         self.approved.emit(self._tx._id, cat)
 
     def _on_reject(self) -> None:
@@ -1106,6 +1158,7 @@ class VerifyInboxWidget(QWidget):
                 _, cat_name = resolved
                 tx.category_name = cat_name
                 tx.item = cat_name
+        await self._ensure_mapping_categories()
         cashier = self._cashier_names.get(tx.cashier_id, "") if tx.cashier_id else ""
         tab = self._current_tab
         if tab == 2:
@@ -1202,7 +1255,7 @@ class VerifyInboxWidget(QWidget):
         self._filter_bar.populate_items(items)
         self._filter_bar.populate_descriptions(descs)
         clist = sorted(
-            [(cname_map.get(ci, str(ci)), ci) for ci in cashier_ids],
+            [(cname_map.get(ci, "Unknown cashier"), ci) for ci in cashier_ids],
             key=lambda x: x[0],
         )
         self._filter_bar.populate_cashiers(clist)
@@ -1624,11 +1677,39 @@ class VerifyInboxWidget(QWidget):
             asyncio.ensure_future(self._do_bulk_approve(tx_ids))
 
     def _on_bulk_reject(self) -> None:
-        QMessageBox.information(
-            self, "Bulk Reject",
-            "Bulk rejection requires individual notes per transaction.\n"
-            "Double-click each row to review, fill in the note, then press Reject & Return.",
+        tx_ids = self._selected_tx_ids()
+        if not tx_ids:
+            return
+        reason, ok = QInputDialog.getMultiLineText(
+            self,
+            "Reject Selected",
+            (
+                f"Enter a reason for rejecting {len(tx_ids)} transaction(s).\n"
+                "The cashier will see this note on each rejected entry."
+            ),
+            "",
         )
+        if not ok:
+            return
+        reason = reason.strip()
+        if not reason:
+            QMessageBox.warning(
+                self,
+                "Note Required",
+                "Please enter a reason before rejecting these entries.",
+            )
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Reject Selected",
+                f"Reject {len(tx_ids)} transaction(s) with this reason?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        asyncio.ensure_future(self._do_bulk_reject(tx_ids, reason))
 
     def _on_bulk_confirm_delete(self) -> None:
         tx_ids = self._selected_tx_ids()
@@ -1667,6 +1748,40 @@ class VerifyInboxWidget(QWidget):
             return None
         return next((c for c in self._category_objects if c.name.lower() == key), None)
 
+    async def _ensure_mapping_categories(self) -> List[Category]:
+        """Load the item catalog used by the mapping dialog (always fresh)."""
+        from tahmeed.services.api_models import desktop_document
+        from tahmeed.services.category_service import get_all_categories
+
+        categories: List[Category] = []
+        try:
+            categories = await get_all_categories(include_inactive=True)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Items Unavailable",
+                f"Could not load items from the server:\n{exc}",
+            )
+            return []
+
+        if not categories:
+            try:
+                from tahmeed.db.connection import get_db
+
+                db = get_db()
+                docs = await db.categories.find({"active": {"$ne": False}}).sort("name", 1).to_list(
+                    length=None
+                )
+                categories = [
+                    Category.from_doc(desktop_document(doc)) for doc in docs
+                ]
+            except Exception:
+                pass
+
+        self._category_objects = categories
+        self._categories = [c.name for c in categories]
+        return categories
+
     async def _assign_item_and_remember(
         self,
         tx_id: ObjectId,
@@ -1682,7 +1797,6 @@ class VerifyInboxWidget(QWidget):
 
     async def _resolve_items_for_transactions(self, txs: List[Transaction]) -> bool:
         """Ensure each transaction has an item; prompt when mapping is unknown."""
-        from tahmeed.services.category_service import get_all_categories
         from tahmeed.services.description_mapping_service import (
             get_mappings_for_descriptions,
             normalize_description,
@@ -1696,17 +1810,14 @@ class VerifyInboxWidget(QWidget):
         if not pending:
             return True
 
-        categories = self._category_objects
-        if not categories:
-            categories = await get_all_categories()
-            self._category_objects = categories
-            self._categories = [c.name for c in categories]
-
+        categories = await self._ensure_mapping_categories()
         if not categories:
             QMessageBox.warning(
                 self,
                 "No Items",
-                "Add items in Manage → Items before approving description-only entries.",
+                "There are no items to map descriptions to.\n\n"
+                "Open Manage → Items and import your Chart of Accounts, "
+                "or add items manually, then try again.",
             )
             return False
 
@@ -1847,6 +1958,18 @@ class VerifyInboxWidget(QWidget):
             await update_transaction_category(tx_id, category)
         except Exception:
             pass
+
+    async def _do_bulk_reject(self, tx_ids: List[ObjectId], reason: str) -> None:
+        from tahmeed.services.accountant_service import bulk_reject_transactions, get_pending_count
+
+        try:
+            n = await bulk_reject_transactions(tx_ids, reason)
+            count = await get_pending_count()
+            self.badge_updated.emit(count)
+            self._reset_and_load()
+            QMessageBox.information(self, "Done", f"Rejected {n} transaction(s).")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Bulk reject failed: {exc}")
 
     async def _do_bulk_approve(self, tx_ids: List[ObjectId]) -> None:
         from tahmeed.services.accountant_service import (

@@ -17,6 +17,7 @@ import qtawesome as qta
 from PySide6.QtCore import Qt, QTimer, QSize, QDate, QEvent, Signal
 from PySide6.QtGui import QColor, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QDateEdit,
     QFileDialog,
@@ -35,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tahmeed.services.truck_service import search_fleet
+from tahmeed.services.truck_service import get_fleet_numbers, search_fleet
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
@@ -53,10 +54,12 @@ _T1 = "#111827"
 _T2 = "#6B7280"
 _TM = "#9CA3AF"
 _HDR_BG = "#F1F5F9"
+_NAVY = "#1B2B4B"
 
 _SCROLL_CHUNK = 50
 _ROW_H = 32
 _MIN_FILTER_DATE = QDate(2000, 1, 1)
+_CURRENCY_FILTERS = ("All", "TZS", "USD", "ZMW")
 
 _SOURCE_OPTIONS = [
     ("All Sources", "all"),
@@ -287,6 +290,74 @@ def _normalize_currency(currency: str) -> str:
     if cur in ("ZMW", "ZMB", "ZK"):
         return "ZMW"
     return cur
+
+
+def _currency_toggle_style(checked: bool) -> str:
+    if checked:
+        return (
+            f"QPushButton {{"
+            f"  background: {_NAVY}; color: {_WHITE}; border: 1px solid {_NAVY};"
+            f"  border-radius: 6px; font-size: 11px; font-weight: 600;"
+            f"  font-family: 'Segoe UI'; padding: 0 10px;"
+            f"}}"
+        )
+    return (
+        f"QPushButton {{"
+        f"  background: {_WHITE}; color: {_T2}; border: 1px solid {_BORDER};"
+        f"  border-radius: 6px; font-size: 11px; font-weight: 600;"
+        f"  font-family: 'Segoe UI'; padding: 0 10px;"
+        f"}}"
+        f"QPushButton:hover {{ background: #F8FAFC; color: {_T1}; }}"
+    )
+
+
+class _CurrencyFilterToggle(QWidget):
+    """Exclusive All / TZS / USD / ZMW filter for the truck overview table."""
+
+    changed = Signal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._currency = "All"
+        self.setStyleSheet("background: transparent; border: none;")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._buttons: dict[str, QPushButton] = {}
+        for cur in _CURRENCY_FILTERS:
+            btn = QPushButton(cur)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(26)
+            btn.setChecked(cur == "All")
+            btn.setStyleSheet(_currency_toggle_style(cur == "All"))
+            btn.clicked.connect(lambda _=False, c=cur: self._on_clicked(c))
+            self._group.addButton(btn)
+            self._buttons[cur] = btn
+            row.addWidget(btn)
+
+    def currency(self) -> str:
+        return self._currency
+
+    def filter_value(self) -> str:
+        """Empty string means all currencies."""
+        return "" if self._currency == "All" else self._currency
+
+    def set_currency(self, currency: str, *, emit: bool = True) -> None:
+        cur = currency if currency in _CURRENCY_FILTERS else "All"
+        if cur == self._currency:
+            return
+        self._currency = cur
+        for code, btn in self._buttons.items():
+            btn.setChecked(code == cur)
+            btn.setStyleSheet(_currency_toggle_style(code == cur))
+        if emit:
+            self.changed.emit(cur)
+
+    def _on_clicked(self, currency: str) -> None:
+        self.set_currency(currency)
 
 
 def _amount_columns(currency: str, amount) -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -617,6 +688,7 @@ class TruckOverviewWidget(QWidget):
         self._loading = False
         self._scroll_loading = False
         self._reload_generation = 0
+        self._fleet_numbers: List[str] = []
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -624,6 +696,7 @@ class TruckOverviewWidget(QWidget):
         self._debounce.timeout.connect(self._reset_and_load)
 
         self._build()
+        asyncio.ensure_future(self._preload_fleet())
 
     def _build(self) -> None:
         self.setObjectName("truckOverview")
@@ -663,8 +736,15 @@ class TruckOverviewWidget(QWidget):
         root.addWidget(self._build_toolbar())
         root.addLayout(self._build_summary_cards())
 
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(12)
         self._status = _lbl("No truck selected yet.", size=11, color=_TM)
-        root.addWidget(self._status)
+        status_row.addWidget(self._status, 1)
+        self._currency_toggle = _CurrencyFilterToggle()
+        self._currency_toggle.changed.connect(self._on_currency_changed)
+        status_row.addWidget(self._currency_toggle, 0, Qt.AlignRight | Qt.AlignVCenter)
+        root.addLayout(status_row)
 
         self._table = _make_table([c[0] for c in _COLS])
         self._table.setShowGrid(True)
@@ -685,6 +765,16 @@ class TruckOverviewWidget(QWidget):
         root.addWidget(self._footer)
 
         self._loading_overlay = LoadingOverlay(self, "Loading truck overview…")
+
+    async def _preload_fleet(self) -> None:
+        """Warm fleet cache and give TruckLineEdit a sync suggestion list."""
+        try:
+            numbers = await get_fleet_numbers()
+            self._fleet_numbers = sorted(numbers)
+            self._truck_edit.set_local_numbers(lambda: list(self._fleet_numbers))
+        except Exception:
+            # Keep async search_fleet as fallback when API fleet load fails.
+            pass
 
     def _build_toolbar(self) -> QFrame:
         toolbar = QFrame()
@@ -872,6 +962,23 @@ class TruckOverviewWidget(QWidget):
             source=self._source_filter_param(),
             date_from=date_from,
             date_to=date_to,
+            currency=self._currency_toggle.filter_value(),
+        )
+
+    def _on_currency_changed(self, _currency: str) -> None:
+        if not self._active_truck:
+            return
+        self._reset_and_load()
+
+    def _status_loaded_text(self, truck: str, total: int) -> str:
+        currency = self._currency_toggle.filter_value()
+        if currency:
+            return (
+                f"Loaded {total:,} {currency} cross-source row(s) for {truck}."
+            )
+        return (
+            f"Loaded {total:,} cross-source row(s) for {truck}. "
+            "Zambia entries are summarized under ZMW."
         )
 
     def _update_footer(self) -> None:
@@ -959,10 +1066,7 @@ class TruckOverviewWidget(QWidget):
             self._liters_card.set_value(_fmt_num(summary["liters_total"], 0))
             self._fill_table(records, append=False)
             self._loaded = len(records)
-            self._status.setText(
-                f"Loaded {total:,} cross-source row(s) for {truck}. "
-                "Zambia entries are summarized under ZMW."
-            )
+            self._status.setText(self._status_loaded_text(truck, total))
         except Exception as exc:
             if generation == self._reload_generation:
                 self._table.setRowCount(0)
@@ -1097,23 +1201,9 @@ class TruckOverviewWidget(QWidget):
         )
 
         try:
-            date_from, date_to = self._date_filters()
-            rows = await get_truck_overview_records(
-                truck=truck,
-                search=self._search_text(),
-                source=self._source_filter_param(),
-                date_from=date_from,
-                date_to=date_to,
-                limit=100000,
-                skip=0,
-            )
-            summary = await get_truck_overview_summary(
-                truck=truck,
-                search=self._search_text(),
-                source=self._source_filter_param(),
-                date_from=date_from,
-                date_to=date_to,
-            )
+            kw = self._filter_kw()
+            rows = await get_truck_overview_records(**kw, limit=100000, skip=0)
+            summary = await get_truck_overview_summary(**kw)
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", f"Failed to prepare export data:\n{exc}")
             return
@@ -1123,7 +1213,10 @@ class TruckOverviewWidget(QWidget):
             return
 
         source_tag = self._source_filter_tag()
-        default_name = f"Truck_Overview_{truck}_{source_tag}.xlsx".replace(" ", "_")
+        currency = self._currency_toggle.filter_value() or "ALL"
+        default_name = (
+            f"Truck_Overview_{truck}_{source_tag}_{currency}.xlsx".replace(" ", "_")
+        )
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Truck Overview", default_name, "Excel Files (*.xlsx)"
         )
@@ -1167,23 +1260,9 @@ class TruckOverviewWidget(QWidget):
         )
 
         try:
-            date_from, date_to = self._date_filters()
-            rows = await get_truck_overview_records(
-                truck=truck,
-                search=self._search_text(),
-                source=self._source_filter_param(),
-                date_from=date_from,
-                date_to=date_to,
-                limit=5000,
-                skip=0,
-            )
-            summary = await get_truck_overview_summary(
-                truck=truck,
-                search=self._search_text(),
-                source=self._source_filter_param(),
-                date_from=date_from,
-                date_to=date_to,
-            )
+            kw = self._filter_kw()
+            rows = await get_truck_overview_records(**kw, limit=5000, skip=0)
+            summary = await get_truck_overview_summary(**kw)
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", f"Failed to prepare export data:\n{exc}")
             return
@@ -1192,7 +1271,8 @@ class TruckOverviewWidget(QWidget):
             QMessageBox.information(self, "Export", "No records match the current truck and filters.")
             return
 
-        default_name = f"Truck_Overview_{truck}_Report.pdf".replace(" ", "_")
+        currency = self._currency_toggle.filter_value() or "ALL"
+        default_name = f"Truck_Overview_{truck}_{currency}_Report.pdf".replace(" ", "_")
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Truck Overview PDF", default_name, "PDF Files (*.pdf)"
         )

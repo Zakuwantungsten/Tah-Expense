@@ -188,7 +188,7 @@ class TruckLineEdit(QLineEdit):
             return
         QTimer.singleShot(0, lambda t=typed: self._kick_async_fetch(t))
 
-    def _kick_async_fetch(self, text: str) -> None:
+    def _kick_async_fetch(self, text: str, *, _retries: int = 0) -> None:
         if self._fetch_fn is None:
             return
         if self._block_suggestions:
@@ -202,13 +202,22 @@ class TruckLineEdit(QLineEdit):
         # is the current task and a modal dialog is pumping the Qt loop.
         try:
             if asyncio.current_task() is not None:
+                if _retries < 20:
+                    QTimer.singleShot(
+                        50,
+                        lambda t=text, r=_retries + 1: self._kick_async_fetch(t, _retries=r),
+                    )
                 return
         except RuntimeError:
             pass
         try:
             asyncio.ensure_future(self._fetch_suggestions(text))
         except RuntimeError:
-            pass
+            if _retries < 20:
+                QTimer.singleShot(
+                    50,
+                    lambda t=text, r=_retries + 1: self._kick_async_fetch(t, _retries=r),
+                )
 
     def _apply_suggestions(self, suggestions: List[str]) -> None:
         self._model.setStringList(suggestions)

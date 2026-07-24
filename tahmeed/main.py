@@ -218,7 +218,10 @@ def main() -> None:
         async def _do_logout(w: MainWindow):
             # Same save/discard prompt as window close — don't return to login
             # until the cashier has dealt with unsaved register rows.
-            if not await w.prepare_to_leave():
+            # After a live DB restore tokens are already cleared; skip the
+            # unsaved prompt (pre-restore drafts are obsolete) and return
+            # straight to login.
+            if api_client.is_authenticated and not await w.prepare_to_leave():
                 return
             try:
                 await api_client.logout()

@@ -52,5 +52,7 @@ class AdminDashboard(QWidget):
         tabs.addTab(CategoriesTab(), "Categories")
         tabs.addTab(RulesTab(), "Keyword Rules")
         tabs.addTab(SettingsTab(), "Settings")
-        tabs.addTab(BackupWidget(allow_restore=True), "Backups")
+        backup = BackupWidget(allow_restore=True)
+        backup.logout_requested.connect(self.logout_requested)
+        tabs.addTab(backup, "Backups")
         layout.addWidget(tabs)

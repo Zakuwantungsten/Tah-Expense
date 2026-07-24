@@ -117,6 +117,68 @@ async def reject_transaction(tx_id: ObjectId, reason: str) -> bool:
     return result.modified_count == 1
 
 
+def _normalize_user_id(value: ObjectId | str | None) -> ObjectId | None:
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    if isinstance(value, str) and ObjectId.is_valid(value):
+        return ObjectId(value)
+    return None
+
+
+async def bulk_reject_transactions(tx_ids: List[ObjectId], reason: str) -> int:
+    if not tx_ids:
+        return 0
+    db = get_db()
+    result = await db.transactions.update_many(
+        {"_id": {"$in": tx_ids}},
+        {"$set": {
+            "verified": False,
+            "rejection_reason": reason,
+            "rejected": True,
+            "discarded": False,
+        }},
+    )
+    return result.modified_count
+
+
+async def get_cashier_names(cashier_ids: List[ObjectId]) -> Dict[ObjectId, str]:
+    if not cashier_ids:
+        return {}
+
+    id_by_original: Dict[ObjectId | str, ObjectId] = {}
+    query_ids: List[ObjectId] = []
+    for cid in cashier_ids:
+        oid = _normalize_user_id(cid)
+        if oid is None:
+            continue
+        id_by_original[cid] = oid
+        query_ids.append(oid)
+
+    if not query_ids:
+        return {}
+
+    db = get_db()
+    docs = await db.users.find(
+        {"_id": {"$in": list(set(query_ids))}},
+        {"_id": 1, "full_name": 1, "username": 1},
+    ).to_list(length=None)
+
+    names_by_oid: Dict[ObjectId, str] = {}
+    for doc in docs:
+        name = (doc.get("full_name") or "").strip()
+        if not name:
+            name = (doc.get("username") or "").strip()
+        names_by_oid[doc["_id"]] = name or "Unknown cashier"
+
+    return {
+        cid: names_by_oid.get(id_by_original[cid], "Unknown cashier")
+        for cid in cashier_ids
+        if cid in id_by_original
+    }
+
+
 async def get_pending_count() -> int:
     """Sidebar / inbox badge: submitted unverified + deletion requests."""
     db = get_db()
@@ -1049,17 +1111,6 @@ async def get_rejected_cashier_ids() -> List[ObjectId]:
         {"rejected": True, "discarded": {"$ne": True}},
     )
     return [v for v in vals if v is not None]
-
-
-async def get_cashier_names(cashier_ids: List[ObjectId]) -> Dict[ObjectId, str]:
-    if not cashier_ids:
-        return {}
-    db = get_db()
-    docs = await db.users.find(
-        {"_id": {"$in": cashier_ids}},
-        {"_id": 1, "full_name": 1},
-    ).to_list(length=None)
-    return {doc["_id"]: doc.get("full_name", str(doc["_id"])) for doc in docs}
 
 
 async def bulk_approve_transactions(
@@ -4083,12 +4134,33 @@ def _normalize_truck_overview_sources(
     return wanted or None
 
 
+def _normalize_truck_overview_currency(currency: str = "") -> str:
+    cur = (currency or "").strip().upper()
+    if cur in ("", "ALL"):
+        return ""
+    if cur in ("TZS", "TSH", "TZ"):
+        return "TZS"
+    if cur == "USD":
+        return "USD"
+    if cur in ("ZMW", "ZMB", "ZK"):
+        return "ZMW"
+    return cur
+
+
+def _truck_row_matches_currency(row: dict, currency: str = "") -> bool:
+    wanted = _normalize_truck_overview_currency(currency)
+    if not wanted:
+        return True
+    return _normalize_truck_overview_currency(row.get("currency") or "") == wanted
+
+
 def _filter_truck_overview_rows(
     rows: list,
     search: str = "",
     source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    currency: str = "",
 ) -> list:
     wanted = _normalize_truck_overview_sources(source)
     filtered = [
@@ -4096,6 +4168,7 @@ def _filter_truck_overview_rows(
         if (wanted is None or row["source_group"] in wanted)
         and _truck_row_matches_search(row, search)
         and _truck_row_in_date_range(row, date_from, date_to)
+        and _truck_row_matches_currency(row, currency)
     ]
     filtered.sort(key=lambda row: (row.get("date") or datetime.min), reverse=True)
     return filtered
@@ -4107,6 +4180,7 @@ async def get_truck_overview_records(
     source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    currency: str = "",
     limit: int = 50,
     skip: int = 0,
 ) -> list:
@@ -4118,6 +4192,7 @@ async def get_truck_overview_records(
         source=source,
         date_from=date_from,
         date_to=date_to,
+        currency=currency,
     )
     return rows[skip: skip + limit]
 
@@ -4128,6 +4203,7 @@ async def count_truck_overview_records(
     source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    currency: str = "",
 ) -> int:
     if not truck.strip():
         return 0
@@ -4137,6 +4213,7 @@ async def count_truck_overview_records(
         source=source,
         date_from=date_from,
         date_to=date_to,
+        currency=currency,
     )
     return len(rows)
 
@@ -4147,6 +4224,7 @@ async def get_truck_overview_summary(
     source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    currency: str = "",
 ) -> dict:
     if not truck.strip():
         return {
@@ -4163,6 +4241,7 @@ async def get_truck_overview_summary(
         source=source,
         date_from=date_from,
         date_to=date_to,
+        currency=currency,
     )
     tzs_total = 0.0
     usd_total = 0.0
@@ -4172,13 +4251,13 @@ async def get_truck_overview_summary(
     for row in rows:
         seen_sources.add(row.get("source", ""))
         amount = row.get("amount")
-        currency = (row.get("currency") or "").upper()
+        row_currency = _normalize_truck_overview_currency(row.get("currency") or "")
         if amount is not None:
-            if currency == "TZS":
+            if row_currency == "TZS":
                 tzs_total += amount
-            elif currency == "USD":
+            elif row_currency == "USD":
                 usd_total += amount
-            elif currency == "ZMW":
+            elif row_currency == "ZMW":
                 zmw_total += amount
         liters_total += row.get("liters") or 0.0
     return {

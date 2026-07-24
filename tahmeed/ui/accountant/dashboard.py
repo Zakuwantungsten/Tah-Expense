@@ -191,6 +191,7 @@ class AccountantDashboard(QWidget):
         self._stack.addWidget(self._users_tab)           # index 23
 
         self._backup = BackupWidget(allow_restore=True)
+        self._backup.logout_requested.connect(self.logout_requested)
         self._stack.addWidget(self._backup)              # index 24
 
         # Cashier daily register (Table) — same widget the cashier uses
