@@ -172,8 +172,12 @@ QToolButton:disabled { color: #9ca3af; }
 # ---------------------------------------------------------------------------
 
 def _accept_editor_completion(editor) -> None:
-    """If the editor has an autocomplete popup visible, accept the highlighted item."""
-    completer = getattr(editor, '_completer', None)
+    """If the editor has an autocomplete popup/preview, accept it before commit."""
+    accept_fn = getattr(editor, "_accept_current_suggestion", None)
+    if callable(accept_fn):
+        accept_fn()
+        return
+    completer = getattr(editor, "_completer", None)
     if completer:
         accept_completion(editor, completer)
 
@@ -577,11 +581,11 @@ class _ItemDelegate(_ExcelCellDelegate):
 
     QuickBooks-style contains match: the list narrows to names that contain the
     typed text anywhere (start/middle/end), ranked so exact and prefix hits
-    come first. The field is not auto-filled while typing; Tab/Enter commits the
-    highlighted suggestion as the *canonical* item name (so "m" + Tab gives
-    "MILEAGE"). The list is read live via ``items_getter`` so newly-created
-    items appear at once.
-    Whether unknown entries are allowed is enforced at the grid level.
+    come first. Prefix matches get an inline preview (selected suffix); Tab /
+    Enter commits the highlighted / previewed canonical name. Mid-string hits
+    stay in the popup until selected. The list is read live via ``items_getter``.
+    Whether unknown entries are allowed is enforced at the grid level
+    (restrict off = free text; restrict on = keep text and flag the cell).
     """
 
     def __init__(self, items_getter, parent=None):
@@ -589,8 +593,7 @@ class _ItemDelegate(_ExcelCellDelegate):
         self._items_getter = items_getter
 
     def createEditor(self, parent, option, index):
-        # Ranked contains: "csh" finds "Diesel CSH". Popup only — field stays
-        # as typed until Tab/Enter/click commits the highlighted item.
+        # Ranked contains: "lat" → LAT[RA] preview + popup; "csh" finds "Diesel CSH".
         ed = CompleterLineEdit(
             self._items_getter() or [],
             parent=parent,

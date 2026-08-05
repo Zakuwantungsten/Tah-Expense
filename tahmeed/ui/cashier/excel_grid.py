@@ -56,9 +56,7 @@ from tahmeed.services.cashier_service import (
     update_transaction, insert_pending_edit,
     check_for_duplicates, submit_day_for_verify, recount_day_order,
 )
-from tahmeed.services.category_service import (
-    create_cashier_category, get_all_categories, item_key,
-)
+from tahmeed.services.category_service import get_all_categories, item_key
 from tahmeed.services.subtable_service import get_subtables
 from tahmeed.services.settings_service import get_setting, set_setting
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
@@ -430,6 +428,7 @@ class DailyRegister(QWidget):
         self._undo_limit: int = 40
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
+        asyncio.ensure_future(self._load_categories())
         asyncio.ensure_future(self._load_cashier_settings())
         asyncio.ensure_future(self._load_locked_subitems())
         asyncio.ensure_future(self._load_fleet_numbers())
@@ -721,6 +720,7 @@ class DailyRegister(QWidget):
         """Re-read the restrict toggles, locked sub-items and fleet list without
         touching the grid rows (so unsaved entries survive). Called on entering
         the table tab."""
+        asyncio.ensure_future(self._load_categories())
         asyncio.ensure_future(self._load_cashier_settings())
         asyncio.ensure_future(self._load_locked_subitems())
         asyncio.ensure_future(self._load_fleet_numbers())
@@ -3184,6 +3184,30 @@ class DailyRegister(QWidget):
         self._cat_by_name = {c.name.lower(): c for c in categories}
         asyncio.ensure_future(self._load_locked_subitems())
 
+    async def _load_categories(self) -> None:
+        """Ensure the Item column has the live Manage Items catalog.
+
+        Dashboard also pushes categories, but the register reloads on its own so
+        autocomplete / restrict still work if that push failed or is stale.
+        """
+        try:
+            cats = await get_all_categories()
+        except Exception:
+            return
+        if cats:
+            self.update_categories(cats)
+            self._revalidate_visible_item_cells()
+
+    def _revalidate_visible_item_cells(self) -> None:
+        """Re-run Item validation after the catalog loads (clears false flags)."""
+        for row in range(self._table.rowCount()):
+            it = self._table.item(row, COL_ITEM)
+            if it is None or not it.text().strip():
+                continue
+            if row < self._saved_count and not self._edit_mode:
+                continue
+            self._validate_item_cell(row, it)
+
     # ------------------------------------------------------------------
     # Settings / locked sub-item cache
     # ------------------------------------------------------------------
@@ -3280,12 +3304,40 @@ class DailyRegister(QWidget):
         self._locked_subitems = cache
 
     # ------------------------------------------------------------------
-    # Item-column validation (canonicalise / restrict / add-new prompt)
+    # Item-column validation (canonicalise / restrict / flag unknown)
     # ------------------------------------------------------------------
+
+    def _item_row_background(self, row: int) -> QBrush:
+        if row < self._saved_count:
+            if row in self._dirty_rows:
+                return QBrush(DIRTY_BG)
+            if self._edit_mode:
+                return QBrush(EDIT_BG)
+            return QBrush(SAVED_BG)
+        return QBrush(NEW_BG)
+
+    def _flag_unknown_item(self, item: QTableWidgetItem, text: str) -> None:
+        """Mark an unknown Item cell (restrict on) — keep text, no add dialog."""
+        item.setForeground(QBrush(NEG_COLOR))
+        item.setToolTip(
+            f'"{text}" is not a known item. Pick an existing item from the list, '
+            "or ask the accountant to add it in Manage Items."
+        )
+
+    def _clear_item_flag(self, row: int, item: QTableWidgetItem) -> None:
+        tip = item.toolTip() or ""
+        if "is not a known item" not in tip:
+            return
+        item.setToolTip("")
+        item.setForeground(QBrush())
+        # Restore row background in case an older build painted DUP_BG.
+        if item.background().color() == DUP_BG:
+            item.setBackground(self._item_row_background(row))
 
     def _validate_item_cell(self, row: int, item: QTableWidgetItem) -> None:
         text = item.text().strip()
         if not text:
+            self._clear_item_flag(row, item)
             return
         cat = self._cat_by_name.get(text.lower())
         if cat is not None:
@@ -3295,51 +3347,18 @@ class DailyRegister(QWidget):
                 self._table.blockSignals(True)
                 item.setText(canonical)
                 self._table.blockSignals(False)
+            self._clear_item_flag(row, item)
             return
         if not self._restrict_items:
+            self._clear_item_flag(row, item)
             return
-        # Unknown item with restriction on — prompt to add (deferred to avoid
-        # reentering the table's edit machinery).
-        QTimer.singleShot(0, lambda: self._prompt_add_item(row, text))
-
-    def _prompt_add_item(self, row: int, name: str) -> None:
-        it = self._table.item(row, COL_ITEM)
-        if it is None or it.text().strip().lower() != name.lower():
-            return  # cell changed in the meantime
-        # Open the same full Add-Item dialog the accountant uses, pre-filled with
-        # the typed name, so every field can be set just like in Manage Items.
-        from tahmeed.ui.accountant.manage_items import _ItemDialog
-        dlg = _ItemDialog(parent=self, prefill_name=name)
-        if dlg.exec() == QDialog.Accepted and dlg.result_data:
-            asyncio.ensure_future(self._create_item_and_refresh(dlg.result_data, row))
-        else:
-            self._table.blockSignals(True)
-            it.setText("")
-            self._table.blockSignals(False)
-
-    async def _create_item_and_refresh(self, data: dict, row: int) -> None:
-        try:
-            await create_cashier_category(
-                data["name"], data["color"],
-                data["requires_receipt"], data["requires_truck"],
-                data.get("description", ""),
-                icon=data.get("icon", "mdi.tag-outline"),
-                sidebar_name=data.get("sidebar_name", ""),
-                show_in_sidebar=data.get("show_in_sidebar", False),
-                show_in_cashier_sidebar=data.get("show_in_cashier_sidebar", False),
-                lock_description=data.get("lock_description", False),
-            )
-            cats = await get_all_categories()
-            self.update_categories(cats)
-            cat = self._cat_by_name.get(data["name"].lower())
-            it = self._table.item(row, COL_ITEM)
-            if it is not None and cat is not None:
-                self._table.blockSignals(True)
-                it.setText(cat.name.upper())
-                self._table.blockSignals(False)
-        except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to add item:\n{exc}")
-
+        # Do not flag every cell when the catalog failed to load — that paints
+        # known names red and makes Restrict look broken.
+        if not self._categories:
+            return
+        # Unknown item with restriction on — keep the typed text and flag the cell.
+        # Do not prompt to add; save still rejects unknown items.
+        self._flag_unknown_item(item, text)
     # ------------------------------------------------------------------
     # Truck-column validation (format + restrict to truck/trailer registry)
     # ------------------------------------------------------------------

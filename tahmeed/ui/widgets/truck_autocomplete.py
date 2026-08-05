@@ -75,11 +75,45 @@ class TruckLineEdit(QLineEdit):
         """Update the sync suggestion source (e.g. after Add to registry)."""
         self._local_numbers = numbers
 
+    def _in_item_view(self) -> bool:
+        """True when this editor is inside a table/grid cell (register, etc.)."""
+        p = self.parent()
+        while p is not None:
+            if getattr(p, "_grid_owner", None) is not None:
+                return True
+            # QTableWidget / QAbstractItemView viewport chain
+            try:
+                from PySide6.QtWidgets import QAbstractItemView
+                if isinstance(p, QAbstractItemView):
+                    return True
+            except Exception:
+                pass
+            p = p.parent()
+        return False
+
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.KeyPress:
             key = event.key()
             if key in (Qt.Key_Tab, Qt.Key_Backtab, Qt.Key_Return, Qt.Key_Enter):
-                if obj is self or obj is self._completer.popup():
+                if obj is self._completer.popup():
+                    # Popup has the keyboard while open — re-route to the editor
+                    # so the table delegate's Tab filter can accept + advance in
+                    # one press (same pattern as CompleterLineEdit / Item column).
+                    QApplication.sendEvent(
+                        self, QKeyEvent(event.type(), event.key(), event.modifiers())
+                    )
+                    return True
+                if obj is self:
+                    if self._in_item_view():
+                        # Beat Qt's completer filter: accept preview, then let the
+                        # event continue to the table delegate (do not swallow).
+                        self._debounce.stop()
+                        self._accept_current_suggestion()
+                        self._block_suggestions = True
+                        self._suppress_preview = True
+                        self._preview_active = False
+                        return False
+                    # Standalone (dialogs / tests): handle accept + focus move.
                     self.keyPressEvent(event)
                     return True
         return super().eventFilter(obj, event)
@@ -291,8 +325,9 @@ class TruckLineEdit(QLineEdit):
             return
 
         if key in (Qt.Key_Tab, Qt.Key_Backtab):
-            # Cancel pending debounce, commit preview (excel-style), hide popup,
-            # then move focus — Qt's completer filter never sees this Tab.
+            # Cancel pending debounce, commit preview (excel-style), hide popup.
+            # In the register grid the delegate's Tab filter advances the cell;
+            # focusNextPrevChild is only a fallback for standalone editors.
             self._debounce.stop()
             self._accept_current_suggestion()
             self._block_suggestions = True
@@ -301,8 +336,8 @@ class TruckLineEdit(QLineEdit):
             forward = key == Qt.Key_Tab and not bool(
                 event.modifiers() & Qt.ShiftModifier
             )
-            # Defer focus move so popup hide settles (same pattern as excel grid).
-            QTimer.singleShot(0, lambda f=forward: self.focusNextPrevChild(f))
+            if not self._in_item_view():
+                QTimer.singleShot(0, lambda f=forward: self.focusNextPrevChild(f))
             event.accept()
             return
 

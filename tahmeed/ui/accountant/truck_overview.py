@@ -36,10 +36,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tahmeed.app_state import app_state
 from tahmeed.services.truck_service import get_fleet_numbers, search_fleet, search_fleet_sync
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
-from tahmeed.ui.accountant.date_filters import style_calendar_popup
+from tahmeed.ui.accountant.date_filters import (
+    style_calendar_popup,
+    sync_from_to,
+)
 from tahmeed.ui.accountant.separate_expenses import _make_table, _cell, _finish_table_row
 
 _WHITE = "#FFFFFF"
@@ -60,6 +64,12 @@ _SCROLL_CHUNK = 50
 _ROW_H = 32
 _MIN_FILTER_DATE = QDate(2000, 1, 1)
 _CURRENCY_FILTERS = ("All", "TZS", "USD", "ZMW")
+_MONTHS = [
+    ("All Months", 0),
+    ("January", 1), ("February", 2), ("March", 3), ("April", 4),
+    ("May", 5), ("June", 6), ("July", 7), ("August", 8),
+    ("September", 9), ("October", 10), ("November", 11), ("December", 12),
+]
 
 _SOURCE_OPTIONS = [
     ("All Sources", "all"),
@@ -689,6 +699,8 @@ class TruckOverviewWidget(QWidget):
         self._scroll_loading = False
         self._reload_generation = 0
         self._fleet_numbers: List[str] = []
+        self._year = app_state.fiscal_year
+        self._month = 0
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -833,6 +845,33 @@ class TruckOverviewWidget(QWidget):
         filter_row.addWidget(self._source_cb)
         QWidget.setTabOrder(self._search, self._source_cb)
 
+        self._year_cb = QComboBox()
+        self._year_cb.addItem("All Years", 0)
+        current_yr = datetime.now().year
+        for yr in range(current_yr - 5, current_yr + 2):
+            self._year_cb.addItem(str(yr), yr)
+        yr_idx = self._year_cb.findData(self._year)
+        self._year_cb.setCurrentIndex(yr_idx if yr_idx >= 0 else 0)
+        self._year_cb.setFixedWidth(100)
+        self._year_cb.setFixedHeight(_CTRL_H)
+        self._year_cb.setStyleSheet(_input_ss())
+        self._year_cb.setToolTip("Limit truck history to one year (recommended for large data).")
+        self._year_cb.currentIndexChanged.connect(self._on_year)
+        filter_row.addWidget(self._year_cb)
+        QWidget.setTabOrder(self._source_cb, self._year_cb)
+
+        self._month_cb = QComboBox()
+        for label, val in _MONTHS:
+            self._month_cb.addItem(label, val)
+        self._month_cb.setFixedWidth(120)
+        self._month_cb.setFixedHeight(_CTRL_H)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.setEnabled(self._year > 0)
+        self._month_cb.setToolTip("Narrow further to a single month within the selected year.")
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        filter_row.addWidget(self._month_cb)
+        QWidget.setTabOrder(self._year_cb, self._month_cb)
+
         self._from_date = QDateEdit()
         self._from_date.setCalendarPopup(True)
         self._from_date.setDisplayFormat("dd MMM yyyy")
@@ -845,6 +884,7 @@ class TruckOverviewWidget(QWidget):
         style_calendar_popup(self._from_date)
         self._from_date.dateChanged.connect(lambda _d: self._on_filter_changed())
         filter_row.addWidget(self._from_date)
+        QWidget.setTabOrder(self._month_cb, self._from_date)
 
         self._to_date = QDateEdit()
         self._to_date.setCalendarPopup(True)
@@ -858,6 +898,11 @@ class TruckOverviewWidget(QWidget):
         style_calendar_popup(self._to_date)
         self._to_date.dateChanged.connect(lambda _d: self._on_filter_changed())
         filter_row.addWidget(self._to_date)
+        QWidget.setTabOrder(self._from_date, self._to_date)
+
+        # Default to fiscal year so loads stay bounded on large histories.
+        if self._year > 0:
+            sync_from_to(self._from_date, self._to_date, self._year, self._month, optional=True)
 
         load_btn = _btn("Load", "mdi.magnify")
         load_btn.clicked.connect(self._on_load_clicked)
@@ -881,7 +926,7 @@ class TruckOverviewWidget(QWidget):
         export_pdf_btn.clicked.connect(self._export_pdf)
         filter_row.addWidget(export_pdf_btn)
 
-        filter_inner.setMinimumWidth(1120)
+        filter_inner.setMinimumWidth(1380)
         filter_inner.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         filter_scroll.setWidget(filter_inner)
         toolbar_v.addWidget(filter_scroll)
@@ -1016,6 +1061,29 @@ class TruckOverviewWidget(QWidget):
         self._active_truck = self._selected_truck()
         self._reset_and_load()
 
+    def _on_year(self, _idx: int = 0) -> None:
+        self._year = int(self._year_cb.currentData() or 0)
+        has_year = self._year > 0
+        self._month_cb.setEnabled(has_year)
+        if not has_year:
+            self._month_cb.blockSignals(True)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.blockSignals(False)
+            self._month = 0
+        else:
+            app_state.fiscal_year = self._year
+        sync_from_to(
+            self._from_date, self._to_date, self._year, self._month, optional=True,
+        )
+        self._on_filter_changed()
+
+    def _on_month(self, _idx: int = 0) -> None:
+        self._month = int(self._month_cb.currentData() or 0)
+        sync_from_to(
+            self._from_date, self._to_date, self._year, self._month, optional=True,
+        )
+        self._on_filter_changed()
+
     def _on_filter_changed(self) -> None:
         if not self._active_truck:
             return
@@ -1057,7 +1125,8 @@ class TruckOverviewWidget(QWidget):
 
             self._active_truck = truck
             self._total = total
-            self._subtitle.setText(f"Cross-source view for {truck}")
+            period = self._format_date_range_label()
+            self._subtitle.setText(f"Cross-source view for {truck}  ·  {period}")
             self._records_card.set_value(f"{summary['record_count']:,}")
             self._sources_card.set_value(f"{summary['source_count']:,}")
             self._tzs_card.set_value(_fmt_amount("TZS", summary["tzs_total"]))
@@ -1333,9 +1402,25 @@ class TruckOverviewWidget(QWidget):
         self._reload_generation += 1
         self._truck_edit.clear()
         self._source_cb.reset_to_all()
-        self._from_date.setDate(_MIN_FILTER_DATE)
-        self._to_date.setDate(_MIN_FILTER_DATE)
-        self._search.clear()
+        # Keep fiscal-year scope after clear so the next load stays bounded.
+        self._year = app_state.fiscal_year
+        self._month = 0
+        self._year_cb.blockSignals(True)
+        self._month_cb.blockSignals(True)
+        self._search.blockSignals(True)
+        try:
+            self._search.clear()
+            yr_idx = self._year_cb.findData(self._year)
+            self._year_cb.setCurrentIndex(yr_idx if yr_idx >= 0 else 0)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(self._year > 0)
+        finally:
+            self._search.blockSignals(False)
+            self._year_cb.blockSignals(False)
+            self._month_cb.blockSignals(False)
+        sync_from_to(
+            self._from_date, self._to_date, self._year, self._month, optional=True,
+        )
         self._subtitle.setText("Select a truck to gather cross-source expenses and fuel.")
         self._status.setText("No truck selected yet.")
         self._table.setRowCount(0)

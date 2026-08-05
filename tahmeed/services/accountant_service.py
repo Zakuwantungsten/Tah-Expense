@@ -28,6 +28,21 @@ def _date_range_clause(
     return {field: rng}
 
 
+def _with_date_range(
+    query: dict,
+    field: str,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Return *query* with an optional inclusive date window on *field*."""
+    clause = _date_range_clause(field, date_from, date_to)
+    if not clause:
+        return query
+    merged = dict(query)
+    merged.update(clause)
+    return merged
+
+
 # ── transactions ──────────────────────────────────────────────────────────────
 
 async def get_unverified_transactions(limit: int = 50, skip: int = 0) -> List[Transaction]:
@@ -3827,11 +3842,21 @@ def _normalized_row(
     }
 
 
-async def _truck_overview_master_rows(truck: str) -> list:
+async def _truck_overview_master_rows(
+    truck: str,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> list:
     db = get_db()
-    docs = await db.transactions.find(
-        {"verified": True, "truck_number": _truck_exact(truck)}
-    ).sort([("date", -1), ("created_at", -1)]).to_list(length=None)
+    query = _with_date_range(
+        {"verified": True, "truck_number": _truck_exact(truck)},
+        "date",
+        date_from,
+        date_to,
+    )
+    docs = await db.transactions.find(query).sort(
+        [("date", -1), ("created_at", -1)]
+    ).to_list(length=None)
 
     rows = []
     for doc in docs:
@@ -3859,13 +3884,23 @@ async def _truck_overview_master_rows(truck: str) -> list:
     return rows
 
 
-async def _truck_overview_diesel_rows(truck: str) -> list:
+async def _truck_overview_diesel_rows(
+    truck: str,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> list:
     db = get_db()
     rows: list = []
     for feed_type, label in _TRUCK_OVERVIEW_DIESEL_FEEDS:
-        docs = await db.imported_feeds.find(
-            {"feed_type": feed_type, "truck_no": _truck_exact(truck)}
-        ).sort([("date", -1), ("import_date", -1)]).to_list(length=None)
+        query = _with_date_range(
+            {"feed_type": feed_type, "truck_no": _truck_exact(truck)},
+            "date",
+            date_from,
+            date_to,
+        )
+        docs = await db.imported_feeds.find(query).sort(
+            [("date", -1), ("import_date", -1)]
+        ).to_list(length=None)
         for doc in docs:
             rows.append(_normalized_row(
                 source_group="diesel_imports",
@@ -3883,12 +3918,21 @@ async def _truck_overview_diesel_rows(truck: str) -> list:
     return rows
 
 
-async def _truck_overview_imported_feed_rows(truck: str) -> list:
+async def _truck_overview_imported_feed_rows(
+    truck: str,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> list:
     db = get_db()
     rows: list = []
 
     toll_docs = await db.imported_feeds.find(
-        {"feed_type": "toll_plaza", "vehicle_reg": _truck_exact(truck)}
+        _with_date_range(
+            {"feed_type": "toll_plaza", "vehicle_reg": _truck_exact(truck)},
+            "toll_date",
+            date_from,
+            date_to,
+        )
     ).sort([("toll_date", -1), ("import_date", -1)]).to_list(length=None)
     for doc in toll_docs:
         rows.append(_normalized_row(
@@ -3904,7 +3948,12 @@ async def _truck_overview_imported_feed_rows(truck: str) -> list:
         ))
 
     parking_docs = await db.imported_feeds.find(
-        {"feed_type": "parking_congo", "vehicle_no": _truck_exact(truck)}
+        _with_date_range(
+            {"feed_type": "parking_congo", "vehicle_no": _truck_exact(truck)},
+            "payment_date",
+            date_from,
+            date_to,
+        )
     ).sort([("payment_date", -1), ("import_date", -1)]).to_list(length=None)
     for doc in parking_docs:
         rows.append(_normalized_row(
@@ -3919,7 +3968,12 @@ async def _truck_overview_imported_feed_rows(truck: str) -> list:
         ))
 
     zambia_docs = await db.imported_feeds.find(
-        {"feed_type": "zambia_parking", "plate_num": _truck_exact(truck)}
+        _with_date_range(
+            {"feed_type": "zambia_parking", "plate_num": _truck_exact(truck)},
+            "transaction_date",
+            date_from,
+            date_to,
+        )
     ).sort([("transaction_date", -1), ("import_date", -1)]).to_list(length=None)
     for doc in zambia_docs:
         debit = _safe_float_value(doc.get("debit"))
@@ -3939,12 +3993,21 @@ async def _truck_overview_imported_feed_rows(truck: str) -> list:
     return rows
 
 
-async def _truck_overview_separate_rows(truck: str) -> list:
+async def _truck_overview_separate_rows(
+    truck: str,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> list:
     db = get_db()
     rows: list = []
 
     congo_docs = await db.separate_expenses.find(
-        {"expense_type": "congo_expenses", "truck_no": _truck_exact(truck)}
+        _with_date_range(
+            {"expense_type": "congo_expenses", "truck_no": _truck_exact(truck)},
+            "expense_date",
+            date_from,
+            date_to,
+        )
     ).sort([("expense_date", -1), ("created_at", -1)]).to_list(length=None)
     for doc in congo_docs:
         rows.append(_normalized_row(
@@ -3959,7 +4022,12 @@ async def _truck_overview_separate_rows(truck: str) -> list:
         ))
 
     kimvi_docs = await db.separate_expenses.find(
-        {"expense_type": "ahmed_kimvi", "truck_no": _truck_exact(truck)}
+        _with_date_range(
+            {"expense_type": "ahmed_kimvi", "truck_no": _truck_exact(truck)},
+            "expense_date",
+            date_from,
+            date_to,
+        )
     ).sort([("expense_date", -1), ("created_at", -1)]).to_list(length=None)
     for doc in kimvi_docs:
         rows.append(_normalized_row(
@@ -3976,12 +4044,21 @@ async def _truck_overview_separate_rows(truck: str) -> list:
     return rows
 
 
-async def _truck_overview_extra_sidebar_rows(truck: str) -> list:
+async def _truck_overview_extra_sidebar_rows(
+    truck: str,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> list:
     db = get_db()
     rows: list = []
 
     afritrack_docs = await db.imported_feeds.find(
-        {"feed_type": "afritrack", "truck": _truck_exact(truck)}
+        _with_date_range(
+            {"feed_type": "afritrack", "truck": _truck_exact(truck)},
+            "import_date",
+            date_from,
+            date_to,
+        )
     ).sort([("import_date", -1), ("row_index", 1)]).to_list(length=None)
     for doc in afritrack_docs:
         rows.append(_normalized_row(
@@ -3997,7 +4074,12 @@ async def _truck_overview_extra_sidebar_rows(truck: str) -> list:
         ))
 
     rahn_docs = await db.imported_feeds.find(
-        {"feed_type": "rahntech", "truck_number": _truck_exact(truck)}
+        _with_date_range(
+            {"feed_type": "rahntech", "truck_number": _truck_exact(truck)},
+            "sales_date",
+            date_from,
+            date_to,
+        )
     ).sort([("sales_date", -1), ("import_date", -1)]).to_list(length=None)
     for doc in rahn_docs:
         rows.append(_normalized_row(
@@ -4010,7 +4092,12 @@ async def _truck_overview_extra_sidebar_rows(truck: str) -> list:
         ))
 
     comesa_docs = await db.imported_feeds.find(
-        {"feed_type": "comesa", "truck_reg": _truck_exact(truck)}
+        _with_date_range(
+            {"feed_type": "comesa", "truck_reg": _truck_exact(truck)},
+            "import_date",
+            date_from,
+            date_to,
+        )
     ).sort([("month", -1), ("import_date", -1)]).to_list(length=None)
     for doc in comesa_docs:
         rows.append(_normalized_row(
@@ -4025,7 +4112,12 @@ async def _truck_overview_extra_sidebar_rows(truck: str) -> list:
         ))
 
     third_party_docs = await db.imported_feeds.find(
-        {"feed_type": "third_party", "reg_no": _truck_exact(truck)}
+        _with_date_range(
+            {"feed_type": "third_party", "reg_no": _truck_exact(truck)},
+            "import_date",
+            date_from,
+            date_to,
+        )
     ).sort([("month", -1), ("import_date", -1)]).to_list(length=None)
     for doc in third_party_docs:
         rows.append(_normalized_row(
@@ -4042,7 +4134,18 @@ async def _truck_overview_extra_sidebar_rows(truck: str) -> list:
         ))
 
     recon_docs = await db.reconciliation_entries.find(
-        {"entity": "sm_burhani", "truck_and_trailer": {"$regex": re.escape(truck.strip()), "$options": "i"}}
+        _with_date_range(
+            {
+                "entity": "sm_burhani",
+                "truck_and_trailer": {
+                    "$regex": re.escape(truck.strip()),
+                    "$options": "i",
+                },
+            },
+            "t1_date",
+            date_from,
+            date_to,
+        )
     ).sort([("t1_date", -1), ("import_date", -1)]).to_list(length=None)
     for doc in recon_docs:
         table = doc.get("table", "bonds")
@@ -4247,13 +4350,17 @@ async def delete_afritrack_upload(upload_id: str) -> int:
     return result.deleted_count
 
 
-async def _load_truck_overview_rows(truck: str) -> list:
+async def _load_truck_overview_rows(
+    truck: str,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> list:
     master_rows, diesel_rows, imported_rows, separate_rows, extra_rows = await asyncio.gather(
-        _truck_overview_master_rows(truck),
-        _truck_overview_diesel_rows(truck),
-        _truck_overview_imported_feed_rows(truck),
-        _truck_overview_separate_rows(truck),
-        _truck_overview_extra_sidebar_rows(truck),
+        _truck_overview_master_rows(truck, date_from, date_to),
+        _truck_overview_diesel_rows(truck, date_from, date_to),
+        _truck_overview_imported_feed_rows(truck, date_from, date_to),
+        _truck_overview_separate_rows(truck, date_from, date_to),
+        _truck_overview_extra_sidebar_rows(truck, date_from, date_to),
     )
     return master_rows + diesel_rows + imported_rows + separate_rows + extra_rows
 
@@ -4327,7 +4434,7 @@ async def get_truck_overview_records(
     if not truck.strip():
         return []
     rows = _filter_truck_overview_rows(
-        await _load_truck_overview_rows(truck.strip()),
+        await _load_truck_overview_rows(truck.strip(), date_from, date_to),
         search=search,
         source=source,
         date_from=date_from,
@@ -4348,7 +4455,7 @@ async def count_truck_overview_records(
     if not truck.strip():
         return 0
     rows = _filter_truck_overview_rows(
-        await _load_truck_overview_rows(truck.strip()),
+        await _load_truck_overview_rows(truck.strip(), date_from, date_to),
         search=search,
         source=source,
         date_from=date_from,
@@ -4376,7 +4483,7 @@ async def get_truck_overview_summary(
             "liters_total": 0.0,
         }
     rows = _filter_truck_overview_rows(
-        await _load_truck_overview_rows(truck.strip()),
+        await _load_truck_overview_rows(truck.strip(), date_from, date_to),
         search=search,
         source=source,
         date_from=date_from,

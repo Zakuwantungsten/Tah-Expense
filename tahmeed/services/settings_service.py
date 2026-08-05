@@ -4,8 +4,8 @@ from tahmeed.db.connection import get_db
 DEFAULTS = {
     "default_currency": "TZS",
     "confidence_threshold": 75,  # percent — below this goes to review queue
-    # When True the cashier register's Item column only accepts existing items
-    # (unknown entries prompt to add). When False the column accepts free text.
+    # When True the cashier register's Item column flags unknown entries
+    # (text is kept; save still requires a known item). When False free text is allowed.
     "restrict_items": False,
     # When True cashiers may save table rows with description only (no item).
     # The accountant assigns items on verify; mappings are remembered.

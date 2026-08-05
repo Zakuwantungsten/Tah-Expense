@@ -33,7 +33,7 @@ from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
+    QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSizePolicy,
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget, QDateEdit,
 )
@@ -636,18 +636,6 @@ class ImportDialog(QDialog):
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
         vl.addWidget(self._stats_lbl)
 
-        self._progress = QProgressBar()
-        self._progress.setFixedHeight(10)
-        self._progress.setTextVisible(False)
-        self._progress.setRange(0, 0)  # indeterminate until stages are known
-        self._progress.setStyleSheet(
-            f"QProgressBar{{background:{_BG};border:1px solid {_BORDER};"
-            f"border-radius:5px;}}"
-            f"QProgressBar::chunk{{background:{_BLUE};border-radius:4px;}}"
-        )
-        self._progress.hide()
-        vl.addWidget(self._progress)
-
         vl.addWidget(_hsep())
 
         # Preview table
@@ -688,21 +676,20 @@ class ImportDialog(QDialog):
         value: Optional[int] = None,
         maximum: int = 0,
     ) -> None:
-        """Show spinner overlay + progress bar; paint immediately."""
+        """Show a single overlay progress indicator; paint immediately."""
         self._busy = True
         self._stats_lbl.setText(message)
-        self._progress.show()
-        if maximum <= 0 and value is None:
-            self._progress.setRange(0, 0)
-        else:
-            self._progress.setRange(0, max(1, maximum))
-            self._progress.setValue(max(0, value or 0))
         self._browse_btn.setEnabled(False)
         if self._tmpl_btn is not None:
             self._tmpl_btn.setEnabled(False)
         self._import_btn.setEnabled(False)
         self._drop.setEnabled(False)
-        self._loading.show_loading(message)
+        if maximum <= 0 and value is None:
+            self._loading.show_loading(message, maximum=0)
+        else:
+            self._loading.show_loading(
+                message, value=value or 0, maximum=max(1, maximum),
+            )
         QApplication.processEvents()
 
     def _update_busy(
@@ -713,18 +700,17 @@ class ImportDialog(QDialog):
         maximum: Optional[int] = None,
     ) -> None:
         self._stats_lbl.setText(message)
-        self._loading.show_loading(message)
+        kwargs: dict = {}
         if maximum is not None:
-            self._progress.setRange(0, max(1, maximum))
-        if value is not None and self._progress.maximum() > 0:
-            self._progress.setValue(value)
+            kwargs["maximum"] = maximum
+        if value is not None:
+            kwargs["value"] = value
+        self._loading.show_loading(message, **kwargs)
         QApplication.processEvents()
 
     def _clear_busy(self, *, enable_import: bool = False) -> None:
         self._busy = False
         self._loading.hide_loading()
-        self._progress.hide()
-        self._progress.setRange(0, 0)
         self._browse_btn.setEnabled(True)
         if self._tmpl_btn is not None:
             self._tmpl_btn.setEnabled(True)
@@ -877,7 +863,6 @@ class ImportDialog(QDialog):
             if truck_field_for(self._feed_type):
                 # Gate has its own progress dialog — hide our overlay while it runs
                 self._loading.hide_loading()
-                self._progress.hide()
                 gate = await run_import_truck_gate(
                     self,
                     rows,
