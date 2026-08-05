@@ -6,7 +6,7 @@ from typing import List, Optional
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QPushButton, QFrame, QMessageBox, QCompleter,
+    QPushButton, QFrame, QMessageBox, QCompleter, QProgressBar,
 )
 from PySide6.QtCore import Qt
 
@@ -43,6 +43,7 @@ class DescriptionMappingDialog(QDialog):
         scope_label: str = "in this import",
         cancel_label: str = "Cancel Import",
         allow_skip: bool = False,
+        total: Optional[int] = None,
     ) -> None:
         super().__init__(parent)
         self._categories = categories
@@ -54,12 +55,18 @@ class DescriptionMappingDialog(QDialog):
         self.setWindowTitle("Map Description to Item")
         self.setMinimumWidth(560)
         self.setModal(True)
-        self._build(description, row_count, remaining)
+        self._build(description, row_count, remaining, total)
 
-    def _build(self, description: str, row_count: int, remaining: int) -> None:
+    def _build(
+        self,
+        description: str,
+        row_count: int,
+        remaining: int,
+        total: Optional[int],
+    ) -> None:
         self.setStyleSheet(
-            f"QDialog {{ background: {_BG}; }}"
-            "QLabel { border: none; background: transparent; }"
+            f"QDialog {{ background: {_BG}; color: {_T1}; }}"
+            "QLabel { border: none; background: transparent; color: #111827; }"
         )
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 20)
@@ -72,13 +79,29 @@ class DescriptionMappingDialog(QDialog):
         )
         root.addWidget(title)
 
+        total_n = max(remaining, total or remaining)
+        done = max(0, total_n - remaining)
         progress = QLabel(
             f"{remaining} unique description{'s' if remaining != 1 else ''} remaining"
+            + (f"  ·  {done} of {total_n} mapped" if total_n > 1 else "")
         )
         progress.setStyleSheet(
             f"color: {_T2}; font-size: 12px; border: none; background: transparent;"
         )
         root.addWidget(progress)
+
+        if total_n > 1:
+            bar = QProgressBar()
+            bar.setRange(0, total_n)
+            bar.setValue(done)
+            bar.setFixedHeight(10)
+            bar.setTextVisible(False)
+            bar.setStyleSheet(
+                f"QProgressBar {{ background: {_BORDER}; border: none;"
+                " border-radius: 5px; }"
+                f"QProgressBar::chunk {{ background: {_BLUE}; border-radius: 5px; }}"
+            )
+            root.addWidget(bar)
 
         card = QFrame()
         card.setObjectName("descMapCard")
@@ -138,6 +161,9 @@ class DescriptionMappingDialog(QDialog):
         cancel_btn = QPushButton(self._cancel_label)
         cancel_btn.setCursor(Qt.PointingHandCursor)
         cancel_btn.setFixedHeight(34)
+        # Enter must not activate Cancel — Qt makes the first autoDefault the default.
+        cancel_btn.setAutoDefault(False)
+        cancel_btn.setDefault(False)
         cancel_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
@@ -153,6 +179,7 @@ class DescriptionMappingDialog(QDialog):
             skip_btn.setToolTip("Leave this description without an item for this import only")
             skip_btn.setCursor(Qt.PointingHandCursor)
             skip_btn.setFixedHeight(34)
+            skip_btn.setAutoDefault(False)
             skip_btn.setStyleSheet(
                 f"QPushButton {{ background: {_WHITE}; color: {_T1};"
                 f" border: 1px solid {_BORDER}; border-radius: 5px;"
@@ -169,6 +196,7 @@ class DescriptionMappingDialog(QDialog):
             )
             skip_all_btn.setCursor(Qt.PointingHandCursor)
             skip_all_btn.setFixedHeight(34)
+            skip_all_btn.setAutoDefault(False)
             skip_all_btn.setStyleSheet(
                 f"QPushButton {{ background: {_WHITE}; color: {_T1};"
                 f" border: 1px solid {_BORDER}; border-radius: 5px;"
@@ -184,6 +212,8 @@ class DescriptionMappingDialog(QDialog):
         assign_btn = QPushButton("Assign && Continue")
         assign_btn.setCursor(Qt.PointingHandCursor)
         assign_btn.setFixedHeight(34)
+        assign_btn.setAutoDefault(True)
+        assign_btn.setDefault(True)
         assign_btn.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
@@ -194,6 +224,12 @@ class DescriptionMappingDialog(QDialog):
         assign_btn.clicked.connect(self._on_assign)
         btn_row.addWidget(assign_btn)
         root.addLayout(btn_row)
+
+        # Enter in the item field = Assign & Continue (same as the primary button).
+        line = self._combo.lineEdit()
+        if line is not None:
+            line.returnPressed.connect(self._on_assign)
+        self._combo.setFocus()
 
     def _on_assign(self) -> None:
         name = self._combo.currentText().strip()

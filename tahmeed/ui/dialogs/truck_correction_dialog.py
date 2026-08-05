@@ -148,8 +148,8 @@ class TruckCorrectionDialog(QDialog):
 
     def _build_ui(self) -> None:
         self.setStyleSheet(
-            f"QDialog {{ background: {_BG}; }}"
-            "QLabel { border: none; background: transparent; }"
+            f"QDialog {{ background: {_BG}; color: {_T1}; }}"
+            f"QLabel {{ border: none; background: transparent; color: {_T1}; }}"
             "QFrame { border: none; }"
         )
         root = QVBoxLayout(self)

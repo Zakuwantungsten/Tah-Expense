@@ -30,6 +30,16 @@ class UploadBusy:
         self._dlg.setMinimumWidth(360)
         self._dlg.setAutoClose(False)
         self._dlg.setAutoReset(False)
+        # Explicit light contrast — Windows dark mode otherwise paints white text.
+        self._dlg.setStyleSheet(
+            "QProgressDialog { background: #FFFFFF; color: #111827; }"
+            "QProgressDialog QLabel { color: #111827; background: transparent; }"
+            "QProgressBar {"
+            "  background: #E5E7EB; border: none; border-radius: 4px;"
+            "  text-align: center; color: #111827; min-height: 12px;"
+            "}"
+            "QProgressBar::chunk { background: #0077C5; border-radius: 4px; }"
+        )
 
     def __enter__(self) -> "UploadBusy":
         self._dlg.show()

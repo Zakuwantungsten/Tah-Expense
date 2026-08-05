@@ -5,9 +5,9 @@ QuickBooks-style full verified ledger with:
   - Month tab bar (All · Jan–Dec) with per-month TZS totals
   - Single unified table (Bonds / Diesel Cash row styling), ITEM column sourced
     from the approved cashier entry's category
-  - Sort on any column (server-side, DB re-query)
+  - Excel-style ▾ header filters (sort / search / multi-select / Apply)
   - ReceiptBadge color pill
-  - AMOUNT column (Verify-style currency prefix) + TZS / USD footer totals
+  - Split TZS + USD amount columns + footer totals
   - Ref_Float column (cashier free-text; empty when unset)
   - Export to Excel (openpyxl, QuickBooks-like layout)
 """
@@ -17,13 +17,13 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 import calendar
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import qtawesome as qta
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem,
     QLineEdit, QComboBox, QPushButton, QDateEdit,
     QMessageBox, QFileDialog, QAbstractItemView, QDialog,
 )
@@ -34,6 +34,9 @@ from tahmeed.models.transaction import Transaction
 from tahmeed.app_state import app_state
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+from tahmeed.ui.widgets.excel_column_filter import (
+    ExcelFilterHeaderView, SORT_ASC, cascade_column_values,
+)
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
     _make_table, _cell, _finish_table_row, _stripe_bg, _fmt_num, _SCROLL_CHUNK,
@@ -61,7 +64,7 @@ _NAVY    = "#1B2B4B"
 _ROW_H = 28
 _MIN_FILTER_DATE = QDate(2000, 1, 1)
 
-# (label, mongo sort field or None)
+# (label, align, mongo sort field or None)
 _COLS = [
     ("S/NO",           "center", None),
     ("DATE",           "left",   "date"),
@@ -70,7 +73,8 @@ _COLS = [
     ("TRUCK NO",       "left",   "truck_number"),
     ("MEMO",           "left",   "memo"),
     ("REF_FLOAT",      "left",   "ref_float"),
-    ("AMOUNT",         "right",  "amount"),
+    ("TZS",            "right",  "amount"),
+    ("USD",            "right",  "amount"),
     ("RECEIPT",        "center", "receipt_status"),
     ("OWNERSHIP",      "left",   "ownership"),
     ("APPROVED BY",    "left",   "approver"),
@@ -78,11 +82,22 @@ _COLS = [
 ]
 
 # Default pixel widths; 0 = stretch (DESCRIPTION fills remaining space).
-_COL_DEFAULTS = [52, 72, 110, 0, 95, 130, 120, 120, 100, 90, 100, 100]
+_COL_DEFAULTS = [52, 72, 110, 0, 95, 120, 110, 110, 100, 100, 90, 100, 100]
 _DESC_COL = 3
 _COL_REF = 6
-_COL_AMT = 7
-_COL_RCPT = 8
+_COL_TZS = 7
+_COL_USD = 8
+_COL_RCPT = 9
+_COL_OWN = 10
+_COL_APP = 11
+_COL_CASH = 12
+
+_FILTERABLE_COLS: Set[int] = set(range(len(_COLS))) - {0}
+_SORT_KINDS = {
+    1: "date",
+    _COL_TZS: "number",
+    _COL_USD: "number",
+}
 
 _MONTHS = [
     (0,  "All"),
@@ -122,8 +137,8 @@ _TABLE_SS = (
     f"  font-family:'Segoe UI';"
     f"  border: none;"
     f"  border-bottom: 1px solid {_BORDER};"
-    f"  padding: 0 8px;"
-    f"  min-height: 26px;"
+    f"  padding: 0 18px 0 8px;"
+    f"  min-height: 28px;"
     f"}}"
     f"QHeaderView::section:hover {{ background: #E2E8F0; }}"
     f"QScrollBar:vertical {{"
@@ -232,11 +247,23 @@ def _fmt_tx_date(dt: Optional[datetime]) -> str:
     return dt.strftime("%d %b") if dt else "—"
 
 
-def _fmt_amount(tx: Transaction) -> str:
-    """Verify-inbox style: ``TZS 1,234`` / ``USD 12.34`` in one cell."""
-    currency = (tx.currency or "TZS").upper()
-    decimals = 0 if currency in {"TZS", "TSH", "TZ", "ZMW", "ZMB", "ZK"} else 2
-    return _fmt_num(tx.amount, f"{currency} ", decimals)
+def _currency_key(tx: Transaction) -> str:
+    return (tx.currency or "TZS").upper()
+
+
+def _is_tzs(currency: str) -> bool:
+    return currency in {"TZS", "TSH", "TZ"}
+
+
+def _amount_cells(tx: Transaction) -> tuple[str, str]:
+    """Return (tzs_text, usd_text) — amount only in its currency column."""
+    cur = _currency_key(tx)
+    if _is_tzs(cur):
+        return _fmt_num(tx.amount, "", 0), "—"
+    if cur == "USD":
+        return "—", _fmt_num(tx.amount, "", 2)
+    # Other currencies stay visible in the TZS column with a prefix.
+    return _fmt_num(tx.amount, f"{cur} ", 2), "—"
 
 
 def _ref_float_display(tx: Transaction) -> str:
@@ -528,15 +555,17 @@ class _FilterBar(QFrame):
 # ── Unified ledger table (single QTableWidget, Bonds / Diesel Cash styling) ────
 
 class _LedgerTable(QFrame):
-    """Single scrolling table with all columns, server-side sort on header click."""
+    """Scrolling ledger with Excel ▾ header filters and server-side sort."""
 
     sort_changed = Signal(str, bool)  # (sort_field, ascending)
+    col_filter_changed = Signal()     # header filters applied / cleared
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setStyleSheet(f"QFrame {{ background: {_WHITE}; border: none; }}")
         self._sort_field = "date"
         self._sort_asc = False
+        self._col_filters: Dict[int, Set[str]] = {}
         self._build()
 
     def _build(self) -> None:
@@ -548,14 +577,26 @@ class _LedgerTable(QFrame):
         self._tbl.setStyleSheet(_TABLE_SS)
         self._tbl.setSelectionMode(QAbstractItemView.SingleSelection)
         self._tbl.setShowGrid(True)
-        self._tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        filter_hdr = ExcelFilterHeaderView(
+            self._tbl,
+            filterable_columns=_FILTERABLE_COLS,
+            sort_kinds=_SORT_KINDS,
+        )
+        filter_hdr.set_value_provider(self._filter_menu_values)
+        filter_hdr.set_label_provider(lambda c: _COLS[c][0] if 0 <= c < len(_COLS) else "")
+        filter_hdr.filter_changed.connect(self._on_col_filter_changed)
+        filter_hdr.sort_requested.connect(self._on_excel_sort)
+        self._tbl.setHorizontalHeader(filter_hdr)
+
         hdr = self._tbl.horizontalHeader()
         hdr.setSortIndicatorShown(True)
         hdr.setSectionsMovable(False)
-        hdr.setMinimumSectionSize(36)
+        hdr.setMinimumSectionSize(40)
         bind_column_width_persistence(
             self._tbl,
-            "master_expenses",
+            "master_expenses_v2",
             _COL_DEFAULTS,
             stretch_columns=[_DESC_COL],
         )
@@ -574,10 +615,98 @@ class _LedgerTable(QFrame):
     def clear_rows(self) -> None:
         self._tbl.setRowCount(0)
 
+    def clear_column_filters(self) -> None:
+        self._col_filters.clear()
+        hdr = self._tbl.horizontalHeader()
+        if isinstance(hdr, ExcelFilterHeaderView):
+            hdr.clear_filters()
+        self._apply_column_filters()
+
+    # ── Excel header filters ───────────────────────────────────────────────
+
+    def _cell_text(self, row: int, col: int) -> str:
+        it = self._tbl.item(row, col)
+        return (it.text() if it else "").strip()
+
+    def _filter_source_rows(self) -> List[dict]:
+        rows: List[dict] = []
+        for r in range(self._tbl.rowCount()):
+            row: dict = {}
+            for c in _FILTERABLE_COLS:
+                txt = self._cell_text(r, c)
+                if txt and txt != "—":
+                    row[c] = txt
+            if row:
+                rows.append(row)
+        return rows
+
+    def _filter_menu_values(self, col: int) -> set:
+        return cascade_column_values(
+            self._filter_source_rows(),
+            target_col=col,
+            active_filters=self._col_filters,
+        )
+
+    def _on_col_filter_changed(self, col: int, accepted) -> None:
+        accepted = set(accepted or [])
+        if accepted:
+            self._col_filters[col] = accepted
+        else:
+            self._col_filters.pop(col, None)
+        self._prune_stale_filters(changed_col=col)
+        hdr = self._tbl.horizontalHeader()
+        if isinstance(hdr, ExcelFilterHeaderView):
+            hdr.sync_active(self._col_filters)
+        self._apply_column_filters()
+        self.col_filter_changed.emit()
+
+    def _prune_stale_filters(self, *, changed_col: int) -> None:
+        if not self._col_filters:
+            return
+        for _ in range(len(self._col_filters) + 1):
+            changed = False
+            for col in list(self._col_filters.keys()):
+                if col == changed_col:
+                    continue
+                available = self._filter_menu_values(col)
+                kept = {v for v in self._col_filters.get(col, set()) if v in available}
+                if not kept:
+                    self._col_filters.pop(col, None)
+                    changed = True
+                elif kept != self._col_filters[col]:
+                    self._col_filters[col] = kept
+                    changed = True
+            if not changed:
+                break
+
+    def _row_matches_filters(self, row: int) -> bool:
+        for col, accepted in self._col_filters.items():
+            if not accepted:
+                continue
+            if self._cell_text(row, col) not in accepted:
+                return False
+        return True
+
+    def _apply_column_filters(self) -> None:
+        t = self._tbl
+        t.setUpdatesEnabled(False)
+        try:
+            for r in range(t.rowCount()):
+                t.setRowHidden(r, not self._row_matches_filters(r))
+        finally:
+            t.setUpdatesEnabled(True)
+
+    def visible_row_count(self) -> int:
+        return sum(
+            1 for r in range(self._tbl.rowCount())
+            if not self._tbl.isRowHidden(r)
+        )
+
     # ── Sort ───────────────────────────────────────────────────────────────
 
     def _on_header_click(self, col: int) -> None:
-        sort_field = _COLS[col][2]
+        # Ignore chevron clicks (handled by ExcelFilterHeaderView).
+        sort_field = _COLS[col][2] if 0 <= col < len(_COLS) else None
         if sort_field is None:
             return
         if self._sort_field == sort_field:
@@ -585,6 +714,15 @@ class _LedgerTable(QFrame):
         else:
             self._sort_field = sort_field
             self._sort_asc = False
+        self._update_sort_indicator()
+        self.sort_changed.emit(self._sort_field, self._sort_asc)
+
+    def _on_excel_sort(self, col: int, mode: str) -> None:
+        sort_field = _COLS[col][2] if 0 <= col < len(_COLS) else None
+        if sort_field is None:
+            return
+        self._sort_field = sort_field
+        self._sort_asc = mode == SORT_ASC
         self._update_sort_indicator()
         self.sort_changed.emit(self._sort_field, self._sort_asc)
 
@@ -608,6 +746,8 @@ class _LedgerTable(QFrame):
             if tx.cashier_id else "—"
         )
         item_str = tx.item or tx.category_name or "—"
+        tzs_txt, usd_txt = _amount_cells(tx)
+        amt_color = _RED if tx.amount < 0 else _T1
 
         t.setItem(r, 0, _cell(str(serial), self._flag("center")))
         t.setItem(r, 1, _cell(_fmt_tx_date(tx.date)))
@@ -622,17 +762,20 @@ class _LedgerTable(QFrame):
             _cell(ref_text or "—", color=_AMBER if ref_text else _TM),
         )
 
-        amt_color = _RED if tx.amount < 0 else _T1
         t.setItem(
-            r, _COL_AMT,
-            _cell(_fmt_amount(tx), self._flag("right"), color=amt_color),
+            r, _COL_TZS,
+            _cell(tzs_txt, self._flag("right"), color=amt_color if tzs_txt != "—" else _TM),
+        )
+        t.setItem(
+            r, _COL_USD,
+            _cell(usd_txt, self._flag("right"), color=amt_color if usd_txt != "—" else _TM),
         )
 
         rcpt_text, rcpt_fg = _receipt_text(tx.receipt_status)
         t.setItem(r, _COL_RCPT, _cell(rcpt_text, self._flag("center"), color=rcpt_fg))
-        t.setItem(r, 9, _cell(tx.ownership or "—"))
-        t.setItem(r, 10, _cell(tx.approver or "—", color=_T2))
-        t.setItem(r, 11, _cell(cashier_name))
+        t.setItem(r, _COL_OWN, _cell(tx.ownership or "—"))
+        t.setItem(r, _COL_APP, _cell(tx.approver or "—", color=_T2))
+        t.setItem(r, _COL_CASH, _cell(cashier_name))
         _finish_table_row(t, r, row_bg)
 
     def populate(self, txs: List[Transaction], skip: int,
@@ -653,6 +796,8 @@ class _LedgerTable(QFrame):
         t.setRowCount(start + len(txs))
         for i, tx in enumerate(txs):
             self._fill_row(start + i, tx, skip + i + 1, cashier_names, start + i)
+        if self._col_filters:
+            self._apply_column_filters()
 
     def row_count(self) -> int:
         return self._tbl.rowCount()
@@ -822,6 +967,7 @@ class MasterExpensesWidget(QWidget):
         # ── Table ────────────────────────────────────────────────────────
         self._table = _LedgerTable()
         self._table.sort_changed.connect(self._on_sort_changed)
+        self._table.col_filter_changed.connect(self._update_status)
         self._table.table().verticalScrollBar().valueChanged.connect(self._on_scroll)
         root.addWidget(self._table, 1)
 
@@ -857,21 +1003,33 @@ class MasterExpensesWidget(QWidget):
             date_to=self._filter_bar.date_to(),
         )
 
-    def _reset_and_load(self) -> None:
+    def _reset_and_load(self, *, keep_col_filters: bool = False) -> None:
         self._reload_generation += 1
         self._loaded = 0
         self._total = 0
+        if not keep_col_filters:
+            self._table.clear_column_filters()
         self._table.clear_rows()
         self._update_status()
         asyncio.ensure_future(self._load_initial(self._reload_generation))
 
     def _update_status(self) -> None:
+        visible = self._table.visible_row_count()
+        filtered = bool(self._table._col_filters)
         if self._total == 0:
             self._status_lbl.setText(
                 "No records match the current filters." if not self._loading else "Loading…"
             )
-        elif self._loaded >= self._total:
+        elif self._loaded >= self._total and not filtered:
             self._status_lbl.setText(f"Showing all {self._total:,} records")
+        elif filtered:
+            more = (
+                f"  •  Scroll down for more ({self._loaded:,} of {self._total:,} loaded)"
+                if self._loaded < self._total else ""
+            )
+            self._status_lbl.setText(
+                f"Showing {visible:,} filtered of {self._loaded:,} loaded{more}"
+            )
         else:
             self._status_lbl.setText(
                 f"Showing {self._loaded:,} of {self._total:,}  •  Scroll down for more"
@@ -901,7 +1059,7 @@ class MasterExpensesWidget(QWidget):
     def _on_sort_changed(self, field: str, asc: bool) -> None:
         self._sort_field = field
         self._sort_asc = asc
-        self._reset_and_load()
+        self._reset_and_load(keep_col_filters=True)
 
     def _on_scroll(self, value: int) -> None:
         bar = self._table.table().verticalScrollBar()
@@ -1122,17 +1280,21 @@ class MasterExpensesWidget(QWidget):
             ref_str     = _ref_float_display(tx)
             cashier_str = _short_name(export_cashier_names.get(tx.cashier_id, "")) if tx.cashier_id else ""
             rcpt_text, _ = _receipt_text(tx.receipt_status)
-            amount_str  = _fmt_amount(tx)
+            tzs_txt, usd_txt = _amount_cells(tx)
+            # Export blanks instead of em-dashes for empty currency cells.
+            tzs_export = "" if tzs_txt == "—" else tzs_txt
+            usd_export = "" if usd_txt == "—" else usd_txt
 
-            if (tx.currency or "TZS").upper() in {"TZS", "TSH", "TZ"}:
+            cur = _currency_key(tx)
+            if _is_tzs(cur):
                 tzs_total += tx.amount
-            elif (tx.currency or "").upper() == "USD":
+            elif cur == "USD":
                 usd_total += tx.amount
 
             row_data = [
                 i + 1, date_str, item_str, tx.description or "",
                 tx.truck_number or "", tx.memo or "", ref_str,
-                amount_str,
+                tzs_export, usd_export,
                 rcpt_text, tx.ownership or "", tx.approver or "", cashier_str,
             ]
             ws.append(row_data)
@@ -1143,30 +1305,31 @@ class MasterExpensesWidget(QWidget):
                 cell.fill = fill
                 cell.alignment = Alignment(vertical="center")
 
-            # Amount (col 8)
-            c = ws.cell(r, 8)
-            c.font = red_font if tx.amount < 0 else mono_font
-            c.alignment = Alignment(horizontal="right", vertical="center")
+            # TZS / USD amount columns (8 / 9)
+            for col_idx, txt in ((_COL_TZS + 1, tzs_export), (_COL_USD + 1, usd_export)):
+                if not txt:
+                    continue
+                c = ws.cell(r, col_idx)
+                c.font = red_font if tx.amount < 0 else mono_font
+                c.alignment = Alignment(horizontal="right", vertical="center")
 
             # Ref_Float highlight when set (col 7)
             if ref_str:
-                ws.cell(r, 7).font = amber_font
+                ws.cell(r, _COL_REF + 1).font = amber_font
 
-            # Receipt font color (col 9)
+            # Receipt font color
             rcpt_fonts = {"Received": rcpt_green, "Pending": amber_font, "No Receipt": rcpt_red}
             rf = rcpt_fonts.get(rcpt_text)
             if rf:
-                ws.cell(r, 9).font = rf
-            ws.cell(r, 9).alignment = Alignment(horizontal="center", vertical="center")
+                ws.cell(r, _COL_RCPT + 1).font = rf
+            ws.cell(r, _COL_RCPT + 1).alignment = Alignment(horizontal="center", vertical="center")
 
         # ── Totals row ────────────────────────────────────────────────
         ws.append([])
         ws.append([
             "", "", "", "TOTAL", "", "", "",
-            (
-                f"TZS {_fmt_num(tzs_total, '', 0)}"
-                + (f"  |  USD {_fmt_num(usd_total, '', 2)}" if usd_total else "")
-            ) if (tzs_total or usd_total) else "",
+            _fmt_num(tzs_total, "", 0) if tzs_total else "",
+            _fmt_num(usd_total, "", 2) if usd_total else "",
             "", "", "", "",
         ])
         total_r = ws.max_row
@@ -1175,14 +1338,18 @@ class MasterExpensesWidget(QWidget):
         for cell in ws[total_r]:
             cell.fill = total_fill
         ws.cell(total_r, 4).font = Font(name="Segoe UI", bold=True, size=11)
-        if tzs_total or usd_total:
-            c = ws.cell(total_r, 8)
-            c.font = Font(name="Cascadia Code", bold=True, size=11,
-                          color="DC2626" if (tzs_total < 0 or usd_total < 0) else "111827")
+        for col_idx, total in ((_COL_TZS + 1, tzs_total), (_COL_USD + 1, usd_total)):
+            if not total:
+                continue
+            c = ws.cell(total_r, col_idx)
+            c.font = Font(
+                name="Cascadia Code", bold=True, size=11,
+                color="DC2626" if total < 0 else "111827",
+            )
             c.alignment = Alignment(horizontal="right", vertical="center")
 
         # ── Column widths ─────────────────────────────────────────────
-        col_widths = [7, 10, 16, 35, 13, 22, 16, 16, 14, 14, 14, 14]
+        col_widths = [7, 10, 16, 35, 13, 20, 16, 14, 12, 14, 14, 14, 14]
         for idx, w in enumerate(col_widths, 1):
             ws.column_dimensions[ws.cell(1, idx).column_letter].width = w
 
@@ -1263,6 +1430,7 @@ class MasterExpensesWidget(QWidget):
             return
 
         # Resolve unmapped descriptions one at a time.
+        total_unmapped = len(preview.unmapped)
         while preview.unmapped:
             key = next(iter(preview.unmapped))
             count = preview.unmapped[key]
@@ -1279,6 +1447,7 @@ class MasterExpensesWidget(QWidget):
                 categories=categories,
                 remaining=len(preview.unmapped),
                 parent=self,
+                total=total_unmapped,
             )
             if dlg.exec() != QDialog.Accepted:
                 QMessageBox.information(

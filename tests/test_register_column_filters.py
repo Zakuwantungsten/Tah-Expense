@@ -1,6 +1,6 @@
 """Header column filter cascading — options only from table rows + chaining."""
 
-from tahmeed.ui.cashier.excel_grid import cascade_column_values
+from tahmeed.ui.widgets.excel_column_filter import cascade_column_values
 
 # Synthetic cols matching register intent
 COL_ITEM, COL_DESC, COL_TRUCK, COL_OWN = 3, 4, 5, 10

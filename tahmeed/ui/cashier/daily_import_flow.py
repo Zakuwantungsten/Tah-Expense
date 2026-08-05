@@ -78,6 +78,7 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
             )
             return None
 
+        total_unmapped = len(preview.unmapped)
         while preview.unmapped:
             key = next(iter(preview.unmapped))
             count = preview.unmapped[key]
@@ -94,6 +95,7 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
                 remaining,
                 parent=parent,
                 allow_skip=True,
+                total=total_unmapped,
             )
             if dlg.exec() != DescriptionMappingDialog.Accepted:
                 return None

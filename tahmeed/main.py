@@ -121,6 +121,9 @@ def main() -> None:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setStyle("Fusion")
+    from tahmeed.ui.dialog_theme import apply_readable_dialog_styles
+
+    apply_readable_dialog_styles(app)
     _set_app_icon(app)
 
     # Show brand splash immediately so the desktop icon click isn't a blank wait.

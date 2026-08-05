@@ -52,8 +52,8 @@ class DateOutlierDialog(QDialog):
         total_rows: int,
     ) -> None:
         self.setStyleSheet(
-            f"QDialog {{ background: {_BG}; }}"
-            "QLabel { border: none; background: transparent; }"
+            f"QDialog {{ background: {_BG}; color: {_T1}; }}"
+            f"QLabel {{ border: none; background: transparent; color: {_T1}; }}"
         )
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 20)

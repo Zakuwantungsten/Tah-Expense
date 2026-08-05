@@ -35,7 +35,6 @@ _BLUE      = "#0077C5"
 _BLUE_L    = "#E8F4FD"
 _GREEN     = "#16A34A"
 _AMBER     = "#D97706"
-_AMBER_L   = "#FEF3C7"
 _RED       = "#DC2626"
 _T1        = "#111827"
 _T2        = "#6B7280"
@@ -1072,6 +1071,19 @@ class VerifyInboxWidget(QWidget):
         """Run ``fn`` on the next Qt tick (outside any running asyncio task)."""
         QTimer.singleShot(0, fn)
 
+    def _set_busy(
+        self,
+        message: str,
+        *,
+        value: Optional[int] = None,
+        maximum: Optional[int] = None,
+    ) -> None:
+        """Show the verify overlay with a status message (and optional progress)."""
+        self._loading_overlay.show_loading(message, value=value, maximum=maximum)
+
+    def _clear_busy(self) -> None:
+        self._loading_overlay.hide_loading()
+
     async def _await_ui(self, fn: Callable[[], _T]) -> _T:
         """Run blocking Qt UI while this asyncio task is suspended.
 
@@ -1107,6 +1119,7 @@ class VerifyInboxWidget(QWidget):
         """Reload / show result dialogs after the async mutation task returns."""
 
         def _run() -> None:
+            self._clear_busy()
             if hide_panel:
                 self._panel.hide()
             if reload:
@@ -1664,8 +1677,6 @@ class VerifyInboxWidget(QWidget):
             date_item = _cell(_fmt_date(tx.date), color=_T2)
             if isinstance(tx.date, datetime) and isinstance(tx.created_at, datetime):
                 if tx.date.date() != tx.created_at.date():
-                    date_item.setBackground(QColor(_AMBER_L))
-                    date_item.setForeground(QColor(_AMBER))
                     date_item.setToolTip(
                         f"Submitted on {tx.created_at.strftime('%d %b %Y')} "
                         f"but dated {tx.date.strftime('%d %b %Y')}"
@@ -1767,11 +1778,9 @@ class VerifyInboxWidget(QWidget):
                 t.setItem(r, _COL_APP, req_item)
                 row_bg = "#FEF2F2"
             else:
+                # New tab — same white/slate zebra as Master / Separate Expenses.
                 t.setItem(r, _COL_APP, _cell(tx.approver or "—", color=_T2))
                 row_bg = None
-                if isinstance(tx.date, datetime) and isinstance(tx.created_at, datetime):
-                    if tx.date.date() != tx.created_at.date():
-                        row_bg = _AMBER_L
 
             # Manual zebra (or soft status wash) — matches Separate Expenses.
             _finish_table_row(t, r, row_bg)
@@ -1782,16 +1791,6 @@ class VerifyInboxWidget(QWidget):
                 if desc_cell:
                     desc_cell.setBackground(QColor("#FEE2E2"))
                     desc_cell.setForeground(QColor(_RED))
-            if (
-                tab != 0
-                and isinstance(tx.date, datetime)
-                and isinstance(tx.created_at, datetime)
-                and tx.date.date() != tx.created_at.date()
-            ):
-                date_cell = t.item(r, _COL_DATE)
-                if date_cell:
-                    date_cell.setBackground(QColor(_AMBER_L))
-                    date_cell.setForeground(QColor(_AMBER))
 
         t.blockSignals(False)
         self._update_bulk_buttons()
@@ -1950,10 +1949,12 @@ class VerifyInboxWidget(QWidget):
         from tahmeed.services.api_models import desktop_document
         from tahmeed.services.category_service import get_all_categories
 
+        self._set_busy("Loading items…")
         categories: List[Category] = []
         try:
             categories = await get_all_categories(include_inactive=True)
         except Exception as exc:
+            self._clear_busy()
             await self._await_ui(lambda: QMessageBox.critical(
                 self,
                 "Items Unavailable",
@@ -1995,9 +1996,9 @@ class VerifyInboxWidget(QWidget):
     async def _resolve_items_for_transactions(self, txs: List[Transaction]) -> bool:
         """Ensure each transaction has an item; prompt when mapping is unknown.
 
-        Dialogs are collected first (no DB awaits between them), then mappings
-        and category updates are persisted in bulk so the next assign window
-        appears immediately.
+        All mapping dialogs run inside a single ``_await_ui`` callback (no asyncio
+        resume between prompts). Mappings and category updates are persisted in
+        bulk afterward.
         """
         from tahmeed.services.description_mapping_service import (
             get_mappings_for_descriptions,
@@ -2014,6 +2015,7 @@ class VerifyInboxWidget(QWidget):
 
         categories = await self._ensure_mapping_categories()
         if not categories:
+            self._clear_busy()
             await self._await_ui(lambda: QMessageBox.warning(
                 self,
                 "No Items",
@@ -2023,6 +2025,7 @@ class VerifyInboxWidget(QWidget):
             ))
             return False
 
+        self._set_busy("Looking up saved description mappings…")
         descriptions = [tx.description for tx in pending if tx.description]
         mappings = await get_mappings_for_descriptions(descriptions)
 
@@ -2038,6 +2041,7 @@ class VerifyInboxWidget(QWidget):
                 gk = (mapping.category_name, mapping.category_id)
                 known_groups.setdefault(gk, []).append(tx._id)
             elif not (tx.description or "").strip():
+                self._clear_busy()
                 await self._await_ui(lambda: QMessageBox.warning(
                     self,
                     "Missing Item",
@@ -2049,6 +2053,7 @@ class VerifyInboxWidget(QWidget):
                 still_need.append(tx)
 
         if known_groups:
+            self._set_busy("Applying saved item mappings…")
             await asyncio.gather(*[
                 bulk_update_transaction_category(ids, name, cat_id)
                 for (name, cat_id), ids in known_groups.items()
@@ -2064,39 +2069,48 @@ class VerifyInboxWidget(QWidget):
             groups.setdefault(key, []).append(tx)
             display[key] = tx.description or key
 
-        # Collect all assignments first — no DB work between dialogs.
-        assignments: Dict[str, Category] = {}
-        remaining = len(groups)
-        for key in list(groups.keys()):
-            desc = display[key]
-            row_count = len(groups[key])
-            rem = remaining
+        # Show every mapping dialog in one Qt-tick callback. Returning to the
+        # asyncio task between dialogs (via repeated _await_ui) lets qasync /
+        # Py3.14 nest tasks during exec() and aborts the sequence mid-way —
+        # user sees ~3–5 prompts then the window vanishes until they approve again.
+        keys = list(groups.keys())
+        total_unique = len(keys)
 
-            def _prompt(
-                description=desc,
-                count=row_count,
-                left=rem,
-            ):
+        def _prompt_all() -> Optional[Dict[str, Category]]:
+            chosen: Dict[str, Category] = {}
+            remaining = total_unique
+            for key in keys:
                 dlg = DescriptionMappingDialog(
-                    description=description,
-                    row_count=count,
+                    description=display[key],
+                    row_count=len(groups[key]),
                     categories=categories,
-                    remaining=left,
+                    remaining=remaining,
                     parent=self,
                     scope_label="in verify inbox",
                     cancel_label="Cancel",
+                    total=total_unique,
                 )
                 if dlg.exec() != QDialog.Accepted:
                     return None
-                return dlg.selected_category()
+                cat = dlg.selected_category()
+                if cat is None:
+                    return None
+                chosen[key] = cat
+                remaining -= 1
+            return chosen
 
-            cat = await self._await_ui(_prompt)
-            if cat is None:
-                return False
-            assignments[key] = cat
-            remaining -= 1
+        # Hide busy UI so mapping dialogs are not covered / delayed behind it.
+        self._clear_busy()
+        assignments = await self._await_ui(_prompt_all)
+        if not assignments:
+            return False
 
         # Persist mappings + category updates in parallel after all dialogs.
+        self._set_busy(
+            f"Saving {len(assignments):,} item mapping(s)…",
+            value=0,
+            maximum=max(1, len(assignments)),
+        )
         persist = []
         for key, cat in assignments.items():
             persist.append(save_mapping(display[key], cat._id, cat.name))
@@ -2154,6 +2168,7 @@ class VerifyInboxWidget(QWidget):
             approve_transaction, re_approve_transaction, get_pending_count,
             get_transactions_by_ids,
         )
+        self._set_busy("Preparing approval…")
         try:
             txs = await get_transactions_by_ids([tx_id])
             if not txs:
@@ -2164,7 +2179,9 @@ class VerifyInboxWidget(QWidget):
                 return
             overrides = {tx_id: category_override} if category_override else {}
             if not await self._prepare_transactions_for_approval(txs, overrides):
+                self._clear_busy()
                 return
+            self._set_busy("Approving…")
             if self._current_tab == 1:
                 await re_approve_transaction(tx_id, self._user._id)
             else:
@@ -2195,6 +2212,7 @@ class VerifyInboxWidget(QWidget):
     async def _do_bulk_reject(self, tx_ids: List[ObjectId], reason: str) -> None:
         from tahmeed.services.accountant_service import bulk_reject_transactions, get_pending_count
 
+        self._set_busy(f"Rejecting {len(tx_ids):,} transaction(s)…")
         try:
             n = await bulk_reject_transactions(tx_ids, reason)
             count = await get_pending_count()
@@ -2211,10 +2229,14 @@ class VerifyInboxWidget(QWidget):
             bulk_approve_transactions, bulk_re_approve_transactions, get_pending_count,
             get_transactions_by_ids,
         )
+        self._set_busy(f"Preparing {len(tx_ids):,} approval(s)…")
         try:
             txs = await get_transactions_by_ids(tx_ids)
+            self._set_busy("Checking items & description mappings…")
             if not await self._prepare_transactions_for_approval(txs):
+                self._clear_busy()
                 return
+            self._set_busy(f"Approving {len(tx_ids):,} transaction(s)…")
             if self._current_tab == 1:
                 n = await bulk_re_approve_transactions(tx_ids, self._user._id)
             else:

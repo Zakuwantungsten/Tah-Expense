@@ -1158,11 +1158,11 @@ class TruckOverviewWidget(QWidget):
             )
             self._table.setItem(
                 r, 8,
-                _cell(_fmt_num(row.get("liters"), 0), align=Qt.AlignRight | Qt.AlignVCenter, mono=True)
+                _cell(_fmt_num(row.get("liters"), 0), align=Qt.AlignRight | Qt.AlignVCenter)
             )
             self._table.setItem(
                 r, 9,
-                _cell(_fmt_num(row.get("rate"), 2), align=Qt.AlignRight | Qt.AlignVCenter, mono=True)
+                _cell(_fmt_num(row.get("rate"), 2), align=Qt.AlignRight | Qt.AlignVCenter)
             )
             self._table.setItem(r, 10, _cell(row.get("station", "—")))
             self._table.setItem(r, 11, _cell(receipt, align=Qt.AlignCenter | Qt.AlignVCenter, color=receipt_color))

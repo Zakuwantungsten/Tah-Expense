@@ -182,24 +182,13 @@ def cascade_column_values(
 ) -> set:
     """Distinct values for *target_col* from rows that pass every *other* filter.
 
-    ``rows`` is a list of ``{col_index: cell_text}`` maps (empty strings omitted).
-    ``active_filters`` maps col_index -> accepted value set (empty set = no filter).
+    Re-exported from the shared Excel filter widget for Daily Register.
     """
-    values: set = set()
-    for row in rows:
-        ok = True
-        for col, accepted in (active_filters or {}).items():
-            if col == target_col or not accepted:
-                continue
-            if (row.get(col) or "") not in accepted:
-                ok = False
-                break
-        if not ok:
-            continue
-        v = (row.get(target_col) or "").strip()
-        if v:
-            values.add(v)
-    return values
+    from tahmeed.ui.widgets.excel_column_filter import (
+        cascade_column_values as _cascade,
+    )
+
+    return _cascade(rows, target_col=target_col, active_filters=active_filters)
 
 
 class _ColumnFilterPopup(QFrame):

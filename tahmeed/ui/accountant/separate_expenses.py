@@ -31,7 +31,7 @@ import qtawesome as qta
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
@@ -3717,8 +3717,22 @@ class CongoExpensesWidget(QWidget):
             QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
-        dlg = CongoImportDialog(parent=self)
-        dlg.imported.connect(self._on_imported)
+        from tahmeed.services import accountant_service as svc
+        dlg = BulkSheetImportDialog(
+            title="Import Sheets — Congo Expenses",
+            hint=(
+                "Choose which sheets to import. "
+                "The last sheet is pre-selected — use Select All New, Select Last, "
+                "or tick individual sheets. Already uploaded sheets stay blocked."
+            ),
+            parse_all_fn=_parse_congo_all_sheets,
+            existing_fn=svc.congo_existing_sheet_labels,
+            save_fn=svc.save_congo_import,
+            feed_key="congo_expenses",
+            initial_selection="last",
+            parent=self,
+        )
+        dlg.imported.connect(self._on_bulk_imported)
         dlg.exec()
 
     def _on_imported(self, n: int) -> None:
@@ -3741,13 +3755,16 @@ class CongoExpensesWidget(QWidget):
         dlg = BulkSheetImportDialog(
             title="Bulk Import — Congo Expenses",
             hint=(
-                "Every sheet in the workbook will be checked. "
-                "New sheets are imported; sheets already uploaded are skipped."
+                "Every sheet in the workbook is listed. "
+                "All new sheets are pre-selected — adjust with Select All New, "
+                "Select Last, Clear, or individual checkboxes. "
+                "Already uploaded sheets are skipped."
             ),
             parse_all_fn=_parse_congo_all_sheets,
             existing_fn=svc.congo_existing_sheet_labels,
             save_fn=svc.save_congo_import,
             feed_key="congo_expenses",
+            initial_selection="all",
             parent=self,
         )
         dlg.imported.connect(self._on_bulk_imported)
@@ -3905,7 +3922,11 @@ _BULK_SHEET_HEADERS = ["SHEET", "RECORDS", "BALANCE (USD)", "STATUS"]
 
 
 class BulkSheetImportDialog(QDialog):
-    """Import every new worksheet from a multi-sheet expenses workbook."""
+    """Import selected worksheets from a multi-sheet expenses workbook.
+
+    Users can pick last sheet, all new sheets, or any custom subset via checkboxes.
+    Already-uploaded sheet names stay unchecked and cannot be selected.
+    """
 
     imported = Signal(int, int)   # (sheets_imported, total_rows)
 
@@ -3919,6 +3940,7 @@ class BulkSheetImportDialog(QDialog):
         balance_fn=None,
         balance_header: str = "BALANCE (USD)",
         feed_key: str = "",
+        initial_selection: str = "all",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -3931,14 +3953,19 @@ class BulkSheetImportDialog(QDialog):
         )
         self._balance_header = balance_header
         self._feed_key       = feed_key
+        # "all" = pre-check every new sheet; "last" = pre-check last sheet only
+        self._initial_selection = (
+            "last" if str(initial_selection).lower() == "last" else "all"
+        )
         self._source_filename = ""
-        self._pending: List[dict] = []
+        self._sheet_rows: List[dict] = []   # all sheets + status + records
+        self._checkboxes: List[QCheckBox] = []
         self._skipped_count = 0
         self._last_skipped = 0
 
         self.setWindowTitle(title)
-        self.setMinimumWidth(720)
-        self.setMinimumHeight(480)
+        self.setMinimumWidth(760)
+        self.setMinimumHeight(520)
         self.setStyleSheet(f"background:{_WHITE};")
         self._build()
         self._hint_lbl.setText(hint)
@@ -3969,12 +3996,35 @@ class BulkSheetImportDialog(QDialog):
         vl.addWidget(self._stats_lbl)
         vl.addWidget(_hsep())
 
-        preview_title = _lbl("Sheets in workbook", size=12, weight=600)
-        vl.addWidget(preview_title)
+        title_row = QWidget()
+        title_row.setStyleSheet("background:transparent;")
+        trl = QHBoxLayout(title_row)
+        trl.setContentsMargins(0, 0, 0, 0)
+        trl.setSpacing(8)
+        trl.addWidget(_lbl("Sheets in workbook", size=12, weight=600))
+        trl.addStretch()
 
-        bulk_headers = ["SHEET", "RECORDS", self._balance_header, "STATUS"]
+        self._sel_all_btn = _btn("Select All New", primary=False, height=28)
+        self._sel_all_btn.setEnabled(False)
+        self._sel_all_btn.clicked.connect(self._select_all_new)
+        trl.addWidget(self._sel_all_btn)
+
+        self._sel_last_btn = _btn("Select Last", primary=False, height=28)
+        self._sel_last_btn.setEnabled(False)
+        self._sel_last_btn.clicked.connect(self._select_last)
+        trl.addWidget(self._sel_last_btn)
+
+        self._sel_clear_btn = _btn("Clear", primary=False, height=28)
+        self._sel_clear_btn.setEnabled(False)
+        self._sel_clear_btn.clicked.connect(self._clear_selection)
+        trl.addWidget(self._sel_clear_btn)
+        vl.addWidget(title_row)
+
+        bulk_headers = ["", "SHEET", "RECORDS", self._balance_header, "STATUS"]
         self._preview_tbl = _make_kimvi_table(bulk_headers)
         self._preview_tbl.setMinimumHeight(260)
+        self._preview_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self._preview_tbl.setColumnWidth(0, 36)
         vl.addWidget(self._preview_tbl, 1)
         vl.addWidget(_hsep())
 
@@ -3988,7 +4038,7 @@ class BulkSheetImportDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         bbl.addWidget(cancel_btn)
 
-        self._import_btn = _btn("Import All New Sheets", "mdi.check-all")
+        self._import_btn = _btn("Import Selected Sheets", "mdi.check-all")
         self._import_btn.setEnabled(False)
         self._import_btn.clicked.connect(self._do_import)
         bbl.addWidget(self._import_btn)
@@ -4013,8 +4063,10 @@ class BulkSheetImportDialog(QDialog):
         except Exception as exc:
             self._stats_lbl.setText(f"Error reading file: {exc}")
             self._import_btn.setEnabled(False)
-            self._pending = []
+            self._sheet_rows = []
+            self._checkboxes = []
             self._preview_tbl.setRowCount(0)
+            self._set_select_btns_enabled(False)
             return
 
         asyncio.ensure_future(self._check_batches(batches))
@@ -4026,9 +4078,8 @@ class BulkSheetImportDialog(QDialog):
         except Exception:
             existing = set()
 
-        self._pending = []
+        self._sheet_rows = []
         self._skipped_count = 0
-        preview_rows: List[dict] = []
 
         for batch in batches:
             label   = batch["sheet_label"]
@@ -4039,78 +4090,149 @@ class BulkSheetImportDialog(QDialog):
                 self._skipped_count += 1
             else:
                 status = "New"
-                self._pending.append({
-                    "sheet_label": label,
-                    "records":     records,
-                    "upload_id":   str(uuid.uuid4()),
-                })
-            preview_rows.append({
+            self._sheet_rows.append({
                 "sheet_label": label,
+                "records":     records,
+                "upload_id":   str(uuid.uuid4()),
                 "count":       len(records),
                 "balance":     balance,
                 "status":      status,
             })
 
-        new_sheets = len(self._pending)
-        new_rows   = sum(len(b["records"]) for b in self._pending)
+        new_sheets = sum(1 for r in self._sheet_rows if r["status"] == "New")
+        new_rows   = sum(
+            r["count"] for r in self._sheet_rows if r["status"] == "New"
+        )
 
         if not batches:
             self._stats_lbl.setText("Workbook has no sheets with data to import.")
-            self._import_btn.setEnabled(False)
-            self._import_btn.setText("Import All New Sheets")
         elif new_sheets == 0:
             self._stats_lbl.setText(
                 f"All {len(batches):,} sheets were already uploaded — nothing new to import."
             )
-            self._import_btn.setEnabled(False)
-            self._import_btn.setText("Nothing to Import")
         else:
             self._stats_lbl.setText(
                 f"Sheets in file: {len(batches):,}     "
                 f"New: {new_sheets:,} ({new_rows:,} rows)     "
-                f"Skipped: {self._skipped_count:,}"
-            )
-            self._import_btn.setEnabled(True)
-            self._import_btn.setText(
-                f"Import {new_sheets:,} Sheet{'s' if new_sheets != 1 else ''} "
-                f"({new_rows:,} rows)"
+                f"Already uploaded: {self._skipped_count:,}"
             )
 
-        self._fill_preview(preview_rows)
+        self._fill_preview()
+        self._apply_initial_selection()
+        self._set_select_btns_enabled(bool(self._sheet_rows))
+        self._refresh_import_btn()
 
-    def _fill_preview(self, rows: List[dict]) -> None:
+    def _fill_preview(self) -> None:
         t = self._preview_tbl
         t.setRowCount(0)
-        for i, row in enumerate(rows):
+        self._checkboxes = []
+
+        for i, row in enumerate(self._sheet_rows):
             r = t.rowCount()
             t.insertRow(r)
             status = row["status"]
-            is_skip = status == "Already uploaded"
-            status_color = _TM if is_skip else _GREEN
+            is_new = status == "New"
+            status_color = _GREEN if is_new else _TM
 
-            t.setItem(r, 0, _cell(row["sheet_label"]))
-            t.setItem(r, 1, _cell(
+            cb = QCheckBox()
+            cb.setEnabled(is_new)
+            cb.setStyleSheet("background:transparent;margin-left:8px;")
+            cb.stateChanged.connect(self._refresh_import_btn)
+            self._checkboxes.append(cb)
+            wrap = QWidget()
+            wrap.setStyleSheet("background:transparent;")
+            wl = QHBoxLayout(wrap)
+            wl.setContentsMargins(0, 0, 0, 0)
+            wl.setAlignment(Qt.AlignCenter)
+            wl.addWidget(cb)
+            t.setCellWidget(r, 0, wrap)
+
+            t.setItem(r, 1, _cell(row["sheet_label"]))
+            t.setItem(r, 2, _cell(
                 f"{row['count']:,}", align=Qt.AlignCenter | Qt.AlignVCenter,
             ))
             balance = row["balance"]
             bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else "")
-            t.setItem(r, 2, _cell(
+            t.setItem(r, 3, _cell(
                 _kimvi_fmt_amount(balance),
                 mono=True,
                 color=bal_color,
                 align=Qt.AlignRight | Qt.AlignVCenter,
             ))
-            t.setItem(r, 3, _cell(status, color=status_color))
+            t.setItem(r, 4, _cell(status, color=status_color))
             _finish_table_row(t, r, _stripe_bg(i))
 
+    def _set_select_btns_enabled(self, enabled: bool) -> None:
+        self._sel_all_btn.setEnabled(enabled)
+        self._sel_last_btn.setEnabled(enabled)
+        self._sel_clear_btn.setEnabled(enabled)
+
+    def _apply_initial_selection(self) -> None:
+        if self._initial_selection == "last":
+            self._select_last()
+        else:
+            self._select_all_new()
+
+    def _select_all_new(self) -> None:
+        for i, row in enumerate(self._sheet_rows):
+            if i < len(self._checkboxes) and row["status"] == "New":
+                self._checkboxes[i].setChecked(True)
+        self._refresh_import_btn()
+
+    def _select_last(self) -> None:
+        for cb in self._checkboxes:
+            cb.setChecked(False)
+        if not self._sheet_rows:
+            self._refresh_import_btn()
+            return
+        last_i = len(self._sheet_rows) - 1
+        if self._sheet_rows[last_i]["status"] == "New":
+            self._checkboxes[last_i].setChecked(True)
+        self._refresh_import_btn()
+
+    def _clear_selection(self) -> None:
+        for cb in self._checkboxes:
+            cb.setChecked(False)
+        self._refresh_import_btn()
+
+    def _selected_batches(self) -> List[dict]:
+        selected: List[dict] = []
+        for i, row in enumerate(self._sheet_rows):
+            if (
+                i < len(self._checkboxes)
+                and self._checkboxes[i].isChecked()
+                and row["status"] == "New"
+            ):
+                selected.append(row)
+        return selected
+
+    def _refresh_import_btn(self) -> None:
+        selected = self._selected_batches()
+        if not selected:
+            self._import_btn.setEnabled(False)
+            if self._sheet_rows and all(
+                r["status"] != "New" for r in self._sheet_rows
+            ):
+                self._import_btn.setText("Nothing to Import")
+            else:
+                self._import_btn.setText("Import Selected Sheets")
+            return
+        n = len(selected)
+        rows = sum(len(b["records"]) for b in selected)
+        self._import_btn.setEnabled(True)
+        self._import_btn.setText(
+            f"Import {n:,} Sheet{'s' if n != 1 else ''} ({rows:,} rows)"
+        )
+
     def _do_import(self) -> None:
-        if not self._pending:
+        pending = self._selected_batches()
+        if not pending:
             return
         self._import_btn.setEnabled(False)
         self._import_btn.setText("Importing…")
-        asyncio.ensure_future(self._async_import())
+        asyncio.ensure_future(self._async_import(pending))
 
-    async def _async_import(self) -> None:
+    async def _async_import(self, pending: List[dict]) -> None:
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
         from tahmeed.services.import_truck_check import truck_field_for
 
@@ -4119,7 +4241,7 @@ class BulkSheetImportDialog(QDialog):
         total_skipped   = 0
 
         try:
-            for batch in self._pending:
+            for batch in pending:
                 docs = []
                 for rec in batch["records"]:
                     doc = dict(rec)
@@ -4155,18 +4277,10 @@ class BulkSheetImportDialog(QDialog):
                 self.imported.emit(sheets_imported, total_rows)
                 self.accept()
             else:
-                new_rows = sum(len(b["records"]) for b in self._pending)
-                self._import_btn.setEnabled(True)
-                self._import_btn.setText(
-                    f"Import {len(self._pending):,} Sheets ({new_rows:,} rows)"
-                )
+                self._refresh_import_btn()
         except Exception as exc:
             QMessageBox.critical(self, "Bulk Import Error", str(exc))
-            new_rows = sum(len(b["records"]) for b in self._pending)
-            self._import_btn.setEnabled(True)
-            self._import_btn.setText(
-                f"Import {len(self._pending):,} Sheets ({new_rows:,} rows)"
-            )
+            self._refresh_import_btn()
 
 
 class KimviImportDialog(QDialog):
@@ -5057,8 +5171,22 @@ class AhmedKimviWidget(QWidget):
             QMessageBox.critical(self, "Template Error", str(exc))
 
     def _open_import(self) -> None:
-        dlg = KimviImportDialog(parent=self)
-        dlg.imported.connect(self._on_imported)
+        from tahmeed.services import accountant_service as svc
+        dlg = BulkSheetImportDialog(
+            title="Import Sheets — Ahmed Kimvi (Klesa)",
+            hint=(
+                "Choose which sheets to import. "
+                "The last sheet is pre-selected — use Select All New, Select Last, "
+                "or tick individual sheets. Already uploaded sheets stay blocked."
+            ),
+            parse_all_fn=_parse_kimvi_all_sheets,
+            existing_fn=svc.kimvi_existing_sheet_labels,
+            save_fn=svc.save_kimvi_import,
+            feed_key="ahmed_kimvi",
+            initial_selection="last",
+            parent=self,
+        )
+        dlg.imported.connect(self._on_bulk_imported)
         dlg.exec()
 
     def _on_imported(self, n: int) -> None:
@@ -5081,13 +5209,16 @@ class AhmedKimviWidget(QWidget):
         dlg = BulkSheetImportDialog(
             title="Bulk Import — Ahmed Kimvi (Klesa)",
             hint=(
-                "Every sheet in the workbook will be checked. "
-                "New sheets are imported; sheets already uploaded are skipped."
+                "Every sheet in the workbook is listed. "
+                "All new sheets are pre-selected — adjust with Select All New, "
+                "Select Last, Clear, or individual checkboxes. "
+                "Already uploaded sheets are skipped."
             ),
             parse_all_fn=_parse_kimvi_all_sheets,
             existing_fn=svc.kimvi_existing_sheet_labels,
             save_fn=svc.save_kimvi_import,
             feed_key="ahmed_kimvi",
+            initial_selection="all",
             parent=self,
         )
         dlg.imported.connect(self._on_bulk_imported)
@@ -6200,8 +6331,10 @@ class ZambiaParkingWidget(QWidget):
         dlg = BulkSheetImportDialog(
             title="Bulk Import — Zambia Parking",
             hint=(
-                "Every sheet (week) in the workbook will be checked. "
-                "New sheets are imported; sheets already uploaded are skipped."
+                "Every sheet (week) in the workbook is listed. "
+                "All new sheets are pre-selected — adjust with Select All New, "
+                "Select Last, Clear, or individual checkboxes. "
+                "Already uploaded sheets are skipped."
             ),
             parse_all_fn=_parse_zambia_all_sheets,
             existing_fn=svc.zambia_existing_sheet_labels,
@@ -6209,6 +6342,7 @@ class ZambiaParkingWidget(QWidget):
             balance_fn=_zambia_batch_balance,
             balance_header="CLOSING BAL (ZMW)",
             feed_key="zambia_parking",
+            initial_selection="all",
             parent=self,
         )
         dlg.imported.connect(self._on_bulk_imported)

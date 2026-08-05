@@ -1,4 +1,4 @@
-"""Semi-transparent loading overlay with a spinning icon."""
+"""Semi-transparent loading overlay with spinner + progress bar."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ import qtawesome as qta
 
 from PySide6.QtCore import Qt, QTimer, QEvent, QObject
 from PySide6.QtGui import QTransform
-from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QFrame, QLabel, QProgressBar, QVBoxLayout, QWidget,
+)
 
 
 class LoadingOverlay(QFrame):
@@ -28,7 +30,7 @@ class LoadingOverlay(QFrame):
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(10)
+        layout.setSpacing(12)
 
         self._icon = QLabel()
         self._icon.setFixedSize(36, 36)
@@ -43,6 +45,21 @@ class LoadingOverlay(QFrame):
             " font-family:'Segoe UI'; background: transparent;"
         )
         layout.addWidget(self._message, alignment=Qt.AlignCenter)
+
+        self._bar = QProgressBar()
+        self._bar.setFixedWidth(220)
+        self._bar.setFixedHeight(10)
+        self._bar.setTextVisible(False)
+        self._bar.setRange(0, 0)  # indeterminate by default
+        self._bar.setStyleSheet(
+            "QProgressBar {"
+            "  background: #E5E7EB; border: none; border-radius: 5px;"
+            "}"
+            "QProgressBar::chunk {"
+            "  background: #0077C5; border-radius: 5px;"
+            "}"
+        )
+        layout.addWidget(self._bar, alignment=Qt.AlignCenter)
 
         self._timer = QTimer(self)
         self._timer.setInterval(60)
@@ -72,14 +89,26 @@ class LoadingOverlay(QFrame):
         except Exception:
             self._icon.setText("…")
 
-    def show_loading(self, message: Optional[str] = None) -> None:
+    def show_loading(
+        self,
+        message: Optional[str] = None,
+        *,
+        value: Optional[int] = None,
+        maximum: Optional[int] = None,
+    ) -> None:
         if message:
             self._message.setText(message)
+        if maximum is not None and maximum > 0:
+            self._bar.setRange(0, maximum)
+            self._bar.setValue(max(0, min(maximum, value or 0)))
+        else:
+            self._bar.setRange(0, 0)
         self._sync_geometry()
         self._rotate()
         self.show()
         self.raise_()
         self._timer.start()
+        QApplication.processEvents()
 
     def hide_loading(self) -> None:
         self._timer.stop()
