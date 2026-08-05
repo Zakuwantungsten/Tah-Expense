@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 import qtawesome as qta
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -31,16 +33,38 @@ from tahmeed.services.truck_format import (
 )
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
 
+try:
+    import openpyxl
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    _HAS_OPENPYXL = True
+except ImportError:
+    openpyxl = None  # type: ignore
+    _HAS_OPENPYXL = False
+
 _BG = "#F4F6F8"
 _WHITE = "#FFFFFF"
 _BORDER = "#E5E7EB"
 _T1 = "#111827"
 _T2 = "#6B7280"
 _BLUE = "#0077C5"
-_ORANGE = "#E85D04"
 
 _HEADERS = [
     "Skipped", "Truck", "Original", "Reason", "Source file", "Sheet", "Upload id",
+]
+
+_EXPORT_HEADERS = [
+    "Skipped At",
+    "Truck",
+    "Original Truck",
+    "Reason",
+    "Source File",
+    "Sheet",
+    "Upload ID",
+    "Ledger / Receipt",
+    "Payment / Date",
+    "Type",
+    "Amount",
+    "Details",
 ]
 
 
@@ -84,6 +108,104 @@ def _cell(text: str) -> QTableWidgetItem:
     return item
 
 
+def _reason_label(reason: str) -> str:
+    if reason == "not_in_registry":
+        return "Not in registry"
+    if reason == "invalid_format":
+        return "Invalid format"
+    return reason or ""
+
+
+def _export_row_values(doc: dict) -> List[str]:
+    """Flatten a skipped row into export columns for follow-up tracking."""
+    skipped_at = doc.get("skipped_at")
+    if isinstance(skipped_at, datetime):
+        when = skipped_at.strftime("%d %b %Y  %H:%M")
+    else:
+        when = str(skipped_at or "")
+    rec = doc.get("record") or {}
+    ledger = (
+        rec.get("ledger_id")
+        or rec.get("receipt_no")
+        or rec.get("lpo_no")
+        or rec.get("serial")
+        or ""
+    )
+    pay_date = (
+        rec.get("payment_date")
+        or rec.get("toll_date")
+        or rec.get("date")
+        or ""
+    )
+    tx_type = rec.get("transaction_type") or rec.get("type") or ""
+    amount = rec.get("amount") or rec.get("tender_amount") or ""
+    details = (
+        rec.get("transaction_details")
+        or rec.get("description")
+        or rec.get("details")
+        or ""
+    )
+    return [
+        when,
+        str(doc.get("truck_value") or ""),
+        str(doc.get("original_truck") or ""),
+        _reason_label(str(doc.get("reason") or "")),
+        str(doc.get("source_filename") or ""),
+        str(doc.get("sheet_label") or ""),
+        str(doc.get("target_upload_id") or ""),
+        str(ledger),
+        str(pay_date),
+        str(tx_type),
+        str(amount),
+        str(details),
+    ]
+
+
+def _write_skipped_csv(path: str, docs: List[dict]) -> None:
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(_EXPORT_HEADERS)
+        for doc in docs:
+            writer.writerow(_export_row_values(doc))
+
+
+def _write_skipped_xlsx(path: str, docs: List[dict]) -> None:
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required for Excel export.")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Skipped Trucks"
+
+    thin = Side(border_style="thin", color="E5E7EB")
+    bdr = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hdr_fill = PatternFill("solid", fgColor="EFF6FF")
+    hdr_font = Font(name="Calibri", bold=True, size=11, color="1E3A5F")
+    alt_fill = PatternFill("solid", fgColor="F9FAFB")
+    nrm_font = Font(name="Calibri", size=11)
+
+    for c, label in enumerate(_EXPORT_HEADERS, 1):
+        cell = ws.cell(row=1, column=c, value=label)
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.border = bdr
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for ri, doc in enumerate(docs, 2):
+        for ci, val in enumerate(_export_row_values(doc), 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.font = nrm_font
+            cell.border = bdr
+            cell.alignment = Alignment(vertical="center")
+            if ri % 2 == 0:
+                cell.fill = alt_fill
+
+    widths = [18, 14, 14, 16, 28, 12, 38, 16, 20, 14, 12, 28]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[ws.cell(1, i).column_letter].width = w
+
+    wb.save(path)
+
+
 class SkippedTrucksTab(QWidget):
     """List parked import rows; edit truck and re-upload into the original batch."""
 
@@ -105,7 +227,7 @@ class SkippedTrucksTab(QWidget):
         hint = _lbl(
             "Rows skipped during import because the truck was unknown or mistyped. "
             "Edit the truck number after follow-up, then re-upload — they join the "
-            "original upload batch.",
+            "original upload batch. Export Excel/CSV to share the skip list.",
             size=11,
             color=_T2,
         )
@@ -131,6 +253,15 @@ class SkippedTrucksTab(QWidget):
         refresh_btn = _btn("Refresh", "mdi.refresh", primary=False)
         refresh_btn.clicked.connect(self.refresh)
         tbl.addWidget(refresh_btn)
+
+        export_xlsx_btn = _btn("Export Excel", "mdi.file-excel-outline", primary=False)
+        export_xlsx_btn.clicked.connect(lambda: self._export("xlsx"))
+        tbl.addWidget(export_xlsx_btn)
+
+        export_csv_btn = _btn("Export CSV", "mdi.file-delimited-outline", primary=False)
+        export_csv_btn.clicked.connect(lambda: self._export("csv"))
+        tbl.addWidget(export_csv_btn)
+
         tbl.addStretch()
 
         edit_btn = _btn("Edit truck", primary=False)
@@ -195,12 +326,7 @@ class SkippedTrucksTab(QWidget):
                 when = skipped_at.strftime("%d %b %Y  %H:%M")
             else:
                 when = str(skipped_at or "—")
-            reason = doc.get("reason") or ""
-            reason_lbl = (
-                "Not in registry" if reason == "not_in_registry"
-                else "Invalid format" if reason == "invalid_format"
-                else reason
-            )
+            reason_lbl = _reason_label(str(doc.get("reason") or ""))
             vals = [
                 when,
                 doc.get("truck_value") or "",
@@ -214,6 +340,41 @@ class SkippedTrucksTab(QWidget):
                 t.setItem(r, c, _cell(val))
             # stash full id on first cell
             t.item(r, 0).setData(Qt.UserRole, str(doc.get("_id") or ""))
+
+    def _export(self, fmt: str) -> None:
+        if not self._rows:
+            QMessageBox.information(
+                self, "Export", "No skipped rows to export. Refresh or clear search.",
+            )
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        default = f"skipped_trucks_{self._feed_key}_{stamp}.{fmt}"
+        if fmt == "xlsx":
+            filt = "Excel Files (*.xlsx)"
+        else:
+            filt = "CSV Files (*.csv)"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Skipped Trucks", default, filt,
+        )
+        if not path:
+            return
+        if fmt == "xlsx" and not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        elif fmt == "csv" and not path.lower().endswith(".csv"):
+            path += ".csv"
+        try:
+            if fmt == "xlsx":
+                _write_skipped_xlsx(path, self._rows)
+            else:
+                _write_skipped_csv(path, self._rows)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Error", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Export Complete",
+            f"Exported {len(self._rows):,} skipped row(s) to:\n{path}",
+        )
 
     def _selected_ids(self) -> List[str]:
         ids: List[str] = []
@@ -304,6 +465,11 @@ class SkippedTrucksTab(QWidget):
         except Exception:
             fleet = set()
         try:
+            from tahmeed.services.truck_service import get_fleet_kinds
+            fleet_kinds = await get_fleet_kinds()
+        except Exception:
+            fleet_kinds = {}
+        try:
             stored = await settings_service.get_setting("allowed_truck_labels")
         except Exception:
             stored = []
@@ -348,6 +514,7 @@ class SkippedTrucksTab(QWidget):
                 can_add=True,
                 allowed_labels=labels,
                 import_mode=True,
+                fleet_kinds=fleet_kinds,
                 parent=self,
             )
             dlg.exec()

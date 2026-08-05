@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 from bson import ObjectId
 import qtawesome as qta
@@ -25,6 +25,8 @@ from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 
+_T = TypeVar("_T")
+
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE     = "#FFFFFF"
 _BG        = "#F4F6F8"
@@ -42,14 +44,17 @@ _QB_HDR_BG = "#EFF6FF"
 _QB_HDR_FG = "#1E3A5F"
 _QB_SEL_BG = "#DBEAFE"
 _QB_SEL_FG = "#1E3A5F"
-# Shared grid look — matches Master Expenses / SM Burhani Bonds
+# Shared grid look — matches Master Expenses / Separate Expenses
 _HDR_BG    = "#F1F5F9"
 _STRIPE    = "#F1F5F9"
+_ROW_EVEN  = "#FFFFFF"
+_ROW_ODD   = "#F1F5F9"   # slate-100 — manual stripe (readable on all row types)
 _HDR_H     = 28
 _ROW_H     = 28
 
-_SCROLL_CHUNK   = 50
-_DATE_OPTS      = ["All Dates", "Today", "Last 7 Days", "Last 30 Days", "This Month"]
+_SCROLL_CHUNK      = 50
+_SELECT_ALL_CHUNK  = 500
+_DATE_OPTS         = ["All Dates", "Today", "Last 7 Days", "Last 30 Days", "This Month"]
 
 _RECEIPT_DISPLAY: Dict[str, str] = {
     "pending":  "Pending",
@@ -160,7 +165,6 @@ def _table_style() -> str:
         "border:none;font-size:11px;font-family:'Segoe UI';}}"
         f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
-        f"QTableWidget::item:alternate{{background:{_STRIPE};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
         "font-size:10px;font-weight:600;font-family:'Segoe UI';"
         f"border:none;border-right:1px solid {_BORDER};"
@@ -171,6 +175,25 @@ def _table_style() -> str:
         "QScrollBar:horizontal{height:8px;background:transparent;}"
         "QScrollBar::handle:horizontal{background:#D1D5DB;border-radius:4px;}"
     )
+
+
+def _stripe_bg(row_idx: int) -> str:
+    return _ROW_ODD if row_idx % 2 else _ROW_EVEN
+
+
+def _apply_row_bg(t: QTableWidget, row: int, bg: str) -> None:
+    for col in range(t.columnCount()):
+        item = t.item(row, col)
+        if item:
+            item.setBackground(QColor(bg))
+
+
+def _finish_table_row(
+    t: QTableWidget, row: int, bg: str | None = None,
+) -> None:
+    """Apply stripe (or custom) background and compact row height."""
+    _apply_row_bg(t, row, bg if bg else _stripe_bg(row))
+    t.setRowHeight(row, _ROW_H)
 
 
 def _cell(text: str,
@@ -848,6 +871,7 @@ class VerifyInboxWidget(QWidget):
         self._filters_tab = -1  # which tab's filters are currently loaded
         self._loading = False
         self._scroll_loading = False
+        self._select_all_loading = False
         self._reload_generation = 0
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -975,13 +999,11 @@ class VerifyInboxWidget(QWidget):
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
         t.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        t.setAlternatingRowColors(True)
+        t.setAlternatingRowColors(False)
         t.verticalHeader().setVisible(False)
         t.verticalHeader().setDefaultSectionSize(_ROW_H)
         t.setShowGrid(True)
-        t.setStyleSheet(
-            _table_style() + f"QTableWidget{{alternate-background-color:{_STRIPE};}}"
-        )
+        t.setStyleSheet(_table_style())
         hdr = t.horizontalHeader()
         hdr.setHighlightSections(False)
         hdr.setMinimumSectionSize(28)
@@ -1002,6 +1024,8 @@ class VerifyInboxWidget(QWidget):
 
     def refresh(self) -> None:
         self._filters_tab = -1
+        self._category_objects = []
+        self._categories = []
         self._reset_and_load()
 
     def _filter_kw(self) -> dict:
@@ -1024,7 +1048,77 @@ class VerifyInboxWidget(QWidget):
         self._panel.hide()
         self._table.setRowCount(0)
         self._update_status()
-        asyncio.ensure_future(self._load_initial(self._reload_generation))
+        generation = self._reload_generation
+
+        def _kick() -> None:
+            if self._reload_generation != generation:
+                return
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            asyncio.ensure_future(self._load_initial(generation))
+
+        try:
+            nested = asyncio.current_task() is not None
+        except RuntimeError:
+            nested = False
+        if nested:
+            self._schedule_ui(_kick)
+        else:
+            _kick()
+
+    def _schedule_ui(self, fn: Callable[[], None]) -> None:
+        """Run ``fn`` on the next Qt tick (outside any running asyncio task)."""
+        QTimer.singleShot(0, fn)
+
+    async def _await_ui(self, fn: Callable[[], _T]) -> _T:
+        """Run blocking Qt UI while this asyncio task is suspended.
+
+        Modal dialogs pump the Qt event loop; doing that while a task is the
+        *current* executing task breaks sibling tasks on Python 3.14 / qasync.
+        """
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        def _run() -> None:
+            if fut.done():
+                return
+            try:
+                fut.set_result(fn())
+            except Exception as exc:
+                fut.set_exception(exc)
+
+        QTimer.singleShot(0, _run)
+        return await fut
+
+    def _finish_mutation(
+        self,
+        *,
+        info: Optional[str] = None,
+        error: Optional[str] = None,
+        warning: Optional[str] = None,
+        hide_panel: bool = False,
+        reload: bool = False,
+        info_title: str = "Done",
+        error_title: str = "Error",
+        warning_title: str = "Not Found",
+    ) -> None:
+        """Reload / show result dialogs after the async mutation task returns."""
+
+        def _run() -> None:
+            if hide_panel:
+                self._panel.hide()
+            if reload:
+                self._reset_and_load()
+            if error:
+                QMessageBox.critical(self, error_title, error)
+            elif warning:
+                QMessageBox.warning(self, warning_title, warning)
+            elif info:
+                QMessageBox.information(self, info_title, info)
+
+        self._schedule_ui(_run)
 
     def _update_status(self) -> None:
         if self._loading and self._loaded == 0:
@@ -1185,12 +1279,26 @@ class VerifyInboxWidget(QWidget):
     def _on_header_click(self, col: int) -> None:
         if col != _COL_CHK:
             return
-        any_unchecked = any(
-            self._table.item(r, _COL_CHK) and
-            self._table.item(r, _COL_CHK).checkState() == Qt.Unchecked
-            for r in range(self._table.rowCount())
+        if self._select_all_loading or self._loading:
+            return
+        # Header checkbox selects / clears every row matching the current
+        # Verify tab + filters — not only the currently loaded scroll page.
+        fully_selected = (
+            self._total > 0
+            and self._loaded >= self._total
+            and self._table.rowCount() > 0
+            and all(
+                self._table.item(r, _COL_CHK)
+                and self._table.item(r, _COL_CHK).checkState() == Qt.Checked
+                for r in range(self._table.rowCount())
+            )
         )
-        state = Qt.Checked if any_unchecked else Qt.Unchecked
+        if fully_selected:
+            self._set_all_checks(Qt.Unchecked)
+        else:
+            asyncio.ensure_future(self._select_all_matching())
+
+    def _set_all_checks(self, state) -> None:
         self._table.blockSignals(True)
         for r in range(self._table.rowCount()):
             it = self._table.item(r, _COL_CHK)
@@ -1198,6 +1306,64 @@ class VerifyInboxWidget(QWidget):
                 it.setCheckState(state)
         self._table.blockSignals(False)
         self._update_bulk_buttons()
+
+    async def _select_all_matching(self) -> None:
+        """Load every matching record, then check all rows."""
+        if self._select_all_loading or self._loading:
+            return
+        if self._total <= 0 and self._table.rowCount() == 0:
+            return
+
+        self._select_all_loading = True
+        gen = self._reload_generation
+        self._loading_overlay.show_loading("Selecting all records…")
+        try:
+            from tahmeed.services.accountant_service import get_cashier_names
+
+            while (
+                gen == self._reload_generation
+                and self._loaded < self._total
+            ):
+                remaining = self._total - self._loaded
+                self._status.set_text(
+                    f"Loading all records… {self._loaded:,} of {self._total:,}"
+                )
+                kw = self._filter_kw()
+                txs = await self._fetch_page(
+                    skip=self._loaded,
+                    limit=max(remaining, _SELECT_ALL_CHUNK),
+                    kw=kw,
+                )
+                if gen != self._reload_generation:
+                    return
+                if not txs:
+                    break
+
+                page_ids = {tx.cashier_id for tx in txs if tx.cashier_id}
+                page_ids |= {tx.last_edited_by for tx in txs if tx.last_edited_by}
+                page_ids |= {
+                    tx.deletion_requested_by
+                    for tx in txs if tx.deletion_requested_by
+                }
+                cname_map = dict(self._cashier_names)
+                if page_ids:
+                    page_names = await get_cashier_names(list(page_ids))
+                    cname_map.update(page_names)
+                    self._cashier_names = cname_map
+
+                self._fill_table(txs, cname_map, self._loaded, append=True)
+                self._loaded += len(txs)
+
+            if gen != self._reload_generation:
+                return
+            self._set_all_checks(Qt.Checked)
+        except Exception:
+            pass
+        finally:
+            self._select_all_loading = False
+            self._loading_overlay.hide_loading()
+            if gen == self._reload_generation:
+                self._update_status()
 
     def _update_bulk_buttons(self) -> None:
         any_checked = any(
@@ -1224,9 +1390,15 @@ class VerifyInboxWidget(QWidget):
         selected_items = self._filter_bar.item_filter()
         selected_descs = self._filter_bar.description_filter()
 
+        # Reuse cached categories unless refresh() cleared them.
+        async def _cats() -> List[Category]:
+            if self._category_objects:
+                return self._category_objects
+            return await get_all_categories()
+
         if tab == 2:
             cats, trucks, cashier_ids, items, descs = await asyncio.gather(
-                get_all_categories(),
+                _cats(),
                 get_rejected_trucks(),
                 get_rejected_cashier_ids(),
                 get_rejected_items(descriptions=selected_descs or None),
@@ -1234,7 +1406,7 @@ class VerifyInboxWidget(QWidget):
             )
         elif tab == 4:
             cats, trucks, cashier_ids, items, descs = await asyncio.gather(
-                get_all_categories(),
+                _cats(),
                 get_deletion_requested_trucks(),
                 get_deletion_requested_cashier_ids(),
                 get_deletion_requested_items(descriptions=selected_descs or None),
@@ -1242,7 +1414,7 @@ class VerifyInboxWidget(QWidget):
             )
         else:
             cats, trucks, cashier_ids, items, descs = await asyncio.gather(
-                get_all_categories(),
+                _cats(),
                 get_unverified_trucks(),
                 get_unverified_cashier_ids(),
                 get_unverified_items(descriptions=selected_descs or None),
@@ -1325,17 +1497,19 @@ class VerifyInboxWidget(QWidget):
 
             kw = self._filter_kw()
             tab = self._current_tab
+            need_filters = self._filters_tab != tab
 
-            cname_map: Dict = {}
-            if self._filters_tab != tab:
-                cname_map = await self._load_filter_options(tab)
-                if generation != self._reload_generation:
-                    return
-
-            txs, counts = await asyncio.gather(
+            # Page + counts first so rows appear quickly; filters load in parallel.
+            page_task = asyncio.ensure_future(
                 self._fetch_page(skip=0, limit=_SCROLL_CHUNK, kw=kw),
-                self._fetch_counts(kw),
             )
+            counts_task = asyncio.ensure_future(self._fetch_counts(kw))
+            filters_task = (
+                asyncio.ensure_future(self._load_filter_options(tab))
+                if need_filters else None
+            )
+
+            txs, counts = await asyncio.gather(page_task, counts_task)
             if generation != self._reload_generation:
                 return
 
@@ -1354,6 +1528,8 @@ class VerifyInboxWidget(QWidget):
             else:
                 total = new_count
 
+            # Paint rows immediately; filter dropdown names can arrive right after.
+            cname_map: Dict = dict(self._cashier_names)
             page_ids = {tx.cashier_id for tx in txs if tx.cashier_id}
             page_ids |= {tx.last_edited_by for tx in txs if tx.last_edited_by}
             page_ids |= {
@@ -1372,6 +1548,21 @@ class VerifyInboxWidget(QWidget):
             self._loaded = len(txs)
             self._pending_badge.setText(str(pending))
             self.badge_updated.emit(pending)
+            self._loading = False
+            self._loading_overlay.hide_loading()
+            self._update_status()
+
+            if filters_task is not None:
+                try:
+                    filter_names = await filters_task
+                    if generation != self._reload_generation:
+                        return
+                    # Merge any extra cashier names from filter distincts.
+                    if filter_names:
+                        self._cashier_names.update(filter_names)
+                except Exception:
+                    pass
+            return
         except Exception as exc:
             if generation == self._reload_generation:
                 self._show_empty(f"Failed to load: {exc}")
@@ -1382,7 +1573,7 @@ class VerifyInboxWidget(QWidget):
                 self._update_status()
 
     async def _load_more(self) -> None:
-        if self._scroll_loading or self._loading:
+        if self._scroll_loading or self._loading or self._select_all_loading:
             return
         if self._loaded >= self._total:
             return
@@ -1528,10 +1719,7 @@ class VerifyInboxWidget(QWidget):
                 if tx.rejection_reason:
                     reason_item.setToolTip(tx.rejection_reason)
                 t.setItem(r, _COL_APP, reason_item)
-                for c in range(_NCOLS):
-                    cell = t.item(r, c)
-                    if cell:
-                        cell.setBackground(QColor("#FFF0F0"))
+                row_bg = "#FFF0F0"
             elif tab == 1:
                 rel = _fmt_relative(tx.last_edited_at)
                 ed_item = _cell(rel or "—", color=_AMBER)
@@ -1541,10 +1729,7 @@ class VerifyInboxWidget(QWidget):
                         f"Edited by {editor or '—'} on {_fmt_date(tx.last_edited_at)}"
                     )
                 t.setItem(r, _COL_APP, ed_item)
-                for c in range(_NCOLS):
-                    cell = t.item(r, c)
-                    if cell:
-                        cell.setBackground(QColor("#FFF7ED"))
+                row_bg = "#FFF7ED"
             elif tab == 3:
                 bits = []
                 if getattr(tx, "possible_duplicate", False):
@@ -1566,10 +1751,7 @@ class VerifyInboxWidget(QWidget):
                 if tip_parts:
                     issue_item.setToolTip(" ".join(tip_parts))
                 t.setItem(r, _COL_APP, issue_item)
-                for c in range(_NCOLS):
-                    cell = t.item(r, c)
-                    if cell:
-                        cell.setBackground(QColor("#FFFBEB"))
+                row_bg = "#FFFBEB"
             elif tab == 4:
                 rel = _fmt_relative(tx.deletion_requested_at)
                 req_item = _cell(rel or "—", color=_RED)
@@ -1583,18 +1765,33 @@ class VerifyInboxWidget(QWidget):
                         f"{_fmt_date(tx.deletion_requested_at)}"
                     )
                 t.setItem(r, _COL_APP, req_item)
-                for c in range(_NCOLS):
-                    cell = t.item(r, c)
-                    if cell:
-                        cell.setBackground(QColor("#FEF2F2"))
+                row_bg = "#FEF2F2"
             else:
                 t.setItem(r, _COL_APP, _cell(tx.approver or "—", color=_T2))
+                row_bg = None
                 if isinstance(tx.date, datetime) and isinstance(tx.created_at, datetime):
                     if tx.date.date() != tx.created_at.date():
-                        for _c in range(_NCOLS):
-                            _cell_item = t.item(r, _c)
-                            if _cell_item:
-                                _cell_item.setBackground(QColor(_AMBER_L))
+                        row_bg = _AMBER_L
+
+            # Manual zebra (or soft status wash) — matches Separate Expenses.
+            _finish_table_row(t, r, row_bg)
+
+            # Re-apply cell-level highlights after row background.
+            if tx.possible_duplicate:
+                desc_cell = t.item(r, _COL_DESC)
+                if desc_cell:
+                    desc_cell.setBackground(QColor("#FEE2E2"))
+                    desc_cell.setForeground(QColor(_RED))
+            if (
+                tab != 0
+                and isinstance(tx.date, datetime)
+                and isinstance(tx.created_at, datetime)
+                and tx.date.date() != tx.created_at.date()
+            ):
+                date_cell = t.item(r, _COL_DATE)
+                if date_cell:
+                    date_cell.setBackground(QColor(_AMBER_L))
+                    date_cell.setForeground(QColor(_AMBER))
 
         t.blockSignals(False)
         self._update_bulk_buttons()
@@ -1757,11 +1954,11 @@ class VerifyInboxWidget(QWidget):
         try:
             categories = await get_all_categories(include_inactive=True)
         except Exception as exc:
-            QMessageBox.critical(
+            await self._await_ui(lambda: QMessageBox.critical(
                 self,
                 "Items Unavailable",
                 f"Could not load items from the server:\n{exc}",
-            )
+            ))
             return []
 
         if not categories:
@@ -1796,14 +1993,19 @@ class VerifyInboxWidget(QWidget):
             await save_mapping(description, category._id, category.name)
 
     async def _resolve_items_for_transactions(self, txs: List[Transaction]) -> bool:
-        """Ensure each transaction has an item; prompt when mapping is unknown."""
+        """Ensure each transaction has an item; prompt when mapping is unknown.
+
+        Dialogs are collected first (no DB awaits between them), then mappings
+        and category updates are persisted in bulk so the next assign window
+        appears immediately.
+        """
         from tahmeed.services.description_mapping_service import (
             get_mappings_for_descriptions,
             normalize_description,
             save_mapping,
             transaction_needs_item,
         )
-        from tahmeed.services.accountant_service import update_transaction_category
+        from tahmeed.services.accountant_service import bulk_update_transaction_category
         from tahmeed.ui.dialogs.description_mapping_dialog import DescriptionMappingDialog
 
         pending = [tx for tx in txs if transaction_needs_item(tx.item, tx.category_name)]
@@ -1812,38 +2014,45 @@ class VerifyInboxWidget(QWidget):
 
         categories = await self._ensure_mapping_categories()
         if not categories:
-            QMessageBox.warning(
+            await self._await_ui(lambda: QMessageBox.warning(
                 self,
                 "No Items",
                 "There are no items to map descriptions to.\n\n"
                 "Open Manage → Items and import your Chart of Accounts, "
                 "or add items manually, then try again.",
-            )
+            ))
             return False
 
         descriptions = [tx.description for tx in pending if tx.description]
         mappings = await get_mappings_for_descriptions(descriptions)
 
         still_need: List[Transaction] = []
+        # Group known mappings by category for one bulk update each.
+        known_groups: Dict[Tuple[str, ObjectId], List[ObjectId]] = {}
         for tx in pending:
             if not tx._id:
                 continue
             key = normalize_description(tx.description or "")
             mapping = mappings.get(key)
             if mapping:
-                await update_transaction_category(
-                    tx._id, mapping.category_name, mapping.category_id,
-                )
+                gk = (mapping.category_name, mapping.category_id)
+                known_groups.setdefault(gk, []).append(tx._id)
             elif not (tx.description or "").strip():
-                QMessageBox.warning(
+                await self._await_ui(lambda: QMessageBox.warning(
                     self,
                     "Missing Item",
                     "One or more selected entries have no item and no description.\n"
                     "Assign a category manually before approving.",
-                )
+                ))
                 return False
             else:
                 still_need.append(tx)
+
+        if known_groups:
+            await asyncio.gather(*[
+                bulk_update_transaction_category(ids, name, cat_id)
+                for (name, cat_id), ids in known_groups.items()
+            ])
 
         if not still_need:
             return True
@@ -1855,27 +2064,49 @@ class VerifyInboxWidget(QWidget):
             groups.setdefault(key, []).append(tx)
             display[key] = tx.description or key
 
+        # Collect all assignments first — no DB work between dialogs.
+        assignments: Dict[str, Category] = {}
         remaining = len(groups)
         for key in list(groups.keys()):
-            dlg = DescriptionMappingDialog(
-                description=display[key],
-                row_count=len(groups[key]),
-                categories=categories,
-                remaining=remaining,
-                parent=self,
-                scope_label="in verify inbox",
-                cancel_label="Cancel",
-            )
-            if dlg.exec() != QDialog.Accepted:
-                return False
-            cat = dlg.selected_category()
+            desc = display[key]
+            row_count = len(groups[key])
+            rem = remaining
+
+            def _prompt(
+                description=desc,
+                count=row_count,
+                left=rem,
+            ):
+                dlg = DescriptionMappingDialog(
+                    description=description,
+                    row_count=count,
+                    categories=categories,
+                    remaining=left,
+                    parent=self,
+                    scope_label="in verify inbox",
+                    cancel_label="Cancel",
+                )
+                if dlg.exec() != QDialog.Accepted:
+                    return None
+                return dlg.selected_category()
+
+            cat = await self._await_ui(_prompt)
             if cat is None:
                 return False
-            await save_mapping(display[key], cat._id, cat.name)
-            for tx in groups[key]:
-                if tx._id:
-                    await update_transaction_category(tx._id, cat.name, cat._id)
+            assignments[key] = cat
             remaining -= 1
+
+        # Persist mappings + category updates in parallel after all dialogs.
+        persist = []
+        for key, cat in assignments.items():
+            persist.append(save_mapping(display[key], cat._id, cat.name))
+            ids = [tx._id for tx in groups[key] if tx._id]
+            if ids:
+                persist.append(
+                    bulk_update_transaction_category(ids, cat.name, cat._id)
+                )
+        if persist:
+            await asyncio.gather(*persist)
 
         return True
 
@@ -1896,11 +2127,12 @@ class VerifyInboxWidget(QWidget):
                 if chosen.lower() != current.lower():
                     cat = self._category_by_name(chosen)
                     if cat is None:
-                        QMessageBox.warning(
+                        chosen_name = chosen
+                        await self._await_ui(lambda: QMessageBox.warning(
                             self,
                             "Invalid Item",
-                            f'"{chosen}" is not a known item. Pick one from the category list.',
-                        )
+                            f'"{chosen_name}" is not a known item. Pick one from the category list.',
+                        ))
                         return False
                     if self._tx_needs_item(tx):
                         await self._assign_item_and_remember(
@@ -1925,7 +2157,10 @@ class VerifyInboxWidget(QWidget):
         try:
             txs = await get_transactions_by_ids([tx_id])
             if not txs:
-                QMessageBox.warning(self, "Not Found", "Transaction could not be loaded.")
+                self._finish_mutation(
+                    warning="Transaction could not be loaded.",
+                    warning_title="Not Found",
+                )
                 return
             overrides = {tx_id: category_override} if category_override else {}
             if not await self._prepare_transactions_for_approval(txs, overrides):
@@ -1936,10 +2171,9 @@ class VerifyInboxWidget(QWidget):
                 await approve_transaction(tx_id, self._user._id)
             count = await get_pending_count()
             self.badge_updated.emit(count)
-            self._panel.hide()
-            self._reset_and_load()
+            self._finish_mutation(hide_panel=True, reload=True)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to approve: {exc}")
+            self._finish_mutation(error=f"Failed to approve: {exc}")
 
     async def _do_reject(self, tx_id: ObjectId, reason: str) -> None:
         from tahmeed.services.accountant_service import reject_transaction, get_pending_count
@@ -1947,10 +2181,9 @@ class VerifyInboxWidget(QWidget):
             await reject_transaction(tx_id, reason)
             count = await get_pending_count()
             self.badge_updated.emit(count)
-            self._panel.hide()
-            self._reset_and_load()
+            self._finish_mutation(hide_panel=True, reload=True)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to reject: {exc}")
+            self._finish_mutation(error=f"Failed to reject: {exc}")
 
     async def _do_save_category(self, tx_id: ObjectId, category: str) -> None:
         from tahmeed.services.accountant_service import update_transaction_category
@@ -1966,10 +2199,12 @@ class VerifyInboxWidget(QWidget):
             n = await bulk_reject_transactions(tx_ids, reason)
             count = await get_pending_count()
             self.badge_updated.emit(count)
-            self._reset_and_load()
-            QMessageBox.information(self, "Done", f"Rejected {n} transaction(s).")
+            self._finish_mutation(
+                info=f"Rejected {n} transaction(s).",
+                reload=True,
+            )
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Bulk reject failed: {exc}")
+            self._finish_mutation(error=f"Bulk reject failed: {exc}")
 
     async def _do_bulk_approve(self, tx_ids: List[ObjectId]) -> None:
         from tahmeed.services.accountant_service import (
@@ -1986,10 +2221,12 @@ class VerifyInboxWidget(QWidget):
                 n = await bulk_approve_transactions(tx_ids, self._user._id)
             count = await get_pending_count()
             self.badge_updated.emit(count)
-            self._reset_and_load()
-            QMessageBox.information(self, "Done", f"Approved {n} transaction(s) successfully.")
+            self._finish_mutation(
+                info=f"Approved {n} transaction(s) successfully.",
+                reload=True,
+            )
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Bulk approve failed: {exc}")
+            self._finish_mutation(error=f"Bulk approve failed: {exc}")
 
     async def _do_return_to_inbox(self, tx_id: ObjectId) -> None:
         from tahmeed.services.accountant_service import return_to_inbox, get_pending_count
@@ -1998,47 +2235,43 @@ class VerifyInboxWidget(QWidget):
             if ok:
                 count = await get_pending_count()
                 self.badge_updated.emit(count)
-                self._panel.hide()
-                self._reset_and_load()
+                self._finish_mutation(hide_panel=True, reload=True)
             else:
-                QMessageBox.warning(self, "Not Found",
-                                    "Could not return this entry — it may have already been updated.")
+                self._finish_mutation(
+                    warning="Could not return this entry — it may have already been updated.",
+                )
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to return entry: {exc}")
+            self._finish_mutation(error=f"Failed to return entry: {exc}")
 
     async def _do_confirm_deletion(self, tx_id: ObjectId) -> None:
         from tahmeed.services.accountant_service import confirm_deletion, get_pending_count
         try:
             ok = await confirm_deletion(tx_id)
             if not ok:
-                QMessageBox.warning(
-                    self, "Not Found",
-                    "Could not delete this entry — it may have already been updated.",
+                self._finish_mutation(
+                    warning="Could not delete this entry — it may have already been updated.",
                 )
                 return
             count = await get_pending_count()
             self.badge_updated.emit(count)
-            self._panel.hide()
-            self._reset_and_load()
+            self._finish_mutation(hide_panel=True, reload=True)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to confirm deletion: {exc}")
+            self._finish_mutation(error=f"Failed to confirm deletion: {exc}")
 
     async def _do_restore_deletion(self, tx_id: ObjectId) -> None:
         from tahmeed.services.accountant_service import restore_deletion, get_pending_count
         try:
             ok = await restore_deletion(tx_id)
             if not ok:
-                QMessageBox.warning(
-                    self, "Not Found",
-                    "Could not restore this entry — it may have already been updated.",
+                self._finish_mutation(
+                    warning="Could not restore this entry — it may have already been updated.",
                 )
                 return
             count = await get_pending_count()
             self.badge_updated.emit(count)
-            self._panel.hide()
-            self._reset_and_load()
+            self._finish_mutation(hide_panel=True, reload=True)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to restore: {exc}")
+            self._finish_mutation(error=f"Failed to restore: {exc}")
 
     async def _do_bulk_confirm_deletions(self, tx_ids: List[ObjectId]) -> None:
         from tahmeed.services.accountant_service import (
@@ -2048,10 +2281,12 @@ class VerifyInboxWidget(QWidget):
             n = await bulk_confirm_deletions(tx_ids)
             count = await get_pending_count()
             self.badge_updated.emit(count)
-            self._reset_and_load()
-            QMessageBox.information(self, "Done", f"Permanently deleted {n} expense(s).")
+            self._finish_mutation(
+                info=f"Permanently deleted {n} expense(s).",
+                reload=True,
+            )
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Bulk delete failed: {exc}")
+            self._finish_mutation(error=f"Bulk delete failed: {exc}")
 
     async def _do_bulk_restore_deletions(self, tx_ids: List[ObjectId]) -> None:
         from tahmeed.services.accountant_service import (
@@ -2061,7 +2296,9 @@ class VerifyInboxWidget(QWidget):
             n = await bulk_restore_deletions(tx_ids)
             count = await get_pending_count()
             self.badge_updated.emit(count)
-            self._reset_and_load()
-            QMessageBox.information(self, "Done", f"Restored {n} expense(s) to Master.")
+            self._finish_mutation(
+                info=f"Restored {n} expense(s) to Master.",
+                reload=True,
+            )
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Bulk restore failed: {exc}")
+            self._finish_mutation(error=f"Bulk restore failed: {exc}")

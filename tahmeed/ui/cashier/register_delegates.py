@@ -11,7 +11,10 @@ from PySide6.QtCore import Qt, QDate, QEvent, QSize, QTimer
 from PySide6.QtGui import QColor, QBrush, QPen, QPainter
 
 from tahmeed.services.truck_format import normalize_truck_number
-from tahmeed.services.cashier_service import search_descriptions
+from tahmeed.services.cashier_service import (
+    search_descriptions,
+    search_descriptions_sync,
+)
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_completion
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
@@ -327,7 +330,12 @@ class _DescriptionDelegate(_ExcelCellDelegate):
                 ed = CompleterLineEdit(subs, parent=parent)
                 ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
                 return ed
-        ed = TruckLineEdit(fetch_fn=search_descriptions, parent=parent)
+        # System-wide description history (all days) with Excel inline preview + Tab.
+        ed = TruckLineEdit(
+            fetch_fn=search_descriptions,
+            sync_fn=search_descriptions_sync,
+            parent=parent,
+        )
         ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
         return ed
 

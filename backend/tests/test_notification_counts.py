@@ -64,7 +64,14 @@ def test_notification_counts_uses_pending_inbox_predicate(role: str) -> None:
     assert response.status_code == 200
     assert response.json() == {"verify": 10}
     assert transactions.queries == [
-        {"verified": False, "rejected": {"$ne": True}},
+        {
+            "verified": False,
+            "rejected": {"$ne": True},
+            "$or": [
+                {"register_status": "submitted"},
+                {"register_status": {"$exists": False}},
+            ],
+        },
         {"deletion_requested": True},
     ]
 

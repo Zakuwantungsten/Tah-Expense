@@ -66,6 +66,12 @@ async def run_import_truck_gate(
         fleet = set()
 
     try:
+        from tahmeed.services.truck_service import get_fleet_kinds
+        fleet_kinds = await get_fleet_kinds()
+    except Exception:
+        fleet_kinds = {}
+
+    try:
         stored = await settings_service.get_setting("allowed_truck_labels")
     except Exception:
         stored = []
@@ -99,6 +105,7 @@ async def run_import_truck_gate(
         can_add=can_add,
         allowed_labels=labels,
         import_mode=True,
+        fleet_kinds=fleet_kinds,
         parent=parent,
     )
     result_code = dlg.exec()

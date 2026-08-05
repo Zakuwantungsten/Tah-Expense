@@ -93,11 +93,13 @@ _FIELD_CANDIDATES: Dict[str, List[str]] = {
 }
 
 # Column layout + required fields per station (matches the real workbook sheets).
+# currency: prefix for money columns / totals (None when the station has no amount).
 _FUEL_SCHEMAS: Dict[str, dict] = {
     "diesel_infinity": {
         "title":      "Infinity Diesel",
         "icon":       "mdi.gas-station",
         "sheet_hint": "INFINITY",
+        "currency":   "TZS",
         "columns": [
             ("S/NO",        "sn",            "text"),
             ("DATE",        "date",          "date"),
@@ -117,6 +119,7 @@ _FUEL_SCHEMAS: Dict[str, dict] = {
         "title":      "Lake Zambia Diesel",
         "icon":       "mdi.water-pump",
         "sheet_hint": "LAKE OIL",
+        "currency":   "USD",
         "columns": [
             ("S/NO",         "sn",            "text"),
             ("DATE",         "date",          "date"),
@@ -136,6 +139,7 @@ _FUEL_SCHEMAS: Dict[str, dict] = {
         "title":      "GBP Diesel",
         "icon":       "mdi.fuel",
         "sheet_hint": "GBP",
+        "currency":   None,
         "columns": [
             ("S/NO",         "sn",            "text"),
             ("DATE",         "date",          "date"),
@@ -154,6 +158,7 @@ _FUEL_SCHEMAS: Dict[str, dict] = {
         "title":      "Lake Tunduma Diesel",
         "icon":       "mdi.water-pump",
         "sheet_hint": "TUNDUMA",
+        "currency":   None,
         "columns": [
             ("DATE",        "date",         "date"),
             ("LPO NO.",     "lpo_no",       "text"),
@@ -333,14 +338,22 @@ def _looks_like_date(val: Any) -> bool:
     return False
 
 
-def _fmt_cell(kind: str, value: Any) -> Tuple[str, Qt.AlignmentFlag, bool]:
-    """Return (text, alignment, mono) for a value given its column kind."""
+def _fmt_cell(
+    kind: str,
+    value: Any,
+    currency: str | None = "TZS",
+) -> Tuple[str, Qt.AlignmentFlag, bool]:
+    """Return (text, alignment, mono) for a value given its column kind.
+
+    Amounts use the same Segoe UI table font as Separate Expenses (no mono).
+    """
     if kind == "date":
         return _fmt_date_str(value), Qt.AlignLeft | Qt.AlignVCenter, False
     if kind == "num":
-        return _fmt_num(value, decimals=2), Qt.AlignRight | Qt.AlignVCenter, True
+        return _fmt_num(value, decimals=2), Qt.AlignRight | Qt.AlignVCenter, False
     if kind == "money":
-        return _fmt_num(value, "TZS ", 0), Qt.AlignRight | Qt.AlignVCenter, True
+        prefix = f"{currency} " if currency else ""
+        return _fmt_num(value, prefix, 0), Qt.AlignRight | Qt.AlignVCenter, False
     return (str(value) if value not in (None, "") else "—",
             Qt.AlignLeft | Qt.AlignVCenter, False)
 
@@ -351,12 +364,13 @@ def _fill_diesel_row(
     rec: dict,
     columns: List[Tuple[str, str, str]],
     sn_offset: int = 0,
+    currency: str | None = "TZS",
 ) -> None:
     for c, (_, key, kind) in enumerate(columns):
         val = rec.get(key, "")
         if key == "sn" and (val is None or str(val).strip() == ""):
             val = sn_offset + 1
-        text, align, mono = _fmt_cell(kind, val)
+        text, align, mono = _fmt_cell(kind, val, currency=currency)
         table.setItem(row, c, _cell(text, align, mono=mono))
     _finish_table_row(table, row)
 
@@ -573,6 +587,7 @@ class _FuelImportDialog(QDialog):
         self._schema    = _FUEL_SCHEMAS[feed_type]
         self._columns   = self._schema["columns"]
         self._required  = self._schema["required"]
+        self._currency  = self._schema.get("currency") or "TZS"
         self._headers   = [c[0] for c in self._columns]
 
         self._wb: Any = None
@@ -663,6 +678,8 @@ class _FuelImportDialog(QDialog):
             self._on_file(path)
 
     def _on_file(self, path: str) -> None:
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
+
         self._source_filename = Path(path).name
         self._stats_lbl.setText("Reading file…")
         self._sheet_cb.blockSignals(True)
@@ -675,7 +692,8 @@ class _FuelImportDialog(QDialog):
         p = Path(path)
         if p.suffix.lower() in (".xlsx", ".xls") and _HAS_OPENPYXL:
             try:
-                self._wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+                with UploadBusy(self, f"Reading {p.name}…", title="Import"):
+                    self._wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
             except Exception as exc:
                 self._stats_lbl.setText(f"Error opening file: {exc}")
                 return
@@ -696,8 +714,9 @@ class _FuelImportDialog(QDialog):
         else:
             self._wb = None
             try:
-                with open(path, newline="", encoding="utf-8-sig") as f:
-                    rows = list(csv.reader(f))
+                with UploadBusy(self, f"Reading {p.name}…", title="Import"):
+                    with open(path, newline="", encoding="utf-8-sig") as f:
+                        rows = list(csv.reader(f))
             except Exception as exc:
                 self._stats_lbl.setText(f"Error reading CSV: {exc}")
                 return
@@ -839,7 +858,7 @@ class _FuelImportDialog(QDialog):
                 val = row.get(key, "")
                 if key == "sn" and (val is None or str(val).strip() == ""):
                     val = i + 1
-                text, align, mono = _fmt_cell(kind, val)
+                text, align, mono = _fmt_cell(kind, val, currency=self._currency)
                 t.setItem(r, c, _cell(text, align, mono=mono))
             _finish_table_row(t, r)
 
@@ -911,6 +930,7 @@ class _DieselAllEntries(QWidget):
         self._feed_type = feed_type
         self._schema = _FUEL_SCHEMAS[feed_type]
         self._columns = self._schema["columns"]
+        self._currency = self._schema.get("currency")
         self._has_amount = any(k == "total_amount" for _, k, _ in self._columns)
         self._search = ""
         self._year = 0
@@ -970,8 +990,8 @@ class _DieselAllEntries(QWidget):
         vl.addWidget(tb)
 
         totals_defs = [("ltrs", "Ltrs: ")]
-        if self._has_amount:
-            totals_defs.append(("amount", "TZS: "))
+        if self._has_amount and self._currency:
+            totals_defs.append(("amount", f"{self._currency}: "))
         totals_defs.append(("count", "Records: "))
         self._totals = _TotalsBar(totals_defs)
         vl.addWidget(self._totals)
@@ -1081,7 +1101,10 @@ class _DieselAllEntries(QWidget):
         for i, rec in enumerate(recs):
             r = self._table.rowCount()
             self._table.insertRow(r)
-            _fill_diesel_row(self._table, r, rec, self._columns, self._loaded + i)
+            _fill_diesel_row(
+                self._table, r, rec, self._columns, self._loaded + i,
+                currency=self._currency,
+            )
 
     def _on_scroll(self, value: int) -> None:
         bar = self._table.verticalScrollBar()
@@ -1138,7 +1161,9 @@ class _DieselAllEntries(QWidget):
 #  Upload browse — one row per import batch
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_BROWSE_HEADERS = ["UPLOAD DATE", "SHEET", "FILE NAME", "RECORDS", "LTRS", "TOTAL (TZS)"]
+def _browse_headers(currency: str | None) -> List[str]:
+    total_hdr = f"TOTAL ({currency})" if currency else "TOTAL"
+    return ["UPLOAD DATE", "SHEET", "FILE NAME", "RECORDS", "LTRS", total_hdr]
 
 
 class _DieselUploadBrowse(QWidget):
@@ -1148,6 +1173,7 @@ class _DieselUploadBrowse(QWidget):
     def __init__(self, feed_type: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._feed_type = feed_type
+        self._currency = _FUEL_SCHEMAS[feed_type].get("currency")
         self._uploads: List[dict] = []
         self._build()
 
@@ -1157,7 +1183,7 @@ class _DieselUploadBrowse(QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        self._table = _make_table(_BROWSE_HEADERS)
+        self._table = _make_table(_browse_headers(self._currency))
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setColumnWidth(0, 160)
@@ -1171,8 +1197,9 @@ class _DieselUploadBrowse(QWidget):
         self._table.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table, 1)
 
+        amt_prefix = f"{self._currency}: " if self._currency else "Total: "
         self._totals = _TotalsBar([("count", "Total records: "),
-                                   ("ltrs", "Ltrs: "), ("amount", "TZS: ")])
+                                   ("ltrs", "Ltrs: "), ("amount", amt_prefix)])
         vl.addWidget(self._totals)
 
         hint = _lbl("Click a row to view its records · right-click to delete an upload.",
@@ -1218,9 +1245,9 @@ class _DieselUploadBrowse(QWidget):
             t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
             t.setItem(r, 3, _cell(f"{count:,}", Qt.AlignCenter | Qt.AlignVCenter))
             t.setItem(r, 4, _cell(_fmt_num(ltrs, decimals=0),
-                                  Qt.AlignRight | Qt.AlignVCenter, mono=True))
+                                  Qt.AlignRight | Qt.AlignVCenter))
             t.setItem(r, 5, _cell(_fmt_num(amt, decimals=0),
-                                  Qt.AlignRight | Qt.AlignVCenter, mono=True))
+                                  Qt.AlignRight | Qt.AlignVCenter))
             _finish_table_row(t, r)
             tot_recs += count
             tot_ltrs += ltrs
@@ -1256,6 +1283,7 @@ class _DieselUploadDetail(QWidget):
         self._feed_type = feed_type
         self._schema    = _FUEL_SCHEMAS[feed_type]
         self._columns   = self._schema["columns"]
+        self._currency  = self._schema.get("currency")
         self._has_amount = any(k == "total_amount" for _, k, _ in self._columns)
         self._upload_id = ""
         self._upload_doc: dict = {}
@@ -1311,8 +1339,8 @@ class _DieselUploadDetail(QWidget):
         vl.addWidget(self._table, 1)
 
         totals_defs = [("ltrs", "Ltrs: ")]
-        if self._has_amount:
-            totals_defs.append(("amount", "TZS: "))
+        if self._has_amount and self._currency:
+            totals_defs.append(("amount", f"{self._currency}: "))
         totals_defs.append(("count", "Records: "))
         self._totals = _TotalsBar(totals_defs)
         vl.addWidget(self._totals)
@@ -1415,7 +1443,10 @@ class _DieselUploadDetail(QWidget):
         for i, rec in enumerate(recs):
             r = self._table.rowCount()
             self._table.insertRow(r)
-            _fill_diesel_row(self._table, r, rec, self._columns, self._loaded + i)
+            _fill_diesel_row(
+                self._table, r, rec, self._columns, self._loaded + i,
+                currency=self._currency,
+            )
 
     def _on_search(self, text: str) -> None:
         self._search = text

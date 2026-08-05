@@ -1,4 +1,4 @@
-"""AccountantDashboard — Main shell: header + sidebar + content stack + status bar."""
+"""AccountantDashboard — Main shell: title + menu + header + sidebar + content."""
 
 from __future__ import annotations
 import asyncio
@@ -10,42 +10,45 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 
+from tahmeed.config import APP_NAME, APP_VERSION
 from tahmeed.models.user import User
 from tahmeed.services.category_service import get_all_categories
 from tahmeed.ui.dialogs.change_password_dialog import ChangePasswordDialog
-from tahmeed.ui.accountant.header_bar import HeaderBar
+from tahmeed.ui.accountant.menu_bar import AccountantMenuBar
 from tahmeed.ui.accountant.sidebar import SidebarWidget
+from tahmeed.ui.accountant.title_bar import AccountantTitleBar
 from tahmeed.ui.accountant.overview import OverviewWidget
-from tahmeed.ui.accountant.truck_overview import TruckOverviewWidget
-from tahmeed.ui.accountant.verify_inbox import VerifyInboxWidget
-from tahmeed.ui.accountant.master_expenses import MasterExpensesWidget
-from tahmeed.ui.accountant.separate_expenses import (
-    TollPlazaWidget,
-    ParkingCongoWidget,
-    CongoExpensesWidget,
-    AhmedKimviWidget,
-    ZambiaParkingWidget,
-    AfritrackWidget,
-    ThirdPartyWidget,
-    ComesaWidget,
-    RahnTechWidget,
-)
-from tahmeed.ui.accountant.category_tables import CategoryTableWidget
-from tahmeed.ui.accountant.reconciliation import RPAScheduleWidget, BondsWidget
-from tahmeed.ui.accountant.fuel_consumption import (
-    InfinityWidget, LakeZambiaWidget, LakeTundumaWidget, GBPDieselWidget,
-)
-from tahmeed.ui.accountant.diesel_cash import DieselCashWidget
-from tahmeed.ui.accountant.fleet_registry import TrucksRegistryWidget, TrailersRegistryWidget
-from tahmeed.ui.accountant.manage_items import ManageItemsWidget
-from tahmeed.ui.accountant.manage_people import PeopleRegistryWidget
-from tahmeed.ui.accountant.backup import BackupWidget
-from tahmeed.ui.admin.users_tab import UsersTab
-from tahmeed.ui.cashier.excel_grid import DailyRegister
-from tahmeed.ui.cashier.transactions_table import TransactionBrowser
-from tahmeed.ui.cashier.dashboard import _TablePage
 
 _APP_BG = "#F4F6F8"
+
+# Sidebar keys that map to dedicated pages (created on first visit).
+_LAZY_PAGE_KEYS = frozenset({
+    "truck_overview",
+    "verify",
+    "master_expenses",
+    "toll_plaza",
+    "parking_congo",
+    "congo_exp",
+    "ahmed_kimvi",
+    "zambia_parking",
+    "afritrack",
+    "third_party",
+    "comesa",
+    "diesel_cash",
+    "infinity",
+    "lake_zambia",
+    "lake_tunduma",
+    "gbp_diesel",
+    "rahntech",
+    "manage_trucks",
+    "manage_trailers",
+    "manage_categories",
+    "manage_people",
+    "manage_users",
+    "backup",
+    "table",
+    "browse",
+})
 
 
 class AccountantDashboard(QWidget):
@@ -55,10 +58,16 @@ class AccountantDashboard(QWidget):
         super().__init__(parent)
         self._user = user
         self._notification_poll_in_flight = False
+        # Lazily created pages (except overview).
+        self._pages: dict[str, QWidget] = {}
+        self._page_indices: dict[str, int] = {}
+        self._register = None  # DailyRegister, created with "table"
+        self._pending_categories: list | None = None
+        self._pending_people: list | None = None
         self._build()
         asyncio.ensure_future(self._load_categories())
         self._notification_timer = QTimer(self)
-        self._notification_timer.setInterval(5_000)
+        self._notification_timer.setInterval(2_000)
         self._notification_timer.timeout.connect(self._poll_notification_counts)
         self._notification_timer.start()
         self._poll_notification_counts()
@@ -73,15 +82,28 @@ class AccountantDashboard(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Header bar ─────────────────────────────────────────────────────
-        self._header = HeaderBar(
-            user=self._user,
-            sidebar_toggle_fn=self._toggle_sidebar,
-            show_search=False,
+        # ── QuickBooks-style chrome ───────────────────────────────────────
+        self._title_bar = AccountantTitleBar(user=self._user)
+        self._title_bar.minimize_requested.connect(self._on_minimize)
+        self._title_bar.maximize_requested.connect(self._on_maximize)
+        self._title_bar.close_requested.connect(self._on_exit)
+        root.addWidget(self._title_bar)
+
+        self._menu_bar = AccountantMenuBar(
+            user_display_name=self._user.full_name or self._user.username,
         )
-        self._header.logout_requested.connect(self.logout_requested)
-        self._header.change_password_requested.connect(self._on_change_password)
-        root.addWidget(self._header)
+        self._menu_bar.bind(
+            navigate=self._menu_navigate,
+            navigate_sub=self._menu_navigate_sub,
+            toggle_sidebar=self._toggle_sidebar,
+            refresh=self._refresh_current,
+            change_password=self._on_change_password,
+            logout=self.logout_requested.emit,
+            exit_app=self._on_exit,
+            about=self._on_about,
+            find=self._on_find,
+        )
+        root.addWidget(self._menu_bar)
 
         # ── Body = sidebar + content ───────────────────────────────────────
         body = QWidget()
@@ -105,7 +127,8 @@ class AccountantDashboard(QWidget):
         vline.setStyleSheet("background: #E5E7EB;")
         body_hl.addWidget(vline)
 
-        # Content stack
+        # Content stack — only Overview (+ placeholder) at login.
+        # Heavy tabs are created on first navigation to keep login snappy.
         self._stack = QStackedWidget()
         self._stack.setObjectName("contentStack")
         self._stack.setStyleSheet(
@@ -113,117 +136,228 @@ class AccountantDashboard(QWidget):
         )
         self._overview = OverviewWidget()
         self._overview.navigate.connect(self._on_overview_nav)
-        self._stack.addWidget(self._overview)         # index 0 — Overview
+        self._page_indices["overview"] = self._stack.addWidget(self._overview)
+        self._pages["overview"] = self._overview
 
-        self._truck_overview = TruckOverviewWidget()
-        self._stack.addWidget(self._truck_overview)   # index 1 — Truck Overview
+        self._placeholder_index = self._stack.addWidget(_PlaceholderPage())
 
-        self._verify_inbox = VerifyInboxWidget(user=self._user)
-        self._verify_inbox.badge_updated.connect(self._on_badge_updated)
-        self._stack.addWidget(self._verify_inbox)     # index 2 — Verify Inbox
-
-        self._master_expenses = MasterExpensesWidget(user=self._user)
-        self._stack.addWidget(self._master_expenses)  # index 3 — Master Expenses
-
-        # ── Separate Expenses ─────────────────────────────────────────────────
-        self._toll_plaza       = TollPlazaWidget()
-        self._stack.addWidget(self._toll_plaza)        # index 4
-
-        self._parking_congo    = ParkingCongoWidget()
-        self._stack.addWidget(self._parking_congo)     # index 5
-
-        self._congo_exp        = CongoExpensesWidget()
-        self._stack.addWidget(self._congo_exp)         # index 6
-
-        self._ahmed_kimvi      = AhmedKimviWidget()
-        self._stack.addWidget(self._ahmed_kimvi)       # index 7
-
-        self._zambia_parking   = ZambiaParkingWidget()
-        self._stack.addWidget(self._zambia_parking)    # index 8
-
-        self._afritrack        = AfritrackWidget()
-        self._stack.addWidget(self._afritrack)         # index 9
-
-        self._third_party      = ThirdPartyWidget()
-        self._stack.addWidget(self._third_party)       # index 10
-
-        self._comesa           = ComesaWidget()
-        self._stack.addWidget(self._comesa)            # index 11
-
-        self._stack.addWidget(_PlaceholderPage())      # index 12 — other sections
-
-        # ── Fuel Consumption ──────────────────────────────────────────────────
-        self._diesel_cash   = DieselCashWidget()
-        self._stack.addWidget(self._diesel_cash)        # index 13
-
-        self._infinity      = InfinityWidget()
-        self._stack.addWidget(self._infinity)           # index 14
-
-        self._lake_zambia   = LakeZambiaWidget()
-        self._stack.addWidget(self._lake_zambia)        # index 15
-
-        self._lake_tunduma  = LakeTundumaWidget()
-        self._stack.addWidget(self._lake_tunduma)       # index 16
-
-        self._gbp_diesel    = GBPDieselWidget()
-        self._stack.addWidget(self._gbp_diesel)         # index 17
-
-        # ── RahnTech ──────────────────────────────────────────────────────────
-        self._rahntech = RahnTechWidget()
-        self._stack.addWidget(self._rahntech)           # index 18
-
-        # ── Fleet Registry ────────────────────────────────────────────────────
-        self._trucks_registry = TrucksRegistryWidget()
-        self._stack.addWidget(self._trucks_registry)    # index 19
-
-        self._trailers_registry = TrailersRegistryWidget()
-        self._stack.addWidget(self._trailers_registry)  # index 20
-
-        self._manage_items = ManageItemsWidget()
-        self._stack.addWidget(self._manage_items)        # index 21
-        # Rebuild the sidebar's dynamic ITEMS whenever the accountant changes them.
-        self._manage_items.items_changed.connect(self._sidebar.refresh_items)
-
-        self._people_registry = PeopleRegistryWidget()
-        self._stack.addWidget(self._people_registry)     # index 22
-
-        self._users_tab = UsersTab()
-        self._stack.addWidget(self._users_tab)           # index 23
-
-        self._backup = BackupWidget(allow_restore=True)
-        self._backup.logout_requested.connect(self.logout_requested)
-        self._stack.addWidget(self._backup)              # index 24
-
-        # Cashier daily register (Table) — same widget the cashier uses
-        self._register = DailyRegister(user=self._user, categories=[])
-        self._table_page = _TablePage(self._register)
-        self._stack.addWidget(self._table_page)          # index 25 — Cashier Table
-
-        self._browser = TransactionBrowser()
-        self._browser.go_to_date.connect(self._on_go_to_date)
-        self._stack.addWidget(self._browser)             # index 26 — Browse
-
-        # Live-refresh a single item's sub-item strip when its sub-items change.
-        self._manage_items.subitems_changed.connect(self._sidebar.refresh_subitems)
-
-        # Category tables (one per ITEMS sidebar key) and user-created
-        # sub-tables are created lazily and cached here as key -> stack index.
+        # Category tables / recon views — already lazy; keep same caches.
         self._category_indices: dict[str, int] = {}
         self._subtable_indices: dict[str, int] = {}
-        self._recon_indices: dict[str, int] = {}   # "rpa_schedule" | "bonds" -> stack idx
+        self._recon_indices: dict[str, int] = {}
 
-        self._stack.setCurrentIndex(0)
+        self._stack.setCurrentIndex(self._page_indices["overview"])
         body_hl.addWidget(self._stack, 1)
 
         root.addWidget(body, 1)
-
-        # ── Status bar ──────────────────────────────────────────────────────
         root.addWidget(_StatusBar())
+
+    # ── Lazy page factories ─────────────────────────────────────────────────
+
+    def _ensure_page(self, key: str) -> QWidget:
+        """Create and cache a dedicated page the first time it is opened."""
+        if key in self._pages:
+            return self._pages[key]
+        widget = self._create_page(key)
+        self._page_indices[key] = self._stack.addWidget(widget)
+        self._pages[key] = widget
+        return widget
+
+    def _create_page(self, key: str) -> QWidget:
+        # Imports are deferred so login does not pay for every heavy module.
+        if key == "truck_overview":
+            from tahmeed.ui.accountant.truck_overview import TruckOverviewWidget
+            return TruckOverviewWidget()
+
+        if key == "verify":
+            from tahmeed.ui.accountant.verify_inbox import VerifyInboxWidget
+            widget = VerifyInboxWidget(user=self._user)
+            widget.badge_updated.connect(self._on_badge_updated)
+            return widget
+
+        if key == "master_expenses":
+            from tahmeed.ui.accountant.master_expenses import MasterExpensesWidget
+            return MasterExpensesWidget(user=self._user)
+
+        if key == "toll_plaza":
+            from tahmeed.ui.accountant.separate_expenses import TollPlazaWidget
+            return TollPlazaWidget()
+
+        if key == "parking_congo":
+            from tahmeed.ui.accountant.separate_expenses import ParkingCongoWidget
+            return ParkingCongoWidget()
+
+        if key == "congo_exp":
+            from tahmeed.ui.accountant.separate_expenses import CongoExpensesWidget
+            return CongoExpensesWidget()
+
+        if key == "ahmed_kimvi":
+            from tahmeed.ui.accountant.separate_expenses import AhmedKimviWidget
+            return AhmedKimviWidget()
+
+        if key == "zambia_parking":
+            from tahmeed.ui.accountant.separate_expenses import ZambiaParkingWidget
+            return ZambiaParkingWidget()
+
+        if key == "afritrack":
+            from tahmeed.ui.accountant.separate_expenses import AfritrackWidget
+            return AfritrackWidget()
+
+        if key == "third_party":
+            from tahmeed.ui.accountant.separate_expenses import ThirdPartyWidget
+            return ThirdPartyWidget()
+
+        if key == "comesa":
+            from tahmeed.ui.accountant.separate_expenses import ComesaWidget
+            return ComesaWidget()
+
+        if key == "diesel_cash":
+            from tahmeed.ui.accountant.diesel_cash import DieselCashWidget
+            return DieselCashWidget()
+
+        if key == "infinity":
+            from tahmeed.ui.accountant.fuel_consumption import InfinityWidget
+            return InfinityWidget()
+
+        if key == "lake_zambia":
+            from tahmeed.ui.accountant.fuel_consumption import LakeZambiaWidget
+            return LakeZambiaWidget()
+
+        if key == "lake_tunduma":
+            from tahmeed.ui.accountant.fuel_consumption import LakeTundumaWidget
+            return LakeTundumaWidget()
+
+        if key == "gbp_diesel":
+            from tahmeed.ui.accountant.fuel_consumption import GBPDieselWidget
+            return GBPDieselWidget()
+
+        if key == "rahntech":
+            from tahmeed.ui.accountant.separate_expenses import RahnTechWidget
+            return RahnTechWidget()
+
+        if key == "manage_trucks":
+            from tahmeed.ui.accountant.fleet_registry import TrucksRegistryWidget
+            return TrucksRegistryWidget()
+
+        if key == "manage_trailers":
+            from tahmeed.ui.accountant.fleet_registry import TrailersRegistryWidget
+            return TrailersRegistryWidget()
+
+        if key == "manage_categories":
+            from tahmeed.ui.accountant.manage_items import ManageItemsWidget
+            widget = ManageItemsWidget()
+            widget.items_changed.connect(self._sidebar.refresh_items)
+            widget.subitems_changed.connect(self._sidebar.refresh_subitems)
+            return widget
+
+        if key == "manage_people":
+            from tahmeed.ui.accountant.manage_people import PeopleRegistryWidget
+            return PeopleRegistryWidget()
+
+        if key == "manage_users":
+            from tahmeed.ui.admin.users_tab import UsersTab
+            return UsersTab()
+
+        if key == "backup":
+            from tahmeed.ui.accountant.backup import BackupWidget
+            widget = BackupWidget(allow_restore=True)
+            widget.logout_requested.connect(self.logout_requested)
+            return widget
+
+        if key == "table":
+            from tahmeed.ui.cashier.excel_grid import DailyRegister
+            from tahmeed.ui.cashier.dashboard import _TablePage
+            self._register = DailyRegister(user=self._user, categories=[])
+            if self._pending_categories is not None:
+                self._register.update_categories(self._pending_categories)
+                self._pending_categories = None
+            if self._pending_people is not None:
+                self._register.update_people(self._pending_people)
+                self._pending_people = None
+            return _TablePage(self._register)
+
+        if key == "browse":
+            from tahmeed.ui.cashier.transactions_table import TransactionBrowser
+            widget = TransactionBrowser()
+            widget.go_to_date.connect(self._on_go_to_date)
+            return widget
+
+        raise KeyError(f"Unknown lazy page key: {key}")
 
     # ── Slot handlers ───────────────────────────────────────────────────────
 
     def _toggle_sidebar(self) -> None:
         self._sidebar.toggle_collapsed()
+
+    def _host_window(self):
+        return self.window()
+
+    def _on_minimize(self) -> None:
+        win = self._host_window()
+        if win is not None:
+            win.showMinimized()
+
+    def _on_maximize(self) -> None:
+        win = self._host_window()
+        if win is None:
+            return
+        if win.isMaximized():
+            win.showNormal()
+            self._title_bar.set_maximized(False)
+        else:
+            win.showMaximized()
+            self._title_bar.set_maximized(True)
+
+    def _on_exit(self) -> None:
+        win = self._host_window()
+        if win is not None:
+            win.close()
+
+    def _menu_navigate(self, key: str) -> None:
+        self._sidebar.select(key)
+        self._on_nav(key)
+
+    def _menu_navigate_sub(self, parent_key: str, match: str) -> None:
+        labels = {"rpa_schedule": "RPA Schedule", "bonds": "Bonds"}
+        name = labels.get(match, match)
+        self._sidebar.select(parent_key)
+        expanded = getattr(self._sidebar, "_expanded", set())
+        if parent_key not in expanded:
+            toggle = getattr(self._sidebar, "_on_toggle", None)
+            if callable(toggle):
+                toggle(parent_key)
+        self._show_subtable(parent_key, "SM Burhani", name, match)
+
+    def _refresh_current(self) -> None:
+        widget = self._stack.currentWidget()
+        refresh = getattr(widget, "refresh", None)
+        if callable(refresh):
+            refresh()
+
+    def _on_about(self) -> None:
+        QMessageBox.about(
+            self,
+            f"About {APP_NAME}",
+            (
+                f"<b>{APP_NAME}</b><br>"
+                f"Accountant Edition<br><br>"
+                f"Version {APP_VERSION}<br>"
+                f"TAHMEED TRANSPORTERS"
+            ),
+        )
+
+    def _on_find(self) -> None:
+        QMessageBox.information(
+            self,
+            "Find",
+            "Global search across trucks, descriptions, and amounts "
+            "will be available in a future update.\n\n"
+            "Use Browse or the page filters for now.",
+        )
+
+    def sync_chrome_maximized(self, maximized: bool) -> None:
+        """Keep title-bar restore/maximize icon in sync with the host window."""
+        self._title_bar.set_maximized(maximized)
 
     def _on_change_password(self) -> None:
         dlg = ChangePasswordDialog(parent=self)
@@ -295,78 +429,71 @@ class AccountantDashboard(QWidget):
             self._notification_poll_in_flight = False
 
     def _on_nav(self, key: str) -> None:
-        _routes = {
-            "overview":       (0,  self._overview),
-            "truck_overview": (1,  self._truck_overview),
-            "verify":         (2,  self._verify_inbox),
-            "master_expenses":(3,  self._master_expenses),
-            "toll_plaza":     (4,  self._toll_plaza),
-            "parking_congo":  (5,  self._parking_congo),
-            "congo_exp":      (6,  self._congo_exp),
-            "ahmed_kimvi":    (7,  self._ahmed_kimvi),
-            "zambia_parking": (8,  self._zambia_parking),
-            "afritrack":      (9,  self._afritrack),
-            "third_party":    (10, self._third_party),
-            "comesa":         (11, self._comesa),
-            "diesel_cash":    (13, self._diesel_cash),
-            "infinity":       (14, self._infinity),
-            "lake_zambia":    (15, self._lake_zambia),
-            "lake_tunduma":   (16, self._lake_tunduma),
-            "gbp_diesel":     (17, self._gbp_diesel),
-            "rahntech":         (18, self._rahntech),
-            "manage_trucks":    (19, self._trucks_registry),
-            "manage_trailers":  (20, self._trailers_registry),
-            "manage_categories":(21, self._manage_items),
-            "manage_people":    (22, self._people_registry),
-            "manage_users":     (23, self._users_tab),
-            "backup":           (24, self._backup),
-            "table":            (25, self._register),
-            "browse":           (26, self._browser),
-        }
-        if key in _routes:
-            idx, widget = _routes[key]
-            self._stack.setCurrentIndex(idx)
+        if key == "overview":
+            self._stack.setCurrentIndex(self._page_indices["overview"])
+            refresh = getattr(self._overview, "refresh", None)
+            if callable(refresh):
+                refresh()
+            return
+
+        if key in _LAZY_PAGE_KEYS:
+            widget = self._ensure_page(key)
+            self._stack.setCurrentIndex(self._page_indices[key])
             if key == "table":
+                assert self._register is not None
                 self._register.reload_settings()
                 return
             refresh = getattr(widget, "refresh", None)
             if callable(refresh):
                 refresh()
-        elif self._sidebar.item_def(key) is not None:
+            return
+
+        if self._sidebar.item_def(key) is not None:
             self._show_category(key)
         elif key == "sm_burhani":
             # Parent click is handled by the sidebar (expand + first sub-item).
             pass
         else:
-            self._stack.setCurrentIndex(12)
+            self._stack.setCurrentIndex(self._placeholder_index)
 
     def _on_go_to_date(self, d, term: str = "") -> None:
         self._sidebar.select("table")
         self._on_nav("table")
+        assert self._register is not None
         self._register.navigate_to_date(d, highlight_term=term)
 
     async def prepare_to_leave(self) -> bool:
         """Prompt to save/discard unsaved table entries before logout or exit."""
+        if self._register is None:
+            return True
         return await self._register.confirm_leave()
 
     async def _load_categories(self) -> None:
         try:
             cats = await get_all_categories()
-            self._register.update_categories(cats)
+            if self._register is not None:
+                self._register.update_categories(cats)
+            else:
+                self._pending_categories = cats
         except Exception:
             pass
         try:
             from tahmeed.services.people_service import get_people_names
-            self._register.update_people(await get_people_names())
+            people = await get_people_names()
+            if self._register is not None:
+                self._register.update_people(people)
+            else:
+                self._pending_people = people
         except Exception:
             pass
 
     def _show_category(self, key: str) -> None:
         """Lazily create (and cache) the item table for this dynamic sidebar key."""
         if key not in self._category_indices:
+            from tahmeed.ui.accountant.category_tables import CategoryTableWidget
             d = self._sidebar.item_def(key)
             if d is None:
-                self._stack.setCurrentIndex(11)
+                self._stack.setCurrentIndex(self._placeholder_index)
                 return
             title, icon, label = d
             widget = CategoryTableWidget(category_name=title, title=label, icon_name=icon)
@@ -378,6 +505,9 @@ class AccountantDashboard(QWidget):
     def _show_recon(self, match: str) -> None:
         """Lazily create (and cache) an SM Burhani reconciliation view."""
         if match not in self._recon_indices:
+            from tahmeed.ui.accountant.reconciliation import (
+                RPAScheduleWidget, BondsWidget,
+            )
             widget = BondsWidget() if match == "bonds" else RPAScheduleWidget()
             self._recon_indices[match] = self._stack.addWidget(widget)
         idx = self._recon_indices[match]
@@ -392,6 +522,7 @@ class AccountantDashboard(QWidget):
             return
         cache_key = f"{parent_key}::{name}"
         if cache_key not in self._subtable_indices:
+            from tahmeed.ui.accountant.category_tables import CategoryTableWidget
             d = self._sidebar.item_def(parent_key)
             icon = d[1] if d else "mdi.tag-outline"
             parent_label = d[2] if d else parent_category

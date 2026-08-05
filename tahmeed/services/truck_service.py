@@ -9,14 +9,18 @@ from tahmeed.services.truck_format import normalize_truck_number
 _fleet_list: Optional[List[str]] = None
 _fleet_set: Optional[set[str]] = None
 _trucks_list: Optional[List[str]] = None
+_trailers_list: Optional[List[str]] = None
+_fleet_kinds: Optional[Dict[str, str]] = None  # number → "truck" | "trailer"
 _cache_lock = asyncio.Lock()
 
 
 def invalidate_fleet_cache() -> None:
-    global _fleet_list, _fleet_set, _trucks_list
+    global _fleet_list, _fleet_set, _trucks_list, _trailers_list, _fleet_kinds
     _fleet_list = None
     _fleet_set = None
     _trucks_list = None
+    _trailers_list = None
+    _fleet_kinds = None
 
 
 async def _page(
@@ -89,7 +93,7 @@ def _normalize_for_write(number: str) -> str:
 
 
 async def _ensure_fleet_cache() -> List[str]:
-    global _fleet_list, _fleet_set, _trucks_list
+    global _fleet_list, _fleet_set, _trucks_list, _trailers_list, _fleet_kinds
     if _fleet_list is not None:
         return _fleet_list
     async with _cache_lock:
@@ -111,12 +115,22 @@ async def _ensure_fleet_cache() -> List[str]:
         ]
         seen: set[str] = set()
         combined: list[str] = []
-        for number in truck_numbers + trailer_numbers:
+        kinds: Dict[str, str] = {}
+        for number in truck_numbers:
+            kinds[number] = "truck"
+            if number not in seen:
+                seen.add(number)
+                combined.append(number)
+        for number in trailer_numbers:
+            # Prefer truck if somehow duplicated across both collections
+            kinds.setdefault(number, "trailer")
             if number not in seen:
                 seen.add(number)
                 combined.append(number)
         combined.sort()
         _trucks_list = sorted(set(truck_numbers))
+        _trailers_list = sorted(set(trailer_numbers))
+        _fleet_kinds = kinds
         _fleet_set = seen
         _fleet_list = combined
         return _fleet_list
@@ -167,6 +181,28 @@ async def get_fleet_numbers(active_only: bool = True) -> set:
         for document in trucks + trailers
         if document.get("number")
     }
+
+
+async def get_fleet_kinds() -> Dict[str, str]:
+    """Return ``{number: "truck"|"trailer"}`` for the active fleet registry."""
+    await _ensure_fleet_cache()
+    assert _fleet_kinds is not None
+    return dict(_fleet_kinds)
+
+
+def lookup_fleet_kind_sync(number: str) -> Optional[str]:
+    """Sync lookup of truck vs trailer from the warm cache (``None`` if unknown)."""
+    if _fleet_kinds is None or not number:
+        return None
+    key = number.strip().upper()
+    kind = _fleet_kinds.get(key)
+    if kind:
+        return kind
+    # Try canonical form
+    result = normalize_truck_number(key, allowed_labels=())
+    if result.status in ("ok", "normalized") and result.value:
+        return _fleet_kinds.get(result.value)
+    return None
 
 
 def _active(active_filter: str) -> bool | None:

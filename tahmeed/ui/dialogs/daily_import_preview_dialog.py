@@ -1,0 +1,150 @@
+"""Confirm preview before staging a daily Excel import into the table."""
+
+from __future__ import annotations
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+)
+
+from tahmeed.services.daily_import_service import DailyImportPreview
+from tahmeed.ui.cashier.register_delegates import format_register_date
+
+_WHITE = "#FFFFFF"
+_BG = "#F4F6F8"
+_BORDER = "#E5E7EB"
+_BLUE = "#0077C5"
+_T1 = "#111827"
+_T2 = "#6B7280"
+
+_PREVIEW_HEADERS = ("Date", "Description", "Truck", "Amount", "Item")
+_PREVIEW_LIMIT = 10
+
+
+class DailyImportPreviewDialog(QDialog):
+    """Show import summary + sample rows; Confirm loads into the Daily Register."""
+
+    def __init__(self, preview: DailyImportPreview, parent=None) -> None:
+        super().__init__(parent)
+        self._preview = preview
+        self.setWindowTitle("Import Preview")
+        self.setMinimumSize(720, 420)
+        self.setModal(True)
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet(
+            f"QDialog {{ background: {_BG}; }}"
+            "QLabel { border: none; background: transparent; }"
+        )
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(12)
+
+        title = QLabel("Review import before loading")
+        title.setStyleSheet(
+            f"color: {_T1}; font-size: 16px; font-weight: 700;"
+        )
+        root.addWidget(title)
+
+        p = self._preview
+        primary = (
+            p.primary_date.strftime("%d/%m/%Y") if p.primary_date else "—"
+        )
+        skipped = p.skipped_blank
+        unmapped = sum(p.unmapped.values()) if p.unmapped else 0
+        summary = QLabel(
+            f"<b>{p.source_filename}</b><br>"
+            f"{len(p.rows):,} row(s) ready · Main date <b>{primary}</b>"
+            + (f" · {skipped:,} blank/skipped" if skipped else "")
+            + (f" · {unmapped:,} without item" if unmapped else "")
+        )
+        summary.setStyleSheet(f"color: {_T2}; font-size: 12px;")
+        summary.setWordWrap(True)
+        root.addWidget(summary)
+
+        card = QFrame()
+        card.setObjectName("previewCard")
+        card.setStyleSheet(
+            f"QFrame#previewCard {{ background: {_WHITE};"
+            f" border: 1px solid {_BORDER}; border-radius: 10px; }}"
+        )
+        cvl = QVBoxLayout(card)
+        cvl.setContentsMargins(12, 10, 12, 10)
+        cvl.setSpacing(8)
+
+        sample_n = min(_PREVIEW_LIMIT, len(p.rows))
+        hint = QLabel(f"Preview (first {sample_n} of {len(p.rows):,})")
+        hint.setStyleSheet(f"color: {_T1}; font-size: 12px; font-weight: 600;")
+        cvl.addWidget(hint)
+
+        table = QTableWidget(sample_n, len(_PREVIEW_HEADERS))
+        table.setHorizontalHeaderLabels(list(_PREVIEW_HEADERS))
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.NoSelection)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setStyleSheet(
+            "QTableWidget { background: #fff; gridline-color: #e5e7eb;"
+            " border: 1px solid #e5e7eb; border-radius: 6px; }"
+            "QHeaderView::section { background: #253A5C; color: #F9FAFB;"
+            " padding: 6px; border: none; font-weight: 600; }"
+        )
+        hh = table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+
+        for i, row in enumerate(p.rows[:_PREVIEW_LIMIT]):
+            amt = f"{row.amount:,.2f} {row.currency}" if row.amount else ""
+            vals = (
+                format_register_date(row.date),
+                row.description or "",
+                row.truck_number or "",
+                amt,
+                row.category_name or "—",
+            )
+            for c, text in enumerate(vals):
+                it = QTableWidgetItem(text)
+                it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                if c == 3:
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                table.setItem(i, c, it)
+
+        cvl.addWidget(table)
+        root.addWidget(card, 1)
+
+        note = QLabel(
+            "Confirm to load these rows into the Daily Register table. "
+            "Nothing is saved until you click Save."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {_T2}; font-size: 11px;")
+        root.addWidget(note)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.setCursor(Qt.PointingHandCursor)
+        cancel.setStyleSheet(
+            f"QPushButton{{background:#fff;color:{_T1};border:1px solid {_BORDER};"
+            "border-radius:6px;padding:8px 16px;font-weight:600;}}"
+            "QPushButton:hover{background:#f9fafb;}"
+        )
+        cancel.clicked.connect(self.reject)
+        confirm = QPushButton(f"Load {len(p.rows):,} into Table")
+        confirm.setCursor(Qt.PointingHandCursor)
+        confirm.setDefault(True)
+        confirm.setStyleSheet(
+            f"QPushButton{{background:{_BLUE};color:#fff;border:none;"
+            "border-radius:6px;padding:8px 16px;font-weight:600;}}"
+            "QPushButton:hover{background:#0066a8;}"
+        )
+        confirm.clicked.connect(self.accept)
+        btns.addWidget(cancel)
+        btns.addWidget(confirm)
+        root.addLayout(btns)

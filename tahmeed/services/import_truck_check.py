@@ -41,6 +41,11 @@ FEED_SAVE_TARGET: Dict[str, str] = {
     "ahmed_kimvi": "separate_expenses",
 }
 
+# Ledger placeholders that are not real truck numbers (Parking Congo deposits, etc.)
+_BLANK_TRUCK_TOKENS = frozenset({
+    "-", "–", "—", "−", ".", "n/a", "na", "none", "nil", "null", "n.a.",
+})
+
 
 @dataclass
 class ImportTruckScanResult:
@@ -49,6 +54,7 @@ class ImportTruckScanResult:
     issues: List[TruckIssue] = field(default_factory=list)
     ok_count: int = 0
     empty_count: int = 0
+    deposit_count: int = 0
 
 
 def truck_field_for(feed_key: str) -> Optional[str]:
@@ -57,6 +63,29 @@ def truck_field_for(feed_key: str) -> Optional[str]:
 
 def save_target_for(feed_key: str) -> str:
     return FEED_SAVE_TARGET.get(feed_key, "imported_feeds")
+
+
+def is_deposit_transaction(transaction_type: object) -> bool:
+    """True when Type/transaction_type is a Parking Congo (or similar) deposit."""
+    return str(transaction_type or "").strip().lower() == "deposit"
+
+
+def is_blank_truck_value(raw: object) -> bool:
+    """True for empty cells and ledger placeholders like ``-`` / ``N/A``."""
+    s = str(raw or "").strip()
+    if not s:
+        return True
+    return s.lower() in _BLANK_TRUCK_TOKENS
+
+
+def mark_parking_congo_deposit(row: dict, truck_field: str = "vehicle_no") -> None:
+    """Tag a deposit row and clear placeholder vehicle / direction cells."""
+    row["is_deposit"] = True
+    if is_blank_truck_value(row.get(truck_field)):
+        row[truck_field] = ""
+    for key in ("direction", "gate_in"):
+        if is_blank_truck_value(row.get(key)):
+            row[key] = ""
 
 
 def scan_import_trucks(
@@ -71,6 +100,9 @@ def scan_import_trucks(
 
     Rows that match the fleet (or an allowed place label) are rewritten with the
     canonical value. Empty truck cells are left alone and not flagged.
+
+    Parking Congo **Deposit** rows (and blank/placeholder plates like ``-``) are
+    never flagged as not-in-registry — deposits are account credits, not trucks.
     """
     labels = list(allowed_labels) if allowed_labels is not None else list(DEFAULT_PLACE_LABELS)
     result = ImportTruckScanResult()
@@ -78,11 +110,24 @@ def scan_import_trucks(
     for i, row in enumerate(rows):
         if progress is not None and (i % 20 == 0 or i + 1 == total):
             progress(i + 1, total)
+
+        # Deposits have no real vehicle — import without fleet gate noise
+        if is_deposit_transaction(row.get("transaction_type")):
+            mark_parking_congo_deposit(row, truck_field)
+            result.deposit_count += 1
+            result.empty_count += 1
+            continue
+
         raw = str(row.get(truck_field, "") or "").strip()
-        if not raw:
+        if is_blank_truck_value(raw):
+            row[truck_field] = ""
             result.empty_count += 1
             continue
         norm = normalize_truck_number(raw, allowed_labels=labels)
+        if norm.status == "empty":
+            row[truck_field] = ""
+            result.empty_count += 1
+            continue
         if norm.status == "place_label":
             row[truck_field] = norm.value
             result.ok_count += 1

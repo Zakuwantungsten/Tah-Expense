@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from tahmeed.ui.accountant.date_filters import (
     add_from_to_editors, read_from_to, sync_from_to, clear_list_filters,
 )
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 import qtawesome as qta
 
@@ -32,7 +33,7 @@ from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSizePolicy,
+    QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget, QDateEdit,
 )
@@ -596,6 +597,7 @@ class ImportDialog(QDialog):
         self._raw_headers: List[str] = []
         self._all_rows:    List[dict] = []
         self._new_rows:    List[dict] = []
+        self._busy = False
 
         self.setWindowTitle(f"Import — {feed_type.replace('_', ' ').title()}")
         self.setMinimumWidth(680)
@@ -619,18 +621,32 @@ class ImportDialog(QDialog):
         brl.setContentsMargins(0, 0, 0, 0)
         brl.setSpacing(8)
         if self._template_headers:
-            tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
-            tmpl_btn.clicked.connect(self._download_template)
-            brl.addWidget(tmpl_btn)
-        browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
-        browse_btn.clicked.connect(self._browse)
+            self._tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
+            self._tmpl_btn.clicked.connect(self._download_template)
+            brl.addWidget(self._tmpl_btn)
+        else:
+            self._tmpl_btn = None
+        self._browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
+        self._browse_btn.clicked.connect(self._browse)
         brl.addStretch()
-        brl.addWidget(browse_btn)
+        brl.addWidget(self._browse_btn)
         vl.addWidget(browse_row)
 
         # Stats row
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
         vl.addWidget(self._stats_lbl)
+
+        self._progress = QProgressBar()
+        self._progress.setFixedHeight(10)
+        self._progress.setTextVisible(False)
+        self._progress.setRange(0, 0)  # indeterminate until stages are known
+        self._progress.setStyleSheet(
+            f"QProgressBar{{background:{_BG};border:1px solid {_BORDER};"
+            f"border-radius:5px;}}"
+            f"QProgressBar::chunk{{background:{_BLUE};border-radius:4px;}}"
+        )
+        self._progress.hide()
+        vl.addWidget(self._progress)
 
         vl.addWidget(_hsep())
 
@@ -652,9 +668,9 @@ class ImportDialog(QDialog):
         bbl.setSpacing(8)
         bbl.addStretch()
 
-        cancel_btn = _btn("Cancel", primary=False)
-        cancel_btn.clicked.connect(self.reject)
-        bbl.addWidget(cancel_btn)
+        self._cancel_btn = _btn("Cancel", primary=False)
+        self._cancel_btn.clicked.connect(self.reject)
+        bbl.addWidget(self._cancel_btn)
 
         self._import_btn = _btn("Import Records", "mdi.check-circle-outline")
         self._import_btn.setEnabled(False)
@@ -663,7 +679,61 @@ class ImportDialog(QDialog):
 
         vl.addWidget(btn_row)
 
+        self._loading = LoadingOverlay(self, "Reading file…")
+
+    def _set_busy(
+        self,
+        message: str,
+        *,
+        value: Optional[int] = None,
+        maximum: int = 0,
+    ) -> None:
+        """Show spinner overlay + progress bar; paint immediately."""
+        self._busy = True
+        self._stats_lbl.setText(message)
+        self._progress.show()
+        if maximum <= 0 and value is None:
+            self._progress.setRange(0, 0)
+        else:
+            self._progress.setRange(0, max(1, maximum))
+            self._progress.setValue(max(0, value or 0))
+        self._browse_btn.setEnabled(False)
+        if self._tmpl_btn is not None:
+            self._tmpl_btn.setEnabled(False)
+        self._import_btn.setEnabled(False)
+        self._drop.setEnabled(False)
+        self._loading.show_loading(message)
+        QApplication.processEvents()
+
+    def _update_busy(
+        self,
+        message: str,
+        *,
+        value: Optional[int] = None,
+        maximum: Optional[int] = None,
+    ) -> None:
+        self._stats_lbl.setText(message)
+        self._loading.show_loading(message)
+        if maximum is not None:
+            self._progress.setRange(0, max(1, maximum))
+        if value is not None and self._progress.maximum() > 0:
+            self._progress.setValue(value)
+        QApplication.processEvents()
+
+    def _clear_busy(self, *, enable_import: bool = False) -> None:
+        self._busy = False
+        self._loading.hide_loading()
+        self._progress.hide()
+        self._progress.setRange(0, 0)
+        self._browse_btn.setEnabled(True)
+        if self._tmpl_btn is not None:
+            self._tmpl_btn.setEnabled(True)
+        self._drop.setEnabled(True)
+        self._import_btn.setEnabled(enable_import)
+
     def _browse(self) -> None:
+        if self._busy:
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open File", "", "Excel / CSV (*.xlsx *.xls *.csv)"
         )
@@ -672,7 +742,7 @@ class ImportDialog(QDialog):
             self._on_file(path)
 
     def _download_template(self) -> None:
-        if not self._template_headers:
+        if not self._template_headers or self._busy:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Import Template",
@@ -692,9 +762,21 @@ class ImportDialog(QDialog):
             QMessageBox.critical(self, "Template Error", str(exc))
 
     def _on_file(self, path: str) -> None:
-        self._stats_lbl.setText("Reading file…")
+        """Kick off load after painting the busy UI (openpyxl blocks the thread)."""
+        if self._busy:
+            return
         self._source_filename = Path(path).name
+        self._import_btn.setText("Import Records")
+        self._preview_tbl.setRowCount(0)
+        self._set_busy(f"Reading {self._source_filename}…")
+        # Defer so the overlay paints before the blocking workbook read
+        QTimer.singleShot(0, lambda: self._process_file(path))
+
+    def _process_file(self, path: str) -> None:
         try:
+            self._update_busy(
+                f"Reading {self._source_filename}…", value=1, maximum=4,
+            )
             if self._auto_header_row:
                 headers, rows = _parse_rows_from_workbook(
                     path, self._header_row, True, self._col_map,
@@ -702,11 +784,12 @@ class ImportDialog(QDialog):
             else:
                 headers, rows = _read_file_rows(path, self._header_row)
         except Exception as exc:
+            self._clear_busy()
             self._stats_lbl.setText(f"Error reading file: {exc}")
             return
 
+        self._update_busy("Mapping columns…", value=2, maximum=4)
         self._raw_headers = headers
-        # Map columns
         hdr_lower = {h.strip().lower(): i for i, h in enumerate(headers)}
 
         def _find(candidates: List[str]) -> Optional[int]:
@@ -721,7 +804,8 @@ class ImportDialog(QDialog):
         }
 
         records: List[dict] = []
-        for row in rows:
+        total_rows = len(rows)
+        for i, row in enumerate(rows):
             rec: dict = {
                 "_raw": row,
                 "feed_type":       self._feed_type,
@@ -731,9 +815,17 @@ class ImportDialog(QDialog):
             for key, idx in field_idxs.items():
                 rec[key] = row[idx].strip() if (idx is not None and idx < len(row)) else ""
             records.append(rec)
+            if total_rows and (i % 200 == 0 or i + 1 == total_rows):
+                # Stay on stage 2–3 while mapping rows
+                self._update_busy(
+                    f"Preparing rows… {i + 1:,} / {total_rows:,}",
+                    value=2,
+                    maximum=4,
+                )
 
         self._all_rows = records
         dedup_vals = [r.get(self._dedup_key, "") for r in records if r.get(self._dedup_key)]
+        self._update_busy("Checking for duplicates…", value=3, maximum=4)
         asyncio.ensure_future(self._check_dupes(records, dedup_vals))
 
     async def _check_dupes(self, records: List[dict], keys: List[str]) -> None:
@@ -742,17 +834,18 @@ class ImportDialog(QDialog):
         except Exception:
             existing = set()
 
+        self._update_busy("Building preview…", value=4, maximum=4)
         self._new_rows = [r for r in records
                           if r.get(self._dedup_key) not in existing]
         dupe_count = len(records) - len(self._new_rows)
 
+        self._fill_preview(self._new_rows[:10])
+        self._clear_busy(enable_import=bool(self._new_rows))
         self._stats_lbl.setText(
             f"New records: {len(self._new_rows):,}     "
             f"Duplicates (skipped): {dupe_count:,}"
         )
-        self._import_btn.setEnabled(bool(self._new_rows))
         self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
-        self._fill_preview(self._new_rows[:10])
 
     def _fill_preview(self, rows: List[dict]) -> None:
         t = self._preview_tbl
@@ -767,8 +860,11 @@ class ImportDialog(QDialog):
             _finish_table_row(t, r)
 
     def _do_import(self) -> None:
+        if self._busy or not self._new_rows:
+            return
         self._import_btn.setEnabled(False)
         self._import_btn.setText("Importing…")
+        self._set_busy("Checking trucks against fleet…", value=0, maximum=0)
         asyncio.ensure_future(self._async_import())
 
     async def _async_import(self) -> None:
@@ -779,6 +875,9 @@ class ImportDialog(QDialog):
             rows = list(self._new_rows)
             skipped = 0
             if truck_field_for(self._feed_type):
+                # Gate has its own progress dialog — hide our overlay while it runs
+                self._loading.hide_loading()
+                self._progress.hide()
                 gate = await run_import_truck_gate(
                     self,
                     rows,
@@ -788,12 +887,13 @@ class ImportDialog(QDialog):
                     can_add=True,
                 )
                 if gate.aborted:
-                    self._import_btn.setEnabled(True)
+                    self._clear_busy(enable_import=True)
                     self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
                     return
                 rows = gate.rows
                 skipped = gate.skipped_count
                 if not rows and skipped:
+                    self._clear_busy()
                     QMessageBox.information(
                         self,
                         "Import",
@@ -804,17 +904,23 @@ class ImportDialog(QDialog):
                     self.accept()
                     return
                 if not rows:
-                    self._import_btn.setEnabled(True)
+                    self._clear_busy(enable_import=True)
                     self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
                     return
 
+            self._set_busy(
+                f"Saving {len(rows):,} records…",
+                value=0,
+                maximum=0,
+            )
             saved = await self._save_fn(rows)
             self._last_skipped = skipped
+            self._clear_busy()
             self.imported.emit(saved)
             self.accept()
         except Exception as exc:
+            self._clear_busy(enable_import=True)
             QMessageBox.critical(self, "Import Error", str(exc))
-            self._import_btn.setEnabled(True)
             self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
 
 
@@ -1689,19 +1795,30 @@ def _pcongo_amount_color(amt_str: str) -> str:
         return _T1
 
 
+def _pcongo_is_deposit(rec: dict) -> bool:
+    if rec.get("is_deposit"):
+        return True
+    return str(rec.get("transaction_type", "") or "").strip().lower() == "deposit"
+
+
 def _pcongo_fill_detail_row(t: QTableWidget, r: int, rec: dict) -> None:
     """Populate one Parking Congo record row (shared by detail + all-entries views)."""
     amt_str = str(rec.get("amount", "") or "")
-    amt_color = _pcongo_amount_color(amt_str)
+    is_deposit = _pcongo_is_deposit(rec)
+    amt_color = _GREEN if is_deposit else _pcongo_amount_color(amt_str)
     try:
         amt_display = _fmt_num(float(amt_str), "", 2)
     except (ValueError, TypeError):
         amt_display = amt_str or "—"
 
+    type_label = str(rec.get("transaction_type", "") or "")
+    if is_deposit and type_label:
+        type_label = type_label if type_label.upper() == "DEPOSIT" else "Deposit"
+
     t.setItem(r,  0, _cell(str(rec.get("sn", "") or "")))
     t.setItem(r,  1, _cell(str(rec.get("ledger_id", "") or "")))
     t.setItem(r,  2, _cell(str(rec.get("payment_date", "") or "")))
-    t.setItem(r,  3, _cell(str(rec.get("transaction_type", "") or ""), color=amt_color))
+    t.setItem(r,  3, _cell(type_label, color=amt_color))
     t.setItem(r,  4, _cell(
         amt_display, align=Qt.AlignRight | Qt.AlignVCenter, color=amt_color,
     ))
@@ -1710,11 +1827,12 @@ def _pcongo_fill_detail_row(t: QTableWidget, r: int, rec: dict) -> None:
         align=Qt.AlignRight | Qt.AlignVCenter,
     ))
     t.setItem(r,  6, _cell(str(rec.get("cashier", "") or "")))
-    t.setItem(r,  7, _cell(str(rec.get("vehicle_no", "") or "")))
-    t.setItem(r,  8, _cell(str(rec.get("direction", "") or "")))
-    t.setItem(r,  9, _cell(str(rec.get("gate_in", "") or "")))
+    vehicle = str(rec.get("vehicle_no", "") or "").strip()
+    t.setItem(r,  7, _cell("—" if (is_deposit and not vehicle) else vehicle))
+    t.setItem(r,  8, _cell(str(rec.get("direction", "") or "") or ("—" if is_deposit else "")))
+    t.setItem(r,  9, _cell(str(rec.get("gate_in", "") or "") or ("—" if is_deposit else "")))
     t.setItem(r, 10, _cell(str(rec.get("transaction_details", "") or "")))
-    _finish_table_row(t, r)
+    _finish_table_row(t, r, bg=_GREEN_L if is_deposit else None)
 
 
 class _ParkingCongoAllEntries(QWidget):
@@ -2167,6 +2285,221 @@ class _ParkingCongoUploadDetail(QWidget):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Deposited sub-widget — all Parking Congo deposit credits
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PCONGO_DEPOSIT_HEADERS = [
+    "PAYMENT DATE", "LEDGER ID", "AMOUNT", "RUNNING BAL",
+    "CASHIER", "DETAILS", "SOURCE FILE", "UPLOAD DATE",
+]
+
+
+class _ParkingCongoDeposited(QWidget):
+    """List of deposit credits with From/To filters; click opens the upload."""
+
+    open_upload = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._search  = ""
+        self._loaded  = 0
+        self._total   = 0
+        self._loading = False
+        self._rows: List[dict] = []
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        hint = _lbl(
+            "Account deposits from the Congo ledger (credits, not trucks). "
+            "Click a row to open the upload batch it came from.",
+            size=11, color=_TM,
+        )
+        hint.setWordWrap(True)
+        vl.addWidget(hint)
+
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search ledger ID, cashier, details, file…")
+        self._search_edit.setFixedWidth(300)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+        tbl.addWidget(self._search_edit)
+
+        self._from_date, self._to_date = add_from_to_editors(
+            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=True,
+        )
+
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(self._clear_filters)
+        tbl.addWidget(clear_btn)
+        tbl.addStretch()
+        vl.addWidget(tb)
+
+        self._totals = _TotalsBar([("amount", "Total deposited: "), ("count", "Deposits: ")])
+        vl.addWidget(self._totals)
+
+        self._table = _make_table(_PCONGO_DEPOSIT_HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setCursor(Qt.PointingHandCursor)
+        self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        vl.addWidget(self._table, 1)
+
+        self._status_lbl = _lbl("", size=11, color=_TM)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._status_lbl)
+
+    def refresh(self) -> None:
+        self._reset_and_load()
+
+    def _date_kw(self) -> dict:
+        df, dt = read_from_to(self._from_date, self._to_date, optional=True)
+        return {"date_from": df, "date_to": dt}
+
+    def _reset_and_load(self) -> None:
+        self._loaded = 0
+        self._total = 0
+        self._rows = []
+        self._table.setRowCount(0)
+        asyncio.ensure_future(self._load_initial())
+
+    def _update_status(self) -> None:
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif self._loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._status_lbl.setText(
+            f"Showing {self._loaded:,} of {self._total:,}{suffix}"
+        )
+
+    async def _load_initial(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        try:
+            totals, recs, total = await asyncio.gather(
+                svc.get_parking_congo_deposit_totals(self._search, **self._date_kw()),
+                svc.get_parking_congo_deposits(
+                    self._search, limit=_PCONGO_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                ),
+                svc.count_parking_congo_deposits(self._search, **self._date_kw()),
+            )
+        except Exception:
+            self._loading = False
+            self._status_lbl.setText("Failed to load deposits.")
+            return
+
+        self._total = total
+        self._append_rows(recs)
+        self._loaded = len(recs)
+        self._totals.set_total("amount", float(totals.get("amount", 0)), "")
+        self._totals.set_total("count",  int(totals.get("count", 0)), "")
+        self._loading = False
+        self._update_status()
+
+    async def _load_more(self) -> None:
+        if self._loading or self._loaded >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        from tahmeed.services import accountant_service as svc
+        try:
+            recs = await svc.get_parking_congo_deposits(
+                self._search, limit=_PCONGO_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+            )
+        except Exception:
+            self._loading = False
+            self._update_status()
+            return
+        if recs:
+            self._append_rows(recs)
+            self._loaded += len(recs)
+        self._loading = False
+        self._update_status()
+
+    def _append_rows(self, recs: List[dict]) -> None:
+        for rec in recs:
+            self._rows.append(rec)
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            amt_str = str(rec.get("amount", "") or "")
+            try:
+                amt_display = _fmt_num(float(amt_str), "", 2)
+            except (ValueError, TypeError):
+                amt_display = amt_str or "—"
+            import_dt = rec.get("import_date")
+            upload_str = (
+                import_dt.strftime("%d %b %Y  %H:%M")
+                if isinstance(import_dt, datetime)
+                else (str(import_dt) if import_dt else "—")
+            )
+            vals = [
+                str(rec.get("payment_date", "") or ""),
+                str(rec.get("ledger_id", "") or ""),
+                amt_display,
+                str(rec.get("running_bal", "") or ""),
+                str(rec.get("cashier", "") or ""),
+                str(rec.get("transaction_details", "") or ""),
+                str(rec.get("source_filename", "") or ""),
+                upload_str,
+            ]
+            aligns = [
+                Qt.AlignLeft | Qt.AlignVCenter,
+                Qt.AlignLeft | Qt.AlignVCenter,
+                Qt.AlignRight | Qt.AlignVCenter,
+                Qt.AlignRight | Qt.AlignVCenter,
+                Qt.AlignLeft | Qt.AlignVCenter,
+                Qt.AlignLeft | Qt.AlignVCenter,
+                Qt.AlignLeft | Qt.AlignVCenter,
+                Qt.AlignLeft | Qt.AlignVCenter,
+            ]
+            for c, (val, aln) in enumerate(zip(vals, aligns)):
+                color = _GREEN if c in (1, 2) else _T1
+                item = _cell(val, align=aln, color=color)
+                self._table.setItem(r, c, item)
+            _finish_table_row(self._table, r, bg=_GREEN_L)
+
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
+
+    def _on_search(self, text: str) -> None:
+        self._search = text
+        self._reset_and_load()
+
+    def _clear_filters(self) -> None:
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._search = ""
+        sync_from_to(self._from_date, self._to_date, 0, 0, optional=True)
+        self._reset_and_load()
+
+    def _on_row_clicked(self, row: int, _col: int) -> None:
+        if 0 <= row < len(self._rows):
+            self.open_upload.emit(self._rows[row])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  2. ParkingCongoWidget — master/detail shell
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2176,7 +2509,8 @@ class ParkingCongoWidget(QWidget):
 
     All Entries tab: every record across uploads with month/year filters and
     infinite scroll.  Uploads tab: batch browse list; clicking a row drills
-    into the per-record detail view for that upload.
+    into the per-record detail view for that upload.  Deposited: deposit
+    credits with date filters.  Skipped: unknown trucks parked for follow-up.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -2200,7 +2534,7 @@ class ParkingCongoWidget(QWidget):
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._tabs = _SegmentTabBar(["All Entries", "Uploads", "Skipped"])
+        self._tabs = _SegmentTabBar(["All Entries", "Uploads", "Deposited", "Skipped"])
         vl.addWidget(self._tabs)
 
         self._main_stack = QStackedWidget()
@@ -2231,6 +2565,10 @@ class ParkingCongoWidget(QWidget):
         upload_vl.addWidget(self._upload_stack, 1)
         self._main_stack.addWidget(upload_host)
 
+        self._deposited = _ParkingCongoDeposited()
+        self._deposited.open_upload.connect(self._open_deposit_upload)
+        self._main_stack.addWidget(self._deposited)
+
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
         self._skipped = SkippedTrucksTab("parking_congo")
         self._main_stack.addWidget(self._skipped)
@@ -2241,11 +2579,15 @@ class ParkingCongoWidget(QWidget):
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
         if idx == 2:
+            self._deposited.refresh()
+        elif idx == 3:
             self._skipped.refresh()
 
     def refresh(self) -> None:
         self._all_entries.refresh()
         self._show_browse()
+        if hasattr(self, "_deposited"):
+            self._deposited.refresh()
         if hasattr(self, "_skipped"):
             self._skipped.refresh()
 
@@ -2258,6 +2600,32 @@ class ParkingCongoWidget(QWidget):
         self._main_stack.setCurrentIndex(1)
         self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
+
+    def _open_deposit_upload(self, deposit_rec: dict) -> None:
+        upload_id = str(deposit_rec.get("upload_id") or "")
+        if not upload_id:
+            QMessageBox.information(
+                self, "Deposit", "This deposit has no linked upload batch.",
+            )
+            return
+        asyncio.ensure_future(self._goto_upload(upload_id, deposit_rec))
+
+    async def _goto_upload(self, upload_id: str, deposit_rec: dict) -> None:
+        from tahmeed.services import accountant_service as svc
+        try:
+            upload_doc = await svc.get_parking_congo_upload_by_id(upload_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Upload", str(exc))
+            return
+        if not upload_doc:
+            # Fallback from deposit fields so navigation still works
+            upload_doc = {
+                "_id": upload_id,
+                "source_filename": deposit_rec.get("source_filename") or "Unknown",
+                "import_date": deposit_rec.get("import_date"),
+                "record_count": 0,
+            }
+        self._show_detail(upload_doc)
 
     def _download_template(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -2302,9 +2670,10 @@ class ParkingCongoWidget(QWidget):
             msg += f"\n{skipped:,} parked in Skipped for follow-up."
         QMessageBox.information(self, "Import Complete", msg)
         self._all_entries.refresh()
+        self._deposited.refresh()
         self._show_browse()
         if skipped and hasattr(self, "_skipped"):
-            self._tabs.set_index(2)
+            self._tabs.set_index(3)
             self._skipped.refresh()
         else:
             self._tabs.set_index(1)
@@ -2338,6 +2707,7 @@ class ParkingCongoWidget(QWidget):
             self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
         )
         self._all_entries.refresh()
+        self._deposited.refresh()
         self._show_browse()
 
 
@@ -2828,10 +3198,13 @@ class CongoImportDialog(QDialog):
             self._on_file(path)
 
     def _on_file(self, path: str) -> None:
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
+
         self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
         try:
-            sheet_label, records = _parse_congo_last_sheet(path)
+            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
+                sheet_label, records = _parse_congo_last_sheet(path)
         except Exception as exc:
             self._stats_lbl.setText(f"Error reading file: {exc}")
             self._import_btn.setEnabled(False)
@@ -3630,10 +4003,13 @@ class BulkSheetImportDialog(QDialog):
             self._on_file(path)
 
     def _on_file(self, path: str) -> None:
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
+
         self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
         try:
-            batches = self._parse_all_fn(path)
+            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
+                batches = self._parse_all_fn(path)
         except Exception as exc:
             self._stats_lbl.setText(f"Error reading file: {exc}")
             self._import_btn.setEnabled(False)
@@ -3877,10 +4253,13 @@ class KimviImportDialog(QDialog):
             self._on_file(path)
 
     def _on_file(self, path: str) -> None:
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
+
         self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
         try:
-            sheet_label, records = _parse_kimvi_last_sheet(path)
+            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
+                sheet_label, records = _parse_kimvi_last_sheet(path)
         except Exception as exc:
             self._stats_lbl.setText(f"Error reading file: {exc}")
             self._import_btn.setEnabled(False)
@@ -5276,10 +5655,13 @@ class ZambiaParkingImportDialog(QDialog):
             self._on_file(path)
 
     def _on_file(self, path: str) -> None:
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
+
         self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
         try:
-            sheet_label, records = _parse_zambia_last_sheet(path)
+            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
+                sheet_label, records = _parse_zambia_last_sheet(path)
         except Exception as exc:
             self._stats_lbl.setText(f"Error reading file: {exc}")
             self._import_btn.setEnabled(False)
@@ -7010,6 +7392,7 @@ class _AfritrackAllEntries(QWidget):
         self._totals.set_total("c", int(totals.get("count", 0) or 0), "")
         self._loading = False
         self._update_status()
+        self._maybe_fill_viewport()
 
     async def _load_more(self) -> None:
         if self._loading or self._loaded >= self._total:
@@ -7032,6 +7415,7 @@ class _AfritrackAllEntries(QWidget):
             self._loaded += len(recs)
         self._loading = False
         self._update_status()
+        self._maybe_fill_viewport()
 
     def _append_rows(self, recs: List[dict]) -> None:
         for rec in recs:
@@ -7039,9 +7423,18 @@ class _AfritrackAllEntries(QWidget):
             self._table.insertRow(r)
             _afritrack_fill_row(self._table, r, rec)
 
+    def _maybe_fill_viewport(self) -> None:
+        """Keep loading while content fits the viewport (no scrollbar yet)."""
+        if self._loading or self._loaded >= self._total:
+            return
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            asyncio.ensure_future(self._load_more())
+
     def _on_scroll(self, value: int) -> None:
         bar = self._table.verticalScrollBar()
         if bar.maximum() <= 0:
+            self._maybe_fill_viewport()
             return
         if value >= bar.maximum() - 24:
             asyncio.ensure_future(self._load_more())
@@ -7290,6 +7683,7 @@ class _AfritrackUploadDetail(QWidget):
         widths = [56, 120, 70, 90, 70, 90, 120, 120, 100, 180]
         for i, w in enumerate(widths):
             self._table.setColumnWidth(i, w)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([
@@ -7362,6 +7756,7 @@ class _AfritrackUploadDetail(QWidget):
         self._totals.set_total("c", int(totals.get("count", total) or 0), "")
         self._loading = False
         self._update_status()
+        self._maybe_fill_viewport()
 
     async def _load_more(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -7382,12 +7777,21 @@ class _AfritrackUploadDetail(QWidget):
             self._loaded += len(recs)
         self._loading = False
         self._update_status()
+        self._maybe_fill_viewport()
 
     def _append_rows(self, recs: List[dict]) -> None:
         for rec in recs:
             r = self._table.rowCount()
             self._table.insertRow(r)
             _afritrack_fill_row(self._table, r, rec)
+
+    def _maybe_fill_viewport(self) -> None:
+        """Keep loading while content fits the viewport (no scrollbar yet)."""
+        if self._loading or self._loaded >= self._total:
+            return
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            asyncio.ensure_future(self._load_more())
 
     def _on_search(self, text: str) -> None:
         self._search = text
@@ -7396,6 +7800,7 @@ class _AfritrackUploadDetail(QWidget):
     def _on_scroll(self, value: int) -> None:
         bar = self._table.verticalScrollBar()
         if bar.maximum() <= 0:
+            self._maybe_fill_viewport()
             return
         if value >= bar.maximum() - 24:
             asyncio.ensure_future(self._load_more())
@@ -7551,8 +7956,10 @@ class AfritrackWidget(QWidget):
     async def _do_import(self, path: str) -> None:
         from tahmeed.services import accountant_service as svc
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
         try:
-            rows, inst_t, inst_i, bal_mar = _read_afritrack_file(path)
+            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
+                rows, inst_t, inst_i, bal_mar = _read_afritrack_file(path)
         except Exception as exc:
             QMessageBox.critical(self, "Import Error", str(exc))
             return
@@ -7588,7 +7995,8 @@ class AfritrackWidget(QWidget):
                 else:
                     QMessageBox.warning(self, "Import", msg)
                 return
-            saved = await svc.save_imported_feed(gate.rows)
+            with UploadBusy(self, "Saving imported rows…", title="Import"):
+                saved = await svc.save_imported_feed(gate.rows)
         except Exception as exc:
             QMessageBox.critical(self, "Import Error", str(exc))
             return
@@ -7895,11 +8303,14 @@ class _InsuranceImportDialog(QDialog):
             self._on_file(path)
 
     def _on_file(self, path: str) -> None:
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
+
         self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
         self._upload_id = str(uuid.uuid4())
         try:
-            records = self._reader_fn(path)
+            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
+                records = self._reader_fn(path)
         except Exception as exc:
             self._stats_lbl.setText(f"Error reading file: {exc}")
             return
@@ -8719,11 +9130,12 @@ class _RahnTechImportDialog(ImportDialog):
     """ImportDialog that uses the RahnTech-specific row reader (skips title row)."""
 
     def _on_file(self, path: str) -> None:
-        self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
         try:
+            self._set_busy(f"Reading {self._source_filename}…")
             headers, rows = _read_rahntech_rows(path)
         except Exception as exc:
+            self._clear_busy()
             self._stats_lbl.setText(f"Error reading file: {exc}")
             return
 

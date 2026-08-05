@@ -256,8 +256,17 @@ async def accountant_notification_counts(
     _manager: Annotated[dict, Depends(require_roles("admin", "accountant"))],
 ) -> dict[str, int]:
     db = database(request)
+    # Match desktop get_pending_count: submitted/legacy inbox + deletion requests
+    # (exclude cashier drafts that are not yet submitted for verify).
     pending = await db.transactions.count_documents(
-        {"verified": False, "rejected": {"$ne": True}}
+        {
+            "verified": False,
+            "rejected": {"$ne": True},
+            "$or": [
+                {"register_status": "submitted"},
+                {"register_status": {"$exists": False}},
+            ],
+        }
     )
     deletions = await db.transactions.count_documents({"deletion_requested": True})
     return {"verify": int(pending) + int(deletions)}

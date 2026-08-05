@@ -230,12 +230,44 @@ def pick_primary_date(
     return detect_date_from_name(filename) or detect_date_from_name(sheet_name)
 
 
+_CLASSIC_MATUMIZI_COLS: Dict[str, int] = {
+    "serial": 0,
+    "date": 1,
+    "description": 3,
+    "truck": 4,
+    "lpo": 5,
+    "do": 6,
+    "memo": 9,
+    "notes": 10,
+    "tzs": 11,
+    "usd": 12,
+    "receipt": 13,
+    "ownership": 14,
+    "approver": 15,
+}
+
+
+def _looks_like_classic_matumizi(header_row: List) -> bool:
+    """True when row 0 matches classic MATUMIZI headers (Date + Description)."""
+    cells = [_norm_header(c) for c in (header_row or [])]
+    if len(cells) < 4:
+        return False
+    date_h = cells[1] if len(cells) > 1 else ""
+    desc_h = cells[3] if len(cells) > 3 else ""
+    date_ok = date_h == "date" or date_h.startswith("date")
+    desc_ok = desc_h in ("description", "desc") or "description" in desc_h
+    return date_ok and desc_ok
+
+
 def parse_daily_expenses_excel(
     path: str | Path,
     *,
     sheet_name: Optional[str] = None,
 ) -> Tuple[List[DailyImportRow], int, str]:
-    """Return (rows, skipped_blank_count, sheet_name_used)."""
+    """Return (rows, skipped_blank_count, sheet_name_used).
+
+    Raises ValueError when the workbook does not match Daily Register format.
+    """
     path = Path(path)
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
@@ -247,25 +279,18 @@ def parse_daily_expenses_excel(
         try:
             header = list(next(rows_iter))
         except StopIteration:
-            return [], 0, used_sheet
+            raise ValueError("The Excel file is empty.")
         cols = _map_headers(header)
         if "description" not in cols or "date" not in cols:
-            # Fallback to classic MATUMIZI positional layout
-            cols = {
-                "serial": 0,
-                "date": 1,
-                "description": 3,
-                "truck": 4,
-                "lpo": 5,
-                "do": 6,
-                "memo": 9,
-                "notes": 10,
-                "tzs": 11,
-                "usd": 12,
-                "receipt": 13,
-                "ownership": 14,
-                "approver": 15,
-            }
+            if _looks_like_classic_matumizi(header):
+                cols = dict(_CLASSIC_MATUMIZI_COLS)
+            else:
+                raise ValueError(
+                    "This file does not match the Daily Register format.\n\n"
+                    "Expected a MATUMIZI-style sheet with Date and Description "
+                    "columns. Wrong or unrelated Excel files are rejected so they "
+                    "do not create faulty uploads."
+                )
 
         parsed: List[DailyImportRow] = []
         skipped = 0
@@ -314,17 +339,17 @@ def parse_daily_expenses_excel(
                 DailyImportRow(
                     serial=serial,
                     date=dt,
-                    description=desc,
+                    description=desc.upper(),
                     truck_number=cell_str(_col(row, cols, "truck")).upper(),
-                    lpo_do=cell_str(_col(row, cols, "lpo")),
-                    do_number=cell_str(_col(row, cols, "do")),
-                    memo=cell_str(_col(row, cols, "memo")),
+                    lpo_do=cell_str(_col(row, cols, "lpo")).upper(),
+                    do_number=cell_str(_col(row, cols, "do")).upper(),
+                    memo=cell_str(_col(row, cols, "memo")).upper(),
                     notes=notes,
                     amount=amount,
                     currency=currency,
                     receipt_status=normalize_receipt(cell_str(_col(row, cols, "receipt"))),
-                    ownership=cell_str(_col(row, cols, "ownership")),
-                    approver=cell_str(_col(row, cols, "approver")),
+                    ownership=cell_str(_col(row, cols, "ownership")).upper(),
+                    approver=cell_str(_col(row, cols, "approver")).upper(),
                 )
             )
     finally:
@@ -422,8 +447,8 @@ def apply_date_policy(
 def _ref_float_from_notes(notes: str) -> str:
     low = (notes or "").strip().lower()
     if "refund" in low and "float" in low:
-        return "Refund to Float"
-    return (notes or "").strip()
+        return "REFUND TO FLOAT"
+    return (notes or "").strip().upper()
 
 
 def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict:
@@ -463,10 +488,38 @@ def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict
     }
 
 
+async def cleanup_null_daily_import_ids() -> int:
+    """Strip null/empty daily_import_id tags left by older saves / bad uploads.
+
+    These used to appear in the Uploads browser as one undeleteable phantom group.
+    """
+    db = get_db()
+    result = await db.transactions.update_many(
+        {
+            "$or": [
+                {"daily_import_id": None},
+                {"daily_import_id": ""},
+                {"daily_import_id": {"$type": "null"}},
+            ]
+        },
+        {
+            "$unset": {
+                "daily_import_id": "",
+                "daily_import_source": "",
+                "import_primary_date": "",
+            }
+        },
+    )
+    return int(result.modified_count or 0)
+
+
 async def list_daily_uploads(limit: int = 100) -> List[dict]:
     db = get_db()
+    # Heal legacy null-tagged rows so they never group as a phantom upload.
+    await cleanup_null_daily_import_ids()
     pipeline = [
-        {"$match": {"daily_import_id": {"$exists": True, "$ne": ""}}},
+        # Only real string batch ids — never null / missing / empty.
+        {"$match": {"daily_import_id": {"$type": "string", "$ne": ""}}},
         {
             "$group": {
                 "_id": "$daily_import_id",
@@ -492,10 +545,12 @@ async def list_daily_uploads(limit: int = 100) -> List[dict]:
 
 
 async def delete_daily_upload(upload_id: str) -> int:
-    if not upload_id:
+    if not upload_id or not str(upload_id).strip():
         return 0
     db = get_db()
-    result = await db.transactions.delete_many({"daily_import_id": upload_id})
+    result = await db.transactions.delete_many(
+        {"daily_import_id": str(upload_id).strip()}
+    )
     return result.deleted_count
 
 

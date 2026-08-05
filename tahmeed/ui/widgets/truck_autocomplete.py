@@ -21,8 +21,9 @@ class TruckLineEdit(QLineEdit):
 
     Pass ``local_numbers`` (list or callable) to filter synchronously — required
     inside modal dialogs where nested asyncio.ensure_future is unsafe.
+    Pass ``sync_fn`` for other warm in-memory sources (e.g. description history).
     Otherwise pass ``fetch_fn``; a warm fleet cache is still preferred so typing
-    during import/modals never nests asyncio tasks.
+    during import/modals never nests asyncio tasks when no custom source is set.
     """
 
     def __init__(
@@ -31,10 +32,12 @@ class TruckLineEdit(QLineEdit):
         parent=None,
         *,
         local_numbers: Optional[Union[List[str], Callable[[], List[str]]]] = None,
+        sync_fn: Optional[Callable[[str], Optional[List[str]]]] = None,
     ):
         super().__init__(parent)
         self._fetch_fn = fetch_fn
         self._local_numbers = local_numbers
+        self._sync_fn = sync_fn
         self._typed = ""
         self._suppress_preview = False
         self._preview_active = False
@@ -170,6 +173,16 @@ class TruckLineEdit(QLineEdit):
         """Return suggestions without awaiting. Prefer explicit local_numbers."""
         if self._local_numbers is not None:
             return self._filter_local(prefix)
+        if self._sync_fn is not None:
+            try:
+                return self._sync_fn(prefix)
+            except Exception:
+                return None
+        # Do not fall through to the truck fleet cache when a custom async
+        # fetch_fn is set (e.g. description / category editors) — a warm fleet
+        # cache would return [] or truck numbers and block the real source.
+        if self._fetch_fn is not None:
+            return None
         try:
             from tahmeed.services.truck_service import search_fleet_sync
             return search_fleet_sync(prefix)

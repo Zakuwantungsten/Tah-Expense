@@ -343,10 +343,13 @@ class ReconImportDialog(QDialog):
             self._on_file(path)
 
     def _on_file(self, path: str) -> None:
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
+
         self._source_path = path
         self._stats.setText("Reading file…")
         try:
-            self._entries = parse_recon_workbook(path, self._table)
+            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
+                self._entries = parse_recon_workbook(path, self._table)
         except Exception as exc:
             self._stats.setText(f"Error reading file: {exc}")
             return

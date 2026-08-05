@@ -183,6 +183,7 @@ class EntryForm(QWidget):
         self._people_names: List[str] = []
         self._confidence_threshold: int  = 75
         self._fleet_numbers: set = set()
+        self._fleet_kinds: dict = {}
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
         self._rcpt_delegate = _ReceiptDelegate()
 
@@ -213,9 +214,12 @@ class EntryForm(QWidget):
         except Exception:
             pass
         try:
+            from tahmeed.services.truck_service import get_fleet_kinds, get_fleet_numbers
             self._fleet_numbers = await get_fleet_numbers()
+            self._fleet_kinds = await get_fleet_kinds()
         except Exception:
             self._fleet_numbers = set()
+            self._fleet_kinds = {}
         try:
             raw = await get_setting("allowed_truck_labels")
             if isinstance(raw, list) and raw:
@@ -696,6 +700,7 @@ class EntryForm(QWidget):
                             self._fleet_numbers,
                             can_add=can_add,
                             allowed_labels=self._allowed_truck_labels,
+                            fleet_kinds=getattr(self, "_fleet_kinds", None) or {},
                             parent=self,
                         )
                         if dlg.exec() != QDialog.Accepted or not dlg.issues or dlg.issues[0].skip:
@@ -714,8 +719,10 @@ class EntryForm(QWidget):
                                 try:
                                     if kind == "trucks":
                                         await add_truck(number)
+                                        self._fleet_kinds[number] = "truck"
                                     else:
                                         await add_trailer(number)
+                                        self._fleet_kinds[number] = "trailer"
                                     self._fleet_numbers.add(number)
                                 except Exception as exc:
                                     QMessageBox.critical(

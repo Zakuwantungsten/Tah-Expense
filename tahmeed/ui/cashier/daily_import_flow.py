@@ -16,6 +16,7 @@ from tahmeed.services.daily_import_service import (
     skip_description_in_preview,
 )
 from tahmeed.services.description_mapping_service import normalize_description
+from tahmeed.ui.dialogs.daily_import_preview_dialog import DailyImportPreviewDialog
 from tahmeed.ui.dialogs.date_outlier_dialog import (
     FORCE_PRIMARY,
     KEEP_AND_FLAG,
@@ -28,10 +29,11 @@ from tahmeed.ui.dialogs.description_mapping_dialog import (
     ACTION_SKIP_ALL,
     DescriptionMappingDialog,
 )
+from tahmeed.ui.widgets.upload_busy import UploadBusy
 
 
 async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]:
-    """Pick a file, resolve mappings + dates, return a ready preview (or None)."""
+    """Pick a file, resolve mappings + dates, confirm preview (or None)."""
     path, _ = QFileDialog.getOpenFileName(
         parent,
         "Import daily Excel transactions",
@@ -42,16 +44,27 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
         return None
 
     try:
-        preview = await preview_daily_import(path)
+        with UploadBusy(parent, "Reading Excel file…", title="Import") as busy:
+            busy.update("Reading Excel file…")
+            preview = await preview_daily_import(path)
+            busy.update(
+                f"Matched descriptions · {len(preview.rows):,} row(s) found…"
+            )
     except Exception as exc:
-        QMessageBox.critical(parent, "Import Error", f"Could not read file:\n{exc}")
+        QMessageBox.critical(
+            parent,
+            "Import Rejected",
+            f"Could not import this file:\n\n{exc}",
+        )
         return None
 
     if not preview.rows:
         QMessageBox.information(
             parent,
             "Import",
-            "No transaction rows were found in that file.",
+            "No transaction rows were found in that file.\n\n"
+            "Check that it is a Daily Register / MATUMIZI Excel with "
+            "Date and Description columns.",
         )
         return None
 
@@ -118,5 +131,10 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
             apply_date_policy(preview, force_primary=False, flag_discrepancy=False)
     else:
         apply_date_policy(preview, force_primary=False, flag_discrepancy=False)
+
+    # ── Confirm preview before staging into the table ─────────────────────
+    confirm = DailyImportPreviewDialog(preview, parent=parent)
+    if confirm.exec() != DailyImportPreviewDialog.Accepted:
+        return None
 
     return preview

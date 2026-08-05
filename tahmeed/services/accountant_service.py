@@ -996,7 +996,9 @@ async def bulk_re_approve_transactions(
 
 async def get_unverified_trucks() -> List[str]:
     db = get_db()
-    vals = await db.transactions.distinct("truck_number", {"verified": False, "rejected": {"$ne": True}})
+    vals = await db.transactions.distinct(
+        "truck_number", _inbox_base_query(rejected=False),
+    )
     return sorted(v for v in vals if v)
 
 
@@ -1065,7 +1067,9 @@ async def get_unverified_descriptions(
 
 async def get_unverified_cashier_ids() -> List[ObjectId]:
     db = get_db()
-    vals = await db.transactions.distinct("cashier_id", {"verified": False, "rejected": {"$ne": True}})
+    vals = await db.transactions.distinct(
+        "cashier_id", _inbox_base_query(rejected=False),
+    )
     return [v for v in vals if v is not None]
 
 
@@ -1143,6 +1147,25 @@ async def update_transaction_category(
         update["category_id"] = category_id
     result = await db.transactions.update_one({"_id": tx_id}, {"$set": update})
     return result.modified_count == 1
+
+
+async def bulk_update_transaction_category(
+    tx_ids: List[ObjectId],
+    category_name: str,
+    category_id: Optional[ObjectId] = None,
+) -> int:
+    """Assign the same item/category to many transactions in one round-trip."""
+    if not tx_ids:
+        return 0
+    db = get_db()
+    update: dict = {"category_name": category_name, "item": category_name}
+    if category_id:
+        update["category_id"] = category_id
+    result = await db.transactions.update_many(
+        {"_id": {"$in": tx_ids}},
+        {"$set": update},
+    )
+    return int(result.modified_count)
 
 
 # ── Master Expenses Table queries ────────────────────────────────────────────
@@ -1872,6 +1895,17 @@ async def save_imported_feed(records: list) -> int:
             parsed = _parse_toll_date(doc.get("payment_date"))
             if parsed:
                 doc["transaction_date"] = parsed
+            # Deposits are account credits (no truck) — tag for Deposited tab
+            tt = str(doc.get("transaction_type", "") or "").strip().lower()
+            if tt == "deposit" or doc.get("is_deposit"):
+                doc["is_deposit"] = True
+                vn = str(doc.get("vehicle_no", "") or "").strip()
+                if vn.lower() in ("", "-", "–", "—", "−", ".", "n/a", "na", "none"):
+                    doc["vehicle_no"] = ""
+                for _k in ("direction", "gate_in"):
+                    val = str(doc.get(_k, "") or "").strip()
+                    if val.lower() in ("", "-", "–", "—", "−", ".", "n/a", "na", "none"):
+                        doc[_k] = ""
         elif doc.get("feed_type") == "rahntech":
             parsed = _parse_toll_date(doc.get("sales_date"))
             if parsed:
@@ -2140,6 +2174,112 @@ async def delete_parking_congo_upload(upload_id: str) -> int:
         {"feed_type": "parking_congo", "upload_id": upload_id}
     )
     return result.deleted_count
+
+
+def _parking_congo_deposit_clause() -> dict:
+    """Match Parking Congo deposit rows (tagged or by Type)."""
+    return {"$or": [
+        {"is_deposit": True},
+        {"transaction_type": {"$regex": r"^deposit$", "$options": "i"}},
+    ]}
+
+
+def _parking_congo_deposits_query(
+    search: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """MongoDB query for Parking Congo deposit records."""
+    clauses: List[dict] = [
+        {"feed_type": "parking_congo"},
+        _parking_congo_deposit_clause(),
+    ]
+    if search.strip():
+        s = re.escape(search.strip())
+        clauses.append({"$or": [
+            {"ledger_id":           {"$regex": s, "$options": "i"}},
+            {"cashier":             {"$regex": s, "$options": "i"}},
+            {"transaction_details": {"$regex": s, "$options": "i"}},
+            {"source_filename":     {"$regex": s, "$options": "i"}},
+            {"payment_date":        {"$regex": s, "$options": "i"}},
+        ]})
+    clause = _date_range_clause("transaction_date", date_from, date_to)
+    if clause:
+        clauses.append(clause)
+    return {"$and": clauses}
+
+
+async def get_parking_congo_deposits(
+    search: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+    skip: int = 0,
+) -> list:
+    """Return paginated Parking Congo deposit records."""
+    db = get_db()
+    query = _parking_congo_deposits_query(search, date_from, date_to)
+    cursor = (
+        db.imported_feeds
+        .find(query)
+        .sort([("transaction_date", -1), ("payment_date", -1), ("import_date", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def count_parking_congo_deposits(
+    search: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> int:
+    """Count Parking Congo deposit records."""
+    db = get_db()
+    return await db.imported_feeds.count_documents(
+        _parking_congo_deposits_query(search, date_from, date_to)
+    )
+
+
+async def get_parking_congo_deposit_totals(
+    search: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Return count and total amount for filtered Parking Congo deposits."""
+    db = get_db()
+    pipeline = [
+        {"$match": _parking_congo_deposits_query(search, date_from, date_to)},
+        {"$group": {
+            "_id": None,
+            "count":  {"$sum": 1},
+            "amount": {"$sum": _safe_double("amount")},
+        }},
+    ]
+    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    if result:
+        return result[0]
+    return {"count": 0, "amount": 0.0}
+
+
+async def get_parking_congo_upload_by_id(upload_id: str) -> Optional[dict]:
+    """Return a browse-style summary doc for one Parking Congo upload batch."""
+    if not upload_id:
+        return None
+    db = get_db()
+    pipeline = [
+        {"$match": {"feed_type": "parking_congo", "upload_id": upload_id}},
+        {"$group": {
+            "_id":             "$upload_id",
+            "source_filename": {"$first": "$source_filename"},
+            "import_date":     {"$first": "$import_date"},
+            "record_count":    {"$sum": 1},
+            "min_date":        {"$min": "$payment_date"},
+            "max_date":        {"$max": "$payment_date"},
+        }},
+    ]
+    rows = await db.imported_feeds.aggregate(pipeline).to_list(1)
+    return rows[0] if rows else None
 
 
 # ── RahnTech — transacted devices import ─────────────────────────────────────

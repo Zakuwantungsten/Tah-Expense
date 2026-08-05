@@ -36,6 +36,55 @@ def test_scan_normalizes_and_matches_fleet() -> None:
     assert len(result.issues) == 2
 
 
+def test_scan_skips_parking_congo_deposits() -> None:
+    """Deposit rows must import without not-in-registry / invalid-format flags."""
+    rows = [
+        {
+            "transaction_type": "Deposit",
+            "vehicle_no": "-",
+            "direction": "-",
+            "gate_in": "-",
+            "amount": "30000",
+            "ledger_id": "LED141016",
+        },
+        {
+            "transaction_type": "Parking",
+            "vehicle_no": "T999 ZZZ",
+            "amount": "-100",
+        },
+        {
+            "transaction_type": "Parking",
+            "vehicle_no": "-",
+            "amount": "-50",
+        },
+    ]
+    fleet = {"T688 EAF"}
+    result = scan_import_trucks(rows, "vehicle_no", fleet)
+    assert result.deposit_count == 1
+    assert rows[0].get("is_deposit") is True
+    assert rows[0]["vehicle_no"] == ""
+    assert rows[0]["direction"] == ""
+    # Placeholder plate on a non-deposit is blanked, not flagged
+    assert rows[2]["vehicle_no"] == ""
+    assert len(result.issues) == 1
+    assert result.issues[0].kind == "not_in_registry"
+    assert result.issues[0].row == 1
+
+
+def test_blank_truck_placeholders() -> None:
+    from tahmeed.services.import_truck_check import (
+        is_blank_truck_value,
+        is_deposit_transaction,
+    )
+    assert is_deposit_transaction("Deposit")
+    assert is_deposit_transaction("DEPOSIT")
+    assert not is_deposit_transaction("Parking")
+    assert is_blank_truck_value("-")
+    assert is_blank_truck_value("N/A")
+    assert is_blank_truck_value("")
+    assert not is_blank_truck_value("T688EAF")
+
+
 def test_apply_resolutions_omit_and_allow() -> None:
     rows = [
         {"truck_no": "T111 AAA"},

@@ -205,10 +205,17 @@ def main() -> None:
     update_controller.start()
 
     def on_login_success(user):
-        # Defer the heavy dashboard import until after a successful sign-in.
+        # Brand splash covers the dashboard build so sign-in never looks frozen.
+        # Cost is negligible vs constructing MainWindow / role dashboards.
         from tahmeed.ui.main_window import MainWindow
+        from tahmeed.ui.splash import SplashScreen
 
         login.hide()
+        loading = SplashScreen()
+        loading.show_centered()
+        role = (getattr(user, "role", "") or "").replace("_", " ").title() or "workspace"
+        loading.set_status(f"Opening {role} dashboard…")
+
         win = MainWindow(user)
         _open_windows.append(win)
 
@@ -231,7 +238,8 @@ def main() -> None:
             _return_to_login(login, w, _open_windows)
 
         win.logout_requested.connect(on_logout)
-        win.show()
+        loading.set_status("Almost ready…")
+        loading.finish(win)
 
     login.login_successful.connect(on_login_success)
 

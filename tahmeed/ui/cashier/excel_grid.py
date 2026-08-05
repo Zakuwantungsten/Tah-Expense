@@ -53,7 +53,7 @@ from tahmeed.services.truck_format import (
 )
 from tahmeed.services.cashier_service import (
     get_transactions_by_date, save_transaction, request_or_delete_transaction,
-    search_descriptions, update_transaction, insert_pending_edit,
+    update_transaction, insert_pending_edit,
     check_for_duplicates, submit_day_for_verify, recount_day_order,
 )
 from tahmeed.services.category_service import (
@@ -407,6 +407,7 @@ class DailyRegister(QWidget):
         self._defer_item_to_verify: bool = False
         self._restrict_trucks: bool = True  # always on — only registered fleet numbers
         self._fleet_numbers: set = set()   # uppercased valid truck/trailer numbers
+        self._fleet_kinds: dict = {}       # number → "truck" | "trailer"
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
         self._people_names: list = []      # Ownership / APR BY suggestions (unrestricted)
         self._cashier_names: dict = {}     # ObjectId -> display name
@@ -444,6 +445,7 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._load_locked_subitems())
         asyncio.ensure_future(self._load_fleet_numbers())
         asyncio.ensure_future(self._load_people_names())
+        asyncio.ensure_future(self._load_description_cache())
 
     # ------------------------------------------------------------------
     # UI construction
@@ -606,7 +608,8 @@ class DailyRegister(QWidget):
         containing this text after the date loads and briefly flashes it.
         """
         self._pending_highlight = highlight_term
-        if self._edit_mode and self._dirty_rows:
+        self._commit_open_editor()
+        if self.has_unsaved_work():
             resp = QMessageBox.question(
                 self, "Unsaved changes",
                 "You have unsaved changes on this date.\nSave them before leaving?",
@@ -655,7 +658,8 @@ class DailyRegister(QWidget):
         """Switch My entries ↔ Merged (all cashiers for the day)."""
         if bool(merged) == self._merged_mode:
             return
-        if self._edit_mode and self._dirty_rows:
+        self._commit_open_editor()
+        if self.has_unsaved_work():
             resp = QMessageBox.question(
                 self, "Unsaved changes",
                 "You have unsaved changes.\nSave them before switching mode?",
@@ -687,7 +691,8 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._do_submit_for_verify())
 
     async def _do_submit_for_verify(self) -> None:
-        if self._edit_mode and self._dirty_rows:
+        self._commit_open_editor()
+        if self.has_unsaved_work():
             resp = QMessageBox.question(
                 self, "Unsaved changes",
                 "Save changes before submitting this day for verify?",
@@ -731,6 +736,7 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._load_locked_subitems())
         asyncio.ensure_future(self._load_fleet_numbers())
         asyncio.ensure_future(self._load_people_names())
+        asyncio.ensure_future(self._load_description_cache())
 
     def update_people(self, names: list) -> None:
         """Refresh Ownership / APR BY suggestion list (free text still allowed)."""
@@ -923,9 +929,11 @@ class DailyRegister(QWidget):
 
         cat = self._cat_by_name.get(item_name.lower()) if item_name else None
         if cat is not None:
-            item_name = cat.name
+            item_name = cat.name.upper()
         elif item_name and self._restrict_items:
             raise ValueError(f'"{item_name}" is not a known item.')
+        elif item_name:
+            item_name = item_name.upper()
 
         if cat is not None and getattr(cat, "lock_description", False):
             allowed = self._locked_subitems.get(item_name.lower(), [])
@@ -937,7 +945,11 @@ class DailyRegister(QWidget):
                     raise ValueError(
                         f'"{description}" is not an allowed description for "{item_name}".'
                     )
-                description = match
+                description = match.upper()
+            else:
+                description = description.upper()
+        else:
+            description = description.upper()
 
         truck_raw = txt(COL_TRUCK)
         truck_number = ""
@@ -965,7 +977,7 @@ class DailyRegister(QWidget):
                 else:
                     truck_number = matched
 
-        ref_text = txt(COL_REF)
+        ref_text = txt(COL_REF).upper()
         return Transaction(
             date=tx_date,
             reported_date=_parse_optional_date(
@@ -978,14 +990,14 @@ class DailyRegister(QWidget):
             truck_number=truck_number,
             amount=amount,
             currency=meta.get("currency") or "TZS",
-            memo=txt(COL_MEMO),
+            memo=txt(COL_MEMO).upper(),
             receipt_status=rcpt_status,
             ref_float=ref_text,
             notes_flag=_is_refund_float(ref_text),
-            ownership=txt(COL_OWN),
-            approver=txt(COL_APR),
-            payee=txt(COL_PAYEE),
-            cheque=txt(COL_CHEQUE),
+            ownership=txt(COL_OWN).upper(),
+            approver=txt(COL_APR).upper(),
+            payee=txt(COL_PAYEE).upper(),
+            cheque=txt(COL_CHEQUE).upper(),
                     cashier_id=self._user._id,
                     day_order=row,
                     register_status="draft",
@@ -993,8 +1005,8 @@ class DailyRegister(QWidget):
                     daily_import_source=meta.get("daily_import_source"),
                     date_discrepancy=bool(meta.get("date_discrepancy")),
                     import_primary_date=meta.get("import_primary_date"),
-                    lpo_do=meta.get("lpo_do") or "",
-                    do_number=meta.get("do_number") or "",
+                    lpo_do=(meta.get("lpo_do") or "").upper(),
+                    do_number=(meta.get("do_number") or "").upper(),
                 )
 
     # ------------------------------------------------------------------
@@ -1432,6 +1444,9 @@ class DailyRegister(QWidget):
                     self._table.blockSignals(True)
                     item.setText(text.upper())
                     self._table.blockSignals(False)
+            if col == COL_DESC and item.text().strip():
+                from tahmeed.services.cashier_service import remember_description
+                remember_description(item.text())
             self._mark_dirty(row)
             if col == COL_TZS:
                 self._update_footer()
@@ -1461,6 +1476,8 @@ class DailyRegister(QWidget):
         if col == COL_ITEM and item.text().strip():
             self._validate_item_cell(row, item)
         elif col == COL_DESC and item.text().strip():
+            from tahmeed.services.cashier_service import remember_description
+            remember_description(item.text())
             self._validate_locked_description(row, item)
             if self._defer_item_to_verify and not self._bulk_mutating:
                 # Defer off the current asyncio task so qasync/Py3.14 does not
@@ -1684,7 +1701,7 @@ class DailyRegister(QWidget):
         snap = {}
         for row in rows:
             for col in range(self._table.columnCount()):
-                if col in READONLY_COLS:
+                if col == COL_SNO:
                     continue
                 it = self._table.item(row, col)
                 snap[(row, col)] = it.text() if it else ""
@@ -1700,15 +1717,20 @@ class DailyRegister(QWidget):
             for (row, col), text in snap.items():
                 if row < 0 or row >= self._table.rowCount():
                     continue
-                if col in READONLY_COLS:
+                if col == COL_SNO:
                     continue
                 if row < self._saved_count and not self._edit_mode:
                     continue
                 it = self._table.item(row, col)
                 if it is None:
                     it = QTableWidgetItem("")
-                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                    if col == COL_CASHIER:
+                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    else:
+                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                     self._table.setItem(row, col, it)
+                elif col == COL_CASHIER:
+                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 it.setText(text)
                 if row < self._saved_count and self._edit_mode:
                     self._dirty_rows.add(row)
@@ -1813,7 +1835,7 @@ class DailyRegister(QWidget):
     def _serialize_row(self, row: int) -> list:
         cells = []
         for col in range(self._table.columnCount()):
-            if col in READONLY_COLS:
+            if col == COL_SNO:
                 cells.append("")
                 continue
             it = self._table.item(row, col)
@@ -1826,10 +1848,10 @@ class DailyRegister(QWidget):
         return cells
 
     def _row_value_map(self, row: int) -> dict:
-        """Column index → exact cell text for cut/insert (preserves Receipt as-is)."""
+        """Column index → exact cell text for cut/insert (preserves Receipt/Cashier)."""
         values = {}
         for col in range(self._table.columnCount()):
-            if col in READONLY_COLS:
+            if col == COL_SNO:
                 continue
             it = self._table.item(row, col)
             if it is None:
@@ -1839,6 +1861,17 @@ class DailyRegister(QWidget):
             else:
                 values[col] = it.text()
         return values
+
+    def _capture_row_meta(self, row: int) -> dict:
+        """Identity/metadata needed to move a row without losing cashier or tx id."""
+        pending = self._pending_row_meta.get(row)
+        return {
+            "was_saved": row < self._saved_count,
+            "saved_id": self._saved_ids.get(row),
+            "saved_tx": self._saved_txs.get(row),
+            "pending": dict(pending) if pending else None,
+            "dirty": row in self._dirty_rows,
+        }
 
     def _cut_rows(self, rows: list) -> None:
         """Mark whole rows as cut (marquee) — do not delete until paste/insert."""
@@ -1856,13 +1889,14 @@ class DailyRegister(QWidget):
 
         self._push_undo_cells(self._snapshot_rows(movable))
         maps = [self._row_value_map(r) for r in movable]
+        metas = [self._capture_row_meta(r) for r in movable]
         lines = ["\t".join(self._serialize_row(r)) for r in movable]
         QApplication.clipboard().setText(_ROWS_CLIP_PREFIX + "\n".join(lines))
 
         cut_cells = set()
         for row in movable:
             for col in range(self._table.columnCount()):
-                if col in READONLY_COLS:
+                if col == COL_SNO:
                     continue
                 cut_cells.add((row, col))
 
@@ -1873,6 +1907,7 @@ class DailyRegister(QWidget):
             "rows": list(movable),
             "lines": lines,
             "maps": maps,
+            "row_metas": metas,
         }
         self._table.viewport().update()
 
@@ -1880,7 +1915,12 @@ class DailyRegister(QWidget):
         """Write a column→text map onto *row*. Returns truck cells to finalize."""
         truck_cells: list = []
         for col, cell in values.items():
-            if col >= self._table.columnCount() or col in READONLY_COLS:
+            if col >= self._table.columnCount() or col == COL_SNO:
+                continue
+            if col == COL_CASHIER:
+                it = QTableWidgetItem(str(cell) if cell is not None else "")
+                it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self._table.setItem(row, col, it)
                 continue
             if col in CHECK_COLS:
                 it = QTableWidgetItem()
@@ -1912,6 +1952,44 @@ class DailyRegister(QWidget):
                 )
         return truck_cells
 
+    def _style_moved_row(self, row: int, was_saved: bool) -> None:
+        """Restore saved/edit styling after a cut→insert move."""
+        if not was_saved:
+            return
+        if self._edit_mode:
+            bg = QBrush(DIRTY_BG if row in self._dirty_rows else EDIT_BG)
+            editable = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+            ro = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        else:
+            bg = QBrush(SAVED_BG)
+            editable = ro = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        for col in range(self._table.columnCount()):
+            it = self._table.item(row, col)
+            if it is None:
+                continue
+            it.setBackground(bg)
+            it.setFlags(ro if col in READONLY_COLS else editable)
+
+    def _restore_moved_row_meta(self, row: int, meta: dict) -> None:
+        """Re-attach tx id / import meta / dirty flag onto an inserted cut row."""
+        if not meta:
+            return
+        pending = meta.get("pending")
+        if pending:
+            self._pending_row_meta[row] = dict(pending)
+        saved_id = meta.get("saved_id")
+        saved_tx = meta.get("saved_tx")
+        was_saved = bool(meta.get("was_saved") or saved_id is not None)
+        if saved_id is not None:
+            self._saved_ids[row] = saved_id
+        if saved_tx is not None:
+            self._saved_txs[row] = saved_tx
+        if was_saved and self._edit_mode:
+            self._dirty_rows.add(row)
+        elif meta.get("dirty"):
+            self._dirty_rows.add(row)
+        self._style_moved_row(row, was_saved)
+
     def _insert_cut_cells(self) -> None:
         """Insert Cut Cells — move the cut buffer to the current position."""
         if not self._has_cut_buffer():
@@ -1930,23 +2008,68 @@ class DailyRegister(QWidget):
         """Insert rows from exact column→value maps (preserves Receipt etc.)."""
         if not maps:
             return
+        metas: list = []
+        source_rows: list = []
+        if (
+            clear_cut_after
+            and self._has_cut_buffer()
+            and self._cut_is_rows
+            and self._cut_payload.get("kind") == "rows"
+        ):
+            metas = list(self._cut_payload.get("row_metas") or [])
+            source_rows = list(self._cut_payload.get("rows") or [])
+
         cur = self._table.currentRow()
         if self._merged_mode and self._edit_mode:
             insert_at = max(cur, 0)
         else:
             insert_at = max(cur, self._saved_count)
 
+        # Remove cut sources first so row maps stay consistent, then insert.
+        if source_rows:
+            removed_before = sum(1 for r in source_rows if r < insert_at)
+            self._table.blockSignals(True)
+            try:
+                for row in sorted(source_rows, reverse=True):
+                    if row < 0 or row >= self._table.rowCount():
+                        continue
+                    self._shift_row_maps_on_remove(row)
+                    self._table.removeRow(row)
+                    if row < self._saved_count:
+                        self._saved_count -= 1
+            finally:
+                self._table.blockSignals(False)
+            insert_at = max(0, insert_at - removed_before)
+            self._clear_cut_marquee()
+            clear_cut_after = False
+            min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+            if self._table.rowCount() < min_rows:
+                start = self._table.rowCount()
+                self._table.setRowCount(min_rows)
+                self._init_editable_rows(start, min_rows)
+
         truck_cells: list = []
         self._bulk_mutating = True
         prev = self._table.blockSignals(True)
         try:
-            for values in maps:
+            for i, values in enumerate(maps):
+                meta = metas[i] if i < len(metas) else {}
+                was_saved = bool(
+                    meta.get("was_saved") or meta.get("saved_id") is not None
+                )
+                # Keep saved drafts in the saved prefix; new rows stay below it.
+                if was_saved:
+                    insert_at = min(insert_at, self._saved_count)
+                else:
+                    insert_at = max(insert_at, self._saved_count)
+
                 self._shift_row_maps_on_insert(insert_at)
                 self._table.insertRow(insert_at)
                 self._init_editable_rows(insert_at, insert_at + 1)
                 truck_cells.extend(self._write_row_values(insert_at, values))
+                self._restore_moved_row_meta(insert_at, meta)
                 self._sync_row_date(insert_at)
-                if insert_at < self._saved_count:
+                if was_saved:
                     self._saved_count += 1
                 insert_at += 1
         finally:
@@ -1957,6 +2080,7 @@ class DailyRegister(QWidget):
         self._finalize_truck_cells(truck_cells)
         if clear_cut_after and self._has_cut_buffer() and self._cut_is_rows:
             self._clear_cut_source_cells()
+        self.edit_state_changed.emit(self._edit_mode, len(self._dirty_rows))
 
     def _clear_cut_source_cells(self) -> None:
         """After a successful paste/insert, clear/remove the original cut source."""
@@ -2051,6 +2175,18 @@ class DailyRegister(QWidget):
         lines = [ln for ln in body.splitlines() if ln.strip() != "" or "\t" in ln]
         if not lines:
             return
+        # Prefer exact maps + identity when this paste is finishing a row cut.
+        if (
+            clear_cut_after
+            and self._has_cut_buffer()
+            and self._cut_is_rows
+            and self._cut_payload.get("maps")
+        ):
+            self._paste_row_maps(
+                self._cut_payload["maps"], clear_cut_after=True
+            )
+            return
+
         cur = self._table.currentRow()
         if self._merged_mode and self._edit_mode:
             insert_at = max(cur, 0)
@@ -2066,37 +2202,12 @@ class DailyRegister(QWidget):
                 self._table.insertRow(insert_at)
                 self._init_editable_rows(insert_at, insert_at + 1)
                 cells = line.split("\t")
-                for col, cell in enumerate(cells):
-                    if col >= self._table.columnCount() or col in READONLY_COLS:
-                        continue
-                    if col in CHECK_COLS:
-                        it = QTableWidgetItem()
-                        it.setData(Qt.UserRole, cell.strip() in ("1", "true", "True", "YES"))
-                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                        self._table.setItem(insert_at, col, it)
-                    elif col == COL_RECEIPT:
-                        it = QTableWidgetItem(_receipt_paste_value(cell))
-                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                        self._table.setItem(insert_at, col, it)
-                    elif col == COL_TZS:
-                        amt = _parse_amount_text(cell)
-                        text = f"{amt:,.2f}" if cell.strip() else ""
-                        it = QTableWidgetItem(text)
-                        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                        if amt < 0:
-                            it.setForeground(NEG_COLOR)
-                        self._table.setItem(insert_at, col, it)
-                    elif col == COL_TRUCK:
-                        raw = cell.strip()
-                        self._table.setItem(
-                            insert_at, col, QTableWidgetItem(raw.upper() if raw else "")
-                        )
-                        if raw:
-                            truck_cells.append((insert_at, raw))
-                    else:
-                        self._table.setItem(
-                            insert_at, col, QTableWidgetItem(_upper_text(col, cell.strip()))
-                        )
+                values = {
+                    col: cell
+                    for col, cell in enumerate(cells)
+                    if col < self._table.columnCount() and col != COL_SNO
+                }
+                truck_cells.extend(self._write_row_values(insert_at, values))
                 self._sync_row_date(insert_at)
                 if insert_at < self._saved_count:
                     self._saved_count += 1
@@ -2130,14 +2241,16 @@ class DailyRegister(QWidget):
 
         # selectedIndexes() covers blank rows (which have no QTableWidgetItem and
         # therefore never appear in selectedItems()).
+        # In edit mode, paste may land on saved rows; otherwise stay below them.
+        min_row = 0 if self._edit_mode else self._saved_count
         sel_indexes = self._table.selectedIndexes()
         if sel_indexes:
-            start_row = max(min(i.row() for i in sel_indexes), self._saved_count)
+            start_row = max(min(i.row() for i in sel_indexes), min_row)
             start_col = min(i.column() for i in sel_indexes)
-            sel_rows = sorted({i.row() for i in sel_indexes if i.row() >= self._saved_count})
+            sel_rows = sorted({i.row() for i in sel_indexes if i.row() >= min_row})
             sel_cols = sorted({i.column() for i in sel_indexes})
         else:
-            start_row = max(self._table.currentRow(), self._saved_count)
+            start_row = max(self._table.currentRow(), min_row)
             start_col = self._table.currentColumn()
             sel_rows = []
             sel_cols = []
@@ -2181,7 +2294,8 @@ class DailyRegister(QWidget):
                                 truck_cells.append((row, cell_value))
                         else:
                             self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell_value)))
-                for row in sel_rows:
+                    if row < self._saved_count and self._edit_mode:
+                        self._mark_dirty(row)
                     self._sync_row_date(row)
                 self._table.blockSignals(prev)
                 self._renumber()
@@ -2198,7 +2312,7 @@ class DailyRegister(QWidget):
                             self._append_editable_rows(20)
                         if col >= self._table.columnCount() or col in READONLY_COLS:
                             continue
-                        if row < self._saved_count:
+                        if row < self._saved_count and not self._edit_mode:
                             continue
                         touched_rows.add(row)
                         if col in CHECK_COLS:
@@ -2228,6 +2342,8 @@ class DailyRegister(QWidget):
                         else:
                             self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell.strip())))
                 for row in touched_rows:
+                    if row < self._saved_count and self._edit_mode:
+                        self._mark_dirty(row)
                     self._sync_row_date(row)
                 self._table.blockSignals(prev)
                 self._renumber()
@@ -2490,6 +2606,7 @@ class DailyRegister(QWidget):
     async def apply_daily_import_preview(self, preview) -> None:
         """Navigate to the Excel main date and stage rows for the user to Save."""
         from tahmeed.services.daily_import_service import staged_row_payload
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
 
         primary = preview.primary_date or self._current_date
         if primary != self._current_date:
@@ -2499,7 +2616,8 @@ class DailyRegister(QWidget):
                     return
             self._reset_edit_state()
             self._current_date = primary
-            await self._load_date(primary)
+            with UploadBusy(self, "Opening import date…", title="Import"):
+                await self._load_date(primary)
 
         payloads = [staged_row_payload(row, preview) for row in preview.rows]
         # Queue truck issues now, but open the correction dialog only after this
@@ -2507,7 +2625,13 @@ class DailyRegister(QWidget):
         # under Python 3.14 / qasync.
         self._suppress_truck_dialog = True
         try:
-            self._load_staged_import_rows(payloads)
+            with UploadBusy(
+                self,
+                f"Loading {len(payloads):,} row(s) into table…",
+                title="Import",
+            ) as busy:
+                busy.update(f"Loading {len(payloads):,} row(s) into table…")
+                self._load_staged_import_rows(payloads)
             QMessageBox.information(
                 self,
                 "Import ready",
@@ -2548,8 +2672,8 @@ class DailyRegister(QWidget):
                     "import_primary_date": data.get("import_primary_date"),
                     "category_id": data.get("category_id"),
                     "currency": data.get("currency") or "TZS",
-                    "lpo_do": data.get("lpo_do") or "",
-                    "do_number": data.get("do_number") or "",
+                    "lpo_do": (data.get("lpo_do") or "").upper(),
+                    "do_number": (data.get("do_number") or "").upper(),
                 }
 
                 dt = data.get("date")
@@ -2580,7 +2704,9 @@ class DailyRegister(QWidget):
 
                 ref = data.get("ref_float") or ""
                 if ref:
-                    self._table.setItem(target, COL_REF, QTableWidgetItem(ref))
+                    self._table.setItem(
+                        target, COL_REF, QTableWidgetItem(_upper_text(COL_REF, ref))
+                    )
 
                 amount = float(data.get("amount") or 0)
                 tzs_it = QTableWidgetItem(f"{amount:,.2f}" if amount else "")
@@ -2879,10 +3005,12 @@ class DailyRegister(QWidget):
 
                 cat = self._cat_by_name.get(item_name.lower()) if item_name else None
                 if cat is not None:
-                    item_name = cat.name  # canonical casing
+                    item_name = cat.name.upper()
                 elif item_name and self._restrict_items:
                     errors.append(f'Row {row + 1}: "{item_name}" is not a known item.')
                     continue
+                elif item_name:
+                    item_name = item_name.upper()
 
                 # Backstop for description-lock (covers paste / fill-down that
                 # skip the live editor validation).
@@ -2896,7 +3024,11 @@ class DailyRegister(QWidget):
                                 f'description for "{item_name}".'
                             )
                             continue
-                        description = match  # canonical casing
+                        description = match.upper()
+                    else:
+                        description = description.upper()
+                else:
+                    description = description.upper()
 
                 truck_raw = txt(COL_TRUCK)
                 truck_number = ""
@@ -2975,7 +3107,7 @@ class DailyRegister(QWidget):
                     else:
                         is_dup = True   # "Save Anyway" — mark as duplicate
 
-                ref_text = txt(COL_REF)
+                ref_text = txt(COL_REF).upper()
                 meta = self._pending_row_meta.get(row) or {}
                 tx = Transaction(
                     date=tx_date,
@@ -2991,14 +3123,14 @@ class DailyRegister(QWidget):
                     truck_number=truck_number,
                     amount=amount,
                     currency=meta.get("currency") or "TZS",
-                    memo=txt(COL_MEMO),
+                    memo=txt(COL_MEMO).upper(),
                     receipt_status=rcpt_status,
                     ref_float=ref_text,
                     notes_flag=_is_refund_float(ref_text),
-                    ownership=txt(COL_OWN),
-                    approver=txt(COL_APR),
-                    payee=txt(COL_PAYEE),
-                    cheque=txt(COL_CHEQUE),
+                    ownership=txt(COL_OWN).upper(),
+                    approver=txt(COL_APR).upper(),
+                    payee=txt(COL_PAYEE).upper(),
+                    cheque=txt(COL_CHEQUE).upper(),
                     cashier_id=self._user._id,
                     day_order=row,
                     register_status="draft",
@@ -3007,8 +3139,8 @@ class DailyRegister(QWidget):
                     daily_import_source=meta.get("daily_import_source"),
                     date_discrepancy=bool(meta.get("date_discrepancy")),
                     import_primary_date=meta.get("import_primary_date"),
-                    lpo_do=meta.get("lpo_do") or "",
-                    do_number=meta.get("do_number") or "",
+                    lpo_do=(meta.get("lpo_do") or "").upper(),
+                    do_number=(meta.get("do_number") or "").upper(),
                 )
                 await save_transaction(tx)
                 saved += 1
@@ -3108,10 +3240,15 @@ class DailyRegister(QWidget):
         self._table.blockSignals(prev)
 
     async def _load_fleet_numbers(self) -> None:
+        from tahmeed.services.truck_service import get_fleet_kinds, get_fleet_numbers
         try:
             self._fleet_numbers = await get_fleet_numbers()
         except Exception:
             self._fleet_numbers = set()
+        try:
+            self._fleet_kinds = await get_fleet_kinds()
+        except Exception:
+            self._fleet_kinds = {}
         try:
             raw = await get_setting("allowed_truck_labels")
             if isinstance(raw, list) and raw:
@@ -3120,6 +3257,14 @@ class DailyRegister(QWidget):
                 self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
         except Exception:
             self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
+
+    async def _load_description_cache(self) -> None:
+        """Warm system-wide description history for Excel-style autocomplete."""
+        from tahmeed.services.cashier_service import ensure_description_cache
+        try:
+            await ensure_description_cache()
+        except Exception:
+            pass
 
     async def _remember_truck_labels(self, labels: list) -> None:
         if not labels:
@@ -3155,10 +3300,11 @@ class DailyRegister(QWidget):
             return
         cat = self._cat_by_name.get(text.lower())
         if cat is not None:
-            # Known item — snap to its canonical casing.
-            if item.text() != cat.name:
+            # Known item — snap to uppercase (table-view convention).
+            canonical = cat.name.upper()
+            if item.text() != canonical:
                 self._table.blockSignals(True)
-                item.setText(cat.name)
+                item.setText(canonical)
                 self._table.blockSignals(False)
             return
         if not self._restrict_items:
@@ -3200,7 +3346,7 @@ class DailyRegister(QWidget):
             it = self._table.item(row, COL_ITEM)
             if it is not None and cat is not None:
                 self._table.blockSignals(True)
-                it.setText(cat.name)
+                it.setText(cat.name.upper())
                 self._table.blockSignals(False)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to add item:\n{exc}")
@@ -3331,6 +3477,7 @@ class DailyRegister(QWidget):
             can_add=self._can_add_fleet(),
             allowed_labels=self._allowed_truck_labels,
             on_resolved=self._on_truck_issue_resolved_live,
+            fleet_kinds=getattr(self, "_fleet_kinds", None) or {},
             parent=self,
         )
         self._open_truck_dialog = dlg
@@ -3358,8 +3505,10 @@ class DailyRegister(QWidget):
             try:
                 if kind == "trucks":
                     await add_truck(number)
+                    self._fleet_kinds[number] = "truck"
                 else:
                     await add_trailer(number)
+                    self._fleet_kinds[number] = "trailer"
                 self._fleet_numbers.add(number)
             except Exception as exc:
                 QMessageBox.critical(

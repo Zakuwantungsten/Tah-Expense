@@ -94,11 +94,16 @@ class Transaction:
             "year": self.year,
             "created_at": self.created_at,
             "possible_duplicate": self.possible_duplicate,
-            "daily_import_id": self.daily_import_id,
-            "daily_import_source": self.daily_import_source,
             "date_discrepancy": self.date_discrepancy,
-            "import_primary_date": self.import_primary_date,
         }
+        # Only persist import batch fields when this row came from an Excel upload.
+        # Writing null here used to create an undeleteable phantom "upload" group.
+        if self.daily_import_id:
+            doc["daily_import_id"] = self.daily_import_id
+        if self.daily_import_source:
+            doc["daily_import_source"] = self.daily_import_source
+        if self.import_primary_date is not None:
+            doc["import_primary_date"] = self.import_primary_date
         if self._id:
             doc["_id"] = self._id
         return doc

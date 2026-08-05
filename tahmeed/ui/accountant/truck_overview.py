@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tahmeed.services.truck_service import get_fleet_numbers, search_fleet
+from tahmeed.services.truck_service import get_fleet_numbers, search_fleet, search_fleet_sync
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
@@ -807,7 +807,7 @@ class TruckOverviewWidget(QWidget):
         filter_row.setContentsMargins(0, 0, 0, 0)
         filter_row.setSpacing(10)
 
-        self._truck_edit = TruckLineEdit(search_fleet)
+        self._truck_edit = TruckLineEdit(search_fleet, sync_fn=search_fleet_sync)
         self._truck_edit.setPlaceholderText("Search truck or trailer…")
         self._truck_edit.setFixedWidth(180)
         self._truck_edit.setFixedHeight(_CTRL_H)
@@ -1129,12 +1129,13 @@ class TruckOverviewWidget(QWidget):
             self._table.setItem(r, 2, _cell(row.get("description", "—")))
             self._table.setItem(r, 3, _cell(row.get("reference", "—")))
             self._table.setItem(r, 4, _cell(row.get("truck_value", "—")))
+            # Amounts use the same Segoe UI table font as Verify / Master / Fuel
+            # (no Cascadia mono) so TZS / USD / ZMW match other accountant tabs.
             self._table.setItem(
                 r, 5,
                 _cell(
                     _fmt_currency_cell("TZS", tzs_amt),
                     align=Qt.AlignRight | Qt.AlignVCenter,
-                    mono=True,
                     color=amount_color if tzs_amt is not None else _TM,
                 ),
             )
@@ -1143,7 +1144,6 @@ class TruckOverviewWidget(QWidget):
                 _cell(
                     _fmt_currency_cell("USD", usd_amt),
                     align=Qt.AlignRight | Qt.AlignVCenter,
-                    mono=True,
                     color=(_GREEN if isinstance(usd_amt, float) and usd_amt >= 0 else amount_color)
                     if usd_amt is not None else _TM,
                 ),
@@ -1153,7 +1153,6 @@ class TruckOverviewWidget(QWidget):
                 _cell(
                     _fmt_currency_cell("ZMW", zmw_amt),
                     align=Qt.AlignRight | Qt.AlignVCenter,
-                    mono=True,
                     color=amount_color if zmw_amt is not None else _TM,
                 ),
             )

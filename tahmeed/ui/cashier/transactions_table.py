@@ -638,6 +638,8 @@ class TransactionBrowser(QWidget):
         from tahmeed.services.accountant_service import get_cashier_names
 
         uploads = await list_daily_uploads(limit=200)
+        # Defense: never show groups without a real batch id.
+        uploads = [u for u in uploads if u.get("_id")]
         self._results_uploads = uploads
         cashier_ids = [u.get("cashier_id") for u in uploads if u.get("cashier_id")]
         names = await get_cashier_names(cashier_ids) if cashier_ids else {}
@@ -698,6 +700,18 @@ class TransactionBrowser(QWidget):
     def _confirm_delete_upload(self, upload_id: str, filename: str, count: int) -> None:
         from PySide6.QtWidgets import QMessageBox
         if not upload_id:
+            resp = QMessageBox.warning(
+                self,
+                "Invalid Upload",
+                f'Upload "{filename}" has no valid batch id (often left by an '
+                "older buggy save).\n\n"
+                "Clean these faulty tags from the database so they stop "
+                "appearing in Uploads?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if resp == QMessageBox.Yes:
+                asyncio.ensure_future(self._cleanup_faulty_uploads())
             return
         resp = QMessageBox.warning(
             self,
@@ -710,11 +724,28 @@ class TransactionBrowser(QWidget):
         if resp == QMessageBox.Yes:
             asyncio.ensure_future(self._delete_upload(upload_id))
 
+    async def _cleanup_faulty_uploads(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        from tahmeed.services.daily_import_service import cleanup_null_daily_import_ids
+        try:
+            n = await cleanup_null_daily_import_ids()
+            QMessageBox.information(
+                self,
+                "Cleaned",
+                f"Removed faulty upload tags from {n:,} transaction(s).\n"
+                "Normal entries were kept; only the bad upload grouping was cleared.",
+            )
+            await self._load_uploads()
+        except Exception as exc:
+            QMessageBox.critical(self, "Cleanup Failed", str(exc))
+
     async def _delete_upload(self, upload_id: str) -> None:
         from PySide6.QtWidgets import QMessageBox
         from tahmeed.services.daily_import_service import delete_daily_upload
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
         try:
-            deleted = await delete_daily_upload(upload_id)
+            with UploadBusy(self, "Deleting upload…", title="Uploads"):
+                deleted = await delete_daily_upload(upload_id)
             QMessageBox.information(
                 self, "Upload Deleted", f"Removed {deleted:,} transaction(s)."
             )

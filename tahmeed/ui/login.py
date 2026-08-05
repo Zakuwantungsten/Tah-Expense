@@ -262,6 +262,7 @@ class LoginWindow(QWidget):
         self._login_error.setText("")
         # Sign In is disabled during authenticate(); re-enable so logout → login works.
         self._login_btn.setEnabled(True)
+        self._login_btn.setText("Sign In")
 
     # Login flow
     # ------------------------------------------------------------------
@@ -271,6 +272,7 @@ class LoginWindow(QWidget):
 
     async def _do_login(self) -> None:
         self._login_btn.setEnabled(False)
+        self._login_btn.setText("Signing in…")
         self._login_error.setText("")
 
         username = self._username.text().strip()
@@ -279,6 +281,7 @@ class LoginWindow(QWidget):
         if not username or not password:
             self._login_error.setText("Enter username and password.")
             self._login_btn.setEnabled(True)
+            self._login_btn.setText("Sign In")
             return
 
         try:
@@ -290,11 +293,13 @@ class LoginWindow(QWidget):
                 detail = "Sign-in failed. Please try again."
             self._login_error.setText(detail or "Sign-in failed. Please try again.")
             self._login_btn.setEnabled(True)
+            self._login_btn.setText("Sign In")
             return
         if user is None:
             self._login_error.setText("Invalid username or password.")
             self._password.clear()
             self._login_btn.setEnabled(True)
+            self._login_btn.setText("Sign In")
             return
 
         self.login_successful.emit(user)

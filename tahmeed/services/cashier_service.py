@@ -446,25 +446,103 @@ async def get_available_months() -> list:
     return [(d["_id"]["year"], d["_id"]["month"]) for d in docs]
 
 
+# In-memory description history for Excel-style autocomplete across all days.
+_desc_ranked: Optional[List[str]] = None
+_desc_counts: Optional[dict] = None
+_desc_lock = asyncio.Lock()
+_DESC_CACHE_LIMIT = 5000
+
+
+def invalidate_description_cache() -> None:
+    global _desc_ranked, _desc_counts
+    _desc_ranked = None
+    _desc_counts = None
+
+
+def _rebuild_desc_ranked() -> None:
+    global _desc_ranked
+    counts = _desc_counts or {}
+    _desc_ranked = sorted(counts.keys(), key=lambda d: (-counts[d], d))
+
+
+async def ensure_description_cache() -> List[str]:
+    """Load distinct descriptions (all days) ranked by frequency."""
+    global _desc_ranked, _desc_counts
+    if _desc_ranked is not None:
+        return _desc_ranked
+    async with _desc_lock:
+        if _desc_ranked is not None:
+            return _desc_ranked
+        db = get_db()
+        pipeline = [
+            {"$match": {"description": {"$type": "string", "$ne": ""}}},
+            {"$group": {
+                "_id": {"$toUpper": "$description"},
+                "n": {"$sum": 1},
+            }},
+            {"$sort": {"n": -1, "_id": 1}},
+            {"$limit": _DESC_CACHE_LIMIT},
+        ]
+        docs = await db.transactions.aggregate(pipeline).to_list(
+            length=_DESC_CACHE_LIMIT
+        )
+        counts: dict = {}
+        ranked: list = []
+        for doc in docs:
+            name = str(doc.get("_id") or "").strip()
+            if not name:
+                continue
+            counts[name] = int(doc.get("n") or 0)
+            ranked.append(name)
+        _desc_counts = counts
+        _desc_ranked = ranked
+        return _desc_ranked
+
+
+def search_descriptions_sync(prefix: str, limit: int = 12) -> Optional[List[str]]:
+    """Prefix filter against the warm description cache (no await).
+
+    Returns ``None`` when the cache has not been loaded yet — callers should
+    fall through to the async path. Safe during modal dialogs / nested tasks.
+    """
+    if _desc_ranked is None:
+        return None
+    value = (prefix or "").strip().lower()
+    if not value:
+        return []
+    out: List[str] = []
+    for description in _desc_ranked:
+        if description.lower().startswith(value):
+            out.append(description)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def remember_description(text: str) -> None:
+    """Boost a just-entered description so same-session typing can Tab-complete it."""
+    global _desc_ranked, _desc_counts
+    if _desc_ranked is None:
+        return
+    name = (text or "").strip().upper()
+    if not name:
+        return
+    counts = _desc_counts if _desc_counts is not None else {}
+    counts[name] = counts.get(name, 0) + 1
+    _desc_counts = counts
+    _rebuild_desc_ranked()
+
+
 async def search_descriptions(prefix: str, limit: int = 12) -> List[str]:
     """
     Return distinct descriptions whose prefix matches (case-insensitive),
     sorted by frequency so the most-used descriptions appear first.
+    Uses the warm in-memory cache covering all days in the system.
     """
     if not prefix.strip():
         return []
-    db = get_db()
-    pattern = f"^{re.escape(prefix.strip())}"
-    pipeline = [
-        {"$match": {"description": {"$regex": pattern, "$options": "i"}}},
-        {"$group": {"_id": "$description", "n": {"$sum": 1}}},
-        {"$sort": {"n": -1}},
-        {"$limit": limit},
-        {"$project": {"_id": 1}},
-    ]
-    cursor = db.transactions.aggregate(pipeline)
-    results = await cursor.to_list(length=limit)
-    return [r["_id"] for r in results]
+    await ensure_description_cache()
+    return search_descriptions_sync(prefix, limit) or []
 
 
 async def get_rejected_transactions_for_cashier(
