@@ -17,6 +17,39 @@ def _mapping(document: dict) -> DescriptionMapping:
     return DescriptionMapping.from_doc(desktop_document(document))
 
 
+async def list_mappings(
+    *,
+    search: str = "",
+    limit: int = 100,
+    skip: int = 0,
+) -> List[DescriptionMapping]:
+    page = await api_client.request(
+        "GET",
+        "v1/description-mappings",
+        params={
+            "search": search,
+            "limit": max(1, min(limit, 500)),
+            "offset": max(0, skip),
+            "include_inactive": "true",
+        },
+    )
+    return [_mapping(document) for document in page["items"]]
+
+
+async def count_mappings(*, search: str = "") -> int:
+    page = await api_client.request(
+        "GET",
+        "v1/description-mappings",
+        params={
+            "search": search,
+            "limit": 1,
+            "offset": 0,
+            "include_inactive": "true",
+        },
+    )
+    return int(page["total"])
+
+
 async def list_all_mappings() -> List[DescriptionMapping]:
     documents = await get_all_pages("v1/description-mappings")
     mappings = [_mapping(document) for document in documents]
@@ -61,6 +94,13 @@ async def save_mapping(
         },
     )
     return _mapping(document)
+
+
+async def delete_mapping(mapping_id: ObjectId | str) -> None:
+    await api_client.request(
+        "DELETE",
+        f"v1/description-mappings/{mapping_id}",
+    )
 
 
 async def delete_all_mappings() -> int:

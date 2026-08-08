@@ -23,11 +23,25 @@ _PREVIEW_LIMIT = 10
 
 
 class DailyImportPreviewDialog(QDialog):
-    """Show import summary + sample rows; Confirm loads into the Daily Register."""
+    """Show import summary + sample rows; Confirm continues the import flow."""
 
-    def __init__(self, preview: DailyImportPreview, parent=None) -> None:
+    def __init__(
+        self,
+        preview: DailyImportPreview,
+        parent=None,
+        *,
+        title: str = "Review import before loading",
+        note: str = (
+            "Confirm to load these rows into the Daily Register table. "
+            "Nothing is saved until you click Save."
+        ),
+        confirm_label: str | None = None,
+    ) -> None:
         super().__init__(parent)
         self._preview = preview
+        self._title_text = title
+        self._note_text = note
+        self._confirm_label = confirm_label or f"Load {len(preview.rows):,} into Table"
         self.setWindowTitle("Import Preview")
         self.setMinimumSize(720, 420)
         self.setModal(True)
@@ -42,7 +56,7 @@ class DailyImportPreviewDialog(QDialog):
         root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(12)
 
-        title = QLabel("Review import before loading")
+        title = QLabel(self._title_text)
         title.setStyleSheet(
             f"color: {_T1}; font-size: 16px; font-weight: 700;"
         )
@@ -118,10 +132,7 @@ class DailyImportPreviewDialog(QDialog):
         cvl.addWidget(table)
         root.addWidget(card, 1)
 
-        note = QLabel(
-            "Confirm to load these rows into the Daily Register table. "
-            "Nothing is saved until you click Save."
-        )
+        note = QLabel(self._note_text)
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {_T2}; font-size: 11px;")
         root.addWidget(note)
@@ -136,7 +147,7 @@ class DailyImportPreviewDialog(QDialog):
             "QPushButton:hover{background:#f9fafb;}"
         )
         cancel.clicked.connect(self.reject)
-        confirm = QPushButton(f"Load {len(p.rows):,} into Table")
+        confirm = QPushButton(self._confirm_label)
         confirm.setCursor(Qt.PointingHandCursor)
         confirm.setDefault(True)
         confirm.setStyleSheet(

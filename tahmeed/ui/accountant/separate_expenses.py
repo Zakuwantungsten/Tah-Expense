@@ -690,7 +690,8 @@ class ImportDialog(QDialog):
             self._loading.show_loading(
                 message, value=value or 0, maximum=max(1, maximum),
             )
-        QApplication.processEvents()
+        from tahmeed.ui.async_utils import safe_process_events
+        safe_process_events()
 
     def _update_busy(
         self,
@@ -706,7 +707,8 @@ class ImportDialog(QDialog):
         if value is not None:
             kwargs["value"] = value
         self._loading.show_loading(message, **kwargs)
-        QApplication.processEvents()
+        from tahmeed.ui.async_utils import safe_process_events
+        safe_process_events()
 
     def _clear_busy(self, *, enable_import: bool = False) -> None:
         self._busy = False

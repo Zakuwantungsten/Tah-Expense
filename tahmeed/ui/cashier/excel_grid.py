@@ -59,6 +59,17 @@ from tahmeed.services.cashier_service import (
 from tahmeed.services.category_service import get_all_categories, item_key
 from tahmeed.services.subtable_service import get_subtables
 from tahmeed.services.settings_service import get_setting, set_setting
+from tahmeed.services.register_draft_service import (
+    build_draft_payload,
+    cells_for_json,
+    cells_from_json,
+    clear_register_draft,
+    draft_is_empty,
+    hydrate_pending_meta,
+    load_register_draft,
+    save_register_draft,
+    serialize_pending_meta,
+)
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_completion
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
@@ -383,6 +394,8 @@ class DailyRegister(QWidget):
     stats_updated     = Signal(int, float, float, object)  # n, total_tzs, refund, register_date
     edit_state_changed = Signal(bool, int)         # (edit_mode_active, dirty_row_count)
     mode_changed      = Signal(bool)               # merged mode on/off
+    attachment_count_changed = Signal(int)         # selected row attachment count
+    save_busy_changed = Signal(bool)               # True while Save/Submit is in flight
 
     def __init__(self, user: User, categories: List[Category], parent=None):
         super().__init__(parent)
@@ -393,8 +406,8 @@ class DailyRegister(QWidget):
         self._restrict_items: bool = False
         self._defer_item_to_verify: bool = False
         self._restrict_trucks: bool = True  # always on — only registered fleet numbers
-        self._fleet_numbers: set = set()   # uppercased valid truck/trailer numbers
-        self._fleet_kinds: dict = {}       # number → "truck" | "trailer"
+        self._fleet_numbers: set = set()   # uppercased valid fleet numbers
+        self._fleet_kinds: dict = {}       # number → "truck" | "trailer" | "motor_vehicle"
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
         self._people_names: list = []      # Ownership / APR BY suggestions (unrestricted)
         self._cashier_names: dict = {}     # ObjectId -> display name
@@ -426,6 +439,15 @@ class DailyRegister(QWidget):
         # Undo stack of cell snapshots
         self._undo_stack: list = []           # [{(r,c): text}, ...]
         self._undo_limit: int = 40
+        # Re-entrancy guards — prevent double-click duplicate inserts.
+        self._save_in_flight = False
+        self._submit_in_flight = False
+        # Local draft autosave (crash / power-loss recovery).
+        self._draft_timer = QTimer(self)
+        self._draft_timer.setSingleShot(True)
+        self._draft_timer.setInterval(1_500)
+        self._draft_timer.timeout.connect(self._flush_local_draft)
+        self._restoring_draft = False
         self._build_ui()
         asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_categories())
@@ -525,6 +547,7 @@ class DailyRegister(QWidget):
         self._table.model().dataChanged.connect(self._on_model_data_changed)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._show_context_menu)
+        self._table.itemSelectionChanged.connect(self._emit_attachment_badge)
 
         root.addWidget(self._table)
 
@@ -598,6 +621,7 @@ class DailyRegister(QWidget):
         self._pending_highlight = highlight_term
         self._commit_open_editor()
         if self.has_unsaved_work():
+            self._flush_local_draft()
             resp = QMessageBox.question(
                 self, "Unsaved changes",
                 "You have unsaved changes on this date.\nSave them before leaving?",
@@ -610,7 +634,8 @@ class DailyRegister(QWidget):
             if resp == QMessageBox.Yes:
                 asyncio.ensure_future(self._save_then_navigate(d))
                 return
-            # Discard → fall through and reload the new date
+            # Discard → clear local recovery draft for this date, then leave.
+            self._clear_local_draft()
         self._reset_edit_state()
         self._current_date = d
         asyncio.ensure_future(self._load_date(d))
@@ -639,6 +664,9 @@ class DailyRegister(QWidget):
             self._pending_row_meta.clear()
             self._populate(txs)
             self._table.setColumnHidden(COL_CASHIER, not self._merged_mode)
+            restored = self._restore_local_draft()
+            if restored:
+                self._show_draft_restored_notice(*restored)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
 
@@ -648,6 +676,7 @@ class DailyRegister(QWidget):
             return
         self._commit_open_editor()
         if self.has_unsaved_work():
+            self._flush_local_draft()
             resp = QMessageBox.question(
                 self, "Unsaved changes",
                 "You have unsaved changes.\nSave them before switching mode?",
@@ -660,6 +689,7 @@ class DailyRegister(QWidget):
             if resp == QMessageBox.Yes:
                 asyncio.ensure_future(self._save_then_switch_mode(bool(merged)))
                 return
+            self._clear_local_draft()
         self._merged_mode = bool(merged)
         self._reset_edit_state()
         self.mode_changed.emit(self._merged_mode)
@@ -676,41 +706,52 @@ class DailyRegister(QWidget):
 
     def submit_for_verify(self) -> None:
         """Submit every draft row for the current calendar day to Verify."""
+        if self._submit_in_flight or self._save_in_flight:
+            return
         asyncio.ensure_future(self._do_submit_for_verify())
 
     async def _do_submit_for_verify(self) -> None:
-        self._commit_open_editor()
-        if self.has_unsaved_work():
+        if self._submit_in_flight or self._save_in_flight:
+            return
+        self._submit_in_flight = True
+        self.save_busy_changed.emit(True)
+        try:
+            self._commit_open_editor()
+            if self.has_unsaved_work():
+                resp = QMessageBox.question(
+                    self, "Unsaved changes",
+                    "Save changes before submitting this day for verify?",
+                    QMessageBox.Yes | QMessageBox.Cancel,
+                    QMessageBox.Yes,
+                )
+                if resp != QMessageBox.Yes:
+                    return
+                if not await self._do_save():
+                    return
+            d = self._current_date
+            label = d.strftime("%d %b %Y")
             resp = QMessageBox.question(
-                self, "Unsaved changes",
-                "Save changes before submitting this day for verify?",
-                QMessageBox.Yes | QMessageBox.Cancel,
+                self, "Submit for Verify",
+                f"Submit all draft entries for {label} to the Verify inbox?\n\n"
+                "This sends the whole day's transactions (all cashiers).",
+                QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes,
             )
             if resp != QMessageBox.Yes:
                 return
-            if not await self._do_save():
-                return
-        d = self._current_date
-        label = d.strftime("%d %b %Y")
-        resp = QMessageBox.question(
-            self, "Submit for Verify",
-            f"Submit all draft entries for {label} to the Verify inbox?\n\n"
-            "This sends the whole day's transactions (all cashiers).",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if resp != QMessageBox.Yes:
-            return
-        try:
-            n = await submit_day_for_verify(d)
-            QMessageBox.information(
-                self, "Submitted",
-                f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for {label}.",
-            )
-            await self._load_date(d)
-        except Exception as exc:
-            QMessageBox.critical(self, "Submit Failed", str(exc))
+            try:
+                n = await submit_day_for_verify(d)
+                QMessageBox.information(
+                    self, "Submitted",
+                    f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for {label}.",
+                )
+                await self._load_date(d)
+            except Exception as exc:
+                QMessageBox.critical(self, "Submit Failed", str(exc))
+        finally:
+            self._submit_in_flight = False
+            if not self._save_in_flight:
+                self.save_busy_changed.emit(False)
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load_date(self._current_date))
@@ -961,7 +1002,7 @@ class DailyRegister(QWidget):
                         truck_number = norm.value
                     else:
                         raise ValueError(
-                            f'"{norm.value}" is not a registered truck/trailer.'
+                            f'"{norm.value}" is not a registered fleet vehicle.'
                         )
                 else:
                     truck_number = matched
@@ -1039,6 +1080,9 @@ class DailyRegister(QWidget):
     def _exit_edit_mode(self, discard: bool) -> None:
         """Leave edit mode. When discard is True the date is reloaded so the grid
         reverts to the stored values; otherwise the caller reloads after saving."""
+        if discard:
+            # Keep typed new rows in the local draft; drop dirty saved-row edits.
+            self._flush_local_draft(include_dirty=False)
         self._reset_edit_state()
         if discard:
             asyncio.ensure_future(self._load_date(self._current_date))
@@ -1060,6 +1104,7 @@ class DailyRegister(QWidget):
                 it.setBackground(QBrush(DIRTY_BG))
         self._table.blockSignals(False)
         self.edit_state_changed.emit(True, len(self._dirty_rows))
+        self._schedule_draft_autosave()
 
     def _updates_from_row(self, row: int) -> Optional[dict]:
         """Build the $set payload for an edited saved row from its cell values.
@@ -1484,6 +1529,8 @@ class DailyRegister(QWidget):
 
         if col in (COL_TZS, COL_REF):
             self._update_footer()
+
+        self._schedule_draft_autosave()
 
     def _on_model_data_changed(self, top_left, bottom_right, roles=()) -> None:
         # Kept for receipt/other UserRole updates if added later.
@@ -2070,6 +2117,7 @@ class DailyRegister(QWidget):
         if clear_cut_after and self._has_cut_buffer() and self._cut_is_rows:
             self._clear_cut_source_cells()
         self.edit_state_changed.emit(self._edit_mode, len(self._dirty_rows))
+        self._schedule_draft_autosave()
 
     def _clear_cut_source_cells(self) -> None:
         """After a successful paste/insert, clear/remove the original cut source."""
@@ -2343,6 +2391,7 @@ class DailyRegister(QWidget):
         if self._has_cut_buffer() and not self._cut_is_rows:
             self._clear_cut_source_cells()
         self._update_footer()
+        self._schedule_draft_autosave()
 
     def _clear_selected(self) -> None:
         snap = self._snapshot_selection()
@@ -2730,6 +2779,7 @@ class DailyRegister(QWidget):
         self._renumber()
         self._finalize_truck_cells(truck_cells)
         self._update_footer()
+        self._schedule_draft_autosave()
 
     def _load_rows(self, file_rows: List[List]) -> None:
         """Legacy positional loader kept for CSV paste-compat helpers."""
@@ -2829,7 +2879,151 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
 
     def save_rows(self) -> None:
+        if self._save_in_flight or self._submit_in_flight:
+            return
         asyncio.ensure_future(self._do_save())
+
+    # ------------------------------------------------------------------
+    # QuickBooks-style toolbar actions
+    # ------------------------------------------------------------------
+
+    def _data_rows(self) -> List[int]:
+        """Saved + non-empty editable rows (for Find navigation)."""
+        rows: List[int] = []
+        for row in range(self._table.rowCount()):
+            if self._table.isRowHidden(row):
+                continue
+            if row < self._saved_count or self._row_has_data(row):
+                rows.append(row)
+        return rows
+
+    def toolbar_find(self, direction: int) -> None:
+        """Move selection to previous (-1) or next (+1) data row."""
+        rows = self._data_rows()
+        if not rows:
+            return
+        cur = self._table.currentRow()
+        if cur not in rows:
+            target = rows[0] if direction >= 0 else rows[-1]
+        else:
+            idx = rows.index(cur)
+            target = rows[(idx + (1 if direction >= 0 else -1)) % len(rows)]
+        self._table.selectRow(target)
+        self._table.setCurrentCell(target, COL_DESC)
+        self._table.scrollToItem(
+            self._table.item(target, COL_DESC) or self._table.item(target, COL_SNO),
+            QAbstractItemView.PositionAtCenter,
+        )
+
+    def toolbar_new_row(self) -> None:
+        """Insert a blank editable row (same as Insert Row Below)."""
+        self._insert_below()
+        row = self._table.currentRow()
+        if row < 0:
+            row = self._saved_count
+        self._table.selectRow(row)
+        self._table.setCurrentCell(row, COL_DESC)
+        item = self._table.item(row, COL_DESC)
+        if item is not None:
+            self._table.editItem(item)
+
+    def toolbar_delete(self) -> None:
+        """Delete the current saved entry or clear selected unsaved rows."""
+        row = self._table.currentRow()
+        if row < 0:
+            return
+        if row < self._saved_count:
+            self._delete_saved_row(row)
+            return
+        # Unsaved editable selection
+        self._delete_rows()
+
+    def toolbar_copy_row(self) -> None:
+        """Duplicate the current row into a new unsaved editable row."""
+        row = self._table.currentRow()
+        if row < 0 or not (row < self._saved_count or self._row_has_data(row)):
+            QMessageBox.information(
+                self, "Create a Copy",
+                "Select an entry to copy first.",
+            )
+            return
+        values: dict = {}
+        for col in range(self._table.columnCount()):
+            if col in (COL_SNO, COL_CASHIER):
+                continue
+            it = self._table.item(row, col)
+            if col == COL_RECEIPT and it is not None:
+                text = it.text().strip()
+                values[col] = text or (it.data(Qt.UserRole) or "pending")
+            else:
+                values[col] = it.text() if it else ""
+        insert_at = max(self._saved_count, row + 1)
+        self._shift_row_maps_on_insert(insert_at)
+        self._table.insertRow(insert_at)
+        self._init_editable_rows(insert_at, insert_at + 1)
+        self._write_row_values(insert_at, values)
+        self._renumber()
+        self._table.selectRow(insert_at)
+        self._table.setCurrentCell(insert_at, COL_DESC)
+
+    def toolbar_print(self) -> None:
+        self.export_as("pdf")
+
+    def toolbar_attach(self) -> None:
+        """Open attachment manager for the selected saved transaction."""
+        row = self._table.currentRow()
+        if row < 0 or row >= self._saved_count:
+            QMessageBox.information(
+                self, "Attach File",
+                "Save the entry first, then select it to attach a file.",
+            )
+            return
+        tx_id = self._saved_ids.get(row)
+        if not tx_id:
+            QMessageBox.information(
+                self, "Attach File",
+                "Save the entry first, then select it to attach a file.",
+            )
+            return
+        tx = self._saved_txs.get(row)
+        desc = ""
+        if tx is not None:
+            desc = getattr(tx, "description", "") or ""
+        else:
+            it = self._table.item(row, COL_DESC)
+            desc = it.text() if it else ""
+        from tahmeed.ui.dialogs.attachment_dialog import AttachmentDialog
+        dlg = AttachmentDialog(
+            tx_id,
+            description=desc,
+            actor_id=getattr(self._user, "_id", None),
+            parent=self,
+        )
+        dlg.exec()
+        asyncio.ensure_future(self._refresh_attachment_meta(row, tx_id))
+
+    async def _refresh_attachment_meta(self, row: int, tx_id) -> None:
+        try:
+            from tahmeed.services.attachment_service import get_attachments
+            atts = await get_attachments(tx_id)
+            tx = self._saved_txs.get(row)
+            if tx is not None:
+                tx.attachments = atts
+            self.attachment_count_changed.emit(len(atts))
+        except Exception:
+            self.attachment_count_changed.emit(0)
+
+    def selected_attachment_count(self) -> int:
+        row = self._table.currentRow()
+        if row < 0 or row >= self._saved_count:
+            return 0
+        tx = self._saved_txs.get(row)
+        if tx is None:
+            return 0
+        return len(getattr(tx, "attachments", None) or [])
+
+    def _emit_attachment_badge(self) -> None:
+        self.attachment_count_changed.emit(self.selected_attachment_count())
 
     def has_unsaved_work(self) -> bool:
         """True when edit-mode dirty rows or typed-but-unsaved new rows exist."""
@@ -2839,6 +3033,174 @@ class DailyRegister(QWidget):
             if self._row_has_data(row):
                 return True
         return False
+
+    # ------------------------------------------------------------------
+    # Local draft autosave (crash / power-loss recovery)
+    # ------------------------------------------------------------------
+
+    def _schedule_draft_autosave(self) -> None:
+        if self._restoring_draft or self._save_in_flight or self._bulk_mutating:
+            return
+        self._draft_timer.start()
+
+    def _flush_local_draft(self, *, include_dirty: bool = True) -> None:
+        """Persist current unsaved grid state to disk (or clear if empty)."""
+        if self._restoring_draft:
+            return
+        try:
+            self._commit_open_editor()
+            payload = self._capture_local_draft(include_dirty=include_dirty)
+            save_register_draft(payload)
+        except Exception:
+            # Local draft must never break typing / save.
+            pass
+
+    def _clear_local_draft(self) -> None:
+        self._draft_timer.stop()
+        try:
+            clear_register_draft(
+                self._user._id, self._current_date, merged=self._merged_mode
+            )
+        except Exception:
+            pass
+
+    def _capture_local_draft(self, *, include_dirty: bool = True) -> dict:
+        dirty_saved: list = []
+        if include_dirty:
+            for row in sorted(self._dirty_rows):
+                tx_id = self._saved_ids.get(row)
+                if tx_id is None:
+                    continue
+                tx = self._saved_txs.get(row)
+                dirty_saved.append({
+                    "tx_id": str(tx_id),
+                    "cashier_id": str(tx.cashier_id) if tx and tx.cashier_id else None,
+                    "cells": cells_for_json(self._row_value_map(row)),
+                })
+
+        new_rows: list = []
+        for row in range(self._saved_count, self._table.rowCount()):
+            if not self._row_has_data(row):
+                continue
+            pending = self._pending_row_meta.get(row)
+            new_rows.append({
+                "cells": cells_for_json(self._row_value_map(row)),
+                "pending_meta": serialize_pending_meta(pending),
+            })
+
+        return build_draft_payload(
+            user_id=self._user._id,
+            username=getattr(self._user, "username", "") or "",
+            register_date=self._current_date,
+            merged=self._merged_mode,
+            edit_mode=self._edit_mode and include_dirty and bool(dirty_saved),
+            dirty_saved=dirty_saved,
+            new_rows=new_rows,
+        )
+
+    def _restore_local_draft(self) -> Optional[tuple]:
+        """Apply a saved draft onto the freshly populated grid.
+
+        Returns ``(dirty_count, new_count)`` when anything was restored, else None.
+        """
+        draft = load_register_draft(
+            self._user._id, self._current_date, merged=self._merged_mode
+        )
+        if draft is None or draft_is_empty(draft):
+            return None
+
+        dirty_entries = list(draft.get("dirty_saved") or [])
+        new_entries = list(draft.get("new_rows") or [])
+        if not dirty_entries and not new_entries:
+            return None
+
+        self._restoring_draft = True
+        self._bulk_mutating = True
+        dirty_applied = 0
+        new_applied = 0
+        truck_cells: list = []
+        prev = self._table.blockSignals(True)
+        try:
+            id_to_row = {str(tx_id): row for row, tx_id in self._saved_ids.items()}
+            need_edit = bool(dirty_entries) and bool(draft.get("edit_mode", True))
+            if need_edit and not self._edit_mode:
+                # Unlock saved rows without clearing dirty set prematurely.
+                self._edit_mode = True
+                editable = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+                for row in range(self._saved_count):
+                    for col in range(self._table.columnCount()):
+                        it = self._table.item(row, col)
+                        if it is None:
+                            continue
+                        if col not in READONLY_COLS:
+                            it.setFlags(editable)
+                        it.setBackground(QBrush(EDIT_BG))
+
+            for entry in dirty_entries:
+                tx_id = str(entry.get("tx_id") or "")
+                row = id_to_row.get(tx_id)
+                if row is None:
+                    continue
+                values = cells_from_json(entry.get("cells"))
+                truck_cells.extend(self._write_row_values(row, values))
+                self._dirty_rows.add(row)
+                for col in range(self._table.columnCount()):
+                    it = self._table.item(row, col)
+                    if it is not None:
+                        it.setBackground(QBrush(DIRTY_BG))
+                dirty_applied += 1
+
+            if new_entries:
+                start = self._first_empty_editable_row()
+                needed = start + len(new_entries) - self._table.rowCount()
+                if needed > 0:
+                    self._append_editable_rows(needed + 5)
+                for offset, entry in enumerate(new_entries):
+                    row = start + offset
+                    if row < self._saved_count:
+                        continue
+                    values = cells_from_json(entry.get("cells"))
+                    truck_cells.extend(self._write_row_values(row, values))
+                    meta = hydrate_pending_meta(entry.get("pending_meta"))
+                    if meta:
+                        self._pending_row_meta[row] = meta
+                    self._activate_row(row)
+                    self._sync_row_date(row)
+                    new_applied += 1
+        finally:
+            self._table.blockSignals(prev)
+            self._bulk_mutating = False
+            self._restoring_draft = False
+
+        self._renumber()
+        self._finalize_truck_cells(truck_cells)
+        self._update_footer()
+        if dirty_applied:
+            self.edit_state_changed.emit(True, len(self._dirty_rows))
+        elif self._edit_mode:
+            self.edit_state_changed.emit(True, 0)
+
+        if dirty_applied or new_applied:
+            return dirty_applied, new_applied
+        return None
+
+    def _show_draft_restored_notice(self, dirty_count: int, new_count: int) -> None:
+        parts = []
+        if dirty_count:
+            parts.append(
+                f"{dirty_count} edited row{'s' if dirty_count != 1 else ''}"
+            )
+        if new_count:
+            parts.append(
+                f"{new_count} new entr{'ies' if new_count != 1 else 'y'}"
+            )
+        detail = " and ".join(parts) if parts else "unsaved work"
+        QMessageBox.information(
+            self,
+            "Draft restored",
+            f"Recovered {detail} from before the app closed.\n\n"
+            "Click Save to store them on the server.",
+        )
 
     def _commit_open_editor(self) -> None:
         """Flush the active cell editor into the model before save/leave checks."""
@@ -2851,7 +3213,9 @@ class DailyRegister(QWidget):
         """Ask to save/discard before logout or app exit. False = stay put."""
         self._commit_open_editor()
         if not self.has_unsaved_work():
+            self._clear_local_draft()
             return True
+        self._flush_local_draft()
         resp = QMessageBox.question(
             self, "Unsaved changes",
             "You have unsaved entries in the Daily Register.\n"
@@ -2862,12 +3226,29 @@ class DailyRegister(QWidget):
         if resp == QMessageBox.Cancel:
             return False
         if resp == QMessageBox.Discard:
+            self._clear_local_draft()
             return True
         # Yes — save; if the user cancels mid-save (duplicates / off-date), stay.
         return await self._do_save()
 
     async def _do_save(self) -> bool:
         """Persist dirty + new rows. Returns False if the user cancelled mid-save."""
+        if self._save_in_flight:
+            return False
+        self._save_in_flight = True
+        # Submit already holds the busy UI lock; avoid flickering it off early.
+        nested_under_submit = self._submit_in_flight
+        if not nested_under_submit:
+            self.save_busy_changed.emit(True)
+        try:
+            return await self._do_save_body()
+        finally:
+            self._save_in_flight = False
+            if not nested_under_submit and not self._submit_in_flight:
+                self.save_busy_changed.emit(False)
+
+    async def _do_save_body(self) -> bool:
+        """Inner save implementation (caller holds `_save_in_flight`)."""
         saved, updated, errors = 0, 0, []
         self._commit_open_editor()
 
@@ -3041,7 +3422,7 @@ class DailyRegister(QWidget):
                                 truck_number = norm.value
                             else:
                                 errors.append(
-                                    f'Row {row + 1}: "{norm.value}" is not a registered truck/trailer.'
+                                    f'Row {row + 1}: "{norm.value}" is not a registered fleet vehicle.'
                                 )
                                 continue
                         else:
@@ -3138,6 +3519,7 @@ class DailyRegister(QWidget):
                 errors.append(f"Row {row + 1}: {exc}")
 
         if cancel_all:
+            self._flush_local_draft()
             return False
 
         if errors:
@@ -3145,11 +3527,17 @@ class DailyRegister(QWidget):
                 self, "Save — partial errors",
                 f"{saved} added, {updated} updated.\n\nErrors:\n" + "\n".join(errors),
             )
+            # Keep the grid as-is and refresh the local draft so a crash still
+            # recovers remaining unsaved / failed rows.
+            self._flush_local_draft()
+            return True
         elif saved == 0 and updated == 0:
             QMessageBox.information(self, "Nothing to save", "No changes to save.")
+            self._clear_local_draft()
             return True
         # else: clean save — reload silently, no popup
 
+        self._clear_local_draft()
         self._reset_edit_state()
         self.rows_saved.emit(saved)
         await self._load_date(self._current_date)
@@ -3360,7 +3748,7 @@ class DailyRegister(QWidget):
         # Do not prompt to add; save still rejects unknown items.
         self._flag_unknown_item(item, text)
     # ------------------------------------------------------------------
-    # Truck-column validation (format + restrict to truck/trailer registry)
+    # Truck-column validation (format + restrict to fleet registry)
     # ------------------------------------------------------------------
 
     def _can_add_fleet(self) -> bool:
@@ -3507,16 +3895,12 @@ class DailyRegister(QWidget):
                     self._set_truck_cell(issue.row, "")
 
     async def _persist_truck_registry_adds(self, adds: list) -> None:
-        from tahmeed.services.truck_service import add_trailer, add_truck
+        from tahmeed.services.truck_service import add_fleet_by_collection
 
         for kind, number in adds:
             try:
-                if kind == "trucks":
-                    await add_truck(number)
-                    self._fleet_kinds[number] = "truck"
-                else:
-                    await add_trailer(number)
-                    self._fleet_kinds[number] = "trailer"
+                label = await add_fleet_by_collection(kind, number)
+                self._fleet_kinds[number] = label
                 self._fleet_numbers.add(number)
             except Exception as exc:
                 QMessageBox.critical(

@@ -46,6 +46,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("table",           "Table",             "mdi.table-large",                  {}),
         ("browse",          "Browse",            "mdi.magnify",                      {}),
         ("master_expenses", "Master Expenses",   "mdi.table-multiple",               {}),
+        ("import_daily",    "Import Daily",      "mdi.file-upload-outline",          {}),
     ]),
     # ITEMS are loaded dynamically from the DB (accountant-managed). The header
     # is rendered statically; the rows below it are built by _load_items().
@@ -71,9 +72,11 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     ]),
     ("MANAGE", [
         ("manage_categories", "Items",             "mdi.tag-multiple-outline", {}),
+        ("manage_description_maps", "Description Maps", "mdi.link-variant", {}),
         ("manage_people",     "People",           "mdi.account-outline", {}),
         ("manage_trucks",     "Trucks",           "mdi.truck",           {}),
         ("manage_trailers",   "Trailers",         "mdi.truck-trailer",   {}),
+        ("manage_motor_vehicles", "Motorcycles & Cars", "mdi.car",        {}),
         ("manage_users",      "Users",            "mdi.account-multiple-outline", {}),
         ("backup",            "Backups",          "mdi.database-export-outline", {}),
     ]),
@@ -501,7 +504,8 @@ class SidebarWidget(QFrame):
         self._items_host_vl = None                 # layout hosting dynamic rows
         self._build()
         self.select("overview")
-        asyncio.ensure_future(self._load_items())
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._load_items())
         for key in _FIXED_CHILDREN:
             if key in self._items:
                 self._items[key].set_has_subtables(True)

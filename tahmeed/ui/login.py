@@ -51,7 +51,8 @@ def _is_dark() -> bool:
 
 
 def _logo_pixmap(width: int = 200):
-    return load_brand_logo(width)
+    # Match ink to the page: dark OS theme → dark login chrome → light wordmark.
+    return load_brand_logo(width, for_dark_bg=_is_dark())
 
 
 def _title_html(text: str, size_pt: int) -> str:

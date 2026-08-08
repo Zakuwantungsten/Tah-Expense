@@ -456,7 +456,7 @@ class SkippedTrucksTab(QWidget):
     async def _do_reupload(self, docs: List[dict]) -> None:
         """Re-check fleet, then insert into each row's original target_upload_id."""
         from tahmeed.services import accountant_service as svc
-        from tahmeed.services.truck_service import get_fleet_numbers, add_truck, add_trailer
+        from tahmeed.services.truck_service import get_fleet_numbers, add_fleet_by_collection
         from tahmeed.services.truck_format import merge_allowed_labels
         from tahmeed.services import settings_service
 
@@ -520,10 +520,7 @@ class SkippedTrucksTab(QWidget):
             dlg.exec()
             for kind, number in dlg.pending_registry_adds:
                 try:
-                    if kind == "trailers":
-                        await add_trailer(number)
-                    else:
-                        await add_truck(number)
+                    await add_fleet_by_collection(kind, number)
                 except Exception as exc:
                     QMessageBox.warning(
                         self, "Registry", f"Could not add {number}:\n{exc}"

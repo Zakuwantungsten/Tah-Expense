@@ -145,6 +145,11 @@ def main() -> None:
     from tahmeed.ui.login import LoginWindow
 
     splash.set_status("Preparing…")
+    from tahmeed.logging_setup import setup_logging
+    from tahmeed.services.attachment_service import purge_stale_staging
+
+    setup_logging()
+    purge_stale_staging(max_age_hours=24.0)
     cleanup_applied_update()
 
     lock_path = update_root().parent / "desktop.lock"
@@ -208,6 +213,14 @@ def main() -> None:
     update_controller.start()
 
     def on_login_success(user):
+        # Defer dashboard build until AFTER LoginWindow._do_login finishes.
+        # Building MainWindow inside that task schedules sidebar/overview loads;
+        # splash processEvents() then tries to run them while login is still
+        # current — Python 3.14 raises and leaves the UI half-initialized so
+        # later sidebar navigation can tear down the process.
+        QTimer.singleShot(0, lambda u=user: _open_dashboard(u))
+
+    def _open_dashboard(user):
         # Brand splash covers the dashboard build so sign-in never looks frozen.
         # Cost is negligible vs constructing MainWindow / role dashboards.
         from tahmeed.ui.main_window import MainWindow
@@ -221,6 +234,14 @@ def main() -> None:
 
         win = MainWindow(user)
         _open_windows.append(win)
+
+        from tahmeed.services.connectivity_service import connectivity_monitor
+
+        connectivity_monitor.start()
+        from tahmeed.ui.async_utils import schedule_coro
+        from tahmeed.services.attachment_service import cleanup_attachment_orphans
+
+        schedule_coro(cleanup_attachment_orphans(max_age_hours=24.0))
 
         def on_logout():
             asyncio.ensure_future(_do_logout(win))
@@ -238,6 +259,7 @@ def main() -> None:
             except Exception:
                 # Local logout must still complete if the server is unavailable.
                 pass
+            connectivity_monitor.stop()
             _return_to_login(login, w, _open_windows)
 
         win.logout_requested.connect(on_logout)
@@ -258,6 +280,9 @@ def main() -> None:
         loop.run_forever()
         # Clean up the DB client while the loop is still open (exiting the
         # `with` block closes the loop, so this must run inside it).
+        from tahmeed.services.connectivity_service import connectivity_monitor
+
+        connectivity_monitor.stop()
         loop.run_until_complete(
             asyncio.gather(close_api(), close_db(), return_exceptions=True)
         )

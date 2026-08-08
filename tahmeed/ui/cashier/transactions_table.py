@@ -81,8 +81,19 @@ _FIELD_SS = (
 
 
 def _seg_style(position: str) -> str:
-    r = {"left": "border-radius:4px 0 0 4px;",
-         "right": "border-radius:0 4px 4px 0;"}.get(position, "border-radius:0;")
+    # Qt stylesheets reject multi-value border-radius shorthands.
+    if position == "left":
+        r = (
+            "border-top-left-radius:4px;border-bottom-left-radius:4px;"
+            "border-top-right-radius:0;border-bottom-right-radius:0;"
+        )
+    elif position == "right":
+        r = (
+            "border-top-left-radius:0;border-bottom-left-radius:0;"
+            "border-top-right-radius:4px;border-bottom-right-radius:4px;"
+        )
+    else:
+        r = "border-radius:0;"
     return (
         f"QPushButton{{background:#ffffff;border:1px solid #d1d5db;{r}"
         " padding:4px 14px;font-size:11px;font-weight:600;color:#6b7280;}}"

@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from bson import ObjectId
 
 
@@ -50,6 +50,7 @@ class Transaction:
     daily_import_source: Optional[str] = None   # original filename
     date_discrepancy: bool = False              # row date differs from import primary date
     import_primary_date: Optional[datetime] = None
+    attachments: List[dict] = field(default_factory=list)  # receipt / file metadata
     _id: Optional[ObjectId] = None
 
     def to_doc(self) -> dict:
@@ -95,6 +96,7 @@ class Transaction:
             "created_at": self.created_at,
             "possible_duplicate": self.possible_duplicate,
             "date_discrepancy": self.date_discrepancy,
+            "attachments": list(self.attachments or []),
         }
         # Only persist import batch fields when this row came from an Excel upload.
         # Writing null here used to create an undeleteable phantom "upload" group.
@@ -158,4 +160,5 @@ class Transaction:
             daily_import_source=doc.get("daily_import_source"),
             date_discrepancy=doc.get("date_discrepancy", False),
             import_primary_date=doc.get("import_primary_date"),
+            attachments=list(doc.get("attachments") or []),
         )

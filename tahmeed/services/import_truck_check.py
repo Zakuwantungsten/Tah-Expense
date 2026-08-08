@@ -20,6 +20,7 @@ from tahmeed.ui.dialogs.truck_correction_dialog import TruckIssue
 
 # feed_type / expense_type → truck column on the import record
 FEED_TRUCK_FIELDS: Dict[str, str] = {
+    "daily_register": "truck_number",
     "toll_plaza": "vehicle_reg",
     "parking_congo": "vehicle_no",
     "congo_expenses": "truck_no",

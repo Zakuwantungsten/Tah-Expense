@@ -475,6 +475,7 @@ def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict
         "category_name": row.category_name,
         "lpo_do": row.lpo_do,
         "do_number": row.do_number,
+        "serial": row.serial,
         "daily_import_id": preview.upload_id,
         "daily_import_source": preview.source_filename,
         "date_discrepancy": bool(
@@ -486,6 +487,144 @@ def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict
             else None
         ),
     }
+
+
+_MONTH_LABELS = (
+    "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
+
+def _month_label(dt: datetime) -> str:
+    return f"{_MONTH_LABELS[dt.month]} {str(dt.year)[-2:]}"
+
+
+def preview_rows_as_truck_dicts(
+    preview: DailyImportPreview,
+) -> List[dict]:
+    """Row dicts suitable for ``run_import_truck_gate`` (truck_number field)."""
+    return [staged_row_payload(row, preview) for row in preview.rows]
+
+
+def _payload_to_verified_transaction(
+    payload: dict,
+    *,
+    verified_by: Optional[ObjectId] = None,
+) -> Transaction:
+    """Build a verified master transaction from a staged daily-import payload."""
+    dt = payload["date"]
+    if not isinstance(dt, datetime):
+        dt = datetime(dt.year, dt.month, dt.day)
+    item_name = (payload.get("category_name") or payload.get("item") or "").strip()
+    ref_float = (payload.get("ref_float") or "").strip()
+    primary = payload.get("import_primary_date")
+    return Transaction(
+        date=dt,
+        description=(payload.get("description") or "").strip(),
+        truck_number=(payload.get("truck_number") or "").strip().upper(),
+        amount=float(payload.get("amount") or 0),
+        currency=(payload.get("currency") or "TZS").strip().upper() or "TZS",
+        category_id=payload.get("category_id"),
+        category_name=item_name or None,
+        category_confidence=1.0 if item_name else 0.0,
+        item=item_name,
+        lpo_do=(payload.get("lpo_do") or "").upper(),
+        do_number=(payload.get("do_number") or "").upper(),
+        memo=(payload.get("memo") or "").strip(),
+        receipt_status=payload.get("receipt_status") or "pending",
+        notes_flag=ref_float == "REFUND TO FLOAT",
+        ref_float=ref_float,
+        ownership=(payload.get("ownership") or "").upper(),
+        approver=(payload.get("approver") or "").upper(),
+        verified=True,
+        verified_by=verified_by,
+        verified_at=datetime.utcnow(),
+        register_status="submitted",
+        month=_month_label(dt),
+        year=dt.year,
+        created_at=datetime.utcnow(),
+        daily_import_id=payload.get("daily_import_id"),
+        daily_import_source=payload.get("daily_import_source"),
+        date_discrepancy=bool(payload.get("date_discrepancy")),
+        import_primary_date=primary,
+    )
+
+
+async def commit_daily_to_master(
+    payloads: List[dict],
+    *,
+    verified_by: Optional[ObjectId] = None,
+) -> dict:
+    """Insert daily-import rows as verified Master Expenses.
+
+    Rows without an item are skipped. Each inserted doc carries
+    ``import_row_key`` so a retry of the same upload cannot duplicate rows
+    (unique partial index on ``daily_import_id`` + ``import_row_key``).
+    """
+    from tahmeed.db.import_idempotency import (
+        daily_import_row_key,
+        ensure_import_indexes,
+        insert_many_idempotent,
+    )
+
+    db = get_db()
+    await ensure_import_indexes()
+    inserted = 0
+    duplicates = 0
+    skipped_no_item = 0
+    batch: List[dict] = []
+    upload_id = ""
+    source = ""
+
+    for payload in payloads:
+        item_name = (payload.get("category_name") or payload.get("item") or "").strip()
+        if not item_name:
+            skipped_no_item += 1
+            continue
+        if not upload_id:
+            upload_id = str(payload.get("daily_import_id") or uuid.uuid4())
+        if not source:
+            source = str(payload.get("daily_import_source") or "")
+        # Keep batch tags consistent even if upstream mutated ids.
+        payload = dict(payload)
+        payload["daily_import_id"] = upload_id
+        if source:
+            payload["daily_import_source"] = source
+        tx = _payload_to_verified_transaction(payload, verified_by=verified_by)
+        doc = tx.to_doc()
+        doc["import_row_key"] = daily_import_row_key(payload)
+        batch.append(doc)
+        if len(batch) >= 500:
+            n, d = await insert_many_idempotent(db.transactions, batch)
+            inserted += n
+            duplicates += d
+            batch.clear()
+
+    if batch:
+        n, d = await insert_many_idempotent(db.transactions, batch)
+        inserted += n
+        duplicates += d
+
+    result = {
+        "inserted": inserted,
+        "duplicates_skipped": duplicates,
+        "skipped_no_item": skipped_no_item,
+        "upload_id": upload_id,
+        "source": source,
+    }
+    try:
+        from tahmeed.services.audit_service import record_event
+
+        await record_event(
+            "import.daily_master",
+            actor_id=verified_by,
+            entity_type="import_batch",
+            upload_id=upload_id or None,
+            details=result,
+        )
+    except Exception:
+        pass
+    return result
 
 
 async def cleanup_null_daily_import_ids() -> int:

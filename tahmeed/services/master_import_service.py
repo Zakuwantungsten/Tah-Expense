@@ -267,7 +267,14 @@ async def commit_master_import(
     verified_by: Optional[ObjectId] = None,
     skip_duplicates: bool = True,
 ) -> dict:
-    """Insert all preview rows as verified master transactions."""
+    """Insert all preview rows as verified master transactions.
+
+    Soft pre-check skips known serials; a unique index on
+    ``(master_import_source, master_serial)`` makes retries after a partial
+    insert safe (duplicate keys are counted, not raised).
+    """
+    from tahmeed.db.import_idempotency import ensure_import_indexes, insert_many_idempotent
+
     if preview.unmapped:
         raise ValueError(
             f"{len(preview.unmapped)} description(s) still need an item mapping."
@@ -275,6 +282,7 @@ async def commit_master_import(
 
     upload_id = str(uuid.uuid4())
     db = get_db()
+    await ensure_import_indexes()
     inserted = 0
     duplicates = 0
     batch: List[dict] = []
@@ -310,17 +318,32 @@ async def commit_master_import(
             doc["master_serial"] = row.serial
         batch.append(doc)
         if len(batch) >= 500:
-            await db.transactions.insert_many(batch)
-            inserted += len(batch)
+            n, d = await insert_many_idempotent(db.transactions, batch)
+            inserted += n
+            duplicates += d
             batch.clear()
 
     if batch:
-        await db.transactions.insert_many(batch)
-        inserted += len(batch)
+        n, d = await insert_many_idempotent(db.transactions, batch)
+        inserted += n
+        duplicates += d
 
-    return {
+    result = {
         "inserted": inserted,
         "duplicates_skipped": duplicates,
         "upload_id": upload_id,
         "source": preview.source_filename,
     }
+    try:
+        from tahmeed.services.audit_service import record_event
+
+        await record_event(
+            "import.master",
+            actor_id=verified_by,
+            entity_type="import_batch",
+            upload_id=upload_id,
+            details=result,
+        )
+    except Exception:
+        pass
+    return result

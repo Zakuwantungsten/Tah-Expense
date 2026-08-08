@@ -25,12 +25,9 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
-    QFrame, QLabel, QLineEdit, QPushButton, QDialog, QMessageBox, QMenu,
+    QFrame, QLabel, QLineEdit, QPushButton, QDialog, QMessageBox,
 )
-from PySide6.QtCore import Qt, Signal, QSize
-from PySide6.QtGui import QAction
-
-import qtawesome as qta
+from PySide6.QtCore import Qt, Signal
 
 from tahmeed.models.user import User
 from tahmeed.services.category_service import get_all_categories
@@ -56,34 +53,61 @@ _BTN_H  = 30  # slim professional control height
 
 # ── Button styles ────────────────────────────────────────────────────────────────
 # Filled primary (Save), outlined secondaries, warm cancel, gold submit.
+# Selectors cover QPushButton (Search) and QToolButton (Export…Submit).
 _BTN_BASE = (
     f"border-radius:5px;font-size:12px;font-weight:600;"
     f"font-family:'Segoe UI',sans-serif;padding:0 12px;min-height:{_BTN_H}px;"
 )
+
+
+def _btn_style(kind: str) -> str:
+    if kind == "primary":
+        bg, border, hover, pressed, disabled = (
+            _BLUE, _BLUE, "#0369A1", "#075985",
+            "background:#93C5FD;border-color:#93C5FD;color:#EFF6FF;",
+        )
+        color = "#FFFFFF"
+    elif kind == "submit":
+        bg, border, hover, pressed, disabled = (
+            _GOLD, _GOLD, "#9A784C", "#84653F",
+            "background:#D6C4A8;border-color:#D6C4A8;color:#FFF8EF;",
+        )
+        color = "#FFFFFF"
+    elif kind == "active":
+        bg, border, hover, pressed, disabled = (
+            "#D97706", "#D97706", "#B45309", "#92400E",
+            "color:#9CA3AF;border-color:#E5E7EB;",
+        )
+        color = "#FFFFFF"
+    else:  # secondary
+        bg, border, hover, pressed, disabled = (
+            "#FFFFFF", "#D1D5DB", "#F9FAFB", "#F3F4F6",
+            "color:#9CA3AF;border-color:#E5E7EB;",
+        )
+        color = "#374151"
+        hover = "#F9FAFB"
+        # secondary hover also tweaks border
+        return (
+            f"QPushButton, QToolButton{{background:{bg};color:{color};"
+            f"border:1px solid {border};{_BTN_BASE}}}"
+            f"QPushButton:hover, QToolButton:hover{{background:{hover};border-color:#9CA3AF;}}"
+            f"QPushButton:pressed, QToolButton:pressed{{background:{pressed};}}"
+            f"QPushButton:disabled, QToolButton:disabled{{{disabled}}}"
+        )
+    return (
+        f"QPushButton, QToolButton{{background:{bg};color:{color};"
+        f"border:1px solid {border};{_BTN_BASE}}}"
+        f"QPushButton:hover, QToolButton:hover{{background:{hover};border-color:{hover};}}"
+        f"QPushButton:pressed, QToolButton:pressed{{background:{pressed};border-color:{pressed};}}"
+        f"QPushButton:disabled, QToolButton:disabled{{{disabled}}}"
+    )
+
+
 _BTN_STYLES = {
-    "primary": (
-        f"QPushButton{{background:{_BLUE};color:#FFFFFF;border:1px solid {_BLUE};{_BTN_BASE}}}"
-        "QPushButton:hover{background:#0369A1;border-color:#0369A1;}"
-        "QPushButton:pressed{background:#075985;border-color:#075985;}"
-        "QPushButton:disabled{background:#93C5FD;border-color:#93C5FD;color:#EFF6FF;}"
-    ),
-    "secondary": (
-        f"QPushButton{{background:#FFFFFF;color:#374151;border:1px solid #D1D5DB;{_BTN_BASE}}}"
-        "QPushButton:hover{background:#F9FAFB;border-color:#9CA3AF;}"
-        "QPushButton:pressed{background:#F3F4F6;}"
-        "QPushButton:disabled{color:#9CA3AF;border-color:#E5E7EB;}"
-    ),
-    "active": (
-        "QPushButton{background:#D97706;color:#FFFFFF;border:1px solid #D97706;" + _BTN_BASE + "}"
-        "QPushButton:hover{background:#B45309;border-color:#B45309;}"
-        "QPushButton:pressed{background:#92400E;border-color:#92400E;}"
-    ),
-    "submit": (
-        f"QPushButton{{background:{_GOLD};color:#FFFFFF;border:1px solid {_GOLD};{_BTN_BASE}}}"
-        "QPushButton:hover{background:#9A784C;border-color:#9A784C;}"
-        "QPushButton:pressed{background:#84653F;border-color:#84653F;}"
-        "QPushButton:disabled{background:#D6C4A8;border-color:#D6C4A8;color:#FFF8EF;}"
-    ),
+    "primary": _btn_style("primary"),
+    "secondary": _btn_style("secondary"),
+    "active": _btn_style("active"),
+    "submit": _btn_style("submit"),
 }
 
 
@@ -238,16 +262,10 @@ class _QBDocHeader(QFrame):
 # ── Action bar (Edit / Save / Export) ────────────────────────────────────────────
 
 class _ActionBar(QFrame):
-    """Thin professional action strip between the document header and the table."""
+    """My entries / Merged / Search strip (register actions live on the QB toolbar)."""
 
-    edit_clicked   = Signal()
-    save_clicked   = Signal()
-    export_clicked = Signal(str)  # "xlsx" | "csv" | "pdf"
-    import_clicked = Signal()
-    today_clicked  = Signal()
     search_changed = Signal(str)
     mode_changed   = Signal(bool)  # True = Merged
-    submit_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -263,7 +281,7 @@ class _ActionBar(QFrame):
         hl.setContentsMargins(16, 6, 16, 6)
         hl.setSpacing(8)
 
-        # My / Merged segmented toggle (design: outlined inactive, filled active)
+        # My / Merged segmented toggle
         toggle = QFrame()
         toggle.setObjectName("modeToggle")
         toggle.setStyleSheet(
@@ -291,11 +309,19 @@ class _ActionBar(QFrame):
         self._my_btn.setFixedHeight(_BTN_H)
         self._merged_btn.setFixedHeight(_BTN_H)
         self._my_btn.setStyleSheet(
-            _toggle_ss + "QPushButton{border-radius:5px 0 0 5px;}"
+            _toggle_ss
+            + "QPushButton{"
+            " border-top-left-radius:5px;border-bottom-left-radius:5px;"
+            " border-top-right-radius:0;border-bottom-right-radius:0;"
+            "}"
         )
         self._merged_btn.setStyleSheet(
             _toggle_ss
-            + "QPushButton{border-radius:0 5px 5px 0;border-left:none;}"
+            + "QPushButton{"
+            " border-top-left-radius:0;border-bottom-left-radius:0;"
+            " border-top-right-radius:5px;border-bottom-right-radius:5px;"
+            " border-left:none;"
+            "}"
         )
         self._my_btn.setChecked(True)
         self._my_btn.clicked.connect(lambda: self._set_mode(False))
@@ -304,7 +330,6 @@ class _ActionBar(QFrame):
         tg.addWidget(self._merged_btn)
         hl.addWidget(toggle)
 
-        # Search bar
         search = QLineEdit()
         search.setPlaceholderText("Search entries…")
         search.setFixedWidth(220)
@@ -353,53 +378,6 @@ class _ActionBar(QFrame):
 
         hl.addStretch()
 
-        self._export_btn = self._make_btn("Export", "mdi.tray-arrow-down", "secondary")
-        export_menu = QMenu(self._export_btn)
-        export_menu.setStyleSheet(
-            "QMenu {"
-            "  background: #FFFFFF; border: 1px solid #D1D5DB; border-radius: 6px;"
-            "  padding: 4px;"
-            "}"
-            "QMenu::item {"
-            "  padding: 6px 16px; border-radius: 4px;"
-            "  font-size: 12px; color: #111827;"
-            "}"
-            "QMenu::item:selected { background: #EFF6FF; color: #1D4ED8; }"
-        )
-        for label, fmt in (
-            ("Excel workbook (.xlsx)", "xlsx"),
-            ("CSV spreadsheet (.csv)", "csv"),
-            ("PDF report (.pdf)", "pdf"),
-        ):
-            act = QAction(label, export_menu)
-            act.triggered.connect(lambda _checked=False, f=fmt: self.export_clicked.emit(f))
-            export_menu.addAction(act)
-        self._export_btn.setMenu(export_menu)
-        hl.addWidget(self._export_btn)
-
-        self._import_btn = self._make_btn("Import", "mdi.tray-arrow-up", "secondary")
-        self._import_btn.clicked.connect(self.import_clicked)
-        hl.addWidget(self._import_btn)
-
-        self._today_btn = self._make_btn("Today", "mdi.calendar-today", "secondary")
-        self._today_btn.clicked.connect(self.today_clicked)
-        hl.addWidget(self._today_btn)
-
-        self._edit_btn = self._make_btn("Edit", "mdi.pencil-outline", "secondary")
-        self._edit_btn.clicked.connect(self.edit_clicked)
-        hl.addWidget(self._edit_btn)
-
-        self._save_btn = self._make_btn("Save", "mdi.content-save-outline", "primary")
-        self._save_btn.clicked.connect(self.save_clicked)
-        hl.addWidget(self._save_btn)
-
-        self._submit_btn = self._make_btn("Submit day", "mdi.send-check-outline", "submit")
-        self._submit_btn.setToolTip(
-            "Submit all draft entries for this calendar day to Verify (whole day)."
-        )
-        self._submit_btn.clicked.connect(self.submit_clicked)
-        hl.addWidget(self._submit_btn)
-
     def _set_mode(self, merged: bool) -> None:
         self._my_btn.setChecked(not merged)
         self._merged_btn.setChecked(merged)
@@ -414,43 +392,18 @@ class _ActionBar(QFrame):
         self._my_btn.blockSignals(False)
         self._merged_btn.blockSignals(False)
 
-    def _make_btn(self, text: str, icon: str, kind: str) -> QPushButton:
-        b = QPushButton(f"  {text}")
-        b.setCursor(Qt.PointingHandCursor)
-        b.setFixedHeight(_BTN_H)
-        try:
-            color = "#FFFFFF" if kind in ("primary", "submit", "active") else "#374151"
-            b.setIcon(qta.icon(icon, color=color))
-            b.setIconSize(QSize(14, 14))
-        except Exception:
-            pass
-        b.setStyleSheet(_BTN_STYLES[kind])
-        return b
-
     def set_edit_state(self, active: bool, dirty_count: int = 0) -> None:
-        """Reflect the register's edit mode on the toggle + status pill."""
+        """Show edit-mode status pill next to search."""
         if active:
-            self._edit_btn.setText("  Cancel")
-            try:
-                self._edit_btn.setIcon(qta.icon("mdi.close", color="#FFFFFF"))
-            except Exception:
-                pass
-            self._edit_btn.setStyleSheet(_BTN_STYLES["active"])
             plural = "" if dirty_count == 1 else "s"
             self._status.setText(f"Edit mode  ·  {dirty_count} unsaved change{plural}")
             self._status.show()
         else:
-            self._edit_btn.setText("  Edit")
-            try:
-                self._edit_btn.setIcon(qta.icon("mdi.pencil-outline", color="#374151"))
-            except Exception:
-                pass
-            self._edit_btn.setStyleSheet(_BTN_STYLES["secondary"])
             self._status.hide()
 
 
 class _TablePage(QWidget):
-    """_QBDocHeader + action bar + DailyRegister stacked vertically."""
+    """QB icon toolbar → Daily Register totals → My/Merged/Search → grid."""
 
     def __init__(self, register: DailyRegister, parent=None):
         super().__init__(parent)
@@ -461,62 +414,43 @@ class _TablePage(QWidget):
         self._doc_header = _QBDocHeader()
         register.stats_updated.connect(self._doc_header.update_stats)
 
-        self._action_bar = _ActionBar()
-        self._action_bar.edit_clicked.connect(register.toggle_edit_mode)
-        self._action_bar.save_clicked.connect(register.save_rows)
-        self._action_bar.export_clicked.connect(register.export_as)
-        self._action_bar.import_clicked.connect(register.import_from_file)
-        self._action_bar.search_changed.connect(register.set_search)
-        self._action_bar.today_clicked.connect(
+        from tahmeed.ui.widgets.qb_txn_toolbar import QbTxnToolbar
+        self._qb_toolbar = QbTxnToolbar(register_actions=True)
+        self._qb_toolbar.find_prev.connect(lambda: register.toolbar_find(-1))
+        self._qb_toolbar.find_next.connect(lambda: register.toolbar_find(1))
+        self._qb_toolbar.new_clicked.connect(register.toolbar_new_row)
+        self._qb_toolbar.save_clicked.connect(register.save_rows)
+        self._qb_toolbar.delete_clicked.connect(register.toolbar_delete)
+        self._qb_toolbar.copy_clicked.connect(register.toolbar_copy_row)
+        self._qb_toolbar.print_clicked.connect(register.toolbar_print)
+        self._qb_toolbar.attach_clicked.connect(register.toolbar_attach)
+        self._qb_toolbar.export_clicked.connect(register.export_as)
+        self._qb_toolbar.import_clicked.connect(register.import_from_file)
+        self._qb_toolbar.today_clicked.connect(
             lambda: register.navigate_to_date(date.today())
         )
+        self._qb_toolbar.edit_clicked.connect(register.toggle_edit_mode)
+        self._qb_toolbar.submit_clicked.connect(register.submit_for_verify)
+        register.attachment_count_changed.connect(self._qb_toolbar.set_attachment_count)
+        register.edit_state_changed.connect(self._qb_toolbar.set_edit_state)
+        register.save_busy_changed.connect(self._qb_toolbar.set_mutation_busy)
+
+        self._action_bar = _ActionBar()
+        self._action_bar.search_changed.connect(register.set_search)
         self._action_bar.mode_changed.connect(register.set_merged_mode)
-        self._action_bar.submit_clicked.connect(register.submit_for_verify)
         register.edit_state_changed.connect(self._action_bar.set_edit_state)
         register.mode_changed.connect(self._action_bar.sync_mode)
         register.mode_changed.connect(self._doc_header.set_merged)
 
+
+        # 1) Icon toolbar (incl. Export/Import/Today/Edit/Submit)
+        # 2) Daily Register + totals
+        # 3) My/Merged + Search
+        vl.addWidget(self._qb_toolbar)
         vl.addWidget(self._doc_header)
         vl.addWidget(self._action_bar)
         vl.addWidget(register, 1)
 
-
-# ── Status bar ───────────────────────────────────────────────────────────────────
-
-_NAVY_STATUS   = "#1B2B4B"
-_NAVY_STATUS_T = "rgba(148,163,184,0.15)"
-
-class _StatusBar(QFrame):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("cashierStatusBar")
-        self.setFixedHeight(24)
-        self.setStyleSheet(
-            f"QFrame#cashierStatusBar {{"
-            f"  background: {_NAVY_STATUS}; border-top: 1px solid {_NAVY_STATUS_T};"
-            f"}}"
-        )
-        hl = QHBoxLayout(self)
-        hl.setContentsMargins(16, 0, 16, 0)
-        hl.setSpacing(0)
-
-        dot = QLabel("●")
-        dot.setStyleSheet("color: #16A34A; font-size: 9px; background: transparent;")
-        hl.addWidget(dot)
-        hl.addSpacing(5)
-
-        status = QLabel(
-            "Connected · MongoDB Atlas"
-            "     |     FY 2025"
-            "     |     Cashier Mode"
-            "     |     v1.0.0"
-        )
-        status.setStyleSheet(
-            "color: #94A3B8; font-size: 11px;"
-            " font-family: 'Segoe UI', sans-serif; background: transparent;"
-        )
-        hl.addWidget(status)
-        hl.addStretch()
 
 
 # ── CashierDashboard ─────────────────────────────────────────────────────────────
@@ -529,7 +463,8 @@ class CashierDashboard(QWidget):
         self._user = user
         self._category_indices: dict[str, int] = {}
         self._build_ui()
-        asyncio.ensure_future(self._load_categories())
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._load_categories())
 
     def _build_ui(self) -> None:
         self.setObjectName("cashierDashboard")
@@ -555,6 +490,12 @@ class CashierDashboard(QWidget):
         self._header.logout_requested.connect(self.logout_requested)
         self._header.change_password_requested.connect(self._on_change_password)
         root.addWidget(self._header)
+
+        from tahmeed.ui.widgets.connectivity_banner import ConnectivityBanner
+        from tahmeed.ui.widgets.live_status_bar import LiveStatusBar
+
+        self._connectivity_banner = ConnectivityBanner()
+        root.addWidget(self._connectivity_banner)
 
         # ── Body = sidebar + content ───────────────────────────────────────────
         body = QWidget()
@@ -605,7 +546,13 @@ class CashierDashboard(QWidget):
         body_hl.addWidget(self._stack, 1)
 
         root.addWidget(body, 1)
-        root.addWidget(_StatusBar())
+        root.addWidget(
+            LiveStatusBar(
+                object_name="cashierStatusBar",
+                mode_label="Cashier Mode",
+                dark=True,
+            )
+        )
 
         # ── Signal wiring ──────────────────────────────────────────────────────
         self._form.transaction_saved.connect(lambda _: self._register.refresh())
@@ -614,6 +561,7 @@ class CashierDashboard(QWidget):
         self._overview.go_to_browse.connect(lambda: self._on_nav("browse"))
         self._overview.export_data.connect(lambda: self._on_nav("browse"))
         self._overview.import_data.connect(self._on_import)
+
 
     def _on_import(self) -> None:
         self._on_nav("table")

@@ -820,7 +820,7 @@ class TruckOverviewWidget(QWidget):
         filter_row.setSpacing(10)
 
         self._truck_edit = TruckLineEdit(search_fleet, sync_fn=search_fleet_sync)
-        self._truck_edit.setPlaceholderText("Search truck or trailer…")
+        self._truck_edit.setPlaceholderText("Search truck, trailer, or bike/car…")
         self._truck_edit.setFixedWidth(180)
         self._truck_edit.setFixedHeight(_CTRL_H)
         self._truck_edit.setStyleSheet(_input_ss())

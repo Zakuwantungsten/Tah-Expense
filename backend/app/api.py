@@ -669,6 +669,33 @@ async def delete_trailer(number: str, request: Request, _manager: Manager) -> Re
     return Response(status_code=204)
 
 
+@fleet.get("/motor_vehicles")
+async def get_motor_vehicles(
+    request: Request,
+    _user: Authenticated,
+    search: str = "",
+    active: bool | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    return await list_fleet("motor_vehicles", request, search, active, limit, offset)
+
+
+@fleet.put("/motor_vehicles/{number}")
+async def upsert_motor_vehicle(number: str, body: FleetWrite, request: Request, _manager: Manager) -> dict:
+    if number.upper().strip() != body.number:
+        raise ApiError(422, "number_mismatch", "Path and body numbers must match")
+    return await put_fleet("motor_vehicles", body, request)
+
+
+@fleet.delete("/motor_vehicles/{number}", status_code=204)
+async def delete_motor_vehicle(number: str, request: Request, _manager: Manager) -> Response:
+    await database(request).motor_vehicles.delete_one(
+        {"number": " ".join(number.upper().split())}
+    )
+    return Response(status_code=204)
+
+
 async def list_people(
     request: Request,
     search: str,

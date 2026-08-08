@@ -43,7 +43,8 @@ class UploadBusy:
 
     def __enter__(self) -> "UploadBusy":
         self._dlg.show()
-        QApplication.processEvents()
+        from tahmeed.ui.async_utils import safe_process_events
+        safe_process_events()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -55,7 +56,8 @@ class UploadBusy:
         if value is not None and self._dlg.maximum() > 0:
             self._dlg.setValue(max(0, value))
         self._dlg.setLabelText(message)
-        QApplication.processEvents()
+        from tahmeed.ui.async_utils import safe_process_events
+        safe_process_events()
 
     def close(self) -> None:
         self._dlg.reset()

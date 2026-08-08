@@ -57,7 +57,7 @@ class _FakeCollection:
         self.docs.append(doc)
         return SimpleNamespace(inserted_id=doc["_id"])
 
-    async def update_one(self, query: dict, update: dict):
+    async def update_one(self, query: dict, update: dict, **_kwargs):
         modified = 0
         for d in self.docs:
             if _match(d, query):
@@ -66,7 +66,7 @@ class _FakeCollection:
                 break
         return SimpleNamespace(modified_count=modified)
 
-    async def delete_one(self, query: dict):
+    async def delete_one(self, query: dict, **_kwargs):
         before = len(self.docs)
         self.docs = [d for d in self.docs if not _match(d, query)]
         return SimpleNamespace(deleted_count=before - len(self.docs))

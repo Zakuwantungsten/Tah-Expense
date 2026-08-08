@@ -4,7 +4,9 @@ from PySide6.QtCore import QObject, Signal
 
 
 class _AppSignals(QObject):
-    transaction_saved = Signal()  # emitted after any single row is auto-saved
+    transaction_saved = Signal()  # legacy; autosave removed
+    # ConnectivityStatus from tahmeed.services.connectivity_service
+    connectivity_changed = Signal(object)
 
 
 app_signals = _AppSignals()

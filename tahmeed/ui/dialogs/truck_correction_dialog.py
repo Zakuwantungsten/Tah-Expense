@@ -1,4 +1,4 @@
-"""Dialog to correct truck/trailer numbers after paste or failed validation.
+"""Dialog to correct fleet numbers after paste or failed validation.
 
 All flagged trucks appear in one combined list. As each row is fixed,
 accepted as a place label (YARD/GARAGE), or cleared, it disappears from
@@ -30,7 +30,7 @@ from tahmeed.services.truck_format import (
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 
 IssueKind = Literal["invalid_format", "not_in_registry"]
-FleetKind = Literal["truck", "trailer"]
+FleetKind = Literal["truck", "trailer", "motor_vehicle"]
 
 _CTRL_H = 34
 _BORDER = "#E5E7EB"
@@ -172,7 +172,7 @@ class TruckCorrectionDialog(QDialog):
                 "Matching rows continue importing."
             )
             if self._can_add:
-                intro_text += " You can also add a missing truck/trailer to the registry."
+                intro_text += " You can also add a missing vehicle to the fleet registry."
         else:
             intro_text = (
                 "All flagged trucks are listed here. Fix one, accept a place label "
@@ -181,7 +181,7 @@ class TruckCorrectionDialog(QDialog):
                 "When nothing remains, this window closes."
             )
             if self._can_add:
-                intro_text += " You can also add a missing truck/trailer to the registry."
+                intro_text += " You can also add a missing vehicle to the fleet registry."
         intro = QLabel(intro_text)
         intro.setWordWrap(True)
         intro.setStyleSheet(
@@ -299,6 +299,8 @@ class TruckCorrectionDialog(QDialog):
             return ("Trailer ✓", _GREEN)
         if kind == "truck":
             return ("Truck ✓", _GREEN)
+        if kind == "motor_vehicle":
+            return ("Bike/Car ✓", _GREEN)
         return ("In registry ✓", _GREEN)
 
     def _refresh_status_badge(self, rw: _RowWidgets) -> None:
@@ -449,12 +451,13 @@ class TruckCorrectionDialog(QDialog):
         edit.editingFinished.connect(lambda e=edit: self._autonorm_edit(e))
         edit_row.addWidget(edit, 1)
 
-        # Status badge (Truck / Trailer / Not in registry) — not a chooser
+        # Status badge (Truck / Trailer / Bike/Car / Not in registry) — not a chooser
         status_badge = QLabel("—")
         status_badge.setFixedHeight(_CTRL_H)
         status_badge.setMinimumWidth(110)
         status_badge.setToolTip(
-            "Shows whether the entered number is a Truck or Trailer in your registry"
+            "Shows whether the entered number is a Truck, Trailer, or "
+            "Motorcycle/Car in your registry"
         )
         edit_row.addWidget(status_badge)
 
@@ -546,7 +549,7 @@ class TruckCorrectionDialog(QDialog):
             text = "Invalid format — use T + digits + space + suffix (e.g. T688 EAF)"
             color = "#b45309"
         else:
-            text = "Not in truck/trailer registry"
+            text = "Not in fleet registry"
             color = "#b91c1c"
         rw.kind_label.setText(text)
         rw.kind_label.setStyleSheet(
@@ -700,13 +703,13 @@ class TruckCorrectionDialog(QDialog):
             self._finish_resolved(rw, corrected=matched, also=also)
             return
 
-        # Not in trucks or trailers — flag and confirm before allowing
+        # Not in fleet registry — flag and confirm before allowing
         if ask_similar:
             reply = QMessageBox.warning(
                 self,
                 "Not in vehicle registry",
                 f'Your allowed truck "{value}" is not in the vehicle registry '
-                "(trucks or trailers).\n\n"
+                "(trucks, trailers, or motorcycles & cars).\n\n"
                 "Allow it anyway for this import?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
@@ -768,7 +771,7 @@ class TruckCorrectionDialog(QDialog):
             self,
             "Not in vehicle registry",
             f"{len(pending)} allowed truck(s) are not in the vehicle registry "
-            "(trucks or trailers):\n\n"
+            "(trucks, trailers, or motorcycles & cars):\n\n"
             + "\n".join(f"  • {s}" for s in samples)
             + extra
             + "\n\nAllow them anyway for this import?",
@@ -860,7 +863,7 @@ class TruckCorrectionDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "Not in registry",
-                f'"{number}" is not in the truck/trailer registry.\n\n'
+                f'"{number}" is not in the fleet registry.\n\n'
                 + (
                     "Use “Add to registry”, “Allow anyway”, or “Skip row”."
                     if self._import_mode and self._can_add
@@ -882,13 +885,14 @@ class TruckCorrectionDialog(QDialog):
         self._finish_resolved(rw, corrected=matched, also=also)
 
     def _ask_registry_kind(self, number: str) -> Optional[str]:
-        """Ask whether to add as Truck or Trailer. Returns ``trucks``/``trailers``."""
+        """Ask which fleet collection to use. Returns collection path or None."""
         box = QMessageBox(self)
         box.setWindowTitle("Add to registry")
         box.setIcon(QMessageBox.Question)
         box.setText(f'Add "{number}" to the fleet registry as:')
         truck_btn = box.addButton("Truck", QMessageBox.AcceptRole)
         trailer_btn = box.addButton("Trailer", QMessageBox.AcceptRole)
+        motor_btn = box.addButton("Motorcycle/Car", QMessageBox.AcceptRole)
         box.addButton("Cancel", QMessageBox.RejectRole)
         box.exec()
         clicked = box.clickedButton()
@@ -896,6 +900,8 @@ class TruckCorrectionDialog(QDialog):
             return "trucks"
         if clicked is trailer_btn:
             return "trailers"
+        if clicked is motor_btn:
+            return "motor_vehicles"
         return None
 
     def _add_to_registry_row(self, rw: _RowWidgets) -> None:
@@ -913,9 +919,11 @@ class TruckCorrectionDialog(QDialog):
         if kind is None:
             return
         # Persist after dialog closes — no nested asyncio inside import modals.
+        from tahmeed.services.truck_service import collection_to_kind
+
         self.pending_registry_adds.append((kind, number))
         self._fleet.add(number)
-        self._fleet_kinds[number] = "truck" if kind == "trucks" else "trailer"
+        self._fleet_kinds[number] = collection_to_kind(kind)
         self._refresh_fleet_completers()
         self._refresh_status_badge(rw)
         also = self._confirm_apply_similar(rw, number, action="add")

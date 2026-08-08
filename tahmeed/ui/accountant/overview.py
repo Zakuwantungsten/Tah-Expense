@@ -544,7 +544,8 @@ class OverviewWidget(QWidget):
         if self._year != app_state.fiscal_year:
             self._year = app_state.fiscal_year
             self._update_fy_button()
-        asyncio.ensure_future(self._load())
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._load())
 
     async def _load(self) -> None:
         if self._loading:

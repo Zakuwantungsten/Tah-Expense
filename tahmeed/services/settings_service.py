@@ -11,7 +11,8 @@ DEFAULTS = {
     # The accountant assigns items on verify; mappings are remembered.
     "defer_item_to_verify": False,
     # When True the cashier register's Truck No. column only accepts numbers that
-    # exist in the accountant's truck/trailer registries. Default On — always intended.
+    # exist in the accountant's fleet registries (trucks, trailers, motor vehicles).
+    # Default On — always intended.
     "restrict_trucks": True,
     # How many days back to scan when checking for duplicate transactions.
     "duplicate_check_days": 5,

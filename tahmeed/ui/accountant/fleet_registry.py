@@ -1,8 +1,8 @@
-"""Fleet Registry — Trucks and Trailers management tables.
+"""Fleet Registry — Trucks, Trailers, and Motorcycles & Cars management tables.
 
-Two widgets (TrucksRegistryWidget / TrailersRegistryWidget) share a common
-_FleetRegistryBase that provides search, table, add-dialog, and Excel import.
-Data is stored in the `trucks` / `trailers` MongoDB collections.
+Widgets share a common _FleetRegistryBase that provides search, table,
+add-dialog, and Excel import. Data is stored in the `trucks` / `trailers` /
+`motor_vehicles` MongoDB collections.
 """
 
 from __future__ import annotations
@@ -191,14 +191,15 @@ class _AddVehicleDialog(QDialog):
 
 class _FleetRegistryBase(QWidget):
     """
-    Shared base for Trucks and Trailers registry pages.
-    Subclasses supply: _kind, _icon, _excel_sheet, _excel_section,
+    Shared base for fleet registry pages (trucks, trailers, motor vehicles).
+    Subclasses supply: _kind, _kind_plural, _icon, _excel_section,
     _fn_list, _fn_count, _fn_add, _fn_remove, _fn_set_active, _fn_bulk_add.
     """
 
     _kind: str = "Vehicle"
+    _kind_plural: str = "vehicles"
     _icon: str = "mdi.truck"
-    _excel_section: str = "TRUCKS"   # "TRUCKS" or "TRAILERS"
+    _excel_section: str = "TRUCKS"   # "TRUCKS" / "TRAILERS" / "MOTOR VEHICLES"
     _col_prefs_key: str = "fleet_registry"
 
     # async callables — set by subclass
@@ -258,7 +259,7 @@ class _FleetRegistryBase(QWidget):
         self._restrict_btn.setCursor(Qt.PointingHandCursor)
         self._restrict_btn.setToolTip(
             "When on, the cashier's Truck No. column only accepts numbers that\n"
-            "exist in the truck/trailer registries. Applies to both registries."
+            "exist in the fleet registries (trucks, trailers, motorcycles & cars)."
         )
         try:
             self._restrict_btn.setIcon(qta.icon("mdi.lock-outline", color=_T2))
@@ -400,7 +401,8 @@ class _FleetRegistryBase(QWidget):
         self._restrict_btn.setEnabled(False)
         self._restrict_btn.setText("  Restrict in cashier: On (required)")
         self._restrict_btn.setToolTip(
-            "Cashiers may only enter trucks/trailers that exist in this registry."
+            "Cashiers may only enter fleet numbers that exist in the registries "
+            "(trucks, trailers, motorcycles & cars)."
         )
         self._restrict_btn.blockSignals(False)
 
@@ -468,7 +470,7 @@ class _FleetRegistryBase(QWidget):
         if self._loading:
             return
         self._loading = True
-        self._loading_overlay.show_loading(f"Loading {self._kind.lower()}s…")
+        self._loading_overlay.show_loading(f"Loading {self._kind_plural}…")
         try:
             search = self._search.text().strip()
             active_filter = self._active_filter()
@@ -497,7 +499,7 @@ class _FleetRegistryBase(QWidget):
             self._populate_table()
             self._update_pager()
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Could not load {self._kind.lower()}s:\n{exc}")
+            QMessageBox.critical(self, "Error", f"Could not load {self._kind_plural}:\n{exc}")
         finally:
             self._loading = False
             self._loading_overlay.hide_loading()
@@ -506,7 +508,7 @@ class _FleetRegistryBase(QWidget):
         rows = self._rows
         skip = self._page * _PAGE_SIZE
         self._table.setRowCount(0)
-        self._count_chip.setText(f"{self._total:,} {self._kind.lower()}s")
+        self._count_chip.setText(f"{self._total:,} {self._kind_plural}")
 
         for i, row in enumerate(rows):
             self._table.insertRow(i)
@@ -609,7 +611,7 @@ class _FleetRegistryBase(QWidget):
         asyncio.ensure_future(self._do_import(path))
 
     async def _do_import(self, path: str) -> None:
-        self._loading_overlay.show_loading(f"Importing {self._kind.lower()}s…")
+        self._loading_overlay.show_loading(f"Importing {self._kind_plural}…")
         try:
             import openpyxl
         except ImportError:
@@ -632,10 +634,9 @@ class _FleetRegistryBase(QWidget):
             self._loading_overlay.hide_loading()
             fname = Path(path).name
             section = self._excel_section
-            kind = self._kind.lower()
             QMessageBox.warning(
                 self, "Nothing Found",
-                f'No {kind} registration numbers found in\n'
+                f'No {self._kind_plural} registration numbers found in\n'
                 f'"{fname}".\n\n'
                 f'Expected a section headed "{section}".'
             )
@@ -651,7 +652,7 @@ class _FleetRegistryBase(QWidget):
         self._loading_overlay.hide_loading()
         QMessageBox.information(
             self, "Import Complete",
-            f"Parsed {len(numbers)} {self._kind.lower()}s from the file.\n"
+            f"Parsed {len(numbers)} {self._kind_plural} from the file.\n"
             f"{count} new entr{'y' if count == 1 else 'ies'} added to the database."
         )
         await self._load()
@@ -688,6 +689,7 @@ class _FleetRegistryBase(QWidget):
 
 class TrucksRegistryWidget(_FleetRegistryBase):
     _kind          = "Truck"
+    _kind_plural   = "trucks"
     _icon          = "mdi.truck"
     _excel_section = "TRUCKS"
     _col_prefs_key = "fleet_trucks"
@@ -710,6 +712,7 @@ class TrucksRegistryWidget(_FleetRegistryBase):
 
 class TrailersRegistryWidget(_FleetRegistryBase):
     _kind          = "Trailer"
+    _kind_plural   = "trailers"
     _icon          = "mdi.truck-trailer"
     _excel_section = "TRAILERS"
     _col_prefs_key = "fleet_trailers"
@@ -725,4 +728,27 @@ class TrailersRegistryWidget(_FleetRegistryBase):
         self._fn_remove     = remove_trailer
         self._fn_set_active = set_trailer_active
         self._fn_bulk_add   = bulk_add_trailers
+        super().__init__(parent)
+
+
+# ── Motorcycles & Cars registry ────────────────────────────────────────────────
+
+class MotorVehiclesRegistryWidget(_FleetRegistryBase):
+    _kind          = "Motorcycles & Cars"
+    _kind_plural   = "motorcycles & cars"
+    _icon          = "mdi.car"
+    _excel_section = "MOTOR VEHICLES"
+    _col_prefs_key = "fleet_motor_vehicles"
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        from tahmeed.services.truck_service import (
+            list_motor_vehicles, count_motor_vehicles, add_motor_vehicle,
+            remove_motor_vehicle, set_motor_vehicle_active, bulk_add_motor_vehicles,
+        )
+        self._fn_list       = list_motor_vehicles
+        self._fn_count      = count_motor_vehicles
+        self._fn_add        = add_motor_vehicle
+        self._fn_remove     = remove_motor_vehicle
+        self._fn_set_active = set_motor_vehicle_active
+        self._fn_bulk_add   = bulk_add_motor_vehicles
         super().__init__(parent)

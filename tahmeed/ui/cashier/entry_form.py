@@ -1,12 +1,11 @@
 import asyncio
 from datetime import datetime, date
 from typing import List, Optional
-from bson import ObjectId
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QDateEdit, QDoubleSpinBox, QComboBox, QCheckBox,
-    QPushButton, QLabel, QMessageBox, QFrame, QDialog,
+    QPushButton, QLabel, QMessageBox, QFrame, QDialog, QFileDialog,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QStyledItemDelegate, QSizePolicy, QSplitter,
 )
@@ -24,10 +23,15 @@ from tahmeed.services.truck_format import (
 from tahmeed.services.rule_service import test_description
 from tahmeed.services.category_service import get_all_categories
 from tahmeed.services.settings_service import get_setting, set_setting
-from tahmeed.services.cashier_service import save_transaction, get_transactions_by_date, check_for_duplicates
+from tahmeed.services.cashier_service import (
+    save_transaction, get_transactions_by_date, check_for_duplicates,
+    request_or_delete_transaction,
+)
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
+from tahmeed.ui.widgets.qb_txn_toolbar import QbTxnToolbar
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
+from tahmeed.ui.dialogs.attachment_dialog import AttachmentDialog
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 
 
@@ -186,6 +190,8 @@ class EntryForm(QWidget):
         self._fleet_kinds: dict = {}
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
         self._rcpt_delegate = _ReceiptDelegate()
+        self._day_txs: List[Transaction] = []
+        self._submit_in_flight = False
 
         self._build_ui()
 
@@ -255,8 +261,24 @@ class EntryForm(QWidget):
     def _build_ui(self) -> None:
         self.setStyleSheet("EntryForm { background:#f3f4f6; }")
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        self._qb_toolbar = QbTxnToolbar()
+        self._qb_toolbar.find_prev.connect(lambda: self._toolbar_find(-1))
+        self._qb_toolbar.find_next.connect(lambda: self._toolbar_find(1))
+        self._qb_toolbar.new_clicked.connect(self._clear_form)
+        self._qb_toolbar.save_clicked.connect(self._on_submit)
+        self._qb_toolbar.delete_clicked.connect(self._toolbar_delete)
+        self._qb_toolbar.copy_clicked.connect(self._toolbar_copy)
+        self._qb_toolbar.print_clicked.connect(self._toolbar_print)
+        self._qb_toolbar.attach_clicked.connect(self._toolbar_attach)
+        outer.addWidget(self._qb_toolbar)
+
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(16, 16, 16, 16)
+        body_lay.setSpacing(0)
 
         splitter = QSplitter(Qt.Vertical)
         splitter.setHandleWidth(7)
@@ -267,7 +289,10 @@ class EntryForm(QWidget):
         splitter.addWidget(self._build_form_card())
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
-        outer.addWidget(splitter)
+        body_lay.addWidget(splitter)
+        outer.addWidget(body, 1)
+
+        self._day_table.itemSelectionChanged.connect(self._sync_attach_badge)
 
         # Reload table when date picker changes
         self._date.dateChanged.connect(
@@ -533,6 +558,7 @@ class EntryForm(QWidget):
             pass
 
     def _fill_table(self, txs: List[Transaction]) -> None:
+        self._day_txs = list(txs)
         self._day_table.setRowCount(0)
         self._day_table.setRowCount(len(txs))
 
@@ -546,6 +572,8 @@ class EntryForm(QWidget):
                 return it
 
             sno = _it(str(row + 1), Qt.AlignCenter)
+            if tx._id is not None:
+                sno.setData(Qt.UserRole, str(tx._id))
             self._day_table.setItem(row, _SNO, sno)
 
             self._day_table.setItem(row, _DATE,  _it(tx.date.strftime("%d/%m/%Y") if tx.date else ""))
@@ -577,6 +605,7 @@ class EntryForm(QWidget):
         self._count_label.setText(f"{n} entr{'y' if n == 1 else 'ies'}")
         if n > 0:
             self._day_table.scrollToBottom()
+        self._sync_attach_badge()
 
     # ──────────────────────────────────────────────────────────────────
     # Category auto-detection (triggered by description typing)
@@ -646,15 +675,25 @@ class EntryForm(QWidget):
     # ──────────────────────────────────────────────────────────────────
 
     def _on_submit(self) -> None:
+        if self._submit_in_flight:
+            return
         asyncio.ensure_future(self._do_submit())
 
     async def _do_submit(self) -> None:
+        if self._submit_in_flight:
+            return
+        self._submit_in_flight = True
         self._submit_btn.setEnabled(False)
+        try:
+            await self._do_submit_body()
+        finally:
+            self._submit_in_flight = False
+            self._submit_btn.setEnabled(True)
 
+    async def _do_submit_body(self) -> None:
         description = self._description.text().strip()
         if not description:
             QMessageBox.warning(self, "Missing field", "Description is required.")
-            self._submit_btn.setEnabled(True)
             return
 
         cat_result = self._resolve_category()
@@ -663,7 +702,6 @@ class EntryForm(QWidget):
                 self, "No category",
                 "Category not recognised. Type a category name or pick one from the dropdown.",
             )
-            self._submit_btn.setEnabled(True)
             return
 
         cat_name, cat_id = cat_result
@@ -705,7 +743,6 @@ class EntryForm(QWidget):
                         )
                         if dlg.exec() != QDialog.Accepted or not dlg.issues or dlg.issues[0].skip:
                             self._truck.clear()
-                            self._submit_btn.setEnabled(True)
                             return
                         truck_number = dlg.issues[0].corrected
                         if getattr(dlg.issues[0], "is_place_label", False):
@@ -714,22 +751,17 @@ class EntryForm(QWidget):
                             self._fleet_numbers.add(truck_number)
                         pending_adds = list(getattr(dlg, "pending_registry_adds", None) or [])
                         if pending_adds:
-                            from tahmeed.services.truck_service import add_trailer, add_truck
+                            from tahmeed.services.truck_service import add_fleet_by_collection
                             for kind, number in pending_adds:
                                 try:
-                                    if kind == "trucks":
-                                        await add_truck(number)
-                                        self._fleet_kinds[number] = "truck"
-                                    else:
-                                        await add_trailer(number)
-                                        self._fleet_kinds[number] = "trailer"
+                                    label = await add_fleet_by_collection(kind, number)
+                                    self._fleet_kinds[number] = label
                                     self._fleet_numbers.add(number)
                                 except Exception as exc:
                                     QMessageBox.critical(
                                         self, "Error",
                                         f"Failed to add {number} to registry:\n{exc}",
                                     )
-                                    self._submit_btn.setEnabled(True)
                                     return
                         if getattr(dlg, "new_labels", None):
                             try:
@@ -756,7 +788,6 @@ class EntryForm(QWidget):
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             ) == QMessageBox.No:
-                self._submit_btn.setEnabled(True)
                 return
 
         # ── Duplicate check ───────────────────────────────────────────────
@@ -796,7 +827,6 @@ class EntryForm(QWidget):
             _cancel_btn = _msg.addButton("Cancel",      QMessageBox.RejectRole)
             _msg.exec()
             if _msg.clickedButton() is _cancel_btn:
-                self._submit_btn.setEnabled(True)
                 return
             possible_dup = True
 
@@ -832,8 +862,6 @@ class EntryForm(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to save:\n{exc}")
 
-        self._submit_btn.setEnabled(True)
-
     # ──────────────────────────────────────────────────────────────────
     # Clear
     # ──────────────────────────────────────────────────────────────────
@@ -851,6 +879,180 @@ class EntryForm(QWidget):
         self._cat_input.clear()
         self._set_cat_waiting()
         self._description.setFocus()
+
+    # ──────────────────────────────────────────────────────────────────
+    # QuickBooks-style toolbar
+    # ──────────────────────────────────────────────────────────────────
+
+    def _selected_tx(self) -> Optional[Transaction]:
+        row = self._day_table.currentRow()
+        if row < 0 or row >= len(self._day_txs):
+            return None
+        return self._day_txs[row]
+
+    def _sync_attach_badge(self) -> None:
+        tx = self._selected_tx()
+        n = len(getattr(tx, "attachments", None) or []) if tx else 0
+        self._qb_toolbar.set_attachment_count(n)
+
+    def _toolbar_find(self, direction: int) -> None:
+        n = self._day_table.rowCount()
+        if n <= 0:
+            return
+        cur = self._day_table.currentRow()
+        if cur < 0:
+            target = 0 if direction >= 0 else n - 1
+        else:
+            target = (cur + (1 if direction >= 0 else -1)) % n
+        self._day_table.selectRow(target)
+        self._day_table.setCurrentCell(target, _DESC)
+        self._day_table.scrollToItem(
+            self._day_table.item(target, _DESC),
+            QAbstractItemView.PositionAtCenter,
+        )
+
+    def _load_tx_into_form(self, tx: Transaction) -> None:
+        """Fill the form fields from a day-table row (for Find / Copy preview)."""
+        if tx.date:
+            self._date.setDate(QDate(tx.date.year, tx.date.month, tx.date.day))
+        self._item.setText(tx.item or "")
+        self._description.setText(tx.description or "")
+        self._truck.setText(tx.truck_number or "")
+        self._amount.setValue(float(tx.amount or 0))
+        self._memo.setText(tx.memo or "")
+        self._notes.setChecked(bool(tx.notes_flag))
+        self._ownership.setText(tx.ownership or "")
+        self._approver.setText(tx.approver or "")
+        self._cat_input.setText(tx.category_name or "")
+        # Receipt combo
+        status = tx.receipt_status or "pending"
+        idx = self._receipt.findData(status)
+        if idx >= 0:
+            self._receipt.setCurrentIndex(idx)
+        if tx.category_name:
+            self._set_cat_matched(tx.category_name, 1.0)
+        else:
+            self._set_cat_waiting()
+
+    def _toolbar_copy(self) -> None:
+        tx = self._selected_tx()
+        if tx is None:
+            QMessageBox.information(
+                self, "Create a Copy",
+                "Select an entry in the day table to copy into the form.",
+            )
+            return
+        self._load_tx_into_form(tx)
+        self._description.setFocus()
+        QMessageBox.information(
+            self, "Create a Copy",
+            "Fields copied into the form. Review and click Add Entry to save a new row.",
+        )
+
+    def _toolbar_delete(self) -> None:
+        tx = self._selected_tx()
+        if tx is None or tx._id is None:
+            QMessageBox.information(
+                self, "Delete",
+                "Select a saved entry in the day table to delete.",
+            )
+            return
+        desc = tx.description or "?"
+        if (
+            QMessageBox.question(
+                self, "Delete Entry",
+                f'Delete saved transaction:\n"{desc}"?',
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        asyncio.ensure_future(self._do_toolbar_delete(tx))
+
+    async def _do_toolbar_delete(self, tx: Transaction) -> None:
+        try:
+            result = await request_or_delete_transaction(
+                tx._id, getattr(self._user, "_id", None)
+            )
+            if result == "not_found":
+                QMessageBox.warning(self, "Not Found", "That entry was already removed.")
+            elif result == "deletion_requested":
+                QMessageBox.information(
+                    self, "Deletion Requested",
+                    "The approved expense was sent to Verify → Deleted.",
+                )
+            await self._refresh_table()
+            self._clear_form()
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to delete:\n{exc}")
+
+    def _toolbar_print(self) -> None:
+        if not self._day_txs:
+            QMessageBox.information(self, "Print", "No entries for this day to export.")
+            return
+        default_name = f"register_{self._selected_date().isoformat()}.pdf"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export day as PDF", default_name, "PDF Report (*.pdf)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path = f"{path}.pdf"
+        rows = []
+        for tx in self._day_txs:
+            rows.append([
+                tx.date.strftime("%d/%m/%Y") if tx.date else "",
+                tx.reported_date.strftime("%d/%m/%Y") if tx.reported_date else "",
+                tx.item or "",
+                tx.description or "",
+                tx.truck_number or "",
+                tx.memo or "",
+                tx.ref_float or "",
+                f"{tx.amount:,.2f}" if tx.amount else "",
+                _RCPT_LABEL.get(tx.receipt_status, tx.receipt_status or ""),
+                tx.ownership or "",
+                tx.approver or "",
+                tx.payee or "",
+                tx.cheque or "",
+            ])
+        try:
+            from tahmeed.services.daily_register_pdf import export_daily_register_pdf
+            export_daily_register_pdf(
+                path, rows=rows, register_date=self._selected_date(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(
+            self, "Export complete",
+            f"{len(rows)} row(s) exported to:\n{path}",
+        )
+
+    def _toolbar_attach(self) -> None:
+        tx = self._selected_tx()
+        if tx is None or tx._id is None:
+            QMessageBox.information(
+                self, "Attach File",
+                "Select a saved entry in the day table first.",
+            )
+            return
+        dlg = AttachmentDialog(
+            tx._id,
+            description=tx.description or "",
+            actor_id=getattr(self._user, "_id", None),
+            parent=self,
+        )
+        dlg.exec()
+        # Refresh metadata for badge
+        asyncio.ensure_future(self._reload_selected_attachments(tx))
+
+    async def _reload_selected_attachments(self, tx: Transaction) -> None:
+        try:
+            from tahmeed.services.attachment_service import get_attachments
+            tx.attachments = await get_attachments(tx._id)
+        except Exception:
+            pass
+        self._sync_attach_badge()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

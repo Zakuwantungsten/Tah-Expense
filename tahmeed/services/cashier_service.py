@@ -87,6 +87,22 @@ async def save_transaction(tx: Transaction) -> Transaction:
     db = get_db()
     result = await db.transactions.insert_one(tx.to_doc())
     tx._id = result.inserted_id
+    try:
+        from tahmeed.services.audit_service import record_event
+
+        await record_event(
+            "txn.save",
+            actor_id=tx.cashier_id,
+            entity_type="transaction",
+            entity_ids=[tx._id],
+            details={
+                "amount": tx.amount,
+                "description": (tx.description or "")[:120],
+                "register_status": tx.register_status,
+            },
+        )
+    except Exception:
+        pass
     return tx
 
 
@@ -100,6 +116,19 @@ async def update_transaction(tx_id: ObjectId, updates: dict) -> bool:
         {"_id": tx_id},
         {"$set": updates},
     )
+    if result.modified_count == 1:
+        try:
+            from tahmeed.services.audit_service import record_event
+
+            await record_event(
+                "txn.update",
+                actor_id=updates.get("last_edited_by"),
+                entity_type="transaction",
+                entity_ids=[tx_id],
+                details={"fields": sorted(str(k) for k in updates.keys())},
+            )
+        except Exception:
+            pass
     return result.modified_count == 1
 
 

@@ -78,7 +78,7 @@ class SplashScreen(QWidget):
         logo.setAlignment(Qt.AlignCenter)
         logo.setAttribute(Qt.WA_TranslucentBackground, True)
         logo.setStyleSheet("background: transparent;")
-        pix = load_brand_logo(160)
+        pix = load_brand_logo(160, for_dark_bg=False)
         if not pix.isNull():
             logo.setPixmap(pix)
         root.addWidget(logo)

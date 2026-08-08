@@ -876,6 +876,7 @@ class MasterExpensesWidget(QWidget):
         self._scroll_loading = False
         self._filters_loaded = False
         self._reload_generation = 0
+        self._import_in_flight = False
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -1375,9 +1376,20 @@ class MasterExpensesWidget(QWidget):
     # ── Excel Import ─────────────────────────────────────────────────────
 
     def _on_import(self) -> None:
+        if self._import_in_flight:
+            return
         asyncio.ensure_future(self._do_import())
 
     async def _do_import(self) -> None:
+        if self._import_in_flight:
+            return
+        self._import_in_flight = True
+        try:
+            await self._do_import_body()
+        finally:
+            self._import_in_flight = False
+
+    async def _do_import_body(self) -> None:
         from pathlib import Path
 
         from tahmeed.services.category_service import get_all_categories

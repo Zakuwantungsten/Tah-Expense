@@ -46,7 +46,7 @@ async def run_import_truck_gate(
     if not field or not rows:
         return ImportTruckGateResult(rows=list(rows))
 
-    from tahmeed.services.truck_service import get_fleet_numbers, add_truck, add_trailer
+    from tahmeed.services.truck_service import get_fleet_numbers, add_fleet_by_collection
     from tahmeed.services import accountant_service as svc
     from tahmeed.services import settings_service
 
@@ -117,10 +117,7 @@ async def run_import_truck_gate(
     # Persist any registry adds queued by the dialog
     for kind, number in dlg.pending_registry_adds:
         try:
-            if kind == "trailers":
-                await add_trailer(number)
-            else:
-                await add_truck(number)
+            await add_fleet_by_collection(kind, number)
         except Exception as exc:
             QMessageBox.warning(
                 parent,

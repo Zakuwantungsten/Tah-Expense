@@ -1,4 +1,4 @@
-"""Truck / trailer registration number format helpers.
+"""Fleet registration number format helpers (trucks, trailers, motor vehicles).
 
 Canonical form: T{digits} {SUFFIX}  e.g. ``T688 EAF``.
 Place labels (YARD, GARAGE, …) are free-text truck-column values that are

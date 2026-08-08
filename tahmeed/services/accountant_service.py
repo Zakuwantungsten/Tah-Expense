@@ -115,10 +115,28 @@ async def approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bool:
             "date_discrepancy": False,
         }},
     )
-    return result.modified_count == 1
+    ok = result.modified_count == 1
+    if ok:
+        try:
+            from tahmeed.services.audit_service import record_event
+
+            await record_event(
+                "txn.approve",
+                actor_id=accountant_id,
+                entity_type="transaction",
+                entity_ids=[tx_id],
+            )
+        except Exception:
+            pass
+    return ok
 
 
-async def reject_transaction(tx_id: ObjectId, reason: str) -> bool:
+async def reject_transaction(
+    tx_id: ObjectId,
+    reason: str,
+    *,
+    actor_id: ObjectId | None = None,
+) -> bool:
     db = get_db()
     result = await db.transactions.update_one(
         {"_id": tx_id},
@@ -129,7 +147,21 @@ async def reject_transaction(tx_id: ObjectId, reason: str) -> bool:
             "discarded": False,
         }},
     )
-    return result.modified_count == 1
+    ok = result.modified_count == 1
+    if ok:
+        try:
+            from tahmeed.services.audit_service import record_event
+
+            await record_event(
+                "txn.reject",
+                actor_id=actor_id,
+                entity_type="transaction",
+                entity_ids=[tx_id],
+                details={"reason": (reason or "")[:240]},
+            )
+        except Exception:
+            pass
+    return ok
 
 
 def _normalize_user_id(value: ObjectId | str | None) -> ObjectId | None:
@@ -142,7 +174,12 @@ def _normalize_user_id(value: ObjectId | str | None) -> ObjectId | None:
     return None
 
 
-async def bulk_reject_transactions(tx_ids: List[ObjectId], reason: str) -> int:
+async def bulk_reject_transactions(
+    tx_ids: List[ObjectId],
+    reason: str,
+    *,
+    actor_id: ObjectId | None = None,
+) -> int:
     if not tx_ids:
         return 0
     db = get_db()
@@ -155,7 +192,21 @@ async def bulk_reject_transactions(tx_ids: List[ObjectId], reason: str) -> int:
             "discarded": False,
         }},
     )
-    return result.modified_count
+    n = int(result.modified_count)
+    if n:
+        try:
+            from tahmeed.services.audit_service import record_event
+
+            await record_event(
+                "txn.reject_bulk",
+                actor_id=actor_id,
+                entity_type="transaction",
+                entity_ids=tx_ids,
+                details={"count": n, "reason": (reason or "")[:240]},
+            )
+        except Exception:
+            pass
+    return n
 
 
 async def get_cashier_names(cashier_ids: List[ObjectId]) -> Dict[ObjectId, str]:
@@ -770,29 +821,85 @@ async def get_deletion_requested_descriptions(
     return sorted(v for v in vals if v)
 
 
-async def confirm_deletion(tx_id: ObjectId) -> bool:
+async def confirm_deletion(
+    tx_id: ObjectId,
+    *,
+    actor_id: ObjectId | None = None,
+) -> bool:
     """Permanently delete an approved row flagged for removal.
 
     Also removes any pending-edit clones that still point at this original.
     """
+    from tahmeed.db.mongo_txn import run_in_transaction, session_kwargs
+
     db = get_db()
     doc = await db.transactions.find_one({"_id": tx_id, "deletion_requested": True})
     if not doc:
         return False
-    await db.transactions.delete_many({"original_transaction_id": tx_id})
-    result = await db.transactions.delete_one({"_id": tx_id, "deletion_requested": True})
-    return result.deleted_count == 1
+
+    async def _body(session):
+        kw = session_kwargs(session)
+        await db.transactions.delete_many(
+            {"original_transaction_id": tx_id}, **kw
+        )
+        result = await db.transactions.delete_one(
+            {"_id": tx_id, "deletion_requested": True}, **kw
+        )
+        return result.deleted_count == 1
+
+    ok = await run_in_transaction(_body)
+    if ok:
+        try:
+            from tahmeed.services.audit_service import record_event
+
+            await record_event(
+                "txn.delete_confirm",
+                actor_id=actor_id,
+                entity_type="transaction",
+                entity_ids=[tx_id],
+            )
+        except Exception:
+            pass
+    return ok
 
 
-async def bulk_confirm_deletions(tx_ids: List[ObjectId]) -> int:
+async def bulk_confirm_deletions(
+    tx_ids: List[ObjectId],
+    *,
+    actor_id: ObjectId | None = None,
+) -> int:
     if not tx_ids:
         return 0
+    from tahmeed.db.mongo_txn import run_in_transaction, session_kwargs
+
     db = get_db()
-    await db.transactions.delete_many({"original_transaction_id": {"$in": tx_ids}})
-    result = await db.transactions.delete_many(
-        {"_id": {"$in": tx_ids}, "deletion_requested": True},
-    )
-    return int(result.deleted_count)
+
+    async def _body(session):
+        kw = session_kwargs(session)
+        await db.transactions.delete_many(
+            {"original_transaction_id": {"$in": tx_ids}}, **kw
+        )
+        result = await db.transactions.delete_many(
+            {"_id": {"$in": tx_ids}, "deletion_requested": True},
+            **kw,
+        )
+        return int(result.deleted_count)
+
+    n = await run_in_transaction(_body)
+    if n:
+        try:
+            from tahmeed.services.audit_service import record_event
+
+            await record_event(
+                "txn.delete_confirm_bulk",
+                actor_id=actor_id,
+                entity_type="transaction",
+                entity_ids=tx_ids,
+                details={"count": n},
+            )
+        except Exception:
+            pass
+    return n
 
 
 async def restore_deletion(tx_id: ObjectId) -> bool:
@@ -934,6 +1041,8 @@ async def re_approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bo
     values cascade to the original approved record and the pending doc is deleted.
     Otherwise (legacy in-place edits) the document is flipped verified=True directly.
     """
+    from tahmeed.db.mongo_txn import run_in_transaction, session_kwargs
+
     db = get_db()
     pending_doc = await db.transactions.find_one({"_id": tx_id, "verified": False})
     if not pending_doc:
@@ -953,11 +1062,32 @@ async def re_approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bo
             "last_edited_at": pending_doc.get("last_edited_at"),
             "last_edited_by": pending_doc.get("last_edited_by"),
         })
-        result = await db.transactions.update_one({"_id": original_id}, {"$set": updates})
-        if result.modified_count == 1:
-            await db.transactions.delete_one({"_id": tx_id})
+
+        async def _cascade(session):
+            kw = session_kwargs(session)
+            result = await db.transactions.update_one(
+                {"_id": original_id}, {"$set": updates}, **kw
+            )
+            if result.modified_count != 1:
+                return False
+            await db.transactions.delete_one({"_id": tx_id}, **kw)
             return True
-        return False
+
+        ok = await run_in_transaction(_cascade)
+        if ok:
+            try:
+                from tahmeed.services.audit_service import record_event
+
+                await record_event(
+                    "txn.re_approve",
+                    actor_id=accountant_id,
+                    entity_type="transaction",
+                    entity_ids=[original_id, tx_id],
+                    details={"cascade": True},
+                )
+            except Exception:
+                pass
+        return ok
 
     result = await db.transactions.update_one(
         {"_id": tx_id, "verified": False},
@@ -970,7 +1100,20 @@ async def re_approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bo
             "edited_after_verification": False,
         }},
     )
-    return result.modified_count == 1
+    ok = result.modified_count == 1
+    if ok:
+        try:
+            from tahmeed.services.audit_service import record_event
+
+            await record_event(
+                "txn.re_approve",
+                actor_id=accountant_id,
+                entity_type="transaction",
+                entity_ids=[tx_id],
+            )
+        except Exception:
+            pass
+    return ok
 
 
 async def bulk_re_approve_transactions(
@@ -1147,7 +1290,21 @@ async def bulk_approve_transactions(
             "rejection_reason": None,
         }},
     )
-    return result.modified_count
+    n = int(result.modified_count)
+    if n:
+        try:
+            from tahmeed.services.audit_service import record_event
+
+            await record_event(
+                "txn.approve_bulk",
+                actor_id=accountant_id,
+                entity_type="transaction",
+                entity_ids=tx_ids,
+                details={"count": n},
+            )
+        except Exception:
+            pass
+    return n
 
 
 async def update_transaction_category(
@@ -1931,8 +2088,10 @@ async def save_imported_feed(records: list) -> int:
                 doc["transaction_date"] = parsed
         _uppercase_import_text(doc)
         docs.append(doc)
-    result = await db.imported_feeds.insert_many(docs, ordered=False)
-    return len(result.inserted_ids)
+    from tahmeed.db.import_idempotency import insert_many_idempotent
+
+    inserted, _dupes = await insert_many_idempotent(db.imported_feeds, docs)
+    return inserted
 
 
 async def get_toll_plaza_uploads() -> list:
@@ -3126,8 +3285,10 @@ async def save_kimvi_import(records: list) -> int:
         doc["created_at"]   = now
         _uppercase_import_text(doc)
         docs.append(doc)
-    result = await db.separate_expenses.insert_many(docs, ordered=False)
-    return len(result.inserted_ids)
+    from tahmeed.db.import_idempotency import insert_many_idempotent
+
+    inserted, _dupes = await insert_many_idempotent(db.separate_expenses, docs)
+    return inserted
 
 
 async def get_kimvi_uploads() -> list:
@@ -3436,8 +3597,10 @@ async def save_congo_import(records: list) -> int:
         doc["created_at"]   = now
         _uppercase_import_text(doc)
         docs.append(doc)
-    result = await db.separate_expenses.insert_many(docs, ordered=False)
-    return len(result.inserted_ids)
+    from tahmeed.db.import_idempotency import insert_many_idempotent
+
+    inserted, _dupes = await insert_many_idempotent(db.separate_expenses, docs)
+    return inserted
 
 
 async def get_congo_uploads() -> list:
@@ -4621,10 +4784,16 @@ async def reupload_skipped_import_rows(ids: list[str]) -> int:
 
     Uses each doc's ``target_upload_id`` and ``save_target`` so rows join the
     upload they were skipped from (not a new batch).
+
+    Each inserted feed/expense doc carries ``skipped_row_id`` so a retry after a
+    crash cannot duplicate rows (unique sparse index).
     """
     from bson import ObjectId
 
+    from tahmeed.db.import_idempotency import ensure_import_indexes
+
     db = get_db()
+    await ensure_import_indexes()
     oids = []
     for raw in ids:
         try:
@@ -4643,6 +4812,7 @@ async def reupload_skipped_import_rows(ids: list[str]) -> int:
         rec.pop("_raw", None)
         upload_id = doc.get("target_upload_id") or rec.get("upload_id") or ""
         rec["upload_id"] = upload_id
+        rec["skipped_row_id"] = str(doc["_id"])
         if doc.get("source_filename") and not rec.get("source_filename"):
             rec["source_filename"] = doc["source_filename"]
         if doc.get("sheet_label") and not rec.get("sheet_label"):

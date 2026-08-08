@@ -58,22 +58,19 @@ async def import_chart_of_accounts(
 
     When ``replace_existing`` is True (default), all existing items, sub-items,
     keyword rules, and description mappings are removed first.
+
+    Category / subtable / keyword wipe + insert run in one Mongo transaction
+    when the server supports it (replica set). Description mappings are cleared
+    via the API after the Mongo replace succeeds.
     """
+    from tahmeed.db.mongo_txn import run_in_transaction, session_kwargs
+
     parsed = _parse_chart_of_accounts(path)
     if not parsed:
         raise ValueError("No accounts found in the Chart of Accounts file.")
 
     db = get_db()
     removed = {"categories": 0, "subtables": 0, "keyword_rules": 0, "mappings": 0}
-
-    if replace_existing:
-        r = await db.categories.delete_many({})
-        removed["categories"] = r.deleted_count
-        r = await db.category_subtables.delete_many({})
-        removed["subtables"] = r.deleted_count
-        r = await db.keyword_rules.delete_many({})
-        removed["keyword_rules"] = r.deleted_count
-        removed["mappings"] = await delete_all_mappings()
 
     docs = []
     for i, row in enumerate(parsed):
@@ -94,11 +91,40 @@ async def import_chart_of_accounts(
         )
         docs.append(cat.to_doc())
 
-    if docs:
-        await db.categories.insert_many(docs)
+    async def _replace(session):
+        kw = session_kwargs(session)
+        local_removed = {"categories": 0, "subtables": 0, "keyword_rules": 0}
+        if replace_existing:
+            r = await db.categories.delete_many({}, **kw)
+            local_removed["categories"] = r.deleted_count
+            r = await db.category_subtables.delete_many({}, **kw)
+            local_removed["subtables"] = r.deleted_count
+            r = await db.keyword_rules.delete_many({}, **kw)
+            local_removed["keyword_rules"] = r.deleted_count
+        if docs:
+            await db.categories.insert_many(docs, **kw)
+        return local_removed
 
-    return {
+    mongo_removed = await run_in_transaction(_replace)
+    removed.update(mongo_removed)
+
+    if replace_existing:
+        # After Mongo catalog is replaced — clear mappings (API path).
+        removed["mappings"] = await delete_all_mappings()
+
+    result = {
         "imported": len(docs),
         "removed": removed,
         "source": str(path),
     }
+    try:
+        from tahmeed.services.audit_service import record_event
+
+        await record_event(
+            "coa.replace",
+            entity_type="category",
+            details=result,
+        )
+    except Exception:
+        pass
+    return result

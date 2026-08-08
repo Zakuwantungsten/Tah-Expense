@@ -26,6 +26,7 @@ UNIQUE_KEYS = (
     UniqueKey("description_mappings", ("description_key",)),
     UniqueKey("trucks", ("number",)),
     UniqueKey("trailers", ("number",)),
+    UniqueKey("motor_vehicles", ("number",)),
     UniqueKey("people", ("name",)),
     UniqueKey("system_settings", ("key",)),
 )
@@ -91,6 +92,51 @@ async def create_indexes(db: Any) -> None:
         [("verified", ASCENDING), ("rejected", ASCENDING)],
         name="pending_verification",
     )
+    # Idempotent import keys (partial unique — ignore docs without the fields).
+    await db.transactions.create_index(
+        [("daily_import_id", ASCENDING), ("import_row_key", ASCENDING)],
+        name="uniq_daily_import_row",
+        unique=True,
+        partialFilterExpression={
+            "daily_import_id": {"$type": "string"},
+            "import_row_key": {"$type": "string"},
+        },
+    )
+    await db.transactions.create_index(
+        [("master_import_source", ASCENDING), ("master_serial", ASCENDING)],
+        name="uniq_master_import_serial",
+        unique=True,
+        partialFilterExpression={
+            "master_import_source": {"$type": "string"},
+            "master_serial": {"$exists": True},
+        },
+    )
+    await db.imported_feeds.create_index(
+        [("skipped_row_id", ASCENDING)],
+        name="uniq_feed_skipped_row_id",
+        unique=True,
+        sparse=True,
+    )
+    await db.separate_expenses.create_index(
+        [("skipped_row_id", ASCENDING)],
+        name="uniq_sep_skipped_row_id",
+        unique=True,
+        sparse=True,
+    )
+    await db.operation_events.create_indexes(
+        [
+            IndexModel([("ts", DESCENDING)], name="ts_desc"),
+            IndexModel(
+                [("actor_id", ASCENDING), ("ts", DESCENDING)],
+                name="actor_ts",
+            ),
+            IndexModel(
+                [("action", ASCENDING), ("ts", DESCENDING)],
+                name="action_ts",
+            ),
+            IndexModel([("entity_ids", ASCENDING)], name="entity_ids"),
+        ]
+    )
 
 
 async def migrate(check_only: bool) -> int:
@@ -108,6 +154,29 @@ async def migrate(check_only: bool) -> int:
             print("No conflicts found; check-only mode made no changes.")
             return 0
         await create_indexes(db)
+        await db.schema_migrations.update_one(
+            {"_id": "0003_operation_events_indexes"},
+            {
+                "$set": {
+                    "description": "Indexes for append-only operation_events audit trail",
+                    "applied_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+        await db.schema_migrations.update_one(
+            {"_id": "0002_import_idempotency_indexes"},
+            {
+                "$set": {
+                    "description": (
+                        "Unique indexes for daily/master import idempotency "
+                        "and skipped-row reupload"
+                    ),
+                    "applied_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
         await db.schema_migrations.update_one(
             {"_id": "0001_api_foundation_indexes"},
             {

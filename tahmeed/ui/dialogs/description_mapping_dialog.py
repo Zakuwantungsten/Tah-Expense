@@ -6,7 +6,7 @@ from typing import List, Optional
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QPushButton, QFrame, QMessageBox, QCompleter, QProgressBar,
+    QPushButton, QFrame, QCompleter, QProgressBar,
 )
 from PySide6.QtCore import Qt
 
@@ -215,7 +215,7 @@ class DescriptionMappingDialog(QDialog):
         assign_btn.setAutoDefault(True)
         assign_btn.setDefault(True)
         assign_btn.setStyleSheet(
-            f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
+            f"QPushButton {{ background: {_BLUE}; color: #FFFFFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
             " padding: 0 16px;"
             " min-height: 34px; max-height: 34px; }}"
@@ -232,16 +232,18 @@ class DescriptionMappingDialog(QDialog):
         self._combo.setFocus()
 
     def _on_assign(self) -> None:
+        from tahmeed.ui.dialog_theme import show_warning
+
         name = self._combo.currentText().strip()
         if not name:
-            QMessageBox.warning(self, "Select Item", "Please choose an item for this description.")
+            show_warning(self, "Select Item", "Please choose an item for this description.")
             return
         idx = self._combo.findText(name)
         cat_id = self._combo.itemData(idx) if idx >= 0 else None
         if cat_id is None:
             match = next((c for c in self._categories if c.name == name), None)
             if match is None:
-                QMessageBox.warning(
+                show_warning(
                     self,
                     "Select Item",
                     "Please pick an existing item from the Items list.",

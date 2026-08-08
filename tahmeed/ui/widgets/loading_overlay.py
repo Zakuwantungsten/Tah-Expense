@@ -84,7 +84,8 @@ class LoadingOverlay(QFrame):
         self._sync_geometry()
         self.show()
         self.raise_()
-        QApplication.processEvents()
+        from tahmeed.ui.async_utils import safe_process_events
+        safe_process_events()
 
     def hide_loading(self) -> None:
         self._bar.setRange(0, 0)

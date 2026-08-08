@@ -26,6 +26,7 @@ _LAZY_PAGE_KEYS = frozenset({
     "truck_overview",
     "verify",
     "master_expenses",
+    "import_daily",
     "toll_plaza",
     "parking_congo",
     "congo_exp",
@@ -42,7 +43,9 @@ _LAZY_PAGE_KEYS = frozenset({
     "rahntech",
     "manage_trucks",
     "manage_trailers",
+    "manage_motor_vehicles",
     "manage_categories",
+    "manage_description_maps",
     "manage_people",
     "manage_users",
     "backup",
@@ -65,10 +68,12 @@ class AccountantDashboard(QWidget):
         self._pending_categories: list | None = None
         self._pending_people: list | None = None
         self._build()
-        asyncio.ensure_future(self._load_categories())
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._load_categories())
         self._notification_timer = QTimer(self)
         self._notification_timer.setInterval(2_000)
         self._notification_timer.timeout.connect(self._poll_notification_counts)
+        self._notification_poll_task: asyncio.Task | None = None
         self._notification_timer.start()
         self._poll_notification_counts()
 
@@ -104,6 +109,12 @@ class AccountantDashboard(QWidget):
             find=self._on_find,
         )
         root.addWidget(self._menu_bar)
+
+        from tahmeed.ui.widgets.connectivity_banner import ConnectivityBanner
+        from tahmeed.ui.widgets.live_status_bar import LiveStatusBar
+
+        self._connectivity_banner = ConnectivityBanner()
+        root.addWidget(self._connectivity_banner)
 
         # ── Body = sidebar + content ───────────────────────────────────────
         body = QWidget()
@@ -150,7 +161,13 @@ class AccountantDashboard(QWidget):
         body_hl.addWidget(self._stack, 1)
 
         root.addWidget(body, 1)
-        root.addWidget(_StatusBar())
+        root.addWidget(
+            LiveStatusBar(
+                object_name="accountantStatusBar",
+                mode_label="FY 2025",
+                dark=False,
+            )
+        )
 
     # ── Lazy page factories ─────────────────────────────────────────────────
 
@@ -178,6 +195,10 @@ class AccountantDashboard(QWidget):
         if key == "master_expenses":
             from tahmeed.ui.accountant.master_expenses import MasterExpensesWidget
             return MasterExpensesWidget(user=self._user)
+
+        if key == "import_daily":
+            from tahmeed.ui.accountant.import_daily_master import ImportDailyMasterWidget
+            return ImportDailyMasterWidget(user=self._user)
 
         if key == "toll_plaza":
             from tahmeed.ui.accountant.separate_expenses import TollPlazaWidget
@@ -243,12 +264,20 @@ class AccountantDashboard(QWidget):
             from tahmeed.ui.accountant.fleet_registry import TrailersRegistryWidget
             return TrailersRegistryWidget()
 
+        if key == "manage_motor_vehicles":
+            from tahmeed.ui.accountant.fleet_registry import MotorVehiclesRegistryWidget
+            return MotorVehiclesRegistryWidget()
+
         if key == "manage_categories":
             from tahmeed.ui.accountant.manage_items import ManageItemsWidget
             widget = ManageItemsWidget()
             widget.items_changed.connect(self._sidebar.refresh_items)
             widget.subitems_changed.connect(self._sidebar.refresh_subitems)
             return widget
+
+        if key == "manage_description_maps":
+            from tahmeed.ui.accountant.manage_description_maps import DescriptionMapsWidget
+            return DescriptionMapsWidget()
 
         if key == "manage_people":
             from tahmeed.ui.accountant.manage_people import PeopleRegistryWidget
@@ -274,7 +303,8 @@ class AccountantDashboard(QWidget):
             if self._pending_people is not None:
                 self._register.update_people(self._pending_people)
                 self._pending_people = None
-            return _TablePage(self._register)
+            page = _TablePage(self._register)
+            return page
 
         if key == "browse":
             from tahmeed.ui.cashier.transactions_table import TransactionBrowser
@@ -390,6 +420,25 @@ class AccountantDashboard(QWidget):
         self._sidebar.select(key)
         self._on_nav(key)
 
+    def pause_notification_polling(self) -> None:
+        """Stop badge polls during modal import dialogs (avoids Py3.14 task nesting)."""
+        self._notification_timer.stop()
+        task = getattr(self, "_notification_poll_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._notification_poll_task = None
+        self._notification_poll_in_flight = False
+        from tahmeed.services.connectivity_service import connectivity_monitor
+
+        connectivity_monitor.pause()
+
+    def resume_notification_polling(self) -> None:
+        if not self._notification_timer.isActive():
+            self._notification_timer.start()
+        from tahmeed.services.connectivity_service import connectivity_monitor
+
+        connectivity_monitor.resume()
+
     def _poll_notification_counts(self) -> None:
         """QTimer slot — schedule poll without nesting into a running task.
 
@@ -398,21 +447,29 @@ class AccountantDashboard(QWidget):
         enter the poll task while that other task is still current.
 
         Also skip this tick when ``asyncio.current_task()`` is set — that means we
-        are inside another coroutine's nested Qt event loop (e.g. QFileDialog).
-        The next 5s timer tick will retry.
+        are inside another coroutine's nested Qt event loop (e.g. QFileDialog /
+        QMessageBox). The next timer tick will retry.
         """
         if self._notification_poll_in_flight:
             return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
+        if not self._notification_timer.isActive():
             return
-        if asyncio.current_task() is not None:
+        from tahmeed.ui.async_utils import create_task, in_running_task
+
+        if in_running_task():
             return
-        loop.create_task(self._poll_notification_counts_async())
+        # Drop a stale unfinished poll rather than stacking wakeups mid-modal.
+        prev = self._notification_poll_task
+        if prev is not None and not prev.done():
+            return
+        self._notification_poll_task = create_task(
+            self._poll_notification_counts_async()
+        )
 
     async def _poll_notification_counts_async(self) -> None:
         if self._notification_poll_in_flight:
+            return
+        if not self._notification_timer.isActive():
             return
         self._notification_poll_in_flight = True
         try:
@@ -422,6 +479,8 @@ class AccountantDashboard(QWidget):
 
             count = await get_verify_notification_count()
             self._sidebar.set_verify_badge(count)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             # A transient API failure must not make a known count disappear.
             pass
@@ -429,11 +488,13 @@ class AccountantDashboard(QWidget):
             self._notification_poll_in_flight = False
 
     def _on_nav(self, key: str) -> None:
+        from tahmeed.ui.async_utils import schedule_call
+
         if key == "overview":
             self._stack.setCurrentIndex(self._page_indices["overview"])
             refresh = getattr(self._overview, "refresh", None)
             if callable(refresh):
-                refresh()
+                schedule_call(refresh)
             return
 
         if key in _LAZY_PAGE_KEYS:
@@ -445,7 +506,7 @@ class AccountantDashboard(QWidget):
                 return
             refresh = getattr(widget, "refresh", None)
             if callable(refresh):
-                refresh()
+                schedule_call(refresh)
             return
 
         if self._sidebar.item_def(key) is not None:
@@ -500,7 +561,8 @@ class AccountantDashboard(QWidget):
             self._category_indices[key] = self._stack.addWidget(widget)
         idx = self._category_indices[key]
         self._stack.setCurrentIndex(idx)
-        self._stack.widget(idx).refresh()
+        from tahmeed.ui.async_utils import schedule_call
+        schedule_call(self._stack.widget(idx).refresh)
 
     def _show_recon(self, match: str) -> None:
         """Lazily create (and cache) an SM Burhani reconciliation view."""
@@ -512,7 +574,8 @@ class AccountantDashboard(QWidget):
             self._recon_indices[match] = self._stack.addWidget(widget)
         idx = self._recon_indices[match]
         self._stack.setCurrentIndex(idx)
-        self._stack.widget(idx).refresh()
+        from tahmeed.ui.async_utils import schedule_call
+        schedule_call(self._stack.widget(idx).refresh)
 
     def _show_subtable(self, parent_key: str, parent_category: str,
                        name: str, match: str) -> None:
@@ -535,7 +598,8 @@ class AccountantDashboard(QWidget):
             self._subtable_indices[cache_key] = self._stack.addWidget(widget)
         idx = self._subtable_indices[cache_key]
         self._stack.setCurrentIndex(idx)
-        self._stack.widget(idx).refresh()
+        from tahmeed.ui.async_utils import schedule_call
+        schedule_call(self._stack.widget(idx).refresh)
 
 
 # ── Placeholder ────────────────────────────────────────────────────────────────
@@ -567,41 +631,3 @@ class _PlaceholderPage(QWidget):
         )
         vl.addWidget(hint)
 
-
-# ── Status bar ─────────────────────────────────────────────────────────────────
-
-class _StatusBar(QFrame):
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("accountantStatusBar")
-        self.setFixedHeight(24)
-        self.setStyleSheet(
-            "QFrame#accountantStatusBar {"
-            "  background: #FFFFFF;"
-            "  border-top: 1px solid #E5E7EB;"
-            "}"
-        )
-
-        hl = QHBoxLayout(self)
-        hl.setContentsMargins(16, 0, 16, 0)
-        hl.setSpacing(0)
-
-        dot = QLabel("●")
-        dot.setStyleSheet(
-            "color: #16A34A; font-size: 9px; background: transparent;"
-        )
-        hl.addWidget(dot)
-        hl.addSpacing(5)
-
-        status = QLabel(
-            "Connected · MongoDB Atlas"
-            "     |     Last refresh: —"
-            "     |     FY 2025"
-            "     |     v1.0.0"
-        )
-        status.setStyleSheet(
-            "color: #6B7280; font-size: 11px;"
-            " font-family:'Segoe UI'; background: transparent;"
-        )
-        hl.addWidget(status)
-        hl.addStretch()

@@ -181,6 +181,7 @@ class AccountantMenuBar(QMenuBar):
         self._edit_menu()
         self._view_menu()
         self._lists_menu()
+        self._import_menu()
         self._accountant_menu()
         self._company_menu()
         self._expenses_menu()
@@ -236,11 +237,69 @@ class AccountantMenuBar(QMenuBar):
     def _lists_menu(self) -> None:
         m = self.addMenu("&Lists")
         self._add(m, "&Items", lambda: self._nav("manage_categories"))
+        self._add(m, "&Description Maps", lambda: self._nav("manage_description_maps"))
         self._add(m, "&People", lambda: self._nav("manage_people"))
         self._add(m, "&Trucks", lambda: self._nav("manage_trucks"))
         self._add(m, "T&railers", lambda: self._nav("manage_trailers"))
+        self._add(m, "&Motorcycles & Cars", lambda: self._nav("manage_motor_vehicles"))
         m.addSeparator()
         self._add(m, "&Users", lambda: self._nav("manage_users"))
+
+    def _import_menu(self) -> None:
+        """Shortcuts to every import surface in the app."""
+        m = self.addMenu("&Import")
+        self._add(
+            m,
+            "&Daily Register → Master…",
+            lambda: self._nav("import_daily"),
+        )
+        self._add(
+            m,
+            "&Master Expenses Excel…",
+            lambda: self._nav("master_expenses"),
+        )
+        m.addSeparator()
+
+        expenses = m.addMenu("&Expenses")
+        for label, key in [
+            ("&Toll Plaza", "toll_plaza"),
+            ("&Parking Congo", "parking_congo"),
+            ("Congo &Expenses", "congo_exp"),
+            ("&Ahmed Kimvi (Klesa)", "ahmed_kimvi"),
+            ("&Zambia Parking", "zambia_parking"),
+            ("Afri&track", "afritrack"),
+            ("Third &Party Covers", "third_party"),
+            ("CO&MESA Covers", "comesa"),
+            ("&RahnTech", "rahntech"),
+        ]:
+            self._add(expenses, label, lambda k=key: self._nav(k))
+        burhani = expenses.addMenu("&SM Burhani")
+        self._add(
+            burhani,
+            "&RPA Schedule",
+            lambda: self._sub("sm_burhani", "rpa_schedule"),
+        )
+        self._add(
+            burhani,
+            "&Bonds",
+            lambda: self._sub("sm_burhani", "bonds"),
+        )
+
+        fuel = m.addMenu("&Fuel")
+        for label, key in [
+            ("&Infinity", "infinity"),
+            ("Lake &Zambia", "lake_zambia"),
+            ("Lake &Tunduma", "lake_tunduma"),
+            ("&GBP Diesel", "gbp_diesel"),
+        ]:
+            self._add(fuel, label, lambda k=key: self._nav(k))
+
+        m.addSeparator()
+        lists = m.addMenu("&Lists / Setup")
+        self._add(lists, "&Items (Chart of Accounts)", lambda: self._nav("manage_categories"))
+        self._add(lists, "&Trucks", lambda: self._nav("manage_trucks"))
+        self._add(lists, "T&railers", lambda: self._nav("manage_trailers"))
+        self._add(lists, "&Motorcycles & Cars", lambda: self._nav("manage_motor_vehicles"))
 
     def _accountant_menu(self) -> None:
         m = self.addMenu("&Accountant")
@@ -251,6 +310,7 @@ class AccountantMenuBar(QMenuBar):
         self._add(m, "&Table", lambda: self._nav("table"))
         self._add(m, "&Browse", lambda: self._nav("browse"))
         self._add(m, "&Master Expenses", lambda: self._nav("master_expenses"))
+        self._add(m, "&Import Daily → Master…", lambda: self._nav("import_daily"))
 
     def _company_menu(self) -> None:
         m = self.addMenu("&Company")

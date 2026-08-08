@@ -402,7 +402,11 @@ class _ReceiptBar(QWidget):
 def _activity_header() -> QWidget:
     w = QWidget()
     # Navy header — matches sidebar exactly
-    w.setStyleSheet(f"background: {_NAVY}; border-radius: 6px 6px 0 0;")
+    w.setStyleSheet(
+        f"background: {_NAVY};"
+        " border-top-left-radius:6px;border-top-right-radius:6px;"
+        " border-bottom-left-radius:0;border-bottom-right-radius:0;"
+    )
     h = QHBoxLayout(w)
     h.setContentsMargins(16, 10, 16, 10)
     h.setSpacing(0)
@@ -706,7 +710,11 @@ class CashierOverview(QWidget):
         bottom_pad = QFrame()
         bottom_pad.setFrameShape(QFrame.NoFrame)
         bottom_pad.setFixedHeight(8)
-        bottom_pad.setStyleSheet(f"background: {_CARD_BG}; border-radius: 0 0 12px 12px;")
+        bottom_pad.setStyleSheet(
+            f"background: {_CARD_BG};"
+            " border-top-left-radius:0;border-top-right-radius:0;"
+            " border-bottom-left-radius:12px;border-bottom-right-radius:12px;"
+        )
         self._activity_lay.addWidget(bottom_pad)
 
         rp_lay.addWidget(activity_card)

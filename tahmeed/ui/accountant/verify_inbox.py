@@ -1056,7 +1056,8 @@ class VerifyInboxWidget(QWidget):
                 asyncio.get_running_loop()
             except RuntimeError:
                 return
-            asyncio.ensure_future(self._load_initial(generation))
+            from tahmeed.ui.async_utils import create_task
+            create_task(self._load_initial(generation))
 
         try:
             nested = asyncio.current_task() is not None
@@ -1513,12 +1514,16 @@ class VerifyInboxWidget(QWidget):
             need_filters = self._filters_tab != tab
 
             # Page + counts first so rows appear quickly; filters load in parallel.
-            page_task = asyncio.ensure_future(
+            # Use eager_start=False tasks — ensure_future/eager start nests into
+            # this coroutine on Python 3.14 and freezes the UI.
+            from tahmeed.ui.async_utils import create_task as safe_task
+
+            page_task = safe_task(
                 self._fetch_page(skip=0, limit=_SCROLL_CHUNK, kw=kw),
             )
-            counts_task = asyncio.ensure_future(self._fetch_counts(kw))
+            counts_task = safe_task(self._fetch_counts(kw))
             filters_task = (
-                asyncio.ensure_future(self._load_filter_options(tab))
+                safe_task(self._load_filter_options(tab))
                 if need_filters else None
             )
 
@@ -2195,7 +2200,7 @@ class VerifyInboxWidget(QWidget):
     async def _do_reject(self, tx_id: ObjectId, reason: str) -> None:
         from tahmeed.services.accountant_service import reject_transaction, get_pending_count
         try:
-            await reject_transaction(tx_id, reason)
+            await reject_transaction(tx_id, reason, actor_id=self._user._id)
             count = await get_pending_count()
             self.badge_updated.emit(count)
             self._finish_mutation(hide_panel=True, reload=True)
@@ -2214,7 +2219,9 @@ class VerifyInboxWidget(QWidget):
 
         self._set_busy(f"Rejecting {len(tx_ids):,} transaction(s)…")
         try:
-            n = await bulk_reject_transactions(tx_ids, reason)
+            n = await bulk_reject_transactions(
+                tx_ids, reason, actor_id=self._user._id
+            )
             count = await get_pending_count()
             self.badge_updated.emit(count)
             self._finish_mutation(
@@ -2268,7 +2275,7 @@ class VerifyInboxWidget(QWidget):
     async def _do_confirm_deletion(self, tx_id: ObjectId) -> None:
         from tahmeed.services.accountant_service import confirm_deletion, get_pending_count
         try:
-            ok = await confirm_deletion(tx_id)
+            ok = await confirm_deletion(tx_id, actor_id=self._user._id)
             if not ok:
                 self._finish_mutation(
                     warning="Could not delete this entry — it may have already been updated.",
@@ -2300,7 +2307,7 @@ class VerifyInboxWidget(QWidget):
             bulk_confirm_deletions, get_pending_count,
         )
         try:
-            n = await bulk_confirm_deletions(tx_ids)
+            n = await bulk_confirm_deletions(tx_ids, actor_id=self._user._id)
             count = await get_pending_count()
             self.badge_updated.emit(count)
             self._finish_mutation(
