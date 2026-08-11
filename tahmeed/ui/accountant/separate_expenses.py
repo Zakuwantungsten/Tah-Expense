@@ -156,7 +156,7 @@ def _card(widget: QWidget) -> QFrame:
     f = QFrame()
     f.setStyleSheet(
         f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};"
-        "border-radius:6px;}}"
+        f"border-radius:6px;}}"
     )
     vl = QVBoxLayout(f)
     vl.setContentsMargins(0, 0, 0, 0)
@@ -168,11 +168,11 @@ def _card(widget: QWidget) -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:11px;font-family:'Segoe UI';}}"
+        f"border:none;font-size:11px;font-family:'Segoe UI';}}"
         f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
-        "font-size:10px;font-weight:600;font-family:'Segoe UI';"
+        f"font-size:10px;font-weight:600;font-family:'Segoe UI';"
         f"border:none;border-bottom:1px solid {_BORDER};"
         f"padding:0 8px;height:{_HDR_H}px;}}"
         "QScrollBar:vertical{width:8px;background:transparent;}"
@@ -365,7 +365,7 @@ class _TotalsBar(QFrame):
         self.setFixedHeight(38)
         self.setStyleSheet(
             f"QFrame{{background:{_HDR_BG};border-top:1px solid {_BORDER};"
-            "border-bottom-left-radius:6px;border-bottom-right-radius:6px;}}"
+            f"border-bottom-left-radius:6px;border-bottom-right-radius:6px;}}"
         )
         hl = QHBoxLayout(self)
         hl.setContentsMargins(16, 0, 16, 0)

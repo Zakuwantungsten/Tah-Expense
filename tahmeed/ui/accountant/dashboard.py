@@ -498,15 +498,34 @@ class AccountantDashboard(QWidget):
             return
 
         if key in _LAZY_PAGE_KEYS:
-            widget = self._ensure_page(key)
-            self._stack.setCurrentIndex(self._page_indices[key])
-            if key == "table":
-                assert self._register is not None
-                self._register.reload_settings()
-                return
-            refresh = getattr(widget, "refresh", None)
-            if callable(refresh):
-                schedule_call(refresh)
+            from tahmeed.ui.async_utils import in_running_task
+
+            def _open_lazy(k: str = key) -> None:
+                try:
+                    widget = self._ensure_page(k)
+                    self._stack.setCurrentIndex(self._page_indices[k])
+                    if k == "table":
+                        assert self._register is not None
+                        self._register.reload_settings()
+                        return
+                    refresh = getattr(widget, "refresh", None)
+                    if callable(refresh):
+                        schedule_call(refresh)
+                except Exception as exc:
+                    from PySide6.QtWidgets import QMessageBox
+
+                    QMessageBox.critical(
+                        self,
+                        "Unable to open page",
+                        f"Failed to open this page:\n{exc}",
+                    )
+
+            # First-time page __init__ may schedule coroutines; building while
+            # another Task is current crashes under Python 3.14 + qasync.
+            if in_running_task() and key not in self._pages:
+                schedule_call(_open_lazy)
+            else:
+                _open_lazy()
             return
 
         if self._sidebar.item_def(key) is not None:
@@ -518,10 +537,21 @@ class AccountantDashboard(QWidget):
             self._stack.setCurrentIndex(self._placeholder_index)
 
     def _on_go_to_date(self, d, term: str = "") -> None:
+        from tahmeed.ui.async_utils import in_running_task, schedule_call
+
         self._sidebar.select("table")
-        self._on_nav("table")
-        assert self._register is not None
-        self._register.navigate_to_date(d, highlight_term=term)
+
+        def _go() -> None:
+            self._ensure_page("table")
+            self._stack.setCurrentIndex(self._page_indices["table"])
+            assert self._register is not None
+            self._register.reload_settings()
+            self._register.navigate_to_date(d, highlight_term=term)
+
+        if in_running_task() and "table" not in self._pages:
+            schedule_call(_go)
+        else:
+            _go()
 
     async def prepare_to_leave(self) -> bool:
         """Prompt to save/discard unsaved table entries before logout or exit."""

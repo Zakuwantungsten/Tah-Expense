@@ -41,11 +41,25 @@ async def _page(
     limit: int = 100,
     offset: int = 0,
 ) -> dict:
+    from tahmeed.services.api_client import ApiError
+
     params = {"search": search}
     if active is not None:
         params["active"] = str(active).lower()
     params.update(limit=max(1, min(limit, 500)), offset=max(0, offset))
-    return await api_client.request("GET", f"v1/{kind}", params=params)
+    try:
+        return await api_client.request("GET", f"v1/{kind}", params=params)
+    except ApiError as exc:
+        if exc.status_code == 404:
+            raise ApiError(
+                f"Fleet API route missing: GET v1/{kind} (404). "
+                "The server may need a deploy that includes fleet endpoints.",
+                status_code=404,
+                code=getattr(exc, "code", "http_error") or "http_error",
+                details=getattr(exc, "details", None),
+                request_id=getattr(exc, "request_id", None),
+            ) from exc
+        raise
 
 
 async def _list(kind: str, search: str = "", active: bool | None = None) -> List[Dict]:
@@ -62,6 +76,24 @@ async def _list(kind: str, search: str = "", active: bool | None = None) -> List
         {"number": document["number"], "active": document.get("active", True)}
         for document in documents
     ]
+
+
+async def _list_optional(
+    kind: str, search: str = "", active: bool | None = None
+) -> List[Dict]:
+    """Like ``_list``, but a missing route (404) yields an empty collection.
+
+    Older API deploys may not have ``motor_vehicles`` yet; import must still be
+    able to match trucks/trailers that are already on the registry.
+    """
+    from tahmeed.services.api_client import ApiError
+
+    try:
+        return await _list(kind, search, active)
+    except ApiError as exc:
+        if exc.status_code == 404:
+            return []
+        raise
 
 
 async def _window(
@@ -124,11 +156,11 @@ async def _ensure_fleet_cache() -> List[str]:
     async with _cache_lock:
         if _fleet_list is not None:
             return _fleet_list
-        trucks, trailers, motor_vehicles = await asyncio.gather(
-            _list("trucks", active=True),
-            _list("trailers", active=True),
-            _list("motor_vehicles", active=True),
-        )
+        # trucks are required; trailers / motor_vehicles may be absent on older
+        # API deploys (404) without blocking the import fleet check.
+        trucks = await _list("trucks", active=True)
+        trailers = await _list_optional("trailers", active=True)
+        motor_vehicles = await _list_optional("motor_vehicles", active=True)
         truck_numbers = [
             document["number"].upper()
             for document in trucks
@@ -198,9 +230,9 @@ async def get_fleet_numbers(active_only: bool = True) -> set:
         await _ensure_fleet_cache()
         assert _fleet_set is not None
         return set(_fleet_set)
-    trucks, trailers, motor_vehicles = await asyncio.gather(
-        _list("trucks"), _list("trailers"), _list("motor_vehicles")
-    )
+    trucks = await _list("trucks")
+    trailers = await _list_optional("trailers")
+    motor_vehicles = await _list_optional("motor_vehicles")
     return {
         document["number"].upper()
         for document in trucks + trailers + motor_vehicles

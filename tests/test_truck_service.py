@@ -85,3 +85,69 @@ def test_fleet_facade_preserves_page_and_count_contracts() -> None:
         assert calls[1]["offset"] == 0
 
     asyncio.run(scenario())
+
+
+def test_fleet_cache_tolerates_missing_optional_routes() -> None:
+    """Older APIs without motor_vehicles must still load trucks/trailers."""
+    from tahmeed.services.api_client import ApiError
+
+    async def scenario() -> None:
+        truck_service.invalidate_fleet_cache()
+
+        async def request(_method: str, path: str, *, params: dict) -> dict:
+            if path == "v1/motor_vehicles":
+                raise ApiError("missing", status_code=404)
+            if path == "v1/trailers":
+                return {
+                    "items": [{"number": "T999 TRL", "active": True}],
+                    "total": 1,
+                    "limit": 500,
+                    "offset": 0,
+                }
+            assert path == "v1/trucks"
+            return {
+                "items": [{"number": "T688 EAF", "active": True}],
+                "total": 1,
+                "limit": 500,
+                "offset": 0,
+            }
+
+        original = truck_service.api_client.request
+        truck_service.api_client.request = request
+        try:
+            fleet = await truck_service.get_fleet_numbers()
+            kinds = await truck_service.get_fleet_kinds()
+        finally:
+            truck_service.api_client.request = original
+            truck_service.invalidate_fleet_cache()
+
+        assert fleet == {"T688 EAF", "T999 TRL"}
+        assert kinds["T688 EAF"] == "truck"
+        assert kinds["T999 TRL"] == "trailer"
+
+    asyncio.run(scenario())
+
+
+def test_fleet_cache_requires_trucks_route() -> None:
+    from tahmeed.services.api_client import ApiError
+
+    async def scenario() -> None:
+        truck_service.invalidate_fleet_cache()
+
+        async def request(_method: str, path: str, *, params: dict) -> dict:
+            raise ApiError("missing", status_code=404)
+
+        original = truck_service.api_client.request
+        truck_service.api_client.request = request
+        try:
+            try:
+                await truck_service.get_fleet_numbers()
+                assert False, "expected ApiError"
+            except ApiError as exc:
+                assert exc.status_code == 404
+                assert "v1/trucks" in str(exc)
+        finally:
+            truck_service.api_client.request = original
+            truck_service.invalidate_fleet_cache()
+
+    asyncio.run(scenario())

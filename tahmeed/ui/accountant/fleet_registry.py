@@ -149,8 +149,8 @@ class _AddVehicleDialog(QDialog):
         self._inp.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:13px;"
-            "font-family:'Segoe UI';padding:0 8px;"
-            "min-height:34px;max-height:34px;}}"
+            f"font-family:'Segoe UI';padding:0 8px;"
+            f"min-height:34px;max-height:34px;}}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
         self._inp.returnPressed.connect(self._accept)
@@ -268,7 +268,7 @@ class _FleetRegistryBase(QWidget):
             pass
         self._restrict_btn.setStyleSheet(
             f"QPushButton{{background:{_WHITE};color:{_T2};border:1px solid {_BORDER};"
-            "border-radius:5px;font-size:12px;font-family:'Segoe UI';padding:0 12px;}}"
+            f"border-radius:5px;font-size:12px;font-family:'Segoe UI';padding:0 12px;}}"
             f"QPushButton:checked{{background:{_GREEN_L};color:{_GREEN};border-color:{_GREEN};}}"
             f"QPushButton:hover:!checked{{background:{_BG};}}"
         )
@@ -295,7 +295,7 @@ class _FleetRegistryBase(QWidget):
         self._search.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI';padding:0 8px;}}"
+            f"font-family:'Segoe UI';padding:0 8px;}}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
         self._search.textChanged.connect(self._on_search_changed)
@@ -307,7 +307,7 @@ class _FleetRegistryBase(QWidget):
         self._filter_cb.setStyleSheet(
             f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI';padding:0 8px;min-width:120px;}}"
+            f"font-family:'Segoe UI';padding:0 8px;min-width:120px;}}"
             f"QComboBox:focus{{border-color:{_BLUE};}}"
             "QComboBox::drop-down{border:none;width:20px;}"
         )

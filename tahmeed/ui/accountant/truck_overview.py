@@ -412,15 +412,15 @@ def _btn(text: str, icon_name: str = "", primary: bool = True) -> QPushButton:
     if primary:
         b.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
-            " border-radius: 5px; font-size: 12px; font-weight: 600;"
-            " font-family:'Segoe UI'; padding: 0 12px; }}"
-            "QPushButton:hover { background: #005EA3; }"
+            f" border-radius: 5px; font-size: 12px; font-weight: 600;"
+            f" font-family:'Segoe UI'; padding: 0 12px; }}"
+            f"QPushButton:hover {{ background: #005EA3; }}"
         )
     else:
         b.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            f" font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
     return b
@@ -708,7 +708,12 @@ class TruckOverviewWidget(QWidget):
         self._debounce.timeout.connect(self._reset_and_load)
 
         self._build()
-        asyncio.ensure_future(self._preload_fleet())
+        # Defer off any current asyncio Task — Python 3.14 + qasync forbids
+        # entering a new Task while another is executing (sidebar nav can nest
+        # via processEvents and previously tore down the whole app).
+        from tahmeed.ui.async_utils import schedule_coro
+
+        schedule_coro(self._preload_fleet())
 
     def _build(self) -> None:
         self.setObjectName("truckOverview")
@@ -1055,7 +1060,9 @@ class TruckOverviewWidget(QWidget):
         self._total = 0
         self._table.setRowCount(0)
         self._update_footer()
-        asyncio.ensure_future(self._load_initial(self._reload_generation))
+        from tahmeed.ui.async_utils import schedule_coro
+
+        schedule_coro(self._load_initial(self._reload_generation))
 
     def _on_load_clicked(self) -> None:
         self._active_truck = self._selected_truck()
@@ -1094,7 +1101,9 @@ class TruckOverviewWidget(QWidget):
         if bar.maximum() <= 0:
             return
         if value >= bar.maximum() - 24:
-            asyncio.ensure_future(self._load_more())
+            from tahmeed.ui.async_utils import schedule_coro
+
+            schedule_coro(self._load_more())
 
     async def _load_initial(self, generation: int) -> None:
         if self._loading:
@@ -1370,7 +1379,18 @@ class TruckOverviewWidget(QWidget):
             self._status.setText(f"PDF export failed for {truck}.")
 
     def _start_background_task(self, coro, action: str) -> None:
-        task = asyncio.ensure_future(coro)
+        from tahmeed.ui.async_utils import create_task, in_running_task
+
+        if in_running_task():
+            def _kick(c=coro, a=action) -> None:
+                task = create_task(c)
+                task.add_done_callback(lambda t: self._handle_task_result(t, a))
+
+            from PySide6.QtCore import QTimer
+
+            QTimer.singleShot(0, _kick)
+            return
+        task = create_task(coro)
         task.add_done_callback(lambda t: self._handle_task_result(t, action))
 
     def _handle_task_result(self, task: asyncio.Task, action: str) -> None:

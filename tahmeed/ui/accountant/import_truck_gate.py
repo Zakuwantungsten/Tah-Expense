@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog, QWidget
+from PySide6.QtWidgets import QMessageBox, QProgressDialog, QWidget
 
 from tahmeed.services.import_truck_check import (
     apply_truck_resolutions,
@@ -15,6 +15,7 @@ from tahmeed.services.import_truck_check import (
     truck_field_for,
 )
 from tahmeed.services.truck_format import DEFAULT_PLACE_LABELS, merge_allowed_labels
+from tahmeed.ui.async_utils import safe_process_events
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog
 
 
@@ -50,20 +51,23 @@ async def run_import_truck_gate(
     from tahmeed.services import accountant_service as svc
     from tahmeed.services import settings_service
 
-    progress = QProgressDialog(
-        "Loading fleet registry…", None, 0, 0, parent
-    )
-    progress.setWindowTitle("Checking trucks")
-    progress.setWindowModality(Qt.WindowModal)
-    progress.setMinimumDuration(0)
-    progress.setCancelButton(None)
-    progress.show()
-    QApplication.processEvents()
-
+    # Load fleet BEFORE any modal/progress UI. Showing a WindowModal dialog and
+    # pumping Qt events while this coroutine is current breaks Python 3.14 +
+    # qasync (nested task enter), which used to collapse fleet to ``set()`` and
+    # falsely flag every truck as not-in-registry.
     try:
         fleet = await get_fleet_numbers()
-    except Exception:
-        fleet = set()
+    except Exception as exc:
+        QMessageBox.critical(
+            parent,
+            "Fleet registry",
+            "Could not load the truck/trailer registry to check this import.\n\n"
+            f"{exc}\n\n"
+            "If this says a fleet route is missing (404), deploy the latest API "
+            "that includes /v1/trucks. Otherwise check the connection and try again.\n"
+            "Import was not saved.",
+        )
+        return ImportTruckGateResult(rows=[], skipped_count=0, aborted=True)
 
     try:
         from tahmeed.services.truck_service import get_fleet_kinds
@@ -77,10 +81,17 @@ async def run_import_truck_gate(
         stored = []
     labels = merge_allowed_labels(DEFAULT_PLACE_LABELS, stored or [])
 
-    progress.setLabelText("Checking truck numbers against fleet…")
+    progress = QProgressDialog(
+        "Checking truck numbers against fleet…", None, 0, 0, parent
+    )
+    progress.setWindowTitle("Checking trucks")
+    progress.setWindowModality(Qt.WindowModal)
+    progress.setMinimumDuration(0)
+    progress.setCancelButton(None)
     progress.setMaximum(max(1, len(rows)))
     progress.setValue(0)
-    QApplication.processEvents()
+    progress.show()
+    safe_process_events()
 
     def _on_progress(done: int, total: int) -> None:
         progress.setMaximum(max(1, total))
@@ -88,13 +99,14 @@ async def run_import_truck_gate(
         progress.setLabelText(
             f"Checking trucks… {done:,} / {total:,}"
         )
-        QApplication.processEvents()
+        safe_process_events()
 
     scan = scan_import_trucks(
         rows, field, fleet, allowed_labels=labels, progress=_on_progress
     )
     progress.setValue(progress.maximum())
     progress.close()
+    safe_process_events()
 
     if not scan.issues:
         return ImportTruckGateResult(rows=list(rows))

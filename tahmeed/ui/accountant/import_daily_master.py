@@ -126,8 +126,8 @@ class ImportDailyMasterWidget(QWidget):
             pass
         self._import_btn.setStyleSheet(
             f"QPushButton{{background:{_BLUE};color:#FFF;border:none;"
-            "border-radius:6px;font-size:13px;font-weight:600;"
-            "font-family:'Segoe UI';padding:0 18px;}}"
+            f"border-radius:6px;font-size:13px;font-weight:600;"
+            f"font-family:'Segoe UI';padding:0 18px;}}"
             "QPushButton:hover{background:#005EA3;}"
             "QPushButton:disabled{background:#93C5FD;}"
         )
