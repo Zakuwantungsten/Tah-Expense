@@ -1,14 +1,25 @@
-"""Dialog when an Excel import has a few rows on dates other than the main day."""
+"""Dialogs / helpers for assigning one register day to a daily Excel upload."""
 
 from __future__ import annotations
 
 from datetime import date
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QRadioButton,
     QButtonGroup,
+    QDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QRadioButton,
+    QVBoxLayout,
+)
+
+from tahmeed.services.daily_import_service import (
+    DailyImportPreview,
+    apply_date_policy,
 )
 
 _WHITE = "#FFFFFF"
@@ -17,38 +28,34 @@ _BORDER = "#E5E7EB"
 _BLUE = "#0077C5"
 _T1 = "#111827"
 _T2 = "#6B7280"
-_AMBER = "#B45309"
+
+# Legacy choice codes (kept for any older callers / tests)
+KEEP_AND_FLAG = "keep_flag"
+FORCE_PRIMARY = "force_primary"
+KEEP_AS_IS = "keep_as_is"
 
 
-# Result codes
-KEEP_AND_FLAG = "keep_flag"      # leave Excel dates; flag outliers for Issues
-FORCE_PRIMARY = "force_primary"  # rewrite all to primary date
-KEEP_AS_IS = "keep_as_is"        # leave Excel dates; no Issues flag
-
-
-class DateOutlierDialog(QDialog):
-    """Ask how to treat rows whose date differs from the import's main date."""
+class DateAllocationDialog(QDialog):
+    """Ask which register day to file the upload under when majority is unclear."""
 
     def __init__(
         self,
-        primary_date: date,
-        outlier_count: int,
-        all_dates: List[date],
+        candidates: List[date],
+        counts: Dict[date, int],
         total_rows: int,
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self._choice = KEEP_AND_FLAG
-        self.setWindowTitle("Mixed Dates in Excel")
-        self.setMinimumWidth(520)
+        self._chosen: Optional[date] = candidates[0] if candidates else None
+        self.setWindowTitle("Choose Register Date")
+        self.setMinimumWidth(540)
         self.setModal(True)
-        self._build(primary_date, outlier_count, all_dates, total_rows)
+        self._build(candidates, counts, total_rows)
 
     def _build(
         self,
-        primary_date: date,
-        outlier_count: int,
-        all_dates: List[date],
+        candidates: List[date],
+        counts: Dict[date, int],
         total_rows: int,
     ) -> None:
         self.setStyleSheet(
@@ -59,7 +66,7 @@ class DateOutlierDialog(QDialog):
         root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(12)
 
-        title = QLabel("Some rows use a different date")
+        title = QLabel("No clear majority register date")
         title.setStyleSheet(
             f"color: {_T1}; font-size: 16px; font-weight: 700;"
             " border: none; background: transparent;"
@@ -67,53 +74,35 @@ class DateOutlierDialog(QDialog):
         root.addWidget(title)
 
         card = QFrame()
-        card.setObjectName("dateOutlierCard")
+        card.setObjectName("dateAllocCard")
         card.setStyleSheet(
-            f"QFrame#dateOutlierCard {{ background-color: {_WHITE};"
+            f"QFrame#dateAllocCard {{ background-color: {_WHITE};"
             f" border: 1px solid {_BORDER}; border-radius: 12px; }}"
         )
         cvl = QVBoxLayout(card)
         cvl.setContentsMargins(14, 12, 14, 12)
         cvl.setSpacing(6)
-
-        main_lbl = QLabel(
-            f"Main date (most rows): <b>{primary_date.strftime('%d/%m/%Y')}</b>"
+        info = QLabel(
+            f"This file has <b>{total_rows}</b> rows and several dates are tied "
+            "for most common. Pick <b>one register date</b> for the whole upload "
+            "(how it is filed and opened). Excel row dates stay as written — "
+            "they are not changed and are not treated as discrepancies."
         )
-        main_lbl.setStyleSheet(f"color: {_T1}; font-size: 13px;")
-        cvl.addWidget(main_lbl)
-
-        other = [d for d in all_dates if d != primary_date]
-        other_txt = ", ".join(d.strftime("%d/%m/%Y") for d in other) or "—"
-        out_lbl = QLabel(
-            f"<span style='color:{_AMBER}'>{outlier_count}</span> of {total_rows} rows "
-            f"use other date(s): <b>{other_txt}</b>"
-        )
-        out_lbl.setWordWrap(True)
-        out_lbl.setStyleSheet(f"color: {_T2}; font-size: 12px;")
-        cvl.addWidget(out_lbl)
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color: {_T2}; font-size: 12px;")
+        cvl.addWidget(info)
         root.addWidget(card)
 
         self._group = QButtonGroup(self)
-        opts = [
-            (
-                KEEP_AND_FLAG,
-                "Keep Excel dates and flag for accountant Issues",
-                "Rows keep their dates; outliers appear under Verify → Issues.",
-            ),
-            (
-                FORCE_PRIMARY,
-                f"Change all rows to {primary_date.strftime('%d/%m/%Y')}",
-                "Overwrite every row date with the main detected date.",
-            ),
-            (
-                KEEP_AS_IS,
-                "Leave dates as they are (no Issues flag)",
-                "Rows keep their Excel dates and are not marked as a discrepancy.",
-            ),
-        ]
-        for i, (code, label, hint) in enumerate(opts):
+        ordered = list(candidates)
+        for d in sorted(counts.keys()):
+            if d not in ordered:
+                ordered.append(d)
+        for i, d in enumerate(ordered):
+            n = int(counts.get(d, 0))
+            label = f"{d.strftime('%d/%m/%Y')}  ({n} row{'s' if n != 1 else ''})"
             rb = QRadioButton(label)
-            rb.setProperty("choice", code)
+            rb.setProperty("alloc_date", d.isoformat())
             rb.setStyleSheet(
                 f"color: {_T1}; font-size: 13px; font-weight: 600;"
             )
@@ -121,12 +110,6 @@ class DateOutlierDialog(QDialog):
                 rb.setChecked(True)
             self._group.addButton(rb, i)
             root.addWidget(rb)
-            hint_lbl = QLabel(hint)
-            hint_lbl.setStyleSheet(
-                f"color: {_T2}; font-size: 11px; margin-left: 22px;"
-            )
-            hint_lbl.setWordWrap(True)
-            root.addWidget(hint_lbl)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -140,7 +123,7 @@ class DateOutlierDialog(QDialog):
         cancel.clicked.connect(self.reject)
         btn_row.addWidget(cancel)
 
-        ok = QPushButton("Continue")
+        ok = QPushButton("Use As Register Date")
         ok.setCursor(Qt.PointingHandCursor)
         ok.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
@@ -155,8 +138,97 @@ class DateOutlierDialog(QDialog):
     def _on_ok(self) -> None:
         btn = self._group.checkedButton()
         if btn is not None:
-            self._choice = btn.property("choice") or KEEP_AND_FLAG
+            raw = btn.property("alloc_date")
+            if raw:
+                self._chosen = date.fromisoformat(str(raw))
         self.accept()
 
+    def chosen_date(self) -> Optional[date]:
+        return self._chosen
+
+
+# Back-compat alias
+class DateOutlierDialog(DateAllocationDialog):
+    def __init__(
+        self,
+        primary_date: date,
+        outlier_count: int,
+        all_dates: List[date],
+        total_rows: int,
+        parent=None,
+        counts: Optional[Dict[date, int]] = None,
+    ) -> None:
+        counts = counts or {d: 0 for d in all_dates}
+        if primary_date not in counts:
+            counts = {
+                **counts,
+                primary_date: max(counts.values(), default=0) + outlier_count,
+            }
+        super().__init__(
+            candidates=[primary_date] + [d for d in all_dates if d != primary_date],
+            counts=counts,
+            total_rows=total_rows,
+            parent=parent,
+        )
+        self._choice = FORCE_PRIMARY
+        self.setWindowTitle("Choose Register Date")
+
     def choice(self) -> str:
-        return self._choice
+        return FORCE_PRIMARY
+
+
+def resolve_import_date_policy(preview: DailyImportPreview, parent=None) -> bool:
+    """Pick the upload's register day; keep every Excel row date as-is.
+
+    - Clear majority (or single date): that day is the register date.
+    - Unclear tie: ask which register date to file the batch under.
+    Returns False if the user cancels.
+    """
+    if not preview.rows:
+        apply_date_policy(preview)
+        return True
+
+    if preview.outlier_count == 0 and preview.primary_date is not None:
+        apply_date_policy(preview)
+        return True
+
+    if preview.date_majority_clear and preview.primary_date is not None:
+        apply_date_policy(preview)
+        return True
+
+    candidates = sorted(
+        preview.date_counts.keys(),
+        key=lambda d: (-int(preview.date_counts.get(d, 0)), d),
+    )
+    if not candidates:
+        candidates = list(preview.detected_dates)
+    if not candidates and preview.primary_date is not None:
+        candidates = [preview.primary_date]
+    if not candidates:
+        apply_date_policy(preview)
+        return True
+
+    if preview.date_counts:
+        max_n = max(preview.date_counts.values())
+        tied = sorted(d for d, n in preview.date_counts.items() if n == max_n)
+        prompt_candidates = tied or candidates
+    else:
+        prompt_candidates = candidates
+
+    dlg = DateAllocationDialog(
+        prompt_candidates,
+        preview.date_counts or {d: 0 for d in candidates},
+        len(preview.rows),
+        parent=parent,
+    )
+    if dlg.exec() != DateAllocationDialog.Accepted:
+        return False
+    chosen = dlg.chosen_date()
+    if chosen is None:
+        return False
+    preview.primary_date = chosen
+    preview.outlier_count = sum(
+        1 for r in preview.rows if r.date.date() != chosen
+    )
+    apply_date_policy(preview)
+    return True

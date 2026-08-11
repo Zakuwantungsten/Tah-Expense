@@ -9,7 +9,6 @@ from PySide6.QtWidgets import QFileDialog, QWidget
 
 from tahmeed.services.category_service import get_all_categories
 from tahmeed.services.daily_import_service import (
-    apply_date_policy,
     apply_mapping_to_preview,
     commit_daily_to_master,
     preview_daily_import,
@@ -19,12 +18,7 @@ from tahmeed.services.description_mapping_service import normalize_description
 from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
 from tahmeed.ui.dialog_theme import show_critical, show_info, show_warning
 from tahmeed.ui.dialogs.daily_import_preview_dialog import DailyImportPreviewDialog
-from tahmeed.ui.dialogs.date_outlier_dialog import (
-    FORCE_PRIMARY,
-    KEEP_AND_FLAG,
-    KEEP_AS_IS,
-    DateOutlierDialog,
-)
+from tahmeed.ui.dialogs.date_outlier_dialog import resolve_import_date_policy
 from tahmeed.ui.dialogs.description_mapping_dialog import (
     ACTION_ASSIGN,
     DescriptionMappingDialog,
@@ -123,26 +117,9 @@ async def run_daily_to_master_flow(
                 preview, key, chosen._id, chosen.name
             )
 
-    # ── Mixed dates ───────────────────────────────────────────────────────
-    if preview.outlier_count > 0 and preview.primary_date is not None:
-        dlg = DateOutlierDialog(
-            preview.primary_date,
-            preview.outlier_count,
-            preview.detected_dates,
-            len(preview.rows),
-            parent=parent,
-        )
-        if dlg.exec() != DateOutlierDialog.Accepted:
-            return None
-        choice = dlg.choice()
-        if choice == FORCE_PRIMARY:
-            apply_date_policy(preview, force_primary=True, flag_discrepancy=False)
-        elif choice == KEEP_AND_FLAG:
-            apply_date_policy(preview, force_primary=False, flag_discrepancy=True)
-        else:
-            apply_date_policy(preview, force_primary=False, flag_discrepancy=False)
-    else:
-        apply_date_policy(preview, force_primary=False, flag_discrepancy=False)
+    # ── One register date for the whole upload ────────────────────────────
+    if not resolve_import_date_policy(preview, parent=parent):
+        return None
 
     # ── Confirm before truck check + commit ───────────────────────────────
     confirm = DailyImportPreviewDialog(
@@ -210,11 +187,32 @@ async def run_daily_to_master_flow(
             f"\n{result['duplicates_skipped']:,} duplicate row(s) skipped."
         )
 
+    date_note = ""
+    min_d = result.get("min_date")
+    max_d = result.get("max_date")
+    if min_d is not None and max_d is not None:
+        def _fmt(dt):
+            d = dt.date() if hasattr(dt, "date") else dt
+            return d.strftime("%d/%m/%Y")
+        if min_d == max_d:
+            date_note = f"\nTransaction date: {_fmt(min_d)}."
+        else:
+            date_note = f"\nTransaction dates: {_fmt(min_d)} – {_fmt(max_d)}."
+        years = set()
+        for dt in (min_d, max_d):
+            years.add(dt.year if hasattr(dt, "year") else dt)
+        if years:
+            yrs = ", ".join(str(y) for y in sorted(years))
+            date_note += (
+                f"\nOpen Master Expenses for year {yrs} (All Months) to see every row."
+                "\nTable → Uploads → Open works the same batch in Advanced / register."
+            )
+
     show_info(
         parent,
         "Import Complete",
         f"Imported {result['inserted']:,} row(s) into Master Expenses "
-        f"from\n{result.get('source') or preview.source_filename}."
-        f"{skipped_note}",
+        f"and Daily Transactions\nfrom {result.get('source') or preview.source_filename}."
+        f"{date_note}{skipped_note}",
     )
     return result

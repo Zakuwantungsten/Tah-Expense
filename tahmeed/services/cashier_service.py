@@ -16,6 +16,11 @@ async def get_transactions_by_date(
 ) -> List[Transaction]:
     """Load a calendar day's register rows.
 
+    Includes:
+    - rows whose Excel/transaction ``date`` falls on that day, and
+    - daily-import rows filed under that day via ``import_primary_date``
+      (Excel dates may differ; the whole upload still belongs on the register day).
+
     ``merged=True`` returns every cashier's rows for that day (Shared/Merged mode).
     Otherwise ``cashier_id`` scopes to one user when provided.
     Sorted by ``day_order`` then ``created_at``.
@@ -23,8 +28,14 @@ async def get_transactions_by_date(
     db = get_db()
     start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
     end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
+    day_clause = {
+        "$or": [
+            {"date": {"$gte": start, "$lte": end}},
+            {"import_primary_date": {"$gte": start, "$lte": end}},
+        ]
+    }
     query: dict = {
-        "date": {"$gte": start, "$lte": end},
+        **day_clause,
         "rejected": {"$ne": True},
         "deletion_requested": {"$ne": True},
     }
@@ -49,20 +60,26 @@ async def get_transactions_by_date(
 async def submit_day_for_verify(target_date: date) -> int:
     """Mark all draft (and legacy) unverified rows for *target_date* as submitted.
 
-    Returns the number of documents updated.
+    Includes daily-import rows filed under this register day via
+    ``import_primary_date``. Returns the number of documents updated.
     """
     db = get_db()
     start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
     end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
     result = await db.transactions.update_many(
         {
-            "date": {"$gte": start, "$lte": end},
-            "verified": {"$ne": True},
-            "rejected": {"$ne": True},
-            "discarded": {"$ne": True},
-            "$or": [
-                {"register_status": "draft"},
-                {"register_status": {"$exists": False}},
+            "$and": [
+                {"$or": [
+                    {"date": {"$gte": start, "$lte": end}},
+                    {"import_primary_date": {"$gte": start, "$lte": end}},
+                ]},
+                {"verified": {"$ne": True}},
+                {"rejected": {"$ne": True}},
+                {"discarded": {"$ne": True}},
+                {"$or": [
+                    {"register_status": "draft"},
+                    {"register_status": {"$exists": False}},
+                ]},
             ],
         },
         {"$set": {"register_status": "submitted"}},
@@ -256,6 +273,7 @@ async def get_daily_summaries(
     category_name="",
     sub_item_match="",
     descriptions="",
+    daily_import_id: str = "",
     limit: int = 365,
 ) -> list:
     """Aggregate transactions by calendar day, returning one summary dict per day.
@@ -276,6 +294,7 @@ async def get_daily_summaries(
         truck=truck,
         category_name=category_name,
         descriptions=desc_filter,
+        daily_import_id=daily_import_id,
     )
 
     pipeline = [
@@ -349,12 +368,17 @@ def _browse_match(
     truck: str = "",
     category_name="",
     descriptions="",
+    daily_import_id: str = "",
 ) -> dict:
     """Shared match clause for browse list / distinct-option queries."""
     match: dict = {}
     and_clauses: list = []
 
-    if date_from or date_to:
+    uid = (daily_import_id or "").strip()
+    if uid:
+        # Whole upload — do not also clip by Excel date range.
+        match["daily_import_id"] = uid
+    elif date_from or date_to:
         date_filter: dict = {}
         if date_from:
             date_filter["$gte"] = datetime(date_from.year, date_from.month, date_from.day)
@@ -408,6 +432,7 @@ async def get_transactions_flat(
     category_name="",
     sub_item_match="",
     descriptions="",
+    daily_import_id: str = "",
     limit: int = 1000,
 ) -> List[Transaction]:
     """Return individual transactions matching all supplied filters."""
@@ -419,6 +444,7 @@ async def get_transactions_flat(
         keyword=keyword,
         category_name=category_name,
         descriptions=desc_filter,
+        daily_import_id=daily_import_id,
     )
     cursor = db.transactions.find(match).sort([("date", -1), ("created_at", -1)]).limit(limit)
     docs = await cursor.to_list(length=limit)
@@ -473,6 +499,22 @@ async def get_available_months() -> list:
     ]
     docs = await db.transactions.aggregate(pipeline).to_list(length=None)
     return [(d["_id"]["year"], d["_id"]["month"]) for d in docs]
+
+
+async def get_available_years() -> list:
+    """Calendar years that have transactions, newest first (always includes recent years)."""
+    db = get_db()
+    pipeline = [
+        {"$group": {"_id": {"$year": "$date"}}},
+        {"$sort": {"_id": -1}},
+    ]
+    docs = await db.transactions.aggregate(pipeline).to_list(length=40)
+    years = [int(d["_id"]) for d in docs if d.get("_id") is not None]
+    today_y = date.today().year
+    for y in (today_y + 1, today_y, today_y - 1):
+        if y not in years:
+            years.append(y)
+    return sorted(set(years), reverse=True)
 
 
 # In-memory description history for Excel-style autocomplete across all days.

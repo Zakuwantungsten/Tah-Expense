@@ -30,8 +30,12 @@ def test_norm_key_collapses_case_and_spaces() -> None:
 def test_status_badge_empty_then_truck_or_trailer(qapp) -> None:
     dlg = TruckCorrectionDialog(
         [],
-        fleet={"T760 HDN", "T100 TRL"},
-        fleet_kinds={"T760 HDN": "truck", "T100 TRL": "trailer"},
+        fleet={"T760 HDN", "T100 TRL", "MC 55 XYZ"},
+        fleet_kinds={
+            "T760 HDN": "truck",
+            "T100 TRL": "trailer",
+            "MC 55 XYZ": "motor_vehicle",
+        },
         can_add=False,
     )
     label, _ = dlg._status_for_text("")
@@ -43,6 +47,9 @@ def test_status_badge_empty_then_truck_or_trailer(qapp) -> None:
 
     label, _ = dlg._status_for_text("T100 TRL")
     assert label == "Trailer ✓"
+
+    label, _ = dlg._status_for_text("MC 55 XYZ")
+    assert label == "Bike/Car ✓"
 
     label, _ = dlg._status_for_text("T999 ZZZ")
     assert label == "Not in registry"

@@ -1343,6 +1343,17 @@ async def bulk_update_transaction_category(
 # ── Master Expenses Table queries ────────────────────────────────────────────
 
 
+def _master_period_clause(start: datetime, end: datetime) -> dict:
+    """Master year/month tabs filter by Excel transaction ``date`` only.
+
+    Register day (``import_primary_date``) is used to file/open an upload as a
+    batch elsewhere. Mixing it into Master month filters pulled Jan-dated rows
+    into December when the upload was filed on 31 Dec — so Master stays
+    date-true here.
+    """
+    return {"date": {"$gte": start, "$lte": end}}
+
+
 def _build_master_query(
     year: Optional[int],
     month: int,          # 0 = all, 1‑12 = month index
@@ -1373,7 +1384,7 @@ def _build_master_query(
     query: dict = {
         "verified": True,
         "deletion_requested": {"$ne": True},
-        "date": {"$gte": start, "$lte": end},
+        **_master_period_clause(start, end),
     }
 
     and_clauses: list = []
@@ -1497,13 +1508,12 @@ async def get_master_month_totals(year: int) -> Dict:
     """Per-month TZS / USD / ZMW totals for the year (master ledger)."""
     db = get_db()
     _year = year
+    start = datetime(_year, 1, 1)
+    end = datetime(_year, 12, 31, 23, 59, 59)
     pipeline = [
         {"$match": {
             "verified": True,
-            "date": {
-                "$gte": datetime(_year, 1, 1),
-                "$lte": datetime(_year, 12, 31, 23, 59, 59),
-            },
+            **_master_period_clause(start, end),
         }},
         {"$group": {
             "_id": {"$month": "$date"},
@@ -1525,12 +1535,50 @@ async def get_master_month_totals(year: int) -> Dict:
     }
 
 
+async def get_master_available_years() -> List[int]:
+    """Calendar years that have verified Master rows (Excel date or register day)."""
+    db = get_db()
+    pipeline = [
+        {"$match": {"verified": True, "deletion_requested": {"$ne": True}}},
+        {"$project": {
+            "years": {
+                "$setUnion": [
+                    {"$cond": [
+                        {"$ne": [{"$ifNull": ["$date", None]}, None]},
+                        [{"$year": "$date"}],
+                        [],
+                    ]},
+                    {"$cond": [
+                        {"$ne": [{"$ifNull": ["$import_primary_date", None]}, None]},
+                        [{"$year": "$import_primary_date"}],
+                        [],
+                    ]},
+                ]
+            }
+        }},
+        {"$unwind": "$years"},
+        {"$group": {"_id": "$years"}},
+        {"$sort": {"_id": -1}},
+    ]
+    docs = await db.transactions.aggregate(pipeline).to_list(50)
+    years = [int(d["_id"]) for d in docs if d.get("_id") is not None]
+    if not years:
+        y = date.today().year
+        return [y - 1, y, y + 1]
+    # Keep a little headroom around the data so new FY entry is easy.
+    lo = min(years) - 1
+    hi = max(max(years), date.today().year) + 1
+    return list(range(hi, lo - 1, -1))
+
+
 async def get_master_trucks(year: Optional[int] = None) -> List[str]:
     db = get_db()
     _year = year or date.today().year
+    start = datetime(_year, 1, 1)
+    end = datetime(_year, 12, 31, 23, 59, 59)
     query = {
         "verified": True,
-        "date": {"$gte": datetime(_year, 1, 1), "$lte": datetime(_year, 12, 31, 23, 59, 59)},
+        **_master_period_clause(start, end),
     }
     vals = await db.transactions.distinct("truck_number", query)
     return sorted(v for v in vals if v)
@@ -1539,9 +1587,11 @@ async def get_master_trucks(year: Optional[int] = None) -> List[str]:
 async def get_master_categories(year: Optional[int] = None) -> List[str]:
     db = get_db()
     _year = year or date.today().year
+    start = datetime(_year, 1, 1)
+    end = datetime(_year, 12, 31, 23, 59, 59)
     query = {
         "verified": True,
-        "date": {"$gte": datetime(_year, 1, 1), "$lte": datetime(_year, 12, 31, 23, 59, 59)},
+        **_master_period_clause(start, end),
     }
     vals = await db.transactions.distinct("category_name", query)
     return sorted(v for v in vals if v)

@@ -84,6 +84,8 @@ class DailyImportPreview:
     skipped_blank: int = 0
     primary_date: Optional[date] = None
     detected_dates: List[date] = field(default_factory=list)
+    date_counts: Dict[date, int] = field(default_factory=dict)
+    date_majority_clear: bool = True
     outlier_count: int = 0
     sheet_name: str = ""
     upload_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -217,17 +219,67 @@ def _col(row: List, cols: Dict[str, int], key: str, default=None):
     return row[idx]
 
 
+@dataclass(frozen=True)
+class DateAllocation:
+    """How to assign one register date to an entire daily upload."""
+
+    primary: Optional[date]
+    clear_majority: bool
+    counts: Dict[date, int] = field(default_factory=dict)
+    candidates: tuple[date, ...] = ()
+
+
+def analyze_date_allocation(
+    row_dates: List[date],
+    *,
+    filename: str = "",
+    sheet_name: str = "",
+) -> DateAllocation:
+    """Majority row date wins; ties / empty rows fall back or need a prompt.
+
+    - Clear majority: one date has strictly more rows than any other.
+    - Unclear: two or more dates share the top count → caller should ask.
+    - No row dates: filename/sheet date is treated as a clear choice when present.
+    """
+    if row_dates:
+        counts = Counter(row_dates)
+        max_n = max(counts.values())
+        tied = tuple(sorted(d for d, n in counts.items() if n == max_n))
+        clear = len(tied) == 1
+        return DateAllocation(
+            primary=tied[0] if clear else None,
+            clear_majority=clear,
+            counts=dict(counts),
+            candidates=tied,
+        )
+    fallback = detect_date_from_name(filename) or detect_date_from_name(sheet_name)
+    if fallback is None:
+        return DateAllocation(primary=None, clear_majority=False, counts={}, candidates=())
+    return DateAllocation(
+        primary=fallback,
+        clear_majority=True,
+        counts={},
+        candidates=(fallback,),
+    )
+
+
 def pick_primary_date(
     row_dates: List[date],
     *,
     filename: str = "",
     sheet_name: str = "",
 ) -> Optional[date]:
-    """Prefer majority row date; fall back to filename/sheet detection."""
-    if row_dates:
-        counts = Counter(row_dates)
-        return counts.most_common(1)[0][0]
-    return detect_date_from_name(filename) or detect_date_from_name(sheet_name)
+    """Prefer majority row date; fall back to filename/sheet detection.
+
+    On a tie, returns the earliest tied date (stable) — prefer
+    ``analyze_date_allocation`` when you need to know if the majority is clear.
+    """
+    alloc = analyze_date_allocation(
+        row_dates, filename=filename, sheet_name=sheet_name
+    )
+    if alloc.primary is not None:
+        return alloc.primary
+    return alloc.candidates[0] if alloc.candidates else None
 
 
 _CLASSIC_MATUMIZI_COLS: Dict[str, int] = {
@@ -374,9 +426,15 @@ async def preview_daily_import(path: str | Path) -> DailyImportPreview:
             unmapped[key] = unmapped.get(key, 0) + 1
 
     row_dates = [r.date.date() for r in parsed]
-    primary = pick_primary_date(row_dates, filename=path.name, sheet_name=sheet)
+    alloc = analyze_date_allocation(
+        row_dates, filename=path.name, sheet_name=sheet
+    )
+    primary = alloc.primary
+    if primary is None and alloc.candidates:
+        # Unclear tie — keep a provisional primary for display; caller asks.
+        primary = alloc.candidates[0]
     outliers = 0
-    if primary is not None:
+    if primary is not None and row_dates:
         outliers = sum(1 for d in row_dates if d != primary)
 
     return DailyImportPreview(
@@ -387,6 +445,8 @@ async def preview_daily_import(path: str | Path) -> DailyImportPreview:
         skipped_blank=skipped,
         primary_date=primary,
         detected_dates=sorted(set(row_dates)),
+        date_counts=dict(alloc.counts),
+        date_majority_clear=alloc.clear_majority,
         outlier_count=outliers,
         sheet_name=sheet,
     )
@@ -429,19 +489,24 @@ def skip_all_unmapped(preview: DailyImportPreview) -> None:
 def apply_date_policy(
     preview: DailyImportPreview,
     *,
-    force_primary: bool,
-    flag_discrepancy: bool,
+    force_primary: bool = False,
+    flag_discrepancy: bool = False,
 ) -> None:
-    preview.force_primary_date = force_primary
-    preview.flag_date_discrepancy = flag_discrepancy and preview.outlier_count > 0
-    if force_primary and preview.primary_date is not None:
-        primary_dt = datetime(
-            preview.primary_date.year,
-            preview.primary_date.month,
-            preview.primary_date.day,
-        )
-        for row in preview.rows:
-            row.date = primary_dt
+    """Attach a register day to the upload; never rewrite Excel row dates.
+
+    Mixed dates in one file are normal (pending items cleared on the upload
+    day). ``force_primary`` / ``flag_discrepancy`` are kept for call-site
+    compatibility but do not change row dates or raise discrepancy flags.
+    """
+    del force_primary, flag_discrepancy  # no longer rewrite / flag
+    preview.force_primary_date = False
+    preview.flag_date_discrepancy = False
+
+
+def _register_dt(primary: Optional[date]) -> Optional[datetime]:
+    if primary is None:
+        return None
+    return datetime(primary.year, primary.month, primary.day)
 
 
 def _ref_float_from_notes(notes: str) -> str:
@@ -454,11 +519,6 @@ def _ref_float_from_notes(notes: str) -> str:
 def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict:
     """Dict used to populate the Daily Register grid before Save."""
     primary = preview.primary_date
-    is_outlier = bool(
-        primary is not None
-        and row.date.date() != primary
-        and not preview.force_primary_date
-    )
     return {
         "date": row.date,
         "item": row.category_name or "",
@@ -478,14 +538,8 @@ def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict
         "serial": row.serial,
         "daily_import_id": preview.upload_id,
         "daily_import_source": preview.source_filename,
-        "date_discrepancy": bool(
-            preview.flag_date_discrepancy and is_outlier
-        ),
-        "import_primary_date": (
-            datetime(primary.year, primary.month, primary.day)
-            if primary is not None
-            else None
-        ),
+        "date_discrepancy": False,
+        "import_primary_date": _register_dt(primary),
     }
 
 
@@ -510,6 +564,7 @@ def _payload_to_verified_transaction(
     payload: dict,
     *,
     verified_by: Optional[ObjectId] = None,
+    day_order: Optional[int] = None,
 ) -> Transaction:
     """Build a verified master transaction from a staged daily-import payload."""
     dt = payload["date"]
@@ -536,10 +591,14 @@ def _payload_to_verified_transaction(
         ref_float=ref_float,
         ownership=(payload.get("ownership") or "").upper(),
         approver=(payload.get("approver") or "").upper(),
+        # Attribute the batch to the importing accountant so rows show in
+        # Table / Merged register like normal system-created entries.
+        cashier_id=verified_by,
         verified=True,
         verified_by=verified_by,
         verified_at=datetime.utcnow(),
         register_status="submitted",
+        day_order=day_order,
         month=_month_label(dt),
         year=dt.year,
         created_at=datetime.utcnow(),
@@ -575,6 +634,9 @@ async def commit_daily_to_master(
     batch: List[dict] = []
     upload_id = ""
     source = ""
+    min_date: Optional[datetime] = None
+    max_date: Optional[datetime] = None
+    row_index = 0
 
     for payload in payloads:
         item_name = (payload.get("category_name") or payload.get("item") or "").strip()
@@ -590,7 +652,15 @@ async def commit_daily_to_master(
         payload["daily_import_id"] = upload_id
         if source:
             payload["daily_import_source"] = source
-        tx = _payload_to_verified_transaction(payload, verified_by=verified_by)
+        tx = _payload_to_verified_transaction(
+            payload, verified_by=verified_by, day_order=row_index
+        )
+        row_index += 1
+        if isinstance(tx.date, datetime):
+            if min_date is None or tx.date < min_date:
+                min_date = tx.date
+            if max_date is None or tx.date > max_date:
+                max_date = tx.date
         doc = tx.to_doc()
         doc["import_row_key"] = daily_import_row_key(payload)
         batch.append(doc)
@@ -611,6 +681,8 @@ async def commit_daily_to_master(
         "skipped_no_item": skipped_no_item,
         "upload_id": upload_id,
         "source": source,
+        "min_date": min_date,
+        "max_date": max_date,
     }
     try:
         from tahmeed.services.audit_service import record_event
@@ -670,7 +742,27 @@ async def list_daily_uploads(limit: int = 100) -> List[dict]:
                 "created_at": {"$min": "$created_at"},
                 "cashier_id": {"$first": "$cashier_id"},
                 "outlier_count": {
-                    "$sum": {"$cond": ["$date_discrepancy", 1, 0]}
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$ne": ["$import_primary_date", None]},
+                                    {"$ne": [
+                                        {"$dateToString": {
+                                            "format": "%Y-%m-%d",
+                                            "date": "$date",
+                                        }},
+                                        {"$dateToString": {
+                                            "format": "%Y-%m-%d",
+                                            "date": "$import_primary_date",
+                                        }},
+                                    ]},
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
                 },
                 "duplicate_count": {
                     "$sum": {"$cond": ["$possible_duplicate", 1, 0]}
@@ -681,6 +773,27 @@ async def list_daily_uploads(limit: int = 100) -> List[dict]:
         {"$limit": limit},
     ]
     return await db.transactions.aggregate(pipeline).to_list(length=limit)
+
+
+async def get_daily_upload_records(
+    upload_id: str,
+    *,
+    limit: int = 10000,
+    skip: int = 0,
+) -> List[Transaction]:
+    """All transaction rows belonging to one daily Excel upload batch."""
+    uid = str(upload_id or "").strip()
+    if not uid:
+        return []
+    db = get_db()
+    cursor = (
+        db.transactions.find({"daily_import_id": uid})
+        .sort([("date", 1), ("day_order", 1), ("created_at", 1)])
+        .skip(max(0, skip))
+        .limit(max(1, limit))
+    )
+    docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
 
 
 async def delete_daily_upload(upload_id: str) -> int:

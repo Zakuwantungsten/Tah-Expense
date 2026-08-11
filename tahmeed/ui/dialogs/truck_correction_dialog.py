@@ -290,6 +290,17 @@ class TruckCorrectionDialog(QDialog):
         if norm.status == "empty":
             return ("—", _T2)
         if norm.status == "invalid":
+            # Free-form motorcycle/car plates can still be in the fleet.
+            matched_free = try_match_fleet(raw, self._fleet)
+            if matched_free is not None:
+                kind = self._lookup_kind(matched_free)
+                if kind == "motor_vehicle":
+                    return ("Bike/Car ✓", _GREEN)
+                if kind == "trailer":
+                    return ("Trailer ✓", _GREEN)
+                if kind == "truck":
+                    return ("Truck ✓", _GREEN)
+                return ("In registry ✓", _GREEN)
             return ("Invalid format", "#B45309")
         matched = try_match_fleet(norm.value, self._fleet)
         if matched is None:
@@ -889,7 +900,11 @@ class TruckCorrectionDialog(QDialog):
         box = QMessageBox(self)
         box.setWindowTitle("Add to registry")
         box.setIcon(QMessageBox.Question)
-        box.setText(f'Add "{number}" to the fleet registry as:')
+        box.setText(f'Add "{number}" to which registry?')
+        box.setInformativeText(
+            "Truck / Trailer require plate format T688 EAF.\n"
+            "Motorcycle/Car accepts other registration styles."
+        )
         truck_btn = box.addButton("Truck", QMessageBox.AcceptRole)
         trailer_btn = box.addButton("Trailer", QMessageBox.AcceptRole)
         motor_btn = box.addButton("Motorcycle/Car", QMessageBox.AcceptRole)
@@ -906,18 +921,48 @@ class TruckCorrectionDialog(QDialog):
 
     def _add_to_registry_row(self, rw: _RowWidgets) -> None:
         text = rw.edit.text().strip()
-        norm = normalize_truck_number(text, allowed_labels=())
-        if norm.status not in ("ok", "normalized"):
+        if not text:
             QMessageBox.warning(
-                self, "Format",
-                "Enter a valid truck number first (e.g. T688 EAF).",
+                self, "Registry", "Enter a registration number first."
             )
             return
-        number = norm.value
-        rw.edit.setText(number)
-        kind = self._ask_registry_kind(number)
+        if is_allowed_place_label(text, self._allowed_labels) or (
+            is_place_label_candidate(text) and not any(ch.isdigit() for ch in text)
+        ):
+            QMessageBox.warning(
+                self,
+                "Registry",
+                f'"{text}" looks like a place label, not a vehicle.\n'
+                "Use “Remember as place label” instead.",
+            )
+            return
+
+        # Category first — format rules depend on the chosen registry.
+        kind = self._ask_registry_kind(text)
         if kind is None:
             return
+
+        if kind in ("trucks", "trailers"):
+            norm = normalize_truck_number(text, allowed_labels=())
+            if norm.status not in ("ok", "normalized"):
+                QMessageBox.warning(
+                    self,
+                    "Format",
+                    f'Truck/Trailer numbers must look like T688 EAF.\n\n'
+                    f'"{text}" is not a valid plate format.\n'
+                    "Choose Motorcycle/Car for other registration styles.",
+                )
+                return
+            number = norm.value
+        else:
+            number = " ".join(text.upper().split())
+            if len(number) < 2:
+                QMessageBox.warning(
+                    self, "Registry", "Enter a registration number first."
+                )
+                return
+
+        rw.edit.setText(number)
         # Persist after dialog closes — no nested asyncio inside import modals.
         from tahmeed.services.truck_service import collection_to_kind
 

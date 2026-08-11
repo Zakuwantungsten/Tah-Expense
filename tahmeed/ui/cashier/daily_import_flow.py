@@ -9,7 +9,6 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox, QWidget
 from tahmeed.services.category_service import get_all_categories
 from tahmeed.services.daily_import_service import (
     DailyImportPreview,
-    apply_date_policy,
     apply_mapping_to_preview,
     preview_daily_import,
     skip_all_unmapped,
@@ -17,12 +16,7 @@ from tahmeed.services.daily_import_service import (
 )
 from tahmeed.services.description_mapping_service import normalize_description
 from tahmeed.ui.dialogs.daily_import_preview_dialog import DailyImportPreviewDialog
-from tahmeed.ui.dialogs.date_outlier_dialog import (
-    FORCE_PRIMARY,
-    KEEP_AND_FLAG,
-    KEEP_AS_IS,
-    DateOutlierDialog,
-)
+from tahmeed.ui.dialogs.date_outlier_dialog import resolve_import_date_policy
 from tahmeed.ui.dialogs.description_mapping_dialog import (
     ACTION_ASSIGN,
     ACTION_SKIP,
@@ -113,26 +107,9 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
                     preview, key, chosen._id, chosen.name
                 )
 
-    # ── Mixed dates ───────────────────────────────────────────────────────
-    if preview.outlier_count > 0 and preview.primary_date is not None:
-        dlg = DateOutlierDialog(
-            preview.primary_date,
-            preview.outlier_count,
-            preview.detected_dates,
-            len(preview.rows),
-            parent=parent,
-        )
-        if dlg.exec() != DateOutlierDialog.Accepted:
-            return None
-        choice = dlg.choice()
-        if choice == FORCE_PRIMARY:
-            apply_date_policy(preview, force_primary=True, flag_discrepancy=False)
-        elif choice == KEEP_AND_FLAG:
-            apply_date_policy(preview, force_primary=False, flag_discrepancy=True)
-        else:  # KEEP_AS_IS
-            apply_date_policy(preview, force_primary=False, flag_discrepancy=False)
-    else:
-        apply_date_policy(preview, force_primary=False, flag_discrepancy=False)
+    # ── One register date for the whole upload ────────────────────────────
+    if not resolve_import_date_policy(preview, parent=parent):
+        return None
 
     # ── Confirm preview before staging into the table ─────────────────────
     confirm = DailyImportPreviewDialog(preview, parent=parent)

@@ -2,20 +2,20 @@
 TransactionBrowser — embedded browse page (Simple / Advanced / Uploads).
 
 Simple   — daily summary (one row per day): Date | TXN ID | Entries | Refund to Float | Total
-           keyword searches description OR truck OR memo across all matched days
+           Year + Month filters; keyword searches description OR truck OR memo
 Advanced — individual transaction rows with full register columns
-           multi-select Item + Description (description = former Sub-Item) filters,
-           cascading from entries in the selected date range
+           Year + Month + multi-select Item / Description filters
 Uploads  — Excel daily imports list
 
-Month combo is populated from real DB data (distinct months that have transactions).
+Year/Month combos are populated from real DB data. A loading overlay covers the
+table while searches run so the first open never looks empty mid-fetch.
 Double-click or "Go To Date" navigates the register to that day/transaction.
 """
 
 import asyncio
 import calendar as _cal
-from datetime import date, timedelta
-from typing import List
+from datetime import date
+from typing import List, Optional
 
 from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout,
@@ -30,10 +30,11 @@ from PySide6.QtGui import QColor, QFont
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.cashier_service import (
     get_daily_summaries, get_transactions_flat, get_available_months,
-    get_browse_items, get_browse_descriptions,
+    get_available_years, get_browse_items, get_browse_descriptions,
 )
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 
 # ── Styles ────────────────────────────────────────────────────────────────────
@@ -130,7 +131,10 @@ _MODE_SIMPLE   = 0
 _MODE_ADVANCED = 1
 _MODE_UPLOADS  = 2
 
-_ONE_MONTH_AGO = date.today() - timedelta(days=30)
+_MONTH_NAMES = (
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
 
 _U_COL_FILE    = 0
 _U_COL_DATE    = 1
@@ -154,8 +158,14 @@ class TransactionBrowser(QWidget):
         self._results_uploads: list = []
         self._filter_opts_loaded = False
         self._months_loaded = False
+        self._years_loaded = False
+        self._available_years: List[int] = []
         self._current_mode = _MODE_SIMPLE
         self._cascade_busy = False
+        self._filter_upload_id: str = ""
+        self._find_generation = 0
+        self._find_in_flight = False
+        self._loading: Optional[LoadingOverlay] = None
         self._build_ui()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -178,7 +188,7 @@ class TransactionBrowser(QWidget):
         t = QLabel("Transaction Browser")
         t.setStyleSheet("color:#ffffff;font-size:14px;font-weight:700;")
         hl.addWidget(t)
-        s = QLabel("Daily summary · Individual rows · Excel uploads")
+        s = QLabel("Daily days · Individual rows · Excel uploads")
         s.setStyleSheet("color:#a8a29e;font-size:11px;margin-left:12px;")
         hl.addWidget(s)
         hl.addStretch()
@@ -236,21 +246,22 @@ class TransactionBrowser(QWidget):
         hl.setSpacing(8)
         hl.setAlignment(Qt.AlignVCenter)
 
-        # Month
+        today = date.today()
+        self._s_year = _combo(88)
+        self._s_year.addItem(str(today.year), today.year)
         self._s_month = _combo(120)
-        self._s_month.addItem("All Months", None)
-        self._s_from = _date_edit(_ONE_MONTH_AGO)
-        self._s_to   = _date_edit(date.today())
-        self._s_month.currentIndexChanged.connect(
-            lambda idx: _apply_month(self._s_month, self._s_from, self._s_to, idx)
-        )
+        self._fill_month_combo(self._s_month)
+        self._s_from = _date_edit(today.replace(day=1))
+        self._s_to = _date_edit(date(today.year, today.month, _cal.monthrange(today.year, today.month)[1]))
+        self._s_year.currentIndexChanged.connect(lambda *_: self._on_period_changed("simple"))
+        self._s_month.currentIndexChanged.connect(lambda *_: self._on_period_changed("simple"))
+        hl.addLayout(_field("Year", self._s_year))
         hl.addLayout(_field("Month", self._s_month))
 
         hl.addLayout(_field("Date From", self._s_from))
         hl.addLayout(_field("Date To",   self._s_to))
         hl.addStretch()
 
-        # Search / Find / Reset at right end
         self._kw_edit = _lineedit("Search keyword…", 190)
         self._kw_edit.returnPressed.connect(self._do_find)
         hl.addLayout(_field("Search", self._kw_edit))
@@ -258,6 +269,12 @@ class TransactionBrowser(QWidget):
         s_find, s_reset = self._make_find_reset()
         self._find_btns.append(s_find)
         hl.addLayout(_btn_col(s_find, s_reset))
+        # Default: current month
+        self._s_month.blockSignals(True)
+        idx = self._s_month.findData(today.month)
+        if idx >= 0:
+            self._s_month.setCurrentIndex(idx)
+        self._s_month.blockSignals(False)
         return w
 
     # ── Advanced filter panel ─────────────────────────────────────────────────
@@ -270,52 +287,55 @@ class TransactionBrowser(QWidget):
         hl.setSpacing(8)
         hl.setAlignment(Qt.AlignVCenter)
 
-        # Month — default to current month
-        _today = date.today()
+        today = date.today()
+        self._a_year = _combo(88)
+        self._a_year.addItem(str(today.year), today.year)
         self._a_month = _combo(120)
-        self._a_month.addItem("All Months", None)
-        self._a_from = _date_edit(_today.replace(day=1))
-        self._a_to   = _date_edit(_today)
-        self._a_month.currentIndexChanged.connect(
-            lambda idx: _apply_month(self._a_month, self._a_from, self._a_to, idx)
-        )
+        self._fill_month_combo(self._a_month)
+        self._a_from = _date_edit(today.replace(day=1))
+        self._a_to = _date_edit(date(today.year, today.month, _cal.monthrange(today.year, today.month)[1]))
+        self._a_year.currentIndexChanged.connect(lambda *_: self._on_period_changed("advanced"))
+        self._a_month.currentIndexChanged.connect(lambda *_: self._on_period_changed("advanced"))
         self._a_from.dateChanged.connect(lambda *_: self._on_adv_dates_changed())
         self._a_to.dateChanged.connect(lambda *_: self._on_adv_dates_changed())
+        hl.addLayout(_field("Year", self._a_year))
         hl.addLayout(_field("Month", self._a_month))
 
         hl.addLayout(_field("Date From", self._a_from))
         hl.addLayout(_field("Date To",   self._a_to))
 
-        # Item — multi-select from entries in the date window
         self._item_combo = CheckableMultiCombo(
             "All Items", noun_plural="items", parent=self,
         )
         self._item_combo.setFixedHeight(28)
-        self._item_combo.setFixedWidth(160)
+        self._item_combo.setFixedWidth(150)
         self._item_combo.setStyleSheet(_FIELD_SS)
         self._item_combo.selectionChanged.connect(self._on_items_changed)
         hl.addLayout(_field("Item", self._item_combo))
 
-        # Sub-Item = description name — multi-select, cascades with Item
         self._subitem_combo = CheckableMultiCombo(
             "All Descriptions", noun_plural="descriptions", parent=self,
         )
         self._subitem_combo.setFixedHeight(28)
-        self._subitem_combo.setFixedWidth(180)
+        self._subitem_combo.setFixedWidth(160)
         self._subitem_combo.setStyleSheet(_FIELD_SS)
         self._subitem_combo.selectionChanged.connect(self._on_descs_changed)
         hl.addLayout(_field("Sub-Item", self._subitem_combo))
 
         hl.addStretch()
 
-        # Search / Find / Reset at right end
-        self._adv_kw_edit = _lineedit("Search keyword…", 190)
+        self._adv_kw_edit = _lineedit("Search keyword…", 170)
         self._adv_kw_edit.returnPressed.connect(self._do_find)
         hl.addLayout(_field("Search", self._adv_kw_edit))
 
         a_find, a_reset = self._make_find_reset()
         self._find_btns.append(a_find)
         hl.addLayout(_btn_col(a_find, a_reset))
+        self._a_month.blockSignals(True)
+        idx = self._a_month.findData(today.month)
+        if idx >= 0:
+            self._a_month.setCurrentIndex(idx)
+        self._a_month.blockSignals(False)
         return w
 
     def _build_uploads_panel(self) -> QWidget:
@@ -324,7 +344,10 @@ class TransactionBrowser(QWidget):
         hl = QHBoxLayout(w)
         hl.setContentsMargins(0, 4, 0, 4)
         hl.setSpacing(8)
-        tip = QLabel("Excel daily imports from all cashiers — delete a wrong upload here.")
+        tip = QLabel(
+            "Excel daily imports — double-click or Open to work the batch in Advanced; "
+            "Go To Date opens that day on the register."
+        )
         tip.setStyleSheet("color:#6b7280;font-size:12px;")
         hl.addWidget(tip)
         hl.addStretch()
@@ -352,7 +375,14 @@ class TransactionBrowser(QWidget):
 
     # ── Table stack ───────────────────────────────────────────────────────────
 
-    def _build_table_stack(self) -> QStackedWidget:
+    def _build_table_stack(self) -> QWidget:
+        wrap = QWidget()
+        wrap.setObjectName("browserTableWrap")
+        wrap.setStyleSheet("QWidget#browserTableWrap{background:#ffffff;}")
+        lay = QVBoxLayout(wrap)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
         self._table_stack = QStackedWidget()
         self._simple_table  = self._build_simple_table()
         self._adv_table     = self._build_adv_table()
@@ -360,7 +390,9 @@ class TransactionBrowser(QWidget):
         self._table_stack.addWidget(self._simple_table)
         self._table_stack.addWidget(self._adv_table)
         self._table_stack.addWidget(self._uploads_table)
-        return self._table_stack
+        lay.addWidget(self._table_stack)
+        self._loading = LoadingOverlay(wrap, "Loading…")
+        return wrap
 
     def _build_uploads_table(self) -> QTableWidget:
         t = QTableWidget()
@@ -381,12 +413,13 @@ class TransactionBrowser(QWidget):
         t.setColumnWidth(_U_COL_CASHIER, 120)
         t.setColumnWidth(_U_COL_ISSUES, 90)
         t.setColumnWidth(_U_COL_WHEN, 140)
-        t.setColumnWidth(_U_COL_ACT, 110)
+        t.setColumnWidth(_U_COL_ACT, 170)
         t.verticalHeader().setVisible(False)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
         t.verticalHeader().setDefaultSectionSize(32)
         t.itemSelectionChanged.connect(self._on_selection_changed)
+        t.doubleClicked.connect(self._on_open_upload)
         return t
 
     def _build_simple_table(self) -> QTableWidget:
@@ -488,19 +521,13 @@ class TransactionBrowser(QWidget):
     # ── Mode switching ────────────────────────────────────────────────────────
 
     def _switch_mode(self, mode: int) -> None:
+        if mode != _MODE_ADVANCED:
+            self._filter_upload_id = ""
         self._current_mode = mode
         self._filter_stack.setCurrentIndex(mode)
         self._table_stack.setCurrentIndex(mode)
         for i, btn in enumerate(self._mode_btns):
             btn.setChecked(i == mode)
-        if not self._months_loaded and mode != _MODE_UPLOADS:
-            asyncio.ensure_future(self._load_months())
-        if mode == _MODE_ADVANCED:
-            asyncio.ensure_future(self._ensure_filter_options())
-            self._do_find()
-        elif mode == _MODE_UPLOADS:
-            self._do_find()
-        # update count label phrasing
         if mode == _MODE_SIMPLE:
             self._count_label.setText("Days shown: —")
         elif mode == _MODE_UPLOADS:
@@ -508,30 +535,147 @@ class TransactionBrowser(QWidget):
         else:
             self._count_label.setText("Transactions: —")
         self._goto_btn.setEnabled(False)
-        self._export_btn.setEnabled(mode != _MODE_UPLOADS and False)
+        self._export_btn.setEnabled(False)
+        # Always reload so first open is never a blank table mid-fetch.
+        self._do_find()
+
+    def _on_open_upload(self, index) -> None:
+        self._open_upload_at(index.row())
+
+    def _open_upload_at(self, row: int) -> None:
+        """Open one Excel upload in Advanced (all its rows) for review/work."""
+        if row < 0 or row >= len(self._results_uploads):
+            return
+        u = self._results_uploads[row]
+        upload_id = str(u.get("_id") or "").strip()
+        if not upload_id:
+            return
+        min_d = u.get("min_date") or u.get("primary_date")
+        max_d = u.get("max_date") or min_d
+        primary = u.get("primary_date") or min_d
+
+        def _as_qdate(val):
+            if val is None:
+                return QDate.currentDate()
+            if hasattr(val, "date"):
+                val = val.date()
+            if isinstance(val, date):
+                return QDate(val.year, val.month, val.day)
+            return QDate.currentDate()
+
+        self._filter_upload_id = upload_id
+        if primary is not None:
+            d = primary.date() if hasattr(primary, "date") else primary
+            if isinstance(d, date):
+                self._a_year.blockSignals(True)
+                self._a_month.blockSignals(True)
+                y_idx = self._a_year.findData(d.year)
+                if y_idx >= 0:
+                    self._a_year.setCurrentIndex(y_idx)
+                else:
+                    self._a_year.addItem(str(d.year), d.year)
+                    self._a_year.setCurrentIndex(self._a_year.findData(d.year))
+                m_idx = self._a_month.findData(d.month)
+                if m_idx >= 0:
+                    self._a_month.setCurrentIndex(m_idx)
+                self._a_year.blockSignals(False)
+                self._a_month.blockSignals(False)
+        self._a_from.setDate(_as_qdate(min_d))
+        self._a_to.setDate(_as_qdate(max_d))
+        self._adv_kw_edit.clear()
+        self._cascade_busy = True
+        try:
+            self._item_combo.reset_to_all(emit=False)
+            self._subitem_combo.reset_to_all(emit=False)
+        finally:
+            self._cascade_busy = False
+
+        # Stay on Advanced with upload filter (don't clear via _switch_mode).
+        self._current_mode = _MODE_ADVANCED
+        self._filter_stack.setCurrentIndex(_MODE_ADVANCED)
+        self._table_stack.setCurrentIndex(_MODE_ADVANCED)
+        for i, btn in enumerate(self._mode_btns):
+            btn.setChecked(i == _MODE_ADVANCED)
+        self._do_find()
+
+        # Also jump the live register to the upload's primary day.
+        if primary is not None:
+            d = primary.date() if hasattr(primary, "date") else primary
+            if isinstance(d, date):
+                self.go_to_date.emit(d, "")
 
     # ── Async loaders ─────────────────────────────────────────────────────────
 
     async def _load_months(self) -> None:
         try:
+            years = await get_available_years()
             months = await get_available_months()
+            self._available_years = years
+            self._years_loaded = True
             self._months_loaded = True
-            for combo in (self._s_month, self._a_month):
-                combo.blockSignals(True)
-                combo.clear()
-                combo.addItem("All Months", None)
-                for y, m in months:
-                    combo.addItem(f"{_cal.month_abbr[m]} {y}", (y, m))
-                combo.blockSignals(False)
-
-            # Auto-select current month in the Advanced combo and fill date range
-            today = date.today()
-            for idx in range(1, self._a_month.count()):
-                if self._a_month.itemData(idx) == (today.year, today.month):
-                    self._a_month.setCurrentIndex(idx)  # triggers _apply_month
-                    break
+            self._populate_year_combos(years)
+            self._db_months = months
+            # Keep the user's Year/Month selection; only refresh date bounds.
+            self._apply_period_to_dates("simple")
+            self._apply_period_to_dates("advanced")
         except Exception:
-            pass
+            self._months_loaded = True
+            self._years_loaded = True
+
+    def _populate_year_combos(self, years: List[int]) -> None:
+        if not years:
+            years = [date.today().year]
+        for cb in (self._s_year, self._a_year):
+            cur = cb.currentData()
+            cb.blockSignals(True)
+            cb.clear()
+            for y in years:
+                cb.addItem(str(y), y)
+            idx = cb.findData(cur if cur is not None else date.today().year)
+            cb.setCurrentIndex(idx if idx >= 0 else 0)
+            cb.blockSignals(False)
+
+    @staticmethod
+    def _fill_month_combo(combo: QComboBox) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("All Months", None)
+        for m in range(1, 13):
+            combo.addItem(_MONTH_NAMES[m], m)
+        combo.blockSignals(False)
+
+    def _on_period_changed(self, which: str) -> None:
+        self._apply_period_to_dates(which)
+        if which == "advanced":
+            self._on_adv_dates_changed()
+        self._do_find()
+
+    def _apply_period_to_dates(self, which: str) -> None:
+        if which == "simple":
+            year_cb, month_cb, from_ed, to_ed = (
+                self._s_year, self._s_month, self._s_from, self._s_to,
+            )
+        else:
+            year_cb, month_cb, from_ed, to_ed = (
+                self._a_year, self._a_month, self._a_from, self._a_to,
+            )
+        y = year_cb.currentData()
+        m = month_cb.currentData()
+        if y is None:
+            y = date.today().year
+        if m is None:
+            from_ed.setDate(QDate(int(y), 1, 1))
+            to_ed.setDate(QDate(int(y), 12, 31))
+        else:
+            last = _cal.monthrange(int(y), int(m))[1]
+            from_ed.setDate(QDate(int(y), int(m), 1))
+            to_ed.setDate(QDate(int(y), int(m), last))
+
+    async def _ensure_period_ready(self) -> None:
+        if not self._years_loaded or not self._months_loaded:
+            await self._load_months()
+
+    # ── Async loaders ─────────────────────────────────────────────────────────
 
     async def _ensure_filter_options(self) -> None:
         await self._reload_cascade_options(from_items=True, from_descs=True)
@@ -594,18 +738,22 @@ class TransactionBrowser(QWidget):
 
     def _get_search_params(self) -> dict:
         if self._current_mode == _MODE_SIMPLE:
-            return dict(
+            params = dict(
                 keyword=self._kw_edit.text().strip(),
                 date_from=_qdate_to_py(self._s_from.date()),
                 date_to=_qdate_to_py(self._s_to.date()),
             )
-        return dict(
-            keyword=self._adv_kw_edit.text().strip(),
-            category_name=self._item_combo.selected_values(),
-            descriptions=self._subitem_combo.selected_values(),
-            date_from=_qdate_to_py(self._a_from.date()),
-            date_to=_qdate_to_py(self._a_to.date()),
-        )
+        else:
+            params = dict(
+                keyword=self._adv_kw_edit.text().strip(),
+                category_name=self._item_combo.selected_values(),
+                descriptions=self._subitem_combo.selected_values(),
+                date_from=_qdate_to_py(self._a_from.date()),
+                date_to=_qdate_to_py(self._a_to.date()),
+            )
+        if self._filter_upload_id and self._current_mode == _MODE_ADVANCED:
+            params["daily_import_id"] = self._filter_upload_id
+        return params
 
     def _do_find(self) -> None:
         for btn in self._find_btns:
@@ -613,21 +761,50 @@ class TransactionBrowser(QWidget):
         asyncio.ensure_future(self._async_find())
 
     async def _async_find(self) -> None:
+        self._find_generation += 1
+        gen = self._find_generation
+        self._find_in_flight = True
+        mode = self._current_mode
+        if self._loading is not None:
+            if mode == _MODE_UPLOADS:
+                msg = "Loading uploads…"
+            elif mode == _MODE_SIMPLE:
+                msg = "Loading daily transactions…"
+            else:
+                msg = "Loading transactions…"
+            self._loading.show_loading(msg)
         try:
-            if self._current_mode == _MODE_UPLOADS:
+            if mode != _MODE_UPLOADS:
+                await self._ensure_period_ready()
+                if gen != self._find_generation:
+                    return
+            if mode == _MODE_UPLOADS:
                 await self._load_uploads()
                 return
+            if mode == _MODE_ADVANCED and not self._filter_upload_id:
+                await self._ensure_filter_options()
+                if gen != self._find_generation:
+                    return
             params = self._get_search_params()
-            if self._current_mode == _MODE_SIMPLE:
-                self._results_simple = await get_daily_summaries(**params)
+            if mode == _MODE_SIMPLE:
+                self._results_simple = await get_daily_summaries(**params, limit=400)
+                if gen != self._find_generation:
+                    return
                 from tahmeed.services.accountant_service import get_cashier_names
                 ids = []
                 for s in self._results_simple:
                     ids.extend(s.get("cashier_ids") or [])
                 self._user_names = await get_cashier_names(ids) if ids else {}
+                if gen != self._find_generation:
+                    return
                 self._populate_simple(self._results_simple)
             else:
-                self._results_advanced = await get_transactions_flat(**params)
+                limit = 10000 if params.get("daily_import_id") else 1000
+                self._results_advanced = await get_transactions_flat(
+                    **params, limit=limit
+                )
+                if gen != self._find_generation:
+                    return
                 from tahmeed.services.accountant_service import get_cashier_names
                 ids = []
                 for tx in self._results_advanced:
@@ -636,13 +813,26 @@ class TransactionBrowser(QWidget):
                     if tx.last_edited_by:
                         ids.append(tx.last_edited_by)
                 self._user_names = await get_cashier_names(ids) if ids else {}
+                if gen != self._find_generation:
+                    return
                 self._populate_advanced(self._results_advanced)
+                if params.get("daily_import_id"):
+                    self._count_label.setText(
+                        f"Upload rows: {len(self._results_advanced):,}"
+                    )
+                    self._export_btn.setEnabled(bool(self._results_advanced))
+                    return
         except Exception as exc:
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Search Error", str(exc))
+            if gen == self._find_generation:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Search Error", str(exc))
         finally:
-            for btn in self._find_btns:
-                btn.setEnabled(True)
+            self._find_in_flight = False
+            if gen == self._find_generation and self._loading is not None:
+                self._loading.hide_loading()
+            if gen == self._find_generation:
+                for btn in self._find_btns:
+                    btn.setEnabled(True)
 
     async def _load_uploads(self) -> None:
         from tahmeed.services.daily_import_service import list_daily_uploads
@@ -692,6 +882,22 @@ class TransactionBrowser(QWidget):
             when = created.strftime("%d/%m/%Y %H:%M") if hasattr(created, "strftime") else "—"
             t.setItem(i, _U_COL_WHEN, _ro(when))
 
+            acts = QWidget()
+            acts.setStyleSheet("background:transparent;")
+            hl = QHBoxLayout(acts)
+            hl.setContentsMargins(4, 2, 4, 2)
+            hl.setSpacing(4)
+
+            open_btn = QPushButton("Open")
+            open_btn.setCursor(Qt.PointingHandCursor)
+            open_btn.setStyleSheet(
+                "QPushButton{background:#fff;color:#1d4ed8;border:1px solid #bfdbfe;"
+                "border-radius:4px;padding:2px 10px;font-size:11px;font-weight:600;}"
+                "QPushButton:hover{background:#eff6ff;}"
+            )
+            open_btn.clicked.connect(lambda _c=False, r=i: self._open_upload_at(r))
+            hl.addWidget(open_btn)
+
             btn = QPushButton("Delete")
             btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(
@@ -702,7 +908,8 @@ class TransactionBrowser(QWidget):
             btn.clicked.connect(
                 lambda _c=False, uid=upload_id, fn=fname, n=count: self._confirm_delete_upload(uid, fn, n)
             )
-            t.setCellWidget(i, _U_COL_ACT, btn)
+            hl.addWidget(btn)
+            t.setCellWidget(i, _U_COL_ACT, acts)
 
         self._count_label.setText(f"Uploads: {len(uploads)}")
         self._goto_btn.setEnabled(False)
@@ -904,22 +1111,40 @@ class TransactionBrowser(QWidget):
         if self._current_mode == _MODE_UPLOADS:
             self._do_find()
             return
+        self._filter_upload_id = ""
+        today = date.today()
         if self._current_mode == _MODE_SIMPLE:
             self._kw_edit.clear()
-            self._s_month.setCurrentIndex(0)
-            self._s_from.setDate(QDate(_ONE_MONTH_AGO.year, _ONE_MONTH_AGO.month, _ONE_MONTH_AGO.day))
-            self._s_to.setDate(QDate.currentDate())
+            self._s_year.blockSignals(True)
+            self._s_month.blockSignals(True)
+            y_idx = self._s_year.findData(today.year)
+            if y_idx >= 0:
+                self._s_year.setCurrentIndex(y_idx)
+            m_idx = self._s_month.findData(today.month)
+            if m_idx >= 0:
+                self._s_month.setCurrentIndex(m_idx)
+            self._s_year.blockSignals(False)
+            self._s_month.blockSignals(False)
+            self._apply_period_to_dates("simple")
         else:
             self._adv_kw_edit.clear()
-            self._a_month.setCurrentIndex(0)
             self._cascade_busy = True
             try:
                 self._item_combo.reset_to_all(emit=False)
                 self._subitem_combo.reset_to_all(emit=False)
             finally:
                 self._cascade_busy = False
-            self._a_from.setDate(QDate(_ONE_MONTH_AGO.year, _ONE_MONTH_AGO.month, _ONE_MONTH_AGO.day))
-            self._a_to.setDate(QDate.currentDate())
+            self._a_year.blockSignals(True)
+            self._a_month.blockSignals(True)
+            y_idx = self._a_year.findData(today.year)
+            if y_idx >= 0:
+                self._a_year.setCurrentIndex(y_idx)
+            m_idx = self._a_month.findData(today.month)
+            if m_idx >= 0:
+                self._a_month.setCurrentIndex(m_idx)
+            self._a_year.blockSignals(False)
+            self._a_month.blockSignals(False)
+            self._apply_period_to_dates("advanced")
             asyncio.ensure_future(self._reload_cascade_options(from_items=True, from_descs=True))
         self._goto_btn.setEnabled(False)
         self._export_btn.setEnabled(False)
@@ -929,13 +1154,23 @@ class TransactionBrowser(QWidget):
 
     def _on_selection_changed(self) -> None:
         if self._current_mode == _MODE_UPLOADS:
-            self._goto_btn.setEnabled(False)
+            self._goto_btn.setEnabled(self._uploads_table.currentRow() >= 0)
             return
         active = self._simple_table if self._current_mode == _MODE_SIMPLE else self._adv_table
         self._goto_btn.setEnabled(bool(active.selectedItems()))
 
     def _on_go_to(self) -> None:
         if self._current_mode == _MODE_UPLOADS:
+            row = self._uploads_table.currentRow()
+            if row < 0 or row >= len(self._results_uploads):
+                return
+            u = self._results_uploads[row]
+            primary = u.get("primary_date") or u.get("min_date")
+            if primary is None:
+                return
+            d = primary.date() if hasattr(primary, "date") else primary
+            if isinstance(d, date):
+                self.go_to_date.emit(d, "")
             return
         if self._current_mode == _MODE_SIMPLE:
             row = self._simple_table.currentRow()
@@ -1009,10 +1244,6 @@ class TransactionBrowser(QWidget):
 
     def refresh(self) -> None:
         """Called when the Browse sidebar page is shown."""
-        if not self._months_loaded:
-            asyncio.ensure_future(self._load_months())
-        if self._current_mode == _MODE_ADVANCED:
-            asyncio.ensure_future(self._ensure_filter_options())
         self._do_find()
 
     def show_and_search(self) -> None:
@@ -1086,16 +1317,6 @@ def _date_edit(d: date) -> QDateEdit:
 
 def _qdate_to_py(qd: QDate) -> date:
     return date(qd.year(), qd.month(), qd.day())
-
-
-def _apply_month(combo: QComboBox, from_edit: QDateEdit, to_edit: QDateEdit, idx: int) -> None:
-    data = combo.itemData(idx)
-    if data is None:
-        return
-    y, m = data
-    _, last_day = _cal.monthrange(y, m)
-    from_edit.setDate(QDate(y, m, 1))
-    to_edit.setDate(QDate(y, m, last_day))
 
 
 # Backward-compat alias

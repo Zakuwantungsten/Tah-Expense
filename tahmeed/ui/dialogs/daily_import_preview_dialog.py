@@ -70,7 +70,13 @@ class DailyImportPreviewDialog(QDialog):
         unmapped = sum(p.unmapped.values()) if p.unmapped else 0
         summary = QLabel(
             f"<b>{p.source_filename}</b><br>"
-            f"{len(p.rows):,} row(s) ready · Main date <b>{primary}</b>"
+            f"{len(p.rows):,} row(s) ready · Register date <b>{primary}</b>"
+            + (
+                f" · Excel dates kept"
+                f" ({p.outlier_count:,} row(s) on other dates)"
+                if p.outlier_count > 0
+                else ""
+            )
             + (f" · {skipped:,} blank/skipped" if skipped else "")
             + (f" · {unmapped:,} without item" if unmapped else "")
         )

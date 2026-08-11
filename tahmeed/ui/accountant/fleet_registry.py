@@ -130,12 +130,19 @@ def _status_chip(active: bool) -> QLabel:
 # ── Add vehicle dialog ─────────────────────────────────────────────────────────
 
 class _AddVehicleDialog(QDialog):
-    def __init__(self, kind: str, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        kind: str,
+        parent: Optional[QWidget] = None,
+        *,
+        require_plate_format: bool = True,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Add {kind}")
         self.setMinimumWidth(360)
         self.setStyleSheet("background:#FFFFFF;")
         self.result_number: Optional[str] = None
+        self._require_plate_format = require_plate_format
 
         vl = QVBoxLayout(self)
         vl.setContentsMargins(24, 24, 24, 24)
@@ -145,7 +152,9 @@ class _AddVehicleDialog(QDialog):
 
         vl.addWidget(_lbl("Registration Number *", size=12, color=_T2))
         self._inp = QLineEdit()
-        self._inp.setPlaceholderText(f"e.g. T880 CUL")
+        self._inp.setPlaceholderText(
+            "e.g. T880 CUL" if require_plate_format else "e.g. MC 123 ABC"
+        )
         self._inp.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:13px;"
@@ -173,17 +182,27 @@ class _AddVehicleDialog(QDialog):
         if not val:
             QMessageBox.warning(self, "Validation", "Registration number is required.")
             return
-        result = normalize_truck_number(val)
-        if result.status == "invalid":
-            QMessageBox.warning(
-                self, "Validation",
-                f'"{val}" is not a valid registration number.\n\n'
-                "Use format T + number + space + suffix, e.g. T880 CUL.\n"
-                "Compact forms like T880CUL are auto-corrected.",
-            )
-            return
-        self.result_number = result.value
-        self._inp.setText(result.value)
+        if self._require_plate_format:
+            result = normalize_truck_number(val)
+            if result.status not in ("ok", "normalized"):
+                QMessageBox.warning(
+                    self, "Validation",
+                    f'"{val}" is not a valid registration number.\n\n'
+                    "Use format T + number + space + suffix, e.g. T880 CUL.\n"
+                    "Compact forms like T880CUL are auto-corrected.",
+                )
+                return
+            self.result_number = result.value
+            self._inp.setText(result.value)
+        else:
+            number = " ".join(val.upper().split())
+            if len(number) < 2:
+                QMessageBox.warning(
+                    self, "Validation", "Registration number is required."
+                )
+                return
+            self.result_number = number
+            self._inp.setText(number)
         self.accept()
 
 
@@ -201,6 +220,8 @@ class _FleetRegistryBase(QWidget):
     _icon: str = "mdi.truck"
     _excel_section: str = "TRUCKS"   # "TRUCKS" / "TRAILERS" / "MOTOR VEHICLES"
     _col_prefs_key: str = "fleet_registry"
+    # Trucks/trailers use T### XXX; motorcycles & cars accept free-form plates.
+    _require_plate_format: bool = True
 
     # async callables — set by subclass
     _fn_list: Callable
@@ -587,7 +608,11 @@ class _FleetRegistryBase(QWidget):
         await self._load()
 
     def _add_vehicle(self) -> None:
-        dlg = _AddVehicleDialog(self._kind, parent=self)
+        dlg = _AddVehicleDialog(
+            self._kind,
+            parent=self,
+            require_plate_format=self._require_plate_format,
+        )
         if dlg.exec() == QDialog.Accepted and dlg.result_number:
             asyncio.ensure_future(self._do_add(dlg.result_number))
 
@@ -739,6 +764,7 @@ class MotorVehiclesRegistryWidget(_FleetRegistryBase):
     _icon          = "mdi.car"
     _excel_section = "MOTOR VEHICLES"
     _col_prefs_key = "fleet_motor_vehicles"
+    _require_plate_format = False
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         from tahmeed.services.truck_service import (

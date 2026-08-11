@@ -36,6 +36,21 @@ def test_scan_normalizes_and_matches_fleet() -> None:
     assert len(result.issues) == 2
 
 
+def test_scan_matches_freeform_fleet_plates() -> None:
+    """Motorcycle/car plates in the fleet must not be flagged invalid_format."""
+    rows = [
+        {"truck_no": "MC 123 ABC"},
+        {"truck_no": "weird/99"},
+    ]
+    fleet = {"MC 123 ABC"}
+    result = scan_import_trucks(rows, "truck_no", fleet)
+    assert rows[0]["truck_no"] == "MC 123 ABC"
+    assert result.ok_count == 1
+    assert len(result.issues) == 1
+    assert result.issues[0].kind == "invalid_format"
+    assert result.issues[0].original == "weird/99"
+
+
 def test_scan_skips_parking_congo_deposits() -> None:
     """Deposit rows must import without not-in-registry / invalid-format flags."""
     rows = [

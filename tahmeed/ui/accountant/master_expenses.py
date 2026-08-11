@@ -920,18 +920,22 @@ class MasterExpensesWidget(QWidget):
 
         tb.addStretch()
 
-        # FY selector
+        # FY selector — years filled dynamically from Master data on load
         tb.addWidget(_lbl("FY", size=12, color=_T2))
         self._fy_cb = QComboBox()
         current_yr = datetime.now().year
-        for yr in range(current_yr - 3, current_yr + 2):
+        for yr in range(current_yr + 1, current_yr - 4, -1):
             self._fy_cb.addItem(str(yr), yr)
         self._fy_cb.setCurrentIndex(
             self._fy_cb.findData(self._year) if self._fy_cb.findData(self._year) >= 0
-            else self._fy_cb.count() - 2
+            else self._fy_cb.findData(current_yr)
         )
         self._fy_cb.setFixedWidth(80)
         self._fy_cb.setStyleSheet(_input_ss())
+        self._fy_cb.setToolTip(
+            "Calendar year for Master (by Excel transaction date). "
+            "Use Uploads / Open upload to see a full daily import batch together."
+        )
         self._fy_cb.currentIndexChanged.connect(self._on_year_changed)
         tb.addWidget(self._fy_cb)
 
@@ -991,6 +995,32 @@ class MasterExpensesWidget(QWidget):
     def refresh(self) -> None:
         self._filters_loaded = False
         self._reset_and_load()
+
+    async def _reload_year_options(self) -> None:
+        """Populate FY combo from years that actually exist in Master."""
+        try:
+            from tahmeed.services.accountant_service import get_master_available_years
+            years = await get_master_available_years()
+        except Exception:
+            return
+        if not years:
+            return
+        cur = self._fy_cb.currentData() or self._year
+        self._fy_cb.blockSignals(True)
+        self._fy_cb.clear()
+        for yr in years:
+            self._fy_cb.addItem(str(yr), yr)
+        idx = self._fy_cb.findData(cur)
+        if idx < 0:
+            idx = self._fy_cb.findData(self._year)
+        if idx < 0:
+            idx = 0
+        self._fy_cb.setCurrentIndex(idx)
+        self._fy_cb.blockSignals(False)
+        chosen = self._fy_cb.currentData()
+        if chosen and chosen != self._year:
+            self._year = int(chosen)
+            app_state.fiscal_year = self._year
 
     def _filter_kw(self) -> dict:
         return dict(
@@ -1080,6 +1110,10 @@ class MasterExpensesWidget(QWidget):
                 get_master_transactions, count_master_transactions,
                 get_cashier_names,
             )
+
+            await self._reload_year_options()
+            if generation != self._reload_generation:
+                return
 
             kw = self._filter_kw()
             txs, total = await asyncio.gather(

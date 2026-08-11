@@ -2674,7 +2674,9 @@ class DailyRegister(QWidget):
                 self,
                 "Import ready",
                 f"Loaded {len(payloads):,} row(s) from \"{preview.source_filename}\" "
-                f"onto {primary.strftime('%d/%m/%Y')}.\n\n"
+                f"under register date {primary.strftime('%d/%m/%Y')}.\n\n"
+                "Excel row dates are kept as written. Open this upload anytime to "
+                "see every row in the batch.\n\n"
                 "Review the Table, make any edits, then click Save.\n"
                 "Saved entries go to the accountant Verify inbox.",
             )

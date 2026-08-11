@@ -143,6 +143,13 @@ def scan_import_trucks(
                 TruckIssue(row=i, original=raw, kind="not_in_registry")
             )
             continue
+        # Free-form plates (motorcycles/cars) may already be in the fleet
+        # without matching T### XXX — accept those before flagging format.
+        matched = try_match_fleet(raw, fleet)
+        if matched is not None:
+            row[truck_field] = matched
+            result.ok_count += 1
+            continue
         # Invalid / unrecognized format — flag for Skip / Allow anyway
         result.issues.append(
             TruckIssue(row=i, original=raw, kind="invalid_format")
