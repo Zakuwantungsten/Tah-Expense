@@ -19,6 +19,7 @@ from tahmeed.services.description_mapping_service import (
     normalize_description,
     save_mapping,
 )
+from tahmeed.services.excel_dates import parse_excel_date
 
 
 _MONTH_LABELS = [
@@ -63,19 +64,10 @@ def _cell_str(val) -> str:
 
 
 def _parse_date(val) -> Optional[datetime]:
-    if isinstance(val, datetime):
-        return val
-    if val is None:
+    parsed = parse_excel_date(val)
+    if parsed is None:
         return None
-    s = str(val).strip()
-    if not s:
-        return None
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    return None
+    return parsed.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def _normalize_receipt(val: str) -> str:

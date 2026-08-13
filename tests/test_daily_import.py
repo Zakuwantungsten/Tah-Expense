@@ -152,6 +152,8 @@ def test_parse_date_value() -> None:
     assert parse_date_value(datetime(2026, 7, 21)).date() == date(2026, 7, 21)
     assert parse_date_value("21/07/2026").date() == date(2026, 7, 21)
     assert parse_date_value("21-07-2026").date() == date(2026, 7, 21)
+    assert parse_date_value(46146).date() == date(2026, 5, 4)
+    assert parse_date_value("46146").date() == date(2026, 5, 4)
 
 
 def test_looks_like_classic_matumizi() -> None:

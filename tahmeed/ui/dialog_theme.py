@@ -11,9 +11,16 @@ before ``exec()`` whenever the parent may be styled.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
-from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QInputDialog,
+    QMessageBox,
+    QProgressDialog,
+    QWidget,
+)
 
 # Kept light to match the rest of the desktop UI (verify, master, cashier).
 _DIALOG_CONTRAST_SS = """
@@ -84,6 +91,18 @@ def style_message_box(box: QMessageBox) -> QMessageBox:
     return box
 
 
+def style_input_dialog(dlg: QInputDialog) -> QInputDialog:
+    """Apply contrast rules directly on an input dialog."""
+    dlg.setStyleSheet(_DIALOG_CONTRAST_SS)
+    return dlg
+
+
+def style_progress_dialog(dlg: QProgressDialog) -> QProgressDialog:
+    """Apply contrast rules directly on a progress dialog."""
+    dlg.setStyleSheet(_DIALOG_CONTRAST_SS)
+    return dlg
+
+
 def show_message(
     parent: Optional[QWidget],
     title: str,
@@ -91,9 +110,12 @@ def show_message(
     *,
     icon: QMessageBox.Icon = QMessageBox.Information,
     buttons: QMessageBox.StandardButton = QMessageBox.Ok,
+    default_button: Optional[QMessageBox.StandardButton] = None,
 ) -> int:
     """Show a contrast-safe message box and return the clicked button."""
     box = QMessageBox(icon, title, text, buttons, parent)
+    if default_button is not None:
+        box.setDefaultButton(default_button)
     style_message_box(box)
     return box.exec()
 
@@ -108,3 +130,38 @@ def show_info(parent: Optional[QWidget], title: str, text: str) -> int:
 
 def show_critical(parent: Optional[QWidget], title: str, text: str) -> int:
     return show_message(parent, title, text, icon=QMessageBox.Critical)
+
+
+def show_question(
+    parent: Optional[QWidget],
+    title: str,
+    text: str,
+    *,
+    default_no: bool = True,
+) -> int:
+    """Contrast-safe Yes/No question; returns the clicked standard button."""
+    return show_message(
+        parent,
+        title,
+        text,
+        icon=QMessageBox.Question,
+        buttons=QMessageBox.Yes | QMessageBox.No,
+        default_button=QMessageBox.No if default_no else QMessageBox.Yes,
+    )
+
+
+def get_text(
+    parent: Optional[QWidget],
+    title: str,
+    label: str,
+    text: str = "",
+) -> Tuple[str, bool]:
+    """Contrast-safe single-line input; returns ``(value, ok)``."""
+    dlg = QInputDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.setLabelText(label)
+    dlg.setTextValue(text)
+    dlg.setInputMode(QInputDialog.TextInput)
+    style_input_dialog(dlg)
+    ok = dlg.exec() == QDialog.Accepted
+    return (dlg.textValue() if ok else text), ok

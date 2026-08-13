@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from typing import Any, Callable, Coroutine
+from contextlib import contextmanager
+from typing import Any, Callable, Coroutine, Iterator, Optional
 
 from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QWidget
 
 
 def in_running_task() -> bool:
@@ -75,3 +77,42 @@ def schedule_coro(coro: Coroutine[Any, Any, Any]) -> None:
         QTimer.singleShot(0, _kick)
     else:
         _kick()
+
+
+def find_poll_pausable(widget: Optional[QWidget]) -> Optional[Any]:
+    """Walk parents for an object with ``pause_notification_polling``."""
+    w = widget
+    while w is not None:
+        if hasattr(w, "pause_notification_polling") and hasattr(
+            w, "resume_notification_polling"
+        ):
+            return w
+        w = w.parent() if hasattr(w, "parent") else None
+    return None
+
+
+# Nested import dialogs (gate inside _async_import) must not resume early.
+_poll_pause_depth = 0
+
+
+@contextmanager
+def pause_background_polls(widget: Optional[QWidget]) -> Iterator[None]:
+    """Pause accountant badge / connectivity polls during modal import work.
+
+    Nested Qt event loops (progress dialogs, correction dialogs, QMessageBox)
+    otherwise wake in-flight poll tasks while the import Task is still current,
+    which crashes under Python 3.14 + qasync.
+
+    Re-entrant: only the outermost caller resumes polling.
+    """
+    global _poll_pause_depth
+    dash = find_poll_pausable(widget)
+    if dash is not None and _poll_pause_depth == 0:
+        dash.pause_notification_polling()
+    _poll_pause_depth += 1
+    try:
+        yield
+    finally:
+        _poll_pause_depth = max(0, _poll_pause_depth - 1)
+        if dash is not None and _poll_pause_depth == 0:
+            dash.resume_notification_polling()

@@ -20,6 +20,7 @@ from tahmeed.services.description_mapping_service import (
     normalize_description,
     save_mapping,
 )
+from tahmeed.services.excel_dates import parse_excel_date
 
 # Header aliases → logical field (first match wins per column)
 _HEADER_ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -153,30 +154,11 @@ def parse_amount(val) -> Optional[float]:
 
 
 def parse_date_value(val) -> Optional[datetime]:
-    if isinstance(val, datetime):
-        return val.replace(hour=0, minute=0, second=0, microsecond=0)
-    if isinstance(val, date) and not isinstance(val, datetime):
-        return datetime(val.year, val.month, val.day)
-    if val is None:
+    """Parse Excel datetime, serial number, or common date string → midnight datetime."""
+    parsed = parse_excel_date(val)
+    if parsed is None:
         return None
-    s = str(val).strip()
-    if not s:
-        return None
-    for fmt in (
-        "%Y-%m-%d",
-        "%d/%m/%Y",
-        "%d-%m-%Y",
-        "%m/%d/%Y",
-        "%d.%m.%Y",
-        "%Y/%m/%d",
-        "%d %b %Y",
-        "%d %B %Y",
-    ):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    return None
+    return parsed.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def detect_date_from_name(text: str) -> Optional[date]:

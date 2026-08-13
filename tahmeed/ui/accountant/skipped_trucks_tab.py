@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -25,11 +24,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tahmeed.services.import_truck_check import truck_field_for
-from tahmeed.services.truck_format import (
-    DEFAULT_PLACE_LABELS,
-    normalize_truck_number,
-    try_match_fleet,
+from tahmeed.services.import_truck_check import (
+    combo_suffix_of,
+    leading_truck_of,
+    resolve_truck_cell,
+    truck_field_for,
+)
+from tahmeed.services.truck_format import DEFAULT_PLACE_LABELS, normalize_truck_number
+from tahmeed.ui.dialog_theme import (
+    show_critical,
+    show_info,
+    show_question,
+    show_warning,
 )
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
 
@@ -49,10 +55,15 @@ _T2 = "#6B7280"
 _BLUE = "#0077C5"
 
 _HEADERS = [
-    "Skipped", "Truck", "Original", "Reason", "Source file", "Sheet", "Upload id",
+    "", "File row", "Skipped", "Truck", "Original", "Reason",
+    "Receipt / Ledger", "Date", "Plaza / Details", "Amount",
+    "Source file", "Sheet", "Upload id",
 ]
 
+_COL_CHK = 0
+
 _EXPORT_HEADERS = [
+    "File Row",
     "Skipped At",
     "Truck",
     "Original Truck",
@@ -116,6 +127,53 @@ def _reason_label(reason: str) -> str:
     return reason or ""
 
 
+def _record_ledger(rec: dict) -> str:
+    return str(
+        rec.get("ledger_id")
+        or rec.get("receipt_no")
+        or rec.get("lpo_no")
+        or rec.get("serial")
+        or rec.get("ticket_no")
+        or ""
+    )
+
+
+def _record_date(rec: dict) -> str:
+    return str(
+        rec.get("payment_date")
+        or rec.get("toll_date")
+        or rec.get("date")
+        or rec.get("sales_date")
+        or ""
+    )
+
+
+def _record_details(rec: dict) -> str:
+    return str(
+        rec.get("toll_plaza")
+        or rec.get("transaction_details")
+        or rec.get("description")
+        or rec.get("details")
+        or rec.get("heading_to")
+        or rec.get("client_name")
+        or ""
+    )
+
+
+def _record_amount(rec: dict) -> str:
+    return str(rec.get("amount") or rec.get("tender_amount") or "")
+
+
+def _source_row_label(doc: dict) -> str:
+    row = doc.get("source_row")
+    if row is None or row == "":
+        return "—"
+    try:
+        return str(int(row))
+    except (TypeError, ValueError):
+        return str(row)
+
+
 def _export_row_values(doc: dict) -> List[str]:
     """Flatten a skipped row into export columns for follow-up tracking."""
     skipped_at = doc.get("skipped_at")
@@ -124,28 +182,8 @@ def _export_row_values(doc: dict) -> List[str]:
     else:
         when = str(skipped_at or "")
     rec = doc.get("record") or {}
-    ledger = (
-        rec.get("ledger_id")
-        or rec.get("receipt_no")
-        or rec.get("lpo_no")
-        or rec.get("serial")
-        or ""
-    )
-    pay_date = (
-        rec.get("payment_date")
-        or rec.get("toll_date")
-        or rec.get("date")
-        or ""
-    )
-    tx_type = rec.get("transaction_type") or rec.get("type") or ""
-    amount = rec.get("amount") or rec.get("tender_amount") or ""
-    details = (
-        rec.get("transaction_details")
-        or rec.get("description")
-        or rec.get("details")
-        or ""
-    )
     return [
+        _source_row_label(doc),
         when,
         str(doc.get("truck_value") or ""),
         str(doc.get("original_truck") or ""),
@@ -153,11 +191,11 @@ def _export_row_values(doc: dict) -> List[str]:
         str(doc.get("source_filename") or ""),
         str(doc.get("sheet_label") or ""),
         str(doc.get("target_upload_id") or ""),
-        str(ledger),
-        str(pay_date),
-        str(tx_type),
-        str(amount),
-        str(details),
+        _record_ledger(rec),
+        _record_date(rec),
+        str(rec.get("transaction_type") or rec.get("type") or ""),
+        _record_amount(rec),
+        _record_details(rec),
     ]
 
 
@@ -199,7 +237,7 @@ def _write_skipped_xlsx(path: str, docs: List[dict]) -> None:
             if ri % 2 == 0:
                 cell.fill = alt_fill
 
-    widths = [18, 14, 14, 16, 28, 12, 38, 16, 20, 14, 12, 28]
+    widths = [10, 18, 14, 14, 16, 28, 12, 38, 16, 20, 14, 12, 28]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[ws.cell(1, i).column_letter].width = w
 
@@ -226,8 +264,10 @@ class SkippedTrucksTab(QWidget):
 
         hint = _lbl(
             "Rows skipped during import because the truck was unknown or mistyped. "
-            "Edit the truck number after follow-up, then re-upload — they join the "
-            "original upload batch. Export Excel/CSV to share the skip list.",
+            "File row is the 1-based data row in that upload (after the header). "
+            "Tick one or more rows (or Select all), edit truck numbers, then "
+            "Re-upload — each truck is checked against the fleet registry again "
+            "before it rejoins the original upload batch.",
             size=11,
             color=_T2,
         )
@@ -241,8 +281,10 @@ class SkippedTrucksTab(QWidget):
         tbl.setSpacing(8)
 
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search truck, file, upload id…")
-        self._search.setFixedWidth(280)
+        self._search.setPlaceholderText(
+            "Search truck, receipt, plaza, file, row #…"
+        )
+        self._search.setFixedWidth(300)
         self._search.setStyleSheet(
             f"QLineEdit{{background:{_WHITE};border:1px solid {_BORDER};border-radius:5px;"
             f"padding:0 10px;min-height:32px;font-size:12px;}}"
@@ -253,6 +295,14 @@ class SkippedTrucksTab(QWidget):
         refresh_btn = _btn("Refresh", "mdi.refresh", primary=False)
         refresh_btn.clicked.connect(self.refresh)
         tbl.addWidget(refresh_btn)
+
+        sel_all_btn = _btn("Select all", primary=False)
+        sel_all_btn.clicked.connect(lambda: self._set_all_checked(True))
+        tbl.addWidget(sel_all_btn)
+
+        clear_sel_btn = _btn("Clear selection", primary=False)
+        clear_sel_btn.clicked.connect(lambda: self._set_all_checked(False))
+        tbl.addWidget(clear_sel_btn)
 
         export_xlsx_btn = _btn("Export Excel", "mdi.file-excel-outline", primary=False)
         export_xlsx_btn.clicked.connect(lambda: self._export("xlsx"))
@@ -291,7 +341,11 @@ class SkippedTrucksTab(QWidget):
         )
         hdr = self._table.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(_COL_CHK, QHeaderView.Fixed)
+        self._table.setColumnWidth(_COL_CHK, 36)
         hdr.setStretchLastSection(True)
+        self._table.itemChanged.connect(self._on_item_changed)
+        self._table.cellClicked.connect(self._on_cell_clicked)
         vl.addWidget(self._table, 1)
 
         self._status = _lbl("", size=11, color=_T2)
@@ -310,13 +364,20 @@ class SkippedTrucksTab(QWidget):
                 self._feed_key, search=search, limit=500, skip=0
             )
         except Exception as exc:
-            QMessageBox.critical(self, "Skipped", str(exc))
+            show_critical(self, "Skipped", str(exc))
             return
         self._fill()
-        self._status.setText(f"{total:,} skipped row(s)")
+        selected = self._checked_count()
+        if selected:
+            self._status.setText(
+                f"{total:,} skipped row(s)  ·  {selected:,} selected"
+            )
+        else:
+            self._status.setText(f"{total:,} skipped row(s)")
 
     def _fill(self) -> None:
         t = self._table
+        t.blockSignals(True)
         t.setRowCount(0)
         for doc in self._rows:
             r = t.rowCount()
@@ -326,24 +387,88 @@ class SkippedTrucksTab(QWidget):
                 when = skipped_at.strftime("%d %b %Y  %H:%M")
             else:
                 when = str(skipped_at or "—")
-            reason_lbl = _reason_label(str(doc.get("reason") or ""))
+            rec = doc.get("record") or {}
+            upload_id = str(doc.get("target_upload_id") or "")
+            upload_short = (upload_id[:8] + "…") if len(upload_id) > 8 else upload_id
+
+            chk = QTableWidgetItem("")
+            chk.setFlags(
+                Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable
+            )
+            chk.setCheckState(Qt.Unchecked)
+            chk.setData(Qt.UserRole, str(doc.get("_id") or ""))
+            t.setItem(r, _COL_CHK, chk)
+
             vals = [
+                _source_row_label(doc),
                 when,
                 doc.get("truck_value") or "",
                 doc.get("original_truck") or "",
-                reason_lbl,
+                _reason_label(str(doc.get("reason") or "")),
+                _record_ledger(rec),
+                _record_date(rec),
+                _record_details(rec),
+                _record_amount(rec),
                 doc.get("source_filename") or "",
                 doc.get("sheet_label") or "—",
-                (doc.get("target_upload_id") or "")[:8] + "…",
+                upload_short,
             ]
             for c, val in enumerate(vals):
-                t.setItem(r, c, _cell(val))
-            # stash full id on first cell
-            t.item(r, 0).setData(Qt.UserRole, str(doc.get("_id") or ""))
+                t.setItem(r, c + 1, _cell(val))
+        t.blockSignals(False)
+        self._update_selection_status()
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if item is None or item.column() != _COL_CHK:
+            return
+        self._update_selection_status()
+
+    def _on_cell_clicked(self, row: int, col: int) -> None:
+        """Clicking a data cell toggles that row's checkbox for easier multi-select."""
+        if col == _COL_CHK:
+            return
+        chk = self._table.item(row, _COL_CHK)
+        if chk is None:
+            return
+        new_state = (
+            Qt.Unchecked if chk.checkState() == Qt.Checked else Qt.Checked
+        )
+        self._table.blockSignals(True)
+        chk.setCheckState(new_state)
+        self._table.blockSignals(False)
+        self._update_selection_status()
+
+    def _set_all_checked(self, checked: bool) -> None:
+        state = Qt.Checked if checked else Qt.Unchecked
+        t = self._table
+        t.blockSignals(True)
+        for r in range(t.rowCount()):
+            chk = t.item(r, _COL_CHK)
+            if chk is not None:
+                chk.setCheckState(state)
+        t.blockSignals(False)
+        self._update_selection_status()
+
+    def _checked_count(self) -> int:
+        n = 0
+        for r in range(self._table.rowCount()):
+            chk = self._table.item(r, _COL_CHK)
+            if chk is not None and chk.checkState() == Qt.Checked:
+                n += 1
+        return n
+
+    def _update_selection_status(self) -> None:
+        total = len(self._rows)
+        selected = self._checked_count()
+        base = f"{total:,} skipped row(s)"
+        if selected:
+            self._status.setText(f"{base}  ·  {selected:,} selected")
+        else:
+            self._status.setText(base)
 
     def _export(self, fmt: str) -> None:
         if not self._rows:
-            QMessageBox.information(
+            show_info(
                 self, "Export", "No skipped rows to export. Refresh or clear search.",
             )
             return
@@ -368,9 +493,9 @@ class SkippedTrucksTab(QWidget):
             else:
                 _write_skipped_csv(path, self._rows)
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_critical(self, "Export Error", str(exc))
             return
-        QMessageBox.information(
+        show_info(
             self,
             "Export Complete",
             f"Exported {len(self._rows):,} skipped row(s) to:\n{path}",
@@ -378,12 +503,13 @@ class SkippedTrucksTab(QWidget):
 
     def _selected_ids(self) -> List[str]:
         ids: List[str] = []
-        for idx in self._table.selectionModel().selectedRows():
-            item = self._table.item(idx.row(), 0)
-            if item:
-                rid = item.data(Qt.UserRole)
-                if rid:
-                    ids.append(str(rid))
+        for r in range(self._table.rowCount()):
+            chk = self._table.item(r, _COL_CHK)
+            if chk is None or chk.checkState() != Qt.Checked:
+                continue
+            rid = chk.data(Qt.UserRole)
+            if rid:
+                ids.append(str(rid))
         return ids
 
     def _selected_docs(self) -> List[dict]:
@@ -392,42 +518,148 @@ class SkippedTrucksTab(QWidget):
 
     def _edit_selected(self) -> None:
         docs = self._selected_docs()
-        if len(docs) != 1:
-            QMessageBox.information(
-                self, "Edit truck", "Select exactly one skipped row to edit."
+        if not docs:
+            show_info(
+                self,
+                "Edit truck",
+                "Select one or more skipped rows (tick the checkbox, or click a row).",
             )
             return
-        doc = docs[0]
-        current = str(doc.get("truck_value") or "")
-        text, ok = QInputDialog.getText(
-            self,
-            "Edit truck number",
-            "Correct truck number (after follow-up with the report author):",
-            text=current,
-        )
-        if not ok:
-            return
-        value = text.strip()
-        if not value:
-            QMessageBox.warning(self, "Edit truck", "Truck number cannot be empty.")
-            return
-        asyncio.ensure_future(self._save_truck(str(doc.get("_id")), value))
+        asyncio.ensure_future(self._do_edit(docs))
 
-    async def _save_truck(self, doc_id: str, value: str) -> None:
+    async def _do_edit(self, docs: List[dict]) -> None:
+        """Open the fleet correction dialog for the selected skipped rows."""
         from tahmeed.services import accountant_service as svc
+        from tahmeed.services.truck_service import get_fleet_numbers, add_fleet_by_collection
+        from tahmeed.services.truck_format import merge_allowed_labels
+        from tahmeed.services import settings_service
 
         try:
-            await svc.update_skipped_import_truck(doc_id, value)
+            fleet = await get_fleet_numbers()
         except Exception as exc:
-            QMessageBox.critical(self, "Edit truck", str(exc))
+            show_critical(
+                self,
+                "Edit truck",
+                "Could not load the fleet registry.\n\n"
+                f"{exc}\n\nNothing was changed.",
+            )
             return
+        try:
+            from tahmeed.services.truck_service import get_fleet_kinds
+            fleet_kinds = await get_fleet_kinds()
+        except Exception:
+            fleet_kinds = {}
+        try:
+            stored = await settings_service.get_setting("allowed_truck_labels")
+        except Exception:
+            stored = []
+        labels = merge_allowed_labels(DEFAULT_PLACE_LABELS, stored or [])
+
+        issues: List[TruckIssue] = []
+        for i, doc in enumerate(docs):
+            raw = str(
+                doc.get("truck_value")
+                or doc.get("original_truck")
+                or ""
+            ).strip()
+            truck_only = leading_truck_of(raw)
+            norm = normalize_truck_number(truck_only, allowed_labels=labels)
+            kind = (
+                "invalid_format"
+                if norm.status == "invalid"
+                else "not_in_registry"
+            )
+            src = _source_row_label(doc)
+            row_label = (
+                f"File row {src}"
+                if src != "—"
+                else f"Skipped row {i + 1}"
+            )
+            issues.append(TruckIssue(
+                row=i,
+                original=raw,
+                kind=kind,
+                row_label=row_label,
+                combo_suffix=combo_suffix_of(raw),
+            ))
+
+        dlg = TruckCorrectionDialog(
+            issues,
+            fleet,
+            can_add=True,
+            allowed_labels=labels,
+            import_mode=True,
+            fleet_kinds=fleet_kinds,
+            heading="Edit truck numbers",
+            intro=(
+                "Correct the selected skipped truck number(s). "
+                "Type to look up the fleet registry, then Apply, Allow anyway, "
+                "Add to registry, or Skip a row to leave it unchanged. "
+                "Applying one fix can also update every other selected row "
+                "with the same original value."
+            ),
+            parent=self,
+        )
+        dlg.exec()
+
+        for kind, number in dlg.pending_registry_adds:
+            try:
+                await add_fleet_by_collection(kind, number)
+            except Exception as exc:
+                show_warning(
+                    self, "Registry", f"Could not add {number}:\n{exc}"
+                )
+
+        if dlg.new_labels:
+            try:
+                merged = merge_allowed_labels(labels, dlg.new_labels)
+                await settings_service.set_setting(
+                    "allowed_truck_labels", sorted(merged)
+                )
+            except Exception:
+                pass
+
+        by_row = {iss.row: iss for iss in dlg.issues}
+        updated = 0
+        for i, doc in enumerate(docs):
+            iss = by_row.get(i)
+            if iss is None or iss.omit_row or (iss.skip and not iss.corrected):
+                continue
+            value = (iss.corrected or iss.original or "").strip()
+            if not value:
+                continue
+            try:
+                await svc.update_skipped_import_truck(str(doc["_id"]), value)
+                updated += 1
+            except Exception as exc:
+                show_critical(self, "Edit truck", str(exc))
+                await self._load()
+                return
+
         await self._load()
+        if updated:
+            show_info(
+                self,
+                "Edit truck",
+                f"Updated truck number on {updated:,} skipped row(s).",
+            )
+        else:
+            show_info(
+                self,
+                "Edit truck",
+                "No truck numbers were changed.",
+            )
 
     def _delete_selected(self) -> None:
         ids = self._selected_ids()
         if not ids:
+            show_info(
+                self,
+                "Delete",
+                "Select one or more skipped rows to delete.",
+            )
             return
-        if QMessageBox.question(
+        if show_question(
             self,
             "Delete skipped",
             f"Permanently delete {len(ids):,} skipped row(s)?",
@@ -441,7 +673,7 @@ class SkippedTrucksTab(QWidget):
         try:
             await svc.delete_skipped_import_rows(ids)
         except Exception as exc:
-            QMessageBox.critical(self, "Delete", str(exc))
+            show_critical(self, "Delete", str(exc))
             return
         self.changed.emit()
         await self._load()
@@ -449,21 +681,32 @@ class SkippedTrucksTab(QWidget):
     def _reupload_selected(self) -> None:
         docs = self._selected_docs()
         if not docs:
-            QMessageBox.information(self, "Re-upload", "Select one or more skipped rows.")
+            show_info(
+                self,
+                "Re-upload",
+                "Select one or more skipped rows (tick checkboxes, or Select all).",
+            )
             return
         asyncio.ensure_future(self._do_reupload(docs))
 
     async def _do_reupload(self, docs: List[dict]) -> None:
-        """Re-check fleet, then insert into each row's original target_upload_id."""
+        """Re-check every selected truck against the fleet, then re-upload passers."""
         from tahmeed.services import accountant_service as svc
+        from tahmeed.services.import_truck_check import scan_import_trucks
         from tahmeed.services.truck_service import get_fleet_numbers, add_fleet_by_collection
         from tahmeed.services.truck_format import merge_allowed_labels
         from tahmeed.services import settings_service
 
         try:
             fleet = await get_fleet_numbers()
-        except Exception:
-            fleet = set()
+        except Exception as exc:
+            show_critical(
+                self,
+                "Re-upload",
+                "Could not load the fleet registry to verify trucks.\n\n"
+                f"{exc}\n\nNothing was re-uploaded.",
+            )
+            return
         try:
             from tahmeed.services.truck_service import get_fleet_kinds
             fleet_kinds = await get_fleet_kinds()
@@ -475,41 +718,25 @@ class SkippedTrucksTab(QWidget):
             stored = []
         labels = merge_allowed_labels(DEFAULT_PLACE_LABELS, stored or [])
 
-        ready_ids: List[str] = []
-        issues: List[TruckIssue] = []
-        issue_docs: List[dict] = []
-
+        field = docs[0].get("truck_field") or self._truck_field
+        work_rows: List[dict] = []
         for doc in docs:
-            field = doc.get("truck_field") or self._truck_field
-            raw = str(doc.get("truck_value") or "")
-            norm = normalize_truck_number(raw, allowed_labels=labels)
-            if norm.status == "place_label":
-                await svc.update_skipped_import_truck(str(doc["_id"]), norm.value)
-                ready_ids.append(str(doc["_id"]))
-                continue
-            if norm.status in ("ok", "normalized"):
-                matched = try_match_fleet(norm.value, fleet)
-                if matched is not None:
-                    await svc.update_skipped_import_truck(str(doc["_id"]), matched)
-                    ready_ids.append(str(doc["_id"]))
-                    continue
-                issues.append(TruckIssue(
-                    row=len(issue_docs),
-                    original=raw,
-                    kind="not_in_registry",
-                ))
-                issue_docs.append(doc)
-                continue
-            issues.append(TruckIssue(
-                row=len(issue_docs),
-                original=raw,
-                kind="invalid_format",
-            ))
-            issue_docs.append(doc)
+            row_field = doc.get("truck_field") or field
+            rec = dict(doc.get("record") or {})
+            rec[row_field] = str(doc.get("truck_value") or rec.get(row_field, "") or "")
+            # Keep a stable field name for the shared scanner
+            if row_field != field:
+                rec[field] = rec[row_field]
+            work_rows.append(rec)
 
-        if issues:
+        scan = scan_import_trucks(
+            work_rows, field, fleet, allowed_labels=labels,
+        )
+
+        by_issue: dict = {}
+        if scan.issues:
             dlg = TruckCorrectionDialog(
-                issues,
+                scan.issues,
                 fleet,
                 can_add=True,
                 allowed_labels=labels,
@@ -521,24 +748,66 @@ class SkippedTrucksTab(QWidget):
             for kind, number in dlg.pending_registry_adds:
                 try:
                     await add_fleet_by_collection(kind, number)
+                    fleet.add(number)
                 except Exception as exc:
-                    QMessageBox.warning(
+                    show_warning(
                         self, "Registry", f"Could not add {number}:\n{exc}"
                     )
-            by_row = {iss.row: iss for iss in dlg.issues}
-            for i, doc in enumerate(issue_docs):
-                iss = by_row.get(i)
-                if iss is None or iss.omit_row or (iss.skip and not iss.corrected):
+            by_issue = {iss.row: iss for iss in dlg.issues}
+            # Apply dialog outcomes onto working rows
+            for i, row in enumerate(work_rows):
+                iss = by_issue.get(i)
+                if iss is None:
                     continue
-                value = iss.corrected or iss.original
+                if iss.omit_row or (iss.skip and not iss.corrected):
+                    continue
+                value = (iss.corrected or iss.original or "").strip()
+                if value:
+                    row[field] = value
+
+            # Refresh fleet after possible registry adds
+            try:
+                fleet = await get_fleet_numbers()
+            except Exception:
+                pass
+
+        ready_ids: List[str] = []
+        blocked = 0
+        for i, doc in enumerate(docs):
+            iss = by_issue.get(i)
+            if iss is not None and (
+                iss.omit_row or (iss.skip and not iss.corrected)
+            ):
+                blocked += 1
+                continue
+
+            value = str(work_rows[i].get(field) or "").strip()
+            if not value:
+                blocked += 1
+                continue
+
+            allow_anyway = bool(iss and iss.allow_anyway)
+            status, canonical = resolve_truck_cell(value, fleet, labels)
+            if status in ("ok", "place_label"):
+                await svc.update_skipped_import_truck(str(doc["_id"]), canonical)
+                ready_ids.append(str(doc["_id"]))
+                continue
+
+            if allow_anyway:
+                # Explicit override from the correction dialog only
                 await svc.update_skipped_import_truck(str(doc["_id"]), value)
                 ready_ids.append(str(doc["_id"]))
+                continue
+
+            blocked += 1
 
         if not ready_ids:
-            QMessageBox.information(
+            show_info(
                 self,
                 "Re-upload",
-                "No rows were ready to re-upload (still skipped or unresolved).",
+                "No rows passed the fleet registry check.\n"
+                "Fix the truck number(s), add them to the registry, "
+                "or use Allow anyway in the correction dialog.",
             )
             await self._load()
             return
@@ -546,14 +815,16 @@ class SkippedTrucksTab(QWidget):
         try:
             saved = await svc.reupload_skipped_import_rows(ready_ids)
         except Exception as exc:
-            QMessageBox.critical(self, "Re-upload", str(exc))
+            show_critical(self, "Re-upload", str(exc))
             await self._load()
             return
 
-        QMessageBox.information(
-            self,
-            "Re-upload complete",
-            f"Re-uploaded {saved:,} row(s) into their original upload batch(es).",
+        msg = (
+            f"Re-uploaded {saved:,} row(s) into their original upload batch(es) "
+            "after fleet registry verification."
         )
+        if blocked:
+            msg += f"\n{blocked:,} row(s) stayed in Skipped (still unresolved)."
+        show_info(self, "Re-upload complete", msg)
         self.changed.emit()
         await self._load()

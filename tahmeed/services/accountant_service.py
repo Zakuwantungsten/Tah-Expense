@@ -2,14 +2,20 @@
 
 import asyncio
 import calendar
+import hashlib
 import re
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Sequence, Set, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from bson import ObjectId
 
 from tahmeed.db.connection import get_db
 from tahmeed.models.transaction import Transaction
+from tahmeed.services.excel_dates import (
+    format_excel_date,
+    normalize_date_fields,
+    parse_excel_date,
+)
 
 
 def _date_range_clause(
@@ -296,10 +302,36 @@ async def _overview_zmw_feed_month_totals(year: int) -> Dict[int, float]:
     return dict(pairs)
 
 
+async def _overview_usd_feed_month_totals(year: int) -> Dict[int, float]:
+    """Per-month USD from separate-expense feeds (all except Toll Plaza / Zambia ZMW).
+
+    Congo / Kimvi contribute money-out; Parking Congo and Afritrack contribute
+    their spend totals. Toll Plaza stays in the ZMW feed merge only.
+    """
+
+    async def _month(m: int) -> tuple[int, float]:
+        congo, kimvi, parking, afritrack = await asyncio.gather(
+            get_congo_all_totals(year=year, month=m),
+            get_kimvi_all_totals(year=year, month=m),
+            get_parking_congo_all_totals(year=year, month=m),
+            get_afritrack_all_totals(year=year, month=m),
+        )
+        total = (
+            float(congo.get("money_out", 0) or 0)
+            + float(kimvi.get("money_out", 0) or 0)
+            + float(parking.get("amount", 0) or 0)
+            + float(afritrack.get("total_invoice", 0) or 0)
+        )
+        return m, total
+
+    pairs = await asyncio.gather(*[_month(m) for m in range(1, 13)])
+    return dict(pairs)
+
+
 async def get_overview_kpis(year: Optional[int] = None) -> dict:
     """Aggregate real counts for the Overview KPI cards (TZS / USD / ZMW).
 
-    ZMW from imported feeds (Toll Plaza / Zambia Parking) is merged by
+    USD/ZMW from imported separate-expense feeds are merged by
     ``get_overview_dashboard`` so feed aggregations run once per refresh.
     """
     today = date.today()
@@ -433,14 +465,15 @@ async def get_overview_receipt_breakdown(year: int) -> dict:
 async def get_overview_month_totals(year: int) -> Dict:
     """Per-month TZS / USD / ZMW totals for the Overview trend chart.
 
-    Master ledger supplies TZS/USD/(any ZMW on transactions). Toll Plaza and
-    Zambia Parking feeds are added into the ZMW bucket so the chart matches
-    the currencies used across the accountant workspace.
+    Master ledger supplies TZS/USD/(any ZMW on transactions). Separate-expense
+    USD feeds (Congo, Kimvi, Parking Congo, Afritrack) are added into USD;
+    Toll Plaza and Zambia Parking feeds are added into ZMW.
 
-    Returns ``{"months": {1: {...}, ...}, "feed_zmw_ytd": float}``.
+    Returns ``{"months": {1: {...}, ...}, "feed_usd_ytd": float, "feed_zmw_ytd": float}``.
     """
-    master, feed_zmw = await asyncio.gather(
+    master, feed_usd, feed_zmw = await asyncio.gather(
         get_master_month_totals(year),
+        _overview_usd_feed_month_totals(year),
         _overview_zmw_feed_month_totals(year),
     )
     months: Dict[int, dict] = {}
@@ -448,12 +481,13 @@ async def get_overview_month_totals(year: int) -> Dict:
         row = master.get(month, {"tzs": 0.0, "usd": 0.0, "zmw": 0.0, "count": 0})
         months[month] = {
             "tzs": float(row.get("tzs", 0.0) or 0.0),
-            "usd": float(row.get("usd", 0.0) or 0.0),
+            "usd": float(row.get("usd", 0.0) or 0.0) + float(feed_usd.get(month, 0.0) or 0.0),
             "zmw": float(row.get("zmw", 0.0) or 0.0) + float(feed_zmw.get(month, 0.0) or 0.0),
             "count": int(row.get("count", 0) or 0),
         }
     return {
         "months": months,
+        "feed_usd_ytd": float(sum(feed_usd.values())),
         "feed_zmw_ytd": float(sum(feed_zmw.values())),
     }
 
@@ -468,6 +502,10 @@ async def get_overview_dashboard(year: int) -> dict:
         get_verified_transactions(year=year, limit=8),
     )
     kpis = dict(kpis)
+    kpis["total_usd_ytd"] = (
+        float(kpis.get("total_usd_ytd", 0.0) or 0.0)
+        + float(month_payload.get("feed_usd_ytd", 0.0) or 0.0)
+    )
     kpis["total_zmw_ytd"] = (
         float(kpis.get("total_zmw_ytd", 0.0) or 0.0)
         + float(month_payload.get("feed_zmw_ytd", 0.0) or 0.0)
@@ -1885,25 +1923,8 @@ async def get_existing_feed_keys(keys: List[str]) -> set:
 
 
 def _parse_toll_date(val) -> Optional[datetime]:
-    """Best-effort parse of a toll_date string or datetime from import."""
-    if val is None or val == "":
-        return None
-    if isinstance(val, datetime):
-        return val
-    if isinstance(val, date):
-        return datetime(val.year, val.month, val.day)
-    s = str(val).strip()
-    if not s:
-        return None
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y",
-        "%d-%m-%Y", "%d %b %Y", "%d %B %Y", "%m/%d/%Y",
-    ):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    return None
+    """Best-effort parse of a toll/payment/sales date from import (incl. Excel serials)."""
+    return parse_excel_date(val)
 
 
 def _toll_month_regex_patterns(year: int, month: int) -> List[str]:
@@ -2082,6 +2103,7 @@ async def get_parking_congo_available_years() -> List[int]:
 _IMPORT_UPPER_SKIP = frozenset({
     "feed_type", "upload_id", "source_filename", "import_date", "created_at",
     "transaction_date", "expense_date", "expense_type", "row_index", "_id",
+    "installation_label", "total_payable_label",
 })
 
 
@@ -2110,13 +2132,9 @@ async def save_imported_feed(records: list) -> int:
         doc.pop("_raw", None)
         doc["import_date"] = now
         if doc.get("feed_type") == "toll_plaza":
-            parsed = _parse_toll_date(doc.get("toll_date"))
-            if parsed:
-                doc["transaction_date"] = parsed
+            normalize_date_fields(doc, "toll_date", store_as="transaction_date")
         elif doc.get("feed_type") == "parking_congo":
-            parsed = _parse_toll_date(doc.get("payment_date"))
-            if parsed:
-                doc["transaction_date"] = parsed
+            normalize_date_fields(doc, "payment_date", store_as="transaction_date")
             # Deposits are account credits (no truck) — tag for Deposited tab
             tt = str(doc.get("transaction_type", "") or "").strip().lower()
             if tt == "deposit" or doc.get("is_deposit"):
@@ -2129,15 +2147,30 @@ async def save_imported_feed(records: list) -> int:
                     if val.lower() in ("", "-", "–", "—", "−", ".", "n/a", "na", "none"):
                         doc[_k] = ""
         elif doc.get("feed_type") == "rahntech":
-            parsed = _parse_toll_date(doc.get("sales_date"))
-            if parsed:
-                doc["transaction_date"] = parsed
+            normalize_date_fields(doc, "sales_date", store_as="transaction_date")
+        elif doc.get("feed_type") == "zambia_parking":
+            # Prefer existing transaction_date; fall back to Date column (serials OK).
+            if isinstance(doc.get("transaction_date"), datetime):
+                pretty = format_excel_date(doc["transaction_date"], "%d %b %Y")
+                if pretty:
+                    doc["date"] = pretty
+            else:
+                normalize_date_fields(
+                    doc, "date", "transaction_date", store_as="transaction_date",
+                )
         elif str(doc.get("feed_type", "")).startswith("diesel_"):
-            parsed = _parse_toll_date(doc.get("date"))
-            if parsed:
-                doc["transaction_date"] = parsed
+            normalize_date_fields(doc, "date", store_as="transaction_date")
         _uppercase_import_text(doc)
         docs.append(doc)
+
+    # Stamp whole-batch content hash on Zambia Parking rows (exact-file gate).
+    # Keep a pre-set hash (from the full file before truck-gate filtering).
+    zambia_docs = [d for d in docs if d.get("feed_type") == "zambia_parking"]
+    if zambia_docs and not str(zambia_docs[0].get("content_hash") or "").strip():
+        batch_hash = zambia_batch_content_hash(zambia_docs)
+        for d in zambia_docs:
+            d["content_hash"] = batch_hash
+
     from tahmeed.db.import_idempotency import insert_many_idempotent
 
     inserted, _dupes = await insert_many_idempotent(db.imported_feeds, docs)
@@ -2690,29 +2723,142 @@ async def delete_rahntech_upload(upload_id: str) -> int:
 
 # ── Zambia Parking — weekly statement import (sheet tab = week label) ─────────
 
+def _norm_sheet_label(label: str) -> str:
+    return str(label or "").strip().upper()
+
+
+def _zambia_hash_field(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if value == int(value):
+            return str(int(value))
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+    return str(value).strip().upper()
+
+
+def zambia_batch_content_hash(records: List[dict]) -> str:
+    """SHA-256 of the exact ordered statement rows (whole-file duplicate gate).
+
+    Does not use ticket-only matching — the full row set must match.
+    """
+    lines: List[str] = []
+    for rec in records:
+        lines.append("|".join([
+            _zambia_hash_field(rec.get("date")),
+            _zambia_hash_field(rec.get("type")),
+            _zambia_hash_field(rec.get("plate_num")),
+            _zambia_hash_field(rec.get("ticket_no")),
+            _zambia_hash_field(rec.get("debit")),
+            _zambia_hash_field(rec.get("credit")),
+            _zambia_hash_field(rec.get("balance")),
+            _zambia_hash_field(rec.get("heading_to")),
+        ]))
+    payload = "\n".join(lines).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 async def zambia_sheet_exists(sheet_label: str) -> bool:
-    """True when a weekly sheet tab was already imported."""
+    """True when a weekly sheet tab was already imported (case-insensitive)."""
     if not sheet_label.strip():
         return False
     db = get_db()
     count = await db.imported_feeds.count_documents({
-        "feed_type":   "zambia_parking",
-        "sheet_label": sheet_label.strip(),
+        "feed_type": "zambia_parking",
+        "sheet_label": {"$regex": f"^{re.escape(sheet_label.strip())}$", "$options": "i"},
     })
     return count > 0
 
 
 async def zambia_existing_sheet_labels(labels: List[str]) -> set:
-    """Return sheet tab names from labels that were already imported."""
-    clean = [l.strip() for l in labels if l and l.strip()]
+    """Return sheet tab names from *labels* that were already imported (case-insensitive)."""
+    clean = [l.strip() for l in labels if l and str(l).strip()]
     if not clean:
         return set()
     db = get_db()
+    clauses = [
+        {"sheet_label": {"$regex": f"^{re.escape(l)}$", "$options": "i"}}
+        for l in clean
+    ]
     found = await db.imported_feeds.distinct(
         "sheet_label",
-        {"feed_type": "zambia_parking", "sheet_label": {"$in": clean}},
+        {"feed_type": "zambia_parking", "$or": clauses},
     )
-    return set(found)
+    found_upper = {_norm_sheet_label(s) for s in found if s}
+    return {l for l in clean if _norm_sheet_label(l) in found_upper}
+
+
+async def find_zambia_uploads_by_content_hash(content_hash: str) -> List[dict]:
+    """Return existing Zambia Parking upload summaries that match *content_hash*."""
+    if not content_hash:
+        return []
+    db = get_db()
+
+    # Fast path: rows stamped with content_hash on save.
+    stamped_ids = await db.imported_feeds.distinct(
+        "upload_id",
+        {"feed_type": "zambia_parking", "content_hash": content_hash},
+    )
+    matches: Dict[str, dict] = {}
+    uploads = await get_zambia_parking_uploads()
+    by_id = {str(u.get("_id") or ""): u for u in uploads}
+
+    for uid in stamped_ids:
+        key = str(uid or "").strip()
+        if not key:
+            continue
+        up = by_id.get(key)
+        if up:
+            matches[key] = {
+                "upload_id": key,
+                "sheet_label": up.get("sheet_label") or "",
+                "source_filename": up.get("source_filename") or "",
+                "import_date": up.get("import_date"),
+                "record_count": int(up.get("record_count", 0) or 0),
+                "content_hash": content_hash,
+            }
+
+    # Legacy uploads (no content_hash): re-hash each batch once.
+    for up in uploads:
+        uid = str(up.get("_id") or "").strip()
+        if not uid or uid in matches:
+            continue
+        rows = await db.imported_feeds.find(
+            {"feed_type": "zambia_parking", "upload_id": uid},
+            {
+                "date": 1, "type": 1, "plate_num": 1, "ticket_no": 1,
+                "debit": 1, "credit": 1, "balance": 1, "heading_to": 1,
+                "row_index": 1, "content_hash": 1,
+            },
+        ).sort([("row_index", 1)]).to_list(length=None)
+        if not rows:
+            continue
+        # If any row already has a different stored hash, skip; if same, caught above.
+        stored = {
+            str(r.get("content_hash") or "").strip()
+            for r in rows
+            if str(r.get("content_hash") or "").strip()
+        }
+        if stored:
+            continue
+        if zambia_batch_content_hash(rows) == content_hash:
+            matches[uid] = {
+                "upload_id": uid,
+                "sheet_label": up.get("sheet_label") or "",
+                "source_filename": up.get("source_filename") or "",
+                "import_date": up.get("import_date"),
+                "record_count": int(up.get("record_count", 0) or 0),
+                "content_hash": content_hash,
+            }
+
+    return list(matches.values())
+
+
+async def zambia_exact_content_already_uploaded(records: List[dict]) -> List[dict]:
+    """If this exact statement body was imported before, return matching upload(s)."""
+    if not records:
+        return []
+    return await find_zambia_uploads_by_content_hash(zambia_batch_content_hash(records))
 
 
 async def get_zambia_parking_uploads() -> list:
@@ -3296,28 +3442,36 @@ async def get_diesel_available_years(feed_type: str) -> List[int]:
 # ── Ahmed Kimvi — Excel import (last sheet per workbook) ─────────────────────
 
 async def kimvi_sheet_exists(sheet_label: str) -> bool:
-    """True when a sheet with this exact tab name was already imported."""
+    """True when a sheet with this tab name was already imported (case-insensitive)."""
     if not sheet_label.strip():
         return False
     db = get_db()
     count = await db.separate_expenses.count_documents({
         "expense_type": "ahmed_kimvi",
-        "sheet_label":  sheet_label.strip(),
+        "sheet_label": {
+            "$regex": f"^{re.escape(sheet_label.strip())}$",
+            "$options": "i",
+        },
     })
     return count > 0
 
 
 async def kimvi_existing_sheet_labels(labels: List[str]) -> set:
-    """Return sheet tab names from labels that were already imported."""
-    clean = [l.strip() for l in labels if l and l.strip()]
+    """Return sheet tab names from *labels* that were already imported (case-insensitive)."""
+    clean = [l.strip() for l in labels if l and str(l).strip()]
     if not clean:
         return set()
     db = get_db()
+    clauses = [
+        {"sheet_label": {"$regex": f"^{re.escape(l)}$", "$options": "i"}}
+        for l in clean
+    ]
     found = await db.separate_expenses.distinct(
         "sheet_label",
-        {"expense_type": "ahmed_kimvi", "sheet_label": {"$in": clean}},
+        {"expense_type": "ahmed_kimvi", "$or": clauses},
     )
-    return set(found)
+    found_upper = {_norm_sheet_label(s) for s in found if s}
+    return {l for l in clean if _norm_sheet_label(l) in found_upper}
 
 
 async def save_kimvi_import(records: list) -> int:
@@ -3333,6 +3487,13 @@ async def save_kimvi_import(records: list) -> int:
         doc["expense_type"] = "ahmed_kimvi"
         doc["import_date"]  = now
         doc["created_at"]   = now
+        if not isinstance(doc.get("expense_date"), datetime):
+            normalize_date_fields(
+                doc, "date_str", "expense_date", store_as="expense_date",
+                display_fmt="%d %b %Y",
+            )
+            if isinstance(doc.get("expense_date"), datetime):
+                doc["date_str"] = format_excel_date(doc["expense_date"], "%d %b %Y")
         _uppercase_import_text(doc)
         docs.append(doc)
     from tahmeed.db.import_idempotency import insert_many_idempotent
@@ -3608,28 +3769,36 @@ async def delete_kimvi_upload(upload_id: str) -> int:
 # ── Congo Expenses — Excel import (last sheet per workbook) ──────────────────
 
 async def congo_sheet_exists(sheet_label: str) -> bool:
-    """True when a sheet with this exact tab name was already imported."""
+    """True when a sheet with this tab name was already imported (case-insensitive)."""
     if not sheet_label.strip():
         return False
     db = get_db()
     count = await db.separate_expenses.count_documents({
         "expense_type": "congo_expenses",
-        "sheet_label":  sheet_label.strip(),
+        "sheet_label": {
+            "$regex": f"^{re.escape(sheet_label.strip())}$",
+            "$options": "i",
+        },
     })
     return count > 0
 
 
 async def congo_existing_sheet_labels(labels: List[str]) -> set:
-    """Return sheet tab names from labels that were already imported."""
-    clean = [l.strip() for l in labels if l and l.strip()]
+    """Return sheet tab names from *labels* that were already imported (case-insensitive)."""
+    clean = [l.strip() for l in labels if l and str(l).strip()]
     if not clean:
         return set()
     db = get_db()
+    clauses = [
+        {"sheet_label": {"$regex": f"^{re.escape(l)}$", "$options": "i"}}
+        for l in clean
+    ]
     found = await db.separate_expenses.distinct(
         "sheet_label",
-        {"expense_type": "congo_expenses", "sheet_label": {"$in": clean}},
+        {"expense_type": "congo_expenses", "$or": clauses},
     )
-    return set(found)
+    found_upper = {_norm_sheet_label(s) for s in found if s}
+    return {l for l in clean if _norm_sheet_label(l) in found_upper}
 
 
 async def save_congo_import(records: list) -> int:
@@ -3645,6 +3814,13 @@ async def save_congo_import(records: list) -> int:
         doc["expense_type"] = "congo_expenses"
         doc["import_date"]  = now
         doc["created_at"]   = now
+        if not isinstance(doc.get("expense_date"), datetime):
+            normalize_date_fields(
+                doc, "date_str", "expense_date", store_as="expense_date",
+                display_fmt="%d %b %Y",
+            )
+            if isinstance(doc.get("expense_date"), datetime):
+                doc["date_str"] = format_excel_date(doc["expense_date"], "%d %b %Y")
         _uppercase_import_text(doc)
         docs.append(doc)
     from tahmeed.db.import_idempotency import insert_many_idempotent
@@ -3957,6 +4133,16 @@ def _truck_exact(value: str) -> dict:
     return {"$regex": f"^{re.escape(value.strip())}$", "$options": "i"}
 
 
+def _truck_and_trailer_match(value: str) -> dict:
+    """Match a truck in SM Burhani ``T469EKZ/T689ELK`` cells and spaced plates."""
+    from tahmeed.services.import_truck_check import truck_and_trailer_search_regex
+
+    pattern = truck_and_trailer_search_regex(value)
+    if not pattern:
+        return _truck_exact(value)
+    return {"$regex": pattern, "$options": "i"}
+
+
 def _safe_float_value(value: Any) -> float:
     try:
         if value in (None, "", "None"):
@@ -4002,7 +4188,11 @@ def _truck_row_matches_search(row: dict, search: str) -> bool:
             "currency",
         )
     ).lower()
-    return needle in haystack
+    if needle in haystack:
+        return True
+    compact_needle = re.sub(r"\s+", "", needle)
+    compact_truck = re.sub(r"\s+", "", str(row.get("truck_value") or "").lower())
+    return bool(compact_needle) and compact_needle in compact_truck
 
 
 def _truck_row_in_date_range(
@@ -4176,6 +4366,7 @@ async def _truck_overview_imported_feed_rows(
             truck_value=str(doc.get("vehicle_no", "") or ""),
             description=doc.get("transaction_details") or doc.get("transaction_type") or "Parking transaction",
             reference=doc.get("ledger_id") or doc.get("direction") or "",
+            currency="USD",
             amount=doc.get("amount"),
             station=doc.get("cashier") or "",
         ))
@@ -4350,10 +4541,7 @@ async def _truck_overview_extra_sidebar_rows(
         _with_date_range(
             {
                 "entity": "sm_burhani",
-                "truck_and_trailer": {
-                    "$regex": re.escape(truck.strip()),
-                    "$options": "i",
-                },
+                "truck_and_trailer": _truck_and_trailer_match(truck),
             },
             "t1_date",
             date_from,
@@ -4395,9 +4583,14 @@ async def get_afritrack_uploads() -> list:
             "total_tahmeed":        {"$sum": _safe_double("total_tahmeed")},
             "total_invoice":        {"$sum": _safe_double("total_invoice")},
             "total_variance":       {"$sum": _safe_double("variance")},
-            "installation_tahmeed": {"$first": _safe_double("installation_tahmeed")},
-            "installation_invoice": {"$first": _safe_double("installation_invoice")},
-            "balance_mar":          {"$first": _safe_double("balance_mar")},
+            "installation_tahmeed": {"$first": "$installation_tahmeed"},
+            "installation_invoice": {"$first": "$installation_invoice"},
+            "balance_mar":          {"$first": "$balance_mar"},
+            "vat_rate":             {"$first": "$vat_rate"},
+            "installation_label":   {"$first": "$installation_label"},
+            "total_payable_label":  {"$first": "$total_payable_label"},
+            "statement_tahmeed":    {"$first": "$statement_tahmeed"},
+            "statement_invoice":    {"$first": "$statement_invoice"},
         }},
         {"$sort": {"import_date": -1}},
     ]
@@ -4758,17 +4951,10 @@ async def list_skipped_import_rows(
     query: dict = {"feed_key": feed_key}
     term = (search or "").strip()
     if term:
-        rx = {"$regex": term, "$options": "i"}
-        query["$or"] = [
-            {"truck_value": rx},
-            {"original_truck": rx},
-            {"source_filename": rx},
-            {"sheet_label": rx},
-            {"target_upload_id": rx},
-        ]
+        query.update(_skipped_import_search_clause(term))
     cursor = (
         db.skipped_import_rows.find(query)
-        .sort("skipped_at", -1)
+        .sort([("skipped_at", -1), ("source_row", 1)])
         .skip(max(0, skip))
         .limit(max(1, limit))
     )
@@ -4780,15 +4966,36 @@ async def count_skipped_import_rows(feed_key: str, search: str = "") -> int:
     query: dict = {"feed_key": feed_key}
     term = (search or "").strip()
     if term:
-        rx = {"$regex": term, "$options": "i"}
-        query["$or"] = [
-            {"truck_value": rx},
-            {"original_truck": rx},
-            {"source_filename": rx},
-            {"sheet_label": rx},
-            {"target_upload_id": rx},
-        ]
+        query.update(_skipped_import_search_clause(term))
     return await db.skipped_import_rows.count_documents(query)
+
+
+def _skipped_import_search_clause(term: str) -> dict:
+    """Build ``$or`` search across parked-row metadata and nested record fields."""
+    rx = {"$regex": re.escape(term), "$options": "i"}
+    clauses: list = [
+        {"truck_value": rx},
+        {"original_truck": rx},
+        {"source_filename": rx},
+        {"sheet_label": rx},
+        {"target_upload_id": rx},
+        {"reason": rx},
+        {"record.receipt_no": rx},
+        {"record.ledger_id": rx},
+        {"record.lpo_no": rx},
+        {"record.serial": rx},
+        {"record.toll_plaza": rx},
+        {"record.vehicle_reg": rx},
+        {"record.vehicle_no": rx},
+        {"record.plate_num": rx},
+        {"record.client_name": rx},
+        {"record.cashier_name": rx},
+        {"record.description": rx},
+        {"record.transaction_details": rx},
+    ]
+    if term.isdigit():
+        clauses.append({"source_row": int(term)})
+    return {"$or": clauses}
 
 
 async def update_skipped_import_truck(doc_id: str, truck_value: str) -> bool:
@@ -4879,6 +5086,13 @@ async def reupload_skipped_import_rows(ids: list[str]) -> int:
             saved += await save_congo_import(records)
         elif feed_key == "ahmed_kimvi":
             saved += await save_kimvi_import(records)
+        elif feed_key in ("rpa_schedule", "bonds", "sm_burhani"):
+            from tahmeed.models.reconciliation import ReconciliationEntry
+            from tahmeed.services.reconciliation_service import save_reconciliation_rows
+
+            saved += await save_reconciliation_rows(
+                [ReconciliationEntry.from_doc(rec) for rec in records]
+            )
         else:
             saved += await save_imported_feed(records)
 

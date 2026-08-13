@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QMessageBox, QProgressDialog, QWidget
+from PySide6.QtWidgets import QProgressDialog, QWidget
 
 from tahmeed.services.import_truck_check import (
     apply_truck_resolutions,
@@ -15,7 +15,8 @@ from tahmeed.services.import_truck_check import (
     truck_field_for,
 )
 from tahmeed.services.truck_format import DEFAULT_PLACE_LABELS, merge_allowed_labels
-from tahmeed.ui.async_utils import safe_process_events
+from tahmeed.ui.async_utils import pause_background_polls, safe_process_events
+from tahmeed.ui.dialog_theme import show_critical, show_warning, style_progress_dialog
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog
 
 
@@ -43,6 +44,30 @@ async def run_import_truck_gate(
 
     If there is no truck field for ``feed_key``, returns rows unchanged.
     """
+    with pause_background_polls(parent):
+        return await _run_import_truck_gate_inner(
+            parent,
+            rows,
+            feed_key=feed_key,
+            upload_id=upload_id,
+            truck_field=truck_field,
+            source_filename=source_filename,
+            sheet_label=sheet_label,
+            can_add=can_add,
+        )
+
+
+async def _run_import_truck_gate_inner(
+    parent: QWidget,
+    rows: List[dict],
+    *,
+    feed_key: str,
+    upload_id: str,
+    truck_field: Optional[str] = None,
+    source_filename: str = "",
+    sheet_label: str = "",
+    can_add: bool = True,
+) -> ImportTruckGateResult:
     field = truck_field or truck_field_for(feed_key)
     if not field or not rows:
         return ImportTruckGateResult(rows=list(rows))
@@ -58,7 +83,7 @@ async def run_import_truck_gate(
     try:
         fleet = await get_fleet_numbers()
     except Exception as exc:
-        QMessageBox.critical(
+        show_critical(
             parent,
             "Fleet registry",
             "Could not load the truck/trailer registry to check this import.\n\n"
@@ -90,6 +115,7 @@ async def run_import_truck_gate(
     progress.setCancelButton(None)
     progress.setMaximum(max(1, len(rows)))
     progress.setValue(0)
+    style_progress_dialog(progress)
     progress.show()
     safe_process_events()
 
@@ -131,7 +157,7 @@ async def run_import_truck_gate(
         try:
             await add_fleet_by_collection(kind, number)
         except Exception as exc:
-            QMessageBox.warning(
+            show_warning(
                 parent,
                 "Registry",
                 f"Could not add {number} to registry:\n{exc}",
@@ -160,7 +186,7 @@ async def run_import_truck_gate(
         try:
             skipped_count = await svc.save_skipped_import_rows(docs)
         except Exception as exc:
-            QMessageBox.warning(
+            show_warning(
                 parent,
                 "Skipped rows",
                 f"Could not park skipped rows for follow-up:\n{exc}",

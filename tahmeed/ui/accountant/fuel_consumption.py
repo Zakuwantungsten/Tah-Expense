@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QDateEdit,
 )
 
+from tahmeed.services.excel_dates import format_excel_date, parse_excel_date
+
 try:
     import openpyxl
     _HAS_OPENPYXL = True
@@ -305,37 +307,19 @@ def _fmt_num(v: Any, prefix: str = "", decimals: int = 2) -> str:
         return str(v)
 
 
-_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S",
-                 "%d/%m/%Y", "%m/%d/%Y")
-
-
 def _fmt_date_str(val: Any) -> str:
+    text = format_excel_date(val, "%d %b %y", fallback="")
+    if text:
+        return text
     if val is None or str(val) in ("None", ""):
         return "—"
-    if isinstance(val, datetime):
-        return val.strftime("%d %b %y")
-    s = str(val).strip()
-    for fmt in _DATE_FORMATS:
-        try:
-            return datetime.strptime(s, fmt).strftime("%d %b %y")
-        except ValueError:
-            continue
-    return s
+    return str(val).strip() or "—"
 
 
 def _looks_like_date(val: Any) -> bool:
     if val in (None, ""):
         return False
-    if isinstance(val, datetime):
-        return True
-    s = str(val).strip()
-    for fmt in _DATE_FORMATS:
-        try:
-            datetime.strptime(s, fmt)
-            return True
-        except ValueError:
-            continue
-    return False
+    return parse_excel_date(val) is not None
 
 
 def _fmt_cell(

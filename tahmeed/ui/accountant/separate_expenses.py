@@ -19,8 +19,9 @@ import io
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
+from tahmeed.services.excel_dates import format_excel_date, parse_excel_date
 from tahmeed.ui.accountant.date_filters import (
     add_from_to_editors, read_from_to, sync_from_to, clear_list_filters,
 )
@@ -225,9 +226,14 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
 
 
 def _fmt_date(dt) -> str:
-    if isinstance(dt, datetime):
-        return dt.strftime("%d %b %y")
-    return str(dt) if dt else "—"
+    text = format_excel_date(dt, "%d %b %y", fallback="")
+    return text if text else "—"
+
+
+# Date column keys in generic ImportDialog feeds — serials must not stay as ints.
+_IMPORT_DATE_KEYS = frozenset({
+    "toll_date", "payment_date", "sales_date", "date",
+})
 
 
 def _fmt_num(v, prefix: str = "", decimals: int = 2) -> str:
@@ -801,7 +807,16 @@ class ImportDialog(QDialog):
                 "source_filename": self._source_filename,
             }
             for key, idx in field_idxs.items():
-                rec[key] = row[idx].strip() if (idx is not None and idx < len(row)) else ""
+                raw = row[idx].strip() if (idx is not None and idx < len(row)) else ""
+                if key in _IMPORT_DATE_KEYS and raw:
+                    parsed = parse_excel_date(raw)
+                    rec[key] = (
+                        format_excel_date(parsed, "%d %b %Y")
+                        if parsed is not None
+                        else raw
+                    )
+                else:
+                    rec[key] = raw
             records.append(rec)
             if total_rows and (i % 200 == 0 or i + 1 == total_rows):
                 # Stay on stage 2–3 while mapping rows
@@ -856,59 +871,62 @@ class ImportDialog(QDialog):
         asyncio.ensure_future(self._async_import())
 
     async def _async_import(self) -> None:
-        try:
-            from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
-            from tahmeed.services.import_truck_check import truck_field_for
+        from tahmeed.ui.async_utils import pause_background_polls
 
-            rows = list(self._new_rows)
-            skipped = 0
-            if truck_field_for(self._feed_type):
-                # Gate has its own progress dialog — hide our overlay while it runs
-                self._loading.hide_loading()
-                gate = await run_import_truck_gate(
-                    self,
-                    rows,
-                    feed_key=self._feed_type,
-                    upload_id=self._upload_id,
-                    source_filename=self._source_filename,
-                    can_add=True,
-                )
-                if gate.aborted:
-                    self._clear_busy(enable_import=True)
-                    self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
-                    return
-                rows = gate.rows
-                skipped = gate.skipped_count
-                if not rows and skipped:
-                    self._clear_busy()
-                    QMessageBox.information(
+        with pause_background_polls(self):
+            try:
+                from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
+                from tahmeed.services.import_truck_check import truck_field_for
+
+                rows = list(self._new_rows)
+                skipped = 0
+                if truck_field_for(self._feed_type):
+                    # Gate has its own progress dialog — hide our overlay while it runs
+                    self._loading.hide_loading()
+                    gate = await run_import_truck_gate(
                         self,
-                        "Import",
-                        f"No rows imported. {skipped:,} parked in the Skipped tab "
-                        "for follow-up.",
+                        rows,
+                        feed_key=self._feed_type,
+                        upload_id=self._upload_id,
+                        source_filename=self._source_filename,
+                        can_add=True,
                     )
-                    self.imported.emit(0)
-                    self.accept()
-                    return
-                if not rows:
-                    self._clear_busy(enable_import=True)
-                    self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
-                    return
+                    if gate.aborted:
+                        self._clear_busy(enable_import=True)
+                        self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
+                        return
+                    rows = gate.rows
+                    skipped = gate.skipped_count
+                    if not rows and skipped:
+                        self._clear_busy()
+                        QMessageBox.information(
+                            self,
+                            "Import",
+                            f"No rows imported. {skipped:,} parked in the Skipped tab "
+                            "for follow-up.",
+                        )
+                        self.imported.emit(0)
+                        self.accept()
+                        return
+                    if not rows:
+                        self._clear_busy(enable_import=True)
+                        self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
+                        return
 
-            self._set_busy(
-                f"Saving {len(rows):,} records…",
-                value=0,
-                maximum=0,
-            )
-            saved = await self._save_fn(rows)
-            self._last_skipped = skipped
-            self._clear_busy()
-            self.imported.emit(saved)
-            self.accept()
-        except Exception as exc:
-            self._clear_busy(enable_import=True)
-            QMessageBox.critical(self, "Import Error", str(exc))
-            self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
+                self._set_busy(
+                    f"Saving {len(rows):,} records…",
+                    value=0,
+                    maximum=0,
+                )
+                saved = await self._save_fn(rows)
+                self._last_skipped = skipped
+                self._clear_busy()
+                self.imported.emit(saved)
+                self.accept()
+            except Exception as exc:
+                self._clear_busy(enable_import=True)
+                QMessageBox.critical(self, "Import Error", str(exc))
+                self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -935,7 +953,7 @@ _TOLL_COL_MAP = {
     "card_no":      ["card no", "card number", "card"],
     "vehicle_reg":  ["vehicle reg", "vehicle", "vehicle registration", "plate"],
     "vehicle_class":["vehicle class", "class"],
-    "tender_amount":["tender", "amount", "tender amount", "zmw"],
+    "tender_amount":["tender", "tender (zmw)", "amount", "tender amount", "zmw"],
     "receipt_no":   ["receipt no", "receipt", "receipt number", "receipt no."],
     "device":       ["device code", "device", "device id"],
     "lane":         ["lane"],
@@ -1684,7 +1702,7 @@ class TollPlazaWidget(QWidget):
             col_map=_TOLL_COL_MAP,
             save_fn=svc.save_imported_feed,
             exist_fn=svc.get_existing_feed_keys,
-            header_row=1,
+            auto_header_row=True,
             template_title=_TOLL_TEMPLATE_TITLE,
             template_headers=_TOLL_DETAIL_HEADERS,
             template_filename="Toll_Plaza_Import_Template.xlsx",
@@ -2738,12 +2756,12 @@ def _parse_congo_sheet(ws) -> List[dict]:
         except (TypeError, ValueError):
             amt = 0.0
 
-        if isinstance(dt, datetime):
-            date_str     = dt.strftime("%d %b %Y")
-            expense_date = dt
-        else:
-            date_str     = str(dt).strip() if dt is not None else ""
-            expense_date = None
+        expense_date = parse_excel_date(dt)
+        date_str = (
+            format_excel_date(expense_date, "%d %b %Y")
+            if expense_date is not None
+            else (str(dt).strip() if dt is not None else "")
+        )
 
         lpo_str   = str(lpo).strip() if lpo is not None else ""
         truck_str = str(truck).strip() if truck is not None else ""
@@ -3254,6 +3272,7 @@ class CongoImportDialog(QDialog):
     async def _async_import(self) -> None:
         from tahmeed.services import accountant_service as svc
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
+        from tahmeed.ui.async_utils import pause_background_polls
 
         docs = []
         for rec in self._records:
@@ -3263,41 +3282,42 @@ class CongoImportDialog(QDialog):
             doc["source_filename"] = self._source_filename
             docs.append(doc)
 
-        try:
-            gate = await run_import_truck_gate(
-                self,
-                docs,
-                feed_key="congo_expenses",
-                upload_id=self._upload_id,
-                source_filename=self._source_filename,
-                sheet_label=self._sheet_label,
-                can_add=True,
-            )
-            if gate.aborted:
-                self._import_btn.setEnabled(True)
-                self._import_btn.setText(f"Import {len(self._records):,} Rows")
-                return
-            self._last_skipped = gate.skipped_count
-            if not gate.rows:
-                if gate.skipped_count:
-                    QMessageBox.information(
-                        self,
-                        "Import",
-                        f"No rows imported. {gate.skipped_count:,} parked in Skipped.",
-                    )
-                    self.imported.emit(0)
-                    self.accept()
-                else:
+        with pause_background_polls(self):
+            try:
+                gate = await run_import_truck_gate(
+                    self,
+                    docs,
+                    feed_key="congo_expenses",
+                    upload_id=self._upload_id,
+                    source_filename=self._source_filename,
+                    sheet_label=self._sheet_label,
+                    can_add=True,
+                )
+                if gate.aborted:
                     self._import_btn.setEnabled(True)
                     self._import_btn.setText(f"Import {len(self._records):,} Rows")
-                return
-            saved = await svc.save_congo_import(gate.rows)
-            self.imported.emit(saved)
-            self.accept()
-        except Exception as exc:
-            QMessageBox.critical(self, "Import Error", str(exc))
-            self._import_btn.setEnabled(True)
-            self._import_btn.setText(f"Import {len(self._records):,} Rows")
+                    return
+                self._last_skipped = gate.skipped_count
+                if not gate.rows:
+                    if gate.skipped_count:
+                        QMessageBox.information(
+                            self,
+                            "Import",
+                            f"No rows imported. {gate.skipped_count:,} parked in Skipped.",
+                        )
+                        self.imported.emit(0)
+                        self.accept()
+                    else:
+                        self._import_btn.setEnabled(True)
+                        self._import_btn.setText(f"Import {len(self._records):,} Rows")
+                    return
+                saved = await svc.save_congo_import(gate.rows)
+                self.imported.emit(saved)
+                self.accept()
+            except Exception as exc:
+                QMessageBox.critical(self, "Import Error", str(exc))
+                self._import_btn.setEnabled(True)
+                self._import_btn.setText(f"Import {len(self._records):,} Rows")
 
 
 class _CongoExpUploadBrowse(QWidget):
@@ -3848,12 +3868,12 @@ def _parse_kimvi_sheet(ws) -> List[dict]:
         except (TypeError, ValueError):
             amt = 0.0
 
-        if isinstance(dt, datetime):
-            date_str     = dt.strftime("%d %b %Y")
-            expense_date = dt
-        else:
-            date_str     = str(dt).strip() if dt is not None else ""
-            expense_date = None
+        expense_date = parse_excel_date(dt)
+        date_str = (
+            format_excel_date(expense_date, "%d %b %Y")
+            if expense_date is not None
+            else (str(dt).strip() if dt is not None else "")
+        )
 
         truck_str = str(truck).strip() if truck is not None else ""
 
@@ -4070,13 +4090,23 @@ class BulkSheetImportDialog(QDialog):
 
         for batch in batches:
             label   = batch["sheet_label"]
-            records = batch["records"]
+            records = list(batch["records"])
             balance = self._balance_fn(records)
-            if label in existing:
+            status = "New"
+            if self._feed_key == "zambia_parking" and records:
+                # Exact whole-statement content only (not ticket / sheet-name).
+                from tahmeed.services import accountant_service as svc
+                try:
+                    matching = await svc.zambia_exact_content_already_uploaded(records)
+                except Exception:
+                    matching = []
+                if matching:
+                    status = "Already uploaded"
+                    self._skipped_count += 1
+            elif label in existing:
                 status = "Already uploaded"
                 self._skipped_count += 1
-            else:
-                status = "New"
+
             self._sheet_rows.append({
                 "sheet_label": label,
                 "records":     records,
@@ -4099,9 +4129,9 @@ class BulkSheetImportDialog(QDialog):
             )
         else:
             self._stats_lbl.setText(
-                f"Sheets in file: {len(batches):,}     "
-                f"New: {new_sheets:,} ({new_rows:,} rows)     "
-                f"Already uploaded: {self._skipped_count:,}"
+                f"Sheets ready: {new_sheets:,} / {len(batches):,}     "
+                f"New rows: {new_rows:,}     "
+                f"Already uploaded sheets: {self._skipped_count:,}"
             )
 
         self._fill_preview()
@@ -4222,51 +4252,59 @@ class BulkSheetImportDialog(QDialog):
     async def _async_import(self, pending: List[dict]) -> None:
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
         from tahmeed.services.import_truck_check import truck_field_for
+        from tahmeed.ui.async_utils import pause_background_polls
 
         sheets_imported = 0
         total_rows      = 0
         total_skipped   = 0
 
-        try:
-            for batch in pending:
-                docs = []
-                for rec in batch["records"]:
-                    doc = dict(rec)
-                    doc["sheet_label"]     = batch["sheet_label"]
-                    doc["upload_id"]       = batch["upload_id"]
-                    doc["source_filename"] = self._source_filename
-                    docs.append(doc)
+        with pause_background_polls(self):
+            try:
+                for batch in pending:
+                    docs = []
+                    for rec in batch["records"]:
+                        doc = dict(rec)
+                        doc["sheet_label"]     = batch["sheet_label"]
+                        doc["upload_id"]       = batch["upload_id"]
+                        doc["source_filename"] = self._source_filename
+                        docs.append(doc)
 
-                if self._feed_key and truck_field_for(self._feed_key):
-                    gate = await run_import_truck_gate(
-                        self,
-                        docs,
-                        feed_key=self._feed_key,
-                        upload_id=batch["upload_id"],
-                        source_filename=self._source_filename,
-                        sheet_label=batch["sheet_label"],
-                        can_add=True,
-                    )
-                    if gate.aborted:
-                        break
-                    docs = gate.rows
-                    total_skipped += gate.skipped_count
-                    if not docs:
-                        continue
+                    if self._feed_key and truck_field_for(self._feed_key):
+                        gate = await run_import_truck_gate(
+                            self,
+                            docs,
+                            feed_key=self._feed_key,
+                            upload_id=batch["upload_id"],
+                            source_filename=self._source_filename,
+                            sheet_label=batch["sheet_label"],
+                            can_add=True,
+                        )
+                        if gate.aborted:
+                            break
+                        docs = gate.rows
+                        total_skipped += gate.skipped_count
+                        if not docs:
+                            continue
 
-                saved = await self._save_fn(docs)
-                if saved:
-                    sheets_imported += 1
-                    total_rows      += saved
+                    if self._feed_key == "zambia_parking" and batch.get("records"):
+                        from tahmeed.services import accountant_service as svc
+                        file_hash = svc.zambia_batch_content_hash(batch["records"])
+                        for row in docs:
+                            row["content_hash"] = file_hash
 
-            self._last_skipped = total_skipped
-            if sheets_imported or total_skipped:
-                self.imported.emit(sheets_imported, total_rows)
-                self.accept()
-            else:
-                self._refresh_import_btn()
-        except Exception as exc:
-            QMessageBox.critical(self, "Bulk Import Error", str(exc))
+                    saved = await self._save_fn(docs)
+                    if saved:
+                        sheets_imported += 1
+                        total_rows      += saved
+
+                self._last_skipped = total_skipped
+                if sheets_imported or total_skipped:
+                    self.imported.emit(sheets_imported, total_rows)
+                    self.accept()
+                else:
+                    self._refresh_import_btn()
+            except Exception as exc:
+                QMessageBox.critical(self, "Bulk Import Error", str(exc))
             self._refresh_import_btn()
 
 
@@ -4426,6 +4464,7 @@ class KimviImportDialog(QDialog):
     async def _async_import(self) -> None:
         from tahmeed.services import accountant_service as svc
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
+        from tahmeed.ui.async_utils import pause_background_polls
 
         docs = []
         for rec in self._records:
@@ -4435,41 +4474,42 @@ class KimviImportDialog(QDialog):
             doc["source_filename"] = self._source_filename
             docs.append(doc)
 
-        try:
-            gate = await run_import_truck_gate(
-                self,
-                docs,
-                feed_key="ahmed_kimvi",
-                upload_id=self._upload_id,
-                source_filename=self._source_filename,
-                sheet_label=self._sheet_label,
-                can_add=True,
-            )
-            if gate.aborted:
-                self._import_btn.setEnabled(True)
-                self._import_btn.setText(f"Import {len(self._records):,} Rows")
-                return
-            self._last_skipped = gate.skipped_count
-            if not gate.rows:
-                if gate.skipped_count:
-                    QMessageBox.information(
-                        self,
-                        "Import",
-                        f"No rows imported. {gate.skipped_count:,} parked in Skipped.",
-                    )
-                    self.imported.emit(0)
-                    self.accept()
-                else:
+        with pause_background_polls(self):
+            try:
+                gate = await run_import_truck_gate(
+                    self,
+                    docs,
+                    feed_key="ahmed_kimvi",
+                    upload_id=self._upload_id,
+                    source_filename=self._source_filename,
+                    sheet_label=self._sheet_label,
+                    can_add=True,
+                )
+                if gate.aborted:
                     self._import_btn.setEnabled(True)
                     self._import_btn.setText(f"Import {len(self._records):,} Rows")
-                return
-            saved = await svc.save_kimvi_import(gate.rows)
-            self.imported.emit(saved)
-            self.accept()
-        except Exception as exc:
-            QMessageBox.critical(self, "Import Error", str(exc))
-            self._import_btn.setEnabled(True)
-            self._import_btn.setText(f"Import {len(self._records):,} Rows")
+                    return
+                self._last_skipped = gate.skipped_count
+                if not gate.rows:
+                    if gate.skipped_count:
+                        QMessageBox.information(
+                            self,
+                            "Import",
+                            f"No rows imported. {gate.skipped_count:,} parked in Skipped.",
+                        )
+                        self.imported.emit(0)
+                        self.accept()
+                    else:
+                        self._import_btn.setEnabled(True)
+                        self._import_btn.setText(f"Import {len(self._records):,} Rows")
+                    return
+                saved = await svc.save_kimvi_import(gate.rows)
+                self.imported.emit(saved)
+                self.accept()
+            except Exception as exc:
+                QMessageBox.critical(self, "Import Error", str(exc))
+                self._import_btn.setEnabled(True)
+                self._import_btn.setText(f"Import {len(self._records):,} Rows")
 
 
 def _kimvi_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
@@ -5315,12 +5355,12 @@ def _parse_zambia_parking_sheet(ws, sheet_label: str = "") -> List[dict]:
 
         type_str = str(typ).strip() if typ is not None else ""
 
-        if isinstance(dt, datetime):
-            date_str         = dt.strftime("%d %b %Y")
-            transaction_date = dt
-        else:
-            date_str         = str(dt).strip() if dt is not None else ""
-            transaction_date = None
+        transaction_date = parse_excel_date(dt)
+        date_str = (
+            format_excel_date(transaction_date, "%d %b %Y")
+            if transaction_date is not None
+            else (str(dt).strip() if dt is not None else "")
+        )
 
         ticket_str = ""
         if ticket is not None and str(ticket).strip():
@@ -5704,6 +5744,8 @@ class ZambiaParkingImportDialog(QDialog):
         self._sheet_label     = ""
         self._records: List[dict] = []
         self._already_exists  = False
+        self._matching_uploads: List[dict] = []
+        self._all_file_records: List[dict] = []
 
         self.setWindowTitle("Import — Zambia Parking")
         self.setMinimumWidth(720)
@@ -5752,6 +5794,13 @@ class ZambiaParkingImportDialog(QDialog):
         btn_row.setStyleSheet("background:transparent;")
         bbl = QHBoxLayout(btn_row)
         bbl.setContentsMargins(0, 0, 0, 0)
+
+        self._review_dupes_btn = _btn(
+            "Review Prior Upload", "mdi.file-search-outline", primary=False
+        )
+        self._review_dupes_btn.setEnabled(False)
+        self._review_dupes_btn.clicked.connect(self._open_duplicate_review)
+        bbl.addWidget(self._review_dupes_btn)
         bbl.addStretch()
 
         cancel_btn = _btn("Cancel", primary=False)
@@ -5792,19 +5841,40 @@ class ZambiaParkingImportDialog(QDialog):
     async def _check_sheet(self, sheet_label: str, records: List[dict]) -> None:
         from tahmeed.services import accountant_service as svc
 
-        try:
-            exists = await svc.zambia_sheet_exists(sheet_label)
-        except Exception:
-            exists = False
+        self._all_file_records = list(records)
+        self._matching_uploads: List[dict] = []
 
-        self._already_exists = exists
+        matching: List[dict] = []
+        if records:
+            try:
+                matching = await svc.zambia_exact_content_already_uploaded(records)
+            except Exception:
+                matching = []
+        self._matching_uploads = matching
+
+        already = bool(matching)
+        self._already_exists = already
+        self._records = [] if already else list(records)
+
         total_debit  = sum(r.get("debit") or 0 for r in records)
         total_credit = sum(r.get("credit") or 0 for r in records)
         closing_bal  = _zambia_batch_balance(records)
 
-        if exists:
+        can_review = bool(matching)
+        self._review_dupes_btn.setEnabled(can_review)
+        self._review_dupes_btn.setText(
+            f"Review Prior Upload ({len(matching):,})" if matching else "Review Prior Upload"
+        )
+
+        if already:
+            names = ", ".join(
+                (u.get("source_filename") or u.get("sheet_label") or "prior upload")
+                for u in matching[:3]
+            )
             self._stats_lbl.setText(
-                f"Sheet \"{sheet_label}\" was already uploaded — import blocked."
+                f"Exact file contents already uploaded ({names}"
+                f"{'…' if len(matching) > 3 else ''}) — import blocked. "
+                f"Trucks are not checked until the file is new."
             )
             self._import_btn.setEnabled(False)
             self._import_btn.setText("Already Uploaded")
@@ -5827,10 +5897,31 @@ class ZambiaParkingImportDialog(QDialog):
 
         t = self._preview_tbl
         t.setRowCount(0)
-        for rec in records[:10]:
+        preview_src = [] if already else records
+        for rec in preview_src[:10]:
             row = t.rowCount()
             t.insertRow(row)
             _zambia_fill_row(t, row, rec)
+
+        if can_review:
+            from tahmeed.ui.async_utils import schedule_call
+            schedule_call(self._open_duplicate_review)
+
+    def _open_duplicate_review(self) -> None:
+        from tahmeed.ui.dialogs.zambia_duplicate_review_dialog import (
+            ZambiaDuplicateReviewDialog,
+        )
+
+        if not getattr(self, "_matching_uploads", None):
+            return
+        dlg = ZambiaDuplicateReviewDialog(
+            self._matching_uploads,
+            sheet_label=self._sheet_label,
+            source_filename=self._source_filename,
+            row_count=len(self._all_file_records or self._records or []),
+            parent=self,
+        )
+        dlg.exec()
 
     def _do_import(self) -> None:
         if self._already_exists or not self._records:
@@ -5842,6 +5933,7 @@ class ZambiaParkingImportDialog(QDialog):
     async def _async_import(self) -> None:
         from tahmeed.services import accountant_service as svc
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
+        from tahmeed.ui.async_utils import pause_background_polls
 
         docs = []
         for rec in self._records:
@@ -5851,41 +5943,60 @@ class ZambiaParkingImportDialog(QDialog):
             doc["source_filename"] = self._source_filename
             docs.append(doc)
 
-        try:
-            gate = await run_import_truck_gate(
-                self,
-                docs,
-                feed_key="zambia_parking",
-                upload_id=self._upload_id,
-                source_filename=self._source_filename,
-                sheet_label=self._sheet_label,
-                can_add=True,
-            )
-            if gate.aborted:
-                self._import_btn.setEnabled(True)
-                self._import_btn.setText(f"Import {len(self._records):,} Rows")
-                return
-            self._last_skipped = gate.skipped_count
-            if not gate.rows:
-                if gate.skipped_count:
-                    QMessageBox.information(
+        with pause_background_polls(self):
+            try:
+                # Exact whole-file content only — no ticket-level filtering.
+                matching = await svc.zambia_exact_content_already_uploaded(docs)
+                if matching:
+                    self._matching_uploads = matching
+                    QMessageBox.warning(
                         self,
-                        "Import",
-                        f"No rows imported. {gate.skipped_count:,} parked in Skipped.",
+                        "Already Uploaded",
+                        "This exact statement content was already uploaded — import blocked.",
                     )
-                    self.imported.emit(0)
-                    self.accept()
-                else:
+                    self._import_btn.setEnabled(False)
+                    self._import_btn.setText("Already Uploaded")
+                    self._review_dupes_btn.setEnabled(True)
+                    return
+
+                gate = await run_import_truck_gate(
+                    self,
+                    docs,
+                    feed_key="zambia_parking",
+                    upload_id=self._upload_id,
+                    source_filename=self._source_filename,
+                    sheet_label=self._sheet_label,
+                    can_add=True,
+                )
+                if gate.aborted:
                     self._import_btn.setEnabled(True)
                     self._import_btn.setText(f"Import {len(self._records):,} Rows")
-                return
-            saved = await svc.save_imported_feed(gate.rows)
-            self.imported.emit(saved)
-            self.accept()
-        except Exception as exc:
-            QMessageBox.critical(self, "Import Error", str(exc))
-            self._import_btn.setEnabled(True)
-            self._import_btn.setText(f"Import {len(self._records):,} Rows")
+                    return
+                self._last_skipped = gate.skipped_count
+                if not gate.rows:
+                    if gate.skipped_count:
+                        QMessageBox.information(
+                            self,
+                            "Import",
+                            f"No rows imported. {gate.skipped_count:,} parked in Skipped.",
+                        )
+                        self.imported.emit(0)
+                        self.accept()
+                    else:
+                        self._import_btn.setEnabled(True)
+                        self._import_btn.setText(f"Import {len(self._records):,} Rows")
+                    return
+                # Hash the full file body (before truck skips) so re-upload is blocked.
+                file_hash = svc.zambia_batch_content_hash(self._all_file_records or docs)
+                for row in gate.rows:
+                    row["content_hash"] = file_hash
+                saved = await svc.save_imported_feed(gate.rows)
+                self.imported.emit(saved)
+                self.accept()
+            except Exception as exc:
+                QMessageBox.critical(self, "Import Error", str(exc))
+                self._import_btn.setEnabled(True)
+                self._import_btn.setText(f"Import {len(self._records):,} Rows")
 
 
 class _ZambiaParkingUploadBrowse(QWidget):
@@ -6500,20 +6611,79 @@ def _af_fmt(val: float, decimals: int = 2) -> str:
     return f"{val:,.{decimals}f}"
 
 
+class _AfritrackParsed(NamedTuple):
+    rows: List[List[str]]
+    inst_t: float = 0.0
+    inst_i: float = 0.0
+    bal_mar: float = 0.0
+    vat_rate: float = 18.0
+    inst_label: str = "Installation Fees"
+    total_label: str = ""
+    statement_tahmeed: float = 0.0
+    statement_invoice: float = 0.0
+
+
+def _afritrack_compute_footer(
+    sum_t: float,
+    sum_i: float,
+    inst_t: float = 0.0,
+    inst_i: float = 0.0,
+    bal_mar: float = 0.0,
+    vat_rate: float = 18.0,
+) -> Dict[str, Tuple[float, Optional[float], Optional[float]]]:
+    """Excel footer math: VAT on subtotal+fees; WHT 5% on the pre-VAT subtotal."""
+    s2t = sum_t + inst_t
+    s2i = sum_i + inst_i
+    rate = vat_rate if vat_rate > 0 else 18.0
+    vat_t = s2t * rate / 100.0
+    vat_i = s2i * rate / 100.0
+    s3t = s2t + vat_t
+    s3i = s2i + vat_i
+    wt = s2t * 0.05
+    wi = s2i * 0.05
+    pt = s3t - wt
+    pi = s3i - wi
+    return {
+        "sub":     (sum_t, sum_i, sum_t - sum_i),
+        "inst":    (inst_t, inst_i, inst_t - inst_i),
+        "sub2":    (s2t, s2i, s2t - s2i),
+        "vat":     (vat_t, vat_i, vat_t - vat_i),
+        "sub3":    (s3t, s3i, s3t - s3i),
+        "wht":     (wt, wi, wt - wi),
+        "payable": (pt, pi, pt - pi),
+        "bal":     (bal_mar, None, None),
+        "total":   (pt + bal_mar, None, None),
+    }
+
+
+def _af_first_label(row) -> str:
+    for cell in row[:9]:
+        text = str(cell or "").strip()
+        if text:
+            return text
+    return ""
+
+
 # ── Excel-style reader ─────────────────────────────────────────────────────────
 
-def _read_afritrack_file(path: str) -> Tuple[List[List[str]], float, float, float]:
-    """Parse Afritrack xlsx.  Returns (data_rows, inst_t, inst_i, bal_mar)."""
+def _read_afritrack_file(path: str) -> _AfritrackParsed:
+    """Parse Afritrack xlsx truck rows plus statement footer figures."""
     if not _HAS_OPENPYXL:
         raise RuntimeError("openpyxl is required to import Afritrack files.")
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb.active
     raw = list(ws.iter_rows(values_only=True))
     if not raw:
-        return [], 0.0, 0.0, 0.0
+        return _AfritrackParsed(rows=[])
 
     data_rows: List[List[str]] = []
     inst_t = inst_i = bal_mar = 0.0
+    vat_rate = 18.0
+    inst_label = "Installation Fees"
+    total_label = ""
+    last_sub_t = 0.0
+    statement_t = statement_i = 0.0
+    saw_truck_sub = False
 
     def _v(row, idx, fallback=0.0):
         try:
@@ -6538,8 +6708,28 @@ def _read_afritrack_file(path: str) -> Tuple[List[List[str]], float, float, floa
             if "installation fee" in label:
                 inst_t = _v(row, 6)
                 inst_i = _v(row, 7)
+                inst_label = _af_first_label(row) or inst_label
             elif "bal mar" in label or "balance mar" in label:
                 bal_mar = _v(row, 6)
+            elif "total payable" in label:
+                total_label = _af_first_label(row)
+            elif "vat" in label and "wht" not in label:
+                vat_t = _v(row, 6)
+                if last_sub_t:
+                    raw_rate = vat_t / last_sub_t * 100.0
+                    vat_rate = (
+                        float(round(raw_rate))
+                        if abs(raw_rate - round(raw_rate)) < 0.08
+                        else round(raw_rate, 2)
+                    )
+            else:
+                maybe_sub = _v(row, 6)
+                if maybe_sub:
+                    last_sub_t = maybe_sub
+                    if not saw_truck_sub:
+                        statement_t = maybe_sub
+                        statement_i = _v(row, 7)
+                        saw_truck_sub = True
             continue
         try:
             sno = int(sno)
@@ -6574,7 +6764,21 @@ def _read_afritrack_file(path: str) -> Tuple[List[List[str]], float, float, floa
             remarks,
         ])
 
-    return data_rows, inst_t, inst_i, bal_mar
+    if not saw_truck_sub:
+        statement_t = sum(_af_flt(r[_AF_COL_TOTAL_T]) if len(r) > _AF_COL_TOTAL_T else 0.0 for r in data_rows)
+        statement_i = sum(_af_flt(r[_AF_COL_TOTAL_I]) if len(r) > _AF_COL_TOTAL_I else 0.0 for r in data_rows)
+
+    return _AfritrackParsed(
+        rows=data_rows,
+        inst_t=inst_t,
+        inst_i=inst_i,
+        bal_mar=bal_mar,
+        vat_rate=vat_rate,
+        inst_label=inst_label,
+        total_label=total_label,
+        statement_tahmeed=statement_t,
+        statement_invoice=statement_i,
+    )
 
 
 # ── Excel exporter ─────────────────────────────────────────────────────────────
@@ -6656,25 +6860,20 @@ def _export_afritrack_xlsx(
 
     # footer rows
     st_t, st_i, _ = grid.get_col_totals()
-    it = inst_t; ii = inst_i; bm = bal_mar; vr = vat_rate
-    s2t  = st_t + it;     s2i = st_i + ii
-    vat_t = s2t * vr / 100; vat_i = s2i * vr / 100
-    s3t  = s2t + vat_t;   s3i = s2i + vat_i
-    wt   = s3t * 0.05;    wi  = s3i * 0.05
-    pt   = s3t - wt;      pi  = s3i - wi
-    tot  = pt + bm
+    fig = _afritrack_compute_footer(st_t, st_i, inst_t, inst_i, bal_mar, vat_rate)
+    vr = vat_rate if vat_rate > 0 else 18.0
 
     fr = len(data) + 2
     footer_rows = [
-        (fr,   "",                                    st_t,  st_i,  st_t-st_i, False, False),
-        (fr+1, "Installation Fees",                   it,    ii,    it-ii,     False, False),
-        (fr+2, "",                                    s2t,   s2i,   s2t-s2i,   False, False),
-        (fr+3, f"VAT @ {vr:.0f}%",                   vat_t, vat_i, vat_t-vat_i, False, False),
-        (fr+4, "",                                    s3t,   s3i,   s3t-s3i,   False, False),
-        (fr+5, "Less WHT @ 5%",                      wt,    wi,    wt-wi,     False, False),
-        (fr+6, "Amount Payable",                      pt,    pi,    pt-pi,     True,  False),
-        (fr+7, "Add Bal. Mar (WHT Calculations)",     bm,    None,  None,      False, True),
-        (fr+8, f"Total Payable {period} Account",     tot,   None,  None,      True,  True),
+        (fr,   "",                                    *fig["sub"],     False, False),
+        (fr+1, "Installation Fees",                   *fig["inst"],    False, False),
+        (fr+2, "",                                    *fig["sub2"],    False, False),
+        (fr+3, f"VAT @ {vr:.0f}%",                    *fig["vat"],     False, False),
+        (fr+4, "",                                    *fig["sub3"],    False, False),
+        (fr+5, "Less WHT @ 5%",                       *fig["wht"],     False, False),
+        (fr+6, "Amount Payable",                      *fig["payable"], True,  False),
+        (fr+7, "Add Bal. Mar (WHT Calculations)",     *fig["bal"],     False, True),
+        (fr+8, f"Total Payable {period} Account",     *fig["total"],   True,  True),
     ]
     for frow, label, vt_, vi_, vvar, bold, red in footer_rows:
         ws.row_dimensions[frow].height = 18
@@ -7122,7 +7321,9 @@ class _AfritrackFooter(QWidget):
         self._inst_t   = 0.0
         self._inst_i   = 0.0
         self._bal_mar  = 0.0
-        self._vat_rate = 15.0
+        self._vat_rate = 18.0
+        self._inst_label = "Installation Fees"
+        self._total_label = ""
         self._build()
 
     def _build(self) -> None:
@@ -7134,6 +7335,11 @@ class _AfritrackFooter(QWidget):
         sep.setFixedHeight(2)
         sep.setStyleSheet(f"background:{_BLUE};border:none;")
         vl.addWidget(sep)
+
+        cap = _lbl("Statement digest  ·  Installation, VAT, WHT, Amount Payable", size=11, weight=600, color=_T2)
+        cap.setContentsMargins(8, 6, 8, 4)
+        self._cap = cap
+        vl.addWidget(cap)
 
         self._table = QTableWidget(len(_AF_FOOTER_DEFS), _AF_NCOLS)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -7159,46 +7365,57 @@ class _AfritrackFooter(QWidget):
         )
 
     def _fix_height(self) -> None:
-        h = sum(self._table.rowHeight(r) for r in range(len(_AF_FOOTER_DEFS))) + 2
-        self._table.setFixedHeight(h)
+        n = len(_AF_FOOTER_DEFS)
+        default_h = max(24, int(self._table.verticalHeader().defaultSectionSize() or 24))
+        total = 2
+        for r in range(n):
+            h = int(self._table.rowHeight(r) or 0)
+            total += h if h > 0 else default_h
+        self._table.setFixedHeight(total)
+        self.setMinimumHeight(total + 28)
 
-    def sync_columns(self, grid: "_AfritrackGrid") -> None:
+    def sync_columns(self, table: QTableWidget) -> None:
         for c in range(_AF_NCOLS):
-            self._table.setColumnWidth(c, grid.columnWidth(c))
+            self._table.setColumnWidth(c, table.columnWidth(c))
 
-    def set_params(self, inst_t: float, inst_i: float,
-                   bal_mar: float, vat_rate: float) -> None:
-        self._inst_t   = inst_t
-        self._inst_i   = inst_i
-        self._bal_mar  = bal_mar
-        self._vat_rate = vat_rate
+    def set_params(
+        self,
+        inst_t: float,
+        inst_i: float,
+        bal_mar: float,
+        vat_rate: float,
+        inst_label: str = "Installation Fees",
+        total_label: str = "",
+    ) -> None:
+        self._inst_t = inst_t
+        self._inst_i = inst_i
+        self._bal_mar = bal_mar
+        self._vat_rate = vat_rate if vat_rate > 0 else 18.0
+        self._inst_label = inst_label or "Installation Fees"
+        self._total_label = total_label or ""
 
-    def refresh(self, grid: "_AfritrackGrid", month: str) -> None:
-        sum_t, sum_i, _ = grid.get_col_totals()
-        it   = self._inst_t;  ii  = self._inst_i
-        s2t  = sum_t + it;    s2i = sum_i + ii
-        vt   = s2t * self._vat_rate / 100
-        vi   = s2i * self._vat_rate / 100
-        s3t  = s2t + vt;      s3i = s2i + vi
-        wt   = s3t * 0.05;    wi  = s3i * 0.05
-        pt   = s3t - wt;      pi  = s3i - wi
-        tot  = pt + self._bal_mar
-
-        vals: Dict[str, Tuple[str, float, Optional[float], Optional[float]]] = {
-            "sub":     ("",                                    sum_t,          sum_i,    sum_t - sum_i),
-            "inst":    ("Installation Fees",                   it,             ii,       it - ii),
-            "sub2":    ("",                                    s2t,            s2i,      s2t - s2i),
-            "vat":     (f"VAT @ {self._vat_rate:.0f}%",       vt,             vi,       vt - vi),
-            "sub3":    ("",                                    s3t,            s3i,      s3t - s3i),
-            "wht":     ("Less WHT @ 5%",                      wt,             wi,       wt - wi),
-            "payable": ("Amount Payable",                      pt,             pi,       pt - pi),
-            "bal":     (f"Add Bal. Mar (WHT Calculations)",    self._bal_mar,  None,     None),
-            "total":   (f"Total Payable {month} Account",      tot,            None,     None),
+    def refresh(self, sum_t: float, sum_i: float, month: str) -> None:
+        fig = _afritrack_compute_footer(
+            sum_t, sum_i, self._inst_t, self._inst_i, self._bal_mar, self._vat_rate,
+        )
+        inst_label = self._inst_label or "Installation Fees"
+        total_label = self._total_label or f"Total Payable {month} Account"
+        labels = {
+            "sub":     "",
+            "inst":    inst_label,
+            "sub2":    "",
+            "vat":     f"VAT @ {self._vat_rate:.0f}%",
+            "sub3":    "",
+            "wht":     "Less WHT @ 5%",
+            "payable": "Amount Payable",
+            "bal":     "Add Bal. Mar (WHT Calculations)",
+            "total":   total_label,
         }
 
         t = self._table
         for ri, (key, bold, red, show_i, show_var) in enumerate(_AF_FOOTER_DEFS):
-            label, vt_, vi_, vvar = vals[key]
+            vt_, vi_, vvar = fig[key]
+            label = labels[key]
 
             # label cell (merged cols 0-5)
             lbl = t.item(ri, 0) or QTableWidgetItem()
@@ -7251,6 +7468,34 @@ class _AfritrackFooter(QWidget):
             "bal_mar":  self._bal_mar,
             "vat_rate": self._vat_rate,
         }
+
+
+def _af_num(val, default: float = 0.0) -> float:
+    try:
+        if val is None:
+            return default
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _apply_afritrack_statement_footer(footer: "_AfritrackFooter", doc: dict) -> None:
+    """Fill the Excel digest from one upload batch (file footer, not skipped-row sums)."""
+    vat = _af_num(doc.get("vat_rate")) or 18.0
+    footer.set_params(
+        _af_num(doc.get("installation_tahmeed")),
+        _af_num(doc.get("installation_invoice")),
+        _af_num(doc.get("balance_mar")),
+        vat,
+        str(doc.get("installation_label") or "Installation Fees"),
+        str(doc.get("total_payable_label") or ""),
+    )
+    sum_t = _af_num(doc.get("statement_tahmeed")) or _af_num(doc.get("total_tahmeed"))
+    sum_i = _af_num(doc.get("statement_invoice")) or _af_num(doc.get("total_invoice"))
+    footer.refresh(sum_t, sum_i, str(doc.get("period") or ""))
+    fname = str(doc.get("source_filename") or doc.get("period") or "").strip()
+    if fname and hasattr(footer, "_cap"):
+        footer._cap.setText(f"Statement digest  ·  {fname}")
 
 
 # ── QB Bill-card field helpers ────────────────────────────────────────────────
@@ -7612,7 +7857,11 @@ def _afritrack_rows_to_records(
     inst_t: float,
     inst_i: float,
     bal_mar: float,
-    vat_rate: float = 15.0,
+    vat_rate: float = 18.0,
+    inst_label: str = "Installation Fees",
+    total_label: str = "",
+    statement_tahmeed: float = 0.0,
+    statement_invoice: float = 0.0,
 ) -> List[dict]:
     records: List[dict] = []
     for row_idx, row in enumerate(rows, 1):
@@ -7644,6 +7893,10 @@ def _afritrack_rows_to_records(
             "installation_invoice": inst_i,
             "balance_mar": bal_mar,
             "vat_rate": vat_rate,
+            "installation_label": inst_label,
+            "total_payable_label": total_label,
+            "statement_tahmeed": statement_tahmeed,
+            "statement_invoice": statement_invoice,
         })
     return records
 
@@ -7693,7 +7946,10 @@ class _AfritrackUploadBrowse(QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
-        uploads = await svc.get_afritrack_uploads()
+        try:
+            uploads = await svc.get_afritrack_uploads()
+        except Exception:
+            uploads = []
         self._uploads = uploads
         self._fill(uploads)
 
@@ -7807,13 +8063,11 @@ class _AfritrackUploadDetail(QWidget):
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         vl.addWidget(self._table, 1)
 
-        self._totals = _TotalsBar([
-            ("t", "Tahmeed "),
-            ("i", "Invoice "),
-            ("v", "Variance "),
-            ("c", "Rows "),
-        ])
-        vl.addWidget(self._totals)
+        self._footer = _AfritrackFooter()
+        self._table.horizontalHeader().sectionResized.connect(
+            lambda *_: self._footer.sync_columns(self._table)
+        )
+        vl.addWidget(self._footer)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
         self._status_lbl.setAlignment(Qt.AlignCenter)
@@ -7831,7 +8085,18 @@ class _AfritrackUploadDetail(QWidget):
         self._search_edit.blockSignals(True)
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
+        self._refresh_footer()
         self._reset_and_load()
+
+    def _refresh_footer(self, totals: Optional[dict] = None) -> None:
+        doc = dict(self._upload_doc or {})
+        if totals:
+            if not _af_num(doc.get("statement_tahmeed")):
+                doc["total_tahmeed"] = totals.get("total_tahmeed", doc.get("total_tahmeed"))
+                doc["total_invoice"] = totals.get("total_invoice", doc.get("total_invoice"))
+        _apply_afritrack_statement_footer(self._footer, doc)
+        self._footer.sync_columns(self._table)
+        self._footer.show()
 
     def _request_delete(self) -> None:
         if self._upload_doc:
@@ -7862,7 +8127,7 @@ class _AfritrackUploadDetail(QWidget):
             recs, total, totals = await asyncio.gather(
                 svc.get_afritrack_upload_records(self._upload_id, self._search, _SCROLL_CHUNK, 0),
                 svc.count_afritrack_upload_records(self._upload_id, self._search),
-                svc.get_afritrack_upload_totals(self._upload_id, self._search),
+                svc.get_afritrack_upload_totals(self._upload_id, ""),
             )
         except Exception:
             self._loading = False
@@ -7871,10 +8136,7 @@ class _AfritrackUploadDetail(QWidget):
         self._total = total
         self._append_rows(recs)
         self._loaded = len(recs)
-        self._totals.set_total("t", float(totals.get("total_tahmeed", 0) or 0), "USD ")
-        self._totals.set_total("i", float(totals.get("total_invoice", 0) or 0), "USD ")
-        self._totals.set_total("v", float(totals.get("total_variance", 0) or 0), "USD ")
-        self._totals.set_total("c", int(totals.get("count", total) or 0), "")
+        self._refresh_footer(totals)
         self._loading = False
         self._update_status()
         self._maybe_fill_viewport()
@@ -7960,7 +8222,7 @@ class _AfritrackUploadDetail(QWidget):
             float(self._upload_doc.get("installation_tahmeed", 0) or 0),
             float(self._upload_doc.get("installation_invoice", 0) or 0),
             float(self._upload_doc.get("balance_mar", 0) or 0),
-            15.0,
+            float(self._upload_doc.get("vat_rate") or 0) or 18.0,
             self._upload_doc.get("period") or "Upload",
         )
         QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
@@ -8028,7 +8290,9 @@ class AfritrackWidget(QWidget):
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
-        if idx == 2:
+        if idx == 1:
+            self._show_browse()
+        elif idx == 2:
             self._skipped.refresh()
 
     def refresh(self) -> None:
@@ -8080,18 +8344,23 @@ class AfritrackWidget(QWidget):
         from tahmeed.ui.widgets.upload_busy import UploadBusy
         try:
             with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
-                rows, inst_t, inst_i, bal_mar = _read_afritrack_file(path)
+                parsed = _read_afritrack_file(path)
         except Exception as exc:
             QMessageBox.critical(self, "Import Error", str(exc))
             return
-        if not rows:
+        if not parsed.rows:
             QMessageBox.warning(self, "Nothing Found", "No Afritrack truck rows were found in that file.")
             return
         source_filename = Path(path).name
         period = Path(path).stem.replace("_", " ")
         upload_id = str(uuid.uuid4())
         records = _afritrack_rows_to_records(
-            rows, period, source_filename, upload_id, inst_t, inst_i, bal_mar, 15.0
+            parsed.rows, period, source_filename, upload_id,
+            parsed.inst_t, parsed.inst_i, parsed.bal_mar, parsed.vat_rate,
+            inst_label=parsed.inst_label,
+            total_label=parsed.total_label,
+            statement_tahmeed=parsed.statement_tahmeed,
+            statement_invoice=parsed.statement_invoice,
         )
         try:
             gate = await run_import_truck_gate(
@@ -8127,15 +8396,19 @@ class AfritrackWidget(QWidget):
         QMessageBox.information(self, "Import Complete", msg)
         self._all_entries.refresh()
         if skipped:
-            self._tabs.set_index(2)
             self._skipped.refresh()
-            return
-        uploads = await svc.get_afritrack_uploads()
+        try:
+            uploads = await svc.get_afritrack_uploads()
+        except Exception:
+            uploads = []
         doc = next((u for u in uploads if str(u.get("_id")) == upload_id), None)
         if doc is not None:
             self._show_detail(doc)
+        elif skipped:
+            self._tabs.set_index(2)
         else:
             self._show_browse()
+            self._tabs.set_index(1)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
         count = int(upload_doc.get("record_count", 0))
@@ -8477,49 +8750,51 @@ class _InsuranceImportDialog(QDialog):
         from tahmeed.services import accountant_service as svc
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
         from tahmeed.services.import_truck_check import truck_field_for
+        from tahmeed.ui.async_utils import pause_background_polls
 
-        try:
-            rows = list(self._new_rows)
-            skipped = 0
-            if truck_field_for(self._feed_type):
-                gate = await run_import_truck_gate(
-                    self,
-                    rows,
-                    feed_key=self._feed_type,
-                    upload_id=self._upload_id,
-                    source_filename=self._source_filename,
-                    can_add=True,
-                )
-                if gate.aborted:
-                    self._import_btn.setEnabled(True)
-                    self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
-                    return
-                rows = gate.rows
-                skipped = gate.skipped_count
-                if not rows and skipped:
-                    QMessageBox.information(
+        with pause_background_polls(self):
+            try:
+                rows = list(self._new_rows)
+                skipped = 0
+                if truck_field_for(self._feed_type):
+                    gate = await run_import_truck_gate(
                         self,
-                        "Import",
-                        f"No rows imported. {skipped:,} parked in the Skipped tab "
-                        "for follow-up.",
+                        rows,
+                        feed_key=self._feed_type,
+                        upload_id=self._upload_id,
+                        source_filename=self._source_filename,
+                        can_add=True,
                     )
-                    self._last_skipped = skipped
-                    self.imported.emit(0)
-                    self.accept()
-                    return
-                if not rows:
-                    self._import_btn.setEnabled(True)
-                    self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
-                    return
+                    if gate.aborted:
+                        self._import_btn.setEnabled(True)
+                        self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
+                        return
+                    rows = gate.rows
+                    skipped = gate.skipped_count
+                    if not rows and skipped:
+                        QMessageBox.information(
+                            self,
+                            "Import",
+                            f"No rows imported. {skipped:,} parked in the Skipped tab "
+                            "for follow-up.",
+                        )
+                        self._last_skipped = skipped
+                        self.imported.emit(0)
+                        self.accept()
+                        return
+                    if not rows:
+                        self._import_btn.setEnabled(True)
+                        self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
+                        return
 
-            saved = await svc.save_imported_feed(rows)
-            self._last_skipped = skipped
-            self.imported.emit(saved)
-            self.accept()
-        except Exception as exc:
-            QMessageBox.critical(self, "Import Error", str(exc))
-            self._import_btn.setEnabled(True)
-            self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
+                saved = await svc.save_imported_feed(rows)
+                self._last_skipped = skipped
+                self.imported.emit(saved)
+                self.accept()
+            except Exception as exc:
+                QMessageBox.critical(self, "Import Error", str(exc))
+                self._import_btn.setEnabled(True)
+                self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
 
 
 # ── QB-style info card shared by both insurance widgets ───────────────────────

@@ -69,6 +69,30 @@ def test_with_date_range_noop_when_unset() -> None:
     assert _with_date_range(base, "toll_date") == base
 
 
+def test_truck_and_trailer_overview_match() -> None:
+    from tahmeed.services.accountant_service import (
+        _truck_and_trailer_match,
+        _truck_row_matches_search,
+    )
+
+    clause = _truck_and_trailer_match("T469 EKZ")
+    import re as _re
+
+    compiled = _re.compile(clause["$regex"], _re.IGNORECASE)
+    assert compiled.search("T469EKZ/T689ELK")
+    assert compiled.search("T469 EKZ/T689ELK")
+    assert not compiled.search("T689ELK/T469EKZ")
+
+    assert _truck_row_matches_search(
+        {"truck_value": "T469EKZ/T689ELK", "source": "SM Burhani RPA"},
+        "T469 EKZ",
+    )
+    assert not _truck_row_matches_search(
+        {"truck_value": "T688 EAF/T123 TRA", "source": "SM Burhani RPA"},
+        "T469 EKZ",
+    )
+
+
 def test_source_multi_combo_selects_multiple() -> None:
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication

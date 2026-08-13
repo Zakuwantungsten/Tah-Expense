@@ -10,12 +10,12 @@ pasted value (e.g. many ``T760 DN`` → ``T760 HDN``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Set
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel,
+    QDialog, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout,
     QWidget,
 )
@@ -26,6 +26,12 @@ from tahmeed.services.truck_format import (
     normalize_place_label,
     normalize_truck_number,
     try_match_fleet,
+)
+from tahmeed.ui.dialog_theme import (
+    show_info,
+    show_question,
+    show_warning,
+    style_message_box,
 )
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 
@@ -90,6 +96,9 @@ class TruckIssue:
     is_place_label: bool = False
     omit_row: bool = False   # import mode: park row for later (Skipped tab)
     allow_anyway: bool = False  # import mode: save even if not in fleet
+    row_label: str = ""      # optional UI title (e.g. "File row 2442")
+    combo_parts: List[str] = field(default_factory=list)  # unused when combo_suffix is set
+    combo_suffix: str = ""  # ``/T691ELK`` kept while the user edits the truck only
 
 
 @dataclass
@@ -103,6 +112,8 @@ class _RowWidgets:
     accept_label_btn: Optional[QPushButton] = None
     allow_btn: Optional[QPushButton] = None
     skip_row_btn: Optional[QPushButton] = None
+    part_edits: List[QLineEdit] = field(default_factory=list)
+    part_badges: List[QLabel] = field(default_factory=list)
 
 
 class TruckCorrectionDialog(QDialog):
@@ -118,17 +129,21 @@ class TruckCorrectionDialog(QDialog):
         on_resolved=None,
         import_mode: bool = False,
         fleet_kinds: Optional[Dict[str, str]] = None,
+        heading: str = "",
+        intro: str = "",
         parent=None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Correct truck numbers")
-        self.setMinimumWidth(760 if import_mode else 680)
+        self.setWindowTitle(heading or "Correct truck numbers")
+        self.setMinimumWidth(920 if import_mode else 680)
         self.setMinimumHeight(380)
         self.setModal(True)
         self._fleet = set(fleet)
         self._fleet_kinds: Dict[str, str] = dict(fleet_kinds or {})
         self._can_add = can_add
         self._import_mode = import_mode
+        self._heading = heading or "Correct truck numbers"
+        self._intro = intro
         self._on_resolved = on_resolved  # optional callback(TruckIssue) per resolved row
         self._allowed_labels: Set[str] = {
             normalize_place_label(x) for x in (allowed_labels or set()) if x
@@ -156,14 +171,16 @@ class TruckCorrectionDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
-        title = QLabel("Correct truck numbers")
+        title = QLabel(self._heading)
         title.setStyleSheet(
             f"color: {_T1}; font-size: 16px; font-weight: 700;"
             " border: none; background: transparent;"
         )
         root.addWidget(title)
 
-        if self._import_mode:
+        if self._intro:
+            intro_text = self._intro
+        elif self._import_mode:
             intro_text = (
                 "These truck numbers are not in your fleet (or need a format fix). "
                 "Apply a correction, allow a row anyway, or skip it for follow-up — "
@@ -211,34 +228,38 @@ class TruckCorrectionDialog(QDialog):
         scroll.setWidget(body)
         root.addWidget(scroll, 1)
 
+        footer = QHBoxLayout()
+        footer.setSpacing(8)
         if self._import_mode:
-            bulk = QHBoxLayout()
-            bulk.setSpacing(8)
             skip_all = QPushButton("Skip all remaining")
             skip_all.setCursor(Qt.PointingHandCursor)
+            skip_all.setFixedHeight(_CTRL_H)
             skip_all.setStyleSheet(_BTN_SECONDARY)
             skip_all.clicked.connect(self._skip_all_remaining)
-            bulk.addWidget(skip_all)
+            footer.addWidget(skip_all)
             allow_all = QPushButton("Allow all remaining")
             allow_all.setCursor(Qt.PointingHandCursor)
+            allow_all.setFixedHeight(_CTRL_H)
             allow_all.setStyleSheet(_BTN_ORANGE)
             allow_all.clicked.connect(self._allow_all_remaining)
-            bulk.addWidget(allow_all)
-            bulk.addStretch()
-            root.addLayout(bulk)
-
-        buttons = QDialogButtonBox()
-        done_btn = buttons.addButton("Done", QDialogButtonBox.AcceptRole)
-        cancel_btn = buttons.addButton(
-            "Skip remaining" if self._import_mode else "Cancel remaining",
-            QDialogButtonBox.RejectRole,
-        )
+            footer.addWidget(allow_all)
+        footer.addStretch()
+        done_btn = QPushButton("Done")
         done_btn.setDefault(True)
+        done_btn.setCursor(Qt.PointingHandCursor)
+        done_btn.setFixedHeight(_CTRL_H)
         done_btn.setStyleSheet(_BTN_PRIMARY)
+        done_btn.clicked.connect(self._on_done)
+        footer.addWidget(done_btn)
+        cancel_btn = QPushButton(
+            "Skip remaining" if self._import_mode else "Cancel remaining"
+        )
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.setFixedHeight(_CTRL_H)
         cancel_btn.setStyleSheet(_BTN_SECONDARY)
-        buttons.accepted.connect(self._on_done)
-        buttons.rejected.connect(self._on_cancel)
-        root.addWidget(buttons)
+        cancel_btn.clicked.connect(self._on_cancel)
+        footer.addWidget(cancel_btn)
+        root.addLayout(footer)
 
     def _update_count(self) -> None:
         n = len(self._rows)
@@ -253,10 +274,84 @@ class TruckCorrectionDialog(QDialog):
         """Sorted registered numbers for inline autocomplete (same UX as table)."""
         return sorted(self._fleet)
 
+    def _combo_part_labels(self, count: int) -> List[str]:
+        if count <= 1:
+            return ["Truck"]
+        if count == 2:
+            return ["Truck", "Trailer"]
+        return ["Truck"] + [f"Trailer {i}" for i in range(1, count)]
+
+    def _row_value(self, rw: _RowWidgets) -> str:
+        """Merged truck/trailer value, or the single edit box."""
+        if rw.part_edits:
+            parts: List[str] = []
+            for edit in rw.part_edits:
+                text = edit.text().strip()
+                if not text:
+                    continue
+                norm = normalize_truck_number(text, allowed_labels=self._allowed_labels)
+                if norm.status in ("ok", "normalized", "place_label"):
+                    parts.append(norm.value)
+                else:
+                    parts.append(" ".join(text.upper().split()))
+            return "/".join(parts)
+        return rw.edit.text().strip()
+
+    def _truck_edit_value(self, rw: _RowWidgets) -> str:
+        """Current truck field, falling back to the leading plate of the pasted cell."""
+        return self._row_value(rw) or self._edit_source_for_issue(rw.issue)
+
+    def _edit_source_for_issue(self, issue: TruckIssue) -> str:
+        """Single-field text: leading truck when the trailer suffix is kept aside."""
+        raw = issue.original or ""
+        suffix = issue.combo_suffix or ""
+        if suffix and raw.endswith(suffix):
+            return raw[: -len(suffix)].strip()
+        if suffix:
+            cut = raw.find(suffix)
+            if cut > 0:
+                return raw[:cut].strip()
+        return raw
+
+    def _fill_truck_edit(self, edit: QLineEdit, source: str) -> None:
+        norm = normalize_truck_number(source, allowed_labels=self._allowed_labels)
+        if norm.status in ("ok", "normalized", "place_label"):
+            edit.setText(norm.value)
+        else:
+            edit.setText(norm.value or str(source).upper())
+
+    def _with_combo_suffix(
+        self,
+        issue: TruckIssue,
+        truck: str,
+        *,
+        is_place_label: bool = False,
+    ) -> str:
+        truck = (truck or "").strip()
+        if is_place_label or not issue.combo_suffix:
+            return truck
+        return f"{truck}{issue.combo_suffix}"
+
+    def _is_two_trailer_issue(self, issue: TruckIssue) -> bool:
+        """True when the pasted cell has truck + two (or more) trailers."""
+        if len(issue.combo_parts or []) >= 3:
+            return True
+        if (issue.combo_suffix or "").count("/") >= 2:
+            return True
+        try:
+            from tahmeed.services.import_truck_check import split_truck_combo_cell
+            parts = split_truck_combo_cell(issue.original or "")
+        except Exception:
+            return False
+        return bool(parts) and len(parts) >= 3
+
     def _refresh_fleet_completers(self) -> None:
+        numbers = self._fleet_suggestions
         for rw in self._rows:
-            if isinstance(rw.edit, TruckLineEdit):
-                rw.edit.set_local_numbers(self._fleet_suggestions)
+            edits = rw.part_edits or ([rw.edit] if isinstance(rw.edit, TruckLineEdit) else [])
+            for edit in edits:
+                if isinstance(edit, TruckLineEdit):
+                    edit.set_local_numbers(numbers)
 
     def _lookup_kind(self, number: str) -> Optional[str]:
         if not number:
@@ -314,26 +409,15 @@ class TruckCorrectionDialog(QDialog):
             return ("Bike/Car ✓", _GREEN)
         return ("In registry ✓", _GREEN)
 
-    def _refresh_status_badge(self, rw: _RowWidgets) -> None:
-        label, color = self._status_for_text(rw.edit.text())
-        rw.status_badge.setText(label)
-        rw.status_badge.setStyleSheet(
-            f"QLabel {{ color: {color}; background: {_BG}; border: 1px solid {_BORDER};"
-            f" border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 700;"
-            f" min-height: {_CTRL_H}px; max-height: {_CTRL_H}px;"
-            f" min-width: 110px; }}"
-        )
-        rw.status_badge.setAlignment(Qt.AlignCenter)
-
     # ── Similar-row helpers ───────────────────────────────────────────────
 
     def _similar_open_rows(self, rw: _RowWidgets) -> List[_RowWidgets]:
-        key = _norm_key(rw.issue.original)
+        key = _norm_key(self._edit_source_for_issue(rw.issue))
         if not key:
             return []
         return [
             other for other in self._rows
-            if other is not rw and _norm_key(other.issue.original) == key
+            if other is not rw and _norm_key(self._edit_source_for_issue(other.issue)) == key
         ]
 
     def _confirm_apply_similar(
@@ -353,14 +437,13 @@ class TruckCorrectionDialog(QDialog):
             "allow": "Allow",
             "add": "Add / apply",
         }.get(action, "Apply")
-        reply = QMessageBox.question(
+        reply = show_question(
             self,
             "Similar trucks",
             f'{verb} "{corrected}" to this row and {len(similar)} other '
             f'row(s) with the same pasted value "{original}"?\n\n'
             "Choose No to fix only this row.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+            default_no=False,
         )
         return similar if reply == QMessageBox.Yes else []
 
@@ -394,13 +477,15 @@ class TruckCorrectionDialog(QDialog):
                 rw = existing[issue.row]
                 rw.issue.original = issue.original
                 rw.issue.kind = issue.kind
-                norm = normalize_truck_number(
-                    issue.original, allowed_labels=self._allowed_labels
-                )
-                if norm.status in ("ok", "normalized", "place_label"):
-                    rw.edit.setText(norm.value)
+                if issue.combo_suffix:
+                    rw.issue.combo_suffix = issue.combo_suffix
+                if issue.combo_parts:
+                    rw.issue.combo_parts = list(issue.combo_parts)
+                if rw.part_edits and rw.issue.combo_parts:
+                    for edit, part in zip(rw.part_edits, rw.issue.combo_parts):
+                        self._fill_truck_edit(edit, part)
                 else:
-                    rw.edit.setText(norm.value or issue.original.upper())
+                    self._fill_truck_edit(rw.edit, self._edit_source_for_issue(issue))
                 pasted = rw.card.findChild(QLabel, "pastedLbl")
                 if pasted is not None:
                     pasted.setText(f'Pasted: "{issue.original}"')
@@ -426,7 +511,7 @@ class TruckCorrectionDialog(QDialog):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        title = QLabel(f"Row {issue.row + 1}")
+        title = QLabel(issue.row_label or f"Row {issue.row + 1}")
         title.setStyleSheet(
             f"font-weight: 700; color: {_T1}; font-size: 12px;"
             " border: none; background: transparent;"
@@ -445,47 +530,13 @@ class TruckCorrectionDialog(QDialog):
         )
         lay.addWidget(pasted)
 
-        edit_row = QHBoxLayout()
-        edit_row.setSpacing(8)
-
-        # Sync fleet filter — modal dialogs cannot safely nest asyncio fetches.
-        edit = TruckLineEdit(local_numbers=self._fleet_suggestions)
-        edit.setFixedHeight(_CTRL_H)
-        edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        norm = normalize_truck_number(issue.original, allowed_labels=self._allowed_labels)
-        if norm.status in ("ok", "normalized", "place_label"):
-            edit.setText(norm.value)
-        else:
-            edit.setText(norm.value or issue.original.upper())
-        edit.setPlaceholderText("T688 EAF  or  YARD")
-        edit.setStyleSheet(_INPUT_SS)
-        edit.editingFinished.connect(lambda e=edit: self._autonorm_edit(e))
-        edit_row.addWidget(edit, 1)
-
-        # Status badge (Truck / Trailer / Bike/Car / Not in registry) — not a chooser
-        status_badge = QLabel("—")
-        status_badge.setFixedHeight(_CTRL_H)
-        status_badge.setMinimumWidth(110)
-        status_badge.setToolTip(
-            "Shows whether the entered number is a Truck, Trailer, or "
-            "Motorcycle/Car in your registry"
-        )
-        edit_row.addWidget(status_badge)
-
+        # Import combos keep trailers on ``combo_suffix`` and edit the truck only.
+        combo = [] if issue.combo_suffix else list(issue.combo_parts or [])
+        part_edits: List[QLineEdit] = []
+        part_badges: List[QLabel] = []
         add_btn = None
-        if self._can_add:
-            add_btn = QPushButton("Add to registry")
-            add_btn.setCursor(Qt.PointingHandCursor)
-            add_btn.setFixedHeight(_CTRL_H)
-            add_btn.setStyleSheet(_BTN_ORANGE)
-            edit_row.addWidget(add_btn)
-
-        accept_btn = QPushButton("Accept label")
-        accept_btn.setToolTip("Accept as place label (YARD / GARAGE) and remove from list")
-        accept_btn.setCursor(Qt.PointingHandCursor)
-        accept_btn.setFixedHeight(_CTRL_H)
-        accept_btn.setStyleSheet(_BTN_BLUE)
-        edit_row.addWidget(accept_btn)
+        accept_btn = None
+        rw_holder: Optional[_RowWidgets] = None
 
         apply_btn = QPushButton("Apply")
         apply_btn.setToolTip(
@@ -494,53 +545,143 @@ class TruckCorrectionDialog(QDialog):
         apply_btn.setCursor(Qt.PointingHandCursor)
         apply_btn.setFixedHeight(_CTRL_H)
         apply_btn.setStyleSheet(_BTN_PRIMARY)
-        edit_row.addWidget(apply_btn)
 
         allow_btn = None
         skip_row_btn = None
+        clear_btn = None
         if self._import_mode:
             allow_btn = QPushButton("Allow anyway")
             allow_btn.setToolTip("Import this row even if the truck is not in the fleet")
             allow_btn.setCursor(Qt.PointingHandCursor)
             allow_btn.setFixedHeight(_CTRL_H)
             allow_btn.setStyleSheet(_BTN_ORANGE)
-            edit_row.addWidget(allow_btn)
-
             skip_row_btn = QPushButton("Skip row")
             skip_row_btn.setToolTip("Park this row in Skipped — other rows still import")
             skip_row_btn.setCursor(Qt.PointingHandCursor)
             skip_row_btn.setFixedHeight(_CTRL_H)
             skip_row_btn.setStyleSheet(_BTN_SECONDARY)
-            edit_row.addWidget(skip_row_btn)
         else:
             clear_btn = QPushButton("Clear")
             clear_btn.setCursor(Qt.PointingHandCursor)
             clear_btn.setFixedHeight(_CTRL_H)
             clear_btn.setStyleSheet(_BTN_SECONDARY)
-            edit_row.addWidget(clear_btn)
-        lay.addLayout(edit_row)
+
+        def _add_row_actions(row: QHBoxLayout) -> None:
+            row.addWidget(apply_btn)
+            if allow_btn is not None:
+                row.addWidget(allow_btn)
+            if skip_row_btn is not None:
+                row.addWidget(skip_row_btn)
+            if clear_btn is not None:
+                row.addWidget(clear_btn)
+
+        if len(combo) >= 2:
+            labels = self._combo_part_labels(len(combo))
+            for idx, part in enumerate(combo):
+                prow = QHBoxLayout()
+                prow.setSpacing(8)
+                name = QLabel(labels[idx])
+                name.setFixedWidth(80)
+                name.setStyleSheet(
+                    f"color: {_T1}; font-size: 12px; font-weight: 600;"
+                    " border: none; background: transparent;"
+                )
+                prow.addWidget(name)
+                edit = TruckLineEdit(local_numbers=self._fleet_suggestions)
+                edit.setFixedHeight(_CTRL_H)
+                edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                norm = normalize_truck_number(part, allowed_labels=self._allowed_labels)
+                if norm.status in ("ok", "normalized", "place_label"):
+                    edit.setText(norm.value)
+                else:
+                    edit.setText(norm.value or str(part).upper())
+                edit.setPlaceholderText("T688 EAF")
+                edit.setStyleSheet(_INPUT_SS)
+                edit.editingFinished.connect(lambda e=edit: self._autonorm_edit(e))
+                prow.addWidget(edit, 1)
+                badge = QLabel("—")
+                badge.setFixedHeight(_CTRL_H)
+                badge.setMinimumWidth(110)
+                prow.addWidget(badge)
+                if self._can_add:
+                    part_add = QPushButton("Add")
+                    part_add.setToolTip(f"Add this {labels[idx].lower()} to the fleet registry")
+                    part_add.setCursor(Qt.PointingHandCursor)
+                    part_add.setFixedHeight(_CTRL_H)
+                    part_add.setStyleSheet(_BTN_ORANGE)
+                    prow.addWidget(part_add)
+                    part_add.clicked.connect(
+                        lambda _=False, i=idx: self._add_combo_part(rw_holder, i)
+                    )
+                if idx == 0:
+                    _add_row_actions(prow)
+                lay.addLayout(prow)
+                part_edits.append(edit)
+                part_badges.append(badge)
+            primary_edit = part_edits[0]
+            status_badge = part_badges[0]
+        else:
+            edit_row = QHBoxLayout()
+            edit_row.setSpacing(8)
+            edit = TruckLineEdit(local_numbers=self._fleet_suggestions)
+            edit.setFixedHeight(_CTRL_H)
+            edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self._fill_truck_edit(edit, self._edit_source_for_issue(issue))
+            edit.setPlaceholderText("T688 EAF  or  YARD")
+            edit.setStyleSheet(_INPUT_SS)
+            edit.editingFinished.connect(lambda e=edit: self._autonorm_edit(e))
+            edit_row.addWidget(edit, 1)
+            status_badge = QLabel("—")
+            status_badge.setFixedHeight(_CTRL_H)
+            status_badge.setMinimumWidth(110)
+            status_badge.setToolTip(
+                "Shows whether the entered number is a Truck, Trailer, or "
+                "Motorcycle/Car in your registry"
+            )
+            edit_row.addWidget(status_badge)
+            if self._can_add:
+                add_btn = QPushButton("Add to registry")
+                add_btn.setCursor(Qt.PointingHandCursor)
+                add_btn.setFixedHeight(_CTRL_H)
+                add_btn.setStyleSheet(_BTN_ORANGE)
+                edit_row.addWidget(add_btn)
+            accept_btn = QPushButton("Accept label")
+            accept_btn.setToolTip("Accept as place label (YARD / GARAGE) and remove from list")
+            accept_btn.setCursor(Qt.PointingHandCursor)
+            accept_btn.setFixedHeight(_CTRL_H)
+            accept_btn.setStyleSheet(_BTN_BLUE)
+            edit_row.addWidget(accept_btn)
+            _add_row_actions(edit_row)
+            lay.addLayout(edit_row)
+            primary_edit = edit
 
         rw = _RowWidgets(
             issue=issue,
             card=card,
-            edit=edit,
+            edit=primary_edit,
             kind_label=kind_label,
             status_badge=status_badge,
             add_btn=add_btn,
             accept_label_btn=accept_btn,
             allow_btn=allow_btn,
             skip_row_btn=skip_row_btn,
+            part_edits=part_edits,
+            part_badges=part_badges,
         )
+        rw_holder = rw
         self._refresh_kind_label(rw)
         self._refresh_status_badge(rw)
-        accept_btn.setVisible(
-            is_place_label_candidate(edit.text())
-            or is_allowed_place_label(edit.text(), self._allowed_labels)
-        )
+        if accept_btn is not None:
+            accept_btn.setVisible(
+                is_place_label_candidate(primary_edit.text())
+                or is_allowed_place_label(primary_edit.text(), self._allowed_labels)
+            )
 
-        edit.textChanged.connect(lambda _t, r=rw: self._on_edit_changed(r))
+        for edit in (part_edits or [primary_edit]):
+            edit.textChanged.connect(lambda _t, r=rw: self._on_edit_changed(r))
         apply_btn.clicked.connect(lambda _=False, r=rw: self._apply_row(r))
-        accept_btn.clicked.connect(lambda _=False, r=rw: self._accept_label_row(r))
+        if accept_btn is not None:
+            accept_btn.clicked.connect(lambda _=False, r=rw: self._accept_label_row(r))
         if allow_btn is not None:
             allow_btn.clicked.connect(lambda _=False, r=rw: self._allow_anyway_row(r))
         if skip_row_btn is not None:
@@ -556,7 +697,26 @@ class TruckCorrectionDialog(QDialog):
         return card
 
     def _refresh_kind_label(self, rw: _RowWidgets) -> None:
-        if rw.issue.kind == "invalid_format":
+        if rw.part_edits:
+            labels = self._combo_part_labels(len(rw.part_edits))
+            bad: List[str] = []
+            for i, edit in enumerate(rw.part_edits):
+                status, _ = self._status_for_text(edit.text())
+                if "✓" not in status and status not in ("Place label", "Place label?"):
+                    bad.append(labels[i])
+            if not bad:
+                text, color = "Ready to apply", _GREEN
+            elif len(bad) == 1:
+                text, color = f"{bad[0]} needs attention", "#b91c1c"
+            else:
+                text, color = "Truck and trailer need attention", "#b91c1c"
+        elif self._is_two_trailer_issue(rw.issue):
+            status, _ = self._status_for_text(rw.edit.text())
+            if "✓" in status or status in ("Place label", "Place label?"):
+                text, color = "Two trailers — Allow anyway or Skip", "#b45309"
+            else:
+                text, color = "Two trailers — truck needs attention", "#b91c1c"
+        elif rw.issue.kind == "invalid_format":
             text = "Invalid format — use T + digits + space + suffix (e.g. T688 EAF)"
             color = "#b45309"
         else:
@@ -567,14 +727,38 @@ class TruckCorrectionDialog(QDialog):
             f"color: {color}; font-size: 11px; border: none; background: transparent;"
         )
 
+    def _refresh_status_badge(self, rw: _RowWidgets) -> None:
+        if rw.part_edits and rw.part_badges:
+            for edit, badge in zip(rw.part_edits, rw.part_badges):
+                label, color = self._status_for_text(edit.text())
+                badge.setText(label)
+                badge.setStyleSheet(
+                    f"QLabel {{ color: {color}; background: {_BG}; border: 1px solid {_BORDER};"
+                    f" border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 700;"
+                    f" min-height: {_CTRL_H}px; max-height: {_CTRL_H}px;"
+                    f" min-width: 110px; }}"
+                )
+                badge.setAlignment(Qt.AlignCenter)
+            return
+        label, color = self._status_for_text(rw.edit.text())
+        rw.status_badge.setText(label)
+        rw.status_badge.setStyleSheet(
+            f"QLabel {{ color: {color}; background: {_BG}; border: 1px solid {_BORDER};"
+            f" border-radius: 5px; padding: 0 10px; font-size: 12px; font-weight: 700;"
+            f" min-height: {_CTRL_H}px; max-height: {_CTRL_H}px;"
+            f" min-width: 110px; }}"
+        )
+        rw.status_badge.setAlignment(Qt.AlignCenter)
+
     def _on_edit_changed(self, rw: _RowWidgets) -> None:
-        text = rw.edit.text().strip()
-        if rw.accept_label_btn is not None:
+        if rw.accept_label_btn is not None and not rw.part_edits:
+            text = rw.edit.text().strip()
             rw.accept_label_btn.setVisible(
                 is_place_label_candidate(text)
                 or is_allowed_place_label(text, self._allowed_labels)
             )
         self._refresh_status_badge(rw)
+        self._refresh_kind_label(rw)
 
     def _autonorm_edit(self, edit: QLineEdit) -> None:
         text = edit.text().strip()
@@ -585,6 +769,75 @@ class TruckCorrectionDialog(QDialog):
             edit.blockSignals(True)
             edit.setText(norm.value)
             edit.blockSignals(False)
+
+    def _part_match_value(self, text: str) -> tuple[Optional[str], str]:
+        """Canonical plate for one combo field, plus ``ok`` / ``place`` / error kind."""
+        raw = (text or "").strip()
+        if not raw:
+            return None, "empty"
+        if is_allowed_place_label(raw, self._allowed_labels):
+            return normalize_place_label(raw), "place"
+        norm = normalize_truck_number(raw, allowed_labels=self._allowed_labels)
+        if norm.status == "place_label":
+            return norm.value, "place"
+        if norm.status in ("ok", "normalized"):
+            matched = try_match_fleet(norm.value, self._fleet)
+            if matched is not None:
+                return matched, "ok"
+            return None, "missing"
+        matched = try_match_fleet(raw, self._fleet)
+        if matched is not None:
+            return matched, "ok"
+        if norm.status == "invalid":
+            return None, "invalid"
+        return None, "missing"
+
+    def _combo_resolved_parts(
+        self, rw: _RowWidgets
+    ) -> tuple[Optional[List[str]], Optional[str]]:
+        """Return canonical truck/trailer parts, or ``(None, warning)``."""
+        labels = self._combo_part_labels(len(rw.part_edits))
+        values: List[str] = []
+        for i, edit in enumerate(rw.part_edits):
+            value, kind = self._part_match_value(edit.text())
+            name = labels[i]
+            raw = edit.text().strip()
+            if kind == "empty":
+                return None, f"Enter a {name.lower()} number."
+            if kind == "invalid":
+                return None, (
+                    f'"{raw}" is not a recognized {name.lower()} format.\n\n'
+                    "Use T + digits + suffix (e.g. T688 EAF), or Add / Allow anyway."
+                )
+            if kind == "missing":
+                return None, (
+                    f'"{raw}" is not in the fleet registry.\n\n'
+                    "Use “Add” next to that field, “Allow anyway”, or “Skip row”."
+                )
+            assert value is not None
+            values.append(value)
+            edit.setText(value)
+        self._refresh_status_badge(rw)
+        self._refresh_kind_label(rw)
+        return values, None
+
+    def _add_combo_part(self, rw: Optional[_RowWidgets], idx: int) -> None:
+        """Add one truck or trailer from a split combo card to the registry."""
+        if rw is None or idx < 0 or idx >= len(rw.part_edits):
+            return
+        edit = rw.part_edits[idx]
+        number = self._commit_registry_add(edit.text().strip())
+        if not number:
+            return
+        edit.setText(number)
+        self._refresh_status_badge(rw)
+        self._refresh_kind_label(rw)
+        parts, err = self._combo_resolved_parts(rw)
+        if err is not None:
+            return
+        merged = "/".join(parts or [])
+        also = self._confirm_apply_similar(rw, merged, action="add")
+        self._finish_resolved(rw, corrected=merged, also=also)
 
     # ── Resolve one row → remove from list ────────────────────────────────
 
@@ -619,7 +872,9 @@ class TruckCorrectionDialog(QDialog):
             rw,
             self._resolve_issue(
                 rw.issue,
-                corrected=corrected,
+                corrected=self._with_combo_suffix(
+                    rw.issue, corrected, is_place_label=is_place_label
+                ),
                 skip=skip,
                 omit_row=omit_row,
                 allow_anyway=allow_anyway,
@@ -633,7 +888,9 @@ class TruckCorrectionDialog(QDialog):
                 other,
                 self._resolve_issue(
                     other.issue,
-                    corrected=corrected,
+                    corrected=self._with_combo_suffix(
+                        other.issue, corrected, is_place_label=is_place_label
+                    ),
                     skip=skip,
                     omit_row=omit_row,
                     allow_anyway=allow_anyway,
@@ -653,8 +910,8 @@ class TruckCorrectionDialog(QDialog):
     def _omit_row(self, rw: _RowWidgets) -> None:
         """Import mode: park this row for the Skipped tab; do not import it now."""
         issue = rw.issue
-        text = rw.edit.text().strip()
-        issue.corrected = text or issue.original
+        text = self._truck_edit_value(rw)
+        issue.corrected = self._with_combo_suffix(issue, text or issue.original)
         issue.skip = False
         issue.omit_row = True
         issue.allow_anyway = False
@@ -668,10 +925,41 @@ class TruckCorrectionDialog(QDialog):
         the registry, resolve it as a normal match (not an override). If it is
         still missing, warn the user before allowing.
         """
-        text = rw.edit.text().strip() or rw.issue.original
+        text = self._truck_edit_value(rw)
         if not text:
-            QMessageBox.warning(self, "Allow anyway", "Enter a truck value first.")
+            show_warning(self, "Allow anyway", "Enter a truck value first.")
             return
+
+        if rw.part_edits:
+            also = (
+                self._confirm_apply_similar(rw, text, action="allow")
+                if ask_similar
+                else []
+            )
+            unmatched = [
+                edit.text().strip()
+                for edit in rw.part_edits
+                if edit.text().strip()
+                and try_match_fleet(edit.text().strip(), self._fleet) is None
+            ]
+            if unmatched and ask_similar:
+                reply = show_question(
+                    self,
+                    "Not in vehicle registry",
+                    "Allow this truck/trailer row anyway even though "
+                    f"{len(unmatched)} part(s) are not in the registry?",
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            self._finish_resolved(
+                rw,
+                corrected=text,
+                allow_anyway=bool(unmatched),
+                also=also,
+            )
+            return
+
+        text = rw.edit.text().strip() or rw.issue.original
 
         norm = normalize_truck_number(text, allowed_labels=self._allowed_labels)
         is_place = False
@@ -702,7 +990,7 @@ class TruckCorrectionDialog(QDialog):
             return
 
         matched = try_match_fleet(value, self._fleet)
-        if matched is not None:
+        if matched is not None and not self._is_two_trailer_issue(rw.issue):
             rw.edit.setText(matched)
             self._refresh_status_badge(rw)
             also = (
@@ -714,17 +1002,28 @@ class TruckCorrectionDialog(QDialog):
             self._finish_resolved(rw, corrected=matched, also=also)
             return
 
-        # Not in fleet registry — flag and confirm before allowing
+        if matched is not None:
+            rw.edit.setText(matched)
+            value = matched
+            self._refresh_status_badge(rw)
+
+        # Not in fleet registry, or two-trailer irregularity — confirm first
         if ask_similar:
-            reply = QMessageBox.warning(
-                self,
-                "Not in vehicle registry",
-                f'Your allowed truck "{value}" is not in the vehicle registry '
-                "(trucks, trailers, or motorcycles & cars).\n\n"
-                "Allow it anyway for this import?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
+            if self._is_two_trailer_issue(rw.issue):
+                reply = show_question(
+                    self,
+                    "Two trailers",
+                    f'This row has two trailers:\n"{rw.issue.original}"\n\n'
+                    "Allow it anyway for this import?",
+                )
+            else:
+                reply = show_question(
+                    self,
+                    "Not in vehicle registry",
+                    f'Your allowed truck "{value}" is not in the vehicle registry '
+                    "(trucks, trailers, or motorcycles & cars).\n\n"
+                    "Allow it anyway for this import?",
+                )
             if reply != QMessageBox.Yes:
                 rw.edit.setFocus()
                 return
@@ -751,7 +1050,17 @@ class TruckCorrectionDialog(QDialog):
         for rw in list(self._rows):
             if rw not in self._rows:
                 continue
-            text = rw.edit.text().strip() or rw.issue.original
+            if rw.part_edits:
+                parts, err = self._combo_resolved_parts(rw)
+                if err is None and parts:
+                    self._allow_anyway_row(rw, ask_similar=False)
+                else:
+                    pending.append(rw)
+                continue
+            if self._is_two_trailer_issue(rw.issue):
+                pending.append(rw)
+                continue
+            text = self._truck_edit_value(rw)
             norm = normalize_truck_number(text, allowed_labels=self._allowed_labels)
             if norm.status in ("ok", "normalized"):
                 value = norm.value
@@ -775,19 +1084,17 @@ class TruckCorrectionDialog(QDialog):
         samples = []
         for rw in pending[:5]:
             samples.append(
-                (rw.edit.text().strip() or rw.issue.original or "").strip() or "—"
+                (self._truck_edit_value(rw) or "").strip() or "—"
             )
         extra = f"\n…and {len(pending) - 5} more" if len(pending) > 5 else ""
-        reply = QMessageBox.warning(
+        reply = show_question(
             self,
             "Not in vehicle registry",
-            f"{len(pending)} allowed truck(s) are not in the vehicle registry "
-            "(trucks, trailers, or motorcycles & cars):\n\n"
+            f"{len(pending)} row(s) are not a normal truck match "
+            "(not in the vehicle registry, or two trailers):\n\n"
             + "\n".join(f"  • {s}" for s in samples)
             + extra
             + "\n\nAllow them anyway for this import?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
@@ -798,12 +1105,12 @@ class TruckCorrectionDialog(QDialog):
     def _accept_label_row(self, rw: _RowWidgets) -> None:
         text = normalize_place_label(rw.edit.text())
         if not text:
-            QMessageBox.warning(self, "Label", "Enter a place label first (e.g. YARD).")
+            show_warning(self, "Label", "Enter a place label first (e.g. YARD).")
             return
         if not is_place_label_candidate(text) and not is_allowed_place_label(
             text, self._allowed_labels
         ):
-            QMessageBox.warning(
+            show_warning(
                 self,
                 "Label",
                 "Place labels should be words like YARD or GARAGE "
@@ -821,13 +1128,39 @@ class TruckCorrectionDialog(QDialog):
             also=also,
         )
 
+    def _apply_combo_row(self, rw: _RowWidgets) -> None:
+        parts, err = self._combo_resolved_parts(rw)
+        if err is not None:
+            if self._import_mode and not any(e.text().strip() for e in rw.part_edits):
+                self._omit_row(rw)
+                return
+            show_warning(self, "Truck / trailer", err)
+            return
+        merged = "/".join(parts or [])
+        also = self._confirm_apply_similar(rw, merged, action="apply")
+        self._finish_resolved(rw, corrected=merged, also=also)
+
     def _apply_row(self, rw: _RowWidgets) -> None:
+        if rw.part_edits:
+            self._apply_combo_row(rw)
+            return
         text = rw.edit.text().strip()
         if not text:
             if self._import_mode:
                 self._omit_row(rw)
             else:
                 self._clear_row(rw)
+            return
+
+        if self._is_two_trailer_issue(rw.issue):
+            show_warning(
+                self,
+                "Two trailers",
+                "This cell has two trailers and cannot be applied as a "
+                "normal truck match.\n\n"
+                "Use “Allow anyway” to import as-is, or “Skip row”.",
+            )
+            rw.edit.setFocus()
             return
 
         if is_allowed_place_label(text, self._allowed_labels):
@@ -848,7 +1181,7 @@ class TruckCorrectionDialog(QDialog):
 
         if norm.status == "invalid":
             if self._import_mode:
-                QMessageBox.warning(
+                show_warning(
                     self,
                     "Invalid format",
                     f'"{text}" is not a recognized truck format yet.\n\n'
@@ -856,7 +1189,7 @@ class TruckCorrectionDialog(QDialog):
                     "or enter a T + digits + suffix number (e.g. T688 EAF).",
                 )
             else:
-                QMessageBox.warning(
+                show_warning(
                     self,
                     "Invalid format",
                     f'"{text}" is not a valid truck number.\n\n'
@@ -871,7 +1204,7 @@ class TruckCorrectionDialog(QDialog):
         self._refresh_status_badge(rw)
         matched = try_match_fleet(number, self._fleet)
         if matched is None:
-            QMessageBox.warning(
+            show_warning(
                 self,
                 "Not in registry",
                 f'"{number}" is not in the fleet registry.\n\n'
@@ -909,6 +1242,7 @@ class TruckCorrectionDialog(QDialog):
         trailer_btn = box.addButton("Trailer", QMessageBox.AcceptRole)
         motor_btn = box.addButton("Motorcycle/Car", QMessageBox.AcceptRole)
         box.addButton("Cancel", QMessageBox.RejectRole)
+        style_message_box(box)
         box.exec()
         clicked = box.clickedButton()
         if clicked is truck_btn:
@@ -919,58 +1253,67 @@ class TruckCorrectionDialog(QDialog):
             return "motor_vehicles"
         return None
 
-    def _add_to_registry_row(self, rw: _RowWidgets) -> None:
-        text = rw.edit.text().strip()
+    def _commit_registry_add(self, text: str) -> Optional[str]:
+        """Ask for a registry kind and queue the plate. Returns canonical number."""
         if not text:
-            QMessageBox.warning(
+            show_warning(
                 self, "Registry", "Enter a registration number first."
             )
-            return
+            return None
         if is_allowed_place_label(text, self._allowed_labels) or (
             is_place_label_candidate(text) and not any(ch.isdigit() for ch in text)
         ):
-            QMessageBox.warning(
+            show_warning(
                 self,
                 "Registry",
                 f'"{text}" looks like a place label, not a vehicle.\n'
                 "Use “Remember as place label” instead.",
             )
-            return
+            return None
 
-        # Category first — format rules depend on the chosen registry.
         kind = self._ask_registry_kind(text)
         if kind is None:
-            return
+            return None
 
         if kind in ("trucks", "trailers"):
             norm = normalize_truck_number(text, allowed_labels=())
             if norm.status not in ("ok", "normalized"):
-                QMessageBox.warning(
+                show_warning(
                     self,
                     "Format",
                     f'Truck/Trailer numbers must look like T688 EAF.\n\n'
                     f'"{text}" is not a valid plate format.\n'
                     "Choose Motorcycle/Car for other registration styles.",
                 )
-                return
+                return None
             number = norm.value
         else:
             number = " ".join(text.upper().split())
             if len(number) < 2:
-                QMessageBox.warning(
+                show_warning(
                     self, "Registry", "Enter a registration number first."
                 )
-                return
+                return None
 
-        rw.edit.setText(number)
-        # Persist after dialog closes — no nested asyncio inside import modals.
         from tahmeed.services.truck_service import collection_to_kind
 
         self.pending_registry_adds.append((kind, number))
         self._fleet.add(number)
         self._fleet_kinds[number] = collection_to_kind(kind)
         self._refresh_fleet_completers()
+        return number
+
+    def _add_to_registry_row(self, rw: _RowWidgets) -> None:
+        text = rw.edit.text().strip()
+        number = self._commit_registry_add(text)
+        if not number:
+            return
+
+        rw.edit.setText(number)
         self._refresh_status_badge(rw)
+        self._refresh_kind_label(rw)
+        if self._is_two_trailer_issue(rw.issue):
+            return
         also = self._confirm_apply_similar(rw, number, action="add")
         self._finish_resolved(rw, corrected=number, also=also)
 
@@ -979,6 +1322,15 @@ class TruckCorrectionDialog(QDialog):
     def _on_done(self) -> None:
         """Auto-apply every remaining row that can be resolved; warn if any remain."""
         for rw in list(self._rows):
+            if rw.part_edits:
+                parts, err = self._combo_resolved_parts(rw)
+                if err is None and parts:
+                    issue = rw.issue
+                    issue.corrected = "/".join(parts)
+                    issue.skip = False
+                    issue.is_place_label = False
+                    self._remove_row(rw, issue)
+                continue
             text = rw.edit.text().strip()
             if not text:
                 self._clear_row(rw)
@@ -1001,11 +1353,13 @@ class TruckCorrectionDialog(QDialog):
                 self._remove_row(rw, issue)
                 continue
             if norm.status in ("ok", "normalized"):
+                if self._is_two_trailer_issue(rw.issue):
+                    continue
                 matched = try_match_fleet(norm.value, self._fleet)
                 if matched is not None:
                     rw.edit.setText(matched)
                     issue = rw.issue
-                    issue.corrected = matched
+                    issue.corrected = self._with_combo_suffix(issue, matched)
                     issue.skip = False
                     issue.is_place_label = False
                     self._remove_row(rw, issue)
@@ -1016,12 +1370,13 @@ class TruckCorrectionDialog(QDialog):
                 if self._import_mode
                 else "Resolve them in the list, or Cancel remaining."
             )
-            QMessageBox.information(
+            show_info(
                 self,
                 "Still need attention",
                 f"{len(self._rows)} truck(s) still need attention.\n{tip}",
             )
-            self._rows[0].edit.setFocus()
+            focus = self._rows[0]
+            (focus.part_edits[0] if focus.part_edits else focus.edit).setFocus()
             return
         # Empty list already called accept() via _remove_row; if we got here with
         # zero rows for another reason, close cleanly.

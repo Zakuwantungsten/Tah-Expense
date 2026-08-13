@@ -44,6 +44,7 @@ from tahmeed.ui.accountant.separate_expenses import (
 )
 from tahmeed.models.reconciliation import ReconciliationEntry
 from tahmeed.services import reconciliation_service as recon_svc
+from tahmeed.ui.dialog_theme import show_question
 
 try:
     import openpyxl
@@ -121,15 +122,38 @@ def _norm(v) -> str:
     return str(v).strip().lower() if v is not None else ""
 
 
+def _is_header_row(row: tuple) -> bool:
+    """True for a column-header row (has both an SR cell and a PRN cell)."""
+    cells = [_norm(c) for c in row]
+    has_sr = any(c == "sr" or c.startswith("sr.") or c.startswith("sr ") for c in cells)
+    has_prn = any("prn" in c for c in cells)
+    return has_sr and has_prn
+
+
 def _find_header_row(rows: List[tuple]) -> Optional[int]:
-    """The header is the row that carries both an 'SR…' cell and a 'PRN' cell."""
+    """First header row index, or None."""
     for i, row in enumerate(rows):
-        cells = [_norm(c) for c in row]
-        has_sr = any(c == "sr" or c.startswith("sr.") or c.startswith("sr ") for c in cells)
-        has_prn = any("prn" in c for c in cells)
-        if has_sr and has_prn:
+        if _is_header_row(row):
             return i
     return None
+
+
+def _find_header_indices(rows: List[tuple]) -> List[int]:
+    """Every stacked table header on a sheet (Nakonde, then Kasumbalesa, …)."""
+    return [i for i, row in enumerate(rows) if _is_header_row(row)]
+
+
+def _looks_like_section_row(row: tuple) -> bool:
+    """Title / schedule banner / totals — not a data row."""
+    text = " ".join(str(c).strip() for c in row if c is not None and str(c).strip())
+    if not text:
+        return True
+    low = text.lower()
+    if "schedule from" in low:
+        return True
+    if "tahmeed rpa" in low or "tahmeed bonds" in low or "tahmeed rits" in low:
+        return True
+    return False
 
 
 def _map_columns(headers: List[str], fields) -> Dict[str, int]:
@@ -149,24 +173,34 @@ def _map_columns(headers: List[str], fields) -> Dict[str, int]:
     return colmap
 
 
-def _find_period(rows: List[tuple]) -> str:
-    for row in rows:
+def _find_period(rows: List[tuple], start: int = 0, end: Optional[int] = None) -> str:
+    stop = len(rows) if end is None else end
+    for row in rows[start:stop]:
         for c in row:
             if c is not None and "schedule from" in str(c).lower():
                 return str(c).strip()
     return ""
 
 
+def _station_from_title_block(rows: List[tuple], header_idx: int, start: int) -> Tuple[str, str]:
+    """Station slug/name from the banner above a table header."""
+    for i in range(header_idx - 1, start - 1, -1):
+        for c in rows[i]:
+            if c is None or not str(c).strip():
+                continue
+            text = str(c).strip()
+            if "schedule from" in text.lower():
+                break
+            word = text.split()[0].split("-")[0].strip()
+            if word:
+                return recon_svc._slug(word), word.title()
+            break
+    return "", ""
+
+
 def _station_from_title(rows: List[tuple]) -> Tuple[str, str]:
     """First non-empty title cell → ('nakonde', 'Nakonde')."""
-    for row in rows:
-        for c in row:
-            if c is not None and str(c).strip():
-                word = str(c).strip().split()[0].split("-")[0].strip()
-                if word:
-                    return word.lower(), word.title()
-                break
-    return "", ""
+    return _station_from_title_block(rows, len(rows), 0)
 
 
 def _to_float(v) -> Optional[float]:
@@ -202,55 +236,81 @@ def _cell_at(row: tuple, idx: Optional[int]) -> object:
     return row[idx]
 
 
+def _parse_recon_sheet_rows(
+    rows: List[tuple],
+    table: str,
+    sheet_title: str = "",
+) -> List[ReconciliationEntry]:
+    """Parse one worksheet, including stacked RPA tables with their own headers."""
+    fields = _RPA_FIELDS if table == "rpa_schedule" else _BONDS_FIELDS
+    header_indices = _find_header_indices(rows)
+    if not header_indices:
+        return []
+
+    entries: List[ReconciliationEntry] = []
+    for ti, hidx in enumerate(header_indices):
+        next_h = header_indices[ti + 1] if ti + 1 < len(header_indices) else len(rows)
+        block_start = 0 if ti == 0 else header_indices[ti - 1] + 1
+        headers = [_norm(c) for c in rows[hidx]]
+        colmap = _map_columns(headers, fields)
+        period = _find_period(rows, block_start, next_h) or _find_period(rows)
+
+        banner = _station_from_title_block(rows, hidx, block_start)[0]
+        sheet_slug = recon_svc._slug(sheet_title) if sheet_title else ""
+        if table == "bonds":
+            station = banner or sheet_slug
+        else:
+            station = banner or sheet_slug or "nakonde"
+
+        for raw in rows[hidx + 1 : next_h]:
+            if _is_header_row(raw) or _looks_like_section_row(raw):
+                continue
+            prn = str(_cell_at(raw, colmap.get("prn_number")) or "").strip()
+            sm_ref = str(_cell_at(raw, colmap.get("sm_ref_no")) or "").strip()
+            if not prn and not sm_ref:
+                continue
+            if _norm(prn) in ("prn", "prn number") or _norm(sm_ref) in ("sm ref no", "sm ref"):
+                continue
+            truck = str(_cell_at(raw, colmap.get("truck_and_trailer")) or "").strip()
+            if "truck" in _norm(truck) and "trailer" in _norm(truck):
+                continue
+            entries.append(ReconciliationEntry(
+                table=table,
+                station=station,
+                schedule_period=period,
+                sr_no=_to_int(_cell_at(raw, colmap.get("sr_no"))),
+                sm_ref_no=sm_ref,
+                prn_number=prn,
+                entry_reg_no=str(_cell_at(raw, colmap.get("entry_reg_no")) or "").strip(),
+                t1_no=str(_cell_at(raw, colmap.get("t1_no")) or "").strip(),
+                t1_date=_to_dt(_cell_at(raw, colmap.get("t1_date"))),
+                importer=str(_cell_at(raw, colmap.get("importer")) or "").strip(),
+                consignment=str(_cell_at(raw, colmap.get("consignment")) or "").strip(),
+                truck_and_trailer=truck,
+                charge=_to_float(_cell_at(raw, colmap.get("charge"))) or 0.0,
+                asycuda_amount=_to_float(_cell_at(raw, colmap.get("asycuda_amount"))),
+                exporter=str(_cell_at(raw, colmap.get("exporter")) or "").strip(),
+            ))
+    return entries
+
+
 def parse_recon_workbook(path: str, table: str) -> List[ReconciliationEntry]:
     """Parse every sheet of an SM Burhani workbook into reconciliation entries.
 
-    For Bonds, each worksheet is a border station (tab title). For the RPA
-    schedule (single sheet) the station is read from the title banner.
+    For Bonds, each worksheet is usually a border station (tab title), and the
+    banner may read ``NAKONDE - TAHMEED RITS``. Both feeds also accept stacked
+    tables on one sheet (Nakonde, then Kasumbalesa), each with its own title
+    banner and header row.
     """
     if not _HAS_OPENPYXL:
         raise RuntimeError("openpyxl is required to read .xlsx files.")
 
-    fields = _RPA_FIELDS if table == "rpa_schedule" else _BONDS_FIELDS
     wb = openpyxl.load_workbook(path, data_only=True)
     entries: List[ReconciliationEntry] = []
     try:
         for ws in wb.worksheets:
             rows = list(ws.iter_rows(values_only=True))
-            hidx = _find_header_row(rows)
-            if hidx is None:
-                continue
-            headers = [_norm(c) for c in rows[hidx]]
-            colmap = _map_columns(headers, fields)
-            period = _find_period(rows)
-
-            if table == "bonds":
-                station = recon_svc._slug(ws.title)
-            else:
-                station = _station_from_title(rows)[0] or "nakonde"
-
-            for raw in rows[hidx + 1:]:
-                prn = str(_cell_at(raw, colmap.get("prn_number")) or "").strip()
-                sm_ref = str(_cell_at(raw, colmap.get("sm_ref_no")) or "").strip()
-                if not prn and not sm_ref:
-                    continue  # blank / trailing rows
-                entries.append(ReconciliationEntry(
-                    table=table,
-                    station=station,
-                    schedule_period=period,
-                    sr_no=_to_int(_cell_at(raw, colmap.get("sr_no"))),
-                    sm_ref_no=sm_ref,
-                    prn_number=prn,
-                    entry_reg_no=str(_cell_at(raw, colmap.get("entry_reg_no")) or "").strip(),
-                    t1_no=str(_cell_at(raw, colmap.get("t1_no")) or "").strip(),
-                    t1_date=_to_dt(_cell_at(raw, colmap.get("t1_date"))),
-                    importer=str(_cell_at(raw, colmap.get("importer")) or "").strip(),
-                    consignment=str(_cell_at(raw, colmap.get("consignment")) or "").strip(),
-                    truck_and_trailer=str(_cell_at(raw, colmap.get("truck_and_trailer")) or "").strip(),
-                    charge=_to_float(_cell_at(raw, colmap.get("charge"))) or 0.0,
-                    asycuda_amount=_to_float(_cell_at(raw, colmap.get("asycuda_amount"))),
-                    exporter=str(_cell_at(raw, colmap.get("exporter")) or "").strip(),
-                ))
+            entries.extend(_parse_recon_sheet_rows(rows, table, ws.title))
     finally:
         wb.close()
     return entries
@@ -285,6 +345,7 @@ class ReconImportDialog(QDialog):
         self._entries: List[ReconciliationEntry] = []
         self._new: List[ReconciliationEntry] = []
         self._source_path = ""
+        self._last_skipped = 0
 
         self.setWindowTitle(f"Import — {title}")
         self.setMinimumWidth(720)
@@ -403,13 +464,44 @@ class ReconImportDialog(QDialog):
         asyncio.ensure_future(self._async_import())
 
     async def _async_import(self) -> None:
+        from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
+
         try:
             upload_id = str(uuid.uuid4())
             filename = Path(self._source_path).name if self._source_path else "Unknown"
+            docs = []
             for e in self._new:
                 e.upload_id = upload_id
                 e.source_filename = filename
-            saved = await recon_svc.save_reconciliation_rows(self._new)
+                docs.append(e.to_doc())
+            gate = await run_import_truck_gate(
+                self,
+                docs,
+                feed_key=self._table,
+                upload_id=upload_id,
+                source_filename=filename,
+                can_add=True,
+            )
+            if gate.aborted:
+                self._import_btn.setEnabled(True)
+                self._import_btn.setText(f"Import {len(self._new):,} Records")
+                return
+            self._last_skipped = gate.skipped_count
+            if not gate.rows:
+                if gate.skipped_count:
+                    QMessageBox.information(
+                        self,
+                        "Import",
+                        f"No rows imported. {gate.skipped_count:,} parked in Skipped.",
+                    )
+                    self.imported.emit(0)
+                    self.accept()
+                else:
+                    self._import_btn.setEnabled(True)
+                    self._import_btn.setText(f"Import {len(self._new):,} Records")
+                return
+            entries = [ReconciliationEntry.from_doc(d) for d in gate.rows]
+            saved = await recon_svc.save_reconciliation_rows(entries)
             self.imported.emit(saved)
             self.accept()
         except Exception as exc:
@@ -677,9 +769,10 @@ class _StationTabBar(QWidget):
     station_changed = Signal(str)   # slug
     add_requested = Signal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, allow_add: bool = True) -> None:
         super().__init__(parent)
         self.setStyleSheet("background:transparent;")
+        self._allow_add = allow_add
         self._hl = QHBoxLayout(self)
         self._hl.setContentsMargins(0, 0, 0, 0)
         self._hl.setSpacing(6)
@@ -702,17 +795,18 @@ class _StationTabBar(QWidget):
             self._buttons[slug] = chip
             self._hl.addWidget(chip)
 
-        add = QPushButton("+ Add Station")
-        add.setCursor(Qt.PointingHandCursor)
-        add.setFixedHeight(30)
-        add.setStyleSheet(
-            f"QPushButton{{background:transparent;color:{_BLUE};border:1px dashed {_BLUE};"
-            "border-radius:15px;font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI';padding:0 14px;}}"
-            f"QPushButton:hover{{background:{_BLUE_L};}}"
-        )
-        add.clicked.connect(self.add_requested.emit)
-        self._hl.addWidget(add)
+        if self._allow_add:
+            add = QPushButton("+ Add Station")
+            add.setCursor(Qt.PointingHandCursor)
+            add.setFixedHeight(30)
+            add.setStyleSheet(
+                f"QPushButton{{background:transparent;color:{_BLUE};border:1px dashed {_BLUE};"
+                "border-radius:15px;font-size:12px;font-weight:600;"
+                "font-family:'Segoe UI';padding:0 14px;}}"
+                f"QPushButton:hover{{background:{_BLUE_L};}}"
+            )
+            add.clicked.connect(self.add_requested.emit)
+            self._hl.addWidget(add)
         self._hl.addStretch()
 
         if stations:
@@ -940,12 +1034,11 @@ class _ReconUploadDetail(QWidget):
         self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
         vl.addWidget(self._info_lbl)
 
-        if self._bonds:
-            self._tabs = _StationTabBar()
-            self._tabs.station_changed.connect(self._on_station)
-            self._tabs.add_requested.connect(self._add_station)
-            vl.addWidget(self._tabs)
+        self._tabs = _StationTabBar(allow_add=False)
+        self._tabs.station_changed.connect(self._on_station)
+        vl.addWidget(self._tabs)
 
+        if self._bonds:
             self._summary = QFrame()
             self._summary.setStyleSheet(
                 f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;border-radius:6px;}}"
@@ -997,7 +1090,9 @@ class _ReconUploadDetail(QWidget):
         vl.addWidget(self._status_lbl)
 
     def load_upload(self, upload_doc: dict) -> None:
+        self._upload_doc = upload_doc or {}
         self._upload_id = str(upload_doc.get("_id") or "")
+        self._station = ""
         filename = upload_doc.get("source_filename") or "Unknown file"
         count = int(upload_doc.get("record_count", 0))
         charge = float(upload_doc.get("total_charge", 0))
@@ -1020,14 +1115,12 @@ class _ReconUploadDetail(QWidget):
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
 
-        if self._bonds:
-            asyncio.ensure_future(self._load_stations())
-        else:
-            self._reset_and_load()
+        asyncio.ensure_future(self._load_stations())
 
     def _request_delete(self) -> None:
-        if self._upload_doc:
-            self.delete_requested.emit(self._upload_doc)
+        doc = self._upload_doc or ({"_id": self._upload_id} if self._upload_id else {})
+        if doc.get("_id"):
+            self.delete_requested.emit(doc)
 
     def _reset_and_load(self) -> None:
         self._loaded = 0
@@ -1045,7 +1138,15 @@ class _ReconUploadDetail(QWidget):
         self._status_lbl.setText(f"Showing {self._loaded:,} of {self._total:,}{suffix}")
 
     async def _load_stations(self) -> None:
-        stations = await recon_svc.get_recon_stations("bonds")
+        stations = await recon_svc.get_recon_upload_stations(
+            self._upload_id, self._table,
+        )
+        if not stations:
+            self._tabs.setVisible(False)
+            self._station = ""
+            self._reset_and_load()
+            return
+        self._tabs.setVisible(True)
         self._tabs.set_stations(stations, active=self._station or self._tabs.active)
         self._station = self._tabs.active
         self._reset_and_load()
@@ -1130,17 +1231,6 @@ class _ReconUploadDetail(QWidget):
         if value >= bar.maximum() - 24:
             asyncio.ensure_future(self._load_more())
 
-    def _add_station(self) -> None:
-        dlg = _AddStationDialog(parent=self)
-        dlg.submitted.connect(
-            lambda name, border: asyncio.ensure_future(self._do_add_station(name, border))
-        )
-        dlg.exec()
-
-    async def _do_add_station(self, name: str, border: str) -> None:
-        await recon_svc.add_recon_station(name, border, "bonds")
-        await self._load_stations()
-
     def _export(self) -> None:
         asyncio.ensure_future(self._do_export())
 
@@ -1215,7 +1305,7 @@ class _ReconUploadDetail(QWidget):
 
 
 class _ReconShellWidget(QWidget):
-    """All Entries + Uploads shell for one SM Burhani table."""
+    """All Entries + Uploads + Skipped shell for one SM Burhani table."""
 
     def __init__(
         self,
@@ -1252,7 +1342,7 @@ class _ReconShellWidget(QWidget):
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._tabs = _SegmentTabBar(["All Entries", "Uploads"])
+        self._tabs = _SegmentTabBar(["All Entries", "Uploads", "Skipped"])
         vl.addWidget(self._tabs)
 
         self._main_stack = QStackedWidget()
@@ -1285,12 +1375,23 @@ class _ReconShellWidget(QWidget):
         upload_vl.addWidget(self._upload_stack, 1)
         self._main_stack.addWidget(upload_host)
 
-        self._tabs.tab_changed.connect(self._main_stack.setCurrentIndex)
+        from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
+        self._skipped = SkippedTrucksTab(self._table)
+        self._main_stack.addWidget(self._skipped)
+
+        self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+
+    def _on_main_tab(self, idx: int) -> None:
+        self._main_stack.setCurrentIndex(idx)
+        if idx == 2:
+            self._skipped.refresh()
 
     def refresh(self) -> None:
         self._all_entries.refresh()
         self._show_browse()
+        if hasattr(self, "_skipped"):
+            self._skipped.refresh()
 
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)
@@ -1332,10 +1433,18 @@ class _ReconShellWidget(QWidget):
         dlg.exec()
 
     def _on_imported(self, n: int) -> None:
-        QMessageBox.information(self, "Import Complete", f"Imported {n:,} new records.")
+        skipped = int(getattr(self.sender(), "_last_skipped", 0) or 0)
+        msg = f"Imported {n:,} new records."
+        if skipped:
+            msg += f"\n{skipped:,} parked in Skipped for follow-up."
+        QMessageBox.information(self, "Import Complete", msg)
         self._all_entries.refresh()
-        self._tabs.set_index(1)
         self._show_browse()
+        if skipped:
+            self._tabs.set_index(2)
+            self._skipped.refresh()
+        else:
+            self._tabs.set_index(1)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
         upload_id = str(upload_doc.get("_id") or "")
@@ -1343,7 +1452,7 @@ class _ReconShellWidget(QWidget):
             return
         filename = upload_doc.get("source_filename") or "Unknown file"
         count = int(upload_doc.get("record_count", 0))
-        if QMessageBox.question(
+        if show_question(
             self,
             "Delete Upload",
             f"Delete upload from \"{filename}\" and all {count:,} records?\n\nThis cannot be undone.",
@@ -1365,6 +1474,8 @@ class _ReconShellWidget(QWidget):
         )
         self._all_entries.refresh()
         self._show_browse()
+        if hasattr(self, "_skipped"):
+            self._skipped.refresh()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -8,8 +8,9 @@ normalizers are added later.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Set
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from tahmeed.services.truck_format import (
     DEFAULT_PLACE_LABELS,
@@ -34,12 +35,18 @@ FEED_TRUCK_FIELDS: Dict[str, str] = {
     "diesel_lake_zambia": "truck_no",
     "diesel_lake_tunduma": "truck_no",
     "diesel_gbp": "truck_no",
+    "rpa_schedule": "truck_and_trailer",
+    "bonds": "truck_and_trailer",
+    "sm_burhani": "truck_and_trailer",
 }
 
 # How re-uploaded skipped rows should be persisted
 FEED_SAVE_TARGET: Dict[str, str] = {
     "congo_expenses": "separate_expenses",
     "ahmed_kimvi": "separate_expenses",
+    "rpa_schedule": "reconciliation",
+    "bonds": "reconciliation",
+    "sm_burhani": "reconciliation",
 }
 
 # Ledger placeholders that are not real truck numbers (Parking Congo deposits, etc.)
@@ -79,6 +86,175 @@ def is_blank_truck_value(raw: object) -> bool:
     return s.lower() in _BLANK_TRUCK_TOKENS
 
 
+_COMBO_SPLIT = re.compile(r"\s*(?:[/,&|]|\bAND\b)\s*", re.IGNORECASE)
+
+
+def split_truck_combo_cell(raw: str) -> Optional[List[str]]:
+    """Split ``T688 EAF / T123 TRA`` into parts; None if it is a single plate.
+
+    Requires every part to look like a registration (letters and digits) so
+    values like ``weird/99`` stay one invalid token, not a combo.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    parts = [p.strip() for p in _COMBO_SPLIT.split(text) if str(p).strip()]
+    if len(parts) < 2:
+        return None
+    if not all(re.search(r"\d", p) and re.search(r"[A-Za-z]", p) for p in parts):
+        return None
+    return parts
+
+
+def split_leading_truck(raw: str) -> Optional[Tuple[str, str]]:
+    """Split SM Burhani ``T469EKZ/T689ELK`` into ``(truck, suffix)``.
+
+    Suffix keeps the original separator and trailer (``/T689ELK``). Returns
+    None when the cell is not a truck/trailer combo.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    match = _COMBO_SPLIT.search(text)
+    if not match:
+        return None
+    truck = text[: match.start()].strip()
+    rest = text[match.end() :].strip()
+    if not truck or not rest:
+        return None
+    if not (re.search(r"\d", truck) and re.search(r"[A-Za-z]", truck)):
+        return None
+    if not (re.search(r"\d", rest) and re.search(r"[A-Za-z]", rest)):
+        return None
+    return truck, text[match.start() :]
+
+
+def truck_and_trailer_search_regex(truck: str) -> Optional[str]:
+    """Regex that matches a truck at the start of a ``truck/trailer`` cell.
+
+    ``T469 EKZ`` matches ``T469EKZ/T689ELK``, ``T469 EKZ / T689 ELK``, and
+    a plain ``T469 EKZ`` cell. Spaces in the stored plate are ignored.
+    """
+    compact = re.sub(r"\s+", "", str(truck or "").strip().upper())
+    if not compact:
+        return None
+    flex = r"\s*".join(re.escape(ch) for ch in compact)
+    return rf"^{flex}(?=\s*/|$)"
+
+
+def _match_one_truck(
+    raw: str,
+    fleet: Set[str],
+    labels: List[str],
+) -> Tuple[str, str]:
+    """Return ``(status, value)`` for one plate/label token."""
+    if is_blank_truck_value(raw):
+        return "empty", ""
+    norm = normalize_truck_number(raw, allowed_labels=labels)
+    if norm.status == "empty":
+        return "empty", ""
+    if norm.status == "place_label":
+        return "place_label", norm.value
+    if norm.status in ("ok", "normalized"):
+        matched = try_match_fleet(norm.value, fleet)
+        if matched is not None:
+            return "ok", matched
+        return "not_in_registry", raw
+    matched = try_match_fleet(raw, fleet)
+    if matched is not None:
+        return "ok", matched
+    return "invalid_format", raw
+
+
+def join_combo_parts(parts: List[str]) -> str:
+    """Join canonical plates as ``T843 EKT/T691 ELK`` (Excel-style slash)."""
+    return "/".join(p.strip() for p in parts if str(p).strip())
+
+
+def attach_combo_suffix(truck: str, suffix: str) -> str:
+    """Reattach ``/T691ELK`` (or two-trailer rest) after editing the truck."""
+    truck = str(truck or "").strip()
+    suffix = str(suffix or "")
+    if not suffix:
+        return truck
+    return f"{truck}{suffix}"
+
+
+def combo_suffix_of(raw: str) -> str:
+    """Trailer rest of a combo cell, including the separator; else ``""``."""
+    split = split_leading_truck(raw)
+    return split[1] if split else ""
+
+
+def leading_truck_of(raw: str) -> str:
+    """First plate of a ``truck/trailer`` cell, or the whole cell."""
+    split = split_leading_truck(raw)
+    return split[0] if split else str(raw or "").strip()
+
+
+def is_two_trailer_cell(raw: str) -> bool:
+    """True for ``truck/trailer/trailer`` (or ``truck/trailer & trailer``) cells."""
+    parts = split_truck_combo_cell(raw)
+    return bool(parts) and len(parts) >= 3
+
+
+def _pretty_combo_part(
+    part: str,
+    fleet: Set[str],
+    labels: List[str],
+) -> str:
+    """Canonical plate when known; otherwise format-normalize without gating."""
+    status, value = _match_one_truck(part, fleet, labels)
+    if status in ("ok", "place_label"):
+        return value
+    norm = normalize_truck_number(part, allowed_labels=labels)
+    if norm.status in ("ok", "normalized", "place_label"):
+        return norm.value
+    return part
+
+
+def resolve_combo_parts(
+    raw: str,
+    fleet: Set[str],
+    labels: Optional[Iterable[str]] = None,
+) -> Tuple[str, str, List[str]]:
+    """Check the leading truck only. Returns ``(status, value, parts)``.
+
+    One unknown trailer does not fail the gate. Two or more trailers
+    (``T724CPQ/T631DZX/T632DZX``) are flagged as ``invalid_format`` so the
+    importer can confirm the truck. ``parts`` is the original split list
+    (empty when the cell is not a combo).
+    """
+    allowed = list(labels) if labels is not None else list(DEFAULT_PLACE_LABELS)
+    text = str(raw or "").strip()
+    parts = split_truck_combo_cell(text)
+    if not parts:
+        status, value = _match_one_truck(text, fleet, allowed)
+        return status, value, []
+    truck_status, truck_value = _match_one_truck(parts[0], fleet, allowed)
+    rest = [_pretty_combo_part(p, fleet, allowed) for p in parts[1:]]
+    if is_two_trailer_cell(text):
+        if truck_status not in ("ok", "place_label"):
+            return truck_status, text, parts
+        return "invalid_format", text, parts
+    if truck_status in ("ok", "place_label"):
+        return "ok", join_combo_parts([truck_value] + rest), parts
+    return truck_status, text, parts
+
+
+def resolve_truck_cell(
+    raw: str,
+    fleet: Set[str],
+    labels: Optional[Iterable[str]] = None,
+) -> Tuple[str, str]:
+    """Match a truck cell against the fleet, including ``truck/trailer`` combos."""
+    text = str(raw or "").strip()
+    if is_blank_truck_value(text):
+        return "empty", ""
+    status, value, _parts = resolve_combo_parts(text, fleet, labels)
+    return status, value
+
+
 def mark_parking_congo_deposit(row: dict, truck_field: str = "vehicle_no") -> None:
     """Tag a deposit row and clear placeholder vehicle / direction cells."""
     row["is_deposit"] = True
@@ -102,6 +278,10 @@ def scan_import_trucks(
     Rows that match the fleet (or an allowed place label) are rewritten with the
     canonical value. Empty truck cells are left alone and not flagged.
 
+    ``TRUCK & TRAILER`` cells (``T469EKZ/T689ELK``) are split; only the
+    leading truck is gated. One missing trailer does not flag the row.
+    Two or more trailers are flagged as irregular for review.
+
     Parking Congo **Deposit** rows (and blank/placeholder plates like ``-``) are
     never flagged as not-in-registry — deposits are account credits, not trucks.
     """
@@ -124,36 +304,21 @@ def scan_import_trucks(
             row[truck_field] = ""
             result.empty_count += 1
             continue
-        norm = normalize_truck_number(raw, allowed_labels=labels)
-        if norm.status == "empty":
+        status, value, _parts = resolve_combo_parts(raw, fleet, labels)
+        if status == "empty":
             row[truck_field] = ""
             result.empty_count += 1
             continue
-        if norm.status == "place_label":
-            row[truck_field] = norm.value
+        if status in ("ok", "place_label"):
+            row[truck_field] = value
             result.ok_count += 1
             continue
-        if norm.status in ("ok", "normalized"):
-            matched = try_match_fleet(norm.value, fleet)
-            if matched is not None:
-                row[truck_field] = matched
-                result.ok_count += 1
-                continue
-            result.issues.append(
-                TruckIssue(row=i, original=raw, kind="not_in_registry")
-            )
-            continue
-        # Free-form plates (motorcycles/cars) may already be in the fleet
-        # without matching T### XXX — accept those before flagging format.
-        matched = try_match_fleet(raw, fleet)
-        if matched is not None:
-            row[truck_field] = matched
-            result.ok_count += 1
-            continue
-        # Invalid / unrecognized format — flag for Skip / Allow anyway
-        result.issues.append(
-            TruckIssue(row=i, original=raw, kind="invalid_format")
-        )
+        result.issues.append(TruckIssue(
+            row=i,
+            original=raw,
+            kind=status if status in ("invalid_format", "not_in_registry") else "not_in_registry",
+            combo_suffix=combo_suffix_of(raw),
+        ))
     return result
 
 
@@ -217,6 +382,8 @@ def skipped_docs_from_pairs(
             "target_upload_id": target_upload_id,
             "source_filename": source_filename or payload.get("source_filename", ""),
             "sheet_label": sheet_label or payload.get("sheet_label", ""),
+            # 1-based position among data rows in the uploaded file
+            "source_row": int(iss.row) + 1,
             "reason": iss.kind,
             "original_truck": iss.original,
             "save_target": save_target_for(feed_key),
