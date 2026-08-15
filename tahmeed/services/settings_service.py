@@ -18,6 +18,8 @@ DEFAULTS = {
     "duplicate_check_days": 5,
     # Free-text Truck No. place labels (YARD, GARAGE, …) accepted without fleet match.
     "allowed_truck_labels": ["YARD", "GARAGE"],
+    # Item names whose verified transactions appear in Fuel Consumption → Diesel Cash.
+    "diesel_cash_items": ["Diesel Cash"],
 }
 
 

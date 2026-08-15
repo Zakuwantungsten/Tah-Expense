@@ -11,6 +11,7 @@ from bson import ObjectId
 
 from tahmeed.db.connection import get_db
 from tahmeed.models.transaction import Transaction
+from tahmeed.services.diesel_amounts import apply_diesel_computed_fields, diesel_line_total
 from tahmeed.services.excel_dates import (
     format_excel_date,
     normalize_date_fields,
@@ -1638,9 +1639,10 @@ async def get_master_categories(year: Optional[int] = None) -> List[str]:
 # ── Diesel Cash (cashier-fed, verified transactions) ─────────────────────────
 
 DIESEL_CASH_CATEGORY = "Diesel Cash"
+DIESEL_CASH_ITEMS_SETTING = "diesel_cash_items"
 
-# Canonical cashier item name for diesel cash. Matched case-insensitively so
-# minor casing variations still land in the Diesel Cash tab.
+# Default item name(s) when the accountant has not configured a list yet.
+# Matching is case-insensitive exact on item / category_name — never description.
 DIESEL_CASH_CATEGORIES = ("Diesel Cash",)
 
 _MONTH_NAMES = (
@@ -1649,10 +1651,93 @@ _MONTH_NAMES = (
 )
 
 
-def _diesel_cash_name_filter() -> dict:
-    """Case-insensitive exact match against any known diesel-cash item name."""
-    alternation = "|".join(re.escape(n) for n in DIESEL_CASH_CATEGORIES)
+def normalize_diesel_cash_item_names(raw: Any = None) -> List[str]:
+    """Unique item names, order preserved. ``None`` → default; ``[]`` stays empty."""
+    if raw is None:
+        values: Sequence[Any] = DIESEL_CASH_CATEGORIES
+    elif isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = DIESEL_CASH_CATEGORIES
+    names: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        name = str(value or "").strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+async def get_diesel_cash_item_names() -> List[str]:
+    """Configured item names that feed Fuel Consumption → Diesel Cash."""
+    from tahmeed.services.settings_service import get_setting
+
+    try:
+        raw = await get_setting(DIESEL_CASH_ITEMS_SETTING)
+    except Exception:
+        raw = None
+    if raw is None:
+        return list(DIESEL_CASH_CATEGORIES)
+    return normalize_diesel_cash_item_names(raw)
+
+
+async def set_diesel_cash_item_names(names: Sequence[str]) -> List[str]:
+    """Persist the item names that feed Diesel Cash. Empty list catches nothing."""
+    from tahmeed.services.settings_service import set_setting
+
+    cleaned = normalize_diesel_cash_item_names(list(names or []))
+    await set_setting(DIESEL_CASH_ITEMS_SETTING, cleaned)
+    return cleaned
+
+
+def _diesel_cash_name_filter(names: Optional[Sequence[str]] = None) -> Optional[dict]:
+    """Case-insensitive exact match against the configured diesel item names."""
+    cleaned = (
+        normalize_diesel_cash_item_names(names)
+        if names is not None
+        else list(DIESEL_CASH_CATEGORIES)
+    )
+    if not cleaned:
+        return None
+    # Longer names first so "Diesel Cash" is not shadowed by "Diesel".
+    alternation = "|".join(
+        re.escape(n) for n in sorted(cleaned, key=len, reverse=True)
+    )
     return {"$regex": f"^(?:{alternation})$", "$options": "i"}
+
+
+def is_diesel_cash_item(
+    name: Optional[str],
+    item_names: Optional[Sequence[str]] = None,
+) -> bool:
+    """True when *name* is one of the configured diesel item names."""
+    if not (name or "").strip():
+        return False
+    name_filter = _diesel_cash_name_filter(item_names)
+    if not name_filter:
+        return False
+    return bool(re.fullmatch(name_filter["$regex"], str(name), re.IGNORECASE))
+
+
+def _diesel_cash_verified_match(names: Optional[Sequence[str]] = None) -> dict:
+    """``verified`` + item/category_name match (source-agnostic: cashier or import)."""
+    query: dict = {"verified": True}
+    name_filter = _diesel_cash_name_filter(names)
+    if name_filter is None:
+        query["category_name"] = {"$in": []}
+        return query
+    query["$or"] = [
+        {"category_name": name_filter},
+        {"item": name_filter},
+    ]
+    return query
 
 
 def _build_diesel_cash_query(
@@ -1663,11 +1748,9 @@ def _build_diesel_cash_query(
     receipt: str = "",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    item_names: Optional[Sequence[str]] = None,
 ) -> dict:
-    query: dict = {
-        "verified": True,
-        "category_name": _diesel_cash_name_filter(),
-    }
+    query: dict = _diesel_cash_verified_match(item_names)
 
     _year = int(year or 0)
     if _year > 0:
@@ -1700,15 +1783,13 @@ def _build_diesel_cash_query(
 async def get_diesel_cash_month_summaries(year: int) -> list:
     """One summary row per calendar month for verified Diesel Cash transactions."""
     db = get_db()
+    match = _diesel_cash_verified_match(await get_diesel_cash_item_names())
+    match["date"] = {
+        "$gte": datetime(year, 1, 1),
+        "$lte": datetime(year, 12, 31, 23, 59, 59),
+    }
     pipeline = [
-        {"$match": {
-            "verified": True,
-            "category_name": _diesel_cash_name_filter(),
-            "date": {
-                "$gte": datetime(year, 1, 1),
-                "$lte": datetime(year, 12, 31, 23, 59, 59),
-            },
-        }},
+        {"$match": match},
         {"$group": {
             "_id": {"$month": "$date"},
             "record_count": {"$sum": 1},
@@ -1757,6 +1838,7 @@ async def get_diesel_cash_transactions(
     db = get_db()
     query = _build_diesel_cash_query(
         year, month, search, truck, receipt, date_from, date_to,
+        item_names=await get_diesel_cash_item_names(),
     )
     direction = 1 if sort_asc else -1
     cursor = (
@@ -1781,6 +1863,7 @@ async def count_diesel_cash_transactions(
     db = get_db()
     query = _build_diesel_cash_query(
         year, month, search, truck, receipt, date_from, date_to,
+        item_names=await get_diesel_cash_item_names(),
     )
     return await db.transactions.count_documents(query)
 
@@ -1797,6 +1880,7 @@ async def get_diesel_cash_totals(
     db = get_db()
     query = _build_diesel_cash_query(
         year, month, search, truck, receipt, date_from, date_to,
+        item_names=await get_diesel_cash_item_names(),
     )
     result = await db.transactions.aggregate([
         {"$match": query},
@@ -2101,9 +2185,10 @@ async def get_parking_congo_available_years() -> List[int]:
 
 
 _IMPORT_UPPER_SKIP = frozenset({
-    "feed_type", "upload_id", "source_filename", "import_date", "created_at",
+    "feed_type", "upload_id", "source_filename", "upload_label", "content_hash",
+    "import_date", "created_at",
     "transaction_date", "expense_date", "expense_type", "row_index", "_id",
-    "installation_label", "total_payable_label",
+    "installation_label", "total_payable_label", "skipped_row_id",
 })
 
 
@@ -2160,15 +2245,23 @@ async def save_imported_feed(records: list) -> int:
                 )
         elif str(doc.get("feed_type", "")).startswith("diesel_"):
             normalize_date_fields(doc, "date", store_as="transaction_date")
+            apply_diesel_computed_fields(doc)
         _uppercase_import_text(doc)
         docs.append(doc)
 
-    # Stamp whole-batch content hash on Zambia Parking rows (exact-file gate).
-    # Keep a pre-set hash (from the full file before truck-gate filtering).
+    # Stamp whole-batch content hash on Zambia Parking / diesel rows
+    # (exact-file gate). Keep a pre-set hash (from the full file before
+    # truck-gate filtering).
     zambia_docs = [d for d in docs if d.get("feed_type") == "zambia_parking"]
     if zambia_docs and not str(zambia_docs[0].get("content_hash") or "").strip():
         batch_hash = zambia_batch_content_hash(zambia_docs)
         for d in zambia_docs:
+            d["content_hash"] = batch_hash
+
+    diesel_docs = [d for d in docs if str(d.get("feed_type", "")).startswith("diesel_")]
+    if diesel_docs and not str(diesel_docs[0].get("content_hash") or "").strip():
+        batch_hash = diesel_batch_content_hash(diesel_docs)
+        for d in diesel_docs:
             d["content_hash"] = batch_hash
 
     from tahmeed.db.import_idempotency import insert_many_idempotent
@@ -3199,6 +3292,11 @@ async def count_diesel_feed(feed_type: str, search: str = "", truck: str = "") -
     return await db.imported_feeds.count_documents(query)
 
 
+def _diesel_computed_amount() -> dict:
+    """Litres × rate — Excel totals are not trusted."""
+    return {"$multiply": [_safe_double("ltrs"), _safe_double("price_per_ltr")]}
+
+
 async def get_diesel_totals(feed_type: str) -> dict:
     db = get_db()
     pipeline = [
@@ -3206,7 +3304,7 @@ async def get_diesel_totals(feed_type: str) -> dict:
         {"$group": {
             "_id":          None,
             "ltrs":         {"$sum": _safe_double("ltrs")},
-            "total_amount": {"$sum": _safe_double("total_amount")},
+            "total_amount": {"$sum": _diesel_computed_amount()},
         }},
     ]
     result = await db.imported_feeds.aggregate(pipeline).to_list(1)
@@ -3231,11 +3329,12 @@ async def get_diesel_uploads(feed_type: str) -> list:
         {"$group": {
             "_id":             "$upload_id",
             "source_filename": {"$first": "$source_filename"},
+            "upload_label":    {"$first": "$upload_label"},
             "sheet_label":     {"$first": "$sheet_label"},
             "import_date":     {"$first": "$import_date"},
             "record_count":    {"$sum": 1},
             "ltrs":            {"$sum": _safe_double("ltrs")},
-            "total_amount":    {"$sum": _safe_double("total_amount")},
+            "total_amount":    {"$sum": _diesel_computed_amount()},
             "min_date":        {"$min": "$date"},
             "max_date":        {"$max": "$date"},
         }},
@@ -3255,6 +3354,8 @@ def _diesel_records_query(feed_type: str, upload_id: str, search: str) -> dict:
             {"clients_name": {"$regex": s, "$options": "i"}},
             {"destinations": {"$regex": s, "$options": "i"}},
             {"diesel_at":    {"$regex": s, "$options": "i"}},
+            {"upload_label": {"$regex": s, "$options": "i"}},
+            {"source_filename": {"$regex": s, "$options": "i"}},
         ]
     return query
 
@@ -3293,7 +3394,7 @@ async def get_diesel_upload_totals(
         {"$group": {
             "_id":          None,
             "ltrs":         {"$sum": _safe_double("ltrs")},
-            "total_amount": {"$sum": _safe_double("total_amount")},
+            "total_amount": {"$sum": _diesel_computed_amount()},
         }},
     ]
     result = await db.imported_feeds.aggregate(pipeline).to_list(1)
@@ -3360,6 +3461,7 @@ def _diesel_all_query(
             {"diesel_at":       {"$regex": s, "$options": "i"}},
             {"ownership":       {"$regex": s, "$options": "i"}},
             {"source_filename": {"$regex": s, "$options": "i"}},
+            {"upload_label":    {"$regex": s, "$options": "i"}},
             {"date":            {"$regex": s, "$options": "i"}},
         ]})
     if year > 0:
@@ -3425,7 +3527,7 @@ async def get_diesel_all_totals(
             "_id":          None,
             "count":        {"$sum": 1},
             "ltrs":         {"$sum": _safe_double("ltrs")},
-            "total_amount": {"$sum": _safe_double("total_amount")},
+            "total_amount": {"$sum": _diesel_computed_amount()},
         }},
     ]
     result = await db.imported_feeds.aggregate(pipeline).to_list(1)
@@ -3437,6 +3539,177 @@ async def get_diesel_all_totals(
 async def get_diesel_available_years(feed_type: str) -> List[int]:
     """Years that appear in uploaded diesel records."""
     return await _feed_available_years(feed_type, "date")
+
+
+# Fields hashed for the diesel whole-file duplicate gate (order matters).
+_DIESEL_HASH_FIELDS = (
+    "date", "lpo_no", "do_sdo_no", "diesel_at", "ownership",
+    "clients_name", "destinations", "truck_no", "ltrs",
+    "price_per_ltr", "total_amount",
+)
+
+
+def diesel_batch_content_hash(records: List[dict]) -> str:
+    """SHA-256 of the exact ordered diesel rows (whole-file duplicate gate)."""
+    lines: List[str] = []
+    for rec in records:
+        lines.append("|".join(
+            _zambia_hash_field(rec.get(field)) for field in _DIESEL_HASH_FIELDS
+        ))
+    payload = "\n".join(lines).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _diesel_filename_sheet_query(
+    feed_type: str,
+    source_filename: str,
+    sheet_label: str = "",
+) -> Optional[dict]:
+    """Match a prior diesel upload by file name + sheet tab (case-insensitive)."""
+    fname = str(source_filename or "").strip()
+    if not feed_type or not fname:
+        return None
+    query: dict = {
+        "feed_type": feed_type,
+        "source_filename": {
+            "$regex": f"^{re.escape(fname)}$",
+            "$options": "i",
+        },
+    }
+    sheet = str(sheet_label or "").strip()
+    if sheet:
+        query["sheet_label"] = {
+            "$regex": f"^{re.escape(sheet)}$",
+            "$options": "i",
+        }
+    else:
+        query["$or"] = [
+            {"sheet_label": {"$in": ["", None]}},
+            {"sheet_label": {"$exists": False}},
+        ]
+    return query
+
+
+def _diesel_upload_summary(up: dict, *, content_hash: str = "") -> dict:
+    uid = str(up.get("upload_id") or up.get("_id") or "").strip()
+    summary = {
+        "upload_id": uid,
+        "sheet_label": up.get("sheet_label") or "",
+        "source_filename": up.get("source_filename") or "",
+        "import_date": up.get("import_date"),
+        "record_count": int(up.get("record_count", 0) or 0),
+    }
+    if content_hash:
+        summary["content_hash"] = content_hash
+    return summary
+
+
+async def diesel_filename_already_uploaded(
+    feed_type: str,
+    source_filename: str,
+    sheet_label: str = "",
+) -> List[dict]:
+    """Prior diesel batches with the same file name and sheet tab."""
+    query = _diesel_filename_sheet_query(feed_type, source_filename, sheet_label)
+    if not query:
+        return []
+    db = get_db()
+    pipeline = [
+        {"$match": query},
+        {"$group": {
+            "_id":             "$upload_id",
+            "source_filename": {"$first": "$source_filename"},
+            "sheet_label":     {"$first": "$sheet_label"},
+            "import_date":     {"$first": "$import_date"},
+            "record_count":    {"$sum": 1},
+        }},
+        {"$sort": {"import_date": -1}},
+    ]
+    found = await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+    matches: List[dict] = []
+    for up in found:
+        uid = str(up.get("_id") or "").strip()
+        if not uid:
+            continue
+        matches.append(_diesel_upload_summary({**up, "upload_id": uid}))
+    return matches
+
+
+async def find_diesel_uploads_by_content_hash(
+    feed_type: str, content_hash: str,
+) -> List[dict]:
+    """Return existing diesel upload summaries that match *content_hash*."""
+    if not feed_type or not content_hash:
+        return []
+    db = get_db()
+
+    stamped_ids = await db.imported_feeds.distinct(
+        "upload_id",
+        {"feed_type": feed_type, "content_hash": content_hash},
+    )
+    matches: Dict[str, dict] = {}
+    uploads = await get_diesel_uploads(feed_type)
+    by_id = {str(u.get("_id") or ""): u for u in uploads}
+
+    for uid in stamped_ids:
+        key = str(uid or "").strip()
+        if not key:
+            continue
+        up = by_id.get(key)
+        if up:
+            matches[key] = _diesel_upload_summary(
+                {**up, "upload_id": key}, content_hash=content_hash,
+            )
+
+    # Legacy uploads (no content_hash): re-hash each batch once.
+    projection = {field: 1 for field in _DIESEL_HASH_FIELDS}
+    projection["content_hash"] = 1
+    for up in uploads:
+        uid = str(up.get("_id") or "").strip()
+        if not uid or uid in matches:
+            continue
+        rows = await db.imported_feeds.find(
+            {"feed_type": feed_type, "upload_id": uid},
+            projection,
+        ).to_list(length=None)
+        if not rows:
+            continue
+        stored = {
+            str(r.get("content_hash") or "").strip()
+            for r in rows
+            if str(r.get("content_hash") or "").strip()
+        }
+        if stored:
+            continue
+        if diesel_batch_content_hash(rows) == content_hash:
+            matches[uid] = _diesel_upload_summary(
+                {**up, "upload_id": uid}, content_hash=content_hash,
+            )
+
+    return list(matches.values())
+
+
+async def diesel_already_uploaded(
+    feed_type: str,
+    records: List[dict],
+    source_filename: str = "",
+    sheet_label: str = "",
+) -> List[dict]:
+    """Matching prior diesel uploads by file/sheet identity or exact contents."""
+    matches: Dict[str, dict] = {}
+    for up in await diesel_filename_already_uploaded(
+        feed_type, source_filename, sheet_label,
+    ):
+        uid = str(up.get("upload_id") or "").strip()
+        if uid:
+            matches[uid] = up
+    if records:
+        file_hash = diesel_batch_content_hash(records)
+        for up in await find_diesel_uploads_by_content_hash(feed_type, file_hash):
+            uid = str(up.get("upload_id") or "").strip()
+            if uid:
+                matches[uid] = up
+    return list(matches.values())
 
 
 # ── Ahmed Kimvi — Excel import (last sheet per workbook) ─────────────────────
@@ -4251,6 +4524,7 @@ async def _truck_overview_master_rows(
     date_to: Optional[datetime] = None,
 ) -> list:
     db = get_db()
+    diesel_items = await get_diesel_cash_item_names()
     query = _with_date_range(
         {"verified": True, "truck_number": _truck_exact(truck)},
         "date",
@@ -4264,13 +4538,9 @@ async def _truck_overview_master_rows(
     rows = []
     for doc in docs:
         tx = Transaction.from_doc(doc)
-        is_diesel_cash = bool(
-            tx.category_name
-            and re.fullmatch(
-                _diesel_cash_name_filter()["$regex"],
-                str(tx.category_name),
-                re.IGNORECASE,
-            )
+        is_diesel_cash = (
+            is_diesel_cash_item(tx.category_name, diesel_items)
+            or is_diesel_cash_item(tx.item, diesel_items)
         )
         rows.append(_normalized_row(
             source_group="diesel_cash" if is_diesel_cash else "master",
@@ -4313,7 +4583,7 @@ async def _truck_overview_diesel_rows(
                 description=doc.get("destinations") or doc.get("clients_name") or "Diesel import",
                 reference=doc.get("lpo_no") or doc.get("do_sdo_no") or doc.get("sheet_label") or "",
                 currency="TZS",
-                amount=doc.get("total_amount"),
+                amount=diesel_line_total(doc.get("ltrs"), doc.get("price_per_ltr")),
                 liters=doc.get("ltrs"),
                 rate=doc.get("price_per_ltr"),
                 station=doc.get("diesel_at") or "",

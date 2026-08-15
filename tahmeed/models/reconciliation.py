@@ -8,7 +8,8 @@ SM Burhani sends two kinds of Excel sheets that both land in the same
   * ``rpa_schedule`` — the RPA SCHEDULE sheet, 12 columns (adds ASYCUDA AMOUNT,
                        EXPORTER and DESCRIPTION OF SHIPMENT).
 
-Duplicate detection uses the composite ``dedup_key`` = ``PRN | ENTRY REG``.
+Duplicate detection uses the composite ``dedup_key`` = ``PRN | ENTRY REG``
+within the same ``table`` (Bonds vs Bonds, RPA vs RPA).
 """
 
 from __future__ import annotations

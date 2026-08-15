@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QFileDialog, QWidget
 
 from tahmeed.services.category_service import get_all_categories
 from tahmeed.services.daily_import_service import (
+    DailyImportCancelled,
     apply_mapping_to_preview,
     commit_daily_to_master,
     preview_daily_import,
@@ -23,7 +24,7 @@ from tahmeed.ui.dialogs.description_mapping_dialog import (
     ACTION_ASSIGN,
     DescriptionMappingDialog,
 )
-from tahmeed.ui.widgets.upload_busy import UploadBusy
+from tahmeed.ui.widgets.upload_busy import UploadBusy, UploadCancelled
 
 
 async def run_daily_to_master_flow(
@@ -44,18 +45,44 @@ async def run_daily_to_master_flow(
     if not path:
         return None
 
+    categories = None
+    items_error = None
     try:
-        with UploadBusy(parent, "Reading Excel file…", title="Import Daily") as busy:
+        with UploadBusy(
+            parent,
+            "Reading Excel file…",
+            title="Import Daily",
+            cancellable=True,
+        ) as busy:
+            await busy.tick()
             busy.update("Reading Excel file…")
-            preview = await preview_daily_import(path)
+            preview = await busy.await_or_cancel(
+                preview_daily_import(path, should_cancel=busy.should_cancel)
+            )
             busy.update(
                 f"Matched descriptions · {len(preview.rows):,} row(s) found…"
             )
+            if preview.rows and preview.unmapped:
+                busy.update("Loading items…")
+                try:
+                    categories = await busy.await_or_cancel(get_all_categories())
+                except UploadCancelled:
+                    raise
+                except Exception as exc:
+                    items_error = exc
+    except (UploadCancelled, DailyImportCancelled):
+        return None
     except Exception as exc:
         show_critical(
             parent,
             "Import Rejected",
             f"Could not import this file:\n\n{exc}",
+        )
+        return None
+
+    if items_error is not None:
+        show_critical(
+            parent, "Import Error", f"Could not load items:\n{items_error}"
         )
         return None
 
@@ -71,13 +98,6 @@ async def run_daily_to_master_flow(
 
     # ── Description → item (required — no skip; going straight to Master) ─
     if preview.unmapped:
-        try:
-            categories = await get_all_categories()
-        except Exception as exc:
-            show_critical(
-                parent, "Import Error", f"Could not load items:\n{exc}"
-            )
-            return None
         if not categories:
             show_warning(
                 parent,

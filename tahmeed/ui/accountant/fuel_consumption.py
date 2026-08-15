@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QDateEdit,
 )
 
+from tahmeed.services.diesel_amounts import apply_diesel_computed_fields, diesel_line_total
 from tahmeed.services.excel_dates import format_excel_date, parse_excel_date
 
 try:
@@ -115,7 +116,7 @@ _FUEL_SCHEMAS: Dict[str, dict] = {
             ("RATE",        "price_per_ltr", "num"),
             ("AMOUNT",      "total_amount",  "money"),
         ],
-        "required": ["date", "lpo_no", "truck_no", "ltrs", "price_per_ltr", "total_amount"],
+        "required": ["date", "lpo_no", "truck_no", "ltrs", "price_per_ltr"],
     },
     "diesel_lake_zambia": {
         "title":      "Lake Zambia Diesel",
@@ -135,7 +136,7 @@ _FUEL_SCHEMAS: Dict[str, dict] = {
             ("DESTINATIONS", "destinations",  "text"),
         ],
         "required": ["date", "lpo_no", "diesel_at", "truck_no", "ltrs",
-                     "price_per_ltr", "total_amount"],
+                     "price_per_ltr"],
     },
     "diesel_gbp": {
         "title":      "GBP Diesel",
@@ -153,6 +154,7 @@ _FUEL_SCHEMAS: Dict[str, dict] = {
             ("TRUCK NO.",    "truck_no",      "text"),
             ("LTRS",         "ltrs",          "num"),
             ("PRICE/LTR",    "price_per_ltr", "num"),
+            ("AMOUNT",       "total_amount",  "money"),
         ],
         "required": ["date", "lpo_no", "truck_no", "ltrs", "price_per_ltr", "clients_name"],
     },
@@ -162,6 +164,7 @@ _FUEL_SCHEMAS: Dict[str, dict] = {
         "sheet_hint": "TUNDUMA",
         "currency":   None,
         "columns": [
+            ("S/NO",        "sn",            "text"),
             ("DATE",        "date",         "date"),
             ("LPO NO.",     "lpo_no",       "text"),
             ("DO NO.",      "do_sdo_no",    "text"),
@@ -169,6 +172,8 @@ _FUEL_SCHEMAS: Dict[str, dict] = {
             ("DESTINATION", "destinations", "text"),
             ("TRUCK NO.",   "truck_no",     "text"),
             ("LTRS",        "ltrs",         "num"),
+            ("RATE",        "price_per_ltr", "num"),
+            ("AMOUNT",      "total_amount",  "money"),
         ],
         "required": ["date", "lpo_no", "truck_no", "ltrs", "do_sdo_no"],
     },
@@ -182,7 +187,20 @@ def _pretty_field(key: str) -> str:
         "clients_name": "Client", "destinations": "Destination",
         "truck_no": "Truck No.", "ltrs": "Litres",
         "price_per_ltr": "Price/Ltr", "total_amount": "Amount",
+        "upload_label": "File Name",
     }.get(key, key)
+
+
+_FILE_COL = ("FILE NAME", "upload_label", "text")
+
+
+def _display_columns(schema: dict) -> List[Tuple[str, str, str]]:
+    """Station columns plus the last File Name (upload description) column."""
+    return list(schema["columns"]) + [_FILE_COL]
+
+
+def _row_label(rec: dict) -> str:
+    return str(rec.get("upload_label") or rec.get("source_filename") or "").strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -351,9 +369,14 @@ def _fill_diesel_row(
     currency: str | None = "TZS",
 ) -> None:
     for c, (_, key, kind) in enumerate(columns):
-        val = rec.get(key, "")
-        if key == "sn" and (val is None or str(val).strip() == ""):
+        if key == "sn":
             val = sn_offset + 1
+        elif key == "total_amount":
+            val = diesel_line_total(rec.get("ltrs"), rec.get("price_per_ltr"))
+        elif key == "upload_label":
+            val = _row_label(rec)
+        else:
+            val = rec.get(key, "")
         text, align, mono = _fmt_cell(kind, val, currency=currency)
         table.setItem(row, c, _cell(text, align, mono=mono))
     _finish_table_row(table, row)
@@ -571,12 +594,15 @@ class _FuelImportDialog(QDialog):
         self._schema    = _FUEL_SCHEMAS[feed_type]
         self._columns   = self._schema["columns"]
         self._required  = self._schema["required"]
-        self._currency  = self._schema.get("currency") or "TZS"
+        self._currency  = self._schema.get("currency")
         self._headers   = [c[0] for c in self._columns]
 
         self._wb: Any = None
         self._source_filename = ""
+        self._sheet_label = ""
         self._rows: List[dict] = []          # rows that will be imported
+        self._already_exists = False
+        self._check_gen = 0
 
         self.setWindowTitle(f"Import — {self._schema['title']}")
         self.setMinimumWidth(760)
@@ -591,7 +617,12 @@ class _FuelImportDialog(QDialog):
 
         # Expected structure hint
         expect = ", ".join(_pretty_field(k) for k in self._required)
-        hint = _lbl(f"This sheet must contain: {expect}", size=11, color=_T2)
+        hint = _lbl(
+            f"This sheet must contain: {expect}. "
+            "S/No is assigned by the system. Amount is litres × rate "
+            "(Excel totals are ignored).",
+            size=11, color=_T2,
+        )
         hint.setWordWrap(True)
         vl.addWidget(hint)
 
@@ -621,6 +652,18 @@ class _FuelImportDialog(QDialog):
         ctrl_hl.addWidget(self._sheet_cb)
         ctrl_hl.addStretch()
         vl.addWidget(ctrl)
+
+        desc_row = QWidget()
+        desc_row.setStyleSheet("background:transparent;")
+        desc_hl = QHBoxLayout(desc_row)
+        desc_hl.setContentsMargins(0, 0, 0, 0)
+        desc_hl.setSpacing(8)
+        desc_hl.addWidget(_lbl("Description:", size=12, color=_T2))
+        self._desc_edit = QLineEdit()
+        self._desc_edit.setPlaceholderText("e.g. 16th - 31st Mar 2026")
+        self._desc_edit.setStyleSheet(_input_ss())
+        desc_hl.addWidget(self._desc_edit, 1)
+        vl.addWidget(desc_row)
 
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
         self._stats_lbl.setWordWrap(True)
@@ -664,7 +707,15 @@ class _FuelImportDialog(QDialog):
     def _on_file(self, path: str) -> None:
         from tahmeed.ui.widgets.upload_busy import UploadBusy
 
+        self._bump_check_gen()
+        self._already_exists = False
         self._source_filename = Path(path).name
+        self._sheet_label = ""
+        if hasattr(self, "_desc_edit"):
+            self._desc_edit.setText("")
+            self._desc_edit.setPlaceholderText(
+                self._source_filename or "e.g. 16th - 31st Mar 2026"
+            )
         self._stats_lbl.setText("Reading file…")
         self._sheet_cb.blockSignals(True)
         self._sheet_cb.clear()
@@ -777,22 +828,37 @@ class _FuelImportDialog(QDialog):
                     else ""
                 )
             self._normalize_row(rec)
+            apply_diesel_computed_fields(rec)
             records.append(rec)
 
+        self._sheet_label = sheet_label
+        if not records:
+            self._reset_preview("This sheet has no data rows to import.")
+            return
+
+        gen = self._bump_check_gen()
+        self._already_exists = False
         self._rows = records
+        self._fill_preview(records[: self._PREVIEW_ROWS])
         self._stats_lbl.setStyleSheet(
-            f"color:{_GREEN};font-size:12px;font-family:'Segoe UI';background:transparent;"
+            f"color:{_T2};font-size:12px;font-family:'Segoe UI';background:transparent;"
         )
         where = f"“{sheet_label}” · " if sheet_label else ""
         self._stats_lbl.setText(
-            f"{where}{len(records):,} rows ready to import."
+            f"{where}{len(records):,} rows. Checking for duplicates…"
         )
-        self._fill_preview(records[: self._PREVIEW_ROWS])
-        self._set_import_enabled(bool(records))
-        self._import_btn.setText(f"Import {len(records):,} Records")
+        self._set_import_enabled(False)
+        self._import_btn.setText("Checking…")
+        asyncio.ensure_future(self._check_already_uploaded(gen, records, sheet_label))
+
+    def _bump_check_gen(self) -> int:
+        self._check_gen += 1
+        return self._check_gen
 
     def _reset_preview(self, message: str) -> None:
         """Neutral state: clear preview + disable import, show an info message."""
+        self._bump_check_gen()
+        self._already_exists = False
         self._rows = []
         self._preview_tbl.setRowCount(0)
         self._stats_lbl.setStyleSheet(
@@ -819,6 +885,8 @@ class _FuelImportDialog(QDialog):
         rec["do_sdo_no"] = ""
 
     def _show_mismatch(self, message: str) -> None:
+        self._bump_check_gen()
+        self._already_exists = False
         self._rows = []
         self._preview_tbl.setRowCount(0)
         self._stats_lbl.setStyleSheet(
@@ -829,8 +897,64 @@ class _FuelImportDialog(QDialog):
         self._set_import_enabled(False)
         self._import_btn.setText("Import Records")
 
+    def _show_already_uploaded(self, message: str) -> None:
+        self._already_exists = True
+        self._stats_lbl.setStyleSheet(
+            f"color:{_RED};font-size:12px;font-weight:600;"
+            "font-family:'Segoe UI';background:transparent;"
+        )
+        self._stats_lbl.setText(message)
+        self._set_import_enabled(False)
+        self._import_btn.setText("Already Uploaded")
+
+    async def _check_already_uploaded(
+        self, gen: int, records: List[dict], sheet_label: str,
+    ) -> None:
+        from tahmeed.services import accountant_service as svc
+
+        matching: List[dict] = []
+        try:
+            matching = await svc.diesel_already_uploaded(
+                self._feed_type,
+                records,
+                source_filename=self._source_filename,
+                sheet_label=sheet_label,
+            )
+        except Exception:
+            matching = []
+        if gen != self._check_gen:
+            return
+        if matching:
+            names = ", ".join(
+                (u.get("source_filename") or u.get("sheet_label") or "prior upload")
+                for u in matching[:3]
+            )
+            extra = "…" if len(matching) > 3 else ""
+            where = f"“{sheet_label}” · " if sheet_label else ""
+            self._show_already_uploaded(
+                f"{where}This upload was already imported ({names}{extra}) "
+                "— import blocked."
+            )
+            return
+        self._already_exists = False
+        self._stats_lbl.setStyleSheet(
+            f"color:{_GREEN};font-size:12px;font-family:'Segoe UI';background:transparent;"
+        )
+        where = f"“{sheet_label}” · " if sheet_label else ""
+        self._stats_lbl.setText(
+            f"{where}{len(records):,} rows ready to import."
+        )
+        self._set_import_enabled(True)
+        self._import_btn.setText(f"Import {len(records):,} Records")
+
     def _set_import_enabled(self, ok: bool) -> None:
         self._import_btn.setEnabled(ok)
+
+    def _resolved_upload_label(self) -> str:
+        typed = ""
+        if hasattr(self, "_desc_edit"):
+            typed = self._desc_edit.text().strip()
+        return typed or self._source_filename
 
     def _fill_preview(self, rows: List[dict]) -> None:
         t = self._preview_tbl
@@ -838,16 +962,14 @@ class _FuelImportDialog(QDialog):
         for i, row in enumerate(rows):
             r = t.rowCount()
             t.insertRow(r)
-            for c, (_, key, kind) in enumerate(self._columns):
-                val = row.get(key, "")
-                if key == "sn" and (val is None or str(val).strip() == ""):
-                    val = i + 1
-                text, align, mono = _fmt_cell(kind, val, currency=self._currency)
-                t.setItem(r, c, _cell(text, align, mono=mono))
-            _finish_table_row(t, r)
+            _fill_diesel_row(
+                t, r, row, self._columns, sn_offset=i, currency=self._currency,
+            )
 
     # ── Import ─────────────────────────────────────────────────────────────────
     def _do_import(self) -> None:
+        if self._already_exists or not self._rows:
+            return
         self._set_import_enabled(False)
         self._import_btn.setText("Importing…")
         asyncio.ensure_future(self._async_import())
@@ -857,15 +979,45 @@ class _FuelImportDialog(QDialog):
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
 
         upload_id = str(uuid.uuid4())
-        sheet_label = (self._sheet_cb.currentData() or "") if self._wb is not None else ""
+        sheet_label = self._sheet_label or (
+            (self._sheet_cb.currentData() or "") if self._wb is not None else ""
+        )
+        upload_label = self._resolved_upload_label()
         docs = []
         for rec in self._rows:
             doc = dict(rec)
             doc["upload_id"] = upload_id
             doc["source_filename"] = self._source_filename
+            doc["upload_label"] = upload_label
             doc["sheet_label"] = sheet_label
             docs.append(doc)
         try:
+            matching = await svc.diesel_already_uploaded(
+                self._feed_type,
+                self._rows,
+                source_filename=self._source_filename,
+                sheet_label=sheet_label,
+            )
+            if matching:
+                names = ", ".join(
+                    (u.get("source_filename") or u.get("sheet_label") or "prior upload")
+                    for u in matching[:3]
+                )
+                extra = "…" if len(matching) > 3 else ""
+                QMessageBox.warning(
+                    self,
+                    "Already Uploaded",
+                    f"This upload was already imported ({names}{extra}) — import blocked.",
+                )
+                self._show_already_uploaded(
+                    f"This upload was already imported ({names}{extra}) — import blocked."
+                )
+                return
+
+            file_hash = svc.diesel_batch_content_hash(self._rows)
+            for row in docs:
+                row["content_hash"] = file_hash
+
             gate = await run_import_truck_gate(
                 self,
                 docs,
@@ -913,7 +1065,7 @@ class _DieselAllEntries(QWidget):
         super().__init__(parent)
         self._feed_type = feed_type
         self._schema = _FUEL_SCHEMAS[feed_type]
-        self._columns = self._schema["columns"]
+        self._columns = _display_columns(self._schema)
         self._currency = self._schema.get("currency")
         self._has_amount = any(k == "total_amount" for _, k, _ in self._columns)
         self._search = ""
@@ -938,7 +1090,7 @@ class _DieselAllEntries(QWidget):
 
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText(
-            "Search truck, LPO, client, destination, station…"
+            "Search truck, LPO, client, destination, station, file name…"
         )
         self._search_edit.setFixedWidth(300)
         self._search_edit.setStyleSheet(_input_ss())
@@ -974,8 +1126,9 @@ class _DieselAllEntries(QWidget):
         vl.addWidget(tb)
 
         totals_defs = [("ltrs", "Ltrs: ")]
-        if self._has_amount and self._currency:
-            totals_defs.append(("amount", f"{self._currency}: "))
+        if self._has_amount:
+            amt_prefix = f"{self._currency}: " if self._currency else "Amount: "
+            totals_defs.append(("amount", amt_prefix))
         totals_defs.append(("count", "Records: "))
         self._totals = _TotalsBar(totals_defs)
         vl.addWidget(self._totals)
@@ -1226,7 +1379,9 @@ class _DieselUploadBrowse(QWidget):
             amt   = float(up.get("total_amount", 0) or 0)
             t.setItem(r, 0, _cell(date_str))
             t.setItem(r, 1, _cell(up.get("sheet_label") or "—"))
-            t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 2, _cell(
+                up.get("upload_label") or up.get("source_filename") or "Unknown"
+            ))
             t.setItem(r, 3, _cell(f"{count:,}", Qt.AlignCenter | Qt.AlignVCenter))
             t.setItem(r, 4, _cell(_fmt_num(ltrs, decimals=0),
                                   Qt.AlignRight | Qt.AlignVCenter))
@@ -1266,7 +1421,7 @@ class _DieselUploadDetail(QWidget):
         super().__init__(parent)
         self._feed_type = feed_type
         self._schema    = _FUEL_SCHEMAS[feed_type]
-        self._columns   = self._schema["columns"]
+        self._columns   = _display_columns(self._schema)
         self._currency  = self._schema.get("currency")
         self._has_amount = any(k == "total_amount" for _, k, _ in self._columns)
         self._upload_id = ""
@@ -1323,8 +1478,9 @@ class _DieselUploadDetail(QWidget):
         vl.addWidget(self._table, 1)
 
         totals_defs = [("ltrs", "Ltrs: ")]
-        if self._has_amount and self._currency:
-            totals_defs.append(("amount", f"{self._currency}: "))
+        if self._has_amount:
+            amt_prefix = f"{self._currency}: " if self._currency else "Amount: "
+            totals_defs.append(("amount", amt_prefix))
         totals_defs.append(("count", "Records: "))
         self._totals = _TotalsBar(totals_defs)
         vl.addWidget(self._totals)
@@ -1336,14 +1492,18 @@ class _DieselUploadDetail(QWidget):
     def load_upload(self, upload_doc: dict) -> None:
         self._upload_doc = upload_doc
         self._upload_id = str(upload_doc.get("_id") or "")
-        filename  = upload_doc.get("source_filename") or "Unknown file"
+        label     = (
+            upload_doc.get("upload_label")
+            or upload_doc.get("source_filename")
+            or "Unknown file"
+        )
         sheet     = upload_doc.get("sheet_label") or "—"
         count     = int(upload_doc.get("record_count", 0))
         import_dt = upload_doc.get("import_date")
         date_str  = import_dt.strftime("%d %b %Y") if isinstance(import_dt, datetime) else ""
         self._crumb_lbl.setText(f"Uploads  ›  {sheet}")
         self._info_lbl.setText(
-            f"{filename}   •   sheet: {sheet}   •   {count:,} records   •   {date_str}"
+            f"{label}   •   sheet: {sheet}   •   {count:,} records   •   {date_str}"
         )
         self._search = ""
         self._search_edit.blockSignals(True)
@@ -1548,7 +1708,10 @@ class _BaseDieselWidget(QWidget):
         )
         if not path:
             return
-        headers = [c[0] for c in self._schema["columns"]]
+        headers = [
+            c[0] for c in self._schema["columns"]
+            if c[1] not in ("sn", "total_amount")
+        ]
         try:
             _write_xlsx_template(path, self._schema["title"], headers)
             QMessageBox.information(

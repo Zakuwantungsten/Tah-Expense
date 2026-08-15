@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import openpyxl
 from bson import ObjectId
@@ -74,6 +75,10 @@ class DailyImportRow:
     category_id: Optional[ObjectId] = None
     category_name: Optional[str] = None
     skipped_item: bool = False  # user chose Skip — leave without item
+
+
+class DailyImportCancelled(Exception):
+    """User aborted reading the daily Excel file."""
 
 
 @dataclass
@@ -297,14 +302,18 @@ def parse_daily_expenses_excel(
     path: str | Path,
     *,
     sheet_name: Optional[str] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Tuple[List[DailyImportRow], int, str]:
     """Return (rows, skipped_blank_count, sheet_name_used).
 
     Raises ValueError when the workbook does not match Daily Register format.
+    Raises DailyImportCancelled when ``should_cancel`` returns True.
     """
     path = Path(path)
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
+        if should_cancel is not None and should_cancel():
+            raise DailyImportCancelled()
         used_sheet = sheet_name or wb.sheetnames[0]
         if used_sheet not in wb.sheetnames:
             raise ValueError(f"Sheet '{used_sheet}' not found in workbook.")
@@ -328,7 +337,9 @@ def parse_daily_expenses_excel(
 
         parsed: List[DailyImportRow] = []
         skipped = 0
-        for row in rows_iter:
+        for i, row in enumerate(rows_iter):
+            if should_cancel is not None and i % 16 == 0 and should_cancel():
+                raise DailyImportCancelled()
             if not row:
                 skipped += 1
                 continue
@@ -391,11 +402,23 @@ def parse_daily_expenses_excel(
     return parsed, skipped, used_sheet
 
 
-async def preview_daily_import(path: str | Path) -> DailyImportPreview:
+async def preview_daily_import(
+    path: str | Path,
+    *,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> DailyImportPreview:
     path = Path(path)
-    parsed, skipped, sheet = parse_daily_expenses_excel(path)
+
+    def _parse() -> Tuple[List[DailyImportRow], int, str]:
+        return parse_daily_expenses_excel(path, should_cancel=should_cancel)
+
+    parsed, skipped, sheet = await asyncio.to_thread(_parse)
+    if should_cancel is not None and should_cancel():
+        raise DailyImportCancelled()
     unique_descs = list({r.description for r in parsed})
     mappings = await get_mappings_for_descriptions(unique_descs)
+    if should_cancel is not None and should_cancel():
+        raise DailyImportCancelled()
 
     unmapped: Dict[str, int] = {}
     for row in parsed:

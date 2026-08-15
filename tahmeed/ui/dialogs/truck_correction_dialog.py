@@ -39,6 +39,7 @@ IssueKind = Literal["invalid_format", "not_in_registry"]
 FleetKind = Literal["truck", "trailer", "motor_vehicle"]
 
 _CTRL_H = 34
+_TRUCK_EDIT_W = 168  # plate-sized; do not stretch across the row
 _BORDER = "#E5E7EB"
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -135,7 +136,7 @@ class TruckCorrectionDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle(heading or "Correct truck numbers")
-        self.setMinimumWidth(920 if import_mode else 680)
+        self.setMinimumWidth(820 if import_mode else 680)
         self.setMinimumHeight(380)
         self.setModal(True)
         self._fleet = set(fleet)
@@ -589,7 +590,9 @@ class TruckCorrectionDialog(QDialog):
                 prow.addWidget(name)
                 edit = TruckLineEdit(local_numbers=self._fleet_suggestions)
                 edit.setFixedHeight(_CTRL_H)
-                edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                edit.setMinimumWidth(120)
+                edit.setMaximumWidth(_TRUCK_EDIT_W)
+                edit.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
                 norm = normalize_truck_number(part, allowed_labels=self._allowed_labels)
                 if norm.status in ("ok", "normalized", "place_label"):
                     edit.setText(norm.value)
@@ -598,7 +601,7 @@ class TruckCorrectionDialog(QDialog):
                 edit.setPlaceholderText("T688 EAF")
                 edit.setStyleSheet(_INPUT_SS)
                 edit.editingFinished.connect(lambda e=edit: self._autonorm_edit(e))
-                prow.addWidget(edit, 1)
+                prow.addWidget(edit)
                 badge = QLabel("—")
                 badge.setFixedHeight(_CTRL_H)
                 badge.setMinimumWidth(110)
@@ -615,6 +618,7 @@ class TruckCorrectionDialog(QDialog):
                     )
                 if idx == 0:
                     _add_row_actions(prow)
+                    prow.addStretch()
                 lay.addLayout(prow)
                 part_edits.append(edit)
                 part_badges.append(badge)
@@ -625,12 +629,14 @@ class TruckCorrectionDialog(QDialog):
             edit_row.setSpacing(8)
             edit = TruckLineEdit(local_numbers=self._fleet_suggestions)
             edit.setFixedHeight(_CTRL_H)
-            edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            edit.setMinimumWidth(120)
+            edit.setMaximumWidth(_TRUCK_EDIT_W)
+            edit.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
             self._fill_truck_edit(edit, self._edit_source_for_issue(issue))
             edit.setPlaceholderText("T688 EAF  or  YARD")
             edit.setStyleSheet(_INPUT_SS)
             edit.editingFinished.connect(lambda e=edit: self._autonorm_edit(e))
-            edit_row.addWidget(edit, 1)
+            edit_row.addWidget(edit)
             status_badge = QLabel("—")
             status_badge.setFixedHeight(_CTRL_H)
             status_badge.setMinimumWidth(110)
@@ -652,6 +658,7 @@ class TruckCorrectionDialog(QDialog):
             accept_btn.setStyleSheet(_BTN_BLUE)
             edit_row.addWidget(accept_btn)
             _add_row_actions(edit_row)
+            edit_row.addStretch()
             lay.addLayout(edit_row)
             primary_edit = edit
 

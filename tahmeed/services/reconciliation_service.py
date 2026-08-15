@@ -17,6 +17,7 @@ from tahmeed.db.connection import get_db
 from tahmeed.models.reconciliation import ReconciliationEntry
 
 ENTITY = "sm_burhani"
+ALL_STATION_SLUG = "all"
 
 # Stations seeded the first time the Bonds view is opened.
 _DEFAULT_STATIONS = [
@@ -28,6 +29,57 @@ _DEFAULT_STATIONS = [
 
 def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+
+
+def station_query_value(slug: str) -> str:
+    """Empty string means no station filter (the All chip)."""
+    s = (slug or "").strip()
+    return "" if not s or s == ALL_STATION_SLUG else s
+
+
+def station_display_name(slug: str) -> str:
+    s = (slug or "").strip()
+    if not s or s == ALL_STATION_SLUG:
+        return "All"
+    return s.replace("_", " ").title()
+
+
+def unique_station_docs(docs: List[dict]) -> List[dict]:
+    """Keep the first row for each slug so chips are not drawn twice."""
+    seen: set = set()
+    out: List[dict] = []
+    for doc in docs:
+        slug = str(doc.get("slug") or "").strip()
+        if not slug or slug == ALL_STATION_SLUG or slug in seen:
+            continue
+        seen.add(slug)
+        out.append(doc)
+    return out
+
+
+def unique_stations_in_order(slugs) -> List[str]:
+    """First-seen station slugs, skipping blanks and the All chip."""
+    seen: set = set()
+    out: List[str] = []
+    for raw in slugs:
+        s = str(raw or "").strip()
+        if not s or s == ALL_STATION_SLUG or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def format_station_counts(slugs) -> str:
+    """'Nakonde 67, Kasumbalesa 110' in file order."""
+    from collections import Counter
+
+    values = [str(s or "").strip() for s in slugs]
+    ordered = unique_stations_in_order(values)
+    counts = Counter(values)
+    return ", ".join(
+        f"{station_display_name(slug)} {counts[slug]:,}" for slug in ordered
+    )
 
 
 def _safe_double(field: str) -> dict:
@@ -133,6 +185,7 @@ async def get_recon_uploads(table: str) -> List[dict]:
             "table": table,
             "upload_id": {"$exists": True, "$ne": ""},
         }},
+        {"$sort": {"source_index": 1, "_id": 1}},
         {"$group": {
             "_id":             "$upload_id",
             "source_filename": {"$first": "$source_filename"},
@@ -140,10 +193,14 @@ async def get_recon_uploads(table: str) -> List[dict]:
             "schedule_period": {"$first": "$schedule_period"},
             "record_count":    {"$sum": 1},
             "total_charge":    {"$sum": _safe_double("charge")},
+            "stations":        {"$push": "$station"},
         }},
         {"$sort": {"import_date": -1}},
     ]
-    return await db.reconciliation_entries.aggregate(pipeline).to_list(length=None)
+    docs = await db.reconciliation_entries.aggregate(pipeline).to_list(length=None)
+    for doc in docs:
+        doc["stations"] = unique_stations_in_order(doc.get("stations") or [])
+    return docs
 
 
 def _all_records_query(
@@ -262,6 +319,13 @@ async def get_recon_available_years(table: str, station: str = "") -> List[int]:
     return sorted(years, reverse=True)
 
 
+def _upload_station_sort_key(doc: dict) -> tuple:
+    idx = doc.get("first_idx")
+    if isinstance(idx, (int, float)):
+        return (0, int(idx), "")
+    return (1, 0, str(doc.get("first_id") or ""))
+
+
 async def get_recon_upload_stations(upload_id: str, table: str) -> List[dict]:
     """Distinct stations present in one upload, in file order."""
     if not upload_id:
@@ -276,11 +340,12 @@ async def get_recon_upload_stations(upload_id: str, table: str) -> List[dict]:
         }},
         {"$group": {
             "_id": "$station",
-            "first_sr": {"$min": "$sr_no"},
+            "first_idx": {"$min": "$source_index"},
+            "first_id": {"$min": "$_id"},
         }},
-        {"$sort": {"first_sr": 1, "_id": 1}},
     ]
     docs = await db.reconciliation_entries.aggregate(pipeline).to_list(length=None)
+    docs.sort(key=_upload_station_sort_key)
     stations: List[dict] = []
     for doc in docs:
         slug = str(doc.get("_id") or "").strip()
@@ -288,7 +353,7 @@ async def get_recon_upload_stations(upload_id: str, table: str) -> List[dict]:
             continue
         stations.append({
             "slug": slug,
-            "name": slug.replace("_", " ").title(),
+            "name": station_display_name(slug),
         })
     return stations
 
@@ -314,9 +379,14 @@ async def get_recon_upload_records(
 ) -> List[ReconciliationEntry]:
     db = get_db()
     query = _upload_record_query(upload_id, table, station, search)
+    sort = (
+        [("sr_no", 1), ("import_date", 1)]
+        if station.strip()
+        else [("source_index", 1), ("_id", 1)]
+    )
     cursor = (
         db.reconciliation_entries.find(query)
-        .sort([("sr_no", 1), ("import_date", 1)])
+        .sort(sort)
         .skip(skip)
         .limit(limit)
     )
@@ -377,13 +447,22 @@ async def delete_recon_upload(upload_id: str, table: str) -> int:
 
 # ── Dedup + write ────────────────────────────────────────────────────────────────
 
-async def get_existing_recon_keys(keys: List[str]) -> set:
-    """Return the dedup_key values already stored (composite PRN | ENTRY REG)."""
+async def get_existing_recon_keys(keys: List[str], table: str) -> set:
+    """Return PRN|ENTRY REG keys already stored for this table only.
+
+    Bonds and RPA share ``reconciliation_entries``; a match in the other
+    feed must not block import.
+    """
     if not keys:
         return set()
     db = get_db()
     docs = await db.reconciliation_entries.find(
-        {"dedup_key": {"$in": keys}}, {"dedup_key": 1}
+        {
+            "entity": ENTITY,
+            "table": table,
+            "dedup_key": {"$in": keys},
+        },
+        {"dedup_key": 1},
     ).to_list(length=None)
     return {d.get("dedup_key") for d in docs if d.get("dedup_key")}
 
@@ -392,8 +471,13 @@ async def save_reconciliation_rows(entries: List[ReconciliationEntry]) -> int:
     if not entries:
         return 0
     db = get_db()
-    docs = [e.to_doc() for e in entries]
+    docs = []
+    for i, e in enumerate(entries):
+        doc = e.to_doc()
+        doc["source_index"] = i
+        docs.append(doc)
     result = await db.reconciliation_entries.insert_many(docs, ordered=False)
+    await ensure_recon_stations(entries[0].table, [e.station for e in entries])
     return len(result.inserted_ids)
 
 
@@ -434,7 +518,13 @@ async def get_recon_stations(table: str = "bonds") -> List[dict]:
         ]
         await db.recon_stations.insert_many(seed)
         docs = seed
-    return docs
+    return unique_station_docs(docs)
+
+
+async def ensure_recon_stations(table: str, slugs: List[str]) -> None:
+    """Create/activate station chips for every station found in an import."""
+    for slug in unique_stations_in_order(slugs):
+        await add_recon_station(station_display_name(slug), table=table)
 
 
 async def add_recon_station(

@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 
 import qtawesome as qta
 
-from PySide6.QtCore import Qt, QSize, Signal
+from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
@@ -59,6 +59,7 @@ except ImportError:
 
 _BONDS_COLS: List[Tuple[str, str, int, str, bool]] = [
     ("SR",              "sr_no",             44,  "center", False),
+    ("STATION",         "station",          110, "left",   False),
     ("SM REF NO",       "sm_ref_no",         100, "left",   False),
     ("PRN NUMBER",      "prn_number",        130, "left",   True),
     ("ENTRY REG NO",    "entry_reg_no",      95,  "left",   False),
@@ -72,6 +73,7 @@ _BONDS_COLS: List[Tuple[str, str, int, str, bool]] = [
 
 _RPA_COLS: List[Tuple[str, str, int, str, bool]] = [
     ("SR",              "sr_no",             44,  "center", False),
+    ("STATION",         "station",          110, "left",   False),
     ("SM REF NO",       "sm_ref_no",         100, "left",   False),
     ("PRN",             "prn_number",        130, "left",   True),
     ("REG NO",          "entry_reg_no",      80,  "left",   False),
@@ -318,6 +320,8 @@ def parse_recon_workbook(path: str, table: str) -> List[ReconciliationEntry]:
 
 def _fmt_recon_value(entry: ReconciliationEntry, field: str) -> str:
     val = getattr(entry, field, None)
+    if field == "station":
+        return recon_svc.station_display_name(val) if val else "—"
     if field == "sr_no":
         return str(val) if val is not None else "—"
     if field == "t1_date":
@@ -346,6 +350,7 @@ class ReconImportDialog(QDialog):
         self._new: List[ReconciliationEntry] = []
         self._source_path = ""
         self._last_skipped = 0
+        self._last_station_summary = ""
 
         self.setWindowTitle(f"Import — {title}")
         self.setMinimumWidth(720)
@@ -404,9 +409,13 @@ class ReconImportDialog(QDialog):
             self._on_file(path)
 
     def _on_file(self, path: str) -> None:
+        from tahmeed.ui.async_utils import schedule_coro
         from tahmeed.ui.widgets.upload_busy import UploadBusy
 
         self._source_path = path
+        self._import_btn.setEnabled(False)
+        self._import_btn.setText("Import Records")
+        self._preview.setRowCount(0)
         self._stats.setText("Reading file…")
         try:
             with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
@@ -416,36 +425,53 @@ class ReconImportDialog(QDialog):
             return
         if not self._entries:
             self._stats.setText("No recognizable schedule rows found in this file.")
-            self._import_btn.setEnabled(False)
             return
-        asyncio.ensure_future(self._check_dupes())
+        # UploadBusy.processEvents can leave a qasync task current (Py 3.14).
+        # Defer dupe-check so Import Records is not left disabled forever.
+        self._stats.setText("Checking for duplicates…")
+        QTimer.singleShot(0, lambda: schedule_coro(self._check_dupes()))
 
     async def _check_dupes(self) -> None:
-        keys = [e.dedup_key for e in self._entries]
         try:
-            existing = await recon_svc.get_existing_recon_keys(keys)
-        except Exception:
-            existing = set()
+            keys = [e.dedup_key for e in self._entries]
+            try:
+                existing = await recon_svc.get_existing_recon_keys(keys, self._table)
+            except Exception:
+                existing = set()
 
-        seen: set = set()
-        new: List[ReconciliationEntry] = []
-        for e in self._entries:
-            k = e.dedup_key
-            if k in existing or k in seen:
-                continue
-            seen.add(k)
-            new.append(e)
-        self._new = new
+            seen: set = set()
+            new: List[ReconciliationEntry] = []
+            for e in self._entries:
+                k = e.dedup_key
+                if k in existing or k in seen:
+                    continue
+                seen.add(k)
+                new.append(e)
+            self._new = new
 
-        stations = sorted({e.station for e in new})
-        dupe = len(self._entries) - len(new)
-        station_txt = f"  ·  Stations: {', '.join(s.title() for s in stations)}" if stations else ""
-        self._stats.setText(
-            f"New records: {len(new):,}     Duplicates (skipped): {dupe:,}{station_txt}"
-        )
-        self._import_btn.setEnabled(bool(new))
-        self._import_btn.setText(f"Import {len(new):,} Records")
-        self._fill_preview(new[:10])
+            station_txt = recon_svc.format_station_counts(e.station for e in new)
+            dupe = len(self._entries) - len(new)
+            station_part = f"  ·  {station_txt}" if station_txt else ""
+            if new:
+                self._stats.setText(
+                    f"New records: {len(new):,}     "
+                    f"Duplicates (skipped): {dupe:,}{station_part}"
+                )
+            else:
+                self._stats.setText(
+                    f"No new records to import. "
+                    f"Duplicates (skipped): {dupe:,}{station_part}"
+                )
+            self._import_btn.setEnabled(bool(new))
+            self._import_btn.setText(
+                f"Import {len(new):,} Records" if new else "Import Records"
+            )
+            self._fill_preview(new[:10])
+        except Exception as exc:
+            self._new = []
+            self._import_btn.setEnabled(False)
+            self._import_btn.setText("Import Records")
+            self._stats.setText(f"Could not finish import check: {exc}")
 
     def _fill_preview(self, rows: List[ReconciliationEntry]) -> None:
         t = self._preview
@@ -459,9 +485,11 @@ class ReconImportDialog(QDialog):
                 t.setItem(r, c, _cell(_fmt_recon_value(e, field), flag, mono=mono))
 
     def _do_import(self) -> None:
+        from tahmeed.ui.async_utils import schedule_coro
+
         self._import_btn.setEnabled(False)
         self._import_btn.setText("Importing…")
-        asyncio.ensure_future(self._async_import())
+        schedule_coro(self._async_import())
 
     async def _async_import(self) -> None:
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
@@ -502,6 +530,9 @@ class ReconImportDialog(QDialog):
                 return
             entries = [ReconciliationEntry.from_doc(d) for d in gate.rows]
             saved = await recon_svc.save_reconciliation_rows(entries)
+            self._last_station_summary = recon_svc.format_station_counts(
+                e.station for e in entries
+            )
             self.imported.emit(saved)
             self.accept()
         except Exception as exc:
@@ -515,7 +546,7 @@ class ReconImportDialog(QDialog):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _RECON_BROWSE_HEADERS = [
-    "UPLOAD DATE", "FILE NAME", "RECORDS", "TOTAL CHARGE", "SCHEDULE PERIOD",
+    "UPLOAD DATE", "FILE NAME", "STATIONS", "RECORDS", "TOTAL CHARGE", "SCHEDULE PERIOD",
 ]
 
 
@@ -542,12 +573,12 @@ class _ReconAllEntries(QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        if self._bonds:
-            self._tabs = _StationTabBar()
-            self._tabs.station_changed.connect(self._on_station)
-            self._tabs.add_requested.connect(self._add_station)
-            vl.addWidget(self._tabs)
+        self._tabs = _StationTabBar(allow_add=self._bonds)
+        self._tabs.station_changed.connect(self._on_station)
+        self._tabs.add_requested.connect(self._add_station)
+        vl.addWidget(self._tabs)
 
+        if self._bonds:
             self._summary = QFrame()
             self._summary.setStyleSheet(
                 f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;border-radius:6px;}}"
@@ -614,20 +645,34 @@ class _ReconAllEntries(QWidget):
         vl.addWidget(self._status_lbl)
 
     def refresh(self) -> None:
-        if self._bonds:
-            asyncio.ensure_future(self._load_stations())
-        else:
-            asyncio.ensure_future(self._reload_years_and_data())
+        asyncio.ensure_future(self._load_stations())
+
+    def show_all_stations(self) -> None:
+        self._station = recon_svc.ALL_STATION_SLUG
+
+    def _station_filter(self) -> str:
+        return recon_svc.station_query_value(self._station)
 
     async def _load_stations(self) -> None:
-        stations = await recon_svc.get_recon_stations("bonds")
-        self._tabs.set_stations(stations, active=self._station or self._tabs.active)
+        stations = await recon_svc.get_recon_stations(self._table)
+        if not stations and not self._bonds:
+            self._tabs.setVisible(False)
+            self._station = ""
+            await self._reload_years_and_data()
+            return
+        self._tabs.setVisible(True)
+        chips = [{"slug": recon_svc.ALL_STATION_SLUG, "name": "All"}] + [
+            {"slug": st["slug"], "name": st.get("name") or recon_svc.station_display_name(st["slug"])}
+            for st in recon_svc.unique_station_docs(stations)
+        ]
+        active = self._station or recon_svc.ALL_STATION_SLUG
+        self._tabs.set_stations(chips, active=active)
         self._station = self._tabs.active
         await self._reload_years_and_data()
 
     async def _reload_years_and_data(self) -> None:
         try:
-            years = await recon_svc.get_recon_available_years(self._table, self._station)
+            years = await recon_svc.get_recon_available_years(self._table, self._station_filter())
         except Exception:
             years = []
         self._year = _populate_year_combo(self._year_cb, years, self._year)
@@ -666,13 +711,13 @@ class _ReconAllEntries(QWidget):
         try:
             rows, total, totals = await asyncio.gather(
                 recon_svc.get_recon_all_records(
-                    self._table, self._station, self._search, self._year, month, _SCROLL_CHUNK, 0,
+                    self._table, self._station_filter(), self._search, self._year, month, _SCROLL_CHUNK, 0,
                 ),
                 recon_svc.count_recon_all_records(
-                    self._table, self._station, self._search, self._year, month,
+                    self._table, self._station_filter(), self._search, self._year, month,
                 ),
                 recon_svc.get_recon_all_totals(
-                    self._table, self._station, self._search, self._year, month,
+                    self._table, self._station_filter(), self._search, self._year, month,
                 ),
             )
         except Exception:
@@ -700,7 +745,7 @@ class _ReconAllEntries(QWidget):
         month = self._effective_month()
         try:
             rows = await recon_svc.get_recon_all_records(
-                self._table, self._station, self._search, self._year, month, _SCROLL_CHUNK, self._loaded,
+                self._table, self._station_filter(), self._search, self._year, month, _SCROLL_CHUNK, self._loaded,
             )
         except Exception:
             self._loading = False
@@ -761,7 +806,7 @@ class _ReconAllEntries(QWidget):
         dlg.exec()
 
     async def _do_add_station(self, name: str, border: str) -> None:
-        await recon_svc.add_recon_station(name, border, "bonds")
+        await recon_svc.add_recon_station(name, border, self._table)
         await self._load_stations()
 
 
@@ -779,24 +824,54 @@ class _StationTabBar(QWidget):
         self._buttons: Dict[str, QPushButton] = {}
         self._active = ""
 
+    def _chip_ss(self, active: bool) -> str:
+        if active:
+            return (
+                f"QPushButton{{background:{_BLUE};color:#FFF;border:none;"
+                "border-radius:15px;font-size:12px;font-weight:600;"
+                "font-family:'Segoe UI';padding:0 16px;}}"
+            )
+        return (
+            f"QPushButton{{background:{_WHITE};color:{_T2};border:1px solid {_BORDER};"
+            "border-radius:15px;font-size:12px;"
+            "font-family:'Segoe UI';padding:0 16px;}}"
+            f"QPushButton:hover{{background:{_BG};color:{_T1};}}"
+        )
+
+    def _make_chip(self, slug: str, name: str) -> QPushButton:
+        chip = QPushButton(name)
+        chip.setFlat(True)
+        chip.setAutoDefault(False)
+        chip.setDefault(False)
+        chip.setCursor(Qt.PointingHandCursor)
+        chip.setFixedHeight(30)
+        chip.setStyleSheet(self._chip_ss(False))
+        chip.clicked.connect(lambda _=False, s=slug: self._select(s))
+        return chip
+
     def set_stations(self, stations: List[dict], active: str = "") -> None:
         while self._hl.count():
             item = self._hl.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            w = item.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
         self._buttons.clear()
 
         for st in stations:
             slug, name = st["slug"], st["name"]
-            chip = QPushButton(name)
-            chip.setCursor(Qt.PointingHandCursor)
-            chip.setFixedHeight(30)
-            chip.clicked.connect(lambda _=False, s=slug: self._select(s))
+            if not slug or slug in self._buttons:
+                continue
+            chip = self._make_chip(slug, name)
             self._buttons[slug] = chip
             self._hl.addWidget(chip)
 
         if self._allow_add:
             add = QPushButton("+ Add Station")
+            add.setFlat(True)
+            add.setAutoDefault(False)
+            add.setDefault(False)
             add.setCursor(Qt.PointingHandCursor)
             add.setFixedHeight(30)
             add.setStyleSheet(
@@ -809,26 +884,14 @@ class _StationTabBar(QWidget):
             self._hl.addWidget(add)
         self._hl.addStretch()
 
-        if stations:
-            self._select(active if active in self._buttons else stations[0]["slug"],
+        if self._buttons:
+            self._select(active if active in self._buttons else next(iter(self._buttons)),
                          emit=False)
 
     def _select(self, slug: str, emit: bool = True) -> None:
         self._active = slug
         for s, chip in self._buttons.items():
-            if s == slug:
-                chip.setStyleSheet(
-                    f"QPushButton{{background:{_BLUE};color:#FFF;border:none;"
-                    "border-radius:15px;font-size:12px;font-weight:600;"
-                    "font-family:'Segoe UI';padding:0 16px;}}"
-                )
-            else:
-                chip.setStyleSheet(
-                    f"QPushButton{{background:{_WHITE};color:{_T2};border:1px solid {_BORDER};"
-                    "border-radius:15px;font-size:12px;"
-                    "font-family:'Segoe UI';padding:0 16px;}}"
-                    f"QPushButton:hover{{background:{_BG};color:{_T1};}}"
-                )
+            chip.setStyleSheet(self._chip_ss(s == slug))
         if emit:
             self.station_changed.emit(slug)
 
@@ -908,10 +971,11 @@ class _ReconUploadBrowse(QWidget):
         self._table_w = _make_table(_RECON_BROWSE_HEADERS)
         self._table_w.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table_w.horizontalHeader().setStretchLastSection(True)
-        self._table_w.setColumnWidth(0, 160)
-        self._table_w.setColumnWidth(1, 260)
-        self._table_w.setColumnWidth(2, 80)
-        self._table_w.setColumnWidth(3, 120)
+        self._table_w.setColumnWidth(0, 150)
+        self._table_w.setColumnWidth(1, 240)
+        self._table_w.setColumnWidth(2, 200)
+        self._table_w.setColumnWidth(3, 80)
+        self._table_w.setColumnWidth(4, 120)
         self._table_w.setStyleSheet(_table_style())
         self._table_w.setCursor(Qt.PointingHandCursor)
         self._table_w.cellClicked.connect(self._on_row_clicked)
@@ -948,15 +1012,20 @@ class _ReconUploadBrowse(QWidget):
             count = int(up.get("record_count", 0))
             charge = float(up.get("total_charge", 0))
             period = str(up.get("schedule_period") or "—").strip() or "—"
+            stations = [
+                recon_svc.station_display_name(s) for s in (up.get("stations") or [])
+            ]
+            station_txt = ", ".join(stations) if stations else "—"
 
             t.setItem(r, 0, _cell(date_str))
             t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
-            t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 3, _cell(
+            t.setItem(r, 2, _cell(station_txt))
+            t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(
                 _fmt_num(charge, "$ ", 0),
                 mono=True, align=Qt.AlignRight | Qt.AlignVCenter,
             ))
-            t.setItem(r, 4, _cell(period))
+            t.setItem(r, 5, _cell(period))
             _finish_table_row(t, r)
             total_charge += charge
             total_recs += count
@@ -998,7 +1067,7 @@ class _ReconUploadDetail(QWidget):
         self._cols = cols
         self._bonds = bonds
         self._upload_id = ""
-        self._station = ""
+        self._station = recon_svc.ALL_STATION_SLUG
         self._search = ""
         self._upload_doc: dict = {}
         self._loaded = 0
@@ -1092,7 +1161,7 @@ class _ReconUploadDetail(QWidget):
     def load_upload(self, upload_doc: dict) -> None:
         self._upload_doc = upload_doc or {}
         self._upload_id = str(upload_doc.get("_id") or "")
-        self._station = ""
+        self._station = recon_svc.ALL_STATION_SLUG
         filename = upload_doc.get("source_filename") or "Unknown file"
         count = int(upload_doc.get("record_count", 0))
         charge = float(upload_doc.get("total_charge", 0))
@@ -1137,9 +1206,14 @@ class _ReconUploadDetail(QWidget):
             suffix = "  •  Scroll down for more"
         self._status_lbl.setText(f"Showing {self._loaded:,} of {self._total:,}{suffix}")
 
+    def _station_filter(self) -> str:
+        return recon_svc.station_query_value(self._station)
+
     async def _load_stations(self) -> None:
-        stations = await recon_svc.get_recon_upload_stations(
-            self._upload_id, self._table,
+        stations = recon_svc.unique_station_docs(
+            await recon_svc.get_recon_upload_stations(
+                self._upload_id, self._table,
+            )
         )
         if not stations:
             self._tabs.setVisible(False)
@@ -1147,7 +1221,13 @@ class _ReconUploadDetail(QWidget):
             self._reset_and_load()
             return
         self._tabs.setVisible(True)
-        self._tabs.set_stations(stations, active=self._station or self._tabs.active)
+        chips = stations
+        if len(stations) > 1:
+            chips = [{"slug": recon_svc.ALL_STATION_SLUG, "name": "All"}] + stations
+            active = self._station or recon_svc.ALL_STATION_SLUG
+        else:
+            active = self._station if self._station in {s["slug"] for s in stations} else stations[0]["slug"]
+        self._tabs.set_stations(chips, active=active)
         self._station = self._tabs.active
         self._reset_and_load()
 
@@ -1163,13 +1243,13 @@ class _ReconUploadDetail(QWidget):
         try:
             rows, total, totals = await asyncio.gather(
                 recon_svc.get_recon_upload_records(
-                    self._upload_id, self._table, self._station, self._search, _SCROLL_CHUNK, 0,
+                    self._upload_id, self._table, self._station_filter(), self._search, _SCROLL_CHUNK, 0,
                 ),
                 recon_svc.count_recon_upload_records(
-                    self._upload_id, self._table, self._station, self._search,
+                    self._upload_id, self._table, self._station_filter(), self._search,
                 ),
                 recon_svc.get_recon_upload_totals(
-                    self._upload_id, self._table, self._station,
+                    self._upload_id, self._table, self._station_filter(),
                 ),
             )
         except Exception:
@@ -1196,7 +1276,7 @@ class _ReconUploadDetail(QWidget):
         self._update_status()
         try:
             rows = await recon_svc.get_recon_upload_records(
-                self._upload_id, self._table, self._station, self._search, _SCROLL_CHUNK, self._loaded,
+                self._upload_id, self._table, self._station_filter(), self._search, _SCROLL_CHUNK, self._loaded,
             )
         except Exception:
             self._loading = False
@@ -1242,7 +1322,7 @@ class _ReconUploadDetail(QWidget):
         from openpyxl.styles import Font, PatternFill, Alignment
 
         rows = await recon_svc.get_recon_upload_records(
-            self._upload_id, self._table, self._station,
+            self._upload_id, self._table, self._station_filter(),
             self._search, limit=100_000, skip=0,
         )
 
@@ -1256,7 +1336,7 @@ class _ReconUploadDetail(QWidget):
         ws["A1"] = "TAHMEED COACH TZ LTD"
         ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
         ws["A1"].alignment = Alignment(horizontal="center")
-        sub = self._title + (f" — {self._station.title()}" if self._station else "")
+        sub = self._title + (f" — {recon_svc.station_display_name(self._station)}" if self._station_filter() else " — All stations")
         ws.merge_cells(f"A2:{col_end}2")
         ws["A2"] = sub
         ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
@@ -1292,7 +1372,7 @@ class _ReconUploadDetail(QWidget):
             ws.column_dimensions[ws.cell(1, idx).column_letter].width = max(10, width // 7)
         ws.freeze_panes = ws.cell(hdr_row + 1, 1)
 
-        tag = (self._station or "all").title()
+        tag = recon_svc.station_display_name(self._station).replace(" ", "_")
         default = f"SM_Burhani_{self._title.replace(' ', '_')}_{tag}.xlsx"
         path, _ = QFileDialog.getSaveFileName(self, "Export", default, "Excel Files (*.xlsx)")
         if path:
@@ -1434,10 +1514,14 @@ class _ReconShellWidget(QWidget):
 
     def _on_imported(self, n: int) -> None:
         skipped = int(getattr(self.sender(), "_last_skipped", 0) or 0)
+        stations = str(getattr(self.sender(), "_last_station_summary", "") or "").strip()
         msg = f"Imported {n:,} new records."
+        if stations:
+            msg += f"\n{stations}."
         if skipped:
             msg += f"\n{skipped:,} parked in Skipped for follow-up."
         QMessageBox.information(self, "Import Complete", msg)
+        self._all_entries.show_all_stations()
         self._all_entries.refresh()
         self._show_browse()
         if skipped:

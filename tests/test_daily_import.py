@@ -8,6 +8,7 @@ import pytest
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.daily_import_service import (
+    DailyImportCancelled,
     DailyImportPreview,
     DailyImportRow,
     _looks_like_classic_matumizi,
@@ -192,6 +193,23 @@ def test_accept_header_mapped_workbook(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0].description == "DIESEL"
     assert rows[0].amount == 10000.0
+
+    rows2, _, _ = parse_daily_expenses_excel(path, should_cancel=lambda: False)
+    assert len(rows2) == 1
+
+
+def test_parse_daily_expenses_excel_can_cancel(tmp_path: Path) -> None:
+    path = tmp_path / "matumizi.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Date", "Description", "TZS"])
+    for i in range(40):
+        ws.append([datetime(2026, 7, 21), f"ITEM {i}", 1000])
+    wb.save(path)
+    wb.close()
+
+    with pytest.raises(DailyImportCancelled):
+        parse_daily_expenses_excel(path, should_cancel=lambda: True)
 
 
 def test_transaction_to_doc_omits_null_import_id() -> None:
