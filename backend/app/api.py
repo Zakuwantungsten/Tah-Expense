@@ -521,7 +521,8 @@ async def list_mappings(
 
 
 @mappings.put("", status_code=200)
-async def put_mapping(body: MappingWrite, request: Request, _manager: Manager) -> dict:
+async def put_mapping(body: MappingWrite, request: Request, _user: Authenticated) -> dict:
+    """Cashiers save maps during daily import; accountants/admins manage them too."""
     return await create_named(request, "description_mappings", body)
 
 

@@ -100,6 +100,29 @@ async def recount_day_order(target_date: date, ordered_ids: List[ObjectId]) -> N
         await db.transactions.bulk_write(ops, ordered=False)
 
 
+async def next_day_order(target_date: date) -> int:
+    """Next ``day_order`` for *target_date* (append after every cashier's rows)."""
+    db = get_db()
+    start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
+    end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
+    docs = await db.transactions.aggregate([
+        {"$match": {
+            "$or": [
+                {"date": {"$gte": start, "$lte": end}},
+                {"import_primary_date": {"$gte": start, "$lte": end}},
+            ],
+        }},
+        {"$group": {"_id": None, "mx": {"$max": "$day_order"}}},
+    ]).to_list(1)
+    mx = docs[0].get("mx") if docs else None
+    if mx is None:
+        return 0
+    try:
+        return int(mx) + 1
+    except (TypeError, ValueError):
+        return 0
+
+
 async def save_transaction(tx: Transaction) -> Transaction:
     db = get_db()
     result = await db.transactions.insert_one(tx.to_doc())
@@ -614,6 +637,54 @@ async def search_descriptions(prefix: str, limit: int = 12) -> List[str]:
         return []
     await ensure_description_cache()
     return search_descriptions_sync(prefix, limit) or []
+
+
+async def resolve_item_name_for_description(description: str) -> Optional[str]:
+    """Item/category for a description: saved map first, then prior entries.
+
+    Prefers verified history when no mapping exists. Returns None when neither
+    source has an item.
+    """
+    from tahmeed.services.description_mapping_service import (
+        normalize_description,
+        resolve_category_for_description,
+    )
+
+    key = normalize_description(description)
+    if not key:
+        return None
+    try:
+        mapped = await resolve_category_for_description(description)
+        if mapped and (mapped[1] or "").strip():
+            return mapped[1].strip()
+    except Exception:
+        pass
+
+    db = get_db()
+    desc_match = {"description": {"$regex": f"^{re.escape(key)}$", "$options": "i"}}
+    has_item = {
+        "$or": [
+            {"item": {"$type": "string", "$ne": ""}},
+            {"category_name": {"$type": "string", "$ne": ""}},
+        ]
+    }
+    projection = {"item": 1, "category_name": 1}
+
+    async def _first(extra: dict) -> Optional[dict]:
+        cursor = (
+            db.transactions.find({**desc_match, **has_item, **extra}, projection)
+            .sort([("date", -1), ("created_at", -1)])
+            .limit(1)
+        )
+        docs = await cursor.to_list(length=1)
+        return docs[0] if docs else None
+
+    doc = await _first({"verified": True})
+    if not doc:
+        doc = await _first({})
+    if not doc:
+        return None
+    return (doc.get("item") or doc.get("category_name") or "").strip() or None
 
 
 async def get_rejected_transactions_for_cashier(

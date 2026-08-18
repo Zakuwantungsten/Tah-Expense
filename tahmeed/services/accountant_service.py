@@ -5,7 +5,7 @@ import calendar
 import hashlib
 import re
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from bson import ObjectId
 
@@ -52,12 +52,16 @@ def _with_date_range(
 
 # ── transactions ──────────────────────────────────────────────────────────────
 
+# Newest calendar day first; within a day, Daily Register / WhatsApp sequence.
+UNVERIFIED_INBOX_SORT = [("date", -1), ("day_order", 1), ("created_at", 1)]
+
+
 async def get_unverified_transactions(limit: int = 50, skip: int = 0) -> List[Transaction]:
     db = get_db()
     cursor = (
         db.transactions
         .find({"verified": False})
-        .sort([("date", -1), ("created_at", -1)])
+        .sort(list(UNVERIFIED_INBOX_SORT))
         .skip(skip)
         .limit(limit)
     )
@@ -647,7 +651,7 @@ async def get_unverified_filtered(
     )
     cursor = (
         db.transactions.find(query)
-        .sort([("date", -1), ("created_at", -1)])
+        .sort(list(UNVERIFIED_INBOX_SORT))
         .skip(skip)
         .limit(limit)
     )
@@ -3440,6 +3444,53 @@ def _diesel_date_filter(year: int, month: int) -> dict:
     ]}
 
 
+def diesel_display_label(rec: dict) -> str:
+    """All Entries FILE NAME value: import description, else Excel file name."""
+    label = str(rec.get("upload_label") or "").strip()
+    if label:
+        return label
+    return str(rec.get("source_filename") or "").strip()
+
+
+def unique_diesel_file_labels(labels: Iterable[str]) -> List[str]:
+    """Case-insensitive unique file-name / description labels, sorted."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for raw in labels:
+        label = str(raw or "").strip()
+        key = label.lower()
+        if label and key not in seen:
+            seen.add(key)
+            out.append(label)
+    out.sort(key=str.lower)
+    return out
+
+
+def _diesel_empty_upload_label_clause() -> dict:
+    """Match rows whose import description is missing or blank."""
+    return {"$or": [
+        {"upload_label": {"$exists": False}},
+        {"upload_label": None},
+        {"upload_label": {"$regex": r"^\s*$"}},
+    ]}
+
+
+def _diesel_file_labels_clause(file_labels: Optional[Sequence[str]] = None) -> Optional[dict]:
+    """Match rows whose displayed FILE NAME is any of the selected labels."""
+    labels = unique_diesel_file_labels(file_labels or [])
+    if not labels:
+        return None
+    empty = _diesel_empty_upload_label_clause()
+    branches: List[dict] = []
+    for label in labels:
+        exact = {"$regex": f"^{re.escape(label)}$", "$options": "i"}
+        branches.append({"upload_label": exact})
+        branches.append({"$and": [empty, {"source_filename": exact}]})
+    if len(branches) == 1:
+        return branches[0]
+    return {"$or": branches}
+
+
 def _diesel_all_query(
     feed_type: str,
     search: str = "",
@@ -3447,6 +3498,7 @@ def _diesel_all_query(
     month: int = 0,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    file_labels: Optional[Sequence[str]] = None,
 ) -> dict:
     """Build a MongoDB query for diesel rows across all uploads."""
     clauses: List[dict] = [{"feed_type": feed_type}]
@@ -3469,9 +3521,38 @@ def _diesel_all_query(
     clause = _date_range_clause("transaction_date", date_from, date_to)
     if clause:
         clauses.append(clause)
+    labels_clause = _diesel_file_labels_clause(file_labels)
+    if labels_clause:
+        clauses.append(labels_clause)
     if len(clauses) == 1:
         return clauses[0]
     return {"$and": clauses}
+
+
+async def get_diesel_file_labels(feed_type: str) -> List[str]:
+    """Distinct FILE NAME / description labels for a diesel station."""
+    db = get_db()
+    pipeline = [
+        {"$match": {"feed_type": feed_type}},
+        {"$project": {
+            "label": {
+                "$let": {
+                    "vars": {
+                        "ul": {"$trim": {"input": {"$ifNull": ["$upload_label", ""]}}},
+                        "fn": {"$trim": {"input": {"$ifNull": ["$source_filename", ""]}}},
+                    },
+                    "in": {"$cond": [{"$ne": ["$$ul", ""]}, "$$ul", "$$fn"]},
+                }
+            }
+        }},
+        {"$match": {"label": {"$nin": ["", None]}}},
+        {"$group": {"_id": "$label"}},
+        {"$sort": {"_id": 1}},
+    ]
+    docs = await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+    return unique_diesel_file_labels(
+        str(d.get("_id") or "") for d in docs
+    )
 
 
 async def get_diesel_all_records(
@@ -3483,12 +3564,15 @@ async def get_diesel_all_records(
     date_to: Optional[datetime] = None,
     limit: int = 50,
     skip: int = 0,
+    file_labels: Optional[Sequence[str]] = None,
 ) -> list:
     """Return paginated diesel rows across all uploads."""
     db = get_db()
     cursor = (
         db.imported_feeds
-        .find(_diesel_all_query(feed_type, search, year, month, date_from, date_to))
+        .find(_diesel_all_query(
+            feed_type, search, year, month, date_from, date_to, file_labels,
+        ))
         .sort([("transaction_date", -1), ("date", -1), ("import_date", -1)])
         .skip(skip)
         .limit(limit)
@@ -3503,11 +3587,14 @@ async def count_diesel_all_records(
     month: int = 0,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    file_labels: Optional[Sequence[str]] = None,
 ) -> int:
     """Count diesel rows across all uploads."""
     db = get_db()
     return await db.imported_feeds.count_documents(
-        _diesel_all_query(feed_type, search, year, month, date_from, date_to)
+        _diesel_all_query(
+            feed_type, search, year, month, date_from, date_to, file_labels,
+        )
     )
 
 
@@ -3518,11 +3605,14 @@ async def get_diesel_all_totals(
     month: int = 0,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    file_labels: Optional[Sequence[str]] = None,
 ) -> dict:
     """Return row count and litre/amount totals for filtered diesel rows."""
     db = get_db()
     pipeline = [
-        {"$match": _diesel_all_query(feed_type, search, year, month, date_from, date_to)},
+        {"$match": _diesel_all_query(
+            feed_type, search, year, month, date_from, date_to, file_labels,
+        )},
         {"$group": {
             "_id":          None,
             "count":        {"$sum": 1},
@@ -4446,28 +4536,6 @@ def _as_date_value(value: Any) -> datetime:
     return datetime.min
 
 
-def _truck_row_matches_search(row: dict, search: str) -> bool:
-    if not search.strip():
-        return True
-    needle = search.strip().lower()
-    haystack = " ".join(
-        str(row.get(key, "") or "")
-        for key in (
-            "source",
-            "description",
-            "reference",
-            "truck_value",
-            "station",
-            "currency",
-        )
-    ).lower()
-    if needle in haystack:
-        return True
-    compact_needle = re.sub(r"\s+", "", needle)
-    compact_truck = re.sub(r"\s+", "", str(row.get("truck_value") or "").lower())
-    return bool(compact_needle) and compact_needle in compact_truck
-
-
 def _truck_row_in_date_range(
     row: dict,
     date_from: Optional[datetime] = None,
@@ -5079,7 +5147,6 @@ def _truck_row_matches_currency(row: dict, currency: str = "") -> bool:
 
 def _filter_truck_overview_rows(
     rows: list,
-    search: str = "",
     source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
@@ -5089,17 +5156,15 @@ def _filter_truck_overview_rows(
     filtered = [
         row for row in rows
         if (wanted is None or row["source_group"] in wanted)
-        and _truck_row_matches_search(row, search)
         and _truck_row_in_date_range(row, date_from, date_to)
         and _truck_row_matches_currency(row, currency)
     ]
-    filtered.sort(key=lambda row: (row.get("date") or datetime.min), reverse=True)
+    filtered.sort(key=lambda row: (row.get("date") or datetime.min))
     return filtered
 
 
 async def get_truck_overview_records(
     truck: str,
-    search: str = "",
     source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
@@ -5111,7 +5176,6 @@ async def get_truck_overview_records(
         return []
     rows = _filter_truck_overview_rows(
         await _load_truck_overview_rows(truck.strip(), date_from, date_to),
-        search=search,
         source=source,
         date_from=date_from,
         date_to=date_to,
@@ -5122,7 +5186,6 @@ async def get_truck_overview_records(
 
 async def count_truck_overview_records(
     truck: str,
-    search: str = "",
     source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
@@ -5132,7 +5195,6 @@ async def count_truck_overview_records(
         return 0
     rows = _filter_truck_overview_rows(
         await _load_truck_overview_rows(truck.strip(), date_from, date_to),
-        search=search,
         source=source,
         date_from=date_from,
         date_to=date_to,
@@ -5143,7 +5205,6 @@ async def count_truck_overview_records(
 
 async def get_truck_overview_summary(
     truck: str,
-    search: str = "",
     source: Union[str, Sequence[str], None] = "all",
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
@@ -5160,7 +5221,6 @@ async def get_truck_overview_summary(
         }
     rows = _filter_truck_overview_rows(
         await _load_truck_overview_rows(truck.strip(), date_from, date_to),
-        search=search,
         source=source,
         date_from=date_from,
         date_to=date_to,

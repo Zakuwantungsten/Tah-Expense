@@ -1,5 +1,8 @@
 """Description column Excel-style autocomplete (system-wide history)."""
 
+from types import SimpleNamespace
+
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QLineEdit, QWidget
@@ -99,3 +102,56 @@ def test_description_inline_preview_and_tab_accept() -> None:
     assert not ed._completer.popup().isVisible()
     assert nxt.hasFocus()
     cs.invalidate_description_cache()
+
+
+@pytest.mark.asyncio
+async def test_resolve_item_prefers_saved_mapping(monkeypatch) -> None:
+    async def mapped(description: str, cache=None):
+        return ("cat-id", "Parking")
+
+    monkeypatch.setattr(
+        "tahmeed.services.description_mapping_service.resolve_category_for_description",
+        mapped,
+    )
+    name = await cs.resolve_item_name_for_description("PARKING CONGO")
+    assert name == "Parking"
+
+
+@pytest.mark.asyncio
+async def test_resolve_item_falls_back_to_verified_history(monkeypatch) -> None:
+    async def none_mapped(description: str, cache=None):
+        return None
+
+    monkeypatch.setattr(
+        "tahmeed.services.description_mapping_service.resolve_category_for_description",
+        none_mapped,
+    )
+
+    class _Cursor:
+        def __init__(self, docs):
+            self._docs = docs
+
+        def sort(self, *_a, **_k):
+            return self
+
+        def limit(self, *_a, **_k):
+            return self
+
+        async def to_list(self, length=1):
+            return self._docs[:length]
+
+    class _Coll:
+        def __init__(self):
+            self.queries = []
+
+        def find(self, query, *_a, **_k):
+            self.queries.append(query)
+            if query.get("verified") is True:
+                return _Cursor([{"item": "Diesel CSH", "category_name": "Diesel CSH"}])
+            return _Cursor([])
+
+    coll = _Coll()
+    monkeypatch.setattr(cs, "get_db", lambda: SimpleNamespace(transactions=coll))
+    name = await cs.resolve_item_name_for_description("DIESEL")
+    assert name == "Diesel CSH"
+    assert any(q.get("verified") is True for q in coll.queries)

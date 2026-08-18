@@ -24,32 +24,31 @@ from tahmeed.ui.accountant.date_filters import style_calendar_popup
 # ---------------------------------------------------------------------------
 COL_SNO      = 0
 COL_DATE     = 1
-COL_REPORTED = 2
-COL_ITEM     = 3
-COL_DESC     = 4
-COL_TRUCK    = 5
-COL_MEMO     = 6
-COL_REF      = 7   # Ref_Float (free text; was checkbox NOTES)
-COL_TZS      = 8
-COL_RECEIPT  = 9
-COL_OWN      = 10
-COL_APR      = 11
-COL_PAYEE    = 12
-COL_CHEQUE   = 13
-COL_CASHIER  = 14
+COL_ITEM     = 2
+COL_DESC     = 3
+COL_TRUCK    = 4
+COL_MEMO     = 5
+COL_REF      = 6   # Ref_Float (free text; was checkbox NOTES)
+COL_TZS      = 7
+COL_RECEIPT  = 8
+COL_OWN      = 9
+COL_APR      = 10
+COL_PAYEE    = 11
+COL_CHEQUE   = 12
+COL_CASHIER  = 13
 
 HEADERS = [
-    "S/NO", "Date", "Reported Date", "Item", "Description", "Truck No.",
+    "S/NO", "Date", "Item", "Description", "Truck No.",
     "Memo", "Ref_Float", "TZS", "Receipt", "Ownership", "APR BY",
     "Payee", "Cheque", "Cashier",
 ]
 
 CHECK_COLS       = set()   # legacy; Ref_Float is free text now
 READONLY_COLS    = {COL_SNO, COL_CASHIER}
-# Date / reported date alone do not count as entry data.
-_DATA_SKIP_COLS  = READONLY_COLS | {COL_RECEIPT, COL_DATE, COL_REPORTED}
+# Date alone does not count as entry data.
+_DATA_SKIP_COLS  = READONLY_COLS | {COL_RECEIPT, COL_DATE}
 # Columns that should NOT be auto-uppercased
-_UPPER_SKIP_COLS = READONLY_COLS | {COL_RECEIPT, COL_DATE, COL_REPORTED}
+_UPPER_SKIP_COLS = READONLY_COLS | {COL_RECEIPT, COL_DATE}
 DEFAULT_EDITABLE_ROWS = 20
 
 _REF_FLOAT_OPTS = ["REFUND TO FLOAT"]
@@ -58,7 +57,6 @@ _REF_FLOAT_OPTS = ["REFUND TO FLOAT"]
 _COL_PREFERRED = {
     COL_SNO: 48,
     COL_DATE: 70,
-    COL_REPORTED: 70,
     COL_ITEM: 100,
     COL_DESC: 200,
     COL_TRUCK: 72,
@@ -80,7 +78,6 @@ _COL_FLEX = (
 _COL_MIN = {
     COL_SNO: 40,
     COL_DATE: 62,
-    COL_REPORTED: 62,
     COL_ITEM: 70,
     COL_DESC: 120,
     COL_TRUCK: 60,
@@ -110,7 +107,7 @@ def _ref_float_text(tx: "Transaction") -> str:
 
 
 def format_register_date(value) -> str:
-    """Short register date for Date / Reported Date cells: ``18 Jul``."""
+    """Short register date for Date cells: ``18 Jul``."""
     if value is None:
         return ""
     if hasattr(value, "date") and not isinstance(value, date):
@@ -581,9 +578,8 @@ class _ItemDelegate(_ExcelCellDelegate):
 
     QuickBooks-style contains match: the list narrows to names that contain the
     typed text anywhere (start/middle/end), ranked so exact and prefix hits
-    come first. Prefix matches get an inline preview (selected suffix); Tab /
-    Enter commits the highlighted / previewed canonical name. Mid-string hits
-    stay in the popup until selected. The list is read live via ``items_getter``.
+    come first. Typed text stays as typed until Tab / Enter / click accepts the
+    highlighted name. The list is read live via ``items_getter``.
     Whether unknown entries are allowed is enforced at the grid level
     (restrict off = free text; restrict on = keep text and flag the cell).
     """

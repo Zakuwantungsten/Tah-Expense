@@ -463,18 +463,23 @@ async def apply_mapping_to_preview(
     category_id: ObjectId,
     category_name: str,
 ) -> None:
+    """Assign an item to matching preview rows, then remember the map if allowed.
+
+    The assignment always applies to this import. Persisting can fail for
+    network/role issues; the current batch must still continue.
+    """
     display = description_key
     for row in preview.rows:
         if normalize_description(row.description) == description_key:
             display = row.description
-            break
-    await save_mapping(display, category_id, category_name)
-    for row in preview.rows:
-        if normalize_description(row.description) == description_key:
             row.category_id = category_id
             row.category_name = category_name
             row.skipped_item = False
     preview.unmapped.pop(description_key, None)
+    try:
+        await save_mapping(display, category_id, category_name)
+    except Exception:
+        pass
 
 
 def skip_description_in_preview(preview: DailyImportPreview, description_key: str) -> None:

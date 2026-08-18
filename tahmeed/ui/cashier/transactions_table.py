@@ -9,12 +9,13 @@ Uploads  — Excel daily imports list
 
 Year/Month combos are populated from real DB data. A loading overlay covers the
 table while searches run so the first open never looks empty mid-fetch.
-Double-click or "Go To Date" navigates the register to that day/transaction.
+Double-click a Simple day, Open an upload, or "Go To Date" jumps the live
+register table to that day / upload batch.
 """
 
 import asyncio
 import calendar as _cal
-from datetime import date
+from datetime import date, datetime
 from typing import List, Optional
 
 from PySide6.QtWidgets import (
@@ -149,6 +150,7 @@ _U_COL_ACT     = 6
 
 class TransactionBrowser(QWidget):
     go_to_date = Signal(object, str)
+    go_to_upload = Signal(str, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -345,8 +347,7 @@ class TransactionBrowser(QWidget):
         hl.setContentsMargins(0, 4, 0, 4)
         hl.setSpacing(8)
         tip = QLabel(
-            "Excel daily imports — double-click or Open to work the batch in Advanced; "
-            "Go To Date opens that day on the register."
+            "Excel daily imports — double-click or Open to view the batch on the register."
         )
         tip.setStyleSheet("color:#6b7280;font-size:12px;")
         hl.addWidget(tip)
@@ -523,6 +524,9 @@ class TransactionBrowser(QWidget):
     def _switch_mode(self, mode: int) -> None:
         if mode != _MODE_ADVANCED:
             self._filter_upload_id = ""
+        self._show_mode(mode)
+
+    def _show_mode(self, mode: int) -> None:
         self._current_mode = mode
         self._filter_stack.setCurrentIndex(mode)
         self._table_stack.setCurrentIndex(mode)
@@ -543,66 +547,15 @@ class TransactionBrowser(QWidget):
         self._open_upload_at(index.row())
 
     def _open_upload_at(self, row: int) -> None:
-        """Open one Excel upload in Advanced (all its rows) for review/work."""
+        """Open one Excel upload on the Daily Register table."""
         if row < 0 or row >= len(self._results_uploads):
             return
         u = self._results_uploads[row]
         upload_id = str(u.get("_id") or "").strip()
         if not upload_id:
             return
-        min_d = u.get("min_date") or u.get("primary_date")
-        max_d = u.get("max_date") or min_d
-        primary = u.get("primary_date") or min_d
-
-        def _as_qdate(val):
-            if val is None:
-                return QDate.currentDate()
-            if hasattr(val, "date"):
-                val = val.date()
-            if isinstance(val, date):
-                return QDate(val.year, val.month, val.day)
-            return QDate.currentDate()
-
-        self._filter_upload_id = upload_id
-        if primary is not None:
-            d = primary.date() if hasattr(primary, "date") else primary
-            if isinstance(d, date):
-                self._a_year.blockSignals(True)
-                self._a_month.blockSignals(True)
-                y_idx = self._a_year.findData(d.year)
-                if y_idx >= 0:
-                    self._a_year.setCurrentIndex(y_idx)
-                else:
-                    self._a_year.addItem(str(d.year), d.year)
-                    self._a_year.setCurrentIndex(self._a_year.findData(d.year))
-                m_idx = self._a_month.findData(d.month)
-                if m_idx >= 0:
-                    self._a_month.setCurrentIndex(m_idx)
-                self._a_year.blockSignals(False)
-                self._a_month.blockSignals(False)
-        self._a_from.setDate(_as_qdate(min_d))
-        self._a_to.setDate(_as_qdate(max_d))
-        self._adv_kw_edit.clear()
-        self._cascade_busy = True
-        try:
-            self._item_combo.reset_to_all(emit=False)
-            self._subitem_combo.reset_to_all(emit=False)
-        finally:
-            self._cascade_busy = False
-
-        # Stay on Advanced with upload filter (don't clear via _switch_mode).
-        self._current_mode = _MODE_ADVANCED
-        self._filter_stack.setCurrentIndex(_MODE_ADVANCED)
-        self._table_stack.setCurrentIndex(_MODE_ADVANCED)
-        for i, btn in enumerate(self._mode_btns):
-            btn.setChecked(i == _MODE_ADVANCED)
-        self._do_find()
-
-        # Also jump the live register to the upload's primary day.
-        if primary is not None:
-            d = primary.date() if hasattr(primary, "date") else primary
-            if isinstance(d, date):
-                self.go_to_date.emit(d, "")
+        primary = u.get("primary_date") or u.get("min_date")
+        self.go_to_upload.emit(upload_id, primary)
 
     # ── Async loaders ─────────────────────────────────────────────────────────
 
@@ -615,9 +568,6 @@ class TransactionBrowser(QWidget):
             self._months_loaded = True
             self._populate_year_combos(years)
             self._db_months = months
-            # Keep the user's Year/Month selection; only refresh date bounds.
-            self._apply_period_to_dates("simple")
-            self._apply_period_to_dates("advanced")
         except Exception:
             self._months_loaded = True
             self._years_loaded = True
@@ -1161,34 +1111,28 @@ class TransactionBrowser(QWidget):
 
     def _on_go_to(self) -> None:
         if self._current_mode == _MODE_UPLOADS:
-            row = self._uploads_table.currentRow()
-            if row < 0 or row >= len(self._results_uploads):
-                return
-            u = self._results_uploads[row]
-            primary = u.get("primary_date") or u.get("min_date")
-            if primary is None:
-                return
-            d = primary.date() if hasattr(primary, "date") else primary
-            if isinstance(d, date):
-                self.go_to_date.emit(d, "")
+            self._open_upload_at(self._uploads_table.currentRow())
             return
         if self._current_mode == _MODE_SIMPLE:
             row = self._simple_table.currentRow()
             if row < 0 or row >= len(self._results_simple):
                 return
-            d    = self._results_simple[row]["date"]
-            term = self._kw_edit.text().strip()
-        else:
+            d = _as_py_date(self._results_simple[row].get("date"))
+            if d is None:
+                return
+            self.go_to_date.emit(d, self._kw_edit.text().strip())
+            return
+        if self._current_mode == _MODE_ADVANCED:
             row = self._adv_table.currentRow()
             if row < 0 or row >= len(self._results_advanced):
                 return
             tx = self._results_advanced[row]
-            d  = tx.date
-            if hasattr(d, "date"):
-                d = d.date()
+            d = _as_py_date(tx.date)
+            if d is None:
+                return
             descs = self._subitem_combo.selected_values()
             term = descs[0] if len(descs) == 1 else self._adv_kw_edit.text().strip()
-        self.go_to_date.emit(d, term)
+            self.go_to_date.emit(d, term)
 
     # ── Export ────────────────────────────────────────────────────────────────
 
@@ -1313,6 +1257,16 @@ def _date_edit(d: date) -> QDateEdit:
     de.setStyleSheet(_FIELD_SS)
     style_calendar_popup(de)
     return de
+
+
+def _as_py_date(val) -> Optional[date]:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    return None
 
 
 def _qdate_to_py(qd: QDate) -> date:

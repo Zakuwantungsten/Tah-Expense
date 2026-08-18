@@ -1,7 +1,7 @@
 """Fleet Expense Report PDF for Truck Overview.
 
-Matches the Tahmeed Transporters portrait report layout:
-logo header, KPI cards, spend-by-source with distribution bars,
+Matches the Tahmeed Transporters report layout in A4 landscape so every
+on-screen column fits: logo header, KPI cards, spend-by-source bars,
 transaction detail, signatures, confidential footer.
 """
 
@@ -16,12 +16,12 @@ from typing import Any, Optional
 
 import fitz
 
-# A4 portrait (points)
-_PAGE_W = 595.2755737304688
-_PAGE_H = 841.8897705078125
+# A4 landscape (points)
+_PAGE_W = 841.8897705078125
+_PAGE_H = 595.2755737304688
 
-_ML = 39.7
-_MR = 39.7
+_ML = 28.0
+_MR = 28.0
 _CONTENT_R = _PAGE_W - _MR
 _CONTENT_W = _CONTENT_R - _ML
 
@@ -38,16 +38,40 @@ _BAR_TRACK = (238 / 255, 238 / 255, 238 / 255)
 _WHITE = (1, 1, 1)
 _RULE = (216 / 255, 216 / 255, 219 / 255)
 
-# Transaction table column x starts / widths (content area)
-_COL = {
-    "date": (_ML + 4.5, 50),
-    "source": (_ML + 56.2, 72),
-    "desc": (_ML + 134.3, 148),
-    "ref": (_ML + 287.7, 88),
-    "rate": (_ML + 380.6, 34),
-    "station": (_ML + 409.3, 82),
-    "usd": (_ML + 491.3, 24.6),
-}
+# Same columns as Truck Overview table / Excel export.
+_COL_SPECS: list[tuple[str, str, float]] = [
+    ("date", "DATE", 50),
+    ("source", "SOURCE", 68),
+    ("desc", "DESCRIPTION", 108),
+    ("ref", "REFERENCE", 66),
+    ("truck", "TRUCK FIELD", 54),
+    ("tzs", "TZS", 56),
+    ("usd", "USD", 48),
+    ("zmw", "ZMW", 48),
+    ("ltrs", "LTRS", 34),
+    ("rate", "RATE", 38),
+    ("station", "STATION / OWNER", 68),
+    ("receipt", "RECEIPT", 44),
+]
+_WRAP_KEYS = {"source", "desc", "ref", "station"}
+_RIGHT_KEYS = {"tzs", "usd", "zmw", "ltrs", "rate"}
+
+
+def _build_cols() -> dict[str, tuple[float, float]]:
+    pad = 3.0
+    usable = _CONTENT_W - 2 * pad
+    total = sum(w for _, _, w in _COL_SPECS)
+    scale = usable / total if total else 1.0
+    cols: dict[str, tuple[float, float]] = {}
+    x = _ML + pad
+    for key, _, width in _COL_SPECS:
+        w = width * scale
+        cols[key] = (x, w)
+        x += w
+    return cols
+
+
+_COL = _build_cols()
 
 _DASH = "—"
 _FONT_REG = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "arial.ttf"
@@ -190,6 +214,46 @@ def _usd_amount(row: dict) -> Optional[float]:
     return val
 
 
+def _split_amounts(row: dict) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    amount = row.get("amount")
+    if amount is None or amount == "":
+        return None, None, None
+    try:
+        val = float(amount)
+    except (TypeError, ValueError):
+        return None, None, None
+    cur = _normalize_currency(row.get("currency") or "")
+    if cur == "TZS":
+        return val, None, None
+    if cur == "USD":
+        return None, val, None
+    if cur == "ZMW":
+        return None, None, val
+    return None, None, None
+
+
+def _fmt_amount(value: Optional[float], *, decimals: int) -> str:
+    if value is None:
+        return _DASH
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return _DASH
+    return f"{val:,.{decimals}f}"
+
+
+def _fmt_liters(value) -> str:
+    if value in (None, "", 0, 0.0):
+        return _DASH
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return _DASH
+    if abs(val) < 1e-12:
+        return _DASH
+    return f"{val:,.0f}"
+
+
 def _wrap(text: str, size: float, max_width: float, *, bold: bool = False) -> list[str]:
     text = (text or "").replace("\n", " ").strip()
     if not text:
@@ -263,9 +327,8 @@ def _fill_rect(page: fitz.Page, rect: fitz.Rect, color: tuple[float, float, floa
 def _header(page: fitz.Page, logo_path: Optional[Path]) -> float:
     """Draw branded header; return y just below orange rule."""
     if logo_path and logo_path.is_file():
-        # Match reference placement ~53x31 pt
         page.insert_image(
-            fitz.Rect(_ML, 22.7, _ML + 52.9, 53.9),
+            fitz.Rect(_ML, 16.0, _ML + 48.0, 44.0),
             filename=str(logo_path),
             keep_proportion=True,
         )
@@ -276,7 +339,7 @@ def _header(page: fitz.Page, logo_path: Optional[Path]) -> float:
     _draw_text(
         page,
         _CONTENT_R - company_w,
-        28.1 + company_size * 0.75,
+        20.0 + company_size * 0.75,
         company,
         size=company_size,
         color=_BLACK,
@@ -289,25 +352,24 @@ def _header(page: fitz.Page, logo_path: Optional[Path]) -> float:
     _draw_text(
         page,
         _CONTENT_R - sub_w,
-        44.9 + sub_size * 0.75,
+        35.5 + sub_size * 0.75,
         subtitle,
         size=sub_size,
         color=_LABEL,
     )
 
-    # Orange accent rule
-    y = 62.0
+    y = 50.0
     page.draw_line(
         fitz.Point(_ML, y),
         fitz.Point(_CONTENT_R, y),
         color=_ORANGE,
         width=2.25,
     )
-    return y + 18.0
+    return y + 14.0
 
 
 def _footer(page: fitz.Page, page_no: int, page_count: int) -> None:
-    y = 805.8
+    y = _PAGE_H - 22.0
     page.draw_line(
         fitz.Point(_ML, y - 10),
         fitz.Point(_CONTENT_R, y - 10),
@@ -317,14 +379,14 @@ def _footer(page: fitz.Page, page_no: int, page_count: int) -> None:
     _draw_text(
         page,
         _ML,
-        y + 7,
+        y + 5,
         "CONFIDENTIAL — INTERNAL USE ONLY",
         size=7.0,
         color=_LABEL,
         bold=True,
     )
     label = f"Page {page_no} of {page_count}"
-    _draw_right(page, _CONTENT_R, y + 7, label, size=7.0, color=_LABEL)
+    _draw_right(page, _CONTENT_R, y + 5, label, size=7.0, color=_LABEL)
 
 
 def _draw_kpi_card(
@@ -344,8 +406,8 @@ def _draw_kpi_card(
     page.draw_rect(rect, color=_CARD_EDGE, width=0.4)
     # orange top accent
     _fill_rect(page, fitz.Rect(x, y, x + w, y + 2.4), _ORANGE)
-    _draw_text(page, x + 9.7, y + 18.5, label, size=6.8, color=_LABEL, bold=True)
-    _draw_text(page, x + 9.7, y + 36.5, value, size=14.0, color=value_color, bold=True)
+    _draw_text(page, x + 10.0, y + 16.5, label, size=6.8, color=_LABEL, bold=True)
+    _draw_text(page, x + 10.0, y + 34.5, value, size=13.0, color=value_color, bold=True)
 
 
 def _draw_meta_block(
@@ -356,24 +418,26 @@ def _draw_meta_block(
     sources: str,
     generated: str,
 ) -> float:
-    h = 56.4
+    h = 48.0
     rect = fitz.Rect(_ML, y, _CONTENT_R, y + h)
     _fill_rect(page, rect, _META_BG)
 
+    col_w = _CONTENT_W / 4
     cols = [
         (_ML, "VEHICLE", truck),
-        (_ML + 129.0, "PERIOD COVERED", period),
-        (_ML + 257.9, "SOURCES", sources),
-        (_ML + 386.9, "GENERATED", generated),
+        (_ML + col_w, "PERIOD COVERED", period),
+        (_ML + 2 * col_w, "SOURCES", sources),
+        (_ML + 3 * col_w, "GENERATED", generated),
     ]
+    wrap_w = col_w - 14.0
     for x, label, value in cols:
-        _draw_text(page, x, y + 16.5, label, size=7.0, color=_LABEL, bold=True)
-        lines = _wrap(value, 9.5, 120, bold=True)
-        yy = y + 29.5
+        _draw_text(page, x + 8.0, y + 14.5, label, size=7.0, color=_LABEL, bold=True)
+        lines = _wrap(value, 9.0, wrap_w, bold=True)
+        yy = y + 27.5
         for line in lines[:2]:
-            _draw_text(page, x, yy, line, size=9.5, color=_DARK, bold=True)
-            yy += 13.8
-    return y + h + 15.0
+            _draw_text(page, x + 8.0, yy, line, size=9.0, color=_DARK, bold=True)
+            yy += 12.5
+    return y + h + 12.0
 
 
 def _spend_by_source(rows: list[dict]) -> list[dict]:
@@ -396,35 +460,61 @@ def _spend_by_source(rows: list[dict]) -> list[dict]:
 
 
 def _row_height(row: dict) -> float:
-    ref_lines = _wrap(_dash(row.get("reference")), 7.8, _COL["ref"][1])
-    desc_lines = _wrap(_dash(row.get("description")), 8.3, _COL["desc"][1])
-    source_lines = _wrap(_dash(row.get("source")), 8.3, _COL["source"][1])
-    lines = max(len(ref_lines), len(desc_lines), len(source_lines), 1)
-    if lines <= 1:
-        return 20.6
-    return 12.0 + lines * 11.3
+    max_lines = 1
+    for key in _WRAP_KEYS:
+        x, w = _COL[key]
+        text = _cell_text(row, key)
+        size = 7.2 if key in ("source", "desc") else 7.0
+        max_lines = max(max_lines, len(_wrap(text, size, w - 2)))
+    if max_lines <= 1:
+        return 16.5
+    return 10.0 + max_lines * 9.5
+
+
+def _cell_text(row: dict, key: str) -> str:
+    tzs, usd, zmw = _split_amounts(row)
+    if key == "date":
+        return _fmt_date(row.get("date"))
+    if key == "source":
+        return _dash(row.get("source"))
+    if key == "desc":
+        return _dash(row.get("description"))
+    if key == "ref":
+        return _dash(row.get("reference"))
+    if key == "truck":
+        return _dash(row.get("truck_value"))
+    if key == "tzs":
+        return _fmt_amount(tzs, decimals=0)
+    if key == "usd":
+        return _fmt_amount(usd, decimals=2)
+    if key == "zmw":
+        return _fmt_amount(zmw, decimals=0)
+    if key == "ltrs":
+        return _fmt_liters(row.get("liters"))
+    if key == "rate":
+        return _fmt_rate(row.get("rate"))
+    if key == "station":
+        return _dash(row.get("station"))
+    if key == "receipt":
+        receipt = (row.get("receipt_status") or "").strip()
+        return receipt.title() if receipt and receipt != _DASH else _DASH
+    return _DASH
 
 
 def _draw_table_header(page: fitz.Page, y: float) -> float:
-    h = 28.0
+    h = 22.0
     _fill_rect(page, fitz.Rect(_ML, y, _CONTENT_R, y + h), _DARK)
-    headers = [
-        (_COL["date"][0], "DATE", False),
-        (_COL["source"][0], "SOURCE", False),
-        (_COL["desc"][0], "DESCRIPTION", False),
-        (_COL["ref"][0], "REFERENCE", False),
-        (_COL["rate"][0], "RATE", False),
-        (_COL["station"][0], "STATION /", True),
-        (_COL["usd"][0] + _COL["usd"][1], "USD", False),
-    ]
-    for x, label, stacked in headers:
-        if stacked:
-            _draw_text(page, x, y + 11.5, "STATION /", size=6.9, color=_WHITE, bold=True)
-            _draw_text(page, x, y + 21.5, "OWNER", size=6.9, color=_WHITE, bold=True)
-        elif label == "USD":
-            _draw_right(page, x, y + 17.5, "USD", size=6.9, color=_WHITE, bold=True)
+    for key, label, _ in _COL_SPECS:
+        x, w = _COL[key]
+        if key in _RIGHT_KEYS:
+            _draw_right(page, x + w - 2, y + 14.0, label, size=6.2, color=_WHITE, bold=True)
+        elif key == "receipt":
+            _draw_right(page, x + w - 2, y + 14.0, label, size=6.2, color=_WHITE, bold=True)
+        elif key == "station":
+            _draw_text(page, x, y + 9.0, "STATION /", size=5.8, color=_WHITE, bold=True)
+            _draw_text(page, x, y + 17.5, "OWNER", size=5.8, color=_WHITE, bold=True)
         else:
-            _draw_text(page, x, y + 17.5, label, size=6.9, color=_WHITE, bold=True)
+            _draw_text(page, x, y + 14.0, label, size=6.2, color=_WHITE, bold=True)
     return y + h
 
 
@@ -433,84 +523,57 @@ def _draw_detail_row(page: fitz.Page, y: float, row: dict, *, alt: bool) -> floa
     if alt:
         _fill_rect(page, fitz.Rect(_ML, y, _CONTENT_R, y + h), _ROW_ALT)
 
-    baseline = y + 12.5
-    date_txt = _fmt_date(row.get("date"))
-    _draw_text(page, _COL["date"][0], baseline, date_txt, size=8.3, color=_MUTED)
+    baseline = y + 11.0
+    for key, _, _ in _COL_SPECS:
+        x, w = _COL[key]
+        text = _cell_text(row, key)
+        size = 7.2 if key in ("source", "desc", "tzs", "usd", "zmw") else 7.0
+        color = _MUTED if key == "date" else _DARK
+        if key == "ref":
+            color = _LABEL
+        bold = key in _RIGHT_KEYS
 
-    source_lines = _wrap(_dash(row.get("source")), 8.3, _COL["source"][1])
-    desc_lines = _wrap(_dash(row.get("description")), 8.3, _COL["desc"][1])
-    ref_lines = _wrap(_dash(row.get("reference")), 7.8, _COL["ref"][1])
-    yy = baseline
-    for line in source_lines:
-        _draw_text(page, _COL["source"][0], yy, line, size=8.3, color=_DARK)
-        yy += 11.3
-
-    yy = baseline
-    for line in desc_lines:
-        _draw_text(page, _COL["desc"][0], yy, line, size=8.3, color=_DARK)
-        yy += 11.3
-
-    yy = baseline
-    for line in ref_lines:
-        _draw_text(page, _COL["ref"][0], yy, line, size=7.8, color=_LABEL)
-        yy += 11.3
-
-    rate_txt = _fmt_rate(row.get("rate"))
-    rate_w = _text_len(rate_txt, 8.3, bold=True)
-    # right-ish within rate column
-    _draw_text(
-        page,
-        _COL["rate"][0] + max(0, _COL["rate"][1] - rate_w),
-        baseline,
-        rate_txt,
-        size=8.3,
-        color=_DARK,
-        bold=True,
-    )
-
-    station = _dash(row.get("station"))
-    _draw_text(page, _COL["station"][0], baseline, station[:18], size=8.3, color=_DARK)
-
-
-    usd = _usd_amount(row)
-    usd_txt = _fmt_usd(usd)
-    _draw_right(
-        page,
-        _CONTENT_R - 4,
-        baseline,
-        usd_txt,
-        size=8.3,
-        color=_DARK,
-        bold=True,
-    )
+        if key in _WRAP_KEYS:
+            lines = _wrap(text, size, w - 2)
+            yy = baseline
+            for line in lines:
+                _draw_text(page, x, yy, line, size=size, color=color)
+                yy += 9.5
+        elif key in _RIGHT_KEYS:
+            _draw_right(page, x + w - 2, baseline, text, size=size, color=_DARK, bold=bold)
+        elif key == "receipt":
+            _draw_right(page, x + w - 2, baseline, text, size=7.0, color=_DARK)
+        else:
+            line = _wrap(text, size, w - 2)[0]
+            _draw_text(page, x, baseline, line, size=size, color=color)
     return y + h
 
 
-def _draw_total_row(page: fitz.Page, y: float, usd_total: float) -> float:
+def _draw_total_row(page: fitz.Page, y: float, summary: dict) -> float:
     page.draw_line(
         fitz.Point(_ML, y),
         fitz.Point(_CONTENT_R, y),
         color=_DARK,
         width=1.125,
     )
-    y += 14.0
-    _draw_text(page, _ML + 0.7, y, "Total", size=8.6, color=_DARK, bold=True)
-    _draw_right(
-        page,
-        _CONTENT_R - 4,
-        y,
-        _fmt_usd(usd_total, money=True),
-        size=8.6,
-        color=_DARK,
-        bold=True,
-    )
-    return y + 16.0
+    y += 12.0
+    _draw_text(page, _ML + 2, y, "Total", size=8.0, color=_DARK, bold=True)
+    totals = {
+        "tzs": _fmt_amount(summary.get("tzs_total"), decimals=0),
+        "usd": _fmt_amount(summary.get("usd_total"), decimals=2),
+        "zmw": _fmt_amount(summary.get("zmw_total"), decimals=0),
+        "ltrs": _fmt_liters(summary.get("liters_total")),
+    }
+    for key, text in totals.items():
+        x, w = _COL[key]
+        _draw_right(page, x + w - 2, y, text, size=8.0, color=_DARK, bold=True)
+    return y + 14.0
 
 
 def _draw_signatures(page: fitz.Page, y: float) -> None:
-    y = max(y + 36.0, 700.0)
+    y = max(y + 22.0, _PAGE_H - 70.0)
     mid = (_ML + _CONTENT_R) / 2
-    gap = 24.0
+    gap = 28.0
     left_x0, left_x1 = _ML, mid - gap
     right_x0, right_x1 = mid + gap, _CONTENT_R
     page.draw_line(fitz.Point(left_x0, y), fitz.Point(left_x1, y), color=_LABEL, width=0.8)
@@ -518,17 +581,17 @@ def _draw_signatures(page: fitz.Page, y: float) -> None:
     _draw_text(
         page,
         left_x0,
-        y + 14,
+        y + 12,
         "PREPARED BY — DATA OPERATIONS",
-        size=7.5,
+        size=7.0,
         color=_LABEL,
     )
     _draw_text(
         page,
         right_x0,
-        y + 14,
+        y + 12,
         "REVIEWED / APPROVED BY",
-        size=7.5,
+        size=7.0,
         color=_LABEL,
     )
 
@@ -561,7 +624,7 @@ def export_truck_overview_pdf(
     source_label: str = "All Sources",
     generated_at: Optional[datetime] = None,
 ) -> None:
-    """Write a Fleet Expense Report PDF for the given truck overview rows."""
+    """Write a landscape Fleet Expense Report PDF for the given truck overview rows."""
     generated_at = generated_at or datetime.now()
     logo = _logo_path()
     spend_items = _spend_by_source(rows)
@@ -582,24 +645,23 @@ def export_truck_overview_pdf(
     y = _header(page, logo)
 
     # Title block
-    _draw_text(page, _ML, y + 8, "FLEET EXPENSE REPORT", size=8.0, color=_ORANGE, bold=True)
-    y += 26.0
+    _draw_text(page, _ML, y + 6, "FLEET EXPENSE REPORT", size=7.5, color=_ORANGE, bold=True)
+    y += 20.0
     title = f"Truck Overview — {truck}"
-    _draw_text(page, _ML, y + 8, title, size=22.0, color=_BLACK, bold=True)
-    # line-items chip top-right near title area
+    _draw_text(page, _ML, y + 6, title, size=18.0, color=_BLACK, bold=True)
     chip = f"{record_count} line items"
     chip_w = _text_len(chip, 8.0, bold=True)
     _draw_text(page, _CONTENT_R - chip_w, y + 4, chip, size=8.0, color=_LABEL, bold=True)
-    y += 32.0
+    y += 26.0
     _draw_text(
         page,
         _ML,
         y,
         "Consolidated expense record across all logged sources",
-        size=10.5,
+        size=9.5,
         color=_MUTED,
     )
-    y += 22.0
+    y += 16.0
 
     y = _draw_meta_block(
         page,
@@ -611,9 +673,9 @@ def export_truck_overview_pdf(
     )
 
     # KPI cards
-    card_w = 105.6
-    card_h = 54.9
-    gap = 6.0
+    card_h = 46.0
+    gap = 8.0
+    card_w = (_CONTENT_W - 4 * gap) / 5
     labels_vals = [
         ("TOTAL RECORDS", f"{record_count:,}", _BLACK),
         ("DATA SOURCES", f"{source_count:,}", _BLACK),
@@ -624,53 +686,56 @@ def export_truck_overview_pdf(
     for i, (lab, val, col) in enumerate(labels_vals):
         x = _ML + i * (card_w + gap)
         _draw_kpi_card(page, x, y, card_w, card_h, lab, val, value_color=col)
-    y += card_h + 18.5
+    y += card_h + 14.0
+    bottom_limit = _PAGE_H - 55.0
 
-    # Spend by Source
-    _draw_text(page, _ML, y + 8, "Spend by Source", size=11.5, color=_BLACK, bold=True)
-    y += 22.0
+    def start_spend_header(current_page: fitz.Page, current_y: float) -> float:
+        _draw_text(current_page, _ML, current_y + 6, "Spend by Source", size=11.0, color=_BLACK, bold=True)
+        current_y += 18.0
+        spend_cols = [
+            (_ML + 6, "SOURCE"),
+            (_ML + 210.0, "RECORDS"),
+            (_ML + 290.0, "USD TOTAL"),
+            (_ML + 390.0, "SHARE"),
+            (_ML + 450.0, "DISTRIBUTION"),
+        ]
+        for x, lab in spend_cols:
+            _draw_text(current_page, x, current_y + 12, lab, size=7.0, color=_LABEL, bold=True)
+        current_page.draw_line(
+            fitz.Point(_ML, current_y + 18.0),
+            fitz.Point(_CONTENT_R, current_y + 18.0),
+            color=_RULE,
+            width=0.75,
+        )
+        return current_y + 18.0
 
-    spend_cols = [
-        (_ML + 6, "SOURCE"),
-        (_ML + 130.8, "RECORDS"),
-        (_ML + 197.7, "USD TOTAL"),
-        (_ML + 276.4, "SHARE"),
-        (_ML + 315.5, "DISTRIBUTION"),
-    ]
-    for x, lab in spend_cols:
-        _draw_text(page, x, y + 14, lab, size=7.2, color=_LABEL, bold=True)
-    # header underline
-    page.draw_line(
-        fitz.Point(_ML, y + 22.7),
-        fitz.Point(_CONTENT_R, y + 22.7),
-        color=_RULE,
-        width=0.75,
-    )
-    y += 22.7
+    y = start_spend_header(page, y)
 
-    bar_x0 = _ML + 315.5
-    bar_w = 194.4
+    bar_x0 = _ML + 450.0
+    bar_w = _CONTENT_R - bar_x0 - 6.0
     for item in spend_items:
-        row_h = 24.3
-        _draw_text(page, _ML + 6, y + 14.5, item["source"], size=9.0, color=_DARK)
-        _draw_right(page, _ML + 175.5, y + 14.5, f"{item['records']}", size=9.0, color=_DARK)
+        row_h = 22.0
+        if y + row_h > bottom_limit:
+            page = new_page()
+            y = start_spend_header(page, _header(page, logo))
+        _draw_text(page, _ML + 6, y + 13.5, item["source"], size=8.5, color=_DARK)
+        _draw_right(page, _ML + 255.0, y + 13.5, f"{item['records']}", size=8.5, color=_DARK)
         _draw_right(
             page,
-            _ML + 267.5,
-            y + 14.5,
+            _ML + 365.0,
+            y + 13.5,
             _fmt_usd(item["usd"], money=True),
-            size=9.0,
+            size=8.5,
             color=_DARK,
         )
         share_txt = f"{item['share']:.0f}%"
-        _draw_right(page, _ML + 309.5, y + 14.5, share_txt, size=9.0, color=_DARK)
+        _draw_right(page, _ML + 430.0, y + 13.5, share_txt, size=8.5, color=_DARK)
 
-        # distribution bar
-        track = fitz.Rect(bar_x0, y + 8.5, bar_x0 + bar_w, y + 16.5)
+        track = fitz.Rect(bar_x0, y + 8.0, bar_x0 + bar_w, y + 15.5)
         _fill_rect(page, track, _BAR_TRACK)
         fill_w = bar_w * max(0.0, min(1.0, item["share"] / 100.0))
         if fill_w > 0.5:
-            _fill_rect(page, fitz.Rect(bar_x0, y + 8.5, bar_x0 + fill_w, y + 16.5), _ORANGE)
+            _fill_rect(page, fitz.Rect(bar_x0, y + 8.0, bar_x0 + fill_w, y + 15.5), _ORANGE)
 
         page.draw_line(
             fitz.Point(_ML, y + row_h),
@@ -689,42 +754,43 @@ def export_truck_overview_pdf(
     )
     y += 14.5
     _draw_text(page, _ML + 6, y, "Total", size=9.0, color=_DARK, bold=True)
-    _draw_right(page, _ML + 175.5, y, f"{record_count}", size=9.0, color=_DARK, bold=True)
+    _draw_right(page, _ML + 255.0, y, f"{record_count}", size=8.5, color=_DARK, bold=True)
     _draw_right(
         page,
-        _ML + 267.5,
+        _ML + 365.0,
         y,
         _fmt_usd(usd_total, money=True),
-        size=9.0,
+        size=8.5,
         color=_DARK,
         bold=True,
     )
-    _draw_right(page, _ML + 309.5, y, "100%", size=9.0, color=_DARK, bold=True)
-    y += 22.0
+    _draw_right(page, _ML + 430.0, y, "100%", size=8.5, color=_DARK, bold=True)
+    y += 18.0
+
+    if y + 70 > bottom_limit:
+        page = new_page()
+        y = _header(page, logo)
 
     # Transaction Detail heading
-    _draw_text(page, _ML, y + 8, "Transaction Detail", size=11.5, color=_BLACK, bold=True)
-    # right chip again
+    _draw_text(page, _ML, y + 6, "Transaction Detail", size=11.0, color=_BLACK, bold=True)
     chip = f"{record_count} line items"
     chip_w = _text_len(chip, 8.0, bold=True)
     _draw_text(page, _CONTENT_R - chip_w, y + 6, chip, size=8.0, color=_LABEL, bold=True)
-    y += 20.0
+    y += 18.0
 
     y = _draw_table_header(page, y)
 
     row_index = 0
     alt = False
-    # Leave room for total row (+ ~30) above the footer
-    bottom_limit = 750.0
 
     while row_index < len(rows):
         row = rows[row_index]
         needed = _row_height(row)
         if y + needed > bottom_limit:
-            _draw_total_row(page, y + 2, usd_total)
+            _draw_total_row(page, y + 2, summary)
             page = new_page()
             y = _header(page, logo)
-            y = _draw_table_header(page, y + 4)
+            y = _draw_table_header(page, y + 2)
             alt = False
             continue
 
@@ -732,13 +798,12 @@ def export_truck_overview_pdf(
         alt = not alt
         row_index += 1
 
-    # Total + signatures on the last page
-    if y + 30 > bottom_limit:
-        _draw_total_row(page, y + 2, usd_total)
+    if y + 40 > bottom_limit:
+        _draw_total_row(page, y + 2, summary)
         page = new_page()
         y = _header(page, logo)
-        y = _draw_table_header(page, y + 4)
-    y = _draw_total_row(page, y + 2, usd_total)
+        y = _draw_table_header(page, y + 2)
+    y = _draw_total_row(page, y + 2, summary)
     _draw_signatures(page, y)
 
     # Stamp footers with final page count

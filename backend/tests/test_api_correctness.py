@@ -375,6 +375,46 @@ def test_accountant_can_use_cashier_category_creation() -> None:
     assert len(categories.documents) == 1
 
 
+class FakeMappings:
+    def __init__(self) -> None:
+        self.documents: list[dict] = []
+
+    async def find_one_and_update(self, query: dict, update: dict, **_kwargs: object) -> dict:
+        values = dict(update.get("$set") or {})
+        for document in self.documents:
+            if document.get("description_key") == query.get("description_key"):
+                document.update(values)
+                return dict(document)
+        created = {"_id": ObjectId(), **values}
+        self.documents.append(created)
+        return dict(created)
+
+
+def test_cashier_can_save_description_mapping() -> None:
+    mappings = FakeMappings()
+
+    class MappingDb:
+        def __init__(self) -> None:
+            self.description_mappings = mappings
+
+        def __getitem__(self, key: str):
+            return getattr(self, key)
+
+    database = SimpleNamespace(db=MappingDb())
+    app = create_app(settings=settings(), database=database)
+    app.dependency_overrides[current_user] = lambda: {"role": "cashier"}
+    body = {
+        "description": "PARKING KURASINI",
+        "category_id": str(ObjectId()),
+        "category_name": "Parking",
+    }
+    with TestClient(app) as client:
+        response = client.put("/v1/description-mappings", json=body)
+    assert response.status_code == 200
+    assert len(mappings.documents) == 1
+    assert mappings.documents[0]["description_key"] == "PARKING KURASINI"
+
+
 class FakeCursor:
     def __init__(self, documents: list[dict] | None = None) -> None:
         self.sort_spec: list[tuple[str, int]] = []

@@ -48,6 +48,7 @@ from tahmeed.ui.accountant.separate_expenses import (
     _SegmentTabBar, _populate_year_combo, _TOLL_MONTHS, _SCROLL_CHUNK,
     _write_xlsx_template,
 )
+from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE   = "#FFFFFF"
@@ -200,7 +201,8 @@ def _display_columns(schema: dict) -> List[Tuple[str, str, str]]:
 
 
 def _row_label(rec: dict) -> str:
-    return str(rec.get("upload_label") or rec.get("source_filename") or "").strip()
+    from tahmeed.services.accountant_service import diesel_display_label
+    return diesel_display_label(rec)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1092,10 +1094,18 @@ class _DieselAllEntries(QWidget):
         self._search_edit.setPlaceholderText(
             "Search truck, LPO, client, destination, station, file name…"
         )
-        self._search_edit.setFixedWidth(300)
+        self._search_edit.setFixedWidth(260)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
+
+        self._file_cb = CheckableMultiCombo(
+            "All File Names", noun_plural="file names", parent=self,
+        )
+        self._file_cb.setFixedWidth(180)
+        self._file_cb.setStyleSheet(_input_ss())
+        self._file_cb.selectionChanged.connect(self._reset_and_load)
+        tbl.addWidget(self._file_cb)
 
         self._year_cb = QComboBox()
         self._year_cb.addItem("All Years", 0)
@@ -1148,11 +1158,15 @@ class _DieselAllEntries(QWidget):
 
     async def _reload_years_and_data(self) -> None:
         from tahmeed.services import accountant_service as svc
-        try:
-            years = await svc.get_diesel_available_years(self._feed_type)
-        except Exception:
-            years = []
+        years_r, labels_r = await asyncio.gather(
+            svc.get_diesel_available_years(self._feed_type),
+            svc.get_diesel_file_labels(self._feed_type),
+            return_exceptions=True,
+        )
+        years = years_r if isinstance(years_r, list) else []
+        labels = labels_r if isinstance(labels_r, list) else []
         self._year = _populate_year_combo(self._year_cb, years, self._year)
+        self._file_cb.set_options(labels, keep_selected=True, emit=False)
         if self._year <= 0:
             self._month = 0
             self._month_cb.blockSignals(True)
@@ -1188,13 +1202,15 @@ class _DieselAllEntries(QWidget):
         month = self._effective_month()
         try:
             totals, recs, total = await asyncio.gather(
-                svc.get_diesel_all_totals(self._feed_type, self._search, self._year, month, **self._date_kw()),
+                svc.get_diesel_all_totals(
+                    self._feed_type, self._search, self._year, month, **self._list_kw(),
+                ),
                 svc.get_diesel_all_records(
                     self._feed_type, self._search, self._year, month,
-                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                    limit=_SCROLL_CHUNK, skip=0, **self._list_kw(),
                 ),
                 svc.count_diesel_all_records(
-                    self._feed_type, self._search, self._year, month, **self._date_kw(),
+                    self._feed_type, self._search, self._year, month, **self._list_kw(),
                 ),
             )
         except Exception:
@@ -1222,7 +1238,7 @@ class _DieselAllEntries(QWidget):
         try:
             recs = await svc.get_diesel_all_records(
                 self._feed_type, self._search, self._year, month,
-                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._list_kw(),
             )
         except Exception:
             self._loading = False
@@ -1260,6 +1276,13 @@ class _DieselAllEntries(QWidget):
         df, dt = read_from_to(self._from_date, self._to_date, optional=True)
         return {"date_from": df, "date_to": dt}
 
+    def _list_kw(self) -> dict:
+        kw = self._date_kw()
+        labels = self._file_cb.selected_values() if hasattr(self, "_file_cb") else []
+        if labels:
+            kw["file_labels"] = labels
+        return kw
+
     def _on_year(self, _idx: int) -> None:
         self._year = int(self._year_cb.currentData() or 0)
         has_year = self._year > 0
@@ -1284,6 +1307,9 @@ class _DieselAllEntries(QWidget):
         self._reset_and_load()
 
     def _clear_filters(self) -> None:
+        self._search = ""
+        if hasattr(self, "_file_cb"):
+            self._file_cb.reset_to_all(emit=False)
         self._year, self._month = clear_list_filters(
             search_edit=self._search_edit,
             year_cb=self._year_cb,

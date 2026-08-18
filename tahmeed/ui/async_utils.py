@@ -91,28 +91,41 @@ def find_poll_pausable(widget: Optional[QWidget]) -> Optional[Any]:
     return None
 
 
-# Nested import dialogs (gate inside _async_import) must not resume early.
+# Nested Qt loops (import gate, export save dialogs, QMessageBox) must not
+# resume background polls until the outermost caller finishes.
 _poll_pause_depth = 0
 
 
 @contextmanager
 def pause_background_polls(widget: Optional[QWidget]) -> Iterator[None]:
-    """Pause accountant badge / connectivity polls during modal import work.
+    """Pause badge / connectivity polls during nested Qt event loops.
 
-    Nested Qt event loops (progress dialogs, correction dialogs, QMessageBox)
-    otherwise wake in-flight poll tasks while the import Task is still current,
-    which crashes under Python 3.14 + qasync.
+    Modal dialogs (QFileDialog, QMessageBox, progress) pump Qt events while an
+    asyncio Task is still current. In-flight connectivity and notification
+    tasks then wake via ``task_wakeup`` and Python 3.14 raises
+    ``Cannot enter into task … while another task … is being executed``.
+
+    Always pause the process-wide connectivity monitor. Also pause accountant
+    notification polling when *widget* sits under AccountantDashboard.
 
     Re-entrant: only the outermost caller resumes polling.
     """
     global _poll_pause_depth
     dash = find_poll_pausable(widget)
-    if dash is not None and _poll_pause_depth == 0:
-        dash.pause_notification_polling()
+    from tahmeed.services.connectivity_service import connectivity_monitor
+
+    if _poll_pause_depth == 0:
+        if dash is not None:
+            dash.pause_notification_polling()
+        else:
+            connectivity_monitor.pause()
     _poll_pause_depth += 1
     try:
         yield
     finally:
         _poll_pause_depth = max(0, _poll_pause_depth - 1)
-        if dash is not None and _poll_pause_depth == 0:
-            dash.resume_notification_polling()
+        if _poll_pause_depth == 0:
+            if dash is not None:
+                dash.resume_notification_polling()
+            else:
+                connectivity_monitor.resume()

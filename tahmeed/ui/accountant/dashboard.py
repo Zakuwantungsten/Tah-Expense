@@ -310,6 +310,7 @@ class AccountantDashboard(QWidget):
             from tahmeed.ui.cashier.transactions_table import TransactionBrowser
             widget = TransactionBrowser()
             widget.go_to_date.connect(self._on_go_to_date)
+            widget.go_to_upload.connect(self._on_go_to_upload)
             return widget
 
         raise KeyError(f"Unknown lazy page key: {key}")
@@ -421,7 +422,7 @@ class AccountantDashboard(QWidget):
         self._on_nav(key)
 
     def pause_notification_polling(self) -> None:
-        """Stop badge polls during modal import dialogs (avoids Py3.14 task nesting)."""
+        """Stop badge and connectivity polls during nested Qt dialogs (Py3.14)."""
         self._notification_timer.stop()
         task = getattr(self, "_notification_poll_task", None)
         if task is not None and not task.done():
@@ -546,7 +547,24 @@ class AccountantDashboard(QWidget):
             self._stack.setCurrentIndex(self._page_indices["table"])
             assert self._register is not None
             self._register.reload_settings()
-            self._register.navigate_to_date(d, highlight_term=term)
+            self._register.navigate_to_date(d, highlight_term=term, merged=True)
+
+        if in_running_task() and "table" not in self._pages:
+            schedule_call(_go)
+        else:
+            _go()
+
+    def _on_go_to_upload(self, upload_id: str, primary_date=None) -> None:
+        from tahmeed.ui.async_utils import in_running_task, schedule_call
+
+        self._sidebar.select("table")
+
+        def _go() -> None:
+            self._ensure_page("table")
+            self._stack.setCurrentIndex(self._page_indices["table"])
+            assert self._register is not None
+            self._register.reload_settings()
+            self._register.navigate_to_upload(upload_id, primary_date)
 
         if in_running_task() and "table" not in self._pages:
             schedule_call(_go)

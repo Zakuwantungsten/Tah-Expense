@@ -19,7 +19,6 @@ def test_export_daily_register_pdf_writes_landscape_with_all_columns(tmp_path: P
     rows = [
         [
             "23/07/2026",
-            "23/07/2026",
             "FUEL",
             "Diesel top-up Dar",
             "T123 ABC",
@@ -34,7 +33,6 @@ def test_export_daily_register_pdf_writes_landscape_with_all_columns(tmp_path: P
         ],
         [
             "23/07/2026",
-            "22/07/2026",
             "TOLLS",
             "Morogoro gate",
             "T456 DEF",
@@ -97,7 +95,7 @@ def test_export_daily_register_pdf_writes_landscape_with_all_columns(tmp_path: P
 
 
 def test_export_headers_match_register_export_columns():
-    assert len(EXPORT_HEADERS) == 13
+    assert len(EXPORT_HEADERS) == 12
     assert EXPORT_HEADERS[0] == "Date"
-    assert EXPORT_HEADERS[7] == "TZS"
+    assert EXPORT_HEADERS[6] == "TZS"
     assert EXPORT_HEADERS[-1] == "Cheque"

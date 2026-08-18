@@ -137,3 +137,73 @@ def test_cut_insert_preserves_cashier_and_tx_id(register):
     assert register._table.item(1, COL_DESC).text()
     assert register._table.item(0, COL_ITEM).text()
     assert register._table.item(1, COL_ITEM).text()
+
+
+def test_cut_insert_reorders_saved_ids_for_whatsapp_sequence(register):
+    from tahmeed.ui.cashier.register_delegates import COL_DESC
+
+    # Cut John (row 1), then insert at Aisha (row 0) → John, Aisha.
+    register._table.selectRow(1)
+    register._cut()
+    register._table.setCurrentCell(0, COL_DESC)
+    register._insert_cut_cells()
+
+    assert register._ordered_saved_ids() == ["tx-1", "tx-0"]
+    assert register._saved_txs[0].cashier_id == "c-b"
+    assert register._saved_txs[1].cashier_id == "c-a"
+
+
+def test_persist_visual_day_order_writes_on_screen_sequence(register, monkeypatch):
+    from tahmeed.ui.cashier.register_delegates import COL_DESC
+
+    register._table.selectRow(1)
+    register._cut()
+    register._table.setCurrentCell(0, COL_DESC)
+    register._insert_cut_cells()
+
+    captured = {}
+
+    async def fake_recount(target_date, ordered_ids):
+        captured["date"] = target_date
+        captured["ids"] = list(ordered_ids)
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.recount_day_order", fake_recount
+    )
+    import asyncio
+
+    asyncio.run(register._persist_visual_day_order())
+    assert captured["ids"] == ["tx-1", "tx-0"]
+    assert captured["date"] == register._current_date
+
+
+def test_navigate_to_date_shows_loading_overlay_immediately(register, monkeypatch):
+    monkeypatch.setattr(register, "has_unsaved_work", lambda: False)
+    register._loading.hide_loading()
+    register.navigate_to_date(date(2026, 7, 23), merged=True)
+    assert not register._loading.isHidden()
+    assert register._loading._message.text().startswith("Loading")
+
+
+def test_navigate_to_upload_shows_loading_overlay_immediately(register, monkeypatch):
+    monkeypatch.setattr(register, "has_unsaved_work", lambda: False)
+    register._loading.hide_loading()
+    register.navigate_to_upload("upload-1", primary_date=date(2026, 7, 23))
+    assert not register._loading.isHidden()
+    assert "upload" in register._loading._message.text().lower()
+
+
+def test_load_date_hides_overlay_when_finished(register, monkeypatch):
+    import asyncio
+    from datetime import date as date_cls
+
+    async def fake_get(*_a, **_k):
+        return []
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.get_transactions_by_date", fake_get
+    )
+    monkeypatch.setattr(register, "_restore_local_draft", lambda: None)
+    register._merged_mode = True
+    asyncio.run(register._load_date(date_cls(2026, 7, 23)))
+    assert register._loading.isHidden()

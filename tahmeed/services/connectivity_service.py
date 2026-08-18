@@ -166,7 +166,7 @@ class ConnectivityMonitor(QObject):
         self._in_flight = False
 
     def pause(self) -> None:
-        """Stop probes during modal imports (avoids nested asyncio issues)."""
+        """Stop probes during nested Qt dialogs / long UI tasks (Py3.14)."""
         self._paused = True
         self._timer.stop()
         task = self._task

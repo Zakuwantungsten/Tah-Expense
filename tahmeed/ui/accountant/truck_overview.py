@@ -25,7 +25,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -498,7 +497,6 @@ def _write_truck_overview_excel(
     path: str,
     truck: str,
     source_label: str,
-    search_text: str,
     date_range_label: str,
     rows: list,
     summary: dict,
@@ -568,7 +566,6 @@ def _write_truck_overview_excel(
     ws.merge_cells(f"A2:{last_col}2")
     ws["A2"] = (
         f"Source: {source_label}  |  "
-        f"Search: {search_text or 'All'}  |  "
         f"Date Range: {date_range_label}  |  "
         f"Exported: {datetime.now().strftime('%d %b %Y %H:%M')}"
     )
@@ -748,6 +745,12 @@ class TruckOverviewWidget(QWidget):
         self._subtitle = _lbl("Select a truck to gather cross-source expenses and fuel.", size=12, color=_T2)
         tb.addWidget(self._subtitle)
         tb.addStretch()
+        export_excel_btn = _btn("Excel", "mdi.microsoft-excel", primary=False)
+        export_excel_btn.clicked.connect(self._export_excel)
+        tb.addWidget(export_excel_btn)
+        export_pdf_btn = _btn("PDF", "mdi.file-pdf-box", primary=False)
+        export_pdf_btn.clicked.connect(self._export_pdf)
+        tb.addWidget(export_pdf_btn)
         root.addWidget(title_bar)
 
         root.addWidget(self._build_toolbar())
@@ -832,23 +835,13 @@ class TruckOverviewWidget(QWidget):
         self._truck_edit.returnPressed.connect(self._on_load_clicked)
         filter_row.addWidget(self._truck_edit)
 
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("Search description…")
-        self._search.setFixedWidth(150)
-        self._search.setFixedHeight(_CTRL_H)
-        self._search.setStyleSheet(_input_ss())
-        self._search.setToolTip("Search description, station, reference…")
-        self._search.textEdited.connect(lambda _t: self._on_filter_changed())
-        filter_row.addWidget(self._search)
-        QWidget.setTabOrder(self._truck_edit, self._search)
-
         self._source_cb = _SourceMultiCombo(_SOURCE_OPTIONS)
         self._source_cb.setFixedWidth(160)
         self._source_cb.setFixedHeight(_CTRL_H)
         self._source_cb.setStyleSheet(_input_ss())
         self._source_cb.selectionChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self._source_cb)
-        QWidget.setTabOrder(self._search, self._source_cb)
+        QWidget.setTabOrder(self._truck_edit, self._source_cb)
 
         self._year_cb = QComboBox()
         self._year_cb.addItem("All Years", 0)
@@ -923,15 +916,7 @@ class TruckOverviewWidget(QWidget):
 
         filter_row.addStretch()
 
-        export_excel_btn = _btn("Excel", "mdi.microsoft-excel", primary=False)
-        export_excel_btn.clicked.connect(self._export_excel)
-        filter_row.addWidget(export_excel_btn)
-
-        export_pdf_btn = _btn("PDF", "mdi.file-pdf-box", primary=False)
-        export_pdf_btn.clicked.connect(self._export_pdf)
-        filter_row.addWidget(export_pdf_btn)
-
-        filter_inner.setMinimumWidth(1380)
+        filter_inner.setMinimumWidth(1200)
         filter_inner.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         filter_scroll.setWidget(filter_inner)
         toolbar_v.addWidget(filter_scroll)
@@ -983,9 +968,6 @@ class TruckOverviewWidget(QWidget):
             return keys[0]
         return "multi"
 
-    def _search_text(self) -> str:
-        return self._search.text().strip()
-
     def _date_filters(self) -> tuple[Optional[datetime], Optional[datetime]]:
         date_from = None
         date_to = None
@@ -1008,7 +990,6 @@ class TruckOverviewWidget(QWidget):
         date_from, date_to = self._date_filters()
         return dict(
             truck=self._active_truck or self._selected_truck(),
-            search=self._search_text(),
             source=self._source_filter_param(),
             date_from=date_from,
             date_to=date_to,
@@ -1253,6 +1234,13 @@ class TruckOverviewWidget(QWidget):
                     if item is not None:
                         item.setBackground(QColor(_BLUE_L))
 
+    def _show_export_busy(self, message: str) -> None:
+        self._loading_overlay.show_loading(message)
+        self._status.setText(message)
+
+    def _hide_export_busy(self) -> None:
+        self._loading_overlay.hide_loading()
+
     def _export_excel(self) -> None:
         self._start_background_task(self._do_export_excel(), "Excel export")
 
@@ -1277,14 +1265,24 @@ class TruckOverviewWidget(QWidget):
             get_truck_overview_summary,
         )
 
+        self._show_export_busy(f"Preparing Excel export for {truck}…")
+        rows = None
+        summary = None
+        prepare_error = None
         try:
             kw = self._filter_kw()
             rows = await get_truck_overview_records(**kw, limit=100000, skip=0)
             summary = await get_truck_overview_summary(**kw)
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", f"Failed to prepare export data:\n{exc}")
-            return
+            prepare_error = exc
+        finally:
+            self._hide_export_busy()
 
+        if prepare_error is not None:
+            QMessageBox.critical(
+                self, "Export Error", f"Failed to prepare export data:\n{prepare_error}"
+            )
+            return
         if not rows:
             QMessageBox.information(self, "Export", "No records match the current truck and filters.")
             return
@@ -1302,23 +1300,29 @@ class TruckOverviewWidget(QWidget):
         if not path.endswith(".xlsx"):
             path += ".xlsx"
 
-        self._status.setText(f"Writing Excel export for {truck}…")
+        self._show_export_busy(f"Writing Excel export for {truck}…")
+        write_error = None
         try:
             await asyncio.to_thread(
                 _write_truck_overview_excel,
                 path,
                 truck,
                 self._source_filter_label(),
-                self._search_text(),
                 self._format_date_range_label(),
                 rows,
                 summary,
             )
-            QMessageBox.information(self, "Export Complete", f"Excel report saved to:\n{path}")
-            self._status.setText(f"Excel export saved for {truck}.")
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", f"Could not save file:\n{exc}")
+            write_error = exc
+        finally:
+            self._hide_export_busy()
+
+        if write_error is not None:
+            QMessageBox.critical(self, "Export Error", f"Could not save file:\n{write_error}")
             self._status.setText(f"Excel export failed for {truck}.")
+            return
+        QMessageBox.information(self, "Export Complete", f"Excel report saved to:\n{path}")
+        self._status.setText(f"Excel export saved for {truck}.")
 
     def _export_pdf(self) -> None:
         self._start_background_task(self._do_export_pdf(), "PDF export")
@@ -1336,14 +1340,24 @@ class TruckOverviewWidget(QWidget):
             get_truck_overview_summary,
         )
 
+        self._show_export_busy(f"Preparing PDF export for {truck}…")
+        rows = None
+        summary = None
+        prepare_error = None
         try:
             kw = self._filter_kw()
             rows = await get_truck_overview_records(**kw, limit=5000, skip=0)
             summary = await get_truck_overview_summary(**kw)
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", f"Failed to prepare export data:\n{exc}")
-            return
+            prepare_error = exc
+        finally:
+            self._hide_export_busy()
 
+        if prepare_error is not None:
+            QMessageBox.critical(
+                self, "Export Error", f"Failed to prepare export data:\n{prepare_error}"
+            )
+            return
         if not rows:
             QMessageBox.information(self, "Export", "No records match the current truck and filters.")
             return
@@ -1358,10 +1372,12 @@ class TruckOverviewWidget(QWidget):
         if not path.endswith(".pdf"):
             path += ".pdf"
 
-        self._status.setText(f"Writing PDF export for {truck}…")
+        self._show_export_busy(f"Writing PDF export for {truck}…")
+        write_error = None
         try:
             from tahmeed.services.truck_overview_pdf import export_truck_overview_pdf
 
+            date_from, date_to = self._date_filters()
             await asyncio.to_thread(
                 export_truck_overview_pdf,
                 path,
@@ -1372,17 +1388,31 @@ class TruckOverviewWidget(QWidget):
                 date_to=date_to,
                 source_label=self._source_filter_label(),
             )
-            QMessageBox.information(self, "Export Complete", f"PDF report saved to:\n{path}")
-            self._status.setText(f"PDF export saved for {truck}.")
         except Exception as exc:
-            QMessageBox.critical(self, "Export Error", f"Could not create PDF:\n{exc}")
+            write_error = exc
+        finally:
+            self._hide_export_busy()
+
+        if write_error is not None:
+            QMessageBox.critical(self, "Export Error", f"Could not create PDF:\n{write_error}")
             self._status.setText(f"PDF export failed for {truck}.")
+            return
+        QMessageBox.information(self, "Export Complete", f"PDF report saved to:\n{path}")
+        self._status.setText(f"PDF export saved for {truck}.")
+
+    async def _run_with_polls_paused(self, coro):
+        """Run export work with connectivity / badge polls paused (Py3.14 + qasync)."""
+        from tahmeed.ui.async_utils import pause_background_polls
+
+        with pause_background_polls(self):
+            return await coro
 
     def _start_background_task(self, coro, action: str) -> None:
         from tahmeed.ui.async_utils import create_task, in_running_task
 
+        wrapped = self._run_with_polls_paused(coro)
         if in_running_task():
-            def _kick(c=coro, a=action) -> None:
+            def _kick(c=wrapped, a=action) -> None:
                 task = create_task(c)
                 task.add_done_callback(lambda t: self._handle_task_result(t, a))
 
@@ -1390,7 +1420,7 @@ class TruckOverviewWidget(QWidget):
 
             QTimer.singleShot(0, _kick)
             return
-        task = create_task(coro)
+        task = create_task(wrapped)
         task.add_done_callback(lambda t: self._handle_task_result(t, action))
 
     def _handle_task_result(self, task: asyncio.Task, action: str) -> None:
@@ -1427,15 +1457,12 @@ class TruckOverviewWidget(QWidget):
         self._month = 0
         self._year_cb.blockSignals(True)
         self._month_cb.blockSignals(True)
-        self._search.blockSignals(True)
         try:
-            self._search.clear()
             yr_idx = self._year_cb.findData(self._year)
             self._year_cb.setCurrentIndex(yr_idx if yr_idx >= 0 else 0)
             self._month_cb.setCurrentIndex(0)
             self._month_cb.setEnabled(self._year > 0)
         finally:
-            self._search.blockSignals(False)
             self._year_cb.blockSignals(False)
             self._month_cb.blockSignals(False)
         sync_from_to(

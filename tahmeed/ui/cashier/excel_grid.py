@@ -55,6 +55,7 @@ from tahmeed.services.cashier_service import (
     get_transactions_by_date, save_transaction, request_or_delete_transaction,
     update_transaction, insert_pending_edit,
     check_for_duplicates, submit_day_for_verify, recount_day_order,
+    next_day_order,
 )
 from tahmeed.services.category_service import get_all_categories, item_key
 from tahmeed.services.subtable_service import get_subtables
@@ -70,6 +71,7 @@ from tahmeed.services.register_draft_service import (
     save_register_draft,
     serialize_pending_meta,
 )
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_completion
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
@@ -78,7 +80,7 @@ from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, Tr
 # Column indices / colors / delegates (shared with RejectedView)
 # ---------------------------------------------------------------------------
 from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
-    COL_SNO, COL_DATE, COL_REPORTED, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
+    COL_SNO, COL_DATE, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
     COL_REF, COL_TZS, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
     COL_CASHIER,
     HEADERS, CHECK_COLS, READONLY_COLS, _DATA_SKIP_COLS, _UPPER_SKIP_COLS,
@@ -421,6 +423,7 @@ class DailyRegister(QWidget):
         self._col_filters: dict   = {}   # col -> set of accepted values
         self._search_text: str    = ""
         self._pending_highlight: str = ""  # set by navigate_to_date; consumed in _populate
+        self._load_upload_id: str = ""     # one-shot: load this Excel batch instead of a day
         # row_index -> import metadata stamped onto Transaction at save time
         self._pending_row_meta: dict = {}
         # When True, skip async side-effects from itemChanged (bulk paste/import).
@@ -448,7 +451,9 @@ class DailyRegister(QWidget):
         self._draft_timer.setInterval(1_500)
         self._draft_timer.timeout.connect(self._flush_local_draft)
         self._restoring_draft = False
+        self._load_gen = 0
         self._build_ui()
+        self._show_register_loading("Loading…")
         asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_categories())
         asyncio.ensure_future(self._load_cashier_settings())
@@ -534,7 +539,6 @@ class DailyRegister(QWidget):
         ))
         date_del = _DateDelegate(lambda: self._current_date, self._table)
         self._table.setItemDelegateForColumn(COL_DATE,     date_del)
-        self._table.setItemDelegateForColumn(COL_REPORTED, date_del)
         self._table.setItemDelegateForColumn(COL_REF,      _RefFloatDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_TZS,      _TZSDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_RECEIPT,  _ReceiptDelegate(self._table))
@@ -549,7 +553,13 @@ class DailyRegister(QWidget):
         self._table.customContextMenuRequested.connect(self._show_context_menu)
         self._table.itemSelectionChanged.connect(self._emit_attachment_badge)
 
-        root.addWidget(self._table)
+        self._table_host = QWidget(self)
+        host_lay = QVBoxLayout(self._table_host)
+        host_lay.setContentsMargins(0, 0, 0, 0)
+        host_lay.setSpacing(0)
+        host_lay.addWidget(self._table)
+        root.addWidget(self._table_host, 1)
+        self._loading = LoadingOverlay(self._table_host, "Loading…")
 
         # ── Footer — totals only ───────────────────────────────────────
         footer = QWidget()
@@ -612,14 +622,24 @@ class DailyRegister(QWidget):
         hh.setSectionResizeMode(COL_SNO,  QHeaderView.Fixed)
         hh.setSectionResizeMode(COL_DESC, QHeaderView.Stretch)
 
-    def navigate_to_date(self, d: date, highlight_term: str = "") -> None:
+    def navigate_to_date(
+        self, d: date, highlight_term: str = "", *, merged: bool | None = None
+    ) -> None:
         """Called by dashboard when TransactionBrowser 'Go To' is used.
 
         highlight_term — if provided, the register scrolls to the first row
         containing this text after the date loads and briefly flashes it.
+        merged=True shows every cashier's rows (Browse is a merged view).
         """
+        if isinstance(d, datetime):
+            d = d.date()
+        if not isinstance(d, date):
+            return
         self._pending_highlight = highlight_term
         self._commit_open_editor()
+        if merged is True and not self._merged_mode:
+            self._merged_mode = True
+            self.mode_changed.emit(True)
         if self.has_unsaved_work():
             self._flush_local_draft()
             resp = QMessageBox.question(
@@ -630,6 +650,7 @@ class DailyRegister(QWidget):
             )
             if resp == QMessageBox.Cancel:
                 self._pending_highlight = ""
+                self._load_upload_id = ""
                 return
             if resp == QMessageBox.Yes:
                 asyncio.ensure_future(self._save_then_navigate(d))
@@ -638,37 +659,95 @@ class DailyRegister(QWidget):
             self._clear_local_draft()
         self._reset_edit_state()
         self._current_date = d
+        if self._load_upload_id:
+            self._show_register_loading("Loading upload…")
+        else:
+            self._show_register_loading(f"Loading {d.strftime('%d %b %Y')}…")
         asyncio.ensure_future(self._load_date(d))
+
+    def navigate_to_upload(self, upload_id: str, primary_date=None) -> None:
+        """Open every row of one Excel upload on the register table."""
+        uid = str(upload_id or "").strip()
+        if not uid:
+            return
+        self._load_upload_id = uid
+        d = primary_date
+        if isinstance(d, datetime):
+            d = d.date()
+        if not isinstance(d, date):
+            d = self._current_date
+        self.navigate_to_date(d, merged=True)
 
     async def _save_then_navigate(self, d: date) -> None:
         await self._do_save()
         self._current_date = d
+        if self._load_upload_id:
+            self._show_register_loading("Loading upload…")
+        else:
+            self._show_register_loading(f"Loading {d.strftime('%d %b %Y')}…")
         await self._load_date(d)
 
     # ------------------------------------------------------------------
     # Load data
     # ------------------------------------------------------------------
 
+    def _show_register_loading(self, message: str = "Loading…") -> None:
+        overlay = getattr(self, "_loading", None)
+        if overlay is not None:
+            overlay.show_loading(message)
+
+    def _hide_register_loading(self) -> None:
+        overlay = getattr(self, "_loading", None)
+        if overlay is not None:
+            overlay.hide_loading()
+
     async def _load_date(self, d: date) -> None:
+        from tahmeed.ui.async_utils import pause_background_polls
+
+        with pause_background_polls(self):
+            await self._load_date_body(d)
+
+    async def _load_date_body(self, d: date) -> None:
+        self._load_gen += 1
+        seq = self._load_gen
+        upload_id = self._load_upload_id
+        if upload_id:
+            self._show_register_loading("Loading upload…")
+        else:
+            label = d.strftime("%d %b %Y") if isinstance(d, date) else "register"
+            self._show_register_loading(f"Loading {label}…")
         try:
-            if self._merged_mode:
+            self._load_upload_id = ""
+            if upload_id:
+                from tahmeed.services.daily_import_service import get_daily_upload_records
+                txs = await get_daily_upload_records(upload_id)
+            elif self._merged_mode:
                 txs = await get_transactions_by_date(d, merged=True)
             else:
                 txs = await get_transactions_by_date(d, cashier_id=self._user._id)
+            if seq != self._load_gen:
+                return
             ids = [tx.cashier_id for tx in txs if tx.cashier_id]
+            cashier_names = {}
             if ids:
                 from tahmeed.services.accountant_service import get_cashier_names
-                self._cashier_names = await get_cashier_names(ids)
-            else:
-                self._cashier_names = {}
+                cashier_names = await get_cashier_names(ids)
+            if seq != self._load_gen:
+                return
+            self._cashier_names = cashier_names
             self._pending_row_meta.clear()
             self._populate(txs)
-            self._table.setColumnHidden(COL_CASHIER, not self._merged_mode)
+            show_cashier = self._merged_mode or bool(upload_id)
+            self._table.setColumnHidden(COL_CASHIER, not show_cashier)
             restored = self._restore_local_draft()
             if restored:
                 self._show_draft_restored_notice(*restored)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
+            if seq == self._load_gen:
+                QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
+        finally:
+            if seq == self._load_gen:
+                self._hide_register_loading()
 
     def set_merged_mode(self, merged: bool) -> None:
         """Switch My entries ↔ Merged (all cashiers for the day)."""
@@ -693,6 +772,7 @@ class DailyRegister(QWidget):
         self._merged_mode = bool(merged)
         self._reset_edit_state()
         self.mode_changed.emit(self._merged_mode)
+        self._show_register_loading("Loading…")
         asyncio.ensure_future(self._load_date(self._current_date))
 
     async def _save_then_switch_mode(self, merged: bool) -> None:
@@ -702,6 +782,7 @@ class DailyRegister(QWidget):
             return
         self._merged_mode = merged
         self.mode_changed.emit(self._merged_mode)
+        self._show_register_loading("Loading…")
         await self._load_date(self._current_date)
 
     def submit_for_verify(self) -> None:
@@ -842,10 +923,6 @@ class DailyRegister(QWidget):
                 f"{tx.created_at.strftime('%d %b %y')}"
             )
         self._table.setItem(row, COL_DATE, date_item)
-
-        reported = getattr(tx, "reported_date", None)
-        reported_str = format_register_date(reported) if reported else ""
-        self._table.setItem(row, COL_REPORTED, saved_item(reported_str))
 
         self._table.setItem(row, COL_ITEM, saved_item(tx.item or ""))
 
@@ -1008,11 +1085,9 @@ class DailyRegister(QWidget):
                     truck_number = matched
 
         ref_text = txt(COL_REF).upper()
+        orig = self._saved_txs.get(row)
         return Transaction(
             date=tx_date,
-            reported_date=_parse_optional_date(
-                txt(COL_REPORTED), default_year=self._current_date.year
-            ),
             description=description,
             item=item_name,
             category_name=item_name or None,
@@ -1028,16 +1103,17 @@ class DailyRegister(QWidget):
             approver=txt(COL_APR).upper(),
             payee=txt(COL_PAYEE).upper(),
             cheque=txt(COL_CHEQUE).upper(),
-                    cashier_id=self._user._id,
-                    day_order=row,
-                    register_status="draft",
-                    daily_import_id=meta.get("daily_import_id"),
-                    daily_import_source=meta.get("daily_import_source"),
-                    date_discrepancy=bool(meta.get("date_discrepancy")),
-                    import_primary_date=meta.get("import_primary_date"),
-                    lpo_do=(meta.get("lpo_do") or "").upper(),
-                    do_number=(meta.get("do_number") or "").upper(),
-                )
+            cashier_id=self._user._id,
+            day_order=row,
+            register_status="draft",
+            daily_import_id=meta.get("daily_import_id"),
+            daily_import_source=meta.get("daily_import_source"),
+            date_discrepancy=bool(meta.get("date_discrepancy")),
+            import_primary_date=meta.get("import_primary_date"),
+            lpo_do=(meta.get("lpo_do") or "").upper(),
+            do_number=(meta.get("do_number") or "").upper(),
+            reported_date=getattr(orig, "reported_date", None) if orig is not None else None,
+        )
 
     # ------------------------------------------------------------------
     # Edit mode
@@ -1115,7 +1191,6 @@ class DailyRegister(QWidget):
             return None
         return {
             "date": tx.date,
-            "reported_date": tx.reported_date,
             "description": tx.description,
             "item": tx.item,
             "category_name": tx.category_name,
@@ -1137,7 +1212,7 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
 
     _EXPORT_COLS = [
-        COL_DATE, COL_REPORTED, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
+        COL_DATE, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
         COL_REF, COL_TZS, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
     ]
 
@@ -1481,6 +1556,11 @@ class DailyRegister(QWidget):
             if col == COL_DESC and item.text().strip():
                 from tahmeed.services.cashier_service import remember_description
                 remember_description(item.text())
+                if not self._bulk_mutating:
+                    desc = item.text().strip()
+                    QTimer.singleShot(
+                        0, lambda r=row, d=desc: self._kick_auto_fill_item(r, d)
+                    )
             self._mark_dirty(row)
             if col == COL_TZS:
                 self._update_footer()
@@ -1501,7 +1581,7 @@ class DailyRegister(QWidget):
         # Keep Date in sync with whether the row has real entry data.
         # Skip when the Date cell itself is edited so a manual date is not
         # immediately cleared on an otherwise empty row.
-        if col not in READONLY_COLS and col not in CHECK_COLS and col not in (COL_DATE, COL_REPORTED):
+        if col not in READONLY_COLS and col not in CHECK_COLS and col not in (COL_DATE,):
             self._table.blockSignals(True)
             self._sync_row_date(row)
             self._table.blockSignals(False)
@@ -1513,7 +1593,7 @@ class DailyRegister(QWidget):
             from tahmeed.services.cashier_service import remember_description
             remember_description(item.text())
             self._validate_locked_description(row, item)
-            if self._defer_item_to_verify and not self._bulk_mutating:
+            if not self._bulk_mutating:
                 # Defer off the current asyncio task so qasync/Py3.14 does not
                 # try to nest _auto_fill inside an active import coroutine.
                 desc = item.text().strip()
@@ -1685,9 +1765,9 @@ class DailyRegister(QWidget):
         self._table.installEventFilter(self._key_filter)
 
     def _commit_date_suggestion(self) -> None:
-        """If the focused cell is an empty Date/Reported Date cell, write the register date."""
+        """If the focused cell is an empty Date cell, write the register date."""
         row, col = self._table.currentRow(), self._table.currentColumn()
-        if col not in (COL_DATE, COL_REPORTED) or row < self._saved_count:
+        if col != COL_DATE or row < self._saved_count:
             return
         it = self._table.item(row, col)
         if it is not None and it.text().strip():
@@ -2636,7 +2716,11 @@ class DailyRegister(QWidget):
     async def _run_daily_import(self) -> None:
         from tahmeed.ui.cashier.daily_import_flow import run_daily_import_flow
 
-        preview = await run_daily_import_flow(self)
+        try:
+            preview = await run_daily_import_flow(self)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Error", f"Could not import this file:\n\n{exc}")
+            return
         if preview is None:
             return
         await self.apply_daily_import_preview(preview)
@@ -3268,7 +3352,6 @@ class DailyRegister(QWidget):
                 continue
             updates["last_edited_at"] = datetime.utcnow()
             updates["last_edited_by"] = self._user._id
-            updates["day_order"] = row
             orig = self._saved_txs.get(row)
             try:
                 if orig is not None and getattr(orig, "original_transaction_id", None):
@@ -3334,6 +3417,12 @@ class DailyRegister(QWidget):
                 return False
 
         cancel_all = False
+        append_order = None
+        if not self._merged_mode:
+            try:
+                append_order = await next_day_order(self._current_date)
+            except Exception:
+                append_order = None
         for row in range(self._saved_count, self._table.rowCount()):
             if cancel_all:
                 break
@@ -3481,11 +3570,15 @@ class DailyRegister(QWidget):
 
                 ref_text = txt(COL_REF).upper()
                 meta = self._pending_row_meta.get(row) or {}
+                if self._merged_mode:
+                    order = row
+                elif append_order is not None:
+                    order = append_order
+                    append_order += 1
+                else:
+                    order = row
                 tx = Transaction(
                     date=tx_date,
-                    reported_date=_parse_optional_date(
-                txt(COL_REPORTED), default_year=self._current_date.year
-            ),
                     description=description,
                     item=item_name,
                     # The chosen item *is* the category — keep them in sync so the
@@ -3504,7 +3597,7 @@ class DailyRegister(QWidget):
                     payee=txt(COL_PAYEE).upper(),
                     cheque=txt(COL_CHEQUE).upper(),
                     cashier_id=self._user._id,
-                    day_order=row,
+                    day_order=order,
                     register_status="draft",
                     possible_duplicate=is_dup,
                     daily_import_id=meta.get("daily_import_id"),
@@ -3523,6 +3616,12 @@ class DailyRegister(QWidget):
         if cancel_all:
             self._flush_local_draft()
             return False
+
+        if self._merged_mode and (saved or updated):
+            try:
+                await self._persist_visual_day_order()
+            except Exception as exc:
+                errors.append(f"Could not save row order: {exc}")
 
         if errors:
             QMessageBox.warning(
@@ -3543,18 +3642,23 @@ class DailyRegister(QWidget):
         self._reset_edit_state()
         self.rows_saved.emit(saved)
         await self._load_date(self._current_date)
-        # Lock in visual sequence after reload.
-        try:
-            ordered_ids = [
-                self._saved_ids[r]
-                for r in range(self._saved_count)
-                if r in self._saved_ids and self._saved_ids[r]
-            ]
-            if ordered_ids:
-                await recount_day_order(self._current_date, ordered_ids)
-        except Exception:
-            pass
         return True
+
+    def _ordered_saved_ids(self) -> list:
+        """Transaction ids in current on-screen order (saved prefix)."""
+        return [
+            self._saved_ids[r]
+            for r in range(self._saved_count)
+            if self._saved_ids.get(r)
+        ]
+
+    async def _persist_visual_day_order(self) -> None:
+        """Write Merged-table sequence to ``day_order`` before a reload can scramble it."""
+        if not self._merged_mode:
+            return
+        ordered_ids = self._ordered_saved_ids()
+        if ordered_ids:
+            await recount_day_order(self._current_date, ordered_ids)
 
     def _row_has_data(self, row: int) -> bool:
         for col in range(self._table.columnCount()):
@@ -3621,18 +3725,20 @@ class DailyRegister(QWidget):
             self._restrict_trucks = True
 
     async def _auto_fill_item_from_mapping(self, row: int, description: str) -> None:
-        """When description-only mode is on, pre-fill Item from saved mappings."""
-        if not self._defer_item_to_verify or not description.strip():
+        """Pre-fill Item from a saved description map or prior entries."""
+        if not description.strip():
             return
         item_it = self._table.item(row, COL_ITEM)
         if item_it and item_it.text().strip():
             return
-        from tahmeed.services.description_mapping_service import resolve_category_for_description
+        from tahmeed.services.cashier_service import resolve_item_name_for_description
 
-        resolved = await resolve_category_for_description(description)
-        if not resolved:
+        try:
+            cat_name = await resolve_item_name_for_description(description)
+        except Exception:
             return
-        _, cat_name = resolved
+        if not cat_name:
+            return
         prev = self._table.blockSignals(True)
         if item_it is None:
             item_it = QTableWidgetItem(cat_name)
@@ -3641,6 +3747,7 @@ class DailyRegister(QWidget):
         else:
             item_it.setText(cat_name)
         self._table.blockSignals(prev)
+        self._validate_item_cell(row, item_it)
 
     async def _load_fleet_numbers(self) -> None:
         from tahmeed.services.truck_service import get_fleet_kinds, get_fleet_numbers

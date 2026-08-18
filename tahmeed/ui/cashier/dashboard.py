@@ -540,6 +540,7 @@ class CashierDashboard(QWidget):
         # index 4 — Browse (embedded)
         self._browser = TransactionBrowser()
         self._browser.go_to_date.connect(self._on_go_to_date)
+        self._browser.go_to_upload.connect(self._on_go_to_upload)
         self._stack.addWidget(self._browser)
 
         self._stack.setCurrentIndex(0)
@@ -640,7 +641,11 @@ class CashierDashboard(QWidget):
 
     def _on_go_to_date(self, d, term: str = "") -> None:
         self._on_nav("table")
-        self._register.navigate_to_date(d, highlight_term=term)
+        self._register.navigate_to_date(d, highlight_term=term, merged=True)
+
+    def _on_go_to_upload(self, upload_id: str, primary_date=None) -> None:
+        self._on_nav("table")
+        self._register.navigate_to_upload(upload_id, primary_date)
 
     # ── Load categories ───────────────────────────────────────────────────────────
 

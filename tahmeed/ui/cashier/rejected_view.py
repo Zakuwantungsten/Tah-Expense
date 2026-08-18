@@ -22,7 +22,7 @@ from PySide6.QtGui import QColor, QBrush, QKeyEvent
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
 from tahmeed.ui.cashier.register_delegates import (
-    COL_SNO, COL_DATE, COL_REPORTED, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
+    COL_SNO, COL_DATE, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
     COL_REF, COL_TZS, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
     HEADERS, CHECK_COLS, READONLY_COLS, _UPPER_SKIP_COLS, _COL_PREFERRED,
     _ref_float_text, _parse_optional_date, _norm_receipt_text, _parse_amount_text,
@@ -320,7 +320,6 @@ class RejectedView(QWidget):
         )
         date_del = _DateDelegate(lambda: date.today(), t)
         t.setItemDelegateForColumn(COL_DATE, date_del)
-        t.setItemDelegateForColumn(COL_REPORTED, date_del)
         t.setItemDelegateForColumn(COL_REF, _RefFloatDelegate(t))
         t.setItemDelegateForColumn(COL_TZS, _TZSDelegate(t))
         t.setItemDelegateForColumn(COL_RECEIPT, _ReceiptDelegate(t))
@@ -483,9 +482,6 @@ class RejectedView(QWidget):
         self._table.setItem(row, COL_SNO, cell(str(sn), Qt.AlignCenter))
         date_str = tx.date.strftime("%d/%m/%Y") if tx.date else ""
         self._table.setItem(row, COL_DATE, cell(date_str))
-        reported = getattr(tx, "reported_date", None)
-        reported_str = reported.strftime("%d/%m/%Y") if reported else ""
-        self._table.setItem(row, COL_REPORTED, cell(reported_str))
         self._table.setItem(row, COL_ITEM, cell(tx.item or ""))
         self._table.setItem(row, COL_DESC, cell(tx.description or ""))
         self._table.setItem(row, COL_TRUCK, cell(tx.truck_number or ""))
@@ -889,7 +885,6 @@ class RejectedView(QWidget):
                         truck_number = truck_raw.upper()
 
         ref = self._txt(row, COL_REF).upper()
-        reported = _parse_optional_date(self._txt(row, COL_REPORTED))
 
         updates = {
             "description": description,
@@ -905,7 +900,6 @@ class RejectedView(QWidget):
             "approver": self._txt(row, COL_APR),
             "payee": self._txt(row, COL_PAYEE),
             "cheque": self._txt(row, COL_CHEQUE),
-            "reported_date": reported,
         }
         if tx_date is not None:
             updates["date"] = tx_date

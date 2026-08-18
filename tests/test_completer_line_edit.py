@@ -76,21 +76,54 @@ def test_ranked_contains_reorders_model_on_type() -> None:
     assert _app is not None
 
 
-def test_ranked_uses_setcompleter_and_prefix_preview() -> None:
-    """Item mode uses setCompleter so Qt shows the popup; prefix gets inline preview."""
+def test_ranked_contains_does_not_rewrite_typed_text() -> None:
+    """Item column keeps keystrokes; Tab later accepts the highlighted name."""
     _app = QApplication.instance() or QApplication([])
     ed = CompleterLineEdit(["LATRA", "Diesel CSH"], ranked_contains=True)
-    assert ed.completer() is ed._completer
-    ed._typed = "lat"
-    ed._apply_first_suggestion_preview()
-    # After reorder+type, completion model may be empty until prefix is set by Qt;
-    # drive preview directly like the timer path after a real keystroke.
-    ed._on_text_edited("lat")
     ed.setText("lat")
     ed._typed = "lat"
-    # Force completion model to see the prefix (Qt does this on textEdited).
     ed._completer.setCompletionPrefix("lat")
     ed._apply_first_suggestion_preview()
-    assert ed.text() == "latRA" or ed.text().lower().startswith("lat")
-    assert ed._preview_active or ed.hasSelectedText() or ed.text().upper() == "LATRA"
+    assert ed.text() == "lat"
+    assert ed._preview_active is False
+
+    ed.setText("csh")
+    ed._typed = "csh"
+    ed._on_text_edited("csh")
+    ed._completer.setCompletionPrefix("csh")
+    ed._apply_first_suggestion_preview()
+    assert ed.text() == "csh"
+    assert _app is not None
+
+
+def test_ranked_contains_undoes_qt_highlight_insert() -> None:
+    """Qt PopupCompletion setText on highlight must not stick for Item."""
+    _app = QApplication.instance() or QApplication([])
+    ed = CompleterLineEdit(["LATRA", "Diesel CSH"], ranked_contains=True)
+    ed.setText("l")
+    ed._typed = "l"
+    ed.setText("LATRA")  # what QLineEdit::_q_completionHighlighted does
+    ed._on_highlighted("LATRA")
+    assert ed.text() == "l"
+    assert _app is not None
+
+
+def test_ranked_contains_typing_and_backspace_keep_keystrokes() -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    _app = QApplication.instance() or QApplication([])
+    ed = CompleterLineEdit(["LATRA", "Diesel CSH"], ranked_contains=True)
+    ed.show()
+    ed.setFocus()
+    QApplication.processEvents()
+    QTest.keyClicks(ed, "l")
+    QTest.qWait(30)
+    QApplication.processEvents()
+    assert ed.text() == "l"
+    QTest.keyClick(ed, Qt.Key_Backspace)
+    QTest.qWait(30)
+    QApplication.processEvents()
+    assert ed.text() == ""
+    ed.hide()
     assert _app is not None

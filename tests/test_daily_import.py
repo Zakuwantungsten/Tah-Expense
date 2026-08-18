@@ -5,6 +5,7 @@ from pathlib import Path
 
 import openpyxl
 import pytest
+from bson import ObjectId
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.daily_import_service import (
@@ -240,6 +241,46 @@ def test_browse_match_upload_id_skips_date_filter() -> None:
     )
     assert match["daily_import_id"] == "batch-abc"
     assert "date" not in match
+
+
+@pytest.mark.asyncio
+async def test_apply_mapping_keeps_assignment_when_save_fails(monkeypatch) -> None:
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("Your role cannot perform this action")
+
+    monkeypatch.setattr(
+        "tahmeed.services.daily_import_service.save_mapping",
+        boom,
+    )
+    cat_id = ObjectId()
+    row = DailyImportRow(
+        serial=1,
+        date=datetime(2026, 7, 21),
+        description="DIESEL",
+        truck_number="",
+        lpo_do="",
+        do_number="",
+        memo="",
+        notes="",
+        amount=100.0,
+        currency="TZS",
+        receipt_status="pending",
+        ownership="",
+        approver="",
+    )
+    preview = DailyImportPreview(
+        source_filename="x.xlsx",
+        source_path="x.xlsx",
+        rows=[row],
+        unmapped={"DIESEL": 1},
+    )
+    from tahmeed.services.daily_import_service import apply_mapping_to_preview
+
+    await apply_mapping_to_preview(preview, "DIESEL", cat_id, "Fuel")
+    assert row.category_id == cat_id
+    assert row.category_name == "Fuel"
+    assert row.skipped_item is False
+    assert "DIESEL" not in preview.unmapped
 
 
 def test_master_query_filters_by_excel_date() -> None:

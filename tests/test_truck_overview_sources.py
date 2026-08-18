@@ -70,10 +70,7 @@ def test_with_date_range_noop_when_unset() -> None:
 
 
 def test_truck_and_trailer_overview_match() -> None:
-    from tahmeed.services.accountant_service import (
-        _truck_and_trailer_match,
-        _truck_row_matches_search,
-    )
+    from tahmeed.services.accountant_service import _truck_and_trailer_match
 
     clause = _truck_and_trailer_match("T469 EKZ")
     import re as _re
@@ -83,14 +80,15 @@ def test_truck_and_trailer_overview_match() -> None:
     assert compiled.search("T469 EKZ/T689ELK")
     assert not compiled.search("T689ELK/T469EKZ")
 
-    assert _truck_row_matches_search(
-        {"truck_value": "T469EKZ/T689ELK", "source": "SM Burhani RPA"},
-        "T469 EKZ",
-    )
-    assert not _truck_row_matches_search(
-        {"truck_value": "T688 EAF/T123 TRA", "source": "SM Burhani RPA"},
-        "T469 EKZ",
-    )
+
+def test_filter_rows_sorts_date_ascending() -> None:
+    rows = [
+        {"source_group": "master", "date": datetime(2026, 12, 1), "description": "dec"},
+        {"source_group": "master", "date": datetime(2026, 1, 15), "description": "jan"},
+        {"source_group": "master", "date": datetime(2026, 6, 1), "description": "jun"},
+    ]
+    filtered = _filter_truck_overview_rows(rows)
+    assert [r["description"] for r in filtered] == ["jan", "jun", "dec"]
 
 
 def test_source_multi_combo_selects_multiple() -> None:
@@ -120,7 +118,7 @@ def test_source_multi_combo_selects_multiple() -> None:
 def test_truck_overview_defaults_to_fiscal_year() -> None:
     import asyncio
 
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QFrame, QPushButton
 
     from tahmeed.app_state import app_state
     from tahmeed.ui.accountant.truck_overview import TruckOverviewWidget
@@ -139,6 +137,12 @@ def test_truck_overview_defaults_to_fiscal_year() -> None:
         assert date_to is not None and date_to.year == app_state.fiscal_year
         assert date_from.month == 1 and date_from.day == 1
         assert date_to.month == 12 and date_to.day == 31
+        assert not hasattr(w, "_search")
+        title_bar = w.findChild(QFrame, "truckTitleBar")
+        assert title_bar is not None
+        labels = {b.text().strip() for b in title_bar.findChildren(QPushButton)}
+        assert "Excel" in labels
+        assert "PDF" in labels
     finally:
         pending = asyncio.all_tasks(loop)
         for task in pending:

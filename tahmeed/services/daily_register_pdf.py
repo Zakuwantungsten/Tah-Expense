@@ -44,7 +44,6 @@ _fonts: dict[str, fitz.Font] = {}
 # Export columns — same order as DailyRegister._EXPORT_COLS / HEADERS
 EXPORT_HEADERS = [
     "Date",
-    "Reported Date",
     "Item",
     "Description",
     "Truck No.",
@@ -61,9 +60,8 @@ EXPORT_HEADERS = [
 # Relative widths (sum ≈ content width after padding). S/N is PDF-only.
 _COL_SPECS: list[tuple[str, str, float]] = [
     ("sno", "S/N", 26),
-    ("date", "DATE", 46),
-    ("reported", "REPORTED", 48),
-    ("item", "ITEM", 62),
+    ("date", "DATE", 52),
+    ("item", "ITEM", 70),
     ("desc", "DESCRIPTION", 118),
     ("truck", "TRUCK NO.", 50),
     ("memo", "MEMO", 50),
@@ -411,7 +409,7 @@ def _draw_detail_row(
 
         text = cells[data_keys.index(key)]
         size = 7.2 if key in ("item", "desc") else 7.0
-        color = _MUTED if key in ("date", "reported") else _DARK
+        color = _MUTED if key == "date" else _DARK
         if key == "ref":
             color = _LABEL
 

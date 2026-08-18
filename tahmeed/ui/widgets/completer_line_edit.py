@@ -145,9 +145,10 @@ class CompleterLineEdit(QLineEdit):
     - As the user types, a dropdown shows all values that *contain* the typed
       text (case-insensitive). The first match is highlighted automatically.
     - With ``ranked_contains=True`` (Item column), matches are ordered exact →
-      prefix → word-boundary → mid-string, and inline auto-preview only applies
-      to prefix matches so a mid-name hit cannot steal the field.
-    - The highlighted suggestion also appears inline for prefix matches: the
+      prefix → word-boundary → mid-string. The typed text is never rewritten
+      until Tab / Enter / click accepts the highlighted row — so a short prefix
+      cannot lock in a different item name.
+    - Without ``ranked_contains``, prefix matches get an inline preview: the
       auto-completed part is shown as a selection, so the next keystroke
       replaces it and the user keeps typing naturally.
     - Down / Up navigate the popup; Tab / Enter accept the highlighted item
@@ -171,6 +172,7 @@ class CompleterLineEdit(QLineEdit):
         self._suppress_preview = False  # True after Delete dismisses preview
         self._preview_active   = False  # True while a preview suggestion is displayed
         self._committing = False  # True while Tab/click writes a chosen suggestion
+        self._ignore_highlight = False  # True while we auto-select popup row 0
 
         self._model = QStringListModel(self._values, self)
         self._completer = QCompleter(self._model, self)
@@ -179,10 +181,13 @@ class CompleterLineEdit(QLineEdit):
         self._completer.setCompletionMode(QCompleter.PopupCompletion)
         self._completer.setMaxVisibleItems(8)
         self.setCompleter(self._completer)
-
-        # Connect after setCompleter() so our handler fires last and wins over any
-        # Qt-internal highlighted→setText that lacks a selection.
+        # QLineEdit+PopupCompletion inserts the highlighted row via
+        # _q_completionHighlighted → setText. That locks in a full item name
+        # on the first letter and refills it after Backspace. Drop that slot
+        # and handle highlight ourselves.
+        self._disconnect_qt_highlight_insert()
         self._completer.highlighted[str].connect(self._on_highlighted)
+        self._completer.activated[str].connect(self._on_activated)
 
         # While the popup is open it grabs the keyboard, so Tab/Enter never reach
         # the table delegate's "accept + move to next cell" filter installed on
@@ -202,6 +207,42 @@ class CompleterLineEdit(QLineEdit):
                 )
                 return True
         return super().eventFilter(obj, event)
+
+    def _disconnect_qt_highlight_insert(self) -> None:
+        """Best-effort: drop Python highlighted→setText if Qt exposed it.
+
+        The C++ QLineEdit slot often cannot be disconnected from Python;
+        ``_keep_typed_text`` still undoes that auto-insert.
+        """
+        signal = self._completer.highlighted[str]
+        for slot in (self.setText, "_q_completionHighlighted"):
+            try:
+                signal.disconnect(self, slot)
+            except (TypeError, RuntimeError):
+                pass
+
+    def _keep_typed_text(self) -> None:
+        """Put back what the user typed if Qt/completer replaced the field."""
+        if self._committing or not self._ranked_contains:
+            return
+        if self.text() != self._typed:
+            self.setText(self._typed)
+            self.setCursorPosition(len(self._typed))
+
+    def _on_activated(self, text: str) -> None:
+        """Click / Enter on a popup row — this is an explicit accept."""
+        if not text:
+            return
+        self._committing = True
+        try:
+            self.setText(text)
+            self._typed = text
+            self.setCursorPosition(len(text))
+        finally:
+            QTimer.singleShot(0, self._end_commit)
+
+    def _end_commit(self) -> None:
+        self._committing = False
 
     def canonical(self, text: str) -> Optional[str]:
         """Return the stored value matching *text* case-insensitively, else None."""
@@ -240,6 +281,14 @@ class CompleterLineEdit(QLineEdit):
         # prefix from field state because the field may currently be showing a
         # previous preview (the suffix is a text selection beyond the real cursor).
         if self._committing:
+            return
+        if self._ranked_contains:
+            # Item column: list highlight only. Undo Qt's PopupCompletion setText
+            # (it runs even when we skip our own preview).
+            self._keep_typed_text()
+            QTimer.singleShot(0, self._keep_typed_text)
+            return
+        if self._ignore_highlight:
             return
         current = self.text()
         typed = current[:self.selectionStart()] if self.hasSelectedText() else current
@@ -289,7 +338,16 @@ class CompleterLineEdit(QLineEdit):
             if not popup.isVisible() and self._completer.completionCount() > 0:
                 self._completer.complete()
             if popup.isVisible():
-                popup.setCurrentIndex(model.index(0, 0))
+                self._ignore_highlight = True
+                try:
+                    popup.setCurrentIndex(model.index(0, 0))
+                finally:
+                    self._ignore_highlight = False
+        if self._ranked_contains:
+            # Keep the user's keystrokes; Tab/Enter/click accept the highlight.
+            self._keep_typed_text()
+            QTimer.singleShot(0, self._keep_typed_text)
+            return
         # Prefix-only auto-preview (QuickBooks): typing "lat" → LAT[RA].
         shown = show_completion_preview(
             self,
@@ -312,6 +370,12 @@ class CompleterLineEdit(QLineEdit):
             self.setCursorPosition(len(self._typed))
             event.accept()
             return
+
+        if key in (Qt.Key_Delete, Qt.Key_Backspace) and self._ranked_contains:
+            # If Qt already inserted a full item name, put the real keystrokes
+            # back first so this Backspace can actually erase.
+            self._keep_typed_text()
+            self._suppress_preview = True
 
         if key in (Qt.Key_Return, Qt.Key_Enter):
             if accept_completion(self, self._completer):
