@@ -424,7 +424,7 @@ class DailyRegister(QWidget):
     mode_changed      = Signal(bool)               # merged mode on/off
     attachment_count_changed = Signal(int)         # selected row attachment count
     save_busy_changed = Signal(bool)               # True while Save/Submit is in flight
-    # Active row Payee/Cheque for the always-visible QB header fields
+    # Day-level Payee/Cheque for the always-visible QB header fields
     active_payee_cheque_changed = Signal(str, str, bool)  # payee, cheque, editable
 
     def __init__(self, user: User, categories: List[Category], parent=None):
@@ -452,6 +452,9 @@ class DailyRegister(QWidget):
         self._search_text: str    = ""
         self._pending_highlight: str = ""  # set by navigate_to_date; consumed in _populate
         self._load_upload_id: str = ""     # one-shot: load this Excel batch instead of a day
+        # Day-level Payee / Cheque stamp (header fields → all data rows)
+        self._header_payee: str = ""
+        self._header_cheque: str = ""
         # row_index -> import metadata stamped onto Transaction at save time
         self._pending_row_meta: dict = {}
         # When True, skip async side-effects from itemChanged (bulk paste/import).
@@ -478,6 +481,13 @@ class DailyRegister(QWidget):
         self._draft_timer.setSingleShot(True)
         self._draft_timer.setInterval(1_500)
         self._draft_timer.timeout.connect(self._flush_local_draft)
+        # Debounce DB writes for day-level Payee/Cheque (saved rows only).
+        self._payee_cheque_persist_timer = QTimer(self)
+        self._payee_cheque_persist_timer.setSingleShot(True)
+        self._payee_cheque_persist_timer.setInterval(400)
+        self._payee_cheque_persist_timer.timeout.connect(
+            self._kick_persist_header_payee_cheque
+        )
         self._restoring_draft = False
         self._load_gen = 0
         self._build_ui()
@@ -894,6 +904,7 @@ class DailyRegister(QWidget):
 
     def _populate(self, transactions: List[Transaction]) -> None:
         # A fresh load always returns the grid to read-only state.
+        self._payee_cheque_persist_timer.stop()
         self._edit_mode = False
         self._dirty_rows = set()
 
@@ -922,6 +933,7 @@ class DailyRegister(QWidget):
         self.edit_state_changed.emit(False, 0)
         if self._table.currentRow() < 0 and self._table.rowCount() > self._saved_count:
             self._table.setCurrentCell(self._saved_count, COL_DESC)
+        self._sync_header_payee_cheque_from_grid()
         self._emit_active_payee_cheque()
 
         if self._pending_highlight:
@@ -1076,9 +1088,7 @@ class DailyRegister(QWidget):
             _parse_optional_amount_text(raw_usd),
         )
 
-        rcpt_status = _norm_receipt_text(txt(COL_RECEIPT))
-        if rcpt_status not in _VALID_RCPT:
-            rcpt_status = "pending"
+        rcpt_status = txt(COL_RECEIPT).strip()
 
         item_name = txt(COL_ITEM)
         meta = self._pending_row_meta.get(row) or {}
@@ -1224,46 +1234,114 @@ class DailyRegister(QWidget):
         self._emit_active_payee_cheque()
 
     def _emit_active_payee_cheque(self) -> None:
-        """Push the focused row's Payee/Cheque into the Table header fields."""
-        row = self._table.currentRow()
-        if row < 0 or row >= self._table.rowCount():
-            self.active_payee_cheque_changed.emit("", "", False)
-            return
-        editable = row >= self._saved_count or self._edit_mode
+        """Push the day-level Payee/Cheque stamp into the Table header fields."""
         self.active_payee_cheque_changed.emit(
-            self._cell_text(row, COL_PAYEE),
-            self._cell_text(row, COL_CHEQUE),
-            editable,
+            self._header_payee,
+            self._header_cheque,
+            True,
         )
 
+    def _sync_header_payee_cheque_from_grid(self) -> None:
+        """Refresh day-level header values from rows that already have data."""
+        rows = self._data_rows()
+        if not rows:
+            self._header_payee = ""
+            self._header_cheque = ""
+            return
+        payees = {self._cell_text(r, COL_PAYEE) for r in rows}
+        cheques = {self._cell_text(r, COL_CHEQUE) for r in rows}
+        # Shared value when unanimous; blank when the day has mixed stamps.
+        self._header_payee = next(iter(payees)) if len(payees) == 1 else ""
+        self._header_cheque = next(iter(cheques)) if len(cheques) == 1 else ""
+
     def set_active_payee(self, text: str) -> None:
-        """Write Payee from the header field into the active register row."""
-        self._set_active_payee_cheque_cell(COL_PAYEE, text)
+        """Stamp Payee from the header onto every saved + filled unsaved row."""
+        self._header_payee = (text or "").upper()
+        self._stamp_payee_cheque_on_data_rows()
+        self._schedule_payee_cheque_persist()
+        self._schedule_draft_autosave()
 
     def set_active_cheque(self, text: str) -> None:
-        """Write Cheque from the header field into the active register row."""
-        self._set_active_payee_cheque_cell(COL_CHEQUE, text)
+        """Stamp Cheque from the header onto every saved + filled unsaved row."""
+        self._header_cheque = (text or "").upper()
+        self._stamp_payee_cheque_on_data_rows()
+        self._schedule_payee_cheque_persist()
+        self._schedule_draft_autosave()
 
-    def _set_active_payee_cheque_cell(self, col: int, text: str) -> None:
-        row = self._table.currentRow()
-        if row < 0:
-            row = self._first_empty_editable_row()
-            if row >= self._table.rowCount():
-                self._append_editable_rows(10)
-            self._table.setCurrentCell(row, col)
-        if row < self._saved_count and not self._edit_mode:
+    def _stamp_payee_cheque_on_data_rows(self) -> None:
+        """Write header Payee/Cheque onto all data rows without dirtying saved rows."""
+        rows = self._data_rows()
+        if not rows:
             return
-        value = (text or "").upper()
+        prev = self._table.blockSignals(True)
+        try:
+            for row in rows:
+                self._write_payee_cheque_cell(row, COL_PAYEE, self._header_payee)
+                self._write_payee_cheque_cell(row, COL_CHEQUE, self._header_cheque)
+        finally:
+            self._table.blockSignals(prev)
+
+    def _write_payee_cheque_cell(self, row: int, col: int, value: str) -> None:
+        """Set one Payee/Cheque cell, preserving row chrome (saved / edit / new)."""
         it = self._table.item(row, col)
         if it is None:
             it = QTableWidgetItem("")
-            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+            if row >= self._saved_count or self._edit_mode:
+                flags |= Qt.ItemIsEditable
+            it.setFlags(flags)
             if row >= self._saved_count:
                 it.setBackground(QBrush(NEW_BG))
+            elif self._edit_mode:
+                bg = DIRTY_BG if row in self._dirty_rows else EDIT_BG
+                it.setBackground(QBrush(bg))
+            else:
+                it.setBackground(QBrush(SAVED_BG))
             self._table.setItem(row, col, it)
-        if it.text() == value:
+        if it.text() != value:
+            it.setText(value)
+
+    def _schedule_payee_cheque_persist(self) -> None:
+        """Debounce soft DB updates for saved rows (no Verify → Edited)."""
+        if self._saved_count <= 0:
             return
-        it.setText(value)
+        self._payee_cheque_persist_timer.start()
+
+    def _kick_persist_header_payee_cheque(self) -> None:
+        asyncio.ensure_future(self._persist_header_payee_cheque())
+
+    async def _persist_header_payee_cheque(self) -> None:
+        """Persist day-level Payee/Cheque on saved rows without re-verify flags."""
+        target_date = self._current_date
+        payee = self._header_payee
+        cheque = self._header_cheque
+        snapshot = [
+            (row, self._saved_ids.get(row), self._saved_txs.get(row))
+            for row in range(self._saved_count)
+        ]
+        for _row, tx_id, tx in snapshot:
+            if self._current_date != target_date:
+                return
+            if tx_id is None:
+                continue
+            updates: dict = {}
+            cur_payee = (getattr(tx, "payee", "") or "") if tx is not None else ""
+            cur_cheque = (getattr(tx, "cheque", "") or "") if tx is not None else ""
+            if cur_payee != payee:
+                updates["payee"] = payee
+            if cur_cheque != cheque:
+                updates["cheque"] = cheque
+            if not updates:
+                continue
+            try:
+                await update_transaction(tx_id, updates)
+            except Exception:
+                continue
+            if tx is not None:
+                if "payee" in updates:
+                    tx.payee = payee
+                if "cheque" in updates:
+                    tx.cheque = cheque
 
     def _mark_dirty(self, row: int) -> None:
         """Flag a saved row as modified and give it a stronger amber background."""
@@ -1663,8 +1741,6 @@ class DailyRegister(QWidget):
             self._mark_dirty(row)
             if col == COL_TZS or col == COL_USD:
                 self._update_footer()
-            if col in (COL_PAYEE, COL_CHEQUE) and row == self._table.currentRow():
-                self._emit_active_payee_cheque()
             return
 
         # Uppercase all free-text cells
@@ -1712,8 +1788,6 @@ class DailyRegister(QWidget):
             self._update_footer()
 
         self._schedule_draft_autosave()
-        if col in (COL_PAYEE, COL_CHEQUE) and row == self._table.currentRow():
-            self._emit_active_payee_cheque()
 
     def _on_model_data_changed(self, top_left, bottom_right, roles=()) -> None:
         # Kept for receipt/other UserRole updates if added later.
@@ -1733,6 +1807,10 @@ class DailyRegister(QWidget):
             ri = QTableWidgetItem("")
             ri.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
             self._table.setItem(row, COL_RECEIPT, ri)
+        # Inherit the day-level Payee/Cheque stamp onto newly started rows.
+        if self._header_payee or self._header_cheque:
+            self._write_payee_cheque_cell(row, COL_PAYEE, self._header_payee)
+            self._write_payee_cheque_cell(row, COL_CHEQUE, self._header_cheque)
         self._table.blockSignals(prev)
 
     def _deactivate_row(self, row: int) -> None:
@@ -3033,10 +3111,8 @@ class DailyRegister(QWidget):
                 self._table.setItem(target, COL_TZS, _money_item(tzs_txt, tzs_amt))
                 self._table.setItem(target, COL_USD, _money_item(usd_txt, usd_amt))
 
-                rcpt = data.get("receipt_status") or "pending"
-                rcpt_it = QTableWidgetItem(
-                    rcpt if rcpt in _VALID_RCPT else _norm_receipt_text(str(rcpt))
-                )
+                rcpt = data.get("receipt_status") or ""
+                rcpt_it = QTableWidgetItem(str(rcpt))
                 rcpt_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                 self._table.setItem(target, COL_RECEIPT, rcpt_it)
 
@@ -3098,9 +3174,8 @@ class DailyRegister(QWidget):
                 raw = str(row_data[file_col]).strip() if row_data[file_col] is not None else ""
 
                 if grid_col == COL_RECEIPT:
-                    norm = _norm_receipt_text(raw)
                     it = self._table.item(target, grid_col) or QTableWidgetItem()
-                    it.setText(norm)
+                    it.setText(raw)
                     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                     self._table.setItem(target, grid_col, it)
                 elif grid_col == COL_REF:
@@ -3655,9 +3730,7 @@ class DailyRegister(QWidget):
                     _parse_optional_amount_text(txt(COL_USD)),
                 )
 
-                rcpt_status = _norm_receipt_text(txt(COL_RECEIPT))
-                if rcpt_status not in _VALID_RCPT:
-                    rcpt_status = "pending"
+                rcpt_status = txt(COL_RECEIPT).strip()
 
                 item_name = txt(COL_ITEM)
                 meta_pre = self._pending_row_meta.get(row) or {}

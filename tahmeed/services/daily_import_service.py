@@ -40,22 +40,6 @@ _HEADER_ALIASES: Dict[str, Tuple[str, ...]] = {
     "approver": ("apr by", "approver", "apr"),
 }
 
-_RCPT_NORM = {
-    "received": "received",
-    "receipt": "received",
-    "1": "received",
-    "yes": "received",
-    "rcvd": "received",
-    "missing": "missing",
-    "pending": "pending",
-    "0": "pending",
-    "no receipt": "no_receipt",
-    "no_receipt": "no_receipt",
-    "none": "no_receipt",
-    "n/a": "no_receipt",
-    "na": "no_receipt",
-}
-
 
 @dataclass
 class DailyImportRow:
@@ -78,6 +62,46 @@ class DailyImportRow:
     amount_usd: Optional[float] = None
 
 
+# Parse-time problem / auto-skip reasons
+REASON_MISSING_DATE = "missing_date"
+REASON_EMPTY_DESCRIPTION = "empty_description"
+REASON_TOTAL_ROW = "total_row"
+REASON_EMPTY_ROW = "empty_row"
+
+
+@dataclass
+class DailyImportProblemRow:
+    """Content row that needs a user choice before it can enter the import."""
+
+    excel_row: int
+    reason: str
+    description: str
+    truck_number: str = ""
+    lpo_do: str = ""
+    do_number: str = ""
+    memo: str = ""
+    notes: str = ""
+    amount: float = 0.0
+    currency: str = "TZS"
+    amount_usd: Optional[float] = None
+    receipt_status: str = "pending"
+    ownership: str = ""
+    approver: str = ""
+    serial: Optional[int] = None
+    raw_date_text: str = ""
+    date: Optional[datetime] = None  # set when user assigns a date
+    skipped: bool = False  # user chose to drop this row
+
+
+@dataclass
+class DailyParseResult:
+    rows: List[DailyImportRow]
+    problems: List[DailyImportProblemRow]
+    skipped_blank: int
+    skip_reasons: Dict[str, int]
+    sheet_name: str
+
+
 class DailyImportCancelled(Exception):
     """User aborted reading the daily Excel file."""
 
@@ -89,6 +113,8 @@ class DailyImportPreview:
     rows: List[DailyImportRow] = field(default_factory=list)
     unmapped: Dict[str, int] = field(default_factory=dict)  # key -> count
     skipped_blank: int = 0
+    skip_reasons: Dict[str, int] = field(default_factory=dict)
+    problem_rows: List[DailyImportProblemRow] = field(default_factory=list)
     primary_date: Optional[date] = None
     detected_dates: List[date] = field(default_factory=list)
     date_counts: Dict[date, int] = field(default_factory=dict)
@@ -107,21 +133,8 @@ def cell_str(val) -> str:
 
 
 def normalize_receipt(val: str) -> str:
-    """Map Excel receipt text to stored status.
-
-    Daily files use only RECEIPT / NO RECEIPT (shown uppercase in the grid).
-    Stored keys remain received / no_receipt for compatibility.
-    """
-    s = " ".join((val or "").strip().lower().split())
-    if not s:
-        return "pending"
-    if s in _RCPT_NORM:
-        return _RCPT_NORM[s]
-    if "no receipt" in s:
-        return "no_receipt"
-    if s == "receipt" or "received" in s:
-        return "received"
-    return "pending"
+    """Preserve receipt cell text as written (trimmed only)."""
+    return cell_str(val)
 
 
 def parse_amount(val) -> Optional[float]:
@@ -299,16 +312,52 @@ def _looks_like_classic_matumizi(header_row: List) -> bool:
     return date_ok and desc_ok
 
 
+def _parse_serial(raw_serial) -> Optional[int]:
+    try:
+        if raw_serial is not None and cell_str(raw_serial):
+            return int(float(raw_serial))
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _bump_reason(reasons: Dict[str, int], reason: str) -> None:
+    reasons[reason] = reasons.get(reason, 0) + 1
+
+
+def problem_to_import_row(problem: DailyImportProblemRow) -> DailyImportRow:
+    """Promote a fixed problem row into a normal import row."""
+    if problem.date is None:
+        raise ValueError("Problem row has no date assigned")
+    return DailyImportRow(
+        serial=problem.serial,
+        date=problem.date,
+        description=problem.description,
+        truck_number=problem.truck_number,
+        lpo_do=problem.lpo_do,
+        do_number=problem.do_number,
+        memo=problem.memo,
+        notes=problem.notes,
+        amount=problem.amount,
+        currency=problem.currency,
+        amount_usd=problem.amount_usd,
+        receipt_status=problem.receipt_status,
+        ownership=problem.ownership,
+        approver=problem.approver,
+    )
+
+
 def parse_daily_expenses_excel(
     path: str | Path,
     *,
     sheet_name: Optional[str] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
-) -> Tuple[List[DailyImportRow], int, str]:
-    """Return (rows, skipped_blank_count, sheet_name_used).
+) -> DailyParseResult:
+    """Parse Daily Register Excel into accepted rows + date problems + auto-skips.
 
-    Raises ValueError when the workbook does not match Daily Register format.
-    Raises DailyImportCancelled when ``should_cancel`` returns True.
+    Rows with a description but missing/invalid date are kept in ``problems``
+    (not silently dropped). Empty rows, blank descriptions, and TOTAL lines
+    remain auto-skipped with a reason breakdown.
     """
     path = Path(path)
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -337,63 +386,172 @@ def parse_daily_expenses_excel(
                 )
 
         parsed: List[DailyImportRow] = []
+        problems: List[DailyImportProblemRow] = []
         skipped = 0
+        skip_reasons: Dict[str, int] = {}
         for i, row in enumerate(rows_iter):
             if should_cancel is not None and i % 16 == 0 and should_cancel():
                 raise DailyImportCancelled()
+            excel_row = i + 2  # header is row 1
             if not row:
                 skipped += 1
+                _bump_reason(skip_reasons, REASON_EMPTY_ROW)
                 continue
             row = list(row)
             desc = cell_str(_col(row, cols, "description"))
             if not desc:
                 skipped += 1
+                _bump_reason(skip_reasons, REASON_EMPTY_DESCRIPTION)
                 continue
             # Skip total/summary rows
-            if desc.upper().startswith("TOTAL") or str(_col(row, cols, "serial", "")).upper() == "TOTAL":
+            if desc.upper().startswith("TOTAL") or str(
+                _col(row, cols, "serial", "")
+            ).upper() == "TOTAL":
                 skipped += 1
-                continue
-            dt = parse_date_value(_col(row, cols, "date"))
-            if dt is None:
-                skipped += 1
+                _bump_reason(skip_reasons, REASON_TOTAL_ROW)
                 continue
 
+            raw_date = _col(row, cols, "date")
+            dt = parse_date_value(raw_date)
             tzs = parse_amount(_col(row, cols, "tzs"))
-            # USD is optional: sheets without a USD header keep usd=None and
-            # behave exactly like the previous TZS-only import path.
             usd = parse_amount(_col(row, cols, "usd")) if "usd" in cols else None
             amount, amount_usd, currency = pack_money(tzs, usd)
-
-            serial = None
-            raw_serial = _col(row, cols, "serial")
-            try:
-                if raw_serial is not None and cell_str(raw_serial):
-                    serial = int(float(raw_serial))
-            except (TypeError, ValueError):
-                pass
-
+            serial = _parse_serial(_col(row, cols, "serial"))
             notes = cell_str(_col(row, cols, "notes"))
+            truck = cell_str(_col(row, cols, "truck")).upper()
+            lpo = cell_str(_col(row, cols, "lpo")).upper()
+            do_no = cell_str(_col(row, cols, "do")).upper()
+            memo = cell_str(_col(row, cols, "memo")).upper()
+            receipt = cell_str(_col(row, cols, "receipt"))
+            ownership = cell_str(_col(row, cols, "ownership")).upper()
+            approver = cell_str(_col(row, cols, "approver")).upper()
+            desc_u = desc.upper()
+
+            if dt is None:
+                problems.append(
+                    DailyImportProblemRow(
+                        excel_row=excel_row,
+                        reason=REASON_MISSING_DATE,
+                        description=desc_u,
+                        truck_number=truck,
+                        lpo_do=lpo,
+                        do_number=do_no,
+                        memo=memo,
+                        notes=notes,
+                        amount=amount,
+                        currency=currency,
+                        amount_usd=amount_usd,
+                        receipt_status=receipt,
+                        ownership=ownership,
+                        approver=approver,
+                        serial=serial,
+                        raw_date_text=cell_str(raw_date),
+                    )
+                )
+                _bump_reason(skip_reasons, REASON_MISSING_DATE)
+                continue
+
             parsed.append(
                 DailyImportRow(
                     serial=serial,
                     date=dt,
-                    description=desc.upper(),
-                    truck_number=cell_str(_col(row, cols, "truck")).upper(),
-                    lpo_do=cell_str(_col(row, cols, "lpo")).upper(),
-                    do_number=cell_str(_col(row, cols, "do")).upper(),
-                    memo=cell_str(_col(row, cols, "memo")).upper(),
+                    description=desc_u,
+                    truck_number=truck,
+                    lpo_do=lpo,
+                    do_number=do_no,
+                    memo=memo,
                     notes=notes,
                     amount=amount,
                     currency=currency,
                     amount_usd=amount_usd,
-                    receipt_status=normalize_receipt(cell_str(_col(row, cols, "receipt"))),
-                    ownership=cell_str(_col(row, cols, "ownership")).upper(),
-                    approver=cell_str(_col(row, cols, "approver")).upper(),
+                    receipt_status=receipt,
+                    ownership=ownership,
+                    approver=approver,
                 )
             )
     finally:
         wb.close()
-    return parsed, skipped, used_sheet
+    return DailyParseResult(
+        rows=parsed,
+        problems=problems,
+        skipped_blank=skipped,
+        skip_reasons=skip_reasons,
+        sheet_name=used_sheet,
+    )
+
+
+def _apply_mappings_to_rows(
+    rows: List[DailyImportRow],
+    mappings: dict,
+) -> Dict[str, int]:
+    unmapped: Dict[str, int] = {}
+    for row in rows:
+        key = normalize_description(row.description)
+        mapping = mappings.get(key)
+        if mapping:
+            row.category_id = mapping.category_id
+            row.category_name = mapping.category_name
+        else:
+            unmapped[key] = unmapped.get(key, 0) + 1
+    return unmapped
+
+
+def _refresh_date_allocation(preview: DailyImportPreview) -> None:
+    row_dates = [r.date.date() for r in preview.rows]
+    alloc = analyze_date_allocation(
+        row_dates,
+        filename=preview.source_filename,
+        sheet_name=preview.sheet_name,
+    )
+    primary = alloc.primary
+    if primary is None and alloc.candidates:
+        primary = alloc.candidates[0]
+    outliers = 0
+    if primary is not None and row_dates:
+        outliers = sum(1 for d in row_dates if d != primary)
+    preview.primary_date = primary
+    preview.detected_dates = sorted(set(row_dates))
+    preview.date_counts = dict(alloc.counts)
+    preview.date_majority_clear = alloc.clear_majority
+    preview.outlier_count = outliers
+
+
+async def absorb_import_problems(preview: DailyImportPreview) -> None:
+    """Move fixed problem rows into ``preview.rows``; count explicit skips.
+
+    Call after the user has assigned a date or marked skip on each problem.
+    Recomputes description mappings and register-date allocation.
+    """
+    kept: List[DailyImportProblemRow] = []
+    promoted: List[DailyImportRow] = []
+    for problem in preview.problem_rows:
+        if problem.skipped:
+            preview.skipped_blank += 1
+            _bump_reason(preview.skip_reasons, f"{problem.reason}_user_skip")
+            continue
+        if problem.date is None:
+            kept.append(problem)
+            continue
+        promoted.append(problem_to_import_row(problem))
+    preview.problem_rows = kept
+    if not promoted:
+        if preview.rows:
+            _refresh_date_allocation(preview)
+        return
+
+    preview.rows.extend(promoted)
+    unique_descs = list({r.description for r in promoted})
+    mappings = await get_mappings_for_descriptions(unique_descs)
+    for row in promoted:
+        key = normalize_description(row.description)
+        mapping = mappings.get(key)
+        if mapping:
+            row.category_id = mapping.category_id
+            row.category_name = mapping.category_name
+            preview.unmapped.pop(key, None)
+        else:
+            preview.unmapped[key] = preview.unmapped.get(key, 0) + 1
+    _refresh_date_allocation(preview)
 
 
 async def preview_daily_import(
@@ -403,52 +561,32 @@ async def preview_daily_import(
 ) -> DailyImportPreview:
     path = Path(path)
 
-    def _parse() -> Tuple[List[DailyImportRow], int, str]:
+    def _parse() -> DailyParseResult:
         return parse_daily_expenses_excel(path, should_cancel=should_cancel)
 
-    parsed, skipped, sheet = await asyncio.to_thread(_parse)
+    result = await asyncio.to_thread(_parse)
     if should_cancel is not None and should_cancel():
         raise DailyImportCancelled()
+    parsed = result.rows
     unique_descs = list({r.description for r in parsed})
-    mappings = await get_mappings_for_descriptions(unique_descs)
+    mappings = await get_mappings_for_descriptions(unique_descs) if unique_descs else {}
     if should_cancel is not None and should_cancel():
         raise DailyImportCancelled()
 
-    unmapped: Dict[str, int] = {}
-    for row in parsed:
-        key = normalize_description(row.description)
-        mapping = mappings.get(key)
-        if mapping:
-            row.category_id = mapping.category_id
-            row.category_name = mapping.category_name
-        else:
-            unmapped[key] = unmapped.get(key, 0) + 1
+    unmapped = _apply_mappings_to_rows(parsed, mappings)
 
-    row_dates = [r.date.date() for r in parsed]
-    alloc = analyze_date_allocation(
-        row_dates, filename=path.name, sheet_name=sheet
-    )
-    primary = alloc.primary
-    if primary is None and alloc.candidates:
-        # Unclear tie — keep a provisional primary for display; caller asks.
-        primary = alloc.candidates[0]
-    outliers = 0
-    if primary is not None and row_dates:
-        outliers = sum(1 for d in row_dates if d != primary)
-
-    return DailyImportPreview(
+    preview = DailyImportPreview(
         source_filename=path.name,
         source_path=str(path),
         rows=parsed,
         unmapped=unmapped,
-        skipped_blank=skipped,
-        primary_date=primary,
-        detected_dates=sorted(set(row_dates)),
-        date_counts=dict(alloc.counts),
-        date_majority_clear=alloc.clear_majority,
-        outlier_count=outliers,
-        sheet_name=sheet,
+        skipped_blank=result.skipped_blank,
+        skip_reasons=dict(result.skip_reasons),
+        problem_rows=list(result.problems),
+        sheet_name=result.sheet_name,
     )
+    _refresh_date_allocation(preview)
+    return preview
 
 
 async def apply_mapping_to_preview(
@@ -596,7 +734,7 @@ def _payload_to_verified_transaction(
         lpo_do=(payload.get("lpo_do") or "").upper(),
         do_number=(payload.get("do_number") or "").upper(),
         memo=(payload.get("memo") or "").strip(),
-        receipt_status=payload.get("receipt_status") or "pending",
+        receipt_status=payload.get("receipt_status") or "",
         notes_flag=ref_float == "REFUND TO FLOAT",
         ref_float=ref_float,
         ownership=(payload.get("ownership") or "").upper(),

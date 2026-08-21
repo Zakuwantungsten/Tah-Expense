@@ -20,6 +20,7 @@ from tahmeed.ui.dialog_theme import show_critical, show_info
 from tahmeed.ui.dialogs.daily_import_preview_dialog import DailyImportPreviewDialog
 from tahmeed.ui.dialogs.date_outlier_dialog import resolve_import_date_policy
 from tahmeed.ui.dialogs.description_mapping_flow import prompt_unmapped_descriptions
+from tahmeed.ui.dialogs.import_problem_rows_dialog import prompt_import_problems
 from tahmeed.ui.widgets.upload_busy import UploadBusy, UploadCancelled
 
 
@@ -57,6 +58,11 @@ async def run_daily_to_master_flow(
             )
             busy.update(
                 f"Matched descriptions · {len(preview.rows):,} row(s) found…"
+                + (
+                    f" · {len(preview.problem_rows):,} need dates"
+                    if preview.problem_rows
+                    else ""
+                )
             )
             if preview.rows and preview.unmapped:
                 busy.update("Loading items…")
@@ -82,6 +88,10 @@ async def run_daily_to_master_flow(
         )
         return None
 
+    # ── Missing / invalid dates (flag to fix or explicit skip) ────────────
+    if not await prompt_import_problems(preview, parent):
+        return None
+
     if not preview.rows:
         show_info(
             parent,
@@ -94,6 +104,14 @@ async def run_daily_to_master_flow(
 
     # ── Description → item (required — no skip; going straight to Master) ─
     if preview.unmapped:
+        if categories is None:
+            try:
+                categories = await get_all_categories()
+            except Exception as exc:
+                show_critical(
+                    parent, "Import Error", f"Could not load items:\n{exc}"
+                )
+                return None
         ok = await prompt_unmapped_descriptions(
             preview,
             categories or [],

@@ -458,7 +458,7 @@ class _ActionBar(QFrame):
         hl.addWidget(fields, 0, Qt.AlignVCenter)
 
     def set_payee_cheque_values(self, payee: str, cheque: str, editable: bool) -> None:
-        """Refresh Payee/Cheque from the active register row without emitting edits."""
+        """Refresh day-level Payee/Cheque header fields without emitting edits."""
         for edit, value in ((self._payee, payee or ""), (self._cheque, cheque or "")):
             edit.blockSignals(True)
             if edit.text() != value:

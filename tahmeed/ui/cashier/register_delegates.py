@@ -516,25 +516,13 @@ _VALID_RCPT = {"pending", "received", "missing", "no_receipt"}
 
 
 def _norm_receipt_text(raw: str) -> str:
-    key = " ".join((raw or "").strip().lower().split())
-    if not key:
-        return ""
-    if key in _RCPT_NORM:
-        return _RCPT_NORM[key]
-    if "no receipt" in key:
-        return "no_receipt"
-    if key == "receipt" or "received" in key:
-        return "received"
-    return "pending"
+    """Keep receipt text as typed/imported (trim only)."""
+    return (raw or "").strip()
 
 
 def _receipt_paste_value(raw: str) -> str:
-    """Preserve clipboard receipt as-is when valid; do not invent pending for blank."""
-    raw = (raw or "").strip()
-    if not raw:
-        return ""
-    norm = _norm_receipt_text(raw)
-    return norm if norm else raw
+    """Preserve clipboard / import receipt text as-is."""
+    return _norm_receipt_text(raw)
 
 
 def _parse_amount_text(raw: str) -> float:
@@ -550,12 +538,13 @@ def _parse_optional_amount_text(raw: str) -> float | None:
 
 
 class _ReceiptDelegate(_ExcelCellDelegate):
-    """Receipt status — normal cell font + autocomplete (same interaction as Item)."""
+    """Receipt column — free text with optional autocomplete suggestions."""
 
     def paint(self, painter, option, index) -> None:
         self.initStyleOption(option, index)
-        status = (index.data() or "").strip().lower()
-        option.text = _RCPT_LABEL.get(status, status.upper() if status else "")
+        raw = (index.data() or "").strip()
+        # Known stored keys still show friendly labels; anything else stays exact.
+        option.text = _RCPT_LABEL.get(raw.lower(), raw)
         self._paint_bg(painter, option, index)
         self._paint_text(painter, option, index)
         self._draw_active_border(painter, option, index)
@@ -567,16 +556,13 @@ class _ReceiptDelegate(_ExcelCellDelegate):
         return ed
 
     def setEditorData(self, editor, index):
-        val = (index.data() or "").strip().lower()
-        editor.setText(_RCPT_LABEL.get(val, "") if val else "")
+        val = (index.data() or "").strip()
+        editor.setText(_RCPT_LABEL.get(val.lower(), val))
         editor.selectAll()
 
     def setModelData(self, editor, model, index):
         disp = editor.canonical(editor.text().strip()) or editor.text().strip()
-        key = _RCPT_OPT_KEY.get(disp.lower())
-        if key is None:
-            key = _norm_receipt_text(disp)
-        model.setData(index, key if key in _VALID_RCPT else "")
+        model.setData(index, disp)
 
     def updateEditorGeometry(self, editor, option, index):
         editor.setGeometry(option.rect)

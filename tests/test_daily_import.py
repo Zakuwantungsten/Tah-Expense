@@ -12,7 +12,9 @@ from tahmeed.services.daily_import_service import (
     DailyImportCancelled,
     DailyImportPreview,
     DailyImportRow,
+    REASON_MISSING_DATE,
     _looks_like_classic_matumizi,
+    absorb_import_problems,
     analyze_date_allocation,
     apply_date_policy,
     detect_date_from_name,
@@ -21,27 +23,43 @@ from tahmeed.services.daily_import_service import (
     parse_date_value,
     parse_daily_expenses_excel,
     pick_primary_date,
+    problem_to_import_row,
     staged_row_payload,
 )
 
 
-def test_normalize_receipt_receipt_word() -> None:
-    assert normalize_receipt("RECEIPT") == "received"
-    assert normalize_receipt("receipt") == "received"
-    assert normalize_receipt("  Receipt  ") == "received"
-
-
-def test_normalize_receipt_no_receipt() -> None:
-    assert normalize_receipt("NO RECEIPT") == "no_receipt"
-    assert normalize_receipt("no receipt") == "no_receipt"
-    assert normalize_receipt("no_receipt") == "no_receipt"
-
-
-def test_normalize_receipt_existing_aliases() -> None:
-    assert normalize_receipt("received") == "received"
+def test_normalize_receipt_preserves_exact_text() -> None:
+    assert normalize_receipt("RECEIPT") == "RECEIPT"
+    assert normalize_receipt("receipt") == "receipt"
+    assert normalize_receipt("  Receipt  ") == "Receipt"
+    assert normalize_receipt("NO RECEIPT") == "NO RECEIPT"
+    assert normalize_receipt("no receipt") == "no receipt"
     assert normalize_receipt("pending") == "pending"
     assert normalize_receipt("missing") == "missing"
-    assert normalize_receipt("") == "pending"
+    assert normalize_receipt("1") == "1"
+    assert normalize_receipt("yes") == "yes"
+    assert normalize_receipt("") == ""
+
+
+def test_parse_preserves_exact_receipt_text(tmp_path: Path) -> None:
+    path = tmp_path / "matumizi_rcpt.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Date", "Description", "TZS", "Receipt"])
+    ws.append([datetime(2026, 8, 20), "DIESEL", 1000, "RECEIPT"])
+    ws.append([datetime(2026, 8, 20), "TOLLS", 500, "NO RECEIPT"])
+    ws.append([datetime(2026, 8, 20), "PARKING", 200, "yes"])
+    ws.append([datetime(2026, 8, 20), "MISC", 100, None])
+    wb.save(path)
+    wb.close()
+
+    result = parse_daily_expenses_excel(path)
+    assert [r.receipt_status for r in result.rows] == [
+        "RECEIPT",
+        "NO RECEIPT",
+        "yes",
+        "",
+    ]
 
 
 def test_parse_amount_plain_and_negative() -> None:
@@ -188,17 +206,18 @@ def test_accept_header_mapped_workbook(tmp_path: Path) -> None:
     wb.save(path)
     wb.close()
 
-    rows, skipped, sheet = parse_daily_expenses_excel(path)
-    assert sheet
-    assert skipped == 0
-    assert len(rows) == 1
-    assert rows[0].description == "DIESEL"
-    assert rows[0].amount == 10000.0
-    assert rows[0].currency == "TZS"
-    assert rows[0].amount_usd is None
+    result = parse_daily_expenses_excel(path)
+    assert result.sheet_name
+    assert result.skipped_blank == 0
+    assert len(result.rows) == 1
+    assert result.rows[0].description == "DIESEL"
+    assert result.rows[0].amount == 10000.0
+    assert result.rows[0].currency == "TZS"
+    assert result.rows[0].amount_usd is None
+    assert result.problems == []
 
-    rows2, _, _ = parse_daily_expenses_excel(path, should_cancel=lambda: False)
-    assert len(rows2) == 1
+    result2 = parse_daily_expenses_excel(path, should_cancel=lambda: False)
+    assert len(result2.rows) == 1
 
 
 def test_parse_dual_tzs_and_usd_when_both_columns_present(tmp_path: Path) -> None:
@@ -211,8 +230,9 @@ def test_parse_dual_tzs_and_usd_when_both_columns_present(tmp_path: Path) -> Non
     wb.save(path)
     wb.close()
 
-    rows, skipped, _ = parse_daily_expenses_excel(path)
-    assert skipped == 0
+    result = parse_daily_expenses_excel(path)
+    rows = result.rows
+    assert result.skipped_blank == 0
     assert len(rows) == 2
     assert rows[0].amount == 50000.0
     assert rows[0].amount_usd == 40.5
@@ -275,6 +295,105 @@ def test_parse_daily_expenses_excel_can_cancel(tmp_path: Path) -> None:
 
     with pytest.raises(DailyImportCancelled):
         parse_daily_expenses_excel(path, should_cancel=lambda: True)
+
+
+def test_parse_missing_date_becomes_problem_not_silent_skip(tmp_path: Path) -> None:
+    path = tmp_path / "matumizi_missing_date.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Date", "Description", "TZS", "Truck No."])
+    ws.append([datetime(2026, 8, 20), "DIESEL", 10000, "T688 EAF"])
+    ws.append([None, "TOLLS", 5000, "T100 ABC"])  # missing date
+    ws.append(["", "PARKING", 2000, ""])  # empty date
+    ws.append([None, "TOTAL", 17000, ""])  # total line — auto-skip
+    wb.save(path)
+    wb.close()
+
+    result = parse_daily_expenses_excel(path)
+    assert len(result.rows) == 1
+    assert result.rows[0].description == "DIESEL"
+    assert len(result.problems) == 2
+    assert all(p.reason == REASON_MISSING_DATE for p in result.problems)
+    assert {p.description for p in result.problems} == {"TOLLS", "PARKING"}
+    assert result.skip_reasons.get(REASON_MISSING_DATE) == 2
+    assert result.skip_reasons.get("total_row") == 1
+    assert result.skipped_blank == 1  # only TOTAL auto-skipped
+
+
+@pytest.mark.asyncio
+async def test_absorb_import_problems_promotes_fixed_and_counts_skips(
+    monkeypatch,
+) -> None:
+    from tahmeed.services.daily_import_service import DailyImportProblemRow
+    from tahmeed.services.description_mapping_service import normalize_description
+
+    preview = DailyImportPreview(
+        source_filename="x.xlsx",
+        source_path="x.xlsx",
+        rows=[
+            DailyImportRow(
+                serial=1,
+                date=datetime(2026, 8, 20),
+                description="DIESEL",
+                truck_number="",
+                lpo_do="",
+                do_number="",
+                memo="",
+                notes="",
+                amount=1000.0,
+                currency="TZS",
+                receipt_status="pending",
+                ownership="",
+                approver="",
+            )
+        ],
+        primary_date=date(2026, 8, 20),
+        problem_rows=[
+            DailyImportProblemRow(
+                excel_row=3,
+                reason=REASON_MISSING_DATE,
+                description="TOLLS",
+                amount=5000.0,
+                date=datetime(2026, 8, 20),
+            ),
+            DailyImportProblemRow(
+                excel_row=4,
+                reason=REASON_MISSING_DATE,
+                description="SKIP ME",
+                amount=100.0,
+                skipped=True,
+            ),
+        ],
+    )
+
+    async def _no_maps(_descs):
+        return {}
+
+    monkeypatch.setattr(
+        "tahmeed.services.daily_import_service.get_mappings_for_descriptions",
+        _no_maps,
+    )
+    await absorb_import_problems(preview)
+
+    assert len(preview.problem_rows) == 0
+    assert len(preview.rows) == 2
+    assert preview.rows[1].description == "TOLLS"
+    assert preview.rows[1].date == datetime(2026, 8, 20)
+    assert preview.skipped_blank == 1
+    assert preview.skip_reasons.get("missing_date_user_skip") == 1
+    assert normalize_description("TOLLS") in preview.unmapped
+
+
+def test_problem_to_import_row_requires_date() -> None:
+    from tahmeed.services.daily_import_service import DailyImportProblemRow
+
+    problem = DailyImportProblemRow(
+        excel_row=2,
+        reason=REASON_MISSING_DATE,
+        description="X",
+    )
+    with pytest.raises(ValueError):
+        problem_to_import_row(problem)
 
 
 def test_transaction_to_doc_omits_null_import_id() -> None:

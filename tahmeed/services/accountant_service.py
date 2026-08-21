@@ -4,7 +4,7 @@ import asyncio
 import calendar
 import hashlib
 import re
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from bson import ObjectId
@@ -472,6 +472,234 @@ async def get_overview_receipt_breakdown(year: int) -> dict:
     }
 
 
+# ── Overview fuel litres (stations + Diesel Cash) ────────────────────────────
+
+FUEL_LITERS_PERIODS = ("month", "3m", "year")
+FUEL_LITERS_SERIES: Tuple[Tuple[str, str], ...] = (
+    ("diesel_cash", "Diesel Cash"),
+    ("infinity", "Infinity"),
+    ("lake_zambia", "Lake Zambia"),
+    ("lake_tunduma", "Lake Tunduma"),
+    ("gbp_diesel", "GBP Diesel"),
+)
+
+
+def empty_fuel_liters_daily() -> Dict[str, Dict[date, float]]:
+    return {key: {} for key, _ in FUEL_LITERS_SERIES}
+
+
+def add_fuel_liters_day(
+    store: Dict[str, Dict[date, float]],
+    source: str,
+    when: Any,
+    liters: Optional[float],
+) -> None:
+    """Add a positive litre quantity onto one calendar day for *source*."""
+    if source not in store or liters is None:
+        return
+    try:
+        qty = float(liters)
+    except (TypeError, ValueError):
+        return
+    if qty <= 0:
+        return
+    if isinstance(when, datetime):
+        day = when.date()
+    elif isinstance(when, date):
+        day = when
+    else:
+        return
+    bucket = store[source]
+    bucket[day] = bucket.get(day, 0.0) + qty
+
+
+def accumulate_diesel_cash_fuel_liters(
+    docs: Iterable[dict],
+    store: Dict[str, Dict[date, float]],
+) -> None:
+    """Parse litres from Diesel Cash descriptions into the daily store."""
+    for doc in docs:
+        liters = parse_liters_from_description(str(doc.get("description") or ""))
+        add_fuel_liters_day(store, "diesel_cash", doc.get("date"), liters)
+
+
+def _fuel_liters_as_of(year: int, today: date) -> date:
+    if year == today.year:
+        return today
+    if year < today.year:
+        return date(year, 12, 31)
+    return date(year, 1, 1)
+
+
+def _fuel_bucket_date(day: date, grain: str) -> date:
+    if grain == "month":
+        return date(day.year, day.month, 1)
+    if grain == "week":
+        return day - timedelta(days=day.weekday())
+    return day
+
+
+def fuel_liters_period_spec(
+    period: str,
+    year: int,
+    today: Optional[date] = None,
+) -> dict:
+    """Labels, bucket keys, and date window for an Overview fuel-litres period."""
+    today = today or date.today()
+    period = period if period in FUEL_LITERS_PERIODS else "year"
+    as_of = _fuel_liters_as_of(year, today)
+
+    if period == "month":
+        start = date(as_of.year, as_of.month, 1)
+        keys = [date(as_of.year, as_of.month, day) for day in range(1, as_of.day + 1)]
+        labels = [str(day) for day in range(1, as_of.day + 1)]
+        subtitle = (
+            f"Litres by day, {calendar.month_name[as_of.month]} {as_of.year}"
+        )
+        grain = "day"
+        end = as_of
+    elif period == "3m":
+        start_month = as_of.month - 2
+        start_year = as_of.year
+        while start_month < 1:
+            start_month += 12
+            start_year -= 1
+        start = date(start_year, start_month, 1)
+        fy_start = date(year, 1, 1)
+        if start < fy_start:
+            start = fy_start
+        end = as_of
+        grain = "week"
+        keys: List[date] = []
+        labels = []
+        cursor = start - timedelta(days=start.weekday())
+        while cursor <= end:
+            keys.append(cursor)
+            label_day = start if cursor < start else cursor
+            labels.append(f"{label_day.day} {calendar.month_abbr[label_day.month]}")
+            cursor += timedelta(days=7)
+        if start.month == as_of.month and start.year == as_of.year:
+            subtitle = (
+                f"Litres by week, {calendar.month_name[as_of.month]} {as_of.year}"
+            )
+        elif start.year == as_of.year:
+            subtitle = (
+                f"Litres by week, {calendar.month_abbr[start.month]} to "
+                f"{calendar.month_abbr[as_of.month]} {as_of.year}"
+            )
+        else:
+            subtitle = (
+                f"Litres by week, {calendar.month_abbr[start.month]} {start.year} "
+                f"to {calendar.month_abbr[as_of.month]} {as_of.year}"
+            )
+    else:
+        grain = "month"
+        start = date(year, 1, 1)
+        end_month = as_of.month if as_of.year == year else 12
+        end = date(year, end_month, calendar.monthrange(year, end_month)[1])
+        if as_of.year == year:
+            end = min(end, as_of)
+        keys = [date(year, month, 1) for month in range(1, end_month + 1)]
+        labels = [calendar.month_abbr[month] for month in range(1, end_month + 1)]
+        if end_month == 1:
+            subtitle = f"Litres by month, Jan {year}"
+        elif end_month == 12:
+            subtitle = f"Litres by month, {year}"
+        else:
+            subtitle = (
+                f"Litres by month, Jan to {calendar.month_abbr[end_month]} {year}"
+            )
+
+    return {
+        "period": period,
+        "grain": grain,
+        "start": start,
+        "end": end,
+        "keys": keys,
+        "labels": labels,
+        "subtitle": subtitle,
+    }
+
+
+def bucket_daily_fuel_liters(
+    daily: Dict[str, Dict[date, float]],
+    period: str,
+    year: int,
+    today: Optional[date] = None,
+) -> dict:
+    """Roll daily litres into the requested period for the line chart."""
+    spec = fuel_liters_period_spec(period, year, today)
+    index = {key: i for i, key in enumerate(spec["keys"])}
+    series = []
+    total = 0.0
+    for key, label in FUEL_LITERS_SERIES:
+        values = [0.0] * len(spec["keys"])
+        for day, liters in (daily.get(key) or {}).items():
+            if day < spec["start"] or day > spec["end"]:
+                continue
+            bucket = _fuel_bucket_date(day, spec["grain"])
+            slot = index.get(bucket)
+            if slot is None:
+                continue
+            values[slot] += float(liters or 0.0)
+        total += sum(values)
+        series.append({"key": key, "label": label, "values": values})
+    return {
+        "period": spec["period"],
+        "grain": spec["grain"],
+        "labels": spec["labels"],
+        "keys": spec["keys"],
+        "subtitle": spec["subtitle"],
+        "series": series,
+        "total": total,
+    }
+
+
+async def get_overview_fuel_liters(year: int) -> dict:
+    """Daily litres for Diesel Cash and each fuel station in *year*."""
+    store = empty_fuel_liters_daily()
+    db = get_db()
+    start = datetime(year, 1, 1)
+    end = datetime(year, 12, 31, 23, 59, 59)
+
+    diesel_match = _diesel_cash_verified_match(await get_diesel_cash_item_names())
+    diesel_match["date"] = {"$gte": start, "$lte": end}
+
+    feed_types = list(_DIESEL_FEED_SOURCE_GROUP.keys())
+    station_pipeline = [
+        {"$match": {
+            "feed_type": {"$in": feed_types},
+            "transaction_date": {"$gte": start, "$lte": end},
+        }},
+        {"$group": {
+            "_id": {
+                "feed": "$feed_type",
+                "y": {"$year": "$transaction_date"},
+                "m": {"$month": "$transaction_date"},
+                "d": {"$dayOfMonth": "$transaction_date"},
+            },
+            "liters": {"$sum": _safe_double("ltrs")},
+        }},
+    ]
+
+    cash_docs, station_docs = await asyncio.gather(
+        db.transactions.find(
+            diesel_match, projection={"date": 1, "description": 1}
+        ).to_list(length=None),
+        db.imported_feeds.aggregate(station_pipeline).to_list(length=None),
+    )
+    accumulate_diesel_cash_fuel_liters(cash_docs, store)
+    for doc in station_docs:
+        ident = doc.get("_id") or {}
+        source = _DIESEL_FEED_SOURCE_GROUP.get(str(ident.get("feed") or ""), "")
+        try:
+            day = date(int(ident["y"]), int(ident["m"]), int(ident["d"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        add_fuel_liters_day(store, source, day, doc.get("liters"))
+    return {"year": year, "series": store}
+
+
 async def get_overview_month_totals(year: int) -> Dict:
     """Per-month TZS / USD / ZMW totals for the Overview trend chart.
 
@@ -504,11 +732,11 @@ async def get_overview_month_totals(year: int) -> Dict:
 
 async def get_overview_dashboard(year: int) -> dict:
     """All data needed by the accountant Overview tab."""
-    kpis, month_payload, categories, receipts, recent = await asyncio.gather(
+    kpis, month_payload, categories, fuel_liters, recent = await asyncio.gather(
         get_overview_kpis(year),
         get_overview_month_totals(year),
         get_overview_category_breakdown(year),
-        get_overview_receipt_breakdown(year),
+        get_overview_fuel_liters(year),
         get_verified_transactions(year=year, limit=8),
     )
     kpis = dict(kpis)
@@ -524,7 +752,7 @@ async def get_overview_dashboard(year: int) -> dict:
         "kpis": kpis,
         "month_totals": month_payload.get("months", {}),
         "categories": categories,
-        "receipts": receipts,
+        "fuel_liters": fuel_liters,
         "recent": recent,
     }
 

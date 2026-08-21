@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import date
 from typing import Optional
 
 import qtawesome as qta
-from PySide6.QtCore import Qt, QRectF, QDateTime, Signal
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont
+from PySide6.QtCore import Qt, QRectF, QPointF, QDateTime, Signal
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPainterPath
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
-    QScrollArea, QPushButton, QSizePolicy, QProgressBar, QMenu, QButtonGroup,
+    QScrollArea, QPushButton, QSizePolicy, QMenu, QButtonGroup,
 )
 
 from tahmeed.app_state import app_state
@@ -41,6 +42,18 @@ _MONTH_ABBR = (
 )
 _CURRENCIES = ("TZS", "USD", "ZMW")
 _CURRENCY_KEY = {"TZS": "tzs", "USD": "usd", "ZMW": "zmw"}
+_FUEL_PERIODS = (
+    ("month", "Month"),
+    ("3m", "3 months"),
+    ("year", "Year"),
+)
+_FUEL_SERIES_COLORS = {
+    "diesel_cash": _NAVY,
+    "infinity": _BLUE,
+    "lake_zambia": _AMBER,
+    "lake_tunduma": _PURPLE,
+    "gbp_diesel": _GREEN,
+}
 
 # Card chrome is applied only via QFrame#overviewCard — never unscoped,
 # so border does not cascade onto child labels.
@@ -177,6 +190,49 @@ class _CurrencyToggle(QWidget):
 
     def _on_clicked(self, currency: str) -> None:
         self.set_currency(currency)
+
+
+class _PeriodToggle(QWidget):
+    changed = Signal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._period = "year"
+        self.setStyleSheet("background: transparent; border: none;")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._buttons: dict[str, QPushButton] = {}
+        for key, label in _FUEL_PERIODS:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(26)
+            btn.setChecked(key == "year")
+            btn.setStyleSheet(_currency_toggle_style(key == "year"))
+            btn.clicked.connect(lambda _=False, k=key: self._on_clicked(k))
+            self._group.addButton(btn)
+            self._buttons[key] = btn
+            row.addWidget(btn)
+
+    def period(self) -> str:
+        return self._period
+
+    def set_period(self, period: str, *, emit: bool = True) -> None:
+        key = period if period in self._buttons else "year"
+        if key == self._period:
+            return
+        self._period = key
+        for code, btn in self._buttons.items():
+            btn.setChecked(code == key)
+            btn.setStyleSheet(_currency_toggle_style(code == key))
+        if emit:
+            self.changed.emit(key)
+
+    def _on_clicked(self, period: str) -> None:
+        self.set_period(period)
 
 
 # ── KPI Card ──────────────────────────────────────────────────────────────────
@@ -363,74 +419,183 @@ def _donut_legend(slices: list[tuple[str, float, str]]) -> QWidget:
     return w
 
 
-# ── Receipt status card ───────────────────────────────────────────────────────
+def _fmt_liters_tick(value: float) -> str:
+    if value >= 1_000_000:
+        text = f"{value / 1_000_000:.1f}M"
+        return text.replace(".0M", "M")
+    if value >= 1000:
+        text = f"{value / 1000:.1f}k"
+        return text.replace(".0k", "k")
+    if abs(value - round(value)) < 0.05:
+        return f"{value:.0f}"
+    return f"{value:.1f}"
 
-class _ReceiptCard(QFrame):
+
+def _nice_max(value: float) -> float:
+    if value <= 0:
+        return 1.0
+    exp = math.floor(math.log10(value))
+    frac = value / (10 ** exp)
+    if frac <= 1:
+        nice = 1
+    elif frac <= 2:
+        nice = 2
+    elif frac <= 5:
+        nice = 5
+    else:
+        nice = 10
+    return nice * (10 ** exp)
+
+
+class _LineChartWidget(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setObjectName("overviewCard")
-        self.setStyleSheet(
-            "QFrame#overviewCard {"
-            "  background: #FFFFFF;"
-            "  border: 1px solid #E5E7EB;"
-            "  border-radius: 12px;"
-            "}"
-        )
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(18, 16, 18, 16)
-        vl.setSpacing(12)
-        vl.addWidget(_lbl("Receipt status", size=14, weight=600))
-        self._rows_layout = QVBoxLayout()
-        self._rows_layout.setSpacing(10)
-        vl.addLayout(self._rows_layout)
+        self._labels: list[str] = []
+        self._series: list[tuple[str, str, list[float]]] = []
+        self.setMinimumHeight(200)
+        self.setStyleSheet("background: transparent; border: none;")
 
-    def set_data(self, received: int, pending: int, missing: int, total: int) -> None:
-        while self._rows_layout.count():
-            item = self._rows_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+    def set_data(
+        self,
+        labels: list[str],
+        series: list[tuple[str, str, list[float]]],
+    ) -> None:
+        self._labels = labels or []
+        self._series = series or []
+        self.update()
 
-        if total <= 0:
-            self._rows_layout.addWidget(_lbl("No verified entries for this FY.", size=12, color=_TM))
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        pl, pr, pt, pb = 48, 16, 12, 32
+        w = max(1, self.width() - pl - pr)
+        h = max(1, self.height() - pt - pb)
+        labels = self._labels
+        n = max(1, len(labels))
+        max_v = 0.0
+        for _, _, values in self._series:
+            if values:
+                max_v = max(max_v, max(values))
+        max_v = _nice_max(max_v)
+
+        p.setPen(QPen(QColor(_BORDER), 1))
+        p.setFont(QFont("Segoe UI", 8))
+        for i in range(5):
+            y = int(pt + h - (i / 4) * h)
+            p.drawLine(pl, y, pl + w, y)
+            p.setPen(QColor(_TM))
+            tick = max_v * i / 4
+            p.drawText(4, y + 4, _fmt_liters_tick(tick))
+            p.setPen(QPen(QColor(_BORDER), 1))
+
+        if not labels or not self._series or max_v <= 0:
+            p.setPen(QColor(_TM))
+            p.setFont(QFont("Segoe UI", 11))
+            p.drawText(
+                QRectF(pl, pt, w, h),
+                Qt.AlignCenter,
+                "No litres for this period.",
+            )
+            p.end()
             return
 
-        rows = [
-            ("Received", received, _GREEN),
-            ("Pending", pending, _AMBER),
-            ("Missing", missing, _RED),
-        ]
-        for label, count, color in rows:
-            pct = int(round(count / total * 100))
-            row_w = QWidget()
-            row_w.setStyleSheet("background: transparent; border: none;")
-            rl = QVBoxLayout(row_w)
-            rl.setContentsMargins(0, 0, 0, 0)
-            rl.setSpacing(4)
+        has_values = any(
+            any(v > 0 for v in values) for _, _, values in self._series
+        )
+        if not has_values:
+            p.setPen(QColor(_TM))
+            p.setFont(QFont("Segoe UI", 11))
+            p.drawText(
+                QRectF(pl, pt, w, h),
+                Qt.AlignCenter,
+                "No litres for this period.",
+            )
+            p.setPen(QColor(_T2))
+            p.setFont(QFont("Segoe UI", 9))
+            fm = p.fontMetrics()
+            step = 1 if n <= 12 else max(1, (n - 1) // 7)
+            for i, label in enumerate(labels):
+                if i % step and i != n - 1:
+                    continue
+                cx = int(pl + (i / max(n - 1, 1)) * w) if n > 1 else pl + w // 2
+                tw = fm.horizontalAdvance(label)
+                p.drawText(cx - tw // 2, self.height() - 8, label)
+            p.end()
+            return
 
-            top = QHBoxLayout()
-            top.addWidget(_lbl(label, size=12, color=_T2))
-            top.addStretch()
-            top.addWidget(_lbl(f"{count:,}  ·  {pct}%", size=12, weight=600))
-            rl.addLayout(top)
+        def _x_at(i: int) -> float:
+            if n == 1:
+                return pl + w / 2
+            return pl + (i / (n - 1)) * w
 
-            bar = QProgressBar()
-            bar.setFixedHeight(6)
-            bar.setRange(0, 100)
-            bar.setValue(pct)
-            bar.setTextVisible(False)
-            bar.setStyleSheet(f"""
-                QProgressBar {{
-                    background: {_BORDER};
-                    border: none;
-                    border-radius: 3px;
-                }}
-                QProgressBar::chunk {{
-                    background: {color};
-                    border-radius: 3px;
-                }}
-            """)
-            rl.addWidget(bar)
-            self._rows_layout.addWidget(row_w)
+        def _y_at(value: float) -> float:
+            return pt + h - (max(value, 0.0) / max_v) * h
+
+        for _, color, values in self._series:
+            if not values:
+                continue
+            path = QPainterPath()
+            started = False
+            points: list[QPointF] = []
+            count = min(n, len(values))
+            for i in range(count):
+                pt_x = _x_at(i)
+                pt_y = _y_at(values[i])
+                point = QPointF(pt_x, pt_y)
+                points.append(point)
+                if not started:
+                    path.moveTo(point)
+                    started = True
+                else:
+                    path.lineTo(point)
+            p.setPen(QPen(QColor(color), 2.2))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+            if count <= 16:
+                p.setBrush(QBrush(QColor(color)))
+                p.setPen(Qt.NoPen)
+                for point in points:
+                    p.drawEllipse(point, 3.2, 3.2)
+
+        p.setPen(QColor(_T2))
+        p.setFont(QFont("Segoe UI", 9))
+        fm = p.fontMetrics()
+        step = 1 if n <= 12 else max(1, (n - 1) // 7)
+        for i, label in enumerate(labels):
+            if i % step and i != n - 1:
+                continue
+            cx = int(_x_at(i))
+            tw = fm.horizontalAdvance(label)
+            p.drawText(cx - tw // 2, self.height() - 8, label)
+
+        p.end()
+
+
+def _fuel_legend(series: list[tuple[str, str]]) -> QWidget:
+    w = QWidget()
+    w.setStyleSheet("background: transparent; border: none;")
+    row = QHBoxLayout(w)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(14)
+    for key, label in series:
+        color = _FUEL_SERIES_COLORS.get(key, _TM)
+        cell = QHBoxLayout()
+        cell.setSpacing(6)
+        cell.setContentsMargins(0, 0, 0, 0)
+        dot = QLabel("●")
+        dot.setStyleSheet(
+            f"QLabel {{ color: {color}; font-size: 11px;"
+            f" background: transparent; border: none; }}"
+        )
+        cell.addWidget(dot)
+        cell.addWidget(_lbl(label, size=11, color=_T2))
+        wrap = QWidget()
+        wrap.setStyleSheet("background: transparent; border: none;")
+        wrap.setLayout(cell)
+        row.addWidget(wrap)
+    row.addStretch()
+    return w
 
 
 # ── Recent activity card ─────────────────────────────────────────────────────
@@ -508,7 +673,7 @@ class _ActivityCard(QFrame):
 # ── OverviewWidget (public) ───────────────────────────────────────────────────
 
 class OverviewWidget(QWidget):
-    """Accountant overview — live KPIs, charts, receipts, and activity."""
+    """Accountant overview — live KPIs, charts, fuel litres, and activity."""
 
     navigate = Signal(str)
 
@@ -531,7 +696,12 @@ class OverviewWidget(QWidget):
         self._category_toggle: Optional[_CurrencyToggle] = None
         self._donut: Optional[_DonutChart] = None
         self._donut_legend_host: Optional[QVBoxLayout] = None
-        self._receipt_card: Optional[_ReceiptCard] = None
+        self._fuel_period = "year"
+        self._fuel_daily: dict = {}
+        self._fuel_chart: Optional[_LineChartWidget] = None
+        self._fuel_subtitle: Optional[QLabel] = None
+        self._fuel_toggle: Optional[_PeriodToggle] = None
+        self._fuel_legend_host: Optional[QVBoxLayout] = None
         self._activity_card: Optional[_ActivityCard] = None
         self._fy_btn: Optional[QPushButton] = None
         self.setStyleSheet(
@@ -564,7 +734,7 @@ class OverviewWidget(QWidget):
         kpis = data["kpis"]
         self._month_totals = data["month_totals"]
         self._categories = data["categories"]
-        receipts = data["receipts"]
+        self._fuel_daily = (data.get("fuel_liters") or {}).get("series") or {}
         recent = data["recent"]
 
         if self._kpi_pending:
@@ -584,14 +754,7 @@ class OverviewWidget(QWidget):
 
         self._refresh_trend_chart()
         self._refresh_category_chart()
-
-        if self._receipt_card:
-            self._receipt_card.set_data(
-                receipts["received"],
-                receipts["pending"],
-                receipts["missing"],
-                receipts["total"],
-            )
+        self._refresh_fuel_chart()
         if self._activity_card:
             self._activity_card.set_transactions(recent)
 
@@ -606,6 +769,43 @@ class OverviewWidget(QWidget):
             self._category_toggle.set_currency(currency, emit=False)
         self._refresh_trend_chart()
         self._refresh_category_chart()
+
+    def _on_fuel_period_changed(self, period: str) -> None:
+        if period == self._fuel_period:
+            return
+        self._fuel_period = period
+        self._refresh_fuel_chart()
+
+    def _refresh_fuel_chart(self) -> None:
+        from tahmeed.services.accountant_service import bucket_daily_fuel_liters
+
+        chart = bucket_daily_fuel_liters(
+            self._fuel_daily,
+            self._fuel_period,
+            self._year,
+        )
+        series = [
+            (
+                item["key"],
+                _FUEL_SERIES_COLORS.get(item["key"], _TM),
+                list(item.get("values") or []),
+            )
+            for item in chart.get("series") or []
+        ]
+        if self._fuel_chart:
+            self._fuel_chart.set_data(list(chart.get("labels") or []), series)
+        if self._fuel_subtitle:
+            self._fuel_subtitle.setText(chart.get("subtitle") or "Litres")
+        if self._fuel_legend_host:
+            while self._fuel_legend_host.count():
+                item = self._fuel_legend_host.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            self._fuel_legend_host.addWidget(
+                _fuel_legend(
+                    [(item["key"], item["label"]) for item in chart.get("series") or []]
+                )
+            )
 
     def _refresh_trend_chart(self) -> None:
         today = date.today()
@@ -817,16 +1017,38 @@ class OverviewWidget(QWidget):
         charts_row.addWidget(pie_card, 4)
         vl.addLayout(charts_row)
 
-        # Bottom row
+        # Bottom row — fuel litres over time + recent activity
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(16)
-        self._receipt_card = _ReceiptCard()
-        bottom_row.addWidget(self._receipt_card, 5)
+
+        fuel_card = _card()
+        fuel_card.setMinimumHeight(280)
+        fuel_vl = QVBoxLayout(fuel_card)
+        fuel_vl.setContentsMargins(20, 18, 20, 18)
+        fuel_vl.setSpacing(6)
+        fuel_header = QHBoxLayout()
+        fuel_header.addWidget(_lbl("Fuel consumption", size=14, weight=600))
+        fuel_header.addStretch()
+        self._fuel_toggle = _PeriodToggle()
+        self._fuel_toggle.changed.connect(self._on_fuel_period_changed)
+        fuel_header.addWidget(self._fuel_toggle)
+        fuel_vl.addLayout(fuel_header)
+        self._fuel_subtitle = _lbl("Litres by month", size=12, color=_TM)
+        fuel_vl.addWidget(self._fuel_subtitle)
+        self._fuel_chart = _LineChartWidget()
+        fuel_vl.addWidget(self._fuel_chart, 1)
+        legend_wrap = QWidget()
+        legend_wrap.setStyleSheet("background: transparent; border: none;")
+        self._fuel_legend_host = QVBoxLayout(legend_wrap)
+        self._fuel_legend_host.setContentsMargins(0, 4, 0, 0)
+        fuel_vl.addWidget(legend_wrap)
+        bottom_row.addWidget(fuel_card, 6)
+
         self._activity_card = _ActivityCard()
         self._activity_card.view_all_clicked.connect(
             lambda: self.navigate.emit("master_expenses")
         )
-        bottom_row.addWidget(self._activity_card, 5)
+        bottom_row.addWidget(self._activity_card, 4)
         vl.addLayout(bottom_row)
 
         # Quick actions
@@ -860,4 +1082,5 @@ class OverviewWidget(QWidget):
 
         scroll.setWidget(content)
         root.addWidget(scroll)
+        self._refresh_fuel_chart()
         self.refresh()

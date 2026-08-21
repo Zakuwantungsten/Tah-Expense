@@ -68,6 +68,18 @@ class DailyImportPreviewDialog(QDialog):
         )
         skipped = p.skipped_blank
         unmapped = sum(p.unmapped.values()) if p.unmapped else 0
+        reasons = p.skip_reasons or {}
+        reason_bits = []
+        if reasons.get("missing_date_user_skip"):
+            reason_bits.append(
+                f"{reasons['missing_date_user_skip']:,} date problem(s) skipped"
+            )
+        if reasons.get("empty_description"):
+            reason_bits.append(
+                f"{reasons['empty_description']:,} blank description"
+            )
+        if reasons.get("total_row"):
+            reason_bits.append(f"{reasons['total_row']:,} total line(s)")
         summary = QLabel(
             f"<b>{p.source_filename}</b><br>"
             f"{len(p.rows):,} row(s) ready · Register date <b>{primary}</b>"
@@ -77,7 +89,12 @@ class DailyImportPreviewDialog(QDialog):
                 if p.outlier_count > 0
                 else ""
             )
-            + (f" · {skipped:,} blank/skipped" if skipped else "")
+            + (
+                f" · {skipped:,} blank/skipped"
+                + (f" ({', '.join(reason_bits)})" if reason_bits else "")
+                if skipped
+                else ""
+            )
             + (f" · {unmapped:,} without item" if unmapped else "")
         )
         summary.setStyleSheet(f"color: {_T2}; font-size: 12px;")

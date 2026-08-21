@@ -49,7 +49,7 @@ class Transaction:
     lpo_do: str = ""
     do_number: str = ""
     memo: str = ""
-    receipt_status: str = "pending"    # "pending" | "received" | "missing" | "no_receipt"
+    receipt_status: str = "pending"    # free text from register / Excel; legacy keys still ok
     notes_flag: bool = False           # True when Ref_Float is "REFUND TO FLOAT"
     ref_float: str = ""                # free-text Ref_Float (autocomplete suggests REFUND TO FLOAT)
     ownership: str = ""

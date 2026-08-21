@@ -29,7 +29,7 @@ from tahmeed.ui.accountant.separate_expenses import (
     _make_table, _cell, _finish_table_row, _stripe_bg, _fmt_num,
 )
 from tahmeed.ui.cashier.register_delegates import (
-    EDIT_BG, DIRTY_BG, NEG_COLOR,
+    EDIT_BG, DIRTY_BG,
     _ExcelCellDelegate, _ItemDelegate, _DescriptionDelegate, _TruckDelegate,
     _DateDelegate, _RefFloatDelegate, _TZSDelegate, _ReceiptDelegate,
     _parse_optional_date, _parse_amount_text, _parse_optional_amount_text,
@@ -403,7 +403,6 @@ class MasterLedgerTable(QFrame):
         )
         item_str = tx.item or tx.category_name or ""
         tzs_txt, usd_txt = _amount_cells(tx)
-        amt_color = _RED if tx.amount < 0 else _T1
         rcpt_key = _normalize_receipt(tx.receipt_status)
 
         sno = _cell(str(serial), self._flag("center"))
@@ -421,14 +420,14 @@ class MasterLedgerTable(QFrame):
         ref_text = _ref_float_display(tx)
         t.setItem(
             r, _COL_REF,
-            _cell(ref_text or "—", color=_AMBER if ref_text else _TM),
+            _cell(ref_text or "—", color=_T1 if ref_text else _TM),
         )
         t.setItem(
             r, _COL_TZS,
             _cell(
                 tzs_txt or "—",
                 self._flag("right"),
-                color=amt_color if tzs_txt else _TM,
+                color=_T1 if tzs_txt else _TM,
             ),
         )
         t.setItem(
@@ -436,7 +435,7 @@ class MasterLedgerTable(QFrame):
             _cell(
                 usd_txt or "—",
                 self._flag("right"),
-                color=amt_color if usd_txt else _TM,
+                color=_T1 if usd_txt else _TM,
             ),
         )
         t.setItem(r, _COL_RCPT, _cell(rcpt_key, self._flag("center")))
@@ -686,7 +685,7 @@ class MasterLedgerTable(QFrame):
                 formatted = f"{amt:,.{decimals}f}"
                 self._tbl.blockSignals(True)
                 item.setText(formatted)
-                item.setForeground(NEG_COLOR if amt < 0 else QColor(_T1))
+                item.setForeground(QColor(_T1))
                 self._tbl.blockSignals(False)
         if col == _COL_TRUCK:
             self._validate_truck_cell(row, item)
@@ -886,8 +885,7 @@ class MasterLedgerTable(QFrame):
         it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
         if col in (_COL_TZS, _COL_USD):
             it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            if value and _parse_amount_text(value) < 0:
-                it.setForeground(NEG_COLOR)
+            it.setForeground(QColor(_T1))
         self._tbl.setItem(row, col, it)
 
     def _fill_down(self) -> None:
