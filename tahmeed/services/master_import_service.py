@@ -13,13 +13,14 @@ import openpyxl
 from bson import ObjectId
 
 from tahmeed.db.connection import get_db
-from tahmeed.models.transaction import Transaction
+from tahmeed.models.transaction import Transaction, pack_money
 from tahmeed.services.description_mapping_service import (
     get_mappings_for_descriptions,
     normalize_description,
     save_mapping,
 )
 from tahmeed.services.excel_dates import parse_excel_date
+from tahmeed.services.daily_import_service import parse_amount
 
 
 _MONTH_LABELS = [
@@ -47,6 +48,7 @@ class MasterImportRow:
     approver: str
     category_id: Optional[ObjectId] = None
     category_name: Optional[str] = None
+    amount_usd: Optional[float] = None
 
 
 @dataclass
@@ -119,23 +121,11 @@ def parse_master_expenses_excel(
                 skipped += 1
                 continue
 
-            tzs = row[11] if len(row) > 11 else None
-            usd = row[12] if len(row) > 12 else None
-            amount = 0.0
-            currency = "TZS"
-            try:
-                if usd is not None and float(usd) != 0:
-                    amount = float(usd)
-                    currency = "USD"
-                elif tzs is not None and float(tzs) != 0:
-                    amount = float(tzs)
-                    currency = "TZS"
-                else:
-                    amount = float(tzs or usd or 0)
-                    currency = "USD" if usd not in (None, "", 0) else "TZS"
-            except (TypeError, ValueError):
-                skipped += 1
-                continue
+            # Positional TZS (11) / USD (12). Short rows without col 12 are
+            # treated as TZS-only — same as sheets that omit the USD column.
+            tzs = parse_amount(row[11] if len(row) > 11 else None)
+            usd = parse_amount(row[12]) if len(row) > 12 else None
+            amount, amount_usd, currency = pack_money(tzs, usd)
 
             serial = None
             try:
@@ -157,6 +147,7 @@ def parse_master_expenses_excel(
                 notes=notes,
                 amount=amount,
                 currency=currency,
+                amount_usd=amount_usd,
                 receipt_raw=_cell_str(row[13]) if len(row) > 13 else "",
                 ownership=_cell_str(row[14]) if len(row) > 14 else "",
                 approver=_cell_str(row[15]) if len(row) > 15 else "",
@@ -233,6 +224,7 @@ def _row_to_transaction(
         truck_number=row.truck_number,
         amount=row.amount,
         currency=row.currency,
+        amount_usd=row.amount_usd,
         category_id=row.category_id,
         category_name=row.category_name,
         category_confidence=1.0 if row.category_name else 0.0,

@@ -194,9 +194,73 @@ def test_accept_header_mapped_workbook(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0].description == "DIESEL"
     assert rows[0].amount == 10000.0
+    assert rows[0].currency == "TZS"
+    assert rows[0].amount_usd is None
 
     rows2, _, _ = parse_daily_expenses_excel(path, should_cancel=lambda: False)
     assert len(rows2) == 1
+
+
+def test_parse_dual_tzs_and_usd_when_both_columns_present(tmp_path: Path) -> None:
+    path = tmp_path / "matumizi_dual.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Date", "Description", "TZS", "USD", "Truck No."])
+    ws.append([datetime(2026, 7, 21), "PARTS", 50000, 40.5, "T688 EAF"])
+    ws.append([datetime(2026, 7, 21), "USD ONLY", None, 12.0, ""])
+    wb.save(path)
+    wb.close()
+
+    rows, skipped, _ = parse_daily_expenses_excel(path)
+    assert skipped == 0
+    assert len(rows) == 2
+    assert rows[0].amount == 50000.0
+    assert rows[0].amount_usd == 40.5
+    assert rows[0].currency == "TZS"
+    assert rows[1].amount == 12.0
+    assert rows[1].amount_usd == 12.0
+    assert rows[1].currency == "USD"
+
+    preview = DailyImportPreview(
+        source_filename=path.name,
+        source_path=str(path),
+        rows=rows,
+        primary_date=date(2026, 7, 21),
+    )
+    payload = staged_row_payload(rows[0], preview)
+    assert payload["amount"] == 50000.0
+    assert payload["amount_usd"] == 40.5
+    assert payload["currency"] == "TZS"
+
+
+def test_pack_money_and_money_parts_roundtrip() -> None:
+    from tahmeed.models.transaction import pack_money
+
+    assert pack_money(1000.0, None) == (1000.0, None, "TZS")
+    assert pack_money(None, 25.0) == (25.0, 25.0, "USD")
+    assert pack_money(1000.0, 25.0) == (1000.0, 25.0, "TZS")
+
+    dual = Transaction(
+        date=datetime(2026, 7, 21),
+        description="X",
+        truck_number="",
+        amount=1000.0,
+        currency="TZS",
+        amount_usd=25.0,
+    )
+    assert dual.money_parts() == (1000.0, 25.0)
+    doc = dual.to_doc()
+    assert doc["amount_usd"] == 25.0
+    assert Transaction.from_doc(doc).money_parts() == (1000.0, 25.0)
+
+    legacy_usd = Transaction(
+        date=datetime(2026, 7, 21),
+        description="Y",
+        truck_number="",
+        amount=25.0,
+        currency="USD",
+    )
+    assert legacy_usd.money_parts() == (0.0, 25.0)
 
 
 def test_parse_daily_expenses_excel_can_cancel(tmp_path: Path) -> None:

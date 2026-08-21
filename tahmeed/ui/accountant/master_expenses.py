@@ -271,14 +271,15 @@ def _is_tzs(currency: str) -> bool:
 
 
 def _amount_cells(tx: Transaction) -> tuple[str, str]:
-    """Return (tzs_text, usd_text) — amount only in its currency column."""
+    """Return (tzs_text, usd_text) — both may be filled on the same row."""
+    tzs, usd = tx.money_parts()
+    tzs_txt = _fmt_num(tzs, "", 0) if tzs else "—"
+    usd_txt = _fmt_num(usd, "", 2) if usd else "—"
+    # Other non-TZS/USD currencies stay visible in the TZS column with a prefix.
     cur = _currency_key(tx)
-    if _is_tzs(cur):
-        return _fmt_num(tx.amount, "", 0), "—"
-    if cur == "USD":
-        return "—", _fmt_num(tx.amount, "", 2)
-    # Other currencies stay visible in the TZS column with a prefix.
-    return _fmt_num(tx.amount, f"{cur} ", 2), "—"
+    if cur not in {"TZS", "TSH", "TZ", "USD"} and tx.amount_usd is None:
+        return _fmt_num(tx.amount, f"{cur} ", 2), "—"
+    return tzs_txt, usd_txt
 
 
 def _ref_float_display(tx: Transaction) -> str:

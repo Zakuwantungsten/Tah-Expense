@@ -4,6 +4,35 @@ from typing import List, Optional
 from bson import ObjectId
 
 
+def pack_money(
+    tzs: Optional[float],
+    usd: Optional[float],
+) -> tuple[float, Optional[float], str]:
+    """Persist TZS/USD cell values.
+
+    ``None`` means the column was empty. Both may be set on the same row.
+    A zero in one column while the other has a real value is treated as
+    blank (Excel often stores empty money cells as 0). USD-only rows keep
+    ``amount`` + ``currency=\"USD\"`` so legacy readers that ignore
+    ``amount_usd`` still see the dollars.
+    """
+    has_tzs = tzs is not None
+    has_usd = usd is not None
+    t_val = float(tzs or 0.0) if has_tzs else 0.0
+    u_val = float(usd or 0.0) if has_usd else 0.0
+    if has_tzs and has_usd:
+        if u_val == 0 and t_val != 0:
+            return t_val, None, "TZS"
+        if t_val == 0 and u_val != 0:
+            return u_val, u_val, "USD"
+        return t_val, u_val, "TZS"
+    if has_usd and not has_tzs:
+        return u_val, u_val, "USD"
+    if has_tzs:
+        return t_val, None, "TZS"
+    return 0.0, None, "TZS"
+
+
 @dataclass
 class Transaction:
     date: datetime
@@ -11,6 +40,8 @@ class Transaction:
     truck_number: str
     amount: float
     currency: str = "TZS"
+    # Optional USD on the same row (Choice B). Absent/None on legacy docs.
+    amount_usd: Optional[float] = None
     category_id: Optional[ObjectId] = None
     category_name: Optional[str] = None
     category_confidence: float = 0.0   # 0.0–1.0
@@ -55,6 +86,26 @@ class Transaction:
     import_primary_date: Optional[datetime] = None
     attachments: List[dict] = field(default_factory=list)  # receipt / file metadata
     _id: Optional[ObjectId] = None
+
+    def money_parts(self) -> tuple[float, float]:
+        """Return (tzs_amount, usd_amount) for UI totals and dual columns.
+
+        Legacy docs store a single ``amount`` + ``currency``. Newer rows may
+        also carry ``amount_usd`` so TZS and USD can coexist on one transaction.
+        """
+        cur = (self.currency or "TZS").upper()
+        amt = float(self.amount or 0.0)
+        if self.amount_usd is not None:
+            usd = float(self.amount_usd or 0.0)
+            if cur == "USD":
+                # USD-only save mirrors amount into amount_usd for legacy sums.
+                if abs(amt - usd) < 1e-9:
+                    return 0.0, usd
+                return amt, usd
+            return amt, usd
+        if cur == "USD":
+            return 0.0, amt
+        return amt, 0.0
 
     def to_doc(self) -> dict:
         doc = {
@@ -112,6 +163,8 @@ class Transaction:
             doc["daily_import_source"] = self.daily_import_source
         if self.import_primary_date is not None:
             doc["import_primary_date"] = self.import_primary_date
+        if self.amount_usd is not None:
+            doc["amount_usd"] = self.amount_usd
         if self._id:
             doc["_id"] = self._id
         return doc
@@ -120,6 +173,12 @@ class Transaction:
     def from_doc(cls, doc: dict) -> "Transaction":
         # Legacy docs without register_status were already in the Verify queue.
         status = doc.get("register_status") or "submitted"
+        amount_usd = doc.get("amount_usd", None)
+        if amount_usd is not None:
+            try:
+                amount_usd = float(amount_usd)
+            except (TypeError, ValueError):
+                amount_usd = None
         return cls(
             _id=doc.get("_id"),
             date=doc["date"],
@@ -127,6 +186,7 @@ class Transaction:
             truck_number=doc.get("truck_number", ""),
             amount=doc["amount"],
             currency=doc.get("currency", "TZS"),
+            amount_usd=amount_usd,
             category_id=doc.get("category_id"),
             category_name=doc.get("category_name"),
             category_confidence=doc.get("category_confidence", 0.0),

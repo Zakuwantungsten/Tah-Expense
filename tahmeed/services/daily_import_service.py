@@ -15,7 +15,7 @@ import openpyxl
 from bson import ObjectId
 
 from tahmeed.db.connection import get_db
-from tahmeed.models.transaction import Transaction
+from tahmeed.models.transaction import Transaction, pack_money
 from tahmeed.services.description_mapping_service import (
     get_mappings_for_descriptions,
     normalize_description,
@@ -75,6 +75,7 @@ class DailyImportRow:
     category_id: Optional[ObjectId] = None
     category_name: Optional[str] = None
     skipped_item: bool = False  # user chose Skip — leave without item
+    amount_usd: Optional[float] = None
 
 
 class DailyImportCancelled(Exception):
@@ -358,18 +359,10 @@ def parse_daily_expenses_excel(
                 continue
 
             tzs = parse_amount(_col(row, cols, "tzs"))
-            usd = parse_amount(_col(row, cols, "usd"))
-            amount = 0.0
-            currency = "TZS"
-            if usd is not None and usd != 0:
-                amount = usd
-                currency = "USD"
-            elif tzs is not None:
-                amount = tzs
-                currency = "TZS"
-            elif usd is not None:
-                amount = usd
-                currency = "USD"
+            # USD is optional: sheets without a USD header keep usd=None and
+            # behave exactly like the previous TZS-only import path.
+            usd = parse_amount(_col(row, cols, "usd")) if "usd" in cols else None
+            amount, amount_usd, currency = pack_money(tzs, usd)
 
             serial = None
             raw_serial = _col(row, cols, "serial")
@@ -392,6 +385,7 @@ def parse_daily_expenses_excel(
                     notes=notes,
                     amount=amount,
                     currency=currency,
+                    amount_usd=amount_usd,
                     receipt_status=normalize_receipt(cell_str(_col(row, cols, "receipt"))),
                     ownership=cell_str(_col(row, cols, "ownership")).upper(),
                     approver=cell_str(_col(row, cols, "approver")).upper(),
@@ -538,6 +532,7 @@ def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict
         "ref_float": _ref_float_from_notes(row.notes),
         "amount": row.amount,
         "currency": row.currency,
+        "amount_usd": row.amount_usd,
         "receipt_status": row.receipt_status,
         "ownership": row.ownership,
         "approver": row.approver,
@@ -589,6 +584,11 @@ def _payload_to_verified_transaction(
         truck_number=(payload.get("truck_number") or "").strip().upper(),
         amount=float(payload.get("amount") or 0),
         currency=(payload.get("currency") or "TZS").strip().upper() or "TZS",
+        amount_usd=(
+            float(payload["amount_usd"])
+            if payload.get("amount_usd") is not None
+            else None
+        ),
         category_id=payload.get("category_id"),
         category_name=item_name or None,
         category_confidence=1.0 if item_name else 0.0,

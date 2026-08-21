@@ -50,6 +50,7 @@ EXPORT_HEADERS = [
     "Memo",
     "Ref_Float",
     "TZS",
+    "USD",
     "Receipt",
     "Ownership",
     "APR BY",
@@ -60,18 +61,19 @@ EXPORT_HEADERS = [
 # Relative widths (sum ≈ content width after padding). S/N is PDF-only.
 _COL_SPECS: list[tuple[str, str, float]] = [
     ("sno", "S/N", 26),
-    ("date", "DATE", 52),
-    ("item", "ITEM", 70),
-    ("desc", "DESCRIPTION", 118),
-    ("truck", "TRUCK NO.", 50),
-    ("memo", "MEMO", 50),
-    ("ref", "REF_FLOAT", 50),
-    ("tzs", "TZS", 56),
-    ("receipt", "RECEIPT", 42),
-    ("own", "OWNERSHIP", 48),
-    ("apr", "APR BY", 40),
-    ("payee", "PAYEE", 48),
-    ("cheque", "CHEQUE", 40),
+    ("date", "DATE", 50),
+    ("item", "ITEM", 66),
+    ("desc", "DESCRIPTION", 108),
+    ("truck", "TRUCK NO.", 48),
+    ("memo", "MEMO", 46),
+    ("ref", "REF_FLOAT", 48),
+    ("tzs", "TZS", 52),
+    ("usd", "USD", 44),
+    ("receipt", "RECEIPT", 40),
+    ("own", "OWNERSHIP", 46),
+    ("apr", "APR BY", 38),
+    ("payee", "PAYEE", 46),
+    ("cheque", "CHEQUE", 38),
 ]
 
 
@@ -510,17 +512,23 @@ def export_daily_register_pdf(
     cell_rows = [_row_cells(row) for row in rows]
     record_count = len(cell_rows)
     tzs_idx = EXPORT_HEADERS.index("TZS")
+    usd_idx = EXPORT_HEADERS.index("USD")
     ref_idx = EXPORT_HEADERS.index("Ref_Float")
     receipt_idx = EXPORT_HEADERS.index("Receipt")
 
     tzs_total = 0.0
+    usd_total = 0.0
     refund_total = 0.0
     for cells in cell_rows:
         val = _parse_tzs(cells[tzs_idx] if cells[tzs_idx] != _DASH else None)
-        if val is None:
+        usd_val = _parse_tzs(cells[usd_idx] if cells[usd_idx] != _DASH else None)
+        if val is None and usd_val is None:
             continue
-        tzs_total += val
-        if _is_refund(cells[ref_idx]):
+        if val is not None:
+            tzs_total += val
+        if usd_val is not None:
+            usd_total += usd_val
+        if val is not None and _is_refund(cells[ref_idx]):
             refund_total += val
 
     with_receipt = sum(
@@ -550,9 +558,10 @@ def export_daily_register_pdf(
 
     card_h = 46.0
     gap = 8.0
-    card_w = (_CONTENT_W - 3 * gap) / 4
+    card_w = (_CONTENT_W - 4 * gap) / 5
     labels_vals = [
         ("TOTAL RECORDS", f"{record_count:,}", _BLACK),
+        ("USD TOTAL", f"USD {usd_total:,.2f}" if usd_total else _DASH, _BLACK),
         ("TZS TOTAL", _fmt_tzs(tzs_total, money=True), _ORANGE),
         ("REFUND TOTAL", _fmt_tzs(refund_total, money=True), _BLACK),
         ("WITH RECEIPT", f"{with_receipt:,}", _BLACK),

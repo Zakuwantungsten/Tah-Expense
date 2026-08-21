@@ -44,7 +44,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QAction, QKeyEvent, QColor, QBrush, QFont, QPen, QPainter
 
 from tahmeed.models.category import Category
-from tahmeed.models.transaction import Transaction
+from tahmeed.models.transaction import Transaction, pack_money
 from tahmeed.models.user import User
 from tahmeed.services.truck_service import get_fleet_numbers
 from tahmeed.services.truck_format import (
@@ -81,7 +81,7 @@ from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, Tr
 # ---------------------------------------------------------------------------
 from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
     COL_SNO, COL_DATE, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
-    COL_REF, COL_TZS, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
+    COL_REF, COL_TZS, COL_USD, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
     COL_CASHIER,
     HEADERS, CHECK_COLS, READONLY_COLS, _DATA_SKIP_COLS, _UPPER_SKIP_COLS,
     DEFAULT_EDITABLE_ROWS, _REF_FLOAT_OPTS, _COL_PREFERRED, _COL_FLEX, _COL_MIN,
@@ -90,12 +90,38 @@ from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
     _FOOTER_BTN_STYLE,
     _accept_editor_completion, _upper_text,
     _ExcelCellDelegate, _DescriptionDelegate, _TruckDelegate, _DateDelegate,
-    _RefFloatDelegate, _norm_receipt_text, _receipt_paste_value, _parse_amount_text, _ReceiptDelegate,
+    _RefFloatDelegate, _norm_receipt_text, _receipt_paste_value, _parse_amount_text,
+    _parse_optional_amount_text, _ReceiptDelegate,
     _ItemDelegate, _CurrencyLineEdit, _TZSDelegate,
     _RCPT_COLORS, _RCPT_LABEL, _RECEIPT_OPTS, _RCPT_OPT_KEY, _RCPT_NORM, _VALID_RCPT,
 )
 
 _ROWS_CLIP_PREFIX = "TAHMEED_ROWS_V1\n"
+
+
+def _amount_item_from_raw(raw: str) -> QTableWidgetItem:
+    amt = _parse_amount_text(raw)
+    text = f"{amt:,.2f}" if (raw or "").strip() else ""
+    it = QTableWidgetItem(text)
+    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    if amt < 0:
+        it.setForeground(NEG_COLOR)
+    return it
+
+
+def _display_money_cells(tx: Transaction) -> tuple[str, str]:
+    tzs, usd = tx.money_parts()
+    tzs_txt = f"{tzs:,.2f}" if tzs else ""
+    usd_txt = f"{usd:,.2f}" if usd else ""
+    return tzs_txt, usd_txt
+
+
+def _money_item(text: str, amount: float) -> QTableWidgetItem:
+    it = QTableWidgetItem(text)
+    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    if amount < 0:
+        it.setForeground(NEG_COLOR)
+    return it
 
 
 
@@ -393,7 +419,7 @@ class DailyRegister(QWidget):
     """Unified daily expense register (replaces ExcelGrid + TransactionsTable)."""
 
     rows_saved        = Signal(int)
-    stats_updated     = Signal(int, float, float, object)  # n, total_tzs, refund, register_date
+    stats_updated     = Signal(int, float, float, float, object)  # n, tzs, usd, refund, date
     edit_state_changed = Signal(bool, int)         # (edit_mode_active, dirty_row_count)
     mode_changed      = Signal(bool)               # merged mode on/off
     attachment_count_changed = Signal(int)         # selected row attachment count
@@ -543,6 +569,7 @@ class DailyRegister(QWidget):
         self._table.setItemDelegateForColumn(COL_DATE,     date_del)
         self._table.setItemDelegateForColumn(COL_REF,      _RefFloatDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_TZS,      _TZSDelegate(self._table))
+        self._table.setItemDelegateForColumn(COL_USD,      _TZSDelegate(self._table))
         self._table.setItemDelegateForColumn(COL_RECEIPT,  _ReceiptDelegate(self._table))
         # Ownership + APR BY — same Item-style autocomplete/preview; free text always allowed.
         people_del = _ItemDelegate(lambda: list(self._people_names), self._table)
@@ -943,12 +970,10 @@ class DailyRegister(QWidget):
         self._table.setItem(row, COL_MEMO,  saved_item(tx.memo or ""))
         self._table.setItem(row, COL_REF,   saved_item(_ref_float_text(tx)))
 
-        # TZS
-        tzs_str = f"{tx.amount:,.2f}" if tx.amount else ""
-        tzs_it  = saved_item(tzs_str, Qt.AlignRight | Qt.AlignVCenter)
-        if tx.amount and tx.amount < 0:
-            tzs_it.setForeground(NEG_COLOR)
-        self._table.setItem(row, COL_TZS, tzs_it)
+        tzs_amt, usd_amt = tx.money_parts()
+        tzs_txt, usd_txt = _display_money_cells(tx)
+        self._table.setItem(row, COL_TZS, _money_item(tzs_txt, tzs_amt))
+        self._table.setItem(row, COL_USD, _money_item(usd_txt, usd_amt))
 
         # Receipt
         rcpt_it = saved_item(tx.receipt_status or "pending")
@@ -978,30 +1003,45 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
 
     def _update_footer(self) -> None:
-        """Recompute entries / total / refund from the live grid (saved + unsaved)."""
-        n, tzs, refund = 0, 0.0, 0.0
+        """Recompute entries / TZS / USD / refund from the live grid."""
+        n, tzs, usd, refund = 0, 0.0, 0.0, 0.0
         for row in range(self._table.rowCount()):
             tzs_it = self._table.item(row, COL_TZS)
-            if not tzs_it:
+            usd_it = self._table.item(row, COL_USD)
+            raw_tzs = tzs_it.text().strip() if tzs_it else ""
+            raw_usd = usd_it.text().strip() if usd_it else ""
+            if not raw_tzs and not raw_usd:
                 continue
-            raw = tzs_it.text().strip()
-            if not raw:
-                continue
-            amount = _parse_amount_text(raw)
+            tzs_amt = _parse_amount_text(raw_tzs) if raw_tzs else 0.0
+            usd_amt = _parse_amount_text(raw_usd) if raw_usd else 0.0
             # Skip non-numeric leftovers that parse as 0
-            if amount == 0.0 and not any(ch.isdigit() for ch in raw):
+            if (
+                raw_tzs
+                and tzs_amt == 0.0
+                and not any(ch.isdigit() for ch in raw_tzs)
+                and not raw_usd
+            ):
+                continue
+            if (
+                raw_usd
+                and usd_amt == 0.0
+                and not any(ch.isdigit() for ch in raw_usd)
+                and not raw_tzs
+            ):
                 continue
             n += 1
-            tzs += amount
+            tzs += tzs_amt
+            usd += usd_amt
             ref_it = self._table.item(row, COL_REF)
             if ref_it and _is_refund_float(ref_it.text()):
-                refund += amount
+                refund += tzs_amt  # refund-to-float stays TZS-only
 
         amount_str = f"TZS {tzs:,.0f}" if tzs else "—"
+        usd_str = f"USD {usd:,.2f}" if usd else "—"
         self._totals_label.setText(
-            f"{n} entr{'y' if n == 1 else 'ies'}   ·   {amount_str}"
+            f"{n} entr{'y' if n == 1 else 'ies'}   ·   {usd_str}   ·   {amount_str}"
         )
-        self.stats_updated.emit(n, tzs, refund, self._current_date)
+        self.stats_updated.emit(n, tzs, usd, refund, self._current_date)
 
     # ------------------------------------------------------------------
     # Row → Transaction
@@ -1030,7 +1070,11 @@ class DailyRegister(QWidget):
             )
 
         raw_tzs = txt(COL_TZS)
-        amount = _parse_amount_text(raw_tzs)
+        raw_usd = txt(COL_USD)
+        amount, amount_usd, currency = pack_money(
+            _parse_optional_amount_text(raw_tzs),
+            _parse_optional_amount_text(raw_usd),
+        )
 
         rcpt_status = _norm_receipt_text(txt(COL_RECEIPT))
         if rcpt_status not in _VALID_RCPT:
@@ -1102,7 +1146,8 @@ class DailyRegister(QWidget):
             category_id=meta.get("category_id"),
             truck_number=truck_number,
             amount=amount,
-            currency=meta.get("currency") or "TZS",
+            currency=currency,
+            amount_usd=amount_usd,
             memo=txt(COL_MEMO).upper(),
             receipt_status=rcpt_status,
             ref_float=ref_text,
@@ -1249,6 +1294,7 @@ class DailyRegister(QWidget):
             "truck_number": tx.truck_number,
             "amount": tx.amount,
             "currency": tx.currency,
+            "amount_usd": tx.amount_usd,
             "memo": tx.memo,
             "receipt_status": tx.receipt_status,
             "notes_flag": tx.notes_flag,
@@ -1265,7 +1311,7 @@ class DailyRegister(QWidget):
 
     _EXPORT_COLS = [
         COL_DATE, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
-        COL_REF, COL_TZS, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
+        COL_REF, COL_TZS, COL_USD, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
     ]
 
     def export_as(self, fmt: str = "xlsx") -> None:
@@ -1614,7 +1660,7 @@ class DailyRegister(QWidget):
                         0, lambda r=row, d=desc: self._kick_auto_fill_item(r, d)
                     )
             self._mark_dirty(row)
-            if col == COL_TZS:
+            if col == COL_TZS or col == COL_USD:
                 self._update_footer()
             if col in (COL_PAYEE, COL_CHEQUE) and row == self._table.currentRow():
                 self._emit_active_payee_cheque()
@@ -1661,7 +1707,7 @@ class DailyRegister(QWidget):
         if row >= self._table.rowCount() - 5 and item.text().strip():
             self._append_editable_rows(10)
 
-        if col in (COL_TZS, COL_REF):
+        if col in (COL_TZS, COL_USD, COL_REF):
             self._update_footer()
 
         self._schedule_draft_autosave()
@@ -2113,14 +2159,8 @@ class DailyRegister(QWidget):
                 it = QTableWidgetItem(_receipt_paste_value(str(cell)))
                 it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                 self._table.setItem(row, col, it)
-            elif col == COL_TZS:
-                amt = _parse_amount_text(str(cell))
-                text = f"{amt:,.2f}" if str(cell).strip() else ""
-                it = QTableWidgetItem(text)
-                it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if amt < 0:
-                    it.setForeground(NEG_COLOR)
-                self._table.setItem(row, col, it)
+            elif col == COL_TZS or col == COL_USD:
+                self._table.setItem(row, col, _amount_item_from_raw(str(cell)))
             elif col == COL_TRUCK:
                 raw = str(cell).strip()
                 self._table.setItem(
@@ -2463,14 +2503,8 @@ class DailyRegister(QWidget):
                             it.setText(norm)
                             it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                             self._table.setItem(row, col, it)
-                        elif col == COL_TZS:
-                            amt = _parse_amount_text(cell_value)
-                            text = f"{amt:,.2f}" if cell_value.strip() else ""
-                            it = QTableWidgetItem(text)
-                            it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                            if amt < 0:
-                                it.setForeground(NEG_COLOR)
-                            self._table.setItem(row, col, it)
+                        elif col in (COL_TZS, COL_USD):
+                            self._table.setItem(row, col, _amount_item_from_raw(cell_value))
                         elif col == COL_TRUCK:
                             self._table.setItem(row, col, QTableWidgetItem(cell_value.upper()))
                             if cell_value:
@@ -2509,14 +2543,8 @@ class DailyRegister(QWidget):
                             it.setText(norm)
                             it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                             self._table.setItem(row, col, it)
-                        elif col == COL_TZS:
-                            amt = _parse_amount_text(cell)
-                            text = f"{amt:,.2f}" if cell.strip() else ""
-                            it = QTableWidgetItem(text)
-                            it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                            if amt < 0:
-                                it.setForeground(NEG_COLOR)
-                            self._table.setItem(row, col, it)
+                        elif col in (COL_TZS, COL_USD):
+                            self._table.setItem(row, col, _amount_item_from_raw(cell))
                         elif col == COL_TRUCK:
                             raw = cell.strip()
                             self._table.setItem(row, col, QTableWidgetItem(raw.upper() if raw else ""))
@@ -2967,12 +2995,23 @@ class DailyRegister(QWidget):
                         target, COL_REF, QTableWidgetItem(_upper_text(COL_REF, ref))
                     )
 
-                amount = float(data.get("amount") or 0)
-                tzs_it = QTableWidgetItem(f"{amount:,.2f}" if amount else "")
-                tzs_it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if amount < 0:
-                    tzs_it.setForeground(NEG_COLOR)
-                self._table.setItem(target, COL_TZS, tzs_it)
+                # Split amount into TZS / USD columns (legacy USD-only rows land in USD).
+                staged = Transaction(
+                    date=data.get("date") or datetime.utcnow(),
+                    description=data.get("description") or "",
+                    truck_number=data.get("truck_number") or "",
+                    amount=float(data.get("amount") or 0),
+                    currency=data.get("currency") or "TZS",
+                    amount_usd=(
+                        float(data["amount_usd"])
+                        if data.get("amount_usd") is not None
+                        else None
+                    ),
+                )
+                tzs_amt, usd_amt = staged.money_parts()
+                tzs_txt, usd_txt = _display_money_cells(staged)
+                self._table.setItem(target, COL_TZS, _money_item(tzs_txt, tzs_amt))
+                self._table.setItem(target, COL_USD, _money_item(usd_txt, usd_amt))
 
                 rcpt = data.get("receipt_status") or "pending"
                 rcpt_it = QTableWidgetItem(
@@ -3015,6 +3054,7 @@ class DailyRegister(QWidget):
             COL_MEMO:     9,
             COL_REF:      10,
             COL_TZS:      11,
+            COL_USD:      12,
             COL_RECEIPT:  13,
             COL_OWN:      14,
             COL_APR:      15,
@@ -3064,7 +3104,7 @@ class DailyRegister(QWidget):
                     except Exception:
                         formatted = raw
                     self._table.setItem(target, grid_col, QTableWidgetItem(formatted))
-                elif grid_col == COL_TZS:
+                elif grid_col in (COL_TZS, COL_USD):
                     amt = _parse_amount_text(raw if raw != "None" else "")
                     if raw and raw != "None":
                         it = QTableWidgetItem(f"{amt:,.2f}")
@@ -3590,7 +3630,10 @@ class DailyRegister(QWidget):
                         self._current_date.day,
                     )
 
-                amount = _parse_amount_text(txt(COL_TZS))
+                amount, amount_usd, currency = pack_money(
+                    _parse_optional_amount_text(txt(COL_TZS)),
+                    _parse_optional_amount_text(txt(COL_USD)),
+                )
 
                 rcpt_status = _norm_receipt_text(txt(COL_RECEIPT))
                 if rcpt_status not in _VALID_RCPT:
@@ -3681,9 +3724,24 @@ class DailyRegister(QWidget):
 
                 if dupes:
                     d = dupes[0]
+                    tzs_show, usd_show = Transaction(
+                        date=tx_date,
+                        description=description,
+                        truck_number=truck_number,
+                        amount=amount,
+                        currency=currency,
+                        amount_usd=amount_usd,
+                    ).money_parts()
+                    amt_label = (
+                        f"TZS {tzs_show:,.0f}"
+                        if tzs_show
+                        else (f"USD {usd_show:,.2f}" if usd_show else "—")
+                    )
+                    if tzs_show and usd_show:
+                        amt_label = f"TZS {tzs_show:,.0f} / USD {usd_show:,.2f}"
                     dupe_info = (
                         f"Row {row + 1}  ·  {description or '—'}  ·  "
-                        f"Truck {truck_number or '—'}  ·  TZS {amount:,.0f}\n\n"
+                        f"Truck {truck_number or '—'}  ·  {amt_label}\n\n"
                         f"A similar entry already exists:\n"
                         f"  Date: {d.date.strftime('%d %b %Y') if d.date else '—'}\n"
                         f"  Item: {d.item or '—'}\n"
@@ -3728,7 +3786,8 @@ class DailyRegister(QWidget):
                     category_id=meta.get("category_id"),
                     truck_number=truck_number,
                     amount=amount,
-                    currency=meta.get("currency") or "TZS",
+                    currency=currency,
+                    amount_usd=amount_usd,
                     memo=txt(COL_MEMO).upper(),
                     receipt_status=rcpt_status,
                     ref_float=ref_text,

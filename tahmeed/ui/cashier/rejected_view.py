@@ -19,13 +19,14 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QObject, QEvent, QSize
 from PySide6.QtGui import QColor, QBrush, QKeyEvent
 
-from tahmeed.models.transaction import Transaction
+from tahmeed.models.transaction import Transaction, pack_money
 from tahmeed.models.user import User
 from tahmeed.ui.cashier.register_delegates import (
     COL_SNO, COL_DATE, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
-    COL_REF, COL_TZS, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
+    COL_REF, COL_TZS, COL_USD, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
     HEADERS, CHECK_COLS, READONLY_COLS, _UPPER_SKIP_COLS, _COL_PREFERRED,
     _ref_float_text, _parse_optional_date, _norm_receipt_text, _parse_amount_text,
+    _parse_optional_amount_text,
     _upper_text, _VALID_RCPT,
     SAVED_BG, EDIT_BG, DIRTY_BG, NEG_COLOR,
     _ExcelCellDelegate, _DescriptionDelegate, _TruckDelegate, _DateDelegate,
@@ -322,6 +323,7 @@ class RejectedView(QWidget):
         t.setItemDelegateForColumn(COL_DATE, date_del)
         t.setItemDelegateForColumn(COL_REF, _RefFloatDelegate(t))
         t.setItemDelegateForColumn(COL_TZS, _TZSDelegate(t))
+        t.setItemDelegateForColumn(COL_USD, _TZSDelegate(t))
         t.setItemDelegateForColumn(COL_RECEIPT, _ReceiptDelegate(t))
         people_del = _ItemDelegate(lambda: list(self._people_names), t)
         t.setItemDelegateForColumn(COL_OWN, people_del)
@@ -488,11 +490,17 @@ class RejectedView(QWidget):
         self._table.setItem(row, COL_MEMO, cell(tx.memo or ""))
         self._table.setItem(row, COL_REF, cell(_ref_float_text(tx)))
 
-        tzs_str = f"{tx.amount:,.2f}" if tx.amount else ""
-        tzs_it = cell(tzs_str, Qt.AlignRight | Qt.AlignVCenter)
-        if tx.amount and tx.amount < 0:
+        tzs_amt, usd_amt = tx.money_parts()
+        tzs_txt = f"{tzs_amt:,.2f}" if tzs_amt else ""
+        usd_txt = f"{usd_amt:,.2f}" if usd_amt else ""
+        tzs_it = cell(tzs_txt, Qt.AlignRight | Qt.AlignVCenter)
+        if tzs_amt < 0:
             tzs_it.setForeground(NEG_COLOR)
         self._table.setItem(row, COL_TZS, tzs_it)
+        usd_it = cell(usd_txt, Qt.AlignRight | Qt.AlignVCenter)
+        if usd_amt < 0:
+            usd_it.setForeground(NEG_COLOR)
+        self._table.setItem(row, COL_USD, usd_it)
 
         self._table.setItem(row, COL_RECEIPT, cell(tx.receipt_status or "pending"))
         self._table.setItem(row, COL_OWN, cell(tx.ownership or ""))
@@ -575,14 +583,14 @@ class RejectedView(QWidget):
         row, col = item.row(), item.column()
         if row not in self._unlocked or col in _ALL_READONLY:
             return
-        if col not in _UPPER_SKIP_COLS and col != COL_TZS:
+        if col not in _UPPER_SKIP_COLS and col not in (COL_TZS, COL_USD):
             text = item.text()
             uppered = _upper_text(col, text)
             if uppered != text:
                 self._table.blockSignals(True)
                 item.setText(uppered)
                 self._table.blockSignals(False)
-        if col == COL_TZS:
+        if col in (COL_TZS, COL_USD):
             raw = item.text().strip()
             if raw:
                 amt = _parse_amount_text(raw)
@@ -724,7 +732,7 @@ class RejectedView(QWidget):
         value = (raw or "").strip()
         if col == COL_RECEIPT:
             value = _norm_receipt_text(value)
-        elif col == COL_TZS:
+        elif col in (COL_TZS, COL_USD):
             if value:
                 amt = _parse_amount_text(value)
                 value = f"{amt:,.2f}"
@@ -737,7 +745,7 @@ class RejectedView(QWidget):
         it = self._table.item(row, col) or QTableWidgetItem()
         it.setText(value)
         it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-        if col == COL_TZS:
+        if col in (COL_TZS, COL_USD):
             it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             if value and _parse_amount_text(value) < 0:
                 it.setForeground(NEG_COLOR)
@@ -840,7 +848,10 @@ class RejectedView(QWidget):
         if tx_date is None and row in self._row_txs:
             tx_date = self._row_txs[row].date
 
-        amount = _parse_amount_text(self._txt(row, COL_TZS))
+        amount, amount_usd, currency = pack_money(
+            _parse_optional_amount_text(self._txt(row, COL_TZS)),
+            _parse_optional_amount_text(self._txt(row, COL_USD)),
+        )
         rcpt = _norm_receipt_text(self._txt(row, COL_RECEIPT))
         if rcpt not in _VALID_RCPT:
             rcpt = "pending"
@@ -891,7 +902,8 @@ class RejectedView(QWidget):
             "item": item_name,
             "truck_number": truck_number,
             "amount": amount,
-            "currency": "TZS",
+            "currency": currency,
+            "amount_usd": amount_usd,
             "memo": self._txt(row, COL_MEMO),
             "receipt_status": rcpt,
             "ref_float": ref,

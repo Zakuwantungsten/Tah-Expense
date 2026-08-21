@@ -181,11 +181,12 @@ class _QBDocHeader(QFrame):
         sep0.setStyleSheet("color: #E5E7EB;")
         hl.addWidget(sep0)
 
-        # 4 KPI tiles — date label switches TODAY ↔ DATE for past/future days
+        # 5 KPI tiles — TOTAL USD sits immediately before TOTAL (TZS)
         tiles_cfg = [
             ("ENTRIES",         "—",                              "#6B7280", "bold"),
             ("TODAY",           date.today().strftime("%d %b %Y"), "#6B7280", "bold"),
             ("REFUND TO FLOAT", "—",                              "#EA580C", "normal"),
+            ("TOTAL USD",       "—",                              "#6B7280", "bold"),
             ("TOTAL",           "—",                              "#6B7280", "bold"),
         ]
         self._lbl_date = None
@@ -227,6 +228,7 @@ class _QBDocHeader(QFrame):
             self._val_entries,
             self._val_today,
             self._val_refund,
+            self._val_total_usd,
             self._val_total,
         ) = val_labels
 
@@ -237,10 +239,12 @@ class _QBDocHeader(QFrame):
         self,
         n_entries: int,
         total_tzs: float,
+        total_usd: float,
         refund_total: float,
         register_date=None,
     ) -> None:
         self._val_entries.setText(f"{n_entries} entr{'y' if n_entries == 1 else 'ies'}")
+        self._val_total_usd.setText(f"USD {total_usd:,.2f}" if total_usd else "—")
         self._val_total.setText(f"TZS {total_tzs:,.0f}" if total_tzs else "—")
         self._val_refund.setText(f"TZS {refund_total:,.0f}" if refund_total else "—")
         if register_date is not None:

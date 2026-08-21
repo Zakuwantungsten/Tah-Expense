@@ -30,16 +30,17 @@ COL_TRUCK    = 4
 COL_MEMO     = 5
 COL_REF      = 6   # Ref_Float (free text; was checkbox NOTES)
 COL_TZS      = 7
-COL_RECEIPT  = 8
-COL_OWN      = 9
-COL_APR      = 10
-COL_PAYEE    = 11
-COL_CHEQUE   = 12
-COL_CASHIER  = 13
+COL_USD      = 8
+COL_RECEIPT  = 9
+COL_OWN      = 10
+COL_APR      = 11
+COL_PAYEE    = 12
+COL_CHEQUE   = 13
+COL_CASHIER  = 14
 
 HEADERS = [
     "S/NO", "Date", "Item", "Description", "Truck No.",
-    "Memo", "Ref_Float", "TZS", "Receipt", "Ownership", "APR BY",
+    "Memo", "Ref_Float", "TZS", "USD", "Receipt", "Ownership", "APR BY",
     "Payee", "Cheque", "Cashier",
 ]
 
@@ -48,7 +49,7 @@ READONLY_COLS    = {COL_SNO, COL_CASHIER}
 # Date alone does not count as entry data.
 _DATA_SKIP_COLS  = READONLY_COLS | {COL_RECEIPT, COL_DATE}
 # Columns that should NOT be auto-uppercased
-_UPPER_SKIP_COLS = READONLY_COLS | {COL_RECEIPT, COL_DATE}
+_UPPER_SKIP_COLS = READONLY_COLS | {COL_RECEIPT, COL_DATE, COL_TZS, COL_USD}
 DEFAULT_EDITABLE_ROWS = 20
 
 _REF_FLOAT_OPTS = ["REFUND TO FLOAT"]
@@ -63,6 +64,7 @@ _COL_PREFERRED = {
     COL_MEMO: 90,
     COL_REF: 100,
     COL_TZS: 96,
+    COL_USD: 80,
     COL_RECEIPT: 88,
     COL_OWN: 80,
     COL_APR: 72,
@@ -84,6 +86,7 @@ _COL_MIN = {
     COL_MEMO: 60,
     COL_REF: 70,
     COL_TZS: 72,
+    COL_USD: 64,
     COL_RECEIPT: 70,
     COL_OWN: 60,
     COL_APR: 56,
@@ -538,6 +541,12 @@ def _parse_amount_text(raw: str) -> float:
     from tahmeed.services.daily_import_service import parse_amount
     val = parse_amount(raw)
     return float(val) if val is not None else 0.0
+
+
+def _parse_optional_amount_text(raw: str) -> float | None:
+    """Like ``_parse_amount_text`` but ``None`` when the cell is blank."""
+    from tahmeed.services.daily_import_service import parse_amount
+    return parse_amount(raw)
 
 
 class _ReceiptDelegate(_ExcelCellDelegate):

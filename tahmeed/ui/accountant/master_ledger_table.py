@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer
 from PySide6.QtGui import QBrush, QKeyEvent, QAction, QColor
 
-from tahmeed.models.transaction import Transaction
+from tahmeed.models.transaction import Transaction, pack_money
 from tahmeed.services.truck_format import (
     normalize_truck_number, try_match_fleet, normalize_place_label,
     DEFAULT_PLACE_LABELS, merge_allowed_labels,
@@ -32,7 +32,8 @@ from tahmeed.ui.cashier.register_delegates import (
     EDIT_BG, DIRTY_BG, NEG_COLOR,
     _ExcelCellDelegate, _ItemDelegate, _DescriptionDelegate, _TruckDelegate,
     _DateDelegate, _RefFloatDelegate, _TZSDelegate, _ReceiptDelegate,
-    _parse_optional_date, _parse_amount_text, _receipt_paste_value,
+    _parse_optional_date, _parse_amount_text, _parse_optional_amount_text,
+    _receipt_paste_value,
     _norm_receipt_text, _VALID_RCPT, format_register_date,
 )
 
@@ -184,12 +185,13 @@ def _is_tzs(currency: str) -> bool:
 
 
 def _amount_cells(tx: Transaction) -> tuple[str, str]:
+    tzs, usd = tx.money_parts()
+    tzs_txt = _fmt_num(tzs, "", 0) if tzs else ""
+    usd_txt = _fmt_num(usd, "", 2) if usd else ""
     cur = _currency_key(tx)
-    if _is_tzs(cur):
-        return _fmt_num(tx.amount, "", 0), ""
-    if cur == "USD":
-        return "", _fmt_num(tx.amount, "", 2)
-    return _fmt_num(tx.amount, f"{cur} ", 2), ""
+    if cur not in {"TZS", "TSH", "TZ", "USD"} and tx.amount_usd is None:
+        return _fmt_num(tx.amount, f"{cur} ", 2), ""
+    return tzs_txt, usd_txt
 
 
 def _plain(text: str) -> str:
@@ -685,10 +687,6 @@ class MasterLedgerTable(QFrame):
                 self._tbl.blockSignals(True)
                 item.setText(formatted)
                 item.setForeground(NEG_COLOR if amt < 0 else QColor(_T1))
-                other = _COL_USD if col == _COL_TZS else _COL_TZS
-                oit = self._tbl.item(row, other)
-                if oit is not None and _plain(oit.text()):
-                    oit.setText("")
                 self._tbl.blockSignals(False)
         if col == _COL_TRUCK:
             self._validate_truck_cell(row, item)
@@ -890,10 +888,6 @@ class MasterLedgerTable(QFrame):
             it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             if value and _parse_amount_text(value) < 0:
                 it.setForeground(NEG_COLOR)
-            other = _COL_USD if col == _COL_TZS else _COL_TZS
-            oit = self._tbl.item(row, other)
-            if oit is not None and _plain(oit.text()):
-                oit.setText("")
         self._tbl.setItem(row, col, it)
 
     def _fill_down(self) -> None:
@@ -1257,17 +1251,16 @@ class MasterLedgerTable(QFrame):
 
         tzs = self._txt(row, _COL_TZS)
         usd = self._txt(row, _COL_USD)
-        if usd:
-            amount = _parse_amount_text(usd)
-            currency = "USD"
-        elif tzs:
-            amount = _parse_amount_text(tzs)
-            currency = "TZS"
-        else:
+        amount, amount_usd, currency = pack_money(
+            _parse_optional_amount_text(tzs) if tzs else None,
+            _parse_optional_amount_text(usd) if usd else None,
+        )
+        if not tzs and not usd:
             amount = float(tx.amount or 0)
             currency = _currency_key(tx)
             if _is_tzs(currency):
                 currency = "TZS"
+            amount_usd = getattr(tx, "amount_usd", None)
 
         item_name = self._txt(row, _COL_ITEM)
         rcpt = _norm_receipt_text(self._txt(row, _COL_RCPT))
@@ -1282,6 +1275,7 @@ class MasterLedgerTable(QFrame):
             "truck_number": self._txt(row, _COL_TRUCK),
             "amount": amount,
             "currency": currency,
+            "amount_usd": amount_usd,
             "memo": self._txt(row, _COL_MEMO),
             "receipt_status": rcpt,
             "ref_float": ref,

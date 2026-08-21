@@ -25,6 +25,7 @@ def test_export_daily_register_pdf_writes_landscape_with_all_columns(tmp_path: P
             "Trip 9",
             "REFUND TO FLOAT",
             "1,250,000.00",
+            "40.00",
             "Yes",
             "Company",
             "JM",
@@ -39,6 +40,7 @@ def test_export_daily_register_pdf_writes_landscape_with_all_columns(tmp_path: P
             "",
             "",
             "45,000",
+            "",
             "No",
             "Owner",
             "AK",
@@ -75,6 +77,7 @@ def test_export_daily_register_pdf_writes_landscape_with_all_columns(tmp_path: P
         assert "LINE ITEMS LISTED" not in upper
         assert "landscape layout" not in text.lower()
         assert "REFUND TOTAL" in upper
+        assert "USD TOTAL" in upper
         assert "TRANSACTION DETAIL" in upper
         assert "23 JUL 2026" in upper
         for header in (
@@ -83,6 +86,7 @@ def test_export_daily_register_pdf_writes_landscape_with_all_columns(tmp_path: P
             "DESCRIPTION",
             "TRUCK",
             "TZS",
+            "USD",
             "RECEIPT",
             "PAYEE",
             "CHEQUE",
@@ -95,7 +99,8 @@ def test_export_daily_register_pdf_writes_landscape_with_all_columns(tmp_path: P
 
 
 def test_export_headers_match_register_export_columns():
-    assert len(EXPORT_HEADERS) == 12
+    assert len(EXPORT_HEADERS) == 13
     assert EXPORT_HEADERS[0] == "Date"
     assert EXPORT_HEADERS[6] == "TZS"
+    assert EXPORT_HEADERS[7] == "USD"
     assert EXPORT_HEADERS[-1] == "Cheque"
