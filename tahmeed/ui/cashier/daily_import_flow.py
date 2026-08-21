@@ -15,15 +15,9 @@ from tahmeed.services.daily_import_service import (
     skip_all_unmapped,
     skip_description_in_preview,
 )
-from tahmeed.services.description_mapping_service import normalize_description
 from tahmeed.ui.dialogs.daily_import_preview_dialog import DailyImportPreviewDialog
 from tahmeed.ui.dialogs.date_outlier_dialog import resolve_import_date_policy
-from tahmeed.ui.dialogs.description_mapping_dialog import (
-    ACTION_ASSIGN,
-    ACTION_SKIP,
-    ACTION_SKIP_ALL,
-    DescriptionMappingDialog,
-)
+from tahmeed.ui.dialogs.description_mapping_flow import prompt_unmapped_descriptions
 from tahmeed.ui.widgets.upload_busy import UploadBusy, UploadCancelled
 
 
@@ -88,41 +82,17 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
 
     # ── Description → item mapping (remembered) / skip ────────────────────
     if preview.unmapped:
-        total_unmapped = len(preview.unmapped)
-        cats = categories or []
-        while preview.unmapped:
-            key = next(iter(preview.unmapped))
-            count = preview.unmapped[key]
-            display = key
-            for row in preview.rows:
-                if normalize_description(row.description) == key:
-                    display = row.description
-                    break
-            remaining = len(preview.unmapped)
-            dlg = DescriptionMappingDialog(
-                display,
-                count,
-                cats,
-                remaining,
-                parent=parent,
-                allow_skip=True,
-                total=total_unmapped,
-            )
-            if dlg.exec() != DescriptionMappingDialog.Accepted:
-                return None
-            action = dlg.action()
-            if action == ACTION_SKIP:
-                skip_description_in_preview(preview, key)
-            elif action == ACTION_SKIP_ALL:
-                skip_all_unmapped(preview)
-                break
-            elif action == ACTION_ASSIGN:
-                chosen = dlg.selected_category()
-                if chosen is None:
-                    return None
-                await apply_mapping_to_preview(
-                    preview, key, chosen._id, chosen.name
-                )
+        ok = await prompt_unmapped_descriptions(
+            preview,
+            categories or [],
+            parent,
+            allow_skip=True,
+            apply_mapping=apply_mapping_to_preview,
+            skip_one=skip_description_in_preview,
+            skip_all=skip_all_unmapped,
+        )
+        if not ok:
+            return None
 
     # ── One register date for the whole upload ────────────────────────────
     if not resolve_import_date_policy(preview, parent=parent):

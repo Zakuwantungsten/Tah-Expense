@@ -398,6 +398,8 @@ class DailyRegister(QWidget):
     mode_changed      = Signal(bool)               # merged mode on/off
     attachment_count_changed = Signal(int)         # selected row attachment count
     save_busy_changed = Signal(bool)               # True while Save/Submit is in flight
+    # Active row Payee/Cheque for the always-visible QB header fields
+    active_payee_cheque_changed = Signal(str, str, bool)  # payee, cheque, editable
 
     def __init__(self, user: User, categories: List[Category], parent=None):
         super().__init__(parent)
@@ -552,6 +554,9 @@ class DailyRegister(QWidget):
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._show_context_menu)
         self._table.itemSelectionChanged.connect(self._emit_attachment_badge)
+        self._table.currentCellChanged.connect(
+            lambda *_: self._emit_active_payee_cheque()
+        )
 
         self._table_host = QWidget(self)
         host_lay = QVBoxLayout(self._table_host)
@@ -888,6 +893,9 @@ class DailyRegister(QWidget):
         self._update_footer()
         self._apply_filters()
         self.edit_state_changed.emit(False, 0)
+        if self._table.currentRow() < 0 and self._table.rowCount() > self._saved_count:
+            self._table.setCurrentCell(self._saved_count, COL_DESC)
+        self._emit_active_payee_cheque()
 
         if self._pending_highlight:
             term = self._pending_highlight
@@ -1152,6 +1160,7 @@ class DailyRegister(QWidget):
                 it.setBackground(QBrush(EDIT_BG))
         self._table.blockSignals(False)
         self.edit_state_changed.emit(True, 0)
+        self._emit_active_payee_cheque()
 
     def _exit_edit_mode(self, discard: bool) -> None:
         """Leave edit mode. When discard is True the date is reloaded so the grid
@@ -1167,6 +1176,49 @@ class DailyRegister(QWidget):
         self._edit_mode = False
         self._dirty_rows = set()
         self.edit_state_changed.emit(False, 0)
+        self._emit_active_payee_cheque()
+
+    def _emit_active_payee_cheque(self) -> None:
+        """Push the focused row's Payee/Cheque into the Table header fields."""
+        row = self._table.currentRow()
+        if row < 0 or row >= self._table.rowCount():
+            self.active_payee_cheque_changed.emit("", "", False)
+            return
+        editable = row >= self._saved_count or self._edit_mode
+        self.active_payee_cheque_changed.emit(
+            self._cell_text(row, COL_PAYEE),
+            self._cell_text(row, COL_CHEQUE),
+            editable,
+        )
+
+    def set_active_payee(self, text: str) -> None:
+        """Write Payee from the header field into the active register row."""
+        self._set_active_payee_cheque_cell(COL_PAYEE, text)
+
+    def set_active_cheque(self, text: str) -> None:
+        """Write Cheque from the header field into the active register row."""
+        self._set_active_payee_cheque_cell(COL_CHEQUE, text)
+
+    def _set_active_payee_cheque_cell(self, col: int, text: str) -> None:
+        row = self._table.currentRow()
+        if row < 0:
+            row = self._first_empty_editable_row()
+            if row >= self._table.rowCount():
+                self._append_editable_rows(10)
+            self._table.setCurrentCell(row, col)
+        if row < self._saved_count and not self._edit_mode:
+            return
+        value = (text or "").upper()
+        it = self._table.item(row, col)
+        if it is None:
+            it = QTableWidgetItem("")
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            if row >= self._saved_count:
+                it.setBackground(QBrush(NEW_BG))
+            self._table.setItem(row, col, it)
+        if it.text() == value:
+            return
+        it.setText(value)
 
     def _mark_dirty(self, row: int) -> None:
         """Flag a saved row as modified and give it a stronger amber background."""
@@ -1564,6 +1616,8 @@ class DailyRegister(QWidget):
             self._mark_dirty(row)
             if col == COL_TZS:
                 self._update_footer()
+            if col in (COL_PAYEE, COL_CHEQUE) and row == self._table.currentRow():
+                self._emit_active_payee_cheque()
             return
 
         # Uppercase all free-text cells
@@ -1611,6 +1665,8 @@ class DailyRegister(QWidget):
             self._update_footer()
 
         self._schedule_draft_autosave()
+        if col in (COL_PAYEE, COL_CHEQUE) and row == self._table.currentRow():
+            self._emit_active_payee_cheque()
 
     def _on_model_data_changed(self, top_left, bottom_right, roles=()) -> None:
         # Kept for receipt/other UserRole updates if added later.
@@ -1713,7 +1769,17 @@ class DailyRegister(QWidget):
             return
 
         if key in (Qt.Key_Delete, Qt.Key_Backspace):
-            self._clear_selected(); return
+            sel_rows = sorted({i.row() for i in self._table.selectedIndexes()})
+            if sel_rows and self._selection_is_full_rows(sel_rows):
+                saved = [r for r in sel_rows if r < self._saved_count]
+                if saved:
+                    self._delete_saved_rows(saved)
+                # Unsaved full rows still use the existing row-remove path.
+                if any(r >= self._saved_count for r in sel_rows):
+                    self._delete_rows()
+                return
+            self._clear_selected()
+            return
 
         if key == Qt.Key_Tab:
             self._commit_date_suggestion()
@@ -2589,7 +2655,20 @@ class DailyRegister(QWidget):
     def _show_context_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
         menu = QMenu(self._table)
-        if 0 <= row < self._saved_count and not self._edit_mode:
+        sel_rows = sorted({i.row() for i in self._table.selectedIndexes()})
+        saved_sel = [r for r in sel_rows if r < self._saved_count]
+        if (
+            saved_sel
+            and self._selection_is_full_rows(saved_sel)
+            and not self._edit_mode
+        ):
+            label = (
+                "Delete Saved Entr"
+                + ("ies" if len(saved_sel) > 1 else "y")
+            )
+            act = menu.addAction(label)
+            act.triggered.connect(lambda: self._delete_saved_rows(saved_sel))
+        elif 0 <= row < self._saved_count and not self._edit_mode:
             act = menu.addAction("Delete Saved Entry")
             act.triggered.connect(lambda: self._delete_saved_row(row))
         else:
@@ -2638,45 +2717,82 @@ class DailyRegister(QWidget):
         self._renumber()
 
     # ------------------------------------------------------------------
-    # Delete saved row
+    # Delete saved row(s)
     # ------------------------------------------------------------------
 
     def _delete_saved_row(self, row: int) -> None:
-        tx_id = self._saved_ids.get(row)
-        if not tx_id:
+        self._delete_saved_rows([row])
+
+    def _delete_saved_rows(self, rows: list) -> None:
+        rows = sorted({r for r in rows if r in self._saved_ids})
+        n_rows = len(rows)
+        if not n_rows:
             return
-        tx = self._saved_txs.get(row)
-        it = self._table.item(row, COL_DESC)
-        desc = it.text() if it else "?"
-        is_pending_edit = bool(
-            tx is not None
-            and getattr(tx, "original_transaction_id", None)
-            and not getattr(tx, "verified", False)
-        )
-        is_verified = bool(tx is not None and getattr(tx, "verified", False))
-        is_submitted = (
-            tx is not None
-            and not is_verified
-            and (getattr(tx, "register_status", "") or "submitted") != "draft"
-        )
-        if is_verified:
-            msg = (
-                f'Request deletion of approved expense:\n"{desc}"?\n\n'
-                "It will leave Master Expenses immediately and appear in the "
-                "accountant's Verify → Deleted tab for confirm or restore."
+
+        verified_n = 0
+        pending_n = 0
+        draft_n = 0
+        submitted_n = 0
+        for row in rows:
+            tx = self._saved_txs.get(row)
+            is_pending_edit = bool(
+                tx is not None
+                and getattr(tx, "original_transaction_id", None)
+                and not getattr(tx, "verified", False)
             )
-        elif is_pending_edit:
-            msg = (
-                f'Delete pending edit:\n"{desc}"?\n\n'
-                "This undoes the edit. The original approved expense stays in Master."
-            )
-        elif is_submitted:
-            msg = (
-                f'Delete submitted transaction:\n"{desc}"?\n\n'
-                "It will be removed from the Verify inbox."
-            )
+            is_verified = bool(tx is not None and getattr(tx, "verified", False))
+            if is_verified:
+                verified_n += 1
+            elif is_pending_edit:
+                pending_n += 1
+            elif (
+                tx is not None
+                and (getattr(tx, "register_status", "") or "submitted") == "draft"
+            ):
+                draft_n += 1
+            else:
+                submitted_n += 1
+
+        if n_rows == 1:
+            row = rows[0]
+            it = self._table.item(row, COL_DESC)
+            desc = it.text() if it else "?"
+            if verified_n:
+                msg = (
+                    f'Request deletion of approved expense:\n"{desc}"?\n\n'
+                    "It will leave Master Expenses immediately and appear in the "
+                    "accountant's Verify → Deleted tab. Confirming moves it to Trash."
+                )
+            elif pending_n:
+                msg = (
+                    f'Delete pending edit:\n"{desc}"?\n\n'
+                    "This undoes the edit. The original approved expense stays in Master."
+                )
+            elif submitted_n:
+                msg = (
+                    f'Delete submitted transaction:\n"{desc}"?\n\n'
+                    "It will be removed from the Verify inbox."
+                )
+            else:
+                msg = f'Delete saved transaction:\n"{desc}"?'
         else:
-            msg = f'Delete saved transaction:\n"{desc}"?'
+            parts = [f"Delete {n_rows} selected saved row(s)?"]
+            if verified_n:
+                parts.append(
+                    f"{verified_n} approved row(s) will go to Verify → Deleted "
+                    "(confirm moves them to Trash)."
+                )
+            if pending_n:
+                parts.append(
+                    f"{pending_n} pending edit(s) will be removed "
+                    "(originals stay on Master)."
+                )
+            if submitted_n or draft_n:
+                parts.append(
+                    f"{submitted_n + draft_n} unverified row(s) will be deleted."
+                )
+            msg = "\n\n".join(parts)
+
         if (
             QMessageBox.question(
                 self, "Delete Entry",
@@ -2685,22 +2801,41 @@ class DailyRegister(QWidget):
             )
             == QMessageBox.Yes
         ):
-            asyncio.ensure_future(self._do_delete_saved(tx_id))
+            tx_ids = [self._saved_ids[r] for r in rows if r in self._saved_ids]
+            asyncio.ensure_future(self._do_delete_saved_many(tx_ids))
 
     async def _do_delete_saved(self, tx_id) -> None:
+        await self._do_delete_saved_many([tx_id])
+
+    async def _do_delete_saved_many(self, tx_ids: list) -> None:
+        if not tx_ids:
+            return
         try:
             cashier_id = getattr(self._user, "_id", None)
-            result = await request_or_delete_transaction(tx_id, cashier_id)
-            if result == "not_found":
+            requested = 0
+            deleted = 0
+            missing = 0
+            for tx_id in tx_ids:
+                result = await request_or_delete_transaction(tx_id, cashier_id)
+                if result == "not_found":
+                    missing += 1
+                elif result == "deletion_requested":
+                    requested += 1
+                elif result == "deleted":
+                    deleted += 1
+            if missing and not (requested or deleted):
                 QMessageBox.warning(
                     self, "Not Found",
-                    "That entry was already removed.",
+                    "Those entries were already removed.",
                 )
-            elif result == "deletion_requested":
+            elif requested:
                 QMessageBox.information(
                     self, "Deletion Requested",
-                    "The approved expense was sent to Verify → Deleted.\n"
-                    "An accountant must confirm permanent removal or restore it.",
+                    (
+                        f"{requested} approved expense(s) sent to Verify → Deleted.\n"
+                        "An accountant must confirm (moves to Trash) or restore."
+                        + (f"\n{deleted} other row(s) were removed." if deleted else "")
+                    ),
                 )
             await self._load_date(self._current_date)
         except Exception as exc:
@@ -3014,14 +3149,20 @@ class DailyRegister(QWidget):
             self._table.editItem(item)
 
     def toolbar_delete(self) -> None:
-        """Delete the current saved entry or clear selected unsaved rows."""
+        """Delete selected saved entries or clear/remove selected unsaved rows."""
+        sel_rows = sorted({i.row() for i in self._table.selectedIndexes()})
+        saved = [r for r in sel_rows if r < self._saved_count]
+        if saved and self._selection_is_full_rows(saved):
+            self._delete_saved_rows(saved)
+            if any(r >= self._saved_count for r in sel_rows):
+                self._delete_rows()
+            return
         row = self._table.currentRow()
         if row < 0:
             return
         if row < self._saved_count:
             self._delete_saved_row(row)
             return
-        # Unsaved editable selection
         self._delete_rows()
 
     def toolbar_copy_row(self) -> None:

@@ -46,6 +46,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("table",           "Table",             "mdi.table-large",                  {}),
         ("browse",          "Browse",            "mdi.magnify",                      {}),
         ("master_expenses", "Master Expenses",   "mdi.table-multiple",               {}),
+        ("trash",           "Trash",             "mdi.delete-outline",               {}),
         ("import_daily",    "Import Daily",      "mdi.file-upload-outline",          {}),
     ]),
     # ITEMS are loaded dynamically from the DB (accountant-managed). The header
@@ -64,6 +65,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("rahntech",        "RahnTech",             "mdi.devices",           {}),
     ]),
     ("FUEL CONSUMPTION", [
+        ("fuel_overview",   "Fuel Overview", "mdi.chart-box-outline", {}),
         ("diesel_cash",     "Diesel Cash",   "mdi.gas-station-outline", {}),
         ("infinity",        "Infinity",      "mdi.gas-station",  {}),
         ("lake_zambia",     "Lake Zambia",   "mdi.water-pump",   {}),

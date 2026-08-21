@@ -73,6 +73,28 @@ def _build_cols() -> dict[str, tuple[float, float]]:
 
 _COL = _build_cols()
 
+# Dashboard stays date-sorted; PDF transaction detail groups by source.
+_DETAIL_SOURCE_ORDER = (
+    "Master Expenses",
+    "Diesel Cash",
+    "Infinity Diesel",
+    "Lake Zambia Diesel",
+    "Lake Tunduma Diesel",
+    "GBP Diesel",
+    "Afritrack",
+    "Toll Plaza",
+    "Parking Congo",
+    "Zambia Parking",
+    "Congo Expenses",
+    "Ahmed Kimvi",
+    "RahnTech",
+    "COMESA",
+    "Third Party Covers",
+    "SM Burhani Bonds",
+    "SM Burhani RPA",
+)
+_DETAIL_SOURCE_RANK = {name: i for i, name in enumerate(_DETAIL_SOURCE_ORDER)}
+
 _DASH = "—"
 _FONT_REG = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "arial.ttf"
 _FONT_BOLD = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "arialbd.ttf"
@@ -613,6 +635,20 @@ def _sources_label(rows: list[dict], source_filter_label: str) -> str:
     return ", ".join(names) if names else "—"
 
 
+def _sort_detail_rows_by_source(rows: list[dict]) -> list[dict]:
+    """Group PDF line items by source, then date within each source."""
+
+    def key(row: dict) -> tuple:
+        source = str(row.get("source") or "").strip()
+        rank = _DETAIL_SOURCE_RANK.get(source, len(_DETAIL_SOURCE_ORDER))
+        date_val = row.get("date")
+        if not isinstance(date_val, datetime):
+            date_val = datetime.min
+        return (rank, source.lower(), date_val)
+
+    return sorted(rows, key=key)
+
+
 def export_truck_overview_pdf(
     path: str,
     *,
@@ -623,9 +659,13 @@ def export_truck_overview_pdf(
     date_to: Optional[datetime] = None,
     source_label: str = "All Sources",
     generated_at: Optional[datetime] = None,
+    eyebrow: str = "FLEET EXPENSE REPORT",
+    report_title: Optional[str] = None,
+    subtitle: str = "Consolidated expense record across all logged sources",
 ) -> None:
     """Write a landscape Fleet Expense Report PDF for the given truck overview rows."""
     generated_at = generated_at or datetime.now()
+    rows = _sort_detail_rows_by_source(list(rows))
     logo = _logo_path()
     spend_items = _spend_by_source(rows)
     usd_total = float(summary.get("usd_total") or 0.0)
@@ -634,6 +674,7 @@ def export_truck_overview_pdf(
     avg = (usd_total / record_count) if record_count else 0.0
     period = _period_label(date_from, date_to, rows)
     sources = _sources_label(rows, source_label)
+    title = report_title or f"Truck Overview — {truck}"
 
     doc = fitz.open()
 
@@ -645,9 +686,8 @@ def export_truck_overview_pdf(
     y = _header(page, logo)
 
     # Title block
-    _draw_text(page, _ML, y + 6, "FLEET EXPENSE REPORT", size=7.5, color=_ORANGE, bold=True)
+    _draw_text(page, _ML, y + 6, eyebrow, size=7.5, color=_ORANGE, bold=True)
     y += 20.0
-    title = f"Truck Overview — {truck}"
     _draw_text(page, _ML, y + 6, title, size=18.0, color=_BLACK, bold=True)
     chip = f"{record_count} line items"
     chip_w = _text_len(chip, 8.0, bold=True)
@@ -657,7 +697,7 @@ def export_truck_overview_pdf(
         page,
         _ML,
         y,
-        "Consolidated expense record across all logged sources",
+        subtitle,
         size=9.5,
         color=_MUTED,
     )

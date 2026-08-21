@@ -305,11 +305,13 @@ class AccountantMenuBar(QMenuBar):
         m = self.addMenu("&Accountant")
         self._add(m, "&Overview", lambda: self._nav("overview"))
         self._add(m, "&Truck Overview", lambda: self._nav("truck_overview"))
+        self._add(m, "&Fuel Overview", lambda: self._nav("fuel_overview"))
         m.addSeparator()
         self._add(m, "&Verify", lambda: self._nav("verify"))
         self._add(m, "&Table", lambda: self._nav("table"))
         self._add(m, "&Browse", lambda: self._nav("browse"))
         self._add(m, "&Master Expenses", lambda: self._nav("master_expenses"))
+        self._add(m, "Tras&h", lambda: self._nav("trash"))
         self._add(m, "&Import Daily → Master…", lambda: self._nav("import_daily"))
 
     def _company_menu(self) -> None:
@@ -348,6 +350,7 @@ class AccountantMenuBar(QMenuBar):
     def _fuel_menu(self) -> None:
         m = self.addMenu("F&uel")
         for label, key in [
+            ("Fuel &Overview", "fuel_overview"),
             ("&Diesel Cash", "diesel_cash"),
             ("&Infinity", "infinity"),
             ("Lake &Zambia", "lake_zambia"),
@@ -360,6 +363,7 @@ class AccountantMenuBar(QMenuBar):
         m = self.addMenu("&Reports")
         self._add(m, "&Overview Dashboard", lambda: self._nav("overview"))
         self._add(m, "&Truck Overview", lambda: self._nav("truck_overview"))
+        self._add(m, "&Fuel Overview", lambda: self._nav("fuel_overview"))
         self._add(m, "&Master Expenses", lambda: self._nav("master_expenses"))
 
     def _window_menu(self) -> None:

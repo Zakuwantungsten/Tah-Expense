@@ -6,7 +6,7 @@ from time import monotonic
 from typing import List, Sequence
 
 from PySide6.QtCore import Qt, Signal, QEvent
-from PySide6.QtGui import QColor, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QColor, QFontMetrics, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import QComboBox
 
 
@@ -44,6 +44,35 @@ QComboBox QLineEdit {
 
 _FG = QColor("#111827")
 _BG = QColor("#FFFFFF")
+
+# Closed combo stays compact on the toolbar; the open list grows to the
+# longest label so filenames are readable. Cap + h-scroll for outliers.
+_POPUP_CHECK_PAD = 48
+_POPUP_MAX_WIDTH = 560
+
+
+def popup_content_width(
+    labels: Sequence[str],
+    font_metrics: QFontMetrics,
+    scrollbar_extra: int = 0,
+) -> int:
+    """Pixel width needed to paint every label plus checkbox padding."""
+    longest = 0
+    for label in labels:
+        longest = max(longest, font_metrics.horizontalAdvance(str(label)))
+    return longest + _POPUP_CHECK_PAD + scrollbar_extra
+
+
+def desired_popup_width(
+    labels: Sequence[str],
+    *,
+    combo_width: int,
+    font_metrics: QFontMetrics,
+    scrollbar_extra: int = 0,
+) -> int:
+    """Width for the open list: fit the longest label, never narrower than the combo."""
+    needed = popup_content_width(labels, font_metrics, scrollbar_extra)
+    return max(combo_width, min(needed, _POPUP_MAX_WIDTH))
 
 
 class CheckableMultiCombo(QComboBox):
@@ -91,6 +120,7 @@ class CheckableMultiCombo(QComboBox):
         item.setCheckState(Qt.Unchecked)
         item.setForeground(_FG)
         item.setBackground(_BG)
+        item.setToolTip(label)
         return item
 
     def set_options(
@@ -130,9 +160,40 @@ class CheckableMultiCombo(QComboBox):
         super().setStyleSheet((ss or "") + "\n" + _COMBO_SS)
 
     def showPopup(self) -> None:
-        self.view().setMinimumWidth(max(self.width(), 200))
+        width = self._size_popup_to_contents()
         self._popup_shown_at = monotonic()
         super().showPopup()
+        container = self.view().parentWidget()
+        if container is not None and container.width() < width:
+            container.resize(width, container.height())
+
+    def _size_popup_to_contents(self) -> int:
+        """Grow the open list to the longest option so long filenames stay readable."""
+        view = self.view()
+        labels = [
+            self._model.item(row).text()
+            for row in range(self._model.rowCount())
+            if self._model.item(row) is not None
+        ]
+        extra = 0
+        if self._model.rowCount() > self.maxVisibleItems():
+            vsb = view.verticalScrollBar()
+            extra = vsb.sizeHint().width() if vsb is not None else 16
+        fm = view.fontMetrics()
+        needed = popup_content_width(labels, fm, extra)
+        width = desired_popup_width(
+            labels,
+            combo_width=self.width(),
+            font_metrics=fm,
+            scrollbar_extra=extra,
+        )
+        view.setMinimumWidth(width)
+        view.setTextElideMode(Qt.ElideNone)
+        view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded if needed > _POPUP_MAX_WIDTH
+            else Qt.ScrollBarAlwaysOff
+        )
+        return width
 
     def hidePopup(self) -> None:
         if monotonic() - getattr(self, "_popup_shown_at", 0) < 0.2:

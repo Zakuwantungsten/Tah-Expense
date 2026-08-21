@@ -500,6 +500,9 @@ def _write_truck_overview_excel(
     date_range_label: str,
     rows: list,
     summary: dict,
+    *,
+    sheet_title: str = "Truck Overview",
+    banner_label: str = "TRUCK OVERVIEW",
 ) -> None:
     """Build and save the truck overview workbook (runs off the UI event loop)."""
     import openpyxl
@@ -507,7 +510,7 @@ def _write_truck_overview_excel(
 
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Truck Overview"
+    ws.title = sheet_title[:31]
 
     # Match results.xlsx style: green section banner, navy headers,
     # thin #CCCCCC borders, alternating #EEF2FF rows, Calibri.
@@ -555,7 +558,7 @@ def _write_truck_overview_excel(
 
     record_count = summary.get("record_count", len(rows))
     ws.merge_cells(f"A1:{last_col}1")
-    ws["A1"] = f"TRUCK OVERVIEW  -  {truck}   ({record_count:,} records)"
+    ws["A1"] = f"{banner_label}  -  {truck}   ({record_count:,} records)"
     ws["A1"].font = title_font
     ws["A1"].fill = title_fill
     ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
@@ -687,6 +690,26 @@ def _write_truck_overview_excel(
 
 
 class TruckOverviewWidget(QWidget):
+    PAGE_TITLE = "Truck Overview"
+    PAGE_ICON = "mdi.truck-fast-outline"
+    PAGE_OBJECT_NAME = "truckOverview"
+    SOURCE_OPTIONS = _SOURCE_OPTIONS
+    SUBTITLE_EMPTY = "Select a truck to gather cross-source expenses and fuel."
+    LOADING_OVERLAY_TEXT = "Loading truck overview…"
+    STATUS_EMPTY = "No truck selected yet."
+    ROW_NOUN = "cross-source row"
+    STATUS_HINT = " Zambia entries are summarized under ZMW."
+    LOADED_SUBTITLE = "Cross-source view for {truck}  ·  {period}"
+    LOAD_ERROR_LABEL = "truck overview"
+    HIGHLIGHT_SOURCE_GROUPS = ("master", "diesel_cash")
+    EXPORT_PREFIX = "Truck_Overview"
+    EXCEL_DIALOG_TITLE = "Export Truck Overview"
+    PDF_DIALOG_TITLE = "Export Truck Overview PDF"
+    EXCEL_SHEET_TITLE = "Truck Overview"
+    EXCEL_BANNER = "TRUCK OVERVIEW"
+    PDF_EYEBROW = "FLEET EXPENSE REPORT"
+    PDF_SUBTITLE = "Consolidated expense record across all logged sources"
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._loaded = 0
@@ -713,10 +736,10 @@ class TruckOverviewWidget(QWidget):
         schedule_coro(self._preload_fleet())
 
     def _build(self) -> None:
-        self.setObjectName("truckOverview")
+        self.setObjectName(self.PAGE_OBJECT_NAME)
         self.setStyleSheet(
-            f"QWidget#truckOverview {{ background: {_BG}; border: none; }}"
-            "QWidget#truckOverview QLabel { border: none; }"
+            f"QWidget#{self.PAGE_OBJECT_NAME} {{ background: {_BG}; border: none; }}"
+            f"QWidget#{self.PAGE_OBJECT_NAME} QLabel {{ border: none; }}"
         )
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 16)
@@ -737,12 +760,12 @@ class TruckOverviewWidget(QWidget):
             icon_lbl = QLabel()
             icon_lbl.setFixedSize(22, 22)
             icon_lbl.setStyleSheet("QLabel { border: none; background: transparent; }")
-            icon_lbl.setPixmap(qta.icon("mdi.truck-fast-outline", color=_BLUE).pixmap(22, 22))
+            icon_lbl.setPixmap(qta.icon(self.PAGE_ICON, color=_BLUE).pixmap(22, 22))
             tb.addWidget(icon_lbl)
         except Exception:
             pass
-        tb.addWidget(_lbl("Truck Overview", size=16, weight=700))
-        self._subtitle = _lbl("Select a truck to gather cross-source expenses and fuel.", size=12, color=_T2)
+        tb.addWidget(_lbl(self.PAGE_TITLE, size=16, weight=700))
+        self._subtitle = _lbl(self.SUBTITLE_EMPTY, size=12, color=_T2)
         tb.addWidget(self._subtitle)
         tb.addStretch()
         export_excel_btn = _btn("Excel", "mdi.microsoft-excel", primary=False)
@@ -759,7 +782,7 @@ class TruckOverviewWidget(QWidget):
         status_row = QHBoxLayout()
         status_row.setContentsMargins(0, 0, 0, 0)
         status_row.setSpacing(12)
-        self._status = _lbl("No truck selected yet.", size=11, color=_TM)
+        self._status = _lbl(self.STATUS_EMPTY, size=11, color=_TM)
         status_row.addWidget(self._status, 1)
         self._currency_toggle = _CurrencyFilterToggle()
         self._currency_toggle.changed.connect(self._on_currency_changed)
@@ -784,7 +807,7 @@ class TruckOverviewWidget(QWidget):
         self._footer = _StatusFooter()
         root.addWidget(self._footer)
 
-        self._loading_overlay = LoadingOverlay(self, "Loading truck overview…")
+        self._loading_overlay = LoadingOverlay(self, self.LOADING_OVERLAY_TEXT)
 
     async def _preload_fleet(self) -> None:
         """Warm fleet cache and give TruckLineEdit a sync suggestion list."""
@@ -835,7 +858,7 @@ class TruckOverviewWidget(QWidget):
         self._truck_edit.returnPressed.connect(self._on_load_clicked)
         filter_row.addWidget(self._truck_edit)
 
-        self._source_cb = _SourceMultiCombo(_SOURCE_OPTIONS)
+        self._source_cb = _SourceMultiCombo(self.SOURCE_OPTIONS)
         self._source_cb.setFixedWidth(160)
         self._source_cb.setFixedHeight(_CTRL_H)
         self._source_cb.setStyleSheet(_input_ss())
@@ -1001,16 +1024,27 @@ class TruckOverviewWidget(QWidget):
             return
         self._reset_and_load()
 
+    def _overview_apis(self):
+        from tahmeed.services.accountant_service import (
+            get_truck_overview_records,
+            count_truck_overview_records,
+            get_truck_overview_summary,
+        )
+        return (
+            get_truck_overview_records,
+            count_truck_overview_records,
+            get_truck_overview_summary,
+        )
+
+    def _pdf_report_title(self, truck: str) -> str:
+        return f"{self.PAGE_TITLE} — {truck}"
+
     def _status_loaded_text(self, truck: str, total: int) -> str:
         currency = self._currency_toggle.filter_value()
+        noun = self.ROW_NOUN if total == 1 else f"{self.ROW_NOUN}s"
         if currency:
-            return (
-                f"Loaded {total:,} {currency} cross-source row(s) for {truck}."
-            )
-        return (
-            f"Loaded {total:,} cross-source row(s) for {truck}. "
-            "Zambia entries are summarized under ZMW."
-        )
+            return f"Loaded {total:,} {currency} {noun} for {truck}."
+        return f"Loaded {total:,} {noun} for {truck}.{self.STATUS_HINT}"
 
     def _update_footer(self) -> None:
         if not self._active_truck:
@@ -1098,17 +1132,13 @@ class TruckOverviewWidget(QWidget):
         self._status.setText(f"Loading data for {truck}…")
         self._update_footer()
         try:
-            from tahmeed.services.accountant_service import (
-                get_truck_overview_records,
-                count_truck_overview_records,
-                get_truck_overview_summary,
-            )
+            get_records, count_records, get_summary = self._overview_apis()
 
             kw = self._filter_kw()
             records, total, summary = await asyncio.gather(
-                get_truck_overview_records(**kw, limit=_SCROLL_CHUNK, skip=0),
-                count_truck_overview_records(**kw),
-                get_truck_overview_summary(**kw),
+                get_records(**kw, limit=_SCROLL_CHUNK, skip=0),
+                count_records(**kw),
+                get_summary(**kw),
             )
             if generation != self._reload_generation:
                 return
@@ -1116,7 +1146,9 @@ class TruckOverviewWidget(QWidget):
             self._active_truck = truck
             self._total = total
             period = self._format_date_range_label()
-            self._subtitle.setText(f"Cross-source view for {truck}  ·  {period}")
+            self._subtitle.setText(
+                self.LOADED_SUBTITLE.format(truck=truck, period=period)
+            )
             self._records_card.set_value(f"{summary['record_count']:,}")
             self._sources_card.set_value(f"{summary['source_count']:,}")
             self._tzs_card.set_value(_fmt_amount("TZS", summary["tzs_total"]))
@@ -1129,7 +1161,7 @@ class TruckOverviewWidget(QWidget):
         except Exception as exc:
             if generation == self._reload_generation:
                 self._table.setRowCount(0)
-                self._status.setText(f"Failed to load truck overview: {exc}")
+                self._status.setText(f"Failed to load {self.LOAD_ERROR_LABEL}: {exc}")
         finally:
             self._loading = False
             self._loading_overlay.hide_loading()
@@ -1144,11 +1176,11 @@ class TruckOverviewWidget(QWidget):
         self._scroll_loading = True
         self._update_footer()
         try:
-            from tahmeed.services.accountant_service import get_truck_overview_records
+            get_records, _count_records, _get_summary = self._overview_apis()
 
             kw = self._filter_kw()
             gen = self._reload_generation
-            records = await get_truck_overview_records(
+            records = await get_records(
                 **kw, limit=_SCROLL_CHUNK, skip=self._loaded,
             )
             if gen != self._reload_generation:
@@ -1172,7 +1204,7 @@ class TruckOverviewWidget(QWidget):
             amount = row.get("amount")
             tzs_amt, usd_amt, zmw_amt = _amount_columns(row.get("currency", ""), amount)
             amount_color = _RED if isinstance(amount, (int, float)) and amount < 0 else _T1
-            source_color = _BLUE if row.get("source_group") in ("master", "diesel_cash") else _T2
+            source_color = _BLUE if row.get("source_group") in self.HIGHLIGHT_SOURCE_GROUPS else _T2
             receipt = row.get("receipt_status") or "—"
             receipt_color = (
                 _GREEN if receipt == "received" else
@@ -1260,10 +1292,7 @@ class TruckOverviewWidget(QWidget):
             )
             return
 
-        from tahmeed.services.accountant_service import (
-            get_truck_overview_records,
-            get_truck_overview_summary,
-        )
+        get_records, _count_records, get_summary = self._overview_apis()
 
         self._show_export_busy(f"Preparing Excel export for {truck}…")
         rows = None
@@ -1271,8 +1300,8 @@ class TruckOverviewWidget(QWidget):
         prepare_error = None
         try:
             kw = self._filter_kw()
-            rows = await get_truck_overview_records(**kw, limit=100000, skip=0)
-            summary = await get_truck_overview_summary(**kw)
+            rows = await get_records(**kw, limit=100000, skip=0)
+            summary = await get_summary(**kw)
         except Exception as exc:
             prepare_error = exc
         finally:
@@ -1290,10 +1319,10 @@ class TruckOverviewWidget(QWidget):
         source_tag = self._source_filter_tag()
         currency = self._currency_toggle.filter_value() or "ALL"
         default_name = (
-            f"Truck_Overview_{truck}_{source_tag}_{currency}.xlsx".replace(" ", "_")
+            f"{self.EXPORT_PREFIX}_{truck}_{source_tag}_{currency}.xlsx".replace(" ", "_")
         )
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Truck Overview", default_name, "Excel Files (*.xlsx)"
+            self, self.EXCEL_DIALOG_TITLE, default_name, "Excel Files (*.xlsx)"
         )
         if not path:
             return
@@ -1311,6 +1340,8 @@ class TruckOverviewWidget(QWidget):
                 self._format_date_range_label(),
                 rows,
                 summary,
+                sheet_title=self.EXCEL_SHEET_TITLE,
+                banner_label=self.EXCEL_BANNER,
             )
         except Exception as exc:
             write_error = exc
@@ -1335,10 +1366,7 @@ class TruckOverviewWidget(QWidget):
         if not self._has_valid_date_range(warn=True):
             return
 
-        from tahmeed.services.accountant_service import (
-            get_truck_overview_records,
-            get_truck_overview_summary,
-        )
+        get_records, _count_records, get_summary = self._overview_apis()
 
         self._show_export_busy(f"Preparing PDF export for {truck}…")
         rows = None
@@ -1346,8 +1374,8 @@ class TruckOverviewWidget(QWidget):
         prepare_error = None
         try:
             kw = self._filter_kw()
-            rows = await get_truck_overview_records(**kw, limit=5000, skip=0)
-            summary = await get_truck_overview_summary(**kw)
+            rows = await get_records(**kw, limit=5000, skip=0)
+            summary = await get_summary(**kw)
         except Exception as exc:
             prepare_error = exc
         finally:
@@ -1363,9 +1391,9 @@ class TruckOverviewWidget(QWidget):
             return
 
         currency = self._currency_toggle.filter_value() or "ALL"
-        default_name = f"Truck_Overview_{truck}_{currency}_Report.pdf".replace(" ", "_")
+        default_name = f"{self.EXPORT_PREFIX}_{truck}_{currency}_Report.pdf".replace(" ", "_")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Truck Overview PDF", default_name, "PDF Files (*.pdf)"
+            self, self.PDF_DIALOG_TITLE, default_name, "PDF Files (*.pdf)"
         )
         if not path:
             return
@@ -1387,6 +1415,9 @@ class TruckOverviewWidget(QWidget):
                 date_from=date_from,
                 date_to=date_to,
                 source_label=self._source_filter_label(),
+                eyebrow=self.PDF_EYEBROW,
+                report_title=self._pdf_report_title(truck),
+                subtitle=self.PDF_SUBTITLE,
             )
         except Exception as exc:
             write_error = exc
@@ -1468,8 +1499,8 @@ class TruckOverviewWidget(QWidget):
         sync_from_to(
             self._from_date, self._to_date, self._year, self._month, optional=True,
         )
-        self._subtitle.setText("Select a truck to gather cross-source expenses and fuel.")
-        self._status.setText("No truck selected yet.")
+        self._subtitle.setText(self.SUBTITLE_EMPTY)
+        self._status.setText(self.STATUS_EMPTY)
         self._table.setRowCount(0)
         self._footer.set_text("Select a truck to load records")
         self._records_card.set_value("—")

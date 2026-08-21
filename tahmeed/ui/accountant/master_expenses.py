@@ -26,21 +26,17 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem,
     QLineEdit, QComboBox, QPushButton, QDateEdit,
     QMessageBox, QFileDialog, QAbstractItemView, QDialog,
+    QFormLayout, QDialogButtonBox,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QSize, QDate
 from PySide6.QtGui import QColor
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.app_state import app_state
-from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
-from tahmeed.ui.widgets.excel_column_filter import (
-    ExcelFilterHeaderView, SORT_ASC, cascade_column_values,
-)
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
-from tahmeed.ui.accountant.separate_expenses import (
-    _make_table, _cell, _finish_table_row, _stripe_bg, _fmt_num, _SCROLL_CHUNK,
-)
+from tahmeed.ui.accountant.separate_expenses import _fmt_num, _SCROLL_CHUNK
+from tahmeed.ui.accountant.master_ledger_table import MasterLedgerTable
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE   = "#FFFFFF"
@@ -84,6 +80,11 @@ _COLS = [
 # Default pixel widths; 0 = stretch (DESCRIPTION fills remaining space).
 _COL_DEFAULTS = [52, 72, 110, 0, 95, 120, 110, 110, 100, 100, 90, 100, 100]
 _DESC_COL = 3
+_COL_DATE = 1
+_COL_ITEM = 2
+_COL_DESC = 3
+_COL_TRUCK = 4
+_COL_MEMO = 5
 _COL_REF = 6
 _COL_TZS = 7
 _COL_USD = 8
@@ -91,6 +92,20 @@ _COL_RCPT = 9
 _COL_OWN = 10
 _COL_APP = 11
 _COL_CASH = 12
+
+# Columns accountants may edit (S/NO + CASHIER stay read-only).
+_EDITABLE_COLS: Set[int] = {
+    _COL_DATE, _COL_ITEM, _COL_DESC, _COL_TRUCK, _COL_MEMO, _COL_REF,
+    _COL_TZS, _COL_USD, _COL_RCPT, _COL_OWN, _COL_APP,
+}
+
+_TX_ID_ROLE = Qt.UserRole
+
+_RECEIPT_EDIT_OPTIONS = [
+    ("received", "Received"),
+    ("pending", "Pending"),
+    ("no_receipt", "No Receipt"),
+]
 
 _FILTERABLE_COLS: Set[int] = set(range(len(_COLS))) - {0}
 _SORT_KINDS = {
@@ -281,6 +296,41 @@ def _short_name(name: str) -> str:
     if len(parts) >= 2:
         return f"{parts[0]} {parts[1][0]}."
     return name or "—"
+
+
+
+class _MasterBulkItemDialog(QDialog):
+    """Bulk assign Item (category) to selected Master rows — picker only."""
+
+    def __init__(self, row_count: int, item_names: list, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Set Item ({row_count} rows)")
+        self.setMinimumWidth(380)
+        self.setStyleSheet(
+            f"QDialog {{ background: {_WHITE}; }}"
+            f"QLabel {{ color: {_T1}; font-size: 12px; font-family:'Segoe UI'; }}"
+            f"QComboBox {{ border: 1px solid {_BORDER}; border-radius: 5px;"
+            f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
+            "  font-family:'Segoe UI'; padding: 0 8px; min-height: 30px; }"
+        )
+        form = QFormLayout()
+        form.setContentsMargins(16, 16, 16, 8)
+        form.setSpacing(10)
+        self._item = QComboBox()
+        self._item.setEditable(True)
+        self._item.setInsertPolicy(QComboBox.NoInsert)
+        names = sorted({(n or "").strip() for n in item_names if (n or "").strip()}, key=str.lower)
+        self._item.addItems(names)
+        form.addRow("Item", self._item)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(buttons)
+
+    def item_name(self) -> str:
+        return self._item.currentText().strip()
 
 
 class _MonthTabBar(QFrame):
@@ -554,256 +604,9 @@ class _FilterBar(QFrame):
 
 # ── Unified ledger table (single QTableWidget, Bonds / Diesel Cash styling) ────
 
-class _LedgerTable(QFrame):
-    """Scrolling ledger with Excel ▾ header filters and server-side sort."""
+# Ledger grid lives in master_ledger_table (Excel-like edit/copy/paste).
+_LedgerTable = MasterLedgerTable
 
-    sort_changed = Signal(str, bool)  # (sort_field, ascending)
-    col_filter_changed = Signal()     # header filters applied / cleared
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setStyleSheet(f"QFrame {{ background: {_WHITE}; border: none; }}")
-        self._sort_field = "date"
-        self._sort_asc = False
-        self._col_filters: Dict[int, Set[str]] = {}
-        self._build()
-
-    def _build(self) -> None:
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(0)
-
-        self._tbl = _make_table([c[0] for c in _COLS])
-        self._tbl.setStyleSheet(_TABLE_SS)
-        self._tbl.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._tbl.setShowGrid(True)
-        self._tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-
-        filter_hdr = ExcelFilterHeaderView(
-            self._tbl,
-            filterable_columns=_FILTERABLE_COLS,
-            sort_kinds=_SORT_KINDS,
-        )
-        filter_hdr.set_value_provider(self._filter_menu_values)
-        filter_hdr.set_label_provider(lambda c: _COLS[c][0] if 0 <= c < len(_COLS) else "")
-        filter_hdr.filter_changed.connect(self._on_col_filter_changed)
-        filter_hdr.sort_requested.connect(self._on_excel_sort)
-        self._tbl.setHorizontalHeader(filter_hdr)
-
-        hdr = self._tbl.horizontalHeader()
-        hdr.setSortIndicatorShown(True)
-        hdr.setSectionsMovable(False)
-        hdr.setMinimumSectionSize(40)
-        bind_column_width_persistence(
-            self._tbl,
-            "master_expenses_v2",
-            _COL_DEFAULTS,
-            stretch_columns=[_DESC_COL],
-        )
-        hdr.sectionClicked.connect(self._on_header_click)
-        self._update_sort_indicator()
-        vl.addWidget(self._tbl)
-
-    @staticmethod
-    def _flag(align: str) -> Qt.AlignmentFlag:
-        return {"left": Qt.AlignLeft, "right": Qt.AlignRight,
-                "center": Qt.AlignHCenter}[align] | Qt.AlignVCenter
-
-    def table(self) -> QTableWidget:
-        return self._tbl
-
-    def clear_rows(self) -> None:
-        self._tbl.setRowCount(0)
-
-    def clear_column_filters(self) -> None:
-        self._col_filters.clear()
-        hdr = self._tbl.horizontalHeader()
-        if isinstance(hdr, ExcelFilterHeaderView):
-            hdr.clear_filters()
-        self._apply_column_filters()
-
-    # ── Excel header filters ───────────────────────────────────────────────
-
-    def _cell_text(self, row: int, col: int) -> str:
-        it = self._tbl.item(row, col)
-        return (it.text() if it else "").strip()
-
-    def _filter_source_rows(self) -> List[dict]:
-        rows: List[dict] = []
-        for r in range(self._tbl.rowCount()):
-            row: dict = {}
-            for c in _FILTERABLE_COLS:
-                txt = self._cell_text(r, c)
-                if txt and txt != "—":
-                    row[c] = txt
-            if row:
-                rows.append(row)
-        return rows
-
-    def _filter_menu_values(self, col: int) -> set:
-        return cascade_column_values(
-            self._filter_source_rows(),
-            target_col=col,
-            active_filters=self._col_filters,
-        )
-
-    def _on_col_filter_changed(self, col: int, accepted) -> None:
-        accepted = set(accepted or [])
-        if accepted:
-            self._col_filters[col] = accepted
-        else:
-            self._col_filters.pop(col, None)
-        self._prune_stale_filters(changed_col=col)
-        hdr = self._tbl.horizontalHeader()
-        if isinstance(hdr, ExcelFilterHeaderView):
-            hdr.sync_active(self._col_filters)
-        self._apply_column_filters()
-        self.col_filter_changed.emit()
-
-    def _prune_stale_filters(self, *, changed_col: int) -> None:
-        if not self._col_filters:
-            return
-        for _ in range(len(self._col_filters) + 1):
-            changed = False
-            for col in list(self._col_filters.keys()):
-                if col == changed_col:
-                    continue
-                available = self._filter_menu_values(col)
-                kept = {v for v in self._col_filters.get(col, set()) if v in available}
-                if not kept:
-                    self._col_filters.pop(col, None)
-                    changed = True
-                elif kept != self._col_filters[col]:
-                    self._col_filters[col] = kept
-                    changed = True
-            if not changed:
-                break
-
-    def _row_matches_filters(self, row: int) -> bool:
-        for col, accepted in self._col_filters.items():
-            if not accepted:
-                continue
-            if self._cell_text(row, col) not in accepted:
-                return False
-        return True
-
-    def _apply_column_filters(self) -> None:
-        t = self._tbl
-        t.setUpdatesEnabled(False)
-        try:
-            for r in range(t.rowCount()):
-                t.setRowHidden(r, not self._row_matches_filters(r))
-        finally:
-            t.setUpdatesEnabled(True)
-
-    def visible_row_count(self) -> int:
-        return sum(
-            1 for r in range(self._tbl.rowCount())
-            if not self._tbl.isRowHidden(r)
-        )
-
-    # ── Sort ───────────────────────────────────────────────────────────────
-
-    def _on_header_click(self, col: int) -> None:
-        # Ignore chevron clicks (handled by ExcelFilterHeaderView).
-        sort_field = _COLS[col][2] if 0 <= col < len(_COLS) else None
-        if sort_field is None:
-            return
-        if self._sort_field == sort_field:
-            self._sort_asc = not self._sort_asc
-        else:
-            self._sort_field = sort_field
-            self._sort_asc = False
-        self._update_sort_indicator()
-        self.sort_changed.emit(self._sort_field, self._sort_asc)
-
-    def _on_excel_sort(self, col: int, mode: str) -> None:
-        sort_field = _COLS[col][2] if 0 <= col < len(_COLS) else None
-        if sort_field is None:
-            return
-        self._sort_field = sort_field
-        self._sort_asc = mode == SORT_ASC
-        self._update_sort_indicator()
-        self.sort_changed.emit(self._sort_field, self._sort_asc)
-
-    def _update_sort_indicator(self) -> None:
-        order = Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
-        for i, (_, _a, f) in enumerate(_COLS):
-            if f == self._sort_field:
-                self._tbl.horizontalHeader().setSortIndicator(i, order)
-                return
-
-    # ── Populate ───────────────────────────────────────────────────────────
-
-    def _fill_row(
-        self, r: int, tx: Transaction, serial: int,
-        cashier_names: Dict, row_idx: int,
-    ) -> None:
-        t = self._tbl
-        row_bg = _stripe_bg(row_idx)
-        cashier_name = (
-            _short_name(cashier_names.get(tx.cashier_id, ""))
-            if tx.cashier_id else "—"
-        )
-        item_str = tx.item or tx.category_name or "—"
-        tzs_txt, usd_txt = _amount_cells(tx)
-        amt_color = _RED if tx.amount < 0 else _T1
-
-        t.setItem(r, 0, _cell(str(serial), self._flag("center")))
-        t.setItem(r, 1, _cell(_fmt_tx_date(tx.date)))
-        t.setItem(r, 2, _cell(item_str))
-        t.setItem(r, 3, _cell(tx.description or "—"))
-        t.setItem(r, 4, _cell(tx.truck_number or "—"))
-        t.setItem(r, 5, _cell(tx.memo or "—"))
-
-        ref_text = _ref_float_display(tx)
-        t.setItem(
-            r, _COL_REF,
-            _cell(ref_text or "—", color=_AMBER if ref_text else _TM),
-        )
-
-        t.setItem(
-            r, _COL_TZS,
-            _cell(tzs_txt, self._flag("right"), color=amt_color if tzs_txt != "—" else _TM),
-        )
-        t.setItem(
-            r, _COL_USD,
-            _cell(usd_txt, self._flag("right"), color=amt_color if usd_txt != "—" else _TM),
-        )
-
-        rcpt_text, rcpt_fg = _receipt_text(tx.receipt_status)
-        t.setItem(r, _COL_RCPT, _cell(rcpt_text, self._flag("center"), color=rcpt_fg))
-        t.setItem(r, _COL_OWN, _cell(tx.ownership or "—"))
-        t.setItem(r, _COL_APP, _cell(tx.approver or "—", color=_T2))
-        t.setItem(r, _COL_CASH, _cell(cashier_name))
-        _finish_table_row(t, r, row_bg)
-
-    def populate(self, txs: List[Transaction], skip: int,
-                 cashier_names: Dict = None) -> None:
-        if cashier_names is None:
-            cashier_names = {}
-        self.clear_rows()
-        self.append_rows(txs, skip, cashier_names)
-
-    def append_rows(
-        self, txs: List[Transaction], skip: int,
-        cashier_names: Dict = None,
-    ) -> None:
-        if cashier_names is None:
-            cashier_names = {}
-        t = self._tbl
-        start = t.rowCount()
-        t.setRowCount(start + len(txs))
-        for i, tx in enumerate(txs):
-            self._fill_row(start + i, tx, skip + i + 1, cashier_names, start + i)
-        if self._col_filters:
-            self._apply_column_filters()
-
-    def row_count(self) -> int:
-        return self._tbl.rowCount()
-
-
-# ── Footer totals bar ─────────────────────────────────────────────────────────
 
 class _FooterBar(QFrame):
     def __init__(self, parent=None) -> None:
@@ -877,6 +680,9 @@ class MasterExpensesWidget(QWidget):
         self._filters_loaded = False
         self._reload_generation = 0
         self._import_in_flight = False
+        self._item_names: List[str] = []
+        self._item_by_name: Dict = {}
+        self._edit_in_flight = False
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -939,6 +745,19 @@ class MasterExpensesWidget(QWidget):
         self._fy_cb.currentIndexChanged.connect(self._on_year_changed)
         tb.addWidget(self._fy_cb)
 
+        self._edit_btn = _action_btn("Edit", "mdi.pencil", primary=False)
+        self._edit_btn.setToolTip(
+            "Unlock the grid for Excel-style editing (type in cells, copy/paste, Ctrl+D fill)."
+        )
+        self._edit_btn.clicked.connect(self._on_toggle_edit)
+        tb.addWidget(self._edit_btn)
+
+        self._save_btn = _action_btn("Save", "mdi.content-save", primary=True)
+        self._save_btn.setEnabled(False)
+        self._save_btn.setToolTip("Save dirty Master rows (Ctrl+S in the grid).")
+        self._save_btn.clicked.connect(self._on_save_edits)
+        tb.addWidget(self._save_btn)
+
         # Refresh
         refresh_btn = QPushButton()
         refresh_btn.setFixedSize(32, 32)
@@ -972,7 +791,10 @@ class MasterExpensesWidget(QWidget):
         # ── Table ────────────────────────────────────────────────────────
         self._table = _LedgerTable()
         self._table.sort_changed.connect(self._on_sort_changed)
-        self._table.col_filter_changed.connect(self._update_status)
+        self._table.col_filter_changed.connect(self._on_col_filter_changed)
+        self._table.edit_state_changed.connect(self._on_edit_state_changed)
+        self._table.bulk_set_item_requested.connect(self._on_bulk_set_item)
+        self._table.save_requested.connect(self._on_save_edits)
         self._table.table().verticalScrollBar().valueChanged.connect(self._on_scroll)
         root.addWidget(self._table, 1)
 
@@ -1023,7 +845,8 @@ class MasterExpensesWidget(QWidget):
             app_state.fiscal_year = self._year
 
     def _filter_kw(self) -> dict:
-        return dict(
+        col_filters = self._table.column_filters_for_query()
+        kw = dict(
             year=self._year,
             month=self._month,
             search=self._filter_bar.search_text(),
@@ -1033,6 +856,9 @@ class MasterExpensesWidget(QWidget):
             date_from=self._filter_bar.date_from(),
             date_to=self._filter_bar.date_to(),
         )
+        if col_filters:
+            kw["column_filters"] = col_filters
+        return kw
 
     def _reset_and_load(self, *, keep_col_filters: bool = False) -> None:
         self._reload_generation += 1
@@ -1045,25 +871,18 @@ class MasterExpensesWidget(QWidget):
         asyncio.ensure_future(self._load_initial(self._reload_generation))
 
     def _update_status(self) -> None:
-        visible = self._table.visible_row_count()
-        filtered = bool(self._table._col_filters)
+        filtered = bool(self._table.column_filters_for_query())
         if self._total == 0:
             self._status_lbl.setText(
                 "No records match the current filters." if not self._loading else "Loading…"
             )
-        elif self._loaded >= self._total and not filtered:
-            self._status_lbl.setText(f"Showing all {self._total:,} records")
-        elif filtered:
-            more = (
-                f"  •  Scroll down for more ({self._loaded:,} of {self._total:,} loaded)"
-                if self._loaded < self._total else ""
-            )
-            self._status_lbl.setText(
-                f"Showing {visible:,} filtered of {self._loaded:,} loaded{more}"
-            )
+        elif self._loaded >= self._total:
+            suffix = " (column filters applied)" if filtered else ""
+            self._status_lbl.setText(f"Showing all {self._total:,} records{suffix}")
         else:
+            extra = "  •  Column filters on full range" if filtered else ""
             self._status_lbl.setText(
-                f"Showing {self._loaded:,} of {self._total:,}  •  Scroll down for more"
+                f"Showing {self._loaded:,} of {self._total:,}  •  Scroll down for more{extra}"
             )
 
     # ── Event handlers ─────────────────────────────────────────────────────
@@ -1087,17 +906,235 @@ class MasterExpensesWidget(QWidget):
     def _on_filter_changed(self) -> None:
         self._debounce.start()
 
+    def _on_col_filter_changed(self) -> None:
+        """Excel ▾ filters query the whole selected year/month range, not one page."""
+        self._reset_and_load(keep_col_filters=True)
+
     def _on_sort_changed(self, field: str, asc: bool) -> None:
         self._sort_field = field
         self._sort_asc = asc
         self._reset_and_load(keep_col_filters=True)
 
     def _on_scroll(self, value: int) -> None:
+        if self._table.scroll_frozen():
+            return
         bar = self._table.table().verticalScrollBar()
         if bar.maximum() <= 0:
             return
         if value >= bar.maximum() - 24:
             asyncio.ensure_future(self._load_more())
+
+    # ── Edit / save (Excel-style grid) ─────────────────────────────────────
+
+    def _accountant_id(self):
+        return getattr(self._user, "_id", None) if self._user else None
+
+    async def _ensure_item_names(self) -> List[str]:
+        if self._item_names:
+            return self._item_names
+        names: List[str] = []
+        try:
+            from tahmeed.services.category_service import get_all_categories
+            cats = await get_all_categories(include_inactive=True)
+            names = [c.name for c in cats if getattr(c, "name", None)]
+            self._item_by_name = {
+                (c.name or "").strip().lower(): c
+                for c in cats if getattr(c, "name", None)
+            }
+        except Exception:
+            self._item_by_name = {}
+            try:
+                from tahmeed.services.accountant_service import get_master_categories
+                names = list(await get_master_categories(self._year) or [])
+            except Exception:
+                names = []
+        self._item_names = names
+        self._table.set_lookups(
+            item_names=names,
+            default_year=self._year,
+        )
+        return names
+
+    def _with_category_id(self, updates: dict) -> dict:
+        out = dict(updates)
+        name = (out.get("item") or out.get("category_name") or "").strip()
+        if not name:
+            return out
+        cat = getattr(self, "_item_by_name", {}).get(name.lower())
+        if cat is not None and getattr(cat, "_id", None) is not None:
+            out["category_id"] = cat._id
+            out["item"] = cat.name
+            out["category_name"] = cat.name
+        return out
+
+    def _on_edit_state_changed(self, editing: bool, dirty_count: int) -> None:
+        if editing:
+            self._edit_btn.setText("  Cancel Edit")
+            try:
+                self._edit_btn.setIcon(qta.icon("mdi.close", color=_T2))
+            except Exception:
+                pass
+        else:
+            self._edit_btn.setText("  Edit")
+            try:
+                self._edit_btn.setIcon(qta.icon("mdi.pencil", color=_T2))
+            except Exception:
+                pass
+        self._save_btn.setEnabled(editing and dirty_count > 0)
+        if dirty_count:
+            self._save_btn.setText(f"  Save ({dirty_count})")
+        else:
+            self._save_btn.setText("  Save")
+
+    def _on_toggle_edit(self) -> None:
+        if self._table.is_edit_mode():
+            if self._table.has_dirty():
+                resp = QMessageBox.question(
+                    self, "Discard changes?",
+                    "Exit edit mode and discard unsaved cell changes?",
+                    QMessageBox.Discard | QMessageBox.Cancel,
+                    QMessageBox.Cancel,
+                )
+                if resp == QMessageBox.Cancel:
+                    return
+            self._table.exit_edit_mode(discard=True)
+            self._filters_loaded = False
+            self._reset_and_load(keep_col_filters=True)
+            return
+        asyncio.ensure_future(self._enter_edit_mode_async())
+
+    async def _enter_edit_mode_async(self) -> None:
+        await self._ensure_item_names()
+        fleet: set = set()
+        fleet_kinds: dict = {}
+        labels = None
+        try:
+            from tahmeed.services.truck_service import get_fleet_numbers, get_fleet_kinds
+            from tahmeed.services.settings_service import get_setting
+            from tahmeed.services.truck_format import (
+                DEFAULT_PLACE_LABELS, merge_allowed_labels,
+            )
+            fleet = set(await get_fleet_numbers() or set())
+            try:
+                fleet_kinds = await get_fleet_kinds() or {}
+            except Exception:
+                fleet_kinds = {}
+            try:
+                raw = await get_setting("allowed_truck_labels")
+                if isinstance(raw, list) and raw:
+                    labels = merge_allowed_labels(raw, DEFAULT_PLACE_LABELS)
+                else:
+                    labels = set(DEFAULT_PLACE_LABELS)
+            except Exception:
+                labels = set(DEFAULT_PLACE_LABELS)
+        except Exception:
+            fleet = set()
+            labels = None
+        role = getattr(self._user, "role", "") if self._user else ""
+        self._table.set_lookups(
+            item_names=self._item_names,
+            fleet_numbers=fleet,
+            fleet_kinds=fleet_kinds,
+            allowed_truck_labels=labels,
+            default_year=self._year,
+            can_add_fleet=role in ("admin", "accountant"),
+        )
+        self._table.enter_edit_mode()
+
+    def _on_save_edits(self) -> None:
+        if self._edit_in_flight or not self._table.has_dirty():
+            return
+        asyncio.ensure_future(self._save_edits_async())
+
+    async def _save_edits_async(self) -> None:
+        from bson import ObjectId
+        from tahmeed.services.accountant_service import update_master_transaction
+
+        self._table._commit_open_editor()
+        dirty = self._table.dirty_rows()
+        if not dirty:
+            return
+        await self._ensure_item_names()
+        self._edit_in_flight = True
+        self._loading_overlay.show_loading(f"Saving {len(dirty)} row(s)…")
+        saved = 0
+        errors: List[str] = []
+        try:
+            for row in dirty:
+                tx = self._table.tx_at(row)
+                if tx is None or tx._id is None:
+                    continue
+                updates = self._table.updates_from_row(row)
+                if not updates:
+                    continue
+                try:
+                    ok = await update_master_transaction(
+                        ObjectId(str(tx._id)),
+                        self._with_category_id(updates),
+                        self._accountant_id(),
+                    )
+                    if ok:
+                        saved += 1
+                    else:
+                        errors.append(f"Row {row + 1}: not updated")
+                except Exception as exc:
+                    errors.append(f"Row {row + 1}: {exc}")
+            if errors:
+                QMessageBox.warning(
+                    self, "Partial Save",
+                    f"Saved {saved} row(s).\n\n" + "\n".join(errors[:8]),
+                )
+            self._table.exit_edit_mode(discard=False)
+            self._filters_loaded = False
+            self._reset_and_load(keep_col_filters=True)
+        finally:
+            self._edit_in_flight = False
+            self._loading_overlay.hide_loading()
+
+    def _on_bulk_set_item(self) -> None:
+        if self._edit_in_flight:
+            return
+        ids = self._table.selected_tx_ids_for_item_bulk()
+        if not ids:
+            QMessageBox.information(
+                self, "Bulk Set Item",
+                "Select one or more rows (or cells) first.",
+            )
+            return
+        asyncio.ensure_future(self._bulk_set_item_async(ids))
+
+    async def _bulk_set_item_async(self, ids: list) -> None:
+        from tahmeed.services.accountant_service import bulk_update_master_transactions
+
+        items = await self._ensure_item_names()
+        dlg = _MasterBulkItemDialog(len(ids), items, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        name = dlg.item_name()
+        if not name:
+            return
+        updates = self._with_category_id({"item": name, "category_name": name})
+        self._edit_in_flight = True
+        self._loading_overlay.show_loading(f"Updating item on {len(ids)} rows…")
+        try:
+            n = await bulk_update_master_transactions(
+                ids, updates, self._accountant_id(),
+            )
+            if n == 0:
+                QMessageBox.warning(
+                    self, "Not Saved",
+                    "No rows were updated. They may no longer be in Master.",
+                )
+                return
+            if self._table.is_edit_mode():
+                self._table.exit_edit_mode(discard=False)
+            self._filters_loaded = False
+            self._reset_and_load(keep_col_filters=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Failed", str(exc))
+        finally:
+            self._edit_in_flight = False
+            self._loading_overlay.hide_loading()
 
     # ── Data loading ───────────────────────────────────────────────────────
 
@@ -1156,7 +1193,9 @@ class MasterExpensesWidget(QWidget):
             from tahmeed.services.accountant_service import (
                 get_master_totals, get_master_month_totals,
                 get_master_trucks, get_master_categories,
+                get_master_column_values,
             )
+            from tahmeed.ui.accountant.master_ledger_table import _COL_FIELD
 
             if not self._filters_loaded:
                 totals, month_data, trucks, cats = await asyncio.gather(
@@ -1178,11 +1217,38 @@ class MasterExpensesWidget(QWidget):
                 self._filter_bar.populate_categories(cats)
                 self._month_bar.update_totals(month_data)
                 self._filters_loaded = True
+
+            # Distinct ▾ values for the whole selected range (cascaded).
+            base_kw = {
+                k: v for k, v in kw.items()
+                if k != "column_filters"
+            }
+            col_filters = kw.get("column_filters") or {}
+            fields = sorted(set(_COL_FIELD.values()))
+            results = await asyncio.gather(*[
+                get_master_column_values(
+                    field,
+                    **base_kw,
+                    column_filters=col_filters or None,
+                )
+                for field in fields
+            ])
+            if generation != self._reload_generation:
+                return
+            field_to_col = {f: c for c, f in _COL_FIELD.items()}
+            cache = {
+                field_to_col[field]: set(vals)
+                for field, vals in zip(fields, results)
+                if field in field_to_col
+            }
+            self._table.set_column_value_cache(cache)
         except Exception:
             pass
 
     async def _load_more(self) -> None:
         if self._scroll_loading or self._loading:
+            return
+        if self._table.scroll_frozen():
             return
         if self._loaded >= self._total:
             return
@@ -1236,15 +1302,7 @@ class MasterExpensesWidget(QWidget):
 
         from tahmeed.services.accountant_service import get_master_transactions, get_cashier_names
 
-        kw = dict(
-            year=self._year, month=self._month,
-            search=self._filter_bar.search_text(),
-            truck=self._filter_bar.truck_filter(),
-            category=self._filter_bar.category_filter(),
-            receipt=self._filter_bar.receipt_filter(),
-            date_from=self._filter_bar.date_from(),
-            date_to=self._filter_bar.date_to(),
-        )
+        kw = self._filter_kw()
         try:
             txs = await get_master_transactions(
                 **kw, sort_field=self._sort_field,
@@ -1432,8 +1490,7 @@ class MasterExpensesWidget(QWidget):
             commit_master_import,
             preview_master_import,
         )
-        from tahmeed.services.description_mapping_service import normalize_description
-        from tahmeed.ui.dialogs.description_mapping_dialog import DescriptionMappingDialog
+        from tahmeed.ui.dialogs.description_mapping_flow import prompt_unmapped_descriptions
 
         default_dir = str(Path(__file__).resolve().parents[3])
         path, _ = QFileDialog.getOpenFileName(
@@ -1454,14 +1511,7 @@ class MasterExpensesWidget(QWidget):
             return
 
         if not categories:
-            self._loading_overlay.hide_loading()
-            QMessageBox.warning(
-                self,
-                "No Items",
-                "Import your Chart of Accounts into Items first\n"
-                "(Manage → Items → Import Chart of Accounts).",
-            )
-            return
+            categories = []
 
         try:
             preview = await preview_master_import(path)
@@ -1475,42 +1525,22 @@ class MasterExpensesWidget(QWidget):
             QMessageBox.information(self, "Import", "No expense rows found in the selected file.")
             return
 
-        # Resolve unmapped descriptions one at a time.
-        total_unmapped = len(preview.unmapped)
-        while preview.unmapped:
-            key = next(iter(preview.unmapped))
-            count = preview.unmapped[key]
-            display = key
-            for row in preview.rows:
-                if normalize_description(row.description) == key:
-                    display = row.description
-                    break
-
+        if preview.unmapped:
             self._loading_overlay.hide_loading()
-            dlg = DescriptionMappingDialog(
-                description=display,
-                row_count=count,
-                categories=categories,
-                remaining=len(preview.unmapped),
-                parent=self,
-                total=total_unmapped,
+            ok = await prompt_unmapped_descriptions(
+                preview,
+                categories,
+                self,
+                allow_skip=False,
+                apply_mapping=apply_mapping_to_preview,
             )
-            if dlg.exec() != QDialog.Accepted:
+            if not ok:
                 QMessageBox.information(
                     self,
                     "Import Cancelled",
                     "No records were imported.",
                 )
                 return
-
-            chosen = dlg.selected_category()
-            if chosen is None or chosen._id is None:
-                return
-
-            self._loading_overlay.show_loading("Saving description mapping…")
-            await apply_mapping_to_preview(
-                preview, key, chosen._id, chosen.name,
-            )
 
         self._loading_overlay.show_loading("Importing master expenses…")
         verified_by = self._user._id if self._user else None

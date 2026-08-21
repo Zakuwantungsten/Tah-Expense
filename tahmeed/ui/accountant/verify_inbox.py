@@ -360,7 +360,7 @@ class _FilterBar(QFrame):
         hl.addWidget(self._reject_btn)
 
         self._confirm_delete_btn = _btn(
-            "Confirm Delete", "mdi.delete-forever", danger=True,
+            "Move to Trash", "mdi.delete-forever", danger=True,
         )
         self._confirm_delete_btn.setEnabled(False)
         self._confirm_delete_btn.clicked.connect(self.confirm_delete_selected)
@@ -620,7 +620,7 @@ class _ActionPanel(QFrame):
         bvl.addWidget(self._return_btn)
 
         self._confirm_delete_btn = _btn(
-            "Confirm Delete", "mdi.delete-forever", danger=True, height=30,
+            "Move to Trash", "mdi.delete-forever", danger=True, height=30,
         )
         self._confirm_delete_btn.clicked.connect(self._on_confirm_delete)
         self._confirm_delete_btn.hide()
@@ -708,7 +708,7 @@ class _ActionPanel(QFrame):
             when = _fmt_date(tx.deletion_requested_at) if tx.deletion_requested_at else "—"
             self._notes.setPlainText(
                 f"Requested by {requester} on {when}.\n"
-                "Confirm to permanently remove from Master Expenses, or Restore to keep it."
+                "Confirm Delete moves it to Trash (restorable), or Restore to keep it on Master."
             )
         else:
             self._notes.setPlainText(tx.rejection_reason or "")
@@ -1832,8 +1832,8 @@ class VerifyInboxWidget(QWidget):
     def _on_deletion_confirmed(self, tx_id: ObjectId) -> None:
         if QMessageBox.question(
             self, "Confirm Delete",
-            "Permanently delete this approved expense from Master Expenses?\n"
-            "This cannot be undone.",
+            "Move this approved expense to Trash?\n"
+            "It will leave Master Expenses and can be restored from Trash later.",
             QMessageBox.Yes | QMessageBox.No,
         ) == QMessageBox.Yes:
             asyncio.ensure_future(self._do_confirm_deletion(tx_id))
@@ -1918,8 +1918,8 @@ class VerifyInboxWidget(QWidget):
             return
         if QMessageBox.question(
             self, "Confirm Delete",
-            f"Permanently delete {len(tx_ids)} approved expense(s) from Master Expenses?\n"
-            "This cannot be undone.",
+            f"Move {len(tx_ids)} approved expense(s) to Trash?\n"
+            "They will leave Master Expenses and can be restored from Trash later.",
             QMessageBox.Yes | QMessageBox.No,
         ) == QMessageBox.Yes:
             asyncio.ensure_future(self._do_bulk_confirm_deletions(tx_ids))
@@ -2012,23 +2012,27 @@ class VerifyInboxWidget(QWidget):
             transaction_needs_item,
         )
         from tahmeed.services.accountant_service import bulk_update_transaction_category
-        from tahmeed.ui.dialogs.description_mapping_dialog import DescriptionMappingDialog
+        from tahmeed.services.mapping_assignment_service import (
+            MappingAssignment,
+            materialize_mapping_assignment,
+            remember_category,
+        )
+        from tahmeed.ui.dialogs.description_mapping_dialog import (
+            ACTION_ASSIGN,
+            DescriptionMappingDialog,
+        )
+        from tahmeed.ui.dialogs.description_mapping_flow import (
+            remember_created_from_assignment,
+        )
 
         pending = [tx for tx in txs if transaction_needs_item(tx.item, tx.category_name)]
         if not pending:
             return True
 
         categories = await self._ensure_mapping_categories()
-        if not categories:
-            self._clear_busy()
-            await self._await_ui(lambda: QMessageBox.warning(
-                self,
-                "No Items",
-                "There are no items to map descriptions to.\n\n"
-                "Open Manage → Items and import your Chart of Accounts, "
-                "or add items manually, then try again.",
-            ))
+        if categories is None:
             return False
+        categories = list(categories)
 
         self._set_busy("Looking up saved description mappings…")
         descriptions = [tx.description for tx in pending if tx.description]
@@ -2081,14 +2085,15 @@ class VerifyInboxWidget(QWidget):
         keys = list(groups.keys())
         total_unique = len(keys)
 
-        def _prompt_all() -> Optional[Dict[str, Category]]:
-            chosen: Dict[str, Category] = {}
+        def _prompt_all() -> Optional[Dict[str, MappingAssignment]]:
+            chosen: Dict[str, MappingAssignment] = {}
             remaining = total_unique
+            cats = list(categories)
             for key in keys:
                 dlg = DescriptionMappingDialog(
                     description=display[key],
                     row_count=len(groups[key]),
-                    categories=categories,
+                    categories=cats,
                     remaining=remaining,
                     parent=self,
                     scope_label="in verify inbox",
@@ -2097,10 +2102,11 @@ class VerifyInboxWidget(QWidget):
                 )
                 if dlg.exec() != QDialog.Accepted:
                     return None
-                cat = dlg.selected_category()
-                if cat is None:
+                assignment = dlg.assignment()
+                if assignment.action != ACTION_ASSIGN:
                     return None
-                chosen[key] = cat
+                remember_created_from_assignment(cats, assignment)
+                chosen[key] = assignment
                 remaining -= 1
             return chosen
 
@@ -2110,14 +2116,31 @@ class VerifyInboxWidget(QWidget):
         if not assignments:
             return False
 
-        # Persist mappings + category updates in parallel after all dialogs.
+        # Persist item/sub-item creates first (sequential so names reuse),
+        # then mappings + category updates in parallel.
         self._set_busy(
             f"Saving {len(assignments):,} item mapping(s)…",
             value=0,
             maximum=max(1, len(assignments)),
         )
+        resolved: Dict[str, Category] = {}
+        try:
+            for key, assignment in assignments.items():
+                resolved[key] = await materialize_mapping_assignment(
+                    assignment, categories
+                )
+        except Exception as exc:
+            self._clear_busy()
+            await self._await_ui(lambda: QMessageBox.critical(
+                self,
+                "Could Not Save Item",
+                f"Could not create the item:\n{exc}",
+            ))
+            return False
+
         persist = []
-        for key, cat in assignments.items():
+        for key, cat in resolved.items():
+            remember_category(self._category_objects, cat)
             persist.append(save_mapping(display[key], cat._id, cat.name))
             ids = [tx._id for tx in groups[key] if tx._id]
             if ids:
@@ -2311,7 +2334,7 @@ class VerifyInboxWidget(QWidget):
             count = await get_pending_count()
             self.badge_updated.emit(count)
             self._finish_mutation(
-                info=f"Permanently deleted {n} expense(s).",
+                info=f"Moved {n} expense(s) to Trash.",
                 reload=True,
             )
         except Exception as exc:

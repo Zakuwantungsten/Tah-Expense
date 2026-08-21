@@ -2876,11 +2876,17 @@ def _set_congo_summary(in_lbl: QLabel, out_lbl: QLabel, bal_lbl: QLabel,
 
 
 class _CongoEntriesBase(QWidget):
-    """Shared flat-list view for Congo All Entries / Money In tabs."""
+    """Shared flat-list view for Congo All Entries / Money In / Called Out tabs."""
 
-    def __init__(self, money_in_only: bool = False, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        money_in_only: bool = False,
+        called_out_only: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._money_in_only = money_in_only
+        self._called_out_only = called_out_only
         self._search  = ""
         self._year    = 0
         self._month   = 0
@@ -3003,16 +3009,16 @@ class _CongoEntriesBase(QWidget):
             totals, recs, total = await asyncio.gather(
                 svc.get_congo_all_totals(
                     self._search, self._year, month,
-                    money_in_only=self._money_in_only, **self._date_kw(),
+                    **self._amount_filter_kw(), **self._date_kw(),
                 ),
                 svc.get_congo_all_records(
                     self._search, self._year, month,
-                    money_in_only=self._money_in_only,
+                    **self._amount_filter_kw(),
                     limit=_SCROLL_CHUNK, skip=0, **self._date_kw(),
                 ),
                 svc.count_congo_all_records(
                     self._search, self._year, month,
-                    money_in_only=self._money_in_only, **self._date_kw(),
+                    **self._amount_filter_kw(), **self._date_kw(),
                 ),
             )
         except Exception:
@@ -3042,7 +3048,7 @@ class _CongoEntriesBase(QWidget):
         try:
             recs = await svc.get_congo_all_records(
                 self._search, self._year, month,
-                money_in_only=self._money_in_only,
+                **self._amount_filter_kw(),
                 limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
             )
         except Exception:
@@ -3077,6 +3083,12 @@ class _CongoEntriesBase(QWidget):
             return {}
         df, dt = read_from_to(self._from_date, self._to_date, optional=True)
         return {"date_from": df, "date_to": dt}
+
+    def _amount_filter_kw(self) -> dict:
+        return {
+            "money_in_only": self._money_in_only,
+            "called_out_only": self._called_out_only,
+        }
 
     def _on_year(self, _idx: int) -> None:
         self._year = int(self._year_cb.currentData() or 0)
@@ -3114,12 +3126,17 @@ class _CongoEntriesBase(QWidget):
 
 class _CongoAllEntries(_CongoEntriesBase):
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(money_in_only=False, parent=parent)
+        super().__init__(parent=parent)
 
 
 class _CongoMoneyInEntries(_CongoEntriesBase):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(money_in_only=True, parent=parent)
+
+
+class _CongoCalledOutEntries(_CongoEntriesBase):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(called_out_only=True, parent=parent)
 
 
 class CongoImportDialog(QDialog):
@@ -3642,7 +3659,9 @@ class CongoExpensesWidget(QWidget):
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._tabs = _SegmentTabBar(["All Entries", "Money In", "Uploads", "Skipped"])
+        self._tabs = _SegmentTabBar(
+            ["All Entries", "Money In", "Called Out", "Uploads", "Skipped"]
+        )
         vl.addWidget(self._tabs)
 
         self._main_stack = QStackedWidget()
@@ -3653,6 +3672,9 @@ class CongoExpensesWidget(QWidget):
 
         self._money_in = _CongoMoneyInEntries()
         self._main_stack.addWidget(self._money_in)
+
+        self._called_out = _CongoCalledOutEntries()
+        self._main_stack.addWidget(self._called_out)
 
         upload_host = QWidget()
         upload_host.setStyleSheet("background:transparent;")
@@ -3685,12 +3707,13 @@ class CongoExpensesWidget(QWidget):
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
-        if idx == 3:
+        if idx == 4:
             self._skipped.refresh()
 
     def refresh(self) -> None:
         self._all_entries.refresh()
         self._money_in.refresh()
+        self._called_out.refresh()
         self._show_browse()
         if hasattr(self, "_skipped"):
             self._skipped.refresh()
@@ -3700,8 +3723,8 @@ class CongoExpensesWidget(QWidget):
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
-        self._tabs.set_index(2, emit=False)
-        self._main_stack.setCurrentIndex(2)
+        self._tabs.set_index(3, emit=False)
+        self._main_stack.setCurrentIndex(3)
         self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
 
@@ -3750,12 +3773,13 @@ class CongoExpensesWidget(QWidget):
         QMessageBox.information(self, "Import Complete", msg)
         self._all_entries.refresh()
         self._money_in.refresh()
+        self._called_out.refresh()
         self._show_browse()
         if skipped:
-            self._tabs.set_index(3)
+            self._tabs.set_index(4)
             self._skipped.refresh()
         else:
-            self._tabs.set_index(2)
+            self._tabs.set_index(3)
 
     def _open_bulk_import(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -3787,12 +3811,13 @@ class CongoExpensesWidget(QWidget):
         QMessageBox.information(self, "Bulk Import Complete", msg)
         self._all_entries.refresh()
         self._money_in.refresh()
+        self._called_out.refresh()
         self._show_browse()
         if skipped:
-            self._tabs.set_index(3)
+            self._tabs.set_index(4)
             self._skipped.refresh()
         else:
-            self._tabs.set_index(2)
+            self._tabs.set_index(3)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
         upload_id = str(upload_doc.get("_id") or "")
@@ -3825,6 +3850,7 @@ class CongoExpensesWidget(QWidget):
         )
         self._all_entries.refresh()
         self._money_in.refresh()
+        self._called_out.refresh()
         self._show_browse()
 
 
@@ -4539,11 +4565,17 @@ def _kimvi_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
 
 
 class _KimviEntriesBase(QWidget):
-    """Shared flat-list view for Ahmed Kimvi All Entries / Money In tabs."""
+    """Shared flat-list view for Ahmed Kimvi All Entries / Money In / Called Out tabs."""
 
-    def __init__(self, money_in_only: bool = False, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        money_in_only: bool = False,
+        called_out_only: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._money_in_only = money_in_only
+        self._called_out_only = called_out_only
         self._search  = ""
         self._year    = 0
         self._month   = 0
@@ -4666,16 +4698,16 @@ class _KimviEntriesBase(QWidget):
             totals, recs, total = await asyncio.gather(
                 svc.get_kimvi_all_totals(
                     self._search, self._year, month,
-                    money_in_only=self._money_in_only, **self._date_kw(),
+                    **self._amount_filter_kw(), **self._date_kw(),
                 ),
                 svc.get_kimvi_all_records(
                     self._search, self._year, month,
-                    money_in_only=self._money_in_only,
+                    **self._amount_filter_kw(),
                     limit=_SCROLL_CHUNK, skip=0, **self._date_kw(),
                 ),
                 svc.count_kimvi_all_records(
                     self._search, self._year, month,
-                    money_in_only=self._money_in_only, **self._date_kw(),
+                    **self._amount_filter_kw(), **self._date_kw(),
                 ),
             )
         except Exception:
@@ -4705,7 +4737,7 @@ class _KimviEntriesBase(QWidget):
         try:
             recs = await svc.get_kimvi_all_records(
                 self._search, self._year, month,
-                money_in_only=self._money_in_only,
+                **self._amount_filter_kw(),
                 limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
             )
         except Exception:
@@ -4740,6 +4772,12 @@ class _KimviEntriesBase(QWidget):
             return {}
         df, dt = read_from_to(self._from_date, self._to_date, optional=True)
         return {"date_from": df, "date_to": dt}
+
+    def _amount_filter_kw(self) -> dict:
+        return {
+            "money_in_only": self._money_in_only,
+            "called_out_only": self._called_out_only,
+        }
 
     def _on_year(self, _idx: int) -> None:
         self._year = int(self._year_cb.currentData() or 0)
@@ -4777,12 +4815,17 @@ class _KimviEntriesBase(QWidget):
 
 class _KimviAllEntries(_KimviEntriesBase):
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(money_in_only=False, parent=parent)
+        super().__init__(parent=parent)
 
 
 class _KimviMoneyInEntries(_KimviEntriesBase):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(money_in_only=True, parent=parent)
+
+
+class _KimviCalledOutEntries(_KimviEntriesBase):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(called_out_only=True, parent=parent)
 
 
 class _KimviUploadBrowse(QWidget):
@@ -5089,7 +5132,7 @@ class AhmedKimviWidget(QWidget):
     """
     Ahmed Kimvi (Klesa) main page.
 
-    Three tabs: All Entries, Money In, and Uploads (browse + drill-down).
+    Tabs: All Entries, Money In, Called Out, Uploads, Skipped.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -5116,7 +5159,9 @@ class AhmedKimviWidget(QWidget):
         vl.addWidget(header)
         vl.addWidget(_hsep())
 
-        self._tabs = _SegmentTabBar(["All Entries", "Money In", "Uploads", "Skipped"])
+        self._tabs = _SegmentTabBar(
+            ["All Entries", "Money In", "Called Out", "Uploads", "Skipped"]
+        )
         vl.addWidget(self._tabs)
 
         self._main_stack = QStackedWidget()
@@ -5127,6 +5172,9 @@ class AhmedKimviWidget(QWidget):
 
         self._money_in = _KimviMoneyInEntries()
         self._main_stack.addWidget(self._money_in)
+
+        self._called_out = _KimviCalledOutEntries()
+        self._main_stack.addWidget(self._called_out)
 
         upload_host = QWidget()
         upload_host.setStyleSheet("background:transparent;")
@@ -5159,12 +5207,13 @@ class AhmedKimviWidget(QWidget):
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
-        if idx == 3:
+        if idx == 4:
             self._skipped.refresh()
 
     def refresh(self) -> None:
         self._all_entries.refresh()
         self._money_in.refresh()
+        self._called_out.refresh()
         self._show_browse()
         if hasattr(self, "_skipped"):
             self._skipped.refresh()
@@ -5174,8 +5223,8 @@ class AhmedKimviWidget(QWidget):
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
-        self._tabs.set_index(2, emit=False)
-        self._main_stack.setCurrentIndex(2)
+        self._tabs.set_index(3, emit=False)
+        self._main_stack.setCurrentIndex(3)
         self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
 
@@ -5224,12 +5273,13 @@ class AhmedKimviWidget(QWidget):
         QMessageBox.information(self, "Import Complete", msg)
         self._all_entries.refresh()
         self._money_in.refresh()
+        self._called_out.refresh()
         self._show_browse()
         if skipped:
-            self._tabs.set_index(3)
+            self._tabs.set_index(4)
             self._skipped.refresh()
         else:
-            self._tabs.set_index(2)
+            self._tabs.set_index(3)
 
     def _open_bulk_import(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -5261,12 +5311,13 @@ class AhmedKimviWidget(QWidget):
         QMessageBox.information(self, "Bulk Import Complete", msg)
         self._all_entries.refresh()
         self._money_in.refresh()
+        self._called_out.refresh()
         self._show_browse()
         if skipped:
-            self._tabs.set_index(3)
+            self._tabs.set_index(4)
             self._skipped.refresh()
         else:
-            self._tabs.set_index(2)
+            self._tabs.set_index(3)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
         upload_id = str(upload_doc.get("_id") or "")
@@ -5299,6 +5350,7 @@ class AhmedKimviWidget(QWidget):
         )
         self._all_entries.refresh()
         self._money_in.refresh()
+        self._called_out.refresh()
         self._show_browse()
 
 

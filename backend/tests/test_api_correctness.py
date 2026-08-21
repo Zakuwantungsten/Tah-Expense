@@ -375,6 +375,60 @@ def test_accountant_can_use_cashier_category_creation() -> None:
     assert len(categories.documents) == 1
 
 
+class FakeNamedCollection:
+    def __init__(self) -> None:
+        self.documents: list[dict] = []
+
+    async def insert_one(self, document: dict) -> SimpleNamespace:
+        self.documents.append(dict(document))
+        return SimpleNamespace(inserted_id=ObjectId())
+
+
+class FakeKeyedDb:
+    def __init__(self, **collections: FakeNamedCollection) -> None:
+        for name, collection in collections.items():
+            setattr(self, name, collection)
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+
+def test_cashier_has_only_narrow_subtable_creation_permission() -> None:
+    subtables = FakeNamedCollection()
+    database = SimpleNamespace(db=FakeKeyedDb(category_subtables=subtables))
+    app = create_app(settings=settings(), database=database)
+    app.dependency_overrides[current_user] = lambda: {"role": "cashier"}
+    body = {
+        "parent_key": "parking",
+        "parent_category": "Parking",
+        "name": "PARKING KURASINI",
+        "match": "PARKING KURASINI",
+    }
+    with TestClient(app) as client:
+        narrow = client.post("/v1/subtables/cashier-create", json=body)
+        manager = client.post("/v1/subtables", json=body)
+    assert narrow.status_code == 201
+    assert manager.status_code == 403
+    assert len(subtables.documents) == 1
+
+
+def test_accountant_can_use_cashier_subtable_creation() -> None:
+    subtables = FakeNamedCollection()
+    database = SimpleNamespace(db=FakeKeyedDb(category_subtables=subtables))
+    app = create_app(settings=settings(), database=database)
+    app.dependency_overrides[current_user] = lambda: {"role": "accountant"}
+    body = {
+        "parent_key": "parking",
+        "parent_category": "Parking",
+        "name": "PARKING KURASINI",
+        "match": "PARKING KURASINI",
+    }
+    with TestClient(app) as client:
+        narrow = client.post("/v1/subtables/cashier-create", json=body)
+    assert narrow.status_code == 201
+    assert len(subtables.documents) == 1
+
+
 class FakeMappings:
     def __init__(self) -> None:
         self.documents: list[dict] = []

@@ -979,7 +979,8 @@ class EntryForm(QWidget):
             elif result == "deletion_requested":
                 QMessageBox.information(
                     self, "Deletion Requested",
-                    "The approved expense was sent to Verify → Deleted.",
+                    "The approved expense was sent to Verify → Deleted.\n"
+                    "Confirming moves it to Trash.",
                 )
             await self._refresh_table()
             self._clear_form()

@@ -189,6 +189,40 @@ def test_split_truck_combo_cell() -> None:
     assert not compiled.search("T4690 EKZ")
 
 
+def test_truck_field_search_regex_full_plate_is_exact() -> None:
+    from tahmeed.services.import_truck_check import truck_field_search_regex
+
+    rx = truck_field_search_regex("t103 dvl")
+    assert rx is not None
+    compiled = __import__("re").compile(rx, __import__("re").IGNORECASE)
+    assert compiled.search("T103 DVL")
+    assert compiled.search("T103DVL")
+    assert compiled.search("T 103 DVL")
+    assert compiled.search("T103DVL/T689ELK")
+    assert not compiled.search("T102 DVL")
+    assert not compiled.search("T1030 DVL")
+    assert not compiled.search("T1103 DVL")
+
+
+def test_truck_field_search_regex_digits_do_not_match_longer_number() -> None:
+    from tahmeed.services.import_truck_check import truck_field_search_regex
+
+    rx = truck_field_search_regex("T103")
+    assert rx is not None
+    compiled = __import__("re").compile(rx, __import__("re").IGNORECASE)
+    assert compiled.search("T103 DVL")
+    assert compiled.search("T103DVL")
+    assert not compiled.search("T1030 DVL")
+    assert not compiled.search("T102 DVL")
+
+
+def test_truck_field_search_regex_ignores_plain_text() -> None:
+    from tahmeed.services.import_truck_check import truck_field_search_regex
+
+    assert truck_field_search_regex("Kapiri") is None
+    assert truck_field_search_regex("receipt 12") is None
+
+
 def test_scan_truck_and_trailer_combo() -> None:
     """SM Burhani gates the leading truck; unknown trailers pass; two trailers flag."""
     from tahmeed.services.import_truck_check import combo_suffix_of

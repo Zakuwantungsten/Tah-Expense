@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from tahmeed.models.category import Category
+from tahmeed.services.mapping_assignment_service import MappingAssignment
+from tahmeed.ui.dialogs.item_dialog import ItemDialog
 
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -30,6 +32,9 @@ class DescriptionMappingDialog(QDialog):
 
     Assignments are remembered via description_mappings for future imports.
     Skip / Skip All apply only to the current import batch.
+
+    Pick an existing item, or click Assign to a New Item to open the same
+    Add New Item dialog used on the Items tab.
     """
 
     def __init__(
@@ -47,8 +52,12 @@ class DescriptionMappingDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self._categories = categories
+        self._description = description
         self._selected: Optional[Category] = None
         self._action = ACTION_ASSIGN
+        self._create_new = False
+        self._new_item_name = ""
+        self._new_item_fields: Optional[dict] = None
         self._scope_label = scope_label
         self._cancel_label = cancel_label
         self._allow_skip = allow_skip
@@ -209,6 +218,25 @@ class DescriptionMappingDialog(QDialog):
 
         btn_row.addStretch()
 
+        new_item_btn = QPushButton("Assign to a New Item…")
+        new_item_btn.setCursor(Qt.PointingHandCursor)
+        new_item_btn.setFixedHeight(34)
+        new_item_btn.setAutoDefault(False)
+        new_item_btn.setDefault(False)
+        new_item_btn.setToolTip(
+            "Open the same Add New Item form used on the Items tab, "
+            "then map this description to it."
+        )
+        new_item_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T1};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 13px; padding: 0 14px;"
+            " min-height: 34px; max-height: 34px; }}"
+            f"QPushButton:hover {{ background: {_BG}; }}"
+        )
+        new_item_btn.clicked.connect(self._on_assign_new)
+        btn_row.addWidget(new_item_btn)
+
         assign_btn = QPushButton("Assign && Continue")
         assign_btn.setCursor(Qt.PointingHandCursor)
         assign_btn.setFixedHeight(34)
@@ -231,6 +259,27 @@ class DescriptionMappingDialog(QDialog):
             line.returnPressed.connect(self._on_assign)
         self._combo.setFocus()
 
+    def _on_assign_new(self) -> None:
+        dlg = ItemDialog(parent=self, prefill_name=self._description)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        data = dict(dlg.result_data or {})
+        name = (data.get("name") or "").strip()
+        if not name:
+            from tahmeed.ui.dialog_theme import show_warning
+            show_warning(self, "New Item", "Item name is required.")
+            return
+        existing = next(
+            (c for c in self._categories if c.name.strip().lower() == name.lower()),
+            None,
+        )
+        self._create_new = existing is None
+        self._new_item_name = name
+        self._new_item_fields = data
+        self._selected = existing or Category(name=name)
+        self._action = ACTION_ASSIGN
+        self.accept()
+
     def _on_assign(self) -> None:
         from tahmeed.ui.dialog_theme import show_warning
 
@@ -240,27 +289,41 @@ class DescriptionMappingDialog(QDialog):
             return
         idx = self._combo.findText(name)
         cat_id = self._combo.itemData(idx) if idx >= 0 else None
-        if cat_id is None:
-            match = next((c for c in self._categories if c.name == name), None)
-            if match is None:
-                show_warning(
-                    self,
-                    "Select Item",
-                    "Please pick an existing item from the Items list.",
-                )
-                return
-            cat_id = match._id
-        self._selected = Category(_id=cat_id, name=name)
+        match = next((c for c in self._categories if c.name == name), None)
+        if match is None:
+            match = next(
+                (c for c in self._categories if c.name.strip().lower() == name.lower()),
+                None,
+            )
+        if cat_id is None and match is None:
+            show_warning(
+                self,
+                "Select Item",
+                "Please pick an existing item from the Items list, "
+                "or click Assign to a New Item.",
+            )
+            return
+        if match is not None:
+            self._selected = match
+        else:
+            self._selected = Category(_id=cat_id, name=name)
+        self._create_new = False
+        self._new_item_name = ""
+        self._new_item_fields = None
         self._action = ACTION_ASSIGN
         self.accept()
 
     def _on_skip(self) -> None:
         self._selected = None
+        self._create_new = False
+        self._new_item_fields = None
         self._action = ACTION_SKIP
         self.accept()
 
     def _on_skip_all(self) -> None:
         self._selected = None
+        self._create_new = False
+        self._new_item_fields = None
         self._action = ACTION_SKIP_ALL
         self.accept()
 
@@ -269,3 +332,16 @@ class DescriptionMappingDialog(QDialog):
 
     def action(self) -> str:
         return self._action
+
+    def creates_new_item(self) -> bool:
+        return self._create_new
+
+    def assignment(self) -> MappingAssignment:
+        return MappingAssignment(
+            action=self._action,
+            description=self._description,
+            category=self._selected,
+            create_new=self._create_new,
+            new_item_name=self._new_item_name,
+            new_item_fields=self._new_item_fields,
+        )

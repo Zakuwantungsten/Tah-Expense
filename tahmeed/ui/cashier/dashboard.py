@@ -26,6 +26,7 @@ from typing import Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
     QFrame, QLabel, QLineEdit, QPushButton, QDialog, QMessageBox,
+    QSizePolicy,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -259,13 +260,69 @@ class _QBDocHeader(QFrame):
                 self._lbl_date.setText(d.strftime("%a").upper())
 
 
-# ── Action bar (Edit / Save / Export) ────────────────────────────────────────────
+# ── Payee / Cheque inline label + field helpers ──────────────────────────────────
+
+def _qb_field_label(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        "QLabel{"
+        "  font-size: 11px; font-weight: 600; color: #6B7280;"
+        "  font-family: 'Segoe UI', sans-serif;"
+        "  background: transparent;"
+        "}"
+    )
+    return lbl
+
+
+def _qb_field_input(placeholder: str = "", *, width: int | None = None) -> QLineEdit:
+    edit = QLineEdit()
+    edit.setPlaceholderText(placeholder)
+    edit.setFixedHeight(_BTN_H)
+    if width is not None:
+        edit.setFixedWidth(width)
+    edit.setStyleSheet(
+        "QLineEdit {"
+        "  border: 1px solid #D1D5DB; border-radius: 5px;"
+        "  padding: 0 8px; font-size: 12px;"
+        "  color: #111827; background: #F3F4F6;"
+        "  font-family: 'Segoe UI', sans-serif;"
+        "}"
+        "QLineEdit:focus {"
+        "  border-color: #0077C5; background: #FFFFFF;"
+        "}"
+        "QLineEdit:read-only {"
+        "  color: #6B7280; background: #F9FAFB;"
+        "}"
+    )
+    return edit
+
+
+def _qb_inline_field(label: str, placeholder: str, width: int) -> tuple[QWidget, QLineEdit]:
+    """Label and input packed tight: Payee [____]"""
+    wrap = QWidget()
+    wrap.setStyleSheet("background: transparent;")
+    wrap.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    row = QHBoxLayout(wrap)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    lbl = _qb_field_label(label)
+    lbl.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    row.addWidget(lbl, 0, Qt.AlignVCenter)
+    edit = _qb_field_input(placeholder, width=width)
+    edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+    row.addWidget(edit, 0, Qt.AlignVCenter)
+    return wrap, edit
+
+
+# ── Action bar (mode / search / payee / cheque) ─────────────────────────────────
 
 class _ActionBar(QFrame):
-    """My entries / Merged / Search strip (register actions live on the QB toolbar)."""
+    """My entries / Merged / Search on the left; Payee / Cheque opposite on the right."""
 
     search_changed = Signal(str)
     mode_changed   = Signal(bool)  # True = Merged
+    payee_edited   = Signal(str)
+    cheque_edited  = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -328,7 +385,7 @@ class _ActionBar(QFrame):
         self._merged_btn.clicked.connect(lambda: self._set_mode(True))
         tg.addWidget(self._my_btn)
         tg.addWidget(self._merged_btn)
-        hl.addWidget(toggle)
+        hl.addWidget(toggle, 0, Qt.AlignVCenter)
 
         search = QLineEdit()
         search.setPlaceholderText("Search entries…")
@@ -344,7 +401,7 @@ class _ActionBar(QFrame):
             "  border-color: #0077C5; background: #ffffff;"
             "}"
         )
-        hl.addWidget(search)
+        hl.addWidget(search, 0, Qt.AlignVCenter)
 
         self._search_clear_btn = QPushButton("Search")
         self._search_clear_btn.setFixedHeight(_BTN_H)
@@ -365,7 +422,7 @@ class _ActionBar(QFrame):
 
         search.textChanged.connect(_on_text_changed)
         self._search_clear_btn.clicked.connect(_on_search_clear_clicked)
-        hl.addWidget(self._search_clear_btn)
+        hl.addWidget(self._search_clear_btn, 0, Qt.AlignVCenter)
 
         self._status = QLabel("")
         self._status.setStyleSheet(
@@ -374,9 +431,36 @@ class _ActionBar(QFrame):
             "font-family:'Segoe UI',sans-serif;}"
         )
         self._status.hide()
-        hl.addWidget(self._status)
+        hl.addWidget(self._status, 0, Qt.AlignVCenter)
 
-        hl.addStretch()
+        hl.addStretch(1)
+
+        # Compact group so labels stay next to their inputs on the right
+        fields = QWidget()
+        fields.setStyleSheet("background: transparent;")
+        fields.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        fields_hl = QHBoxLayout(fields)
+        fields_hl.setContentsMargins(0, 0, 0, 0)
+        fields_hl.setSpacing(14)
+
+        payee_wrap, self._payee = _qb_inline_field("Payee", "Payee name…", 180)
+        self._payee.textEdited.connect(self.payee_edited.emit)
+        fields_hl.addWidget(payee_wrap)
+
+        cheque_wrap, self._cheque = _qb_inline_field("Cheque", "Cheque no.…", 110)
+        self._cheque.textEdited.connect(self.cheque_edited.emit)
+        fields_hl.addWidget(cheque_wrap)
+
+        hl.addWidget(fields, 0, Qt.AlignVCenter)
+
+    def set_payee_cheque_values(self, payee: str, cheque: str, editable: bool) -> None:
+        """Refresh Payee/Cheque from the active register row without emitting edits."""
+        for edit, value in ((self._payee, payee or ""), (self._cheque, cheque or "")):
+            edit.blockSignals(True)
+            if edit.text() != value:
+                edit.setText(value)
+            edit.setReadOnly(not editable)
+            edit.blockSignals(False)
 
     def _set_mode(self, merged: bool) -> None:
         self._my_btn.setChecked(not merged)
@@ -403,7 +487,7 @@ class _ActionBar(QFrame):
 
 
 class _TablePage(QWidget):
-    """QB icon toolbar → Daily Register totals → My/Merged/Search → grid."""
+    """QB icon toolbar → Daily Register totals → My/Merged/Search/Payee/Cheque → grid."""
 
     def __init__(self, register: DailyRegister, parent=None):
         super().__init__(parent)
@@ -438,14 +522,18 @@ class _TablePage(QWidget):
         self._action_bar = _ActionBar()
         self._action_bar.search_changed.connect(register.set_search)
         self._action_bar.mode_changed.connect(register.set_merged_mode)
+        self._action_bar.payee_edited.connect(register.set_active_payee)
+        self._action_bar.cheque_edited.connect(register.set_active_cheque)
         register.edit_state_changed.connect(self._action_bar.set_edit_state)
         register.mode_changed.connect(self._action_bar.sync_mode)
         register.mode_changed.connect(self._doc_header.set_merged)
-
+        register.active_payee_cheque_changed.connect(
+            self._action_bar.set_payee_cheque_values
+        )
 
         # 1) Icon toolbar (incl. Export/Import/Today/Edit/Submit)
         # 2) Daily Register + totals
-        # 3) My/Merged + Search
+        # 3) My/Merged + Search  ···  Payee / Cheque
         vl.addWidget(self._qb_toolbar)
         vl.addWidget(self._doc_header)
         vl.addWidget(self._action_bar)

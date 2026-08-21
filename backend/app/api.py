@@ -496,6 +496,14 @@ async def create_subtable(body: SubtableWrite, request: Request, _manager: Manag
     return await create_named(request, "category_subtables", body)
 
 
+@subtables.post("/cashier-create", status_code=201)
+async def cashier_create_subtable(
+    body: SubtableWrite, request: Request, _cashier: Cashier
+) -> dict:
+    """Allow cashier/accountant sub-item creation from import mapping."""
+    return await create_named(request, "category_subtables", body)
+
+
 @rules.get("")
 async def list_rules(request: Request, _user: Authenticated, page: Annotated[dict, Depends(page_params)]) -> dict:
     return await list_collection(request, "keyword_rules", **page)

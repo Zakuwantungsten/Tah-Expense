@@ -89,11 +89,15 @@ def _safe_double(field: str) -> dict:
 # ── Query builder ───────────────────────────────────────────────────────────────
 
 def _truck_search_clauses(search: str) -> list:
-    """Match SM Burhani ``T469EKZ/T689ELK`` cells when searching a spaced truck."""
-    from tahmeed.services.import_truck_check import truck_and_trailer_search_regex
+    """Match SM Burhani truck cells; plate queries do not scan other columns."""
+    from tahmeed.services.import_truck_check import truck_field_search_regex
 
-    rx = {"$regex": re.escape(search.strip()), "$options": "i"}
-    clauses = [
+    text = search.strip()
+    plate_rx = truck_field_search_regex(text)
+    if plate_rx:
+        return [{"truck_and_trailer": {"$regex": plate_rx, "$options": "i"}}]
+    rx = {"$regex": re.escape(text), "$options": "i"}
+    return [
         {"sm_ref_no": rx},
         {"prn_number": rx},
         {"entry_reg_no": rx},
@@ -103,10 +107,6 @@ def _truck_search_clauses(search: str) -> list:
         {"consignment": rx},
         {"truck_and_trailer": rx},
     ]
-    flex = truck_and_trailer_search_regex(search)
-    if flex:
-        clauses.append({"truck_and_trailer": {"$regex": flex, "$options": "i"}})
-    return clauses
 
 
 def _build_query(table: str, station: str = "", search: str = "") -> dict:

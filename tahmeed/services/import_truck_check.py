@@ -129,17 +129,55 @@ def split_leading_truck(raw: str) -> Optional[Tuple[str, str]]:
     return truck, text[match.start() :]
 
 
+def _plate_flex_body(compact: str) -> str:
+    """Allow optional spaces between each character of a compact plate."""
+    return r"\s*".join(re.escape(ch) for ch in compact)
+
+
 def truck_and_trailer_search_regex(truck: str) -> Optional[str]:
     """Regex that matches a truck at the start of a ``truck/trailer`` cell.
 
     ``T469 EKZ`` matches ``T469EKZ/T689ELK``, ``T469 EKZ / T689 ELK``, and
     a plain ``T469 EKZ`` cell. Spaces in the stored plate are ignored.
     """
-    compact = re.sub(r"\s+", "", str(truck or "").strip().upper())
+    return truck_exact_match_regex(truck)
+
+
+def truck_exact_match_regex(value: str) -> Optional[str]:
+    """Space-insensitive exact plate match, optionally followed by ``/trailer``.
+
+    ``T103 DVL`` matches ``T103DVL``, ``T103 DVL``, and ``T103DVL/T689ELK``.
+    It does not match ``T102 DVL`` or ``T1030 DVL``.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    compact = re.sub(r"\s+", "", raw.upper())
     if not compact:
         return None
-    flex = r"\s*".join(re.escape(ch) for ch in compact)
-    return rf"^{flex}(?=\s*/|$)"
+    norm = normalize_truck_number(raw, allowed_labels=())
+    if norm.status in ("ok", "normalized"):
+        compact = norm.value.replace(" ", "")
+    return rf"^{_plate_flex_body(compact)}(?=\s*/|$)"
+
+
+def truck_field_search_regex(query: str) -> Optional[str]:
+    """Plate-shaped search regex, or ``None`` so callers can use text search.
+
+    Full plates (``T103 DVL``) match only that plate. A ``T103`` / digits-only
+    query matches that number with an optional suffix, not ``T1030``.
+    """
+    raw = str(query or "").strip()
+    if not raw:
+        return None
+    norm = normalize_truck_number(raw, allowed_labels=())
+    if norm.status in ("ok", "normalized"):
+        return truck_exact_match_regex(norm.value)
+    digits = re.match(r"^T?\s*(\d+)$", raw, re.I)
+    if digits:
+        body = _plate_flex_body(digits.group(1))
+        return rf"^T?\s*{body}(?=\s*[A-Z]|\s*/|$)"
+    return None
 
 
 def _match_one_truck(

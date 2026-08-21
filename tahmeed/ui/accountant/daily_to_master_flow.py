@@ -15,15 +15,11 @@ from tahmeed.services.daily_import_service import (
     preview_daily_import,
     preview_rows_as_truck_dicts,
 )
-from tahmeed.services.description_mapping_service import normalize_description
 from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
-from tahmeed.ui.dialog_theme import show_critical, show_info, show_warning
+from tahmeed.ui.dialog_theme import show_critical, show_info
 from tahmeed.ui.dialogs.daily_import_preview_dialog import DailyImportPreviewDialog
 from tahmeed.ui.dialogs.date_outlier_dialog import resolve_import_date_policy
-from tahmeed.ui.dialogs.description_mapping_dialog import (
-    ACTION_ASSIGN,
-    DescriptionMappingDialog,
-)
+from tahmeed.ui.dialogs.description_mapping_flow import prompt_unmapped_descriptions
 from tahmeed.ui.widgets.upload_busy import UploadBusy, UploadCancelled
 
 
@@ -98,44 +94,15 @@ async def run_daily_to_master_flow(
 
     # ── Description → item (required — no skip; going straight to Master) ─
     if preview.unmapped:
-        if not categories:
-            show_warning(
-                parent,
-                "No Items",
-                "Import your Chart of Accounts into Items first\n"
-                "(Manage → Items → Import Chart of Accounts).",
-            )
+        ok = await prompt_unmapped_descriptions(
+            preview,
+            categories or [],
+            parent,
+            allow_skip=False,
+            apply_mapping=apply_mapping_to_preview,
+        )
+        if not ok:
             return None
-
-        total_unmapped = len(preview.unmapped)
-        while preview.unmapped:
-            key = next(iter(preview.unmapped))
-            count = preview.unmapped[key]
-            display = key
-            for row in preview.rows:
-                if normalize_description(row.description) == key:
-                    display = row.description
-                    break
-            remaining = len(preview.unmapped)
-            dlg = DescriptionMappingDialog(
-                display,
-                count,
-                categories,
-                remaining,
-                parent=parent,
-                allow_skip=False,
-                total=total_unmapped,
-            )
-            if dlg.exec() != DescriptionMappingDialog.Accepted:
-                return None
-            if dlg.action() != ACTION_ASSIGN:
-                return None
-            chosen = dlg.selected_category()
-            if chosen is None:
-                return None
-            await apply_mapping_to_preview(
-                preview, key, chosen._id, chosen.name
-            )
 
     # ── One register date for the whole upload ────────────────────────────
     if not resolve_import_date_policy(preview, parent=parent):

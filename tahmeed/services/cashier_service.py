@@ -38,6 +38,7 @@ async def get_transactions_by_date(
         **day_clause,
         "rejected": {"$ne": True},
         "deletion_requested": {"$ne": True},
+        "trashed": {"$ne": True},
     }
     if not merged and cashier_id is not None:
         query["cashier_id"] = cashier_id
@@ -219,7 +220,10 @@ async def search_transactions(
     limit: int = 500,
 ) -> List[Transaction]:
     db = get_db()
-    query: dict = {}
+    query: dict = {
+        "trashed": {"$ne": True},
+        "deletion_requested": {"$ne": True},
+    }
     if date_from or date_to:
         date_filter: dict = {}
         if date_from:

@@ -16,10 +16,12 @@ from PySide6.QtWidgets import (
 
 from tahmeed.models.category import Category
 from tahmeed.models.description_mapping import DescriptionMapping
+from tahmeed.services.mapping_assignment_service import MappingAssignment
 from tahmeed.ui.accountant.separate_expenses import (
     _finish_table_row, _stripe_bg, _table_style, _ROW_H,
 )
 from tahmeed.ui.dialog_theme import show_critical, show_info, show_warning
+from tahmeed.ui.dialogs.item_dialog import ItemDialog
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
@@ -34,7 +36,7 @@ _T2 = "#6B7280"
 _TM = "#9CA3AF"
 
 _COL_DEFAULTS = [52, 280, 220]
-_PAGE_SIZE = 100
+_SCROLL_CHUNK = 50
 
 
 def _lbl(text: str = "", size: int = 13, weight: int = 400,
@@ -95,7 +97,11 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
 
 
 class _MappingEditorDialog(QDialog):
-    """Create or edit a description → item map."""
+    """Add, edit, or bulk re-assign description → item maps.
+
+    Pick an existing item, or open the same Add New Item dialog used on
+    the Items tab.
+    """
 
     def __init__(
         self,
@@ -103,32 +109,47 @@ class _MappingEditorDialog(QDialog):
         parent: Optional[QWidget] = None,
         *,
         mapping: Optional[DescriptionMapping] = None,
+        mappings: Optional[List[DescriptionMapping]] = None,
     ) -> None:
         super().__init__(parent)
         self._categories = categories
-        self._mapping = mapping
+        entries = list(mappings or [])
+        if mapping is not None and not entries:
+            entries = [mapping]
+        self._entries = entries
+        self._mapping = entries[0] if len(entries) == 1 else mapping
         self.result_description: Optional[str] = None
         self.result_category: Optional[Category] = None
-        editing = mapping is not None
-        self.setWindowTitle("Edit Mapping" if editing else "Add Mapping")
-        self.setMinimumWidth(440)
+        self.result_assignment: Optional[MappingAssignment] = None
+        bulk = len(entries) > 1
+        editing = bool(entries) and not bulk
+        if bulk:
+            title = f"Re-assign {len(entries):,} Mappings"
+        elif editing:
+            title = "Edit Mapping"
+        else:
+            title = "Add Mapping"
+        self.setWindowTitle(title)
+        self.setMinimumWidth(480)
         self.setStyleSheet(
             f"QDialog {{ background: {_WHITE}; color: {_T1}; }}"
             f"QLabel {{ color: {_T1}; background: transparent; border: none; }}"
         )
-        self._build(editing)
+        self._build(editing=editing, bulk=bulk)
 
-    def _build(self, editing: bool) -> None:
+    def _build(self, *, editing: bool, bulk: bool) -> None:
         vl = QVBoxLayout(self)
         vl.setContentsMargins(24, 24, 24, 24)
         vl.setSpacing(12)
 
-        vl.addWidget(_lbl(
-            "Edit description → item" if editing else "Add description → item",
-            size=15, weight=700,
-        ))
+        if bulk:
+            heading = f"Re-assign {len(self._entries):,} description maps"
+        elif editing:
+            heading = "Edit description → item"
+        else:
+            heading = "Add description → item"
+        vl.addWidget(_lbl(heading, size=15, weight=700))
 
-        vl.addWidget(_lbl("Description *", size=12, color=_T2))
         self._desc = QLineEdit()
         self._desc.setPlaceholderText("e.g. TRIANGLE")
         self._desc.setFixedHeight(34)
@@ -139,13 +160,29 @@ class _MappingEditorDialog(QDialog):
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
             f"QLineEdit:disabled{{background:{_BG};color:{_T2};}}"
         )
-        if self._mapping is not None:
-            self._desc.setText(self._mapping.description)
-            self._desc.setEnabled(False)
-            self._desc.setToolTip(
-                "Description key cannot be changed. Delete and re-add to rename."
-            )
-        vl.addWidget(self._desc)
+        if bulk:
+            preview = [e.description for e in self._entries[:6]]
+            extra = len(self._entries) - len(preview)
+            lines = "\n".join(f"• {name}" for name in preview)
+            if extra > 0:
+                lines += f"\n• … and {extra:,} more"
+            summary = _lbl(lines, size=12, color=_T2)
+            summary.setWordWrap(True)
+            vl.addWidget(_lbl(
+                "These descriptions will all point at the same item:",
+                size=12, color=_T2,
+            ))
+            vl.addWidget(summary)
+            self._desc.hide()
+        else:
+            vl.addWidget(_lbl("Description *", size=12, color=_T2))
+            if self._mapping is not None:
+                self._desc.setText(self._mapping.description)
+                self._desc.setEnabled(False)
+                self._desc.setToolTip(
+                    "Description key cannot be changed. Delete and re-add to rename."
+                )
+            vl.addWidget(self._desc)
 
         vl.addWidget(_lbl("Item *", size=12, color=_T2))
         self._combo = QComboBox()
@@ -164,7 +201,7 @@ class _MappingEditorDialog(QDialog):
         completer.setCaseSensitivity(Qt.CaseInsensitive)
         completer.setFilterMode(Qt.MatchContains)
         self._combo.setCompleter(completer)
-        if self._mapping is not None:
+        if self._mapping is not None and not bulk:
             idx = self._combo.findText(self._mapping.category_name)
             if idx >= 0:
                 self._combo.setCurrentIndex(idx)
@@ -175,23 +212,82 @@ class _MappingEditorDialog(QDialog):
         vl.addWidget(self._combo)
 
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
+        btn_row.setSpacing(8)
         cancel = _btn("Cancel", primary=False, height=32)
+        cancel.setAutoDefault(False)
+        cancel.setDefault(False)
         cancel.clicked.connect(self.reject)
         btn_row.addWidget(cancel)
-        save = _btn("Save", primary=True, height=32)
+        btn_row.addStretch()
+        new_item = _btn("Assign to a New Item…", primary=False, height=32)
+        new_item.setAutoDefault(False)
+        new_item.setDefault(False)
+        new_item.setToolTip(
+            "Open the same Add New Item form used on the Items tab, "
+            "then map the selected description(s) to it."
+        )
+        new_item.clicked.connect(self._on_assign_new)
+        btn_row.addWidget(new_item)
+        save_label = "Re-assign" if bulk else "Save"
+        save = _btn(save_label, primary=True, height=32)
+        save.setAutoDefault(True)
+        save.setDefault(True)
         save.clicked.connect(self._accept)
         btn_row.addWidget(save)
         vl.addLayout(btn_row)
 
-        if self._mapping is None:
+        if self._mapping is None and not bulk:
             self._desc.setFocus()
         else:
             self._combo.setFocus()
 
-    def _accept(self) -> None:
+    def _descriptions(self) -> List[str]:
+        if self._entries:
+            return [e.description for e in self._entries]
         desc = self._desc.text().strip()
-        if not desc:
+        return [desc] if desc else []
+
+    def _prefill_item_name(self) -> str:
+        if len(self._entries) == 1:
+            return self._entries[0].description
+        if not self._entries:
+            return self._desc.text().strip()
+        return ""
+
+    def _on_assign_new(self) -> None:
+        if not self._entries:
+            desc = self._desc.text().strip()
+            if not desc:
+                show_warning(self, "Validation", "Description is required.")
+                return
+        dlg = ItemDialog(parent=self, prefill_name=self._prefill_item_name())
+        if dlg.exec() != QDialog.Accepted:
+            return
+        data = dict(dlg.result_data or {})
+        name = (data.get("name") or "").strip()
+        if not name:
+            show_warning(self, "New Item", "Item name is required.")
+            return
+        existing = next(
+            (c for c in self._categories if c.name.strip().lower() == name.lower()),
+            None,
+        )
+        descriptions = self._descriptions()
+        self.result_description = descriptions[0] if descriptions else name
+        self.result_category = existing or Category(name=name)
+        self.result_assignment = MappingAssignment(
+            action="assign",
+            description=self.result_description or "",
+            category=self.result_category,
+            create_new=existing is None,
+            new_item_name=name,
+            new_item_fields=data,
+        )
+        self.accept()
+
+    def _accept(self) -> None:
+        descriptions = self._descriptions()
+        if not descriptions:
             show_warning(self, "Validation", "Description is required.")
             return
         name = self._combo.currentText().strip()
@@ -200,18 +296,30 @@ class _MappingEditorDialog(QDialog):
             return
         idx = self._combo.findText(name)
         cat_id = self._combo.itemData(idx) if idx >= 0 else None
-        if cat_id is None:
-            match = next((c for c in self._categories if c.name == name), None)
-            if match is None:
-                show_warning(
-                    self,
-                    "Validation",
-                    "Please pick an existing item from the Items list.",
-                )
-                return
-            cat_id = match._id
-        self.result_description = desc
-        self.result_category = Category(_id=cat_id, name=name)
+        match = next((c for c in self._categories if c.name == name), None)
+        if match is None:
+            match = next(
+                (c for c in self._categories
+                 if c.name.strip().lower() == name.lower()),
+                None,
+            )
+        if cat_id is None and match is None:
+            show_warning(
+                self,
+                "Validation",
+                "Please pick an existing item from the Items list, "
+                "or click Assign to a New Item.",
+            )
+            return
+        category = match or Category(_id=cat_id, name=name)
+        self.result_description = descriptions[0]
+        self.result_category = category
+        self.result_assignment = MappingAssignment(
+            action="assign",
+            description=descriptions[0],
+            category=category,
+            create_new=False,
+        )
         self.accept()
 
 
@@ -221,7 +329,6 @@ class DescriptionMapsWidget(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._rows: List[DescriptionMapping] = []
-        self._page = 0
         self._total = 0
         self._loading = False
         self._categories: List[Category] = []
@@ -257,27 +364,11 @@ class DescriptionMapsWidget(QWidget):
         )
         hdr.addWidget(self._count_chip)
         hdr.addStretch()
-
         hint = _lbl(
-            "Select a row to delete · right-click for Edit / Delete",
+            "Select rows to re-assign or delete · right-click for more",
             size=11, color=_TM,
         )
         hdr.addWidget(hint)
-
-        self._delete_btn = _btn("Delete Selected", icon="mdi.delete-outline", primary=False, danger=True, height=32)
-        self._delete_btn.setEnabled(False)
-        self._delete_btn.setToolTip("Delete the selected mapping(s)")
-        self._delete_btn.clicked.connect(self._delete_selected)
-        hdr.addWidget(self._delete_btn)
-
-        clear_btn = _btn("Clear All", primary=False, height=32)
-        clear_btn.setToolTip("Delete every description → item mapping")
-        clear_btn.clicked.connect(self._confirm_clear_all)
-        hdr.addWidget(clear_btn)
-
-        add_btn = _btn("+ Add Mapping", primary=True, height=32)
-        add_btn.clicked.connect(self._add_mapping)
-        hdr.addWidget(add_btn)
         root.addLayout(hdr)
 
         toolbar = QHBoxLayout()
@@ -293,6 +384,33 @@ class DescriptionMapsWidget(QWidget):
         )
         self._search.textChanged.connect(self._on_search_changed)
         toolbar.addWidget(self._search, 1)
+
+        self._reassign_btn = _btn(
+            "Re-assign Selected", icon="mdi.swap-horizontal", primary=False, height=32,
+        )
+        self._reassign_btn.setEnabled(False)
+        self._reassign_btn.setToolTip(
+            "Map the selected description(s) to an existing item or a new item"
+        )
+        self._reassign_btn.clicked.connect(self._reassign_selected)
+        toolbar.addWidget(self._reassign_btn)
+
+        self._delete_btn = _btn(
+            "Delete Selected", icon="mdi.delete-outline", primary=False, danger=True, height=32,
+        )
+        self._delete_btn.setEnabled(False)
+        self._delete_btn.setToolTip("Delete the selected mapping(s)")
+        self._delete_btn.clicked.connect(self._delete_selected)
+        toolbar.addWidget(self._delete_btn)
+
+        clear_btn = _btn("Clear All", primary=False, height=32)
+        clear_btn.setToolTip("Delete every description → item mapping")
+        clear_btn.clicked.connect(self._confirm_clear_all)
+        toolbar.addWidget(clear_btn)
+
+        add_btn = _btn("+ Add Mapping", primary=True, height=32)
+        add_btn.clicked.connect(self._add_mapping)
+        toolbar.addWidget(add_btn)
         root.addLayout(toolbar)
 
         self._table_host = QFrame()
@@ -316,6 +434,7 @@ class DescriptionMapsWidget(QWidget):
         self._table.customContextMenuRequested.connect(self._context_menu)
         self._table.doubleClicked.connect(self._on_double_click)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
         hdr_view = self._table.horizontalHeader()
         hdr_view.setSectionsMovable(False)
@@ -331,66 +450,47 @@ class DescriptionMapsWidget(QWidget):
 
         self._loading_overlay = LoadingOverlay(self._table_host, "Loading…")
 
-        pager = QFrame()
-        pager.setFixedHeight(44)
-        pager.setStyleSheet(
-            f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};border-radius:6px;}}"
-        )
-        pl = QHBoxLayout(pager)
-        pl.setContentsMargins(12, 0, 12, 0)
-        pl.setSpacing(10)
-        self._page_info = _lbl("—", size=12, color=_T2)
-        pl.addWidget(self._page_info)
-        pl.addStretch()
-        self._prev_btn = _btn("← Prev", primary=False, height=30)
-        self._prev_btn.setFixedWidth(88)
-        self._prev_btn.clicked.connect(self._on_prev_page)
-        pl.addWidget(self._prev_btn)
-        self._next_btn = _btn("Next →", primary=False, height=30)
-        self._next_btn.setFixedWidth(88)
-        self._next_btn.clicked.connect(self._on_next_page)
-        pl.addWidget(self._next_btn)
-        root.addWidget(pager)
-
         self._footer = _lbl("", size=11, color=_TM)
+        self._footer.setAlignment(Qt.AlignCenter)
         root.addWidget(self._footer)
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
     def _on_search_changed(self) -> None:
         self._search_debounce.start()
 
     def _on_search_commit(self) -> None:
-        self._page = 0
-        asyncio.ensure_future(self._load())
+        self._reset_and_load()
 
-    def _on_prev_page(self) -> None:
-        if self._page > 0:
-            self._page -= 1
-            asyncio.ensure_future(self._load())
+    def _reset_and_load(self) -> None:
+        asyncio.ensure_future(self._load_initial())
 
-    def _on_next_page(self) -> None:
-        max_pg = max(0, (self._total - 1) // _PAGE_SIZE) if self._total else 0
-        if self._page < max_pg:
-            self._page += 1
-            asyncio.ensure_future(self._load())
+    def _update_status(self) -> None:
+        loaded = len(self._rows)
+        if self._loading:
+            suffix = "  •  Loading…"
+        elif loaded >= self._total:
+            suffix = ""
+        else:
+            suffix = "  •  Scroll down for more"
+        self._footer.setText(f"Showing {loaded:,} of {self._total:,}{suffix}")
+        self._count_chip.setText(f"{self._total:,} maps")
 
-    def _update_pager(self) -> None:
-        total = self._total
-        size = _PAGE_SIZE
-        page = self._page
-        max_pg = max(0, (total - 1) // size) if total else 0
-        start = page * size + 1 if total else 0
-        end = min((page + 1) * size, total)
-        self._page_info.setText(
-            f"Showing {start:,}–{end:,} of {total:,}  ·  Page {page + 1} of {max_pg + 1}"
-        )
-        self._prev_btn.setEnabled(page > 0)
-        self._next_btn.setEnabled(page < max_pg)
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
-    async def _ensure_categories(self) -> bool:
-        if self._categories:
+    def _fill_if_needed(self) -> None:
+        bar = self._table.verticalScrollBar()
+        if not self._loading and len(self._rows) < self._total and bar.maximum() <= 0:
+            asyncio.ensure_future(self._load_more())
+
+    async def _ensure_categories(self, *, refresh: bool = False) -> bool:
+        if self._categories and not refresh:
             return True
         from tahmeed.services.category_service import get_all_categories
 
@@ -399,80 +499,94 @@ class DescriptionMapsWidget(QWidget):
         except Exception as exc:
             show_critical(self, "Error", f"Could not load items:\n{exc}")
             return False
-        if not self._categories:
-            show_warning(
-                self,
-                "No Items",
-                "Import your Chart of Accounts into Items first\n"
-                "(Manage → Items → Import Chart of Accounts).",
-            )
-            return False
         return True
 
-    async def _load(self) -> None:
+    async def _load_initial(self) -> None:
         if self._loading:
             return
         self._loading = True
         self._loading_overlay.show_loading("Loading mappings…")
+        self._update_status()
         try:
             from tahmeed.services.description_mapping_service import (
                 count_mappings, list_mappings,
             )
 
             search = self._search.text().strip()
-            skip = self._page * _PAGE_SIZE
             rows, total = await asyncio.gather(
-                list_mappings(search=search, limit=_PAGE_SIZE, skip=skip),
+                list_mappings(search=search, limit=_SCROLL_CHUNK, skip=0),
                 count_mappings(search=search),
             )
-            max_pg = max(0, (total - 1) // _PAGE_SIZE) if total else 0
-            if self._page > max_pg:
-                self._page = max_pg
-                skip = self._page * _PAGE_SIZE
-                rows = await list_mappings(
-                    search=search, limit=_PAGE_SIZE, skip=skip,
-                )
             self._rows = rows
             self._total = total
-            self._populate_table()
-            self._update_pager()
+            self._rebuild_table()
         except Exception as exc:
             show_critical(self, "Error", f"Could not load mappings:\n{exc}")
         finally:
             self._loading = False
             self._loading_overlay.hide_loading()
+            self._update_status()
+            self._fill_if_needed()
 
-    def _populate_table(self) -> None:
-        rows = self._rows
-        skip = self._page * _PAGE_SIZE
-        self._table.setRowCount(0)
-        self._count_chip.setText(f"{self._total:,} maps")
+    async def _load_more(self) -> None:
+        if self._loading or len(self._rows) >= self._total:
+            return
+        self._loading = True
+        self._update_status()
+        try:
+            from tahmeed.services.description_mapping_service import list_mappings
 
-        for i, row in enumerate(rows):
-            self._table.insertRow(i)
-            row_bg = _stripe_bg(i)
-            self._table.setItem(
-                i, 0,
-                _cell(str(skip + i + 1), Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
+            search = self._search.text().strip()
+            rows = await list_mappings(
+                search=search, limit=_SCROLL_CHUNK, skip=len(self._rows),
             )
-            self._table.setItem(i, 1, _cell(row.description, bg=row_bg))
-            self._table.setItem(i, 2, _cell(row.category_name, bg=row_bg))
-            _finish_table_row(self._table, i, row_bg)
+        except Exception as exc:
+            self._loading = False
+            self._update_status()
+            show_critical(self, "Error", f"Could not load more mappings:\n{exc}")
+            return
+        if rows:
+            start = len(self._rows)
+            self._rows.extend(rows)
+            self._append_rows(rows, start)
+        self._loading = False
+        self._update_status()
+        self._fill_if_needed()
 
-        shown = len(rows)
-        self._footer.setText(
-            f"{shown} on this page  ·  {self._total:,} total matching"
-        )
+    def _rebuild_table(self) -> None:
+        self._table.setRowCount(0)
+        self._append_rows(self._rows, 0)
         self._on_selection_changed()
+
+    def _append_rows(
+        self, rows: List[DescriptionMapping], start_index: int,
+    ) -> None:
+        for i, row in enumerate(rows):
+            idx = start_index + i
+            self._table.insertRow(idx)
+            row_bg = _stripe_bg(idx)
+            self._table.setItem(
+                idx, 0,
+                _cell(str(idx + 1), Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
+            )
+            self._table.setItem(idx, 1, _cell(row.description, bg=row_bg))
+            self._table.setItem(idx, 2, _cell(row.category_name, bg=row_bg))
+            _finish_table_row(self._table, idx, row_bg)
+
+    async def _load(self) -> None:
+        await self._load_initial()
 
     def _on_selection_changed(self) -> None:
         selected = self._selected_entries()
         n = len(selected)
         self._delete_btn.setEnabled(n > 0)
+        self._reassign_btn.setEnabled(n > 0)
         if n <= 1:
             self._delete_btn.setText("  Delete Selected")
+            self._reassign_btn.setText("  Re-assign Selected")
         else:
             self._delete_btn.setText(f"  Delete Selected ({n})")
+            self._reassign_btn.setText(f"  Re-assign Selected ({n})")
 
     def _selected_entries(self) -> List[DescriptionMapping]:
         rows = sorted({idx.row() for idx in self._table.selectedIndexes()})
@@ -510,9 +624,20 @@ class DescriptionMapsWidget(QWidget):
             self._table.selectRow(row)
         entry = self._rows[row]
         menu = QMenu(self)
-        edit_act = menu.addAction("Edit Item…")
-        menu.addSeparator()
         selected = self._selected_entries()
+        if len(selected) > 1:
+            reassign_act = menu.addAction(f"Re-assign Selected ({len(selected)})…")
+            edit_act = None
+        else:
+            reassign_act = None
+            edit_act = menu.addAction("Edit Item…")
+        try:
+            act = reassign_act or edit_act
+            if act is not None:
+                act.setIcon(qta.icon("mdi.swap-horizontal", color=_T1))
+        except Exception:
+            pass
+        menu.addSeparator()
         if len(selected) > 1:
             delete_act = menu.addAction(f"Delete Selected ({len(selected)})")
         else:
@@ -522,11 +647,10 @@ class DescriptionMapsWidget(QWidget):
         except Exception:
             pass
         chosen = menu.exec(self._table.viewport().mapToGlobal(pos))
-        if chosen == edit_act:
-            if len(selected) == 1:
-                asyncio.ensure_future(self._edit_mapping(entry))
-            else:
-                show_info(self, "Edit", "Select a single mapping to edit.")
+        if reassign_act is not None and chosen == reassign_act:
+            self._reassign_selected()
+        elif edit_act is not None and chosen == edit_act:
+            asyncio.ensure_future(self._edit_mapping(entry))
         elif chosen == delete_act:
             self._delete_selected()
 
@@ -538,48 +662,88 @@ class DescriptionMapsWidget(QWidget):
     def _add_mapping(self) -> None:
         asyncio.ensure_future(self._do_add())
 
+    def _reassign_selected(self) -> None:
+        entries = self._selected_entries()
+        if not entries:
+            show_info(self, "Re-assign", "Select one or more mappings to re-assign.")
+            return
+        asyncio.ensure_future(self._do_reassign(entries))
+
     async def _do_add(self) -> None:
-        if not await self._ensure_categories():
+        if not await self._ensure_categories(refresh=True):
             return
         dlg = _MappingEditorDialog(self._categories, parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
-        if not dlg.result_description or not dlg.result_category:
+        if not dlg.result_assignment or not dlg.result_description:
             return
-        from tahmeed.services.description_mapping_service import save_mapping
-
-        try:
-            await save_mapping(
-                dlg.result_description,
-                dlg.result_category._id,
-                dlg.result_category.name,
-            )
-        except Exception as exc:
-            show_critical(self, "Error", f"Could not save mapping:\n{exc}")
-            return
-        await self._load()
+        await self._save_assignment([dlg.result_description], dlg.result_assignment)
 
     async def _edit_mapping(self, entry: DescriptionMapping) -> None:
-        if not await self._ensure_categories():
+        await self._do_reassign([entry])
+
+    async def _do_reassign(self, entries: List[DescriptionMapping]) -> None:
+        if not await self._ensure_categories(refresh=True):
             return
         dlg = _MappingEditorDialog(
-            self._categories, parent=self, mapping=entry,
+            self._categories, parent=self, mappings=entries,
         )
         if dlg.exec() != QDialog.Accepted:
             return
-        if not dlg.result_description or not dlg.result_category:
+        if not dlg.result_assignment:
             return
-        from tahmeed.services.description_mapping_service import save_mapping
+        descriptions = [e.description for e in entries]
+        if len(entries) > 1:
+            name = dlg.result_assignment.item_name
+            box = QMessageBox(self)
+            box.setWindowTitle("Re-assign Mappings")
+            box.setIcon(QMessageBox.Question)
+            box.setText(
+                f'Re-assign {len(entries):,} mapping(s) to "{name}"?'
+            )
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.Yes)
+            from tahmeed.ui.dialog_theme import style_message_box
+            style_message_box(box)
+            if box.exec() != QMessageBox.Yes:
+                return
+        await self._save_assignment(descriptions, dlg.result_assignment)
 
+    async def _save_assignment(
+        self,
+        descriptions: List[str],
+        assignment: MappingAssignment,
+    ) -> None:
+        from tahmeed.services.mapping_assignment_service import (
+            apply_assignment_to_descriptions,
+        )
+
+        bulk = len(descriptions) > 1
+        self._loading_overlay.show_loading(
+            "Re-assigning mappings…" if bulk else "Saving mapping…"
+        )
         try:
-            await save_mapping(
-                dlg.result_description,
-                dlg.result_category._id,
-                dlg.result_category.name,
+            chosen, failed = await apply_assignment_to_descriptions(
+                descriptions, assignment, self._categories,
             )
         except Exception as exc:
-            show_critical(self, "Error", f"Could not update mapping:\n{exc}")
+            self._loading_overlay.hide_loading()
+            show_critical(self, "Error", f"Could not save mapping:\n{exc}")
             return
+        self._loading_overlay.hide_loading()
+        saved = len(descriptions) - failed
+        if failed:
+            show_warning(
+                self,
+                "Re-assign",
+                f"Updated {saved:,} mapping(s); {failed:,} failed.",
+            )
+        elif bulk:
+            show_info(
+                self,
+                "Re-assigned",
+                f'Re-assigned {saved:,} mapping(s) to "{chosen.name}".',
+            )
         await self._load()
 
     def _confirm_delete(self, entry: DescriptionMapping) -> None:
@@ -657,5 +821,4 @@ class DescriptionMapsWidget(QWidget):
             show_critical(self, "Error", f"Could not clear mappings:\n{exc}")
             return
         show_info(self, "Cleared", f"Deleted {count:,} mapping(s).")
-        self._page = 0
         await self._load()

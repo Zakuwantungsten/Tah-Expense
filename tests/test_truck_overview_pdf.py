@@ -8,7 +8,10 @@ from pathlib import Path
 import fitz
 import pytest
 
-from tahmeed.services.truck_overview_pdf import export_truck_overview_pdf
+from tahmeed.services.truck_overview_pdf import (
+    _sort_detail_rows_by_source,
+    export_truck_overview_pdf,
+)
 
 
 def test_export_truck_overview_pdf_writes_landscape_with_all_columns(tmp_path: Path):
@@ -125,3 +128,26 @@ def test_export_truck_overview_pdf_writes_landscape_with_all_columns(tmp_path: P
         assert "T123" in text
     finally:
         doc.close()
+
+
+def test_pdf_detail_rows_group_by_source_then_date():
+    rows = [
+        {"source": "Toll Plaza", "date": datetime(2026, 6, 1), "description": "toll-late"},
+        {"source": "Congo Expenses", "date": datetime(2026, 3, 10), "description": "congo-late"},
+        {"source": "Toll Plaza", "date": datetime(2026, 1, 2), "description": "toll-early"},
+        {"source": "Congo Expenses", "date": datetime(2026, 2, 1), "description": "congo-early"},
+    ]
+    grouped = _sort_detail_rows_by_source(rows)
+    assert [r["description"] for r in grouped] == [
+        "toll-early",
+        "toll-late",
+        "congo-early",
+        "congo-late",
+    ]
+    # Original list stays date-mixed so the dashboard sort is unchanged.
+    assert [r["description"] for r in rows] == [
+        "toll-late",
+        "congo-late",
+        "toll-early",
+        "congo-early",
+    ]

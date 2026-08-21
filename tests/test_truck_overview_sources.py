@@ -91,6 +91,76 @@ def test_filter_rows_sorts_date_ascending() -> None:
     assert [r["description"] for r in filtered] == ["jan", "jun", "dec"]
 
 
+def test_truck_exact_matches_compact_and_spaced_plates() -> None:
+    import re as _re
+
+    from tahmeed.services.accountant_service import _truck_exact
+
+    clause = _truck_exact("T103 DVL")
+    compiled = _re.compile(clause["$regex"], _re.IGNORECASE)
+    assert compiled.search("T103 DVL")
+    assert compiled.search("T103DVL")
+    assert compiled.search("T103DVL/T200 XXX")
+    assert not compiled.search("T102 DVL")
+    assert not compiled.search("T1030 DVL")
+
+
+def test_normalize_sources_diesel_imports_expands_stations() -> None:
+    from tahmeed.services.accountant_service import (
+        _DIESEL_STATION_SOURCE_GROUPS,
+        _normalize_truck_overview_sources,
+    )
+
+    wanted = _normalize_truck_overview_sources("diesel_imports")
+    assert wanted == set(_DIESEL_STATION_SOURCE_GROUPS)
+    assert "diesel_imports" not in wanted
+
+
+def test_filter_rows_diesel_imports_matches_station_groups() -> None:
+    rows = [
+        {"source_group": "infinity", "date": None, "description": "inf"},
+        {"source_group": "master", "date": None, "description": "m"},
+        {"source_group": "gbp_diesel", "date": None, "description": "gbp"},
+    ]
+    filtered = _filter_truck_overview_rows(rows, source="diesel_imports")
+    assert [r["description"] for r in filtered] == ["inf", "gbp"]
+
+
+def test_diesel_overview_query_uses_transaction_date_not_display_date() -> None:
+    """Station imports store the real datetime on transaction_date."""
+    from tahmeed.services.accountant_service import _diesel_overview_query
+
+    query = _diesel_overview_query(
+        "diesel_infinity",
+        "T103 DVL",
+        datetime(2026, 1, 1),
+        datetime(2026, 12, 31),
+    )
+    assert query["feed_type"] == "diesel_infinity"
+    assert "transaction_date" in query
+    assert "date" not in query
+    assert query["transaction_date"]["$gte"] == datetime(2026, 1, 1, 0, 0, 0)
+    assert query["transaction_date"]["$lte"] == datetime(2026, 12, 31, 23, 59, 59)
+    assert "$regex" in query["truck_no"]
+
+
+def test_truck_overview_covers_separate_expense_tabs() -> None:
+    from tahmeed.services.accountant_service import _TRUCK_OVERVIEW_SOURCES
+
+    assert {
+        "toll_plaza",
+        "parking_congo",
+        "zambia_parking",
+        "congo_expenses",
+        "ahmed_kimvi",
+        "afritrack",
+        "third_party",
+        "comesa",
+        "sm_burhani",
+        "rahntech",
+    }.issubset(_TRUCK_OVERVIEW_SOURCES)
+
+
 def test_source_multi_combo_selects_multiple() -> None:
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication

@@ -146,6 +146,7 @@ def _base_doc(**extra):
         "rejected": False,
         "discarded": False,
         "deletion_requested": False,
+        "trashed": False,
         "edited_after_verification": False,
         "item": "Toll",
         "category_name": "Toll",
@@ -201,7 +202,7 @@ def test_verified_delete_requests_and_hides_from_master(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_confirm_deletion_removes_pending_edit_clones(monkeypatch):
+def test_confirm_deletion_moves_to_trash_and_removes_pending_edit_clones(monkeypatch):
     cashier = ObjectId()
     original = _base_doc(
         cashier_id=cashier,
@@ -223,6 +224,65 @@ def test_confirm_deletion_removes_pending_edit_clones(monkeypatch):
 
     async def scenario():
         ok = await accountant_service.confirm_deletion(original["_id"])
+        assert ok is True
+        assert len(coll.docs) == 1
+        doc = coll.docs[0]
+        assert doc["_id"] == original["_id"]
+        assert doc["trashed"] is True
+        assert doc["deletion_requested"] is False
+        assert doc["deletion_requested_at"] is None
+        assert doc["deletion_requested_by"] is None
+
+        master = await accountant_service.get_master_transactions(year=2026, month=1)
+        assert master == []
+
+        trash = await accountant_service.get_trashed_transactions()
+        assert len(trash) == 1
+        assert trash[0]._id == original["_id"]
+
+        pending = await accountant_service.get_deletion_requested_filtered()
+        assert pending == []
+
+    asyncio.run(scenario())
+
+
+def test_restore_from_trash_returns_to_master(monkeypatch):
+    cashier = ObjectId()
+    doc = _base_doc(
+        cashier_id=cashier,
+        verified=True,
+        trashed=True,
+        trashed_at=datetime.utcnow(),
+        trashed_by=ObjectId(),
+        year=2026,
+    )
+    coll = _FakeCollection([doc])
+    _patch_db(monkeypatch, coll)
+
+    async def scenario():
+        ok = await accountant_service.restore_from_trash(doc["_id"])
+        assert ok is True
+        assert coll.docs[0]["trashed"] is False
+        assert coll.docs[0]["trashed_at"] is None
+        assert coll.docs[0]["trashed_by"] is None
+
+        master = await accountant_service.get_master_transactions(year=2026, month=1)
+        assert len(master) == 1
+        assert master[0]._id == doc["_id"]
+
+        trash = await accountant_service.get_trashed_transactions()
+        assert trash == []
+
+    asyncio.run(scenario())
+
+
+def test_permanently_delete_trashed(monkeypatch):
+    doc = _base_doc(verified=True, trashed=True, trashed_at=datetime.utcnow())
+    coll = _FakeCollection([doc])
+    _patch_db(monkeypatch, coll)
+
+    async def scenario():
+        ok = await accountant_service.permanently_delete_trashed(doc["_id"])
         assert ok is True
         assert coll.docs == []
 

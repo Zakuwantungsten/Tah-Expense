@@ -24,7 +24,8 @@ async def get_subtables(
     return [_subtable(document) for document in documents]
 
 
-async def create_subtable(
+async def _create_subtable(
+    path: str,
     parent_key: str,
     parent_category: str,
     name: str,
@@ -32,7 +33,7 @@ async def create_subtable(
 ) -> SubTable:
     document = await api_client.request(
         "POST",
-        "v1/subtables",
+        path,
         json={
             "parent_key": parent_key,
             "parent_category": parent_category,
@@ -41,6 +42,28 @@ async def create_subtable(
         },
     )
     return _subtable(document)
+
+
+async def create_subtable(
+    parent_key: str,
+    parent_category: str,
+    name: str,
+    match: Optional[str] = None,
+) -> SubTable:
+    return await _create_subtable(
+        "v1/subtables", parent_key, parent_category, name, match
+    )
+
+
+async def create_cashier_subtable(
+    parent_key: str,
+    parent_category: str,
+    name: str,
+    match: Optional[str] = None,
+) -> SubTable:
+    return await _create_subtable(
+        "v1/subtables/cashier-create", parent_key, parent_category, name, match
+    )
 
 
 async def update_subtable(sub_id: ObjectId, **fields) -> None:

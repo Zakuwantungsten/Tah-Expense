@@ -93,7 +93,8 @@ class ImportDailyMasterWidget(QWidget):
 
         steps = QLabel(
             "<b>What happens</b><ol style='margin-top:6px;'>"
-            "<li>Map each unknown description to an Item (saved for next time)</li>"
+            "<li>Map each unknown description to an Item, or assign it to a "
+            "new item (same Add Item form as the Items tab; saved for next time)</li>"
             "<li>Resolve mixed dates if the file spans more than one day</li>"
             "<li>Confirm a preview of the rows</li>"
             "<li>Check / correct vehicle numbers (add to registry, allow, or skip)</li>"

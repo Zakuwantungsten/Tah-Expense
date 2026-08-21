@@ -39,6 +39,9 @@ class Transaction:
     deletion_requested: bool = False           # True when cashier requested delete of an approved row
     deletion_requested_at: Optional[datetime] = None
     deletion_requested_by: Optional[ObjectId] = None
+    trashed: bool = False                      # Soft-deleted after accountant confirms deletion
+    trashed_at: Optional[datetime] = None
+    trashed_by: Optional[ObjectId] = None
     original_transaction_id: Optional[ObjectId] = None  # Points to the original approved doc when this is a pending edit
     day_order: Optional[int] = None            # Sequence within the calendar day (Merged register)
     register_status: str = "draft"             # "draft" | "submitted" — gate before Verify
@@ -88,6 +91,9 @@ class Transaction:
             "deletion_requested": self.deletion_requested,
             "deletion_requested_at": self.deletion_requested_at,
             "deletion_requested_by": self.deletion_requested_by,
+            "trashed": self.trashed,
+            "trashed_at": self.trashed_at,
+            "trashed_by": self.trashed_by,
             "original_transaction_id": self.original_transaction_id,
             "day_order": self.day_order,
             "register_status": self.register_status or "draft",
@@ -149,6 +155,9 @@ class Transaction:
             deletion_requested=doc.get("deletion_requested", False),
             deletion_requested_at=doc.get("deletion_requested_at"),
             deletion_requested_by=doc.get("deletion_requested_by"),
+            trashed=doc.get("trashed", False),
+            trashed_at=doc.get("trashed_at"),
+            trashed_by=doc.get("trashed_by"),
             original_transaction_id=doc.get("original_transaction_id"),
             day_order=doc.get("day_order"),
             register_status=status,

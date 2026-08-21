@@ -26,6 +26,7 @@ _LAZY_PAGE_KEYS = frozenset({
     "truck_overview",
     "verify",
     "master_expenses",
+    "trash",
     "import_daily",
     "toll_plaza",
     "parking_congo",
@@ -36,6 +37,7 @@ _LAZY_PAGE_KEYS = frozenset({
     "third_party",
     "comesa",
     "diesel_cash",
+    "fuel_overview",
     "infinity",
     "lake_zambia",
     "lake_tunduma",
@@ -196,6 +198,10 @@ class AccountantDashboard(QWidget):
             from tahmeed.ui.accountant.master_expenses import MasterExpensesWidget
             return MasterExpensesWidget(user=self._user)
 
+        if key == "trash":
+            from tahmeed.ui.accountant.trash import TrashWidget
+            return TrashWidget(user=self._user)
+
         if key == "import_daily":
             from tahmeed.ui.accountant.import_daily_master import ImportDailyMasterWidget
             return ImportDailyMasterWidget(user=self._user)
@@ -235,6 +241,10 @@ class AccountantDashboard(QWidget):
         if key == "diesel_cash":
             from tahmeed.ui.accountant.diesel_cash import DieselCashWidget
             return DieselCashWidget()
+
+        if key == "fuel_overview":
+            from tahmeed.ui.accountant.fuel_overview import FuelOverviewWidget
+            return FuelOverviewWidget()
 
         if key == "infinity":
             from tahmeed.ui.accountant.fuel_consumption import InfinityWidget
