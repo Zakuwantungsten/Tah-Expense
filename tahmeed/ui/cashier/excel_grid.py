@@ -1162,7 +1162,7 @@ class DailyRegister(QWidget):
             daily_import_id=meta.get("daily_import_id"),
             daily_import_source=meta.get("daily_import_source"),
             date_discrepancy=bool(meta.get("date_discrepancy")),
-            import_primary_date=meta.get("import_primary_date"),
+            import_primary_date=self._resolve_import_primary_date(row),
             lpo_do=(meta.get("lpo_do") or "").upper(),
             do_number=(meta.get("do_number") or "").upper(),
             reported_date=getattr(orig, "reported_date", None) if orig is not None else None,
@@ -1303,6 +1303,7 @@ class DailyRegister(QWidget):
             "approver": tx.approver,
             "payee": tx.payee,
             "cheque": tx.cheque,
+            "import_primary_date": tx.import_primary_date,
         }
 
     # ------------------------------------------------------------------
@@ -1744,6 +1745,25 @@ class DailyRegister(QWidget):
 
     def _register_date_str(self) -> str:
         return format_register_date(self._current_date)
+
+    def _register_primary_dt(self) -> datetime:
+        """Register calendar day as datetime (same shape as daily-import primary)."""
+        d = self._current_date
+        return datetime(d.year, d.month, d.day)
+
+    def _resolve_import_primary_date(self, row: int):
+        """Register day ownership for this row (upload meta, existing stamp, or open day).
+
+        Prior Excel/system dates stay on the open register day — same as uploads.
+        """
+        meta = self._pending_row_meta.get(row) or {}
+        stamped = meta.get("import_primary_date")
+        if stamped is not None:
+            return stamped
+        orig = self._saved_txs.get(row)
+        if orig is not None and getattr(orig, "import_primary_date", None) is not None:
+            return orig.import_primary_date
+        return self._register_primary_dt()
 
     def _sync_row_date(self, row: int) -> None:
         """Fill Date when the row gains entry data; clear it when the row is emptied.
@@ -3803,7 +3823,7 @@ class DailyRegister(QWidget):
                     daily_import_id=meta.get("daily_import_id"),
                     daily_import_source=meta.get("daily_import_source"),
                     date_discrepancy=bool(meta.get("date_discrepancy")),
-                    import_primary_date=meta.get("import_primary_date"),
+                    import_primary_date=self._resolve_import_primary_date(row),
                     lpo_do=(meta.get("lpo_do") or "").upper(),
                     do_number=(meta.get("do_number") or "").upper(),
                 )

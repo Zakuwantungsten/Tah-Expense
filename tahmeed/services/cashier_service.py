@@ -7,6 +7,67 @@ from bson import ObjectId
 from tahmeed.db.connection import get_db
 from tahmeed.models.transaction import Transaction
 
+# Effective register day for Simple day-transaction grouping.
+_REGISTER_DAY_EXPR = {"$ifNull": ["$import_primary_date", "$date"]}
+
+
+def _day_bounds(target_date: date) -> tuple:
+    start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
+    end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
+    return start, end
+
+
+def _register_day_clause(target_date: date) -> dict:
+    """Match rows that belong on this register calendar day.
+
+    Daily-import rows are owned by ``import_primary_date`` even when their
+    Excel ``date`` is earlier. Manual/legacy rows without a primary date use
+    Excel ``date``. Prior-day Excel rows filed under another register day are
+    excluded from this day.
+    """
+    start, end = _day_bounds(target_date)
+    return {
+        "$or": [
+            {"import_primary_date": {"$gte": start, "$lte": end}},
+            {
+                "$and": [
+                    {"date": {"$gte": start, "$lte": end}},
+                    {"import_primary_date": None},
+                ]
+            },
+        ]
+    }
+
+
+def _register_day_range_clause(
+    date_from: date = None,
+    date_to: date = None,
+) -> dict:
+    """Match rows whose effective register day falls in the browse window."""
+    primary: dict = {}
+    excel: dict = {}
+    if date_from:
+        start = datetime(date_from.year, date_from.month, date_from.day, 0, 0, 0)
+        primary["$gte"] = start
+        excel["$gte"] = start
+    if date_to:
+        end = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59)
+        primary["$lte"] = end
+        excel["$lte"] = end
+    if not primary:
+        return {}
+    return {
+        "$or": [
+            {"import_primary_date": primary},
+            {
+                "$and": [
+                    {"date": excel},
+                    {"import_primary_date": None},
+                ]
+            },
+        ]
+    }
+
 
 async def get_transactions_by_date(
     target_date: date,
@@ -16,26 +77,17 @@ async def get_transactions_by_date(
 ) -> List[Transaction]:
     """Load a calendar day's register rows.
 
-    Includes:
-    - rows whose Excel/transaction ``date`` falls on that day, and
-    - daily-import rows filed under that day via ``import_primary_date``
-      (Excel dates may differ; the whole upload still belongs on the register day).
+    Includes daily-import rows filed under that day via ``import_primary_date``
+    (Excel dates may differ; the whole upload still belongs on the register day)
+    and manual/legacy rows whose Excel ``date`` is that day.
 
     ``merged=True`` returns every cashier's rows for that day (Shared/Merged mode).
     Otherwise ``cashier_id`` scopes to one user when provided.
     Sorted by ``day_order`` then ``created_at``.
     """
     db = get_db()
-    start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
-    end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
-    day_clause = {
-        "$or": [
-            {"date": {"$gte": start, "$lte": end}},
-            {"import_primary_date": {"$gte": start, "$lte": end}},
-        ]
-    }
     query: dict = {
-        **day_clause,
+        **_register_day_clause(target_date),
         "rejected": {"$ne": True},
         "deletion_requested": {"$ne": True},
         "trashed": {"$ne": True},
@@ -65,15 +117,10 @@ async def submit_day_for_verify(target_date: date) -> int:
     ``import_primary_date``. Returns the number of documents updated.
     """
     db = get_db()
-    start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
-    end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
     result = await db.transactions.update_many(
         {
             "$and": [
-                {"$or": [
-                    {"date": {"$gte": start, "$lte": end}},
-                    {"import_primary_date": {"$gte": start, "$lte": end}},
-                ]},
+                _register_day_clause(target_date),
                 {"verified": {"$ne": True}},
                 {"rejected": {"$ne": True}},
                 {"discarded": {"$ne": True}},
@@ -104,15 +151,8 @@ async def recount_day_order(target_date: date, ordered_ids: List[ObjectId]) -> N
 async def next_day_order(target_date: date) -> int:
     """Next ``day_order`` for *target_date* (append after every cashier's rows)."""
     db = get_db()
-    start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
-    end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
     docs = await db.transactions.aggregate([
-        {"$match": {
-            "$or": [
-                {"date": {"$gte": start, "$lte": end}},
-                {"import_primary_date": {"$gte": start, "$lte": end}},
-            ],
-        }},
+        {"$match": _register_day_clause(target_date)},
         {"$group": {"_id": None, "mx": {"$max": "$day_order"}}},
     ]).to_list(1)
     mx = docs[0].get("mx") if docs else None
@@ -303,7 +343,11 @@ async def get_daily_summaries(
     daily_import_id: str = "",
     limit: int = 365,
 ) -> list:
-    """Aggregate transactions by calendar day, returning one summary dict per day.
+    """Aggregate transactions by register day, returning one summary dict per day.
+
+    Grouping uses ``import_primary_date`` when set (daily-import register day),
+    otherwise Excel ``date``. Prior-day Excel rows inside an upload therefore
+    stay on that upload's day transaction instead of spawning a separate TXN-*.
 
     Each dict has: date (date), entries_count (int), total_tzs (float), total_refund (float).
     Filters narrow which *entries* are counted before the group-by, so a truck
@@ -314,23 +358,34 @@ async def get_daily_summaries(
     """
     db = get_db()
     desc_filter = descriptions if descriptions not in ("", None, []) else sub_item_match
+    uid = (daily_import_id or "").strip()
+    # Date window is applied via register-day clause below (not Excel date alone).
     match = _browse_match(
-        date_from=date_from,
-        date_to=date_to,
+        date_from=date_from if uid else None,
+        date_to=date_to if uid else None,
         keyword=keyword,
         truck=truck,
         category_name=category_name,
         descriptions=desc_filter,
         daily_import_id=daily_import_id,
     )
+    if not uid and (date_from or date_to):
+        range_clause = _register_day_range_clause(date_from, date_to)
+        if range_clause:
+            if "$and" in match:
+                match["$and"] = [range_clause, *match["$and"]]
+            elif match:
+                match = {"$and": [range_clause, match]}
+            else:
+                match = range_clause
 
     pipeline = [
         {"$match": match},
         {"$group": {
             "_id": {
-                "year":  {"$year":  "$date"},
-                "month": {"$month": "$date"},
-                "day":   {"$dayOfMonth": "$date"},
+                "year":  {"$year":  _REGISTER_DAY_EXPR},
+                "month": {"$month": _REGISTER_DAY_EXPR},
+                "day":   {"$dayOfMonth": _REGISTER_DAY_EXPR},
             },
             "entries_count": {"$sum": 1},
             "total_tzs":     {"$sum": "$amount"},
