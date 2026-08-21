@@ -2181,6 +2181,241 @@ async def get_master_totals(
     return {"tzs": 0.0, "usd": 0.0}
 
 
+async def get_category_lifetime_usage(category: str) -> dict:
+    """Verified master usage for one item across all years (no FY window).
+
+    Returns ``{"count": int, "tzs": float, "usd": float}``.
+    """
+    return await get_category_report_totals(category)
+
+
+def _category_report_query(
+    category: str,
+    *,
+    description: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Verified / not-trashed rows for one item; optional description + date range."""
+    name = (category or "").strip()
+    query: dict = {
+        "verified": True,
+        "deletion_requested": {"$ne": True},
+        "trashed": {"$ne": True},
+        "category_name": {
+            "$regex": f"^{re.escape(name)}$",
+            "$options": "i",
+        },
+    }
+    and_clauses: list = []
+    if description.strip():
+        and_clauses.append({
+            "description": {
+                "$regex": re.escape(description.strip()),
+                "$options": "i",
+            },
+        })
+    if date_from is not None or date_to is not None:
+        date_clause: dict = {}
+        if date_from is not None:
+            date_clause["$gte"] = date_from.replace(
+                hour=0, minute=0, second=0, microsecond=0,
+            )
+        if date_to is not None:
+            date_clause["$lte"] = date_to.replace(
+                hour=23, minute=59, second=59, microsecond=0,
+            )
+        and_clauses.append({"date": date_clause})
+    if and_clauses:
+        query = {**query, "$and": and_clauses}
+    return query
+
+
+async def get_category_report_totals(
+    category: str,
+    *,
+    description: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Aggregate count / TZS / USD for an item report (all years by default)."""
+    name = (category or "").strip()
+    if not name:
+        return {"count": 0, "tzs": 0.0, "usd": 0.0}
+
+    db = get_db()
+    query = _category_report_query(
+        name, description=description, date_from=date_from, date_to=date_to,
+    )
+    result = await db.transactions.aggregate([
+        {"$match": query},
+        {"$group": {
+            "_id": None,
+            "count": {"$sum": 1},
+            "tzs_total": {"$sum": {"$cond": [
+                {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]},
+                "$amount",
+                0,
+            ]}},
+            "usd_total": {"$sum": {"$cond": [
+                {"$eq": [{"$toUpper": "$currency"}, "USD"]},
+                "$amount",
+                0,
+            ]}},
+        }},
+    ]).to_list(1)
+    if not result:
+        return {"count": 0, "tzs": 0.0, "usd": 0.0}
+    row = result[0]
+    return {
+        "count": int(row.get("count") or 0),
+        "tzs": float(row.get("tzs_total") or 0.0),
+        "usd": float(row.get("usd_total") or 0.0),
+    }
+
+
+async def get_categories_usage_totals(
+    category_names: Sequence[str],
+) -> Dict[str, dict]:
+    """Lifetime totals for many items (Manage Items Amount column).
+
+    Keys are lower-cased category names. Values: ``{count, tzs, usd}``.
+    """
+    names = sorted({(n or "").strip() for n in category_names if (n or "").strip()})
+    if not names:
+        return {}
+
+    db = get_db()
+    # Case-insensitive match via lowercasing both sides.
+    lowered = [n.lower() for n in names]
+    result = await db.transactions.aggregate([
+        {"$match": {
+            "verified": True,
+            "deletion_requested": {"$ne": True},
+            "trashed": {"$ne": True},
+            "category_name": {"$type": "string", "$ne": ""},
+        }},
+        {"$addFields": {"_cat_l": {"$toLower": {"$ifNull": ["$category_name", ""]}}}},
+        {"$match": {"_cat_l": {"$in": lowered}}},
+        {"$group": {
+            "_id": "$_cat_l",
+            "count": {"$sum": 1},
+            "tzs_total": {"$sum": {"$cond": [
+                {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]},
+                "$amount",
+                0,
+            ]}},
+            "usd_total": {"$sum": {"$cond": [
+                {"$eq": [{"$toUpper": "$currency"}, "USD"]},
+                "$amount",
+                0,
+            ]}},
+        }},
+    ]).to_list(length=None)
+
+    out: Dict[str, dict] = {}
+    for row in result:
+        key = (row.get("_id") or "").strip().lower()
+        if not key:
+            continue
+        out[key] = {
+            "count": int(row.get("count") or 0),
+            "tzs": float(row.get("tzs_total") or 0.0),
+            "usd": float(row.get("usd_total") or 0.0),
+        }
+    return out
+
+
+async def get_category_report_transactions(
+    category: str,
+    *,
+    description: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    sort_field: str = "date",
+    sort_asc: bool = True,
+    limit: int = 100,
+    skip: int = 0,
+) -> List[Transaction]:
+    """Paginated verified master rows for an item QuickReport (all years by default)."""
+    name = (category or "").strip()
+    if not name:
+        return []
+    db = get_db()
+    query = _category_report_query(
+        name, description=description, date_from=date_from, date_to=date_to,
+    )
+    field, direction = _category_report_sort(sort_field, sort_asc)
+    cursor = (
+        db.transactions.find(query)
+        .sort([(field, direction), ("created_at", direction)])
+        .skip(skip)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    return [Transaction.from_doc(d) for d in docs]
+
+
+def _category_report_sort(
+    sort_field: str = "date",
+    sort_asc: bool = True,
+) -> tuple[str, int]:
+    field = sort_field if sort_field in {
+        "date", "description", "truck_number", "memo", "amount",
+        "category_name", "item", "approver", "ownership", "ref_float",
+    } else "date"
+    return field, (1 if sort_asc else -1)
+
+
+async def get_category_report_opening_balance(
+    category: str,
+    *,
+    description: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    sort_field: str = "date",
+    sort_asc: bool = True,
+    skip: int = 0,
+) -> dict:
+    """TZS/USD sum of rows *before* the current page (for running Balance)."""
+    if skip <= 0:
+        return {"tzs": 0.0, "usd": 0.0}
+    name = (category or "").strip()
+    if not name:
+        return {"tzs": 0.0, "usd": 0.0}
+
+    db = get_db()
+    query = _category_report_query(
+        name, description=description, date_from=date_from, date_to=date_to,
+    )
+    field, direction = _category_report_sort(sort_field, sort_asc)
+    result = await db.transactions.aggregate([
+        {"$match": query},
+        {"$sort": {field: direction, "created_at": direction}},
+        {"$limit": int(skip)},
+        {"$group": {
+            "_id": None,
+            "tzs_total": {"$sum": {"$cond": [
+                {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]},
+                "$amount",
+                0,
+            ]}},
+            "usd_total": {"$sum": {"$cond": [
+                {"$eq": [{"$toUpper": "$currency"}, "USD"]},
+                "$amount",
+                0,
+            ]}},
+        }},
+    ]).to_list(1)
+    if not result:
+        return {"tzs": 0.0, "usd": 0.0}
+    row = result[0]
+    return {
+        "tzs": float(row.get("tzs_total") or 0.0),
+        "usd": float(row.get("usd_total") or 0.0),
+    }
+
+
 async def get_master_column_values(
     field: str,
     *,

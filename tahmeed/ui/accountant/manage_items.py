@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QLineEdit, QPushButton, QMessageBox, QAbstractItemView,
-    QDialog, QFormLayout,
+    QDialog, QFormLayout, QMenu, QWidgetAction,
     QSplitter, QStackedWidget, QSizePolicy,
     QFileDialog,
 )
@@ -42,6 +42,7 @@ from tahmeed.services.settings_service import get_setting, set_setting
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.dialogs.item_dialog import ItemDialog as _ItemDialog
+from tahmeed.ui.accountant.item_quick_report import ItemQuickReportView
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 
@@ -615,15 +616,18 @@ class ManageItemsWidget(QWidget):
     # Items table columns
     _ITEM_COLS = [
         ("",            44,  False, "center"),   # colour dot
-        ("Name",       300,  False, "left"),
+        ("Name",       260,  False, "left"),
         ("Description", 140, False, "left"),
         ("Sidebar",      96, False, "center"),
         ("Req. Receipt", 96, False, "center"),
         ("Req. Truck",   90, False, "center"),
         ("Status",        88, False, "center"),
-        ("Actions",      196, False, "center"),
+        ("Amount",      120, False, "right"),
+        ("Actions",       56, False, "center"),
     ]
-    _ITEM_COL_DEFAULTS = [44, 300, 140, 96, 96, 90, 88, 196]
+    _ITEM_COL_DEFAULTS = [44, 260, 140, 96, 96, 90, 88, 120, 56]
+    _COL_AMOUNT = 7
+    _COL_ACTIONS = 8
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -634,10 +638,13 @@ class ManageItemsWidget(QWidget):
         self._page = 0
         self._total = 0
         self._loading = False
+        self._scroll_loading = False
+        self._usage_by_name: dict = {}
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(350)
         self._search_debounce.timeout.connect(self._on_search_commit)
+        self._report_item: Optional[Category] = None
         self._build()
 
     # ── Build ──────────────────────────────────────────────────────────────────
@@ -648,10 +655,23 @@ class ManageItemsWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._build_title_bar())
-        root.addWidget(self._build_filter_bar())
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_catalog_page())   # 0 — items list
+        self._stack.addWidget(self._build_report_shell())   # 1 — item QuickReport
+        root.addWidget(self._stack, 1)
 
-        # ── Body: splitter ────────────────────────────────────────────────────
+        self._loading_overlay = LoadingOverlay(self, "Loading items…")
+
+    def _build_catalog_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet(f"background: {_BG};")
+        vl = QVBoxLayout(page)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
+
+        vl.addWidget(self._build_title_bar())
+        vl.addWidget(self._build_filter_bar())
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(5)
@@ -668,9 +688,111 @@ class ManageItemsWidget(QWidget):
         splitter.addWidget(self._sub_panel)
 
         splitter.setSizes([600, 340])
-        root.addWidget(splitter, 1)
+        vl.addWidget(splitter, 1)
+        return page
 
-        self._loading_overlay = LoadingOverlay(self, "Loading items…")
+    def _build_report_shell(self) -> QWidget:
+        """In-page Account QuickReport shell (table + filters land in later phases)."""
+        page = QWidget()
+        page.setStyleSheet(f"background: {_BG};")
+        vl = QVBoxLayout(page)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
+
+        nav = QFrame()
+        nav.setFixedHeight(52)
+        nav.setStyleSheet(
+            f"QFrame {{ background: {_WHITE}; border-bottom: 1px solid {_BORDER}; }}"
+        )
+        nl = QHBoxLayout(nav)
+        nl.setContentsMargins(16, 0, 16, 0)
+        nl.setSpacing(12)
+
+        back_btn = QPushButton("← Items")
+        back_btn.setFixedHeight(30)
+        back_btn.setCursor(Qt.PointingHandCursor)
+        back_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T1};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            f"QPushButton:hover {{ background: {_BG}; }}"
+        )
+        back_btn.clicked.connect(self._close_item_report)
+        nl.addWidget(back_btn)
+
+        self._report_nav_lbl = _lbl("", size=13, weight=600, color=_NAVY)
+        nl.addWidget(self._report_nav_lbl)
+        nl.addStretch()
+        vl.addWidget(nav)
+
+        body = QFrame()
+        body.setStyleSheet(
+            f"QFrame {{ background: {_WHITE}; border: none; }}"
+        )
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(24, 20, 24, 16)
+        bl.setSpacing(4)
+
+        meta_row = QHBoxLayout()
+        meta_row.setContentsMargins(0, 0, 0, 0)
+        self._report_meta_lbl = QLabel("")
+        self._report_meta_lbl.setStyleSheet(
+            f"color: {_T2}; font-size: 11px;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        meta_row.addWidget(self._report_meta_lbl)
+        meta_row.addStretch()
+        bl.addLayout(meta_row)
+
+        self._report_company_lbl = QLabel("TAHMEED COACH TZ LTD")
+        self._report_company_lbl.setAlignment(Qt.AlignCenter)
+        self._report_company_lbl.setStyleSheet(
+            f"color: {_T1}; font-size: 15px; font-weight: 700;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        bl.addWidget(self._report_company_lbl)
+
+        self._report_kind_lbl = QLabel("Account QuickReport")
+        self._report_kind_lbl.setAlignment(Qt.AlignCenter)
+        self._report_kind_lbl.setStyleSheet(
+            f"color: {_T1}; font-size: 13px; font-weight: 600;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        bl.addWidget(self._report_kind_lbl)
+
+        self._report_scope_lbl = QLabel("All Transactions")
+        self._report_scope_lbl.setAlignment(Qt.AlignCenter)
+        self._report_scope_lbl.setStyleSheet(
+            f"color: {_T2}; font-size: 12px;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        bl.addWidget(self._report_scope_lbl)
+
+        self._report_item_lbl = QLabel("")
+        self._report_item_lbl.setAlignment(Qt.AlignCenter)
+        self._report_item_lbl.setStyleSheet(
+            f"color: {_NAVY}; font-size: 14px; font-weight: 700;"
+            " font-family:'Segoe UI'; background: transparent;"
+            " margin-top: 8px;"
+        )
+        bl.addWidget(self._report_item_lbl)
+
+        self._report_content = QFrame()
+        self._report_content.setObjectName("itemReportContent")
+        self._report_content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._report_content.setStyleSheet(
+            f"#itemReportContent {{ background: {_WHITE}; border: none; }}"
+        )
+        cl = QVBoxLayout(self._report_content)
+        cl.setContentsMargins(0, 16, 0, 0)
+        cl.setSpacing(0)
+        self._report_table = ItemQuickReportView()
+        self._report_table.header_context_changed.connect(self._on_report_header_context)
+        cl.addWidget(self._report_table, 1)
+        bl.addWidget(self._report_content, 1)
+
+        vl.addWidget(body, 1)
+        return page
 
     def _build_title_bar(self) -> QFrame:
         bar = QFrame()
@@ -874,57 +996,63 @@ class ManageItemsWidget(QWidget):
         )
 
         self._table.selectionModel().currentRowChanged.connect(self._on_row_changed)
+        self._table.cellDoubleClicked.connect(self._on_item_double_clicked)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
         vl.addWidget(self._table, 1)
 
-        # Pagination (100 items per page; search hits the full collection)
-        pager = QFrame()
-        pager.setFixedHeight(44)
-        pager.setStyleSheet(
+        footer = QFrame()
+        footer.setFixedHeight(40)
+        footer.setStyleSheet(
             f"QFrame {{ background: {_WHITE}; border-top: 1px solid {_BORDER}; }}"
         )
-        pl = QHBoxLayout(pager)
+        pl = QHBoxLayout(footer)
         pl.setContentsMargins(12, 0, 12, 0)
-        pl.setSpacing(10)
-
         self._page_info = _lbl("—", size=12, color=_T2)
         pl.addWidget(self._page_info)
         pl.addStretch()
-
-        self._prev_btn = QPushButton("← Prev")
-        self._prev_btn.setFixedSize(88, 30)
-        self._prev_btn.setCursor(Qt.PointingHandCursor)
-        self._prev_btn.setStyleSheet(
-            f"QPushButton {{ background: {_WHITE}; color: {_T1};"
-            f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; }}"
-            f"QPushButton:hover {{ background: {_BG}; }}"
-            f"QPushButton:disabled {{ color: {_TM}; }}"
-        )
-        self._prev_btn.clicked.connect(self._on_prev_page)
-        pl.addWidget(self._prev_btn)
-
-        self._next_btn = QPushButton("Next →")
-        self._next_btn.setFixedSize(88, 30)
-        self._next_btn.setCursor(Qt.PointingHandCursor)
-        self._next_btn.setStyleSheet(
-            f"QPushButton {{ background: {_WHITE}; color: {_T1};"
-            f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; }}"
-            f"QPushButton:hover {{ background: {_BG}; }}"
-            f"QPushButton:disabled {{ color: {_TM}; }}"
-        )
-        self._next_btn.clicked.connect(self._on_next_page)
-        pl.addWidget(self._next_btn)
-
-        vl.addWidget(pager)
+        vl.addWidget(footer)
         return w
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._load())
+        self._page = 0
+        asyncio.ensure_future(self._load_initial())
         asyncio.ensure_future(self._load_cashier_settings())
+
+    # ── Item QuickReport navigation ────────────────────────────────────────────
+
+    def _on_item_double_clicked(self, row: int, col: int) -> None:
+        if col == self._COL_ACTIONS:
+            return  # Actions ⋯ — use the menu, don't open the report
+        if row < 0 or row >= len(self._visible):
+            return
+        self._open_item_report(self._visible[row])
+
+    def _open_item_report(self, item: Category) -> None:
+        from datetime import date as _date, datetime as _dt
+
+        self._report_item = item
+        self._selected_id = item._id
+        self._report_nav_lbl.setText(f"Account QuickReport  ·  {item.name}")
+        self._report_item_lbl.setText(item.name)
+        now = _dt.now()
+        self._report_meta_lbl.setText(
+            f"{now.strftime('%I:%M %p').lstrip('0')}  {now.strftime('%d-%m-%y')}"
+        )
+        self._on_report_header_context(str(_date.today().year), "All Transactions")
+        self._stack.setCurrentIndex(1)
+        self._report_table.load(item.name)
+
+    def _on_report_header_context(self, year_label: str, scope_label: str) -> None:
+        self._report_company_lbl.setText(f"TAHMEED COACH TZ LTD - {year_label}")
+        self._report_scope_lbl.setText(scope_label)
+
+    def _close_item_report(self) -> None:
+        self._report_item = None
+        self._report_table.clear()
+        self._stack.setCurrentIndex(0)
 
     # ── Data ───────────────────────────────────────────────────────────────────
 
@@ -933,73 +1061,121 @@ class ManageItemsWidget(QWidget):
 
     def _on_search_commit(self) -> None:
         self._page = 0
-        asyncio.ensure_future(self._load())
+        asyncio.ensure_future(self._load_initial())
 
-    def _on_prev_page(self) -> None:
-        if self._page > 0:
-            self._page -= 1
-            asyncio.ensure_future(self._load())
+    def _on_scroll(self, _value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if bar.value() >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
-    def _on_next_page(self) -> None:
-        max_pg = max(0, (self._total - 1) // _PAGE_SIZE) if self._total else 0
-        if self._page < max_pg:
-            self._page += 1
-            asyncio.ensure_future(self._load())
+    def _fill_if_needed(self) -> None:
+        bar = self._table.verticalScrollBar()
+        if (
+            not self._loading
+            and not self._scroll_loading
+            and len(self._visible) < self._total
+            and bar.maximum() <= 0
+        ):
+            asyncio.ensure_future(self._load_more())
 
-    def _update_pager(self) -> None:
+    def _update_scroll_footer(self) -> None:
+        loaded = len(self._visible)
         total = self._total
-        size = _PAGE_SIZE
-        page = self._page
-        max_pg = max(0, (total - 1) // size) if total else 0
-        start = page * size + 1 if total else 0
-        end = min((page + 1) * size, total)
-        self._page_info.setText(
-            f"Showing {start:,}–{end:,} of {total:,}  ·  Page {page + 1} of {max_pg + 1}"
+        if self._loading or self._scroll_loading:
+            suffix = "  ·  Loading…"
+        elif loaded >= total and total:
+            suffix = ""
+        elif total:
+            suffix = "  ·  Scroll for more"
+        else:
+            suffix = ""
+        self._page_info.setText(f"Showing {loaded:,} of {total:,}{suffix}")
+        self._count_lbl.setText(
+            f"{total:,} item{'s' if total != 1 else ''}"
+            + (f"  ·  {loaded} loaded" if total > loaded else "")
         )
-        self._prev_btn.setEnabled(page > 0)
-        self._next_btn.setEnabled(page < max_pg)
 
-    async def _load(self) -> None:
+    async def _load_initial(self) -> None:
         if self._loading:
             return
         self._loading = True
+        self._page = 0
         self._loading_overlay.show_loading("Loading items…")
         try:
             search = self._search.text().strip()
-            skip = self._page * _PAGE_SIZE
             items, total = await asyncio.gather(
                 list_categories(
                     search=search,
                     include_inactive=self._show_inactive,
                     limit=_PAGE_SIZE,
-                    skip=skip,
+                    skip=0,
                 ),
                 count_categories(
                     search=search,
                     include_inactive=self._show_inactive,
                 ),
             )
-            # If the current page is past the end (e.g. after delete), snap back.
-            max_pg = max(0, (total - 1) // _PAGE_SIZE) if total else 0
-            if self._page > max_pg:
-                self._page = max_pg
-                skip = self._page * _PAGE_SIZE
-                items = await list_categories(
-                    search=search,
-                    include_inactive=self._show_inactive,
-                    limit=_PAGE_SIZE,
-                    skip=skip,
-                )
-            self._items = items
-            self._visible = items
+            self._items = list(items)
+            self._visible = list(items)
             self._total = total
-            self._populate()
-            self._update_pager()
+            self._usage_by_name = {}
+            await self._fetch_usage_for(items)
+            self._populate(reset=True)
+            self._update_scroll_footer()
+            self._fill_if_needed()
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load items:\n{exc}")
         finally:
             self._loading = False
             self._loading_overlay.hide_loading()
+            self._update_scroll_footer()
+
+    async def _load_more(self) -> None:
+        if self._scroll_loading or self._loading:
+            return
+        if len(self._visible) >= self._total:
+            return
+        self._scroll_loading = True
+        self._update_scroll_footer()
+        try:
+            search = self._search.text().strip()
+            skip = len(self._visible)
+            items = await list_categories(
+                search=search,
+                include_inactive=self._show_inactive,
+                limit=_PAGE_SIZE,
+                skip=skip,
+            )
+            if not items:
+                return
+            self._items.extend(items)
+            self._visible.extend(items)
+            await self._fetch_usage_for(items)
+            self._populate(reset=False, new_items=items, start_row=skip)
+            self._fill_if_needed()
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to load more items:\n{exc}")
+        finally:
+            self._scroll_loading = False
+            self._update_scroll_footer()
+
+    async def _fetch_usage_for(self, items: List[Category]) -> None:
+        names = [it.name for it in items if it.name]
+        if not names:
+            return
+        try:
+            from tahmeed.services.accountant_service import get_categories_usage_totals
+
+            usage = await get_categories_usage_totals(names)
+            self._usage_by_name.update(usage)
+        except Exception:
+            pass
+
+    async def _load(self) -> None:
+        """Compatibility wrapper — full refresh from the top."""
+        await self._load_initial()
 
     # ── Cashier register settings ────────────────────────────────────────────────
 
@@ -1048,95 +1224,117 @@ class ManageItemsWidget(QWidget):
 
     # ── Restrict-items global toggle (legacy section header) ─────────────────────
 
-    def _populate(self) -> None:
-        total = self._total
-        shown = len(self._visible)
-        self._count_lbl.setText(
-            f"{total:,} item{'s' if total != 1 else ''}"
-            + (f"  ·  {shown} on this page" if total > shown else "")
-        )
-
-        # Block selection signals while rebuilding rows
-        self._table.selectionModel().blockSignals(True)
-        self._table.setRowCount(len(self._visible))
-
-        restore_row = None
-        for i, item in enumerate(self._visible):
-            if self._selected_id and item._id == self._selected_id:
-                restore_row = i
-
-            row_bg = _STRIPE if i % 2 else _WHITE
-
-            # Col 0: colour dot
-            dot_w = QWidget()
-            dot_w.setStyleSheet(f"background: {row_bg};")
-            dl = QHBoxLayout(dot_w)
-            dl.setContentsMargins(0, 0, 0, 0)
-            dl.setAlignment(Qt.AlignCenter)
-            dot = QLabel()
-            dot.setFixedSize(14, 14)
-            dot.setStyleSheet(
-                f"background: {item.color}; border-radius: 7px;"
-                " border: 1px solid rgba(0,0,0,0.1);"
-            )
-            dl.addWidget(dot)
-            self._table.setCellWidget(i, 0, dot_w)
-
-            # Col 1: name
-            name_it = QTableWidgetItem(item.name)
-            name_it.setBackground(QBrush(QColor(row_bg)))
-            name_it.setForeground(QBrush(QColor(_T1 if item.active else _TM)))
-            name_it.setFont(_item_table_font(italic=not item.active))
-            name_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self._table.setItem(i, 1, name_it)
-
-            # Col 2: description hint
-            desc_text = item.description or ""
-            desc_it = QTableWidgetItem(desc_text if desc_text else "—")
-            desc_it.setBackground(QBrush(QColor(row_bg)))
-            desc_it.setForeground(QBrush(QColor(_T2 if desc_text else _TM)))
-            desc_it.setFont(_item_table_font())
-            desc_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self._table.setItem(i, 2, desc_it)
-
-            # Col 3: sidebar tab indicator (icon + On / —)
-            if item.show_in_sidebar:
-                self._table.setCellWidget(i, 3, self._sidebar_cell(item, row_bg))
+    def _populate(
+        self,
+        *,
+        reset: bool = True,
+        new_items: Optional[List[Category]] = None,
+        start_row: int = 0,
+    ) -> None:
+        if reset:
+            items = self._visible
+            self._table.selectionModel().blockSignals(True)
+            self._table.setRowCount(len(items))
+            restore_row = None
+            for i, item in enumerate(items):
+                if self._selected_id and item._id == self._selected_id:
+                    restore_row = i
+                self._fill_item_row(i, item)
+            self._table.selectionModel().blockSignals(False)
+            self._repaint_row_widgets()
+            if restore_row is not None:
+                self._table.selectRow(restore_row)
             else:
-                self._table.removeCellWidget(i, 3)
-                self._table.setItem(i, 3, _status_item("—", _TM, row_bg, bold=False))
+                self._selected_id = None
+                self._sub_panel.clear()
+            self._update_scroll_footer()
+            return
 
-            # Col 4: req receipt
-            self._table.setItem(i, 4, _status_item(
-                "Yes" if item.requires_receipt else "No",
-                _GREEN if item.requires_receipt else _TM, row_bg,
-            ))
-
-            # Col 5: req truck
-            self._table.setItem(i, 5, _status_item(
-                "Yes" if item.requires_truck else "No",
-                _GREEN if item.requires_truck else _TM, row_bg,
-            ))
-
-            # Col 6: status
-            self._table.setItem(i, 6, _status_item(
-                "Active" if item.active else "Inactive",
-                _GREEN if item.active else _RED, row_bg,
-            ))
-
-            # Col 7: action buttons
-            self._table.setCellWidget(i, 7, self._action_btns(item, row_bg))
-            self._table.setRowHeight(i, _ROW_H)
-
+        batch = new_items or []
+        self._table.selectionModel().blockSignals(True)
+        for offset, item in enumerate(batch):
+            r = start_row + offset
+            if r >= self._table.rowCount():
+                self._table.insertRow(r)
+            self._fill_item_row(r, item)
         self._table.selectionModel().blockSignals(False)
         self._repaint_row_widgets()
+        self._update_scroll_footer()
 
-        # Restore previous selection
-        if restore_row is not None:
-            self._table.selectRow(restore_row)
+    def _fill_item_row(self, i: int, item: Category) -> None:
+        row_bg = _STRIPE if i % 2 else _WHITE
+
+        # Col 0: colour dot
+        dot_w = QWidget()
+        dot_w.setStyleSheet(f"background: {row_bg};")
+        dl = QHBoxLayout(dot_w)
+        dl.setContentsMargins(0, 0, 0, 0)
+        dl.setAlignment(Qt.AlignCenter)
+        dot = QLabel()
+        dot.setFixedSize(14, 14)
+        dot.setStyleSheet(
+            f"background: {item.color}; border-radius: 7px;"
+            " border: 1px solid rgba(0,0,0,0.1);"
+        )
+        dl.addWidget(dot)
+        self._table.setCellWidget(i, 0, dot_w)
+
+        # Col 1: name
+        name_it = QTableWidgetItem(item.name)
+        name_it.setBackground(QBrush(QColor(row_bg)))
+        name_it.setForeground(QBrush(QColor(_T1 if item.active else _TM)))
+        name_it.setFont(_item_table_font(italic=not item.active))
+        name_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self._table.setItem(i, 1, name_it)
+
+        # Col 2: description hint
+        desc_text = item.description or ""
+        desc_it = QTableWidgetItem(desc_text if desc_text else "—")
+        desc_it.setBackground(QBrush(QColor(row_bg)))
+        desc_it.setForeground(QBrush(QColor(_T2 if desc_text else _TM)))
+        desc_it.setFont(_item_table_font())
+        desc_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self._table.setItem(i, 2, desc_it)
+
+        # Col 3: sidebar tab indicator
+        if item.show_in_sidebar:
+            self._table.setCellWidget(i, 3, self._sidebar_cell(item, row_bg))
         else:
-            self._selected_id = None
-            self._sub_panel.clear()
+            self._table.removeCellWidget(i, 3)
+            self._table.setItem(i, 3, _status_item("—", _TM, row_bg, bold=False))
+
+        # Col 4: req receipt
+        self._table.setItem(i, 4, _status_item(
+            "Yes" if item.requires_receipt else "No",
+            _GREEN if item.requires_receipt else _TM, row_bg,
+        ))
+
+        # Col 5: req truck
+        self._table.setItem(i, 5, _status_item(
+            "Yes" if item.requires_truck else "No",
+            _GREEN if item.requires_truck else _TM, row_bg,
+        ))
+
+        # Col 6: status
+        self._table.setItem(i, 6, _status_item(
+            "Active" if item.active else "Inactive",
+            _GREEN if item.active else _RED, row_bg,
+        ))
+
+        # Col 7: amount used (lifetime, always positive, black)
+        usage = self._usage_by_name.get((item.name or "").strip().lower(), {})
+        tzs_used = abs(float(usage.get("tzs") or 0.0))
+        amt_it = QTableWidgetItem(f"{tzs_used:,.0f}" if tzs_used else "—")
+        amt_it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        amt_it.setBackground(QBrush(QColor(row_bg)))
+        amt_it.setForeground(QBrush(QColor(_T1 if tzs_used else _TM)))
+        amt_it.setFont(_item_table_font())
+        amt_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self._table.setItem(i, self._COL_AMOUNT, amt_it)
+
+        # Col 8: actions
+        self._table.setCellWidget(i, self._COL_ACTIONS, self._action_btns(item, row_bg))
+        self._table.setRowHeight(i, _ROW_H)
 
     # ── Row selection → sub-items panel ───────────────────────────────────────
 
@@ -1341,45 +1539,119 @@ class ManageItemsWidget(QWidget):
                 if w is not None:
                     w.setStyleSheet(f"background: {bg};")
 
-    # ── Action buttons cell ────────────────────────────────────────────────────
+    # ── Actions cell (⋯ menu) ─────────────────────────────────────────────────
 
     def _action_btns(self, item: Category, row_bg: str) -> QWidget:
         container = QWidget()
         container.setStyleSheet(f"background: {row_bg};")
         hl = QHBoxLayout(container)
-        hl.setContentsMargins(8, 4, 8, 4)
-        hl.setSpacing(5)
+        hl.setContentsMargins(4, 4, 4, 4)
+        hl.setSpacing(0)
+        hl.setAlignment(Qt.AlignCenter)
 
-        edit_btn = QPushButton("Edit")
-        edit_btn.setFixedHeight(24)
-        edit_btn.setCursor(Qt.PointingHandCursor)
-        edit_btn.setStyleSheet(
-            f"QPushButton {{ background: {_WHITE}; color: {_BLUE};"
-            f" border: 1px solid {_BLUE}; border-radius: 4px;"
-            " font-size: 11px; font-weight: 400;"
-            " font-family:'Segoe UI'; padding: 0 10px; }}"
-            f"QPushButton:hover {{ background: #EFF6FF; }}"
-        )
-        edit_btn.clicked.connect(lambda _, it=item: self._on_edit(it))
-        hl.addWidget(edit_btn)
-
-        toggle_lbl = "Activate" if not item.active else "Deactivate"
-        toggle_btn = QPushButton(toggle_lbl)
-        toggle_btn.setFixedHeight(24)
-        toggle_btn.setCursor(Qt.PointingHandCursor)
-        toggle_btn.setStyleSheet(
-            f"QPushButton {{ background: {_WHITE}; color: {_T2};"
-            f" border: 1px solid {_BORDER}; border-radius: 4px;"
-            " font-size: 11px;"
-            " font-family:'Segoe UI'; padding: 0 10px; }}"
-            f"QPushButton:hover {{ background: {_BG}; }}"
-        )
-        toggle_btn.clicked.connect(lambda _, it=item: self._on_toggle(it))
-        hl.addWidget(toggle_btn)
-
-        del_btn = _icon_btn("mdi.trash-can-outline", "Delete item permanently", _RED, _RED_L)
-        del_btn.clicked.connect(lambda _, it=item: self._on_delete(it))
-        hl.addWidget(del_btn)
-
-        hl.addStretch()
+        menu_btn = _icon_btn("mdi.dots-vertical", "Item actions", _T2, _BG)
+        menu_btn.clicked.connect(lambda _, it=item, b=menu_btn: self._open_item_menu(it, b))
+        hl.addWidget(menu_btn)
         return container
+
+    def _open_item_menu(self, item: Category, anchor: QWidget) -> None:
+        asyncio.ensure_future(self._open_item_menu_async(item, anchor))
+
+    async def _open_item_menu_async(self, item: Category, anchor: QWidget) -> None:
+        from tahmeed.services.accountant_service import get_category_lifetime_usage
+
+        try:
+            usage = await get_category_lifetime_usage(item.name)
+        except Exception:
+            usage = {"count": 0, "tzs": 0.0, "usd": 0.0}
+
+        if not anchor.isVisible():
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background: {_WHITE}; border: 1px solid {_BORDER};"
+            " padding: 4px; border-radius: 6px; }}"
+            f"QMenu::item {{ padding: 6px 20px; border-radius: 4px;"
+            f" color: {_T1}; font-size: 12px; font-family:'Segoe UI'; }}"
+            f"QMenu::item:selected {{ background: {_BLUE_L}; }}"
+            f"QMenu::separator {{ height: 1px; background: {_BORDER}; margin: 4px 8px; }}"
+        )
+
+        usage_act = QWidgetAction(menu)
+        usage_act.setDefaultWidget(self._usage_summary_widget(item.name, usage))
+        menu.addAction(usage_act)
+        menu.addSeparator()
+
+        edit_act = menu.addAction(qta.icon("mdi.pencil-outline", color=_BLUE), "Edit")
+        toggle_lbl = "Activate" if not item.active else "Deactivate"
+        toggle_icon = "mdi.check-circle-outline" if not item.active else "mdi.pause-circle-outline"
+        toggle_act = menu.addAction(qta.icon(toggle_icon, color=_T2), toggle_lbl)
+        menu.addSeparator()
+        delete_act = menu.addAction(
+            qta.icon("mdi.trash-can-outline", color=_RED), "Delete"
+        )
+
+        chosen = menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+        if chosen == edit_act:
+            self._on_edit(item)
+        elif chosen == toggle_act:
+            self._on_toggle(item)
+        elif chosen == delete_act:
+            self._on_delete(item)
+
+    def _usage_summary_widget(self, item_name: str, usage: dict) -> QWidget:
+        """Compact lifetime usage block shown at the top of the ⋯ menu."""
+        count = int(usage.get("count") or 0)
+        tzs = abs(float(usage.get("tzs") or 0.0))
+        usd = abs(float(usage.get("usd") or 0.0))
+
+        wrap = QFrame()
+        wrap.setFixedWidth(220)
+        wrap.setStyleSheet(
+            f"QFrame {{ background: {_BG}; border: none; border-radius: 4px; }}"
+        )
+        vl = QVBoxLayout(wrap)
+        vl.setContentsMargins(12, 10, 12, 10)
+        vl.setSpacing(2)
+
+        title = QLabel("Total used (all years)")
+        title.setStyleSheet(
+            f"color: {_T2}; font-size: 10px; font-weight: 600;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        vl.addWidget(title)
+
+        name_lbl = QLabel(item_name)
+        name_lbl.setWordWrap(True)
+        name_lbl.setStyleSheet(
+            f"color: {_NAVY}; font-size: 12px; font-weight: 600;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        vl.addWidget(name_lbl)
+
+        count_lbl = QLabel(f"{count:,} entries")
+        count_lbl.setStyleSheet(
+            f"color: {_T2}; font-size: 11px;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        vl.addWidget(count_lbl)
+
+        tzs_lbl = QLabel(f"TZS  {tzs:,.0f}")
+        tzs_lbl.setStyleSheet(
+            f"color: {_T1}; font-size: 13px; font-weight: 700;"
+            " font-family:'Cascadia Code','Consolas',monospace;"
+            " background: transparent; margin-top: 4px;"
+        )
+        vl.addWidget(tzs_lbl)
+
+        if usd:
+            usd_lbl = QLabel(f"USD  ${usd:,.2f}")
+            usd_lbl.setStyleSheet(
+                f"color: {_T1}; font-size: 12px; font-weight: 600;"
+                " font-family:'Cascadia Code','Consolas',monospace;"
+                " background: transparent;"
+            )
+            vl.addWidget(usd_lbl)
+
+        return wrap
