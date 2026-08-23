@@ -75,6 +75,8 @@ from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_completion
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
+from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
+from tahmeed.services.duplicate_review import DuplicateReviewItem, format_amount_label
 
 # ---------------------------------------------------------------------------
 # Column indices / colors / delegates (shared with RejectedView)
@@ -86,7 +88,7 @@ from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
     HEADERS, CHECK_COLS, READONLY_COLS, _DATA_SKIP_COLS, _UPPER_SKIP_COLS,
     DEFAULT_EDITABLE_ROWS, _REF_FLOAT_OPTS, _COL_PREFERRED, _COL_FLEX, _COL_MIN,
     _is_refund_float, _ref_float_text, _parse_optional_date, format_register_date,
-    SAVED_BG, NEW_BG, EMPTY_BG, NEG_COLOR, EDIT_BG, DIRTY_BG, DUP_BG, MISMATCH_BG,
+    SAVED_BG, NEW_BG, EMPTY_BG, NEG_COLOR, EDIT_BG, DIRTY_BG, DRAFT_BG, DUP_BG, MISMATCH_BG,
     _FOOTER_BTN_STYLE,
     _accept_editor_completion, _upper_text,
     _ExcelCellDelegate, _DescriptionDelegate, _TruckDelegate, _DateDelegate,
@@ -420,6 +422,9 @@ class DailyRegister(QWidget):
 
     rows_saved        = Signal(int)
     stats_updated     = Signal(int, float, float, float, object)  # n, tzs, usd, refund, date
+    register_status_updated = Signal(int, int)  # draft_count, submitted_count on saved rows
+    drafts_changed        = Signal()
+    undo_redo_changed     = Signal(bool, bool)  # can_undo, can_redo
     edit_state_changed = Signal(bool, int)         # (edit_mode_active, dirty_row_count)
     mode_changed      = Signal(bool)               # merged mode on/off
     attachment_count_changed = Signal(int)         # selected row attachment count
@@ -470,9 +475,12 @@ class DailyRegister(QWidget):
         self._cut_cells: set = set()          # {(row, col), ...}
         self._cut_payload: dict = {}          # serialized cut buffer
         self._cut_is_rows: bool = False
-        # Undo stack of cell snapshots
-        self._undo_stack: list = []           # [{(r,c): text}, ...]
-        self._undo_limit: int = 40
+        # Undo / redo stacks (Excel-style cell + row operations)
+        self._undo_stack: list = []
+        self._redo_stack: list = []
+        self._undo_limit: int = 100
+        self._undo_redo_active: bool = False
+        self._pending_cell_edit: tuple | None = None  # (row, col, serialized value)
         # Re-entrancy guards — prevent double-click duplicate inserts.
         self._save_in_flight = False
         self._submit_in_flight = False
@@ -492,6 +500,7 @@ class DailyRegister(QWidget):
         self._load_gen = 0
         self._build_ui()
         self._show_register_loading("Loading…")
+        self._emit_undo_redo_state()
         asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_categories())
         asyncio.ensure_future(self._load_cashier_settings())
@@ -594,6 +603,7 @@ class DailyRegister(QWidget):
         self._table.currentCellChanged.connect(
             lambda *_: self._emit_active_payee_cheque()
         )
+        self._table.currentCellChanged.connect(self._on_current_cell_changed)
 
         self._table_host = QWidget(self)
         host_lay = QVBoxLayout(self._table_host)
@@ -868,6 +878,7 @@ class DailyRegister(QWidget):
                     self, "Submitted",
                     f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for {label}.",
                 )
+                self.drafts_changed.emit()
                 await self._load_date(d)
             except Exception as exc:
                 QMessageBox.critical(self, "Submit Failed", str(exc))
@@ -928,6 +939,8 @@ class DailyRegister(QWidget):
         self._clear_column_filters()
         self._clear_cut_marquee()
         self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._emit_undo_redo_state()
         self._update_footer()
         self._apply_filters()
         self.edit_state_changed.emit(False, 0)
@@ -947,7 +960,13 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
 
     def _fill_saved_row(self, row: int, tx: Transaction) -> None:
-        bg = QBrush(SAVED_BG)
+        status = getattr(tx, "register_status", "") or "submitted"
+        if status == "draft":
+            bg = QBrush(DRAFT_BG)
+            status_tip = "Draft — saved but not submitted to Verify"
+        else:
+            bg = QBrush(SAVED_BG)
+            status_tip = "Submitted — awaiting accountant Verify"
         ro = Qt.ItemIsEnabled | Qt.ItemIsSelectable
 
         def saved_item(text: str, align=Qt.AlignVCenter | Qt.AlignLeft) -> QTableWidgetItem:
@@ -955,6 +974,7 @@ class DailyRegister(QWidget):
             it.setFlags(ro)
             it.setBackground(bg)
             it.setTextAlignment(align)
+            it.setToolTip(status_tip)
             return it
 
         # S/NO — same row background as siblings (Excel-style continuous row)
@@ -1054,6 +1074,16 @@ class DailyRegister(QWidget):
             f"{n} entr{'y' if n == 1 else 'ies'}   ·   {usd_str}   ·   {amount_str}"
         )
         self.stats_updated.emit(n, tzs, usd, refund, self._current_date)
+        draft_n = submitted_n = 0
+        for row in range(self._saved_count):
+            tx = self._saved_txs.get(row)
+            if tx is None:
+                continue
+            if (getattr(tx, "register_status", "") or "submitted") == "draft":
+                draft_n += 1
+            else:
+                submitted_n += 1
+        self.register_status_updated.emit(draft_n, submitted_n)
 
     # ------------------------------------------------------------------
     # Row → Transaction
@@ -1145,9 +1175,18 @@ class DailyRegister(QWidget):
                         )
                 else:
                     truck_number = matched
+            it_truck = self._table.item(row, COL_TRUCK)
+            if it_truck and truck_number and it_truck.text() != truck_number:
+                self._table.blockSignals(True)
+                it_truck.setText(truck_number)
+                self._table.blockSignals(False)
 
         ref_text = txt(COL_REF).upper()
         orig = self._saved_txs.get(row)
+        primary_dt = self._resolve_import_primary_date(row)
+        primary_day = primary_dt.date() if primary_dt else self._current_date
+        tx_day = tx_date.date() if hasattr(tx_date, "date") else tx_date
+        date_discrep = bool(meta.get("date_discrepancy")) or (tx_day != primary_day)
         return Transaction(
             date=tx_date,
             description=description,
@@ -1171,8 +1210,8 @@ class DailyRegister(QWidget):
             register_status="draft",
             daily_import_id=meta.get("daily_import_id"),
             daily_import_source=meta.get("daily_import_source"),
-            date_discrepancy=bool(meta.get("date_discrepancy")),
-            import_primary_date=self._resolve_import_primary_date(row),
+            date_discrepancy=date_discrep,
+            import_primary_date=primary_dt,
             lpo_do=(meta.get("lpo_do") or "").upper(),
             do_number=(meta.get("do_number") or "").upper(),
             reported_date=getattr(orig, "reported_date", None) if orig is not None else None,
@@ -1890,7 +1929,15 @@ class DailyRegister(QWidget):
             if key == Qt.Key_C:    self._copy();                               return
             if key == Qt.Key_X:    self._cut();                                return
             if key == Qt.Key_V:    self._paste();                              return
-            if key == Qt.Key_Z:    self._undo();                               return
+            if key == Qt.Key_Z:
+                if mod & Qt.ShiftModifier:
+                    self._redo()
+                else:
+                    self._undo()
+                return
+            if key in (Qt.Key_Y,):
+                self._redo()
+                return
             if key == Qt.Key_A:    self._table.selectAll();                    return
             if key == Qt.Key_D:    self._fill_down();                          return
             if key == Qt.Key_R:    self._fill_right();                         return
@@ -2007,20 +2054,89 @@ class DailyRegister(QWidget):
     # Clipboard
     # ------------------------------------------------------------------
 
-    def _push_undo_cells(self, cells: dict) -> None:
-        """Snapshot {(row, col): text} before a mutating edit."""
-        if not cells:
+    # ------------------------------------------------------------------
+    # Undo / redo (Excel-style)
+    # ------------------------------------------------------------------
+
+    def _normalize_cell_val(self, val) -> tuple:
+        if isinstance(val, tuple) and len(val) >= 2:
+            return val
+        return ("text", "" if val is None else str(val))
+
+    def _serialize_cell(self, row: int, col: int) -> tuple:
+        if row < 0 or row >= self._table.rowCount() or col == COL_SNO:
+            return ("text", "")
+        it = self._table.item(row, col)
+        if col in CHECK_COLS:
+            checked = bool(it.data(Qt.UserRole)) if it else False
+            return ("check", checked)
+        return ("text", it.text() if it else "")
+
+    def _cell_editable(self, row: int, col: int) -> bool:
+        if col in READONLY_COLS or col == COL_SNO:
+            return False
+        if row < self._saved_count and not self._edit_mode:
+            return False
+        return True
+
+    def _write_cell_value(self, row: int, col: int, val: tuple) -> None:
+        kind, payload = self._normalize_cell_val(val)
+        if col in CHECK_COLS or kind == "check":
+            it = self._table.item(row, col) or QTableWidgetItem()
+            it.setData(Qt.UserRole, bool(payload))
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            self._table.setItem(row, col, it)
             return
-        self._undo_stack.append(dict(cells))
+        text = str(payload)
+        if col == COL_RECEIPT:
+            it = QTableWidgetItem(_receipt_paste_value(text))
+        elif col in (COL_TZS, COL_USD):
+            it = _amount_item_from_raw(text)
+        elif col == COL_CASHIER:
+            it = QTableWidgetItem(text)
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        else:
+            it = QTableWidgetItem(_upper_text(col, text))
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+        self._table.setItem(row, col, it)
+
+    def _normalize_undo_entry(self, entry: dict) -> dict:
+        if "cells" in entry or "row_ops" in entry:
+            return entry
+        cells = {
+            (int(r), int(c)): self._normalize_cell_val(v)
+            for (r, c), v in entry.items()
+        }
+        return {"cells": cells}
+
+    def _record_undo(self, entry: dict) -> None:
+        normalized = self._normalize_undo_entry(entry)
+        if not normalized.get("cells") and not normalized.get("row_ops"):
+            return
+        self._undo_stack.append(normalized)
+        self._redo_stack.clear()
         if len(self._undo_stack) > self._undo_limit:
             self._undo_stack = self._undo_stack[-self._undo_limit:]
+        self._emit_undo_redo_state()
+
+    def _push_undo_cells(self, cells: dict) -> None:
+        """Snapshot cell values before a mutating edit."""
+        if not cells:
+            return
+        mapped = {}
+        for (row, col), val in cells.items():
+            if isinstance(val, tuple):
+                mapped[(row, col)] = val
+            else:
+                mapped[(row, col)] = self._normalize_cell_val(val)
+        self._record_undo({"cells": mapped})
 
     def _snapshot_selection(self) -> dict:
         snap = {}
         for it in self._table.selectedItems():
             if it.column() in READONLY_COLS:
                 continue
-            snap[(it.row(), it.column())] = it.text()
+            snap[(it.row(), it.column())] = self._serialize_cell(it.row(), it.column())
         return snap
 
     def _snapshot_rows(self, rows: list) -> dict:
@@ -2029,42 +2145,213 @@ class DailyRegister(QWidget):
             for col in range(self._table.columnCount()):
                 if col == COL_SNO:
                     continue
-                it = self._table.item(row, col)
-                snap[(row, col)] = it.text() if it else ""
+                snap[(row, col)] = self._serialize_cell(row, col)
         return snap
+
+    def _snapshot_cells_for_keys(self, keys) -> dict:
+        return {(r, c): self._serialize_cell(r, c) for (r, c) in keys}
+
+    def _apply_cells(self, cells: dict) -> None:
+        if not cells:
+            return
+        self._undo_redo_active = True
+        self._table.blockSignals(True)
+        try:
+            touched_rows: set = set()
+            for (row, col), val in cells.items():
+                if row < 0 or row >= self._table.rowCount():
+                    continue
+                if not self._cell_editable(row, col) and row < self._saved_count:
+                    continue
+                self._write_cell_value(row, col, val)
+                touched_rows.add(row)
+                if row < self._saved_count and self._edit_mode:
+                    self._dirty_rows.add(row)
+            for row in touched_rows:
+                self._sync_row_date(row)
+        finally:
+            self._table.blockSignals(False)
+            self._undo_redo_active = False
+        self._renumber()
+        self._update_footer()
+        self._table.viewport().update()
+        self._schedule_draft_autosave()
+
+    def _apply_row_ops(self, ops: list, *, forward: bool) -> None:
+        """Apply row insert/remove ops. ``forward=True`` runs as recorded; False inverts."""
+        if not ops:
+            return
+        self._undo_redo_active = True
+        self._bulk_mutating = True
+        self._table.blockSignals(True)
+        try:
+            removes = [o for o in ops if o.get("op") == "remove"]
+            inserts = [o for o in ops if o.get("op") == "insert"]
+            if forward:
+                for op in sorted(removes, key=lambda o: int(o.get("at", 0)), reverse=True):
+                    at = int(op.get("at", 0))
+                    if at < self._table.rowCount():
+                        self._shift_row_maps_on_remove(at)
+                        self._table.removeRow(at)
+                for op in inserts:
+                    at = int(op.get("at", 0))
+                    count = int(op.get("count") or 1)
+                    for _ in range(count):
+                        self._shift_row_maps_on_insert(at)
+                        self._table.insertRow(at)
+                        self._init_editable_rows(at, at + 1)
+            else:
+                for op in sorted(removes, key=lambda o: int(o.get("at", 0))):
+                    at = int(op.get("at", 0))
+                    values = dict(op.get("values") or {})
+                    meta = dict(op.get("meta") or {})
+                    self._shift_row_maps_on_insert(at)
+                    self._table.insertRow(at)
+                    self._init_editable_rows(at, at + 1)
+                    truck_cells = self._write_row_values(at, values)
+                    self._restore_moved_row_meta(at, meta)
+                    self._sync_row_date(at)
+                    self._finalize_truck_cells(truck_cells)
+                for op in reversed(inserts):
+                    at = int(op.get("at", 0))
+                    count = int(op.get("count") or 1)
+                    for _ in range(count):
+                        if at < self._table.rowCount():
+                            self._shift_row_maps_on_remove(at)
+                            self._table.removeRow(at)
+            min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+            if self._table.rowCount() < min_rows:
+                start = self._table.rowCount()
+                self._table.setRowCount(min_rows)
+                self._init_editable_rows(start, min_rows)
+        finally:
+            self._table.blockSignals(False)
+            self._bulk_mutating = False
+            self._undo_redo_active = False
+        self._renumber()
+        self._update_footer()
+        self._schedule_draft_autosave()
+
+    def _invert_undo_entry(self, entry: dict) -> dict:
+        entry = self._normalize_undo_entry(entry)
+        inverted: dict = {}
+        cells = entry.get("cells") or {}
+        if cells:
+            inverted["cells"] = self._snapshot_cells_for_keys(cells.keys())
+        ops = entry.get("row_ops") or []
+        if ops:
+            inv_ops = []
+            for op in reversed(ops):
+                action = op.get("op")
+                if action == "insert":
+                    inv_ops.append({
+                        "op": "insert",
+                        "at": int(op.get("at", 0)),
+                        "count": int(op.get("count") or 1),
+                    })
+                elif action == "remove":
+                    inv_ops.append({"op": "remove", "at": int(op.get("at", 0))})
+            inverted["row_ops"] = inv_ops
+        return inverted
+
+    def _apply_undo_entry(self, entry: dict, *, forward: bool) -> None:
+        entry = self._normalize_undo_entry(entry)
+        if not forward:
+            ops = entry.get("row_ops") or []
+            if ops:
+                self._apply_row_ops(ops, forward=False)
+            cells = entry.get("cells") or {}
+            if cells:
+                self._apply_cells(cells)
+            return
+        cells = entry.get("cells") or {}
+        if cells:
+            self._apply_cells(cells)
+        ops = entry.get("row_ops") or []
+        if ops:
+            self._apply_row_ops(ops, forward=True)
 
     def _undo(self) -> None:
         if not self._undo_stack:
             return
-        snap = self._undo_stack.pop()
+        self._finalize_pending_cell_undo()
         self._clear_cut_marquee()
-        self._table.blockSignals(True)
-        try:
-            for (row, col), text in snap.items():
-                if row < 0 or row >= self._table.rowCount():
-                    continue
-                if col == COL_SNO:
-                    continue
-                if row < self._saved_count and not self._edit_mode:
-                    continue
-                it = self._table.item(row, col)
-                if it is None:
-                    it = QTableWidgetItem("")
-                    if col == COL_CASHIER:
-                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                    else:
-                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                    self._table.setItem(row, col, it)
-                elif col == COL_CASHIER:
-                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                it.setText(text)
-                if row < self._saved_count and self._edit_mode:
-                    self._dirty_rows.add(row)
-        finally:
-            self._table.blockSignals(False)
-        self._renumber()
-        self._update_footer()
-        self._table.viewport().update()
+        entry = self._undo_stack.pop()
+        redo_entry = self._invert_undo_entry(entry)
+        self._apply_undo_entry(entry, forward=False)
+        self._redo_stack.append(redo_entry)
+        if len(self._redo_stack) > self._undo_limit:
+            self._redo_stack = self._redo_stack[-self._undo_limit:]
+        self._emit_undo_redo_state()
+
+    def _redo(self) -> None:
+        if not self._redo_stack:
+            return
+        self._finalize_pending_cell_undo()
+        self._clear_cut_marquee()
+        entry = self._redo_stack.pop()
+        undo_entry = self._invert_undo_entry(entry)
+        self._apply_undo_entry(entry, forward=True)
+        self._undo_stack.append(undo_entry)
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack = self._undo_stack[-self._undo_limit:]
+        self._emit_undo_redo_state()
+
+    def _on_current_cell_changed(
+        self, row: int, col: int, prev_row: int, prev_col: int,
+    ) -> None:
+        if prev_row >= 0 and prev_col >= 0:
+            self._finalize_pending_cell_undo(prev_row, prev_col)
+        if row >= 0 and col >= 0 and self._cell_editable(row, col):
+            self._pending_cell_edit = (row, col, self._serialize_cell(row, col))
+        else:
+            self._pending_cell_edit = None
+
+    def _finalize_pending_cell_undo(
+        self, row: int | None = None, col: int | None = None,
+    ) -> None:
+        if self._undo_redo_active or self._bulk_mutating:
+            return
+        pending = self._pending_cell_edit
+        if pending is None:
+            return
+        pr, pc, old_val = pending
+        if row is not None and col is not None and (row, col) != (pr, pc):
+            pass
+        elif row is not None and col is not None:
+            pr, pc = row, col
+        if not self._cell_editable(pr, pc):
+            self._pending_cell_edit = None
+            return
+        new_val = self._serialize_cell(pr, pc)
+        if new_val != old_val:
+            self._record_undo({"cells": {(pr, pc): old_val}})
+        self._pending_cell_edit = None
+
+    def _record_row_remove_undo(self, rows: list) -> None:
+        ops = []
+        for row in sorted(rows):
+            ops.append({
+                "op": "remove",
+                "at": row,
+                "values": self._row_value_map(row),
+                "meta": self._capture_row_meta(row),
+            })
+        self._record_undo({"row_ops": ops})
+
+    def _record_row_insert_undo(self, at: int, count: int = 1) -> None:
+        self._record_undo({"row_ops": [{"op": "insert", "at": at, "count": count}]})
+
+    def _emit_undo_redo_state(self) -> None:
+        self.undo_redo_changed.emit(bool(self._undo_stack), bool(self._redo_stack))
+
+    def toolbar_undo(self) -> None:
+        self._commit_open_editor()
+        self._undo()
+
+    def toolbar_redo(self) -> None:
+        self._commit_open_editor()
+        self._redo()
 
     def _clear_cut_marquee(self) -> None:
         self._cut_cells = set()
@@ -2368,6 +2655,7 @@ class DailyRegister(QWidget):
                 self._table.setRowCount(min_rows)
                 self._init_editable_rows(start, min_rows)
 
+        self._record_row_insert_undo(insert_at, len(maps))
         truck_cells: list = []
         self._bulk_mutating = True
         prev = self._table.blockSignals(True)
@@ -2514,6 +2802,7 @@ class DailyRegister(QWidget):
         else:
             insert_at = max(cur, self._saved_count)
 
+        self._record_row_insert_undo(insert_at, len(lines))
         truck_cells: list = []
         self._bulk_mutating = True
         prev = self._table.blockSignals(True)
@@ -2810,10 +3099,13 @@ class DailyRegister(QWidget):
             if self._undo_stack:
                 menu.addSeparator()
                 menu.addAction("Undo", self._undo)
+            if self._redo_stack:
+                menu.addAction("Redo", self._redo)
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
     def _insert_above(self) -> None:
         row = max(self._table.currentRow(), self._saved_count)
+        self._record_row_insert_undo(row, 1)
         self._shift_row_maps_on_insert(row)
         self._table.insertRow(row)
         self._init_editable_rows(row, row + 1)
@@ -2821,6 +3113,7 @@ class DailyRegister(QWidget):
 
     def _insert_below(self) -> None:
         row = max(self._table.currentRow() + 1, self._saved_count)
+        self._record_row_insert_undo(row, 1)
         self._shift_row_maps_on_insert(row)
         self._table.insertRow(row)
         self._init_editable_rows(row, row + 1)
@@ -2832,6 +3125,9 @@ class DailyRegister(QWidget):
              if i.row() >= self._saved_count},
             reverse=True,
         )
+        if not rows:
+            return
+        self._record_row_remove_undo(sorted(rows))
         for row in rows:
             self._shift_row_maps_on_remove(row)
             self._table.removeRow(row)
@@ -3566,10 +3862,13 @@ class DailyRegister(QWidget):
 
     def _commit_open_editor(self) -> None:
         """Flush the active cell editor into the model before save/leave checks."""
+        row, col = self._table.currentRow(), self._table.currentColumn()
         w = QApplication.focusWidget()
         if w is not None and self._table.isAncestorOf(w):
             self._table.commitData(w)
             self._table.closeEditor(w, QAbstractItemDelegate.NoHint)
+        if row >= 0 and col >= 0:
+            self._finalize_pending_cell_undo(row, col)
 
     async def confirm_leave(self) -> bool:
         """Ask to save/discard before logout or app exit. False = stay put."""
@@ -3664,7 +3963,8 @@ class DailyRegister(QWidget):
         except Exception:
             dup_days = 5
 
-        # ── Pre-scan: warn once if any new rows carry a non-today date ──────
+        # ── Pre-scan: warn once if any new rows carry a date other than the open register day
+        register_label = self._current_date.strftime("%d %b %Y")
         _off_date = 0
         for _s in range(self._saved_count, self._table.rowCount()):
             if not self._row_has_data(_s):
@@ -3676,239 +3976,97 @@ class DailyRegister(QWidget):
                 _td = _parsed.date()
             else:
                 _td = self._current_date
-            if _td != date.today():
+            if _td != self._current_date:
                 _off_date += 1
         if _off_date:
             _plural = "s" if _off_date != 1 else ""
             _are    = "are" if _off_date != 1 else "is"
             if QMessageBox.warning(
                 self, "Off-date Entries",
-                f"{_off_date} row{_plural} {_are} not dated today "
-                f"({date.today().strftime('%d %b %Y')}).\n\n"
-                "These entries will be flagged in the accountant's verify inbox.\n\n"
+                f"{_off_date} row{_plural} {_are} not dated {register_label}.\n\n"
+                "They will stay on this register day (visible after Save) but "
+                "will be flagged in the accountant's Verify inbox.\n\n"
                 "Proceed with save?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             ) == QMessageBox.No:
                 return False
 
-        cancel_all = False
+        pending_inserts: list[tuple[int, Transaction]] = []
+        duplicate_items: list[DuplicateReviewItem] = []
+
         append_order = None
         if not self._merged_mode:
             try:
                 append_order = await next_day_order(self._current_date)
             except Exception:
                 append_order = None
+
         for row in range(self._saved_count, self._table.rowCount()):
-            if cancel_all:
-                break
             if not self._row_has_data(row):
                 continue
-
-            def txt(col: int, _row: int = row) -> str:
-                it = self._table.item(_row, col)
-                return it.text().strip() if it else ""
-
-            description = txt(COL_DESC)
-            if not description:
+            try:
+                tx = self._build_transaction_from_row(row)
+            except ValueError as exc:
+                errors.append(f"Row {row + 1}: {exc}")
+                continue
+            if tx is None:
                 continue
 
+            if self._merged_mode:
+                tx.day_order = row
+            elif append_order is not None:
+                tx.day_order = append_order
+                append_order += 1
+            else:
+                tx.day_order = row
+
+            dupes = []
             try:
-                date_str = txt(COL_DATE)
-                tx_date = _parse_optional_date(
-                    date_str, default_year=self._current_date.year
+                dupes = await check_for_duplicates(
+                    truck_number=tx.truck_number or "",
+                    amount=tx.amount,
+                    item=tx.item or "",
+                    description=tx.description or "",
+                    days=dup_days,
                 )
-                if tx_date is None:
-                    tx_date = datetime(
-                        self._current_date.year,
-                        self._current_date.month,
-                        self._current_date.day,
-                    )
+            except Exception:
+                dupes = []
 
-                amount, amount_usd, currency = pack_money(
-                    _parse_optional_amount_text(txt(COL_TZS)),
-                    _parse_optional_amount_text(txt(COL_USD)),
-                )
+            if dupes:
+                duplicate_items.append(DuplicateReviewItem(
+                    row=row,
+                    row_display=row + 1,
+                    description=tx.description or "—",
+                    truck_number=tx.truck_number or "",
+                    item=tx.item or "",
+                    amount=tx.amount,
+                    amount_label=format_amount_label(tx),
+                    existing=dupes[0],
+                ))
+            pending_inserts.append((row, tx))
 
-                rcpt_status = txt(COL_RECEIPT).strip()
+        save_anyway: set[int] = set()
+        if duplicate_items:
+            dlg = DuplicateReviewDialog(
+                duplicate_items, dup_days=dup_days, parent=self,
+            )
+            if dlg.exec() != QDialog.Accepted:
+                self._flush_local_draft()
+                return False
+            save_anyway = dlg.save_anyway_rows()
 
-                item_name = txt(COL_ITEM)
-                meta_pre = self._pending_row_meta.get(row) or {}
-                allow_blank_item = self._defer_item_to_verify or bool(
-                    meta_pre.get("daily_import_id")
-                )
-                if not item_name and not allow_blank_item:
-                    errors.append(f"Row {row + 1}: Item is required.")
-                    continue
-
-                cat = self._cat_by_name.get(item_name.lower()) if item_name else None
-                if cat is not None:
-                    item_name = cat.name.upper()
-                elif item_name and self._restrict_items:
-                    errors.append(f'Row {row + 1}: "{item_name}" is not a known item.')
-                    continue
-                elif item_name:
-                    item_name = item_name.upper()
-
-                # Backstop for description-lock (covers paste / fill-down that
-                # skip the live editor validation).
-                if cat is not None and getattr(cat, "lock_description", False):
-                    allowed = self._locked_subitems.get(item_name.lower(), [])
-                    if allowed:
-                        match = next((a for a in allowed if a.lower() == description.lower()), None)
-                        if match is None:
-                            errors.append(
-                                f'Row {row + 1}: "{description}" is not an allowed '
-                                f'description for "{item_name}".'
-                            )
-                            continue
-                        description = match.upper()
-                    else:
-                        description = description.upper()
-                else:
-                    description = description.upper()
-
-                truck_raw = txt(COL_TRUCK)
-                truck_number = ""
-                if truck_raw:
-                    if is_allowed_place_label(truck_raw, self._allowed_truck_labels):
-                        truck_number = normalize_place_label(truck_raw)
-                    else:
-                        matched = try_match_fleet(truck_raw, self._fleet_numbers)
-                        if matched is None:
-                            norm = normalize_truck_number(
-                                truck_raw, allowed_labels=self._allowed_truck_labels
-                            )
-                            label = norm.value if norm.status != "empty" else truck_raw
-                            if norm.status == "invalid":
-                                errors.append(
-                                    f'Row {row + 1}: "{label}" is not a valid truck number '
-                                    f"(expected T + number + space + suffix, e.g. T688 EAF)."
-                                )
-                                continue
-                            if norm.status == "place_label":
-                                truck_number = norm.value
-                            else:
-                                errors.append(
-                                    f'Row {row + 1}: "{norm.value}" is not a registered fleet vehicle.'
-                                )
-                                continue
-                        else:
-                            truck_number = matched
-                    # Snap cell to canonical registry / label form
-                    it_truck = self._table.item(row, COL_TRUCK)
-                    if it_truck and it_truck.text() != truck_number:
-                        self._table.blockSignals(True)
-                        it_truck.setText(truck_number)
-                        self._table.blockSignals(False)
-
-                # ── Duplicate check ──────────────────────────────────────
-                is_dup = False
-                try:
-                    dupes = await check_for_duplicates(
-                        truck_number=truck_number,
-                        amount=amount,
-                        item=item_name,
-                        description=description,
-                        days=dup_days,
-                    )
-                except Exception:
-                    dupes = []
-
-                if dupes:
-                    d = dupes[0]
-                    tzs_show, usd_show = Transaction(
-                        date=tx_date,
-                        description=description,
-                        truck_number=truck_number,
-                        amount=amount,
-                        currency=currency,
-                        amount_usd=amount_usd,
-                    ).money_parts()
-                    amt_label = (
-                        f"TZS {tzs_show:,.0f}"
-                        if tzs_show
-                        else (f"USD {usd_show:,.2f}" if usd_show else "—")
-                    )
-                    if tzs_show and usd_show:
-                        amt_label = f"TZS {tzs_show:,.0f} / USD {usd_show:,.2f}"
-                    dupe_info = (
-                        f"Row {row + 1}  ·  {description or '—'}  ·  "
-                        f"Truck {truck_number or '—'}  ·  {amt_label}\n\n"
-                        f"A similar entry already exists:\n"
-                        f"  Date: {d.date.strftime('%d %b %Y') if d.date else '—'}\n"
-                        f"  Item: {d.item or '—'}\n"
-                        f"  Description: {d.description or '—'}\n"
-                        f"  Amount: TZS {d.amount:,.0f}\n"
-                        f"  Truck: {d.truck_number or '—'}\n\n"
-                        f"(Checked last {dup_days} day{'s' if dup_days != 1 else ''})"
-                    )
-                    msg = QMessageBox(self)
-                    msg.setWindowTitle("Possible Duplicate Entry")
-                    msg.setText(dupe_info)
-                    msg.setIcon(QMessageBox.Warning)
-                    save_btn   = msg.addButton("Save Anyway", QMessageBox.AcceptRole)
-                    skip_btn   = msg.addButton("Skip Row",    QMessageBox.RejectRole)
-                    cancel_btn = msg.addButton("Cancel Save", QMessageBox.DestructiveRole)
-                    msg.exec()
-                    clicked = msg.clickedButton()
-                    if clicked is cancel_btn:
-                        cancel_all = True
-                        break
-                    elif clicked is skip_btn:
-                        continue
-                    else:
-                        is_dup = True   # "Save Anyway" — mark as duplicate
-
-                ref_text = txt(COL_REF).upper()
-                meta = self._pending_row_meta.get(row) or {}
-                if self._merged_mode:
-                    order = row
-                elif append_order is not None:
-                    order = append_order
-                    append_order += 1
-                else:
-                    order = row
-                tx = Transaction(
-                    date=tx_date,
-                    description=description,
-                    item=item_name,
-                    # The chosen item *is* the category — keep them in sync so the
-                    # item's sidebar tab (which filters on category_name) shows it.
-                    category_name=item_name or None,
-                    category_id=meta.get("category_id"),
-                    truck_number=truck_number,
-                    amount=amount,
-                    currency=currency,
-                    amount_usd=amount_usd,
-                    memo=txt(COL_MEMO).upper(),
-                    receipt_status=rcpt_status,
-                    ref_float=ref_text,
-                    notes_flag=_is_refund_float(ref_text),
-                    ownership=txt(COL_OWN).upper(),
-                    approver=txt(COL_APR).upper(),
-                    payee=txt(COL_PAYEE).upper(),
-                    cheque=txt(COL_CHEQUE).upper(),
-                    cashier_id=self._user._id,
-                    day_order=order,
-                    register_status="draft",
-                    possible_duplicate=is_dup,
-                    daily_import_id=meta.get("daily_import_id"),
-                    daily_import_source=meta.get("daily_import_source"),
-                    date_discrepancy=bool(meta.get("date_discrepancy")),
-                    import_primary_date=self._resolve_import_primary_date(row),
-                    lpo_do=(meta.get("lpo_do") or "").upper(),
-                    do_number=(meta.get("do_number") or "").upper(),
-                )
+        duplicate_rows = {item.row for item in duplicate_items}
+        for row, tx in pending_inserts:
+            if row in duplicate_rows and row not in save_anyway:
+                continue
+            tx.possible_duplicate = row in save_anyway
+            try:
                 await save_transaction(tx)
                 saved += 1
                 self._pending_row_meta.pop(row, None)
             except Exception as exc:
                 errors.append(f"Row {row + 1}: {exc}")
-
-        if cancel_all:
-            self._flush_local_draft()
-            return False
 
         if self._merged_mode and (saved or updated):
             try:
@@ -3934,6 +4092,7 @@ class DailyRegister(QWidget):
         self._clear_local_draft()
         self._reset_edit_state()
         self.rows_saved.emit(saved)
+        self.drafts_changed.emit()
         await self._load_date(self._current_date)
         return True
 

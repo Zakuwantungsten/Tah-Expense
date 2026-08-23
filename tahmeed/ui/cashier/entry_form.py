@@ -27,6 +27,8 @@ from tahmeed.services.cashier_service import (
     save_transaction, get_transactions_by_date, check_for_duplicates,
     request_or_delete_transaction,
 )
+from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
+from tahmeed.services.duplicate_review import DuplicateReviewItem, format_amount_label
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
 from tahmeed.ui.widgets.qb_txn_toolbar import QbTxnToolbar
@@ -809,27 +811,31 @@ class EntryForm(QWidget):
             dupes = []
 
         if dupes:
-            d = dupes[0]
-            _msg = QMessageBox(self)
-            _msg.setWindowTitle("Possible Duplicate Entry")
-            _msg.setText(
-                f"A similar entry already exists:\n\n"
-                f"  Description: {d.description or '—'}\n"
-                f"  Item:        {d.item or '—'}\n"
-                f"  Truck:       {d.truck_number or '—'}\n"
-                f"  Amount:      TZS {d.amount:,.0f}\n"
-                f"  Date:        {d.date.strftime('%d %b %Y') if d.date else '—'}\n\n"
-                f"(Checked last {dup_days} day{'s' if dup_days != 1 else ''})\n\n"
-                "Save anyway?"
+            probe = Transaction(
+                date=tx_date,
+                description=description,
+                truck_number=truck_number,
+                amount=self._amount.value(),
+                currency="TZS",
             )
-            _msg.setIcon(QMessageBox.Warning)
-            _save_btn   = _msg.addButton("Save Anyway", QMessageBox.AcceptRole)
-            _cancel_btn = _msg.addButton("Cancel",      QMessageBox.RejectRole)
-            _msg.exec()
-            if _msg.clickedButton() is _cancel_btn:
+            item = DuplicateReviewItem(
+                row=0,
+                row_display=1,
+                description=description or "—",
+                truck_number=truck_number or "",
+                item=self._item.text().strip(),
+                amount=self._amount.value(),
+                amount_label=format_amount_label(probe),
+                existing=dupes[0],
+            )
+            dlg = DuplicateReviewDialog([item], dup_days=dup_days, parent=self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            if 0 not in dlg.save_anyway_rows():
                 return
             possible_dup = True
 
+        primary_day = tx_date.date() if hasattr(tx_date, "date") else tx_date
         tx = Transaction(
             date=tx_date,
             description=description,
@@ -852,6 +858,10 @@ class EntryForm(QWidget):
             ).upper(),
             cashier_id=self._user._id,
             possible_duplicate=possible_dup,
+            register_status="draft",
+            import_primary_date=datetime(
+                primary_day.year, primary_day.month, primary_day.day,
+            ),
         )
 
         try:

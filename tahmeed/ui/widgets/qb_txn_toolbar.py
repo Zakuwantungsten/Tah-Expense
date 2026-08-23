@@ -24,13 +24,15 @@ _HOVER = "#E5E7EB"
 class QbTxnToolbar(QFrame):
     """Classic QB Desktop-style strip: icon above label, one shared row.
 
-    Core: Find, New, Save, Delete, Copy, Print, Attach File.
+    Core: Undo, Redo, Find, New, Save, Delete, Copy, Print, Attach File.
     With ``register_actions=True`` (cashier Table): also Export, Import,
     Today, Edit, Submit day — same icon style as New/Save.
     """
 
     find_prev = Signal()
     find_next = Signal()
+    undo_clicked = Signal()
+    redo_clicked = Signal()
     new_clicked = Signal()
     save_clicked = Signal()
     delete_clicked = Signal()
@@ -105,6 +107,23 @@ class QbTxnToolbar(QFrame):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 4, 10, 4)
         lay.setSpacing(2)
+
+        self._btn_undo: Optional[QToolButton] = None
+        self._btn_redo: Optional[QToolButton] = None
+        if register_actions:
+            self._btn_undo = self._tool_btn(
+                "mdi.undo", "Undo", "Undo last change (Ctrl+Z)"
+            )
+            self._btn_redo = self._tool_btn(
+                "mdi.redo", "Redo", "Redo (Ctrl+Y)"
+            )
+            self._btn_undo.clicked.connect(self.undo_clicked.emit)
+            self._btn_redo.clicked.connect(self.redo_clicked.emit)
+            self._btn_undo.setEnabled(False)
+            self._btn_redo.setEnabled(False)
+            lay.addWidget(self._btn_undo)
+            lay.addWidget(self._btn_redo)
+            lay.addWidget(self._sep())
 
         self._btn_find_prev = self._icon_btn(
             "mdi.chevron-left", "Previous", "Find previous entry"
@@ -334,6 +353,13 @@ class QbTxnToolbar(QFrame):
         self._btn_edit.style().unpolish(self._btn_edit)
         self._btn_edit.style().polish(self._btn_edit)
 
+    def set_undo_redo_enabled(self, *, can_undo: bool, can_redo: bool) -> None:
+        """Enable Undo/Redo when the register has history (table toolbar only)."""
+        if self._btn_undo is not None:
+            self._btn_undo.setEnabled(can_undo)
+        if self._btn_redo is not None:
+            self._btn_redo.setEnabled(can_redo)
+
     def set_actions_enabled(
         self,
         *,
@@ -363,3 +389,8 @@ class QbTxnToolbar(QFrame):
             self._btn_import.setEnabled(not busy)
         if self._btn_edit is not None:
             self._btn_edit.setEnabled(not busy)
+        if busy:
+            if self._btn_undo is not None:
+                self._btn_undo.setEnabled(False)
+            if self._btn_redo is not None:
+                self._btn_redo.setEnabled(False)

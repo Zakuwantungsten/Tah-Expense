@@ -43,7 +43,8 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("form",  "Form",  "mdi.form-select", {}),
     ]),
     ("INBOX", [
-        ("rejected", "Rejected", "mdi.alert-circle-outline", {}),
+        ("drafts",   "Drafts",   "mdi.file-document-edit-outline", {"badge": True}),
+        ("rejected", "Rejected", "mdi.alert-circle-outline",       {}),
     ]),
     ("ITEMS", []),
 ]
@@ -63,7 +64,7 @@ class _NavItem(QWidget):
     toggle_requested = Signal(str)   # chevron clicked (expandable items only)
 
     def __init__(self, key: str, label: str, icon_name: str,
-                 expandable: bool = False, parent=None):
+                 expandable: bool = False, badge: bool = False, parent=None):
         super().__init__(parent)
         self._key = key
         self._icon_name = icon_name
@@ -72,12 +73,14 @@ class _NavItem(QWidget):
         self._expanded = False
         self._has_subtables = False
         self._is_collapsed = False
+        self._has_badge = badge
+        self._badge_count = 0
         self.setFixedHeight(36)
         self.setCursor(Qt.PointingHandCursor)
-        self._build(label, expandable)
+        self._build(label, expandable, badge)
         self._paint(hover=False)
 
-    def _build(self, label: str, expandable: bool) -> None:
+    def _build(self, label: str, expandable: bool, badge: bool) -> None:
         self._label = label
         hl = QHBoxLayout(self)
         hl.setContentsMargins(0, 0, 8, 0)
@@ -112,6 +115,19 @@ class _NavItem(QWidget):
         self._text_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         hl.addWidget(self._text_lbl)
 
+        self._badge_lbl: Optional[QLabel] = None
+        if badge:
+            self._badge_lbl = QLabel("0")
+            self._badge_lbl.setAlignment(Qt.AlignCenter)
+            self._badge_lbl.setFixedHeight(18)
+            self._badge_lbl.setMinimumWidth(24)
+            self._badge_lbl.setStyleSheet(
+                "background:#B45309;color:#FFFBEB;border-radius:9px;"
+                "font-size:10px;font-weight:700;font-family:'Segoe UI';padding:0 6px;"
+            )
+            self._badge_lbl.setVisible(False)
+            hl.addWidget(self._badge_lbl)
+
         self._chevron_lbl: Optional[QLabel] = None
         if expandable:
             self._chevron_lbl = QLabel()
@@ -142,6 +158,8 @@ class _NavItem(QWidget):
         self._is_collapsed = collapsed
         self._text_lbl.setVisible(not collapsed)
         self._indicator.setVisible(not collapsed)
+        if self._badge_lbl:
+            self._badge_lbl.setVisible(not collapsed and self._badge_count > 0)
         if self._chevron_lbl:
             self._chevron_lbl.setVisible(self._has_subtables and not collapsed)
 
@@ -181,6 +199,14 @@ class _NavItem(QWidget):
         if self._chevron_lbl:
             icon = "mdi.chevron-down" if expanded else "mdi.chevron-right"
             self._chevron_lbl.setPixmap(_qta(icon, color=_MUTED).pixmap(14, 14))
+
+    def set_badge(self, count: int) -> None:
+        self._badge_count = max(0, int(count))
+        if self._badge_lbl:
+            self._badge_lbl.setText(str(self._badge_count))
+            self._badge_lbl.setVisible(
+                not self._is_collapsed and self._badge_count > 0
+            )
 
     def _refresh_icon(self, active: bool) -> None:
         color = _WHITE if active else _MUTED
@@ -430,8 +456,13 @@ class CashierSidebarWidget(QFrame):
                 vl.addWidget(items_host)
                 continue
 
-            for key, label, icon_name, _ in items:
-                nav = _NavItem(key=key, label=label, icon_name=icon_name)
+            for key, label, icon_name, opts in items:
+                nav = _NavItem(
+                    key=key,
+                    label=label,
+                    icon_name=icon_name,
+                    badge=opts.get("badge", False),
+                )
                 nav.activated.connect(self._on_item_clicked)
                 self._items[key] = nav
                 vl.addWidget(nav)
@@ -539,6 +570,10 @@ class CashierSidebarWidget(QFrame):
                 }}
                 QToolButton:hover {{ background: {_ACTIVE_BG}; color: {_WHITE}; }}
             """)
+
+    def set_drafts_badge(self, count: int) -> None:
+        if "drafts" in self._items:
+            self._items["drafts"].set_badge(count)
 
     # ── Internal: top-level nav ────────────────────────────────────────────────
 

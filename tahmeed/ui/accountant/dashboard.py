@@ -25,6 +25,7 @@ _APP_BG = "#F4F6F8"
 _LAZY_PAGE_KEYS = frozenset({
     "truck_overview",
     "verify",
+    "drafts",
     "master_expenses",
     "trash",
     "import_daily",
@@ -194,6 +195,15 @@ class AccountantDashboard(QWidget):
             widget.badge_updated.connect(self._on_badge_updated)
             return widget
 
+        if key == "drafts":
+            from tahmeed.ui.cashier.drafts_view import DraftsView
+            widget = DraftsView(user=self._user, show_all_cashiers=True)
+            widget.open_register_date.connect(self._on_drafts_open_register)
+            widget.drafts_changed.connect(
+                lambda: asyncio.ensure_future(self._refresh_drafts_badge())
+            )
+            return widget
+
         if key == "master_expenses":
             from tahmeed.ui.accountant.master_expenses import MasterExpensesWidget
             return MasterExpensesWidget(user=self._user)
@@ -313,6 +323,12 @@ class AccountantDashboard(QWidget):
             if self._pending_people is not None:
                 self._register.update_people(self._pending_people)
                 self._pending_people = None
+            self._register.rows_saved.connect(
+                lambda _: asyncio.ensure_future(self._refresh_drafts_badge())
+            )
+            self._register.drafts_changed.connect(
+                lambda: asyncio.ensure_future(self._refresh_drafts_badge())
+            )
             page = _TablePage(self._register)
             return page
 
@@ -427,6 +443,31 @@ class AccountantDashboard(QWidget):
     def _on_badge_updated(self, count: int) -> None:
         self._sidebar.set_verify_badge(count)
 
+    async def _refresh_drafts_badge(self) -> None:
+        from tahmeed.ui.cashier.drafts_view import fetch_draft_badge_count
+        try:
+            count = await fetch_draft_badge_count(self._user, all_cashiers=True)
+        except Exception:
+            count = 0
+        self._sidebar.set_drafts_badge(count)
+
+    def _on_drafts_open_register(self, d) -> None:
+        from tahmeed.ui.async_utils import in_running_task, schedule_call
+
+        self._sidebar.select("table")
+
+        def _go() -> None:
+            self._ensure_page("table")
+            self._stack.setCurrentIndex(self._page_indices["table"])
+            assert self._register is not None
+            self._register.reload_settings()
+            self._register.navigate_to_date(d, merged=True)
+
+        if in_running_task() and "table" not in self._pages:
+            schedule_call(_go)
+        else:
+            _go()
+
     def _on_overview_nav(self, key: str) -> None:
         self._sidebar.select(key)
         self._on_nav(key)
@@ -490,6 +531,7 @@ class AccountantDashboard(QWidget):
 
             count = await get_verify_notification_count()
             self._sidebar.set_verify_badge(count)
+            await self._refresh_drafts_badge()
         except asyncio.CancelledError:
             raise
         except Exception:

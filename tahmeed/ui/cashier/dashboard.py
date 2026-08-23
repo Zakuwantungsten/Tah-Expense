@@ -41,6 +41,7 @@ from tahmeed.ui.cashier.overview import CashierOverview
 from tahmeed.ui.cashier.transactions_table import TransactionBrowser
 from tahmeed.ui.cashier.cashier_category_view import CashierCategoryView
 from tahmeed.ui.cashier.rejected_view import RejectedView
+from tahmeed.ui.cashier.drafts_view import DraftsView, fetch_draft_badge_count
 
 _APP_BG = "#F4F6F8"
 _BORDER = "#E5E7EB"
@@ -172,6 +173,18 @@ class _QBDocHeader(QFrame):
         )
         self._merged_badge.hide()
         title_row.addWidget(self._merged_badge, 0, Qt.AlignVCenter)
+
+        self._draft_status = QLabel("")
+        self._draft_status.setAlignment(Qt.AlignCenter)
+        self._draft_status.setFixedHeight(22)
+        self._draft_status.setStyleSheet(
+            "QLabel{background:transparent;color:#B45309;border:1.5px solid #FCD34D;"
+            "border-radius:11px;padding:0 10px;font-size:10px;font-weight:700;"
+            "letter-spacing:0.4px;font-family:'Segoe UI',sans-serif;}"
+        )
+        self._draft_status.hide()
+        title_row.addWidget(self._draft_status, 0, Qt.AlignVCenter)
+
         title_row.addStretch()
 
         hl.addLayout(title_row, 1)
@@ -234,6 +247,18 @@ class _QBDocHeader(QFrame):
 
     def set_merged(self, merged: bool) -> None:
         self._merged_badge.setVisible(bool(merged))
+
+    def set_register_status(self, draft_count: int, submitted_count: int) -> None:
+        parts = []
+        if draft_count:
+            parts.append(f"{draft_count} draft")
+        if submitted_count:
+            parts.append(f"{submitted_count} submitted")
+        if parts:
+            self._draft_status.setText(" · ".join(parts))
+            self._draft_status.show()
+        else:
+            self._draft_status.hide()
 
     def update_stats(
         self,
@@ -501,9 +526,12 @@ class _TablePage(QWidget):
 
         self._doc_header = _QBDocHeader()
         register.stats_updated.connect(self._doc_header.update_stats)
+        register.register_status_updated.connect(self._doc_header.set_register_status)
 
         from tahmeed.ui.widgets.qb_txn_toolbar import QbTxnToolbar
         self._qb_toolbar = QbTxnToolbar(register_actions=True)
+        self._qb_toolbar.undo_clicked.connect(register.toolbar_undo)
+        self._qb_toolbar.redo_clicked.connect(register.toolbar_redo)
         self._qb_toolbar.find_prev.connect(lambda: register.toolbar_find(-1))
         self._qb_toolbar.find_next.connect(lambda: register.toolbar_find(1))
         self._qb_toolbar.new_clicked.connect(register.toolbar_new_row)
@@ -522,6 +550,22 @@ class _TablePage(QWidget):
         register.attachment_count_changed.connect(self._qb_toolbar.set_attachment_count)
         register.edit_state_changed.connect(self._qb_toolbar.set_edit_state)
         register.save_busy_changed.connect(self._qb_toolbar.set_mutation_busy)
+        register.save_busy_changed.connect(
+            lambda busy: (
+                None if busy
+                else self._qb_toolbar.set_undo_redo_enabled(
+                    can_undo=bool(register._undo_stack),
+                    can_redo=bool(register._redo_stack),
+                )
+            )
+        )
+        register.undo_redo_changed.connect(
+            lambda u, r: self._qb_toolbar.set_undo_redo_enabled(can_undo=u, can_redo=r)
+        )
+        self._qb_toolbar.set_undo_redo_enabled(
+            can_undo=bool(register._undo_stack),
+            can_redo=bool(register._redo_stack),
+        )
 
         self._action_bar = _ActionBar()
         self._action_bar.search_changed.connect(register.set_search)
@@ -625,11 +669,15 @@ class CashierDashboard(QWidget):
         self._form = EntryForm(user=self._user)
         self._stack.addWidget(self._form)
 
-        # index 3 — Rejected entries
+        # index 3 — Drafts inbox
+        self._drafts_view = DraftsView(user=self._user, show_all_cashiers=False)
+        self._stack.addWidget(self._drafts_view)
+
+        # index 4 — Rejected entries
         self._rejected_view = RejectedView(user=self._user)
         self._stack.addWidget(self._rejected_view)
 
-        # index 4 — Browse (embedded)
+        # index 5 — Browse (embedded)
         self._browser = TransactionBrowser()
         self._browser.go_to_date.connect(self._on_go_to_date)
         self._browser.go_to_upload.connect(self._on_go_to_upload)
@@ -654,6 +702,13 @@ class CashierDashboard(QWidget):
         self._overview.go_to_browse.connect(lambda: self._on_nav("browse"))
         self._overview.export_data.connect(lambda: self._on_nav("browse"))
         self._overview.import_data.connect(self._on_import)
+        self._drafts_view.open_register_date.connect(self._on_drafts_open_register)
+        self._drafts_view.drafts_changed.connect(self._refresh_draft_badge)
+        self._register.rows_saved.connect(lambda _: self._refresh_draft_badge())
+        self._register.drafts_changed.connect(self._refresh_draft_badge)
+
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._refresh_draft_badge())
 
 
     def _on_import(self) -> None:
@@ -702,11 +757,14 @@ class CashierDashboard(QWidget):
             self._register.reload_settings()
         elif key == "form":
             self._stack.setCurrentIndex(2)
-        elif key == "rejected":
+        elif key == "drafts":
             self._stack.setCurrentIndex(3)
+            self._drafts_view.refresh()
+        elif key == "rejected":
+            self._stack.setCurrentIndex(4)
             self._rejected_view.refresh()
         elif key == "browse":
-            self._stack.setCurrentIndex(4)
+            self._stack.setCurrentIndex(5)
             self._browser.refresh()
         elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
@@ -738,6 +796,18 @@ class CashierDashboard(QWidget):
     def _on_go_to_upload(self, upload_id: str, primary_date=None) -> None:
         self._on_nav("table")
         self._register.navigate_to_upload(upload_id, primary_date)
+
+    def _on_drafts_open_register(self, d: date) -> None:
+        self._on_nav("table")
+        self._register.navigate_to_date(d, merged=False)
+
+    async def _refresh_draft_badge(self) -> None:
+        try:
+            count = await fetch_draft_badge_count(self._user, all_cashiers=False)
+        except Exception:
+            count = 0
+        if hasattr(self._sidebar, "set_drafts_badge"):
+            self._sidebar.set_drafts_badge(count)
 
     # ── Load categories ───────────────────────────────────────────────────────────
 

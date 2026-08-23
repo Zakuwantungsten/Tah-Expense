@@ -909,6 +909,111 @@ async def check_for_duplicates(
     return [Transaction.from_doc(d) for d in docs]
 
 
+_DRAFT_BASE_MATCH = {
+    "register_status": "draft",
+    "verified": {"$ne": True},
+    "rejected": {"$ne": True},
+    "discarded": {"$ne": True},
+    "deletion_requested": {"$ne": True},
+    "trashed": {"$ne": True},
+}
+
+
+async def count_draft_transactions(
+    cashier_id=None,
+    *,
+    all_cashiers: bool = False,
+) -> int:
+    """Count unsubmitted draft rows (for sidebar badge)."""
+    db = get_db()
+    query: dict = dict(_DRAFT_BASE_MATCH)
+    if not all_cashiers and cashier_id is not None:
+        query["cashier_id"] = cashier_id
+    return int(await db.transactions.count_documents(query))
+
+
+async def get_draft_day_summaries(
+    cashier_id=None,
+    *,
+    all_cashiers: bool = False,
+    limit: int = 120,
+) -> List[dict]:
+    """Calendar days that have at least one draft entry, newest first."""
+    db = get_db()
+    match: dict = dict(_DRAFT_BASE_MATCH)
+    if not all_cashiers and cashier_id is not None:
+        match["cashier_id"] = cashier_id
+
+    pipeline = [
+        {"$match": match},
+        {"$addFields": {"register_day": _REGISTER_DAY_EXPR}},
+        {"$group": {
+            "_id": {
+                "year": {"$year": "$register_day"},
+                "month": {"$month": "$register_day"},
+                "day": {"$dayOfMonth": "$register_day"},
+            },
+            "entries_count": {"$sum": 1},
+            "total_tzs": {"$sum": "$amount"},
+            "cashier_ids": {"$addToSet": "$cashier_id"},
+        }},
+        {"$sort": {"_id.year": -1, "_id.month": -1, "_id.day": -1}},
+        {"$limit": limit},
+    ]
+    docs = await db.transactions.aggregate(pipeline).to_list(length=limit)
+    result = []
+    for d in docs:
+        g = d["_id"]
+        cashier_ids = [cid for cid in (d.get("cashier_ids") or []) if cid is not None]
+        result.append({
+            "date": date(g["year"], g["month"], g["day"]),
+            "entries_count": int(d.get("entries_count") or 0),
+            "total_tzs": float(d.get("total_tzs") or 0.0),
+            "cashier_ids": cashier_ids,
+        })
+    return result
+
+
+async def get_draft_transactions(
+    register_date: date,
+    cashier_id=None,
+    *,
+    merged: bool = False,
+) -> List[Transaction]:
+    """Draft rows for one register calendar day."""
+    db = get_db()
+    query: dict = {
+        **_register_day_clause(register_date),
+        **_DRAFT_BASE_MATCH,
+    }
+    if not merged and cashier_id is not None:
+        query["cashier_id"] = cashier_id
+    cursor = db.transactions.find(query).sort([("day_order", 1), ("created_at", 1)])
+    docs = await cursor.to_list(length=None)
+    return [Transaction.from_doc(d) for d in docs]
+
+
+async def discard_draft_transactions(
+    tx_ids: List[ObjectId],
+    actor_id: ObjectId,
+    *,
+    allow_any_cashier: bool = False,
+) -> int:
+    """Hard-delete draft rows. Cashiers may only discard their own unless
+    ``allow_any_cashier`` is True (accountant merged register)."""
+    if not tx_ids:
+        return 0
+    db = get_db()
+    query: dict = {
+        "_id": {"$in": list(tx_ids)},
+        **_DRAFT_BASE_MATCH,
+    }
+    if not allow_any_cashier:
+        query["cashier_id"] = actor_id
+    result = await db.transactions.delete_many(query)
+    return int(result.deleted_count)
+
+
 async def insert_pending_edit(
     original_tx_id: ObjectId,
     updates: dict,

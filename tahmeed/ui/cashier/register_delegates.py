@@ -148,6 +148,7 @@ EMPTY_BG  = QColor("#fafafa")
 NEG_COLOR = QColor("#dc2626")
 EDIT_BG   = QColor("#FFFBEB")   # warm yellow — saved rows unlocked for editing
 DIRTY_BG  = QColor("#FEF3C7")   # stronger amber — a saved row that was modified
+DRAFT_BG  = QColor("#FFF7ED")   # warm orange — saved draft (not yet submitted)
 DUP_BG    = QColor("#FEE2E2")   # light red — possible duplicate flag
 MISMATCH_BG = QColor("#FEF3C7") # amber — date mismatch (submitted vs transaction date)
 

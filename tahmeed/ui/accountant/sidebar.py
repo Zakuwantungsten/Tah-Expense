@@ -43,6 +43,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     ]),
     ("CASHIER FLOW", [
         ("verify",          "Verify",            "mdi.inbox-arrow-down",             {"badge": True}),
+        ("drafts",          "Drafts",            "mdi.file-document-edit-outline",   {"badge": True}),
         ("table",           "Table",             "mdi.table-large",                  {}),
         ("browse",          "Browse",            "mdi.magnify",                      {}),
         ("master_expenses", "Master Expenses",   "mdi.table-multiple",               {}),
@@ -700,6 +701,10 @@ class SidebarWidget(QFrame):
     def set_verify_badge(self, count: int) -> None:
         if "verify" in self._items:
             self._items["verify"].set_badge(count)
+
+    def set_drafts_badge(self, count: int) -> None:
+        if "drafts" in self._items:
+            self._items["drafts"].set_badge(count)
 
     # ── Internal: top-level nav ────────────────────────────────────────────
 
