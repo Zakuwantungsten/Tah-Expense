@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QMessageBox, QAbstractItemView,
     QDialog, QFormLayout, QMenu, QWidgetAction,
     QSplitter, QStackedWidget, QSizePolicy,
-    QFileDialog,
+    QFileDialog, QListWidget, QListWidgetItem,
 )
 from PySide6.QtCore import Qt, QSize, Signal, QTimer
 from PySide6.QtGui import QColor, QBrush, QFont
@@ -31,7 +31,7 @@ from PySide6.QtGui import QColor, QBrush, QFont
 from tahmeed.models.category import Category
 from tahmeed.models.sub_table import SubTable
 from tahmeed.services.category_service import (
-    list_categories, count_categories,
+    list_categories, count_categories, get_all_categories,
     create_category, update_category,
     toggle_category, delete_category, item_key,
 )
@@ -39,6 +39,11 @@ from tahmeed.services.subtable_service import (
     get_subtables, create_subtable, update_subtable, delete_subtable,
 )
 from tahmeed.services.settings_service import get_setting, set_setting
+from tahmeed.services.export_restriction_service import (
+    EXPORT_SURFACES,
+    get_enabled_export_surfaces,
+    set_enabled_export_surfaces,
+)
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.dialogs.item_dialog import ItemDialog as _ItemDialog
@@ -602,6 +607,77 @@ class _SubItemsPanel(QWidget):
         return container
 
 
+class _ExportScopesDialog(QDialog):
+    """Multi-select export surfaces that apply restrict_in_pdf / restrict_in_excel."""
+
+    def __init__(self, enabled: set[str], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export scopes")
+        self.setMinimumWidth(520)
+        self._enabled = set(enabled)
+        self._build()
+
+    def _build(self) -> None:
+        self.setStyleSheet(f"background: {_WHITE};")
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(24, 20, 24, 20)
+        vl.setSpacing(12)
+
+        title = _lbl("Export restriction scopes", size=16, weight=600, color=_NAVY)
+        vl.addWidget(title)
+        intro = _lbl(
+            "Tick each export destination that should omit items marked "
+            "Restrict in PDF or Restrict in Excel. Item Quick Report is never affected.",
+            size=12, color=_T2,
+        )
+        intro.setWordWrap(True)
+        vl.addWidget(intro)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            f"QListWidget {{ border: 1px solid {_BORDER}; border-radius: 6px;"
+            f" font-size: 13px; font-family:'Segoe UI'; padding: 4px; }}"
+            f"QListWidget::item {{ padding: 8px 10px; border-radius: 4px; }}"
+            f"QListWidget::item:hover {{ background: {_BG}; }}"
+        )
+        for key, label in EXPORT_SURFACES.items():
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, key)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if key in self._enabled else Qt.Unchecked)
+            self._list.addItem(item)
+        vl.addWidget(self._list, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        save = QPushButton("Save scopes")
+        save.setDefault(True)
+        save.setStyleSheet(
+            f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
+            " border-radius: 5px; font-size: 13px; font-weight: 600; padding: 0 16px;"
+            " min-height: 34px; }}"
+        )
+        save.clicked.connect(self._save)
+        btn_row.addWidget(save)
+        vl.addLayout(btn_row)
+
+    def _save(self) -> None:
+        picked: list[str] = []
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.checkState() == Qt.Checked:
+                picked.append(str(item.data(Qt.UserRole)))
+        self._enabled = set(picked)
+        self.accept()
+
+    @property
+    def selected(self) -> set[str]:
+        return set(self._enabled)
+
+
 # ── ManageItemsWidget ──────────────────────────────────────────────────────────
 
 class ManageItemsWidget(QWidget):
@@ -621,19 +697,22 @@ class ManageItemsWidget(QWidget):
         ("Sidebar",      96, False, "center"),
         ("Req. Receipt", 96, False, "center"),
         ("Req. Truck",   90, False, "center"),
+        ("Excl. PDF",    80, False, "center"),
+        ("Excl. Excel",  88, False, "center"),
         ("Status",        88, False, "center"),
         ("Amount",      120, False, "right"),
         ("Actions",       56, False, "center"),
     ]
-    _ITEM_COL_DEFAULTS = [44, 260, 140, 96, 96, 90, 88, 120, 56]
-    _COL_AMOUNT = 7
-    _COL_ACTIONS = 8
+    _ITEM_COL_DEFAULTS = [44, 260, 140, 96, 96, 90, 80, 88, 88, 120, 56]
+    _COL_AMOUNT = 9
+    _COL_ACTIONS = 10
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._items: List[Category] = []
         self._visible: List[Category] = []
         self._show_inactive = False
+        self._show_export_restricted = False
         self._selected_id: Optional[ObjectId] = None
         self._page = 0
         self._total = 0
@@ -646,6 +725,8 @@ class ManageItemsWidget(QWidget):
         self._search_debounce.timeout.connect(self._on_search_commit)
         self._report_item: Optional[Category] = None
         self._build()
+        asyncio.ensure_future(self._load_initial())
+        asyncio.ensure_future(self._load_cashier_settings())
 
     # ── Build ──────────────────────────────────────────────────────────────────
 
@@ -937,6 +1018,39 @@ class ManageItemsWidget(QWidget):
         self._defer_item_btn.toggled.connect(self._on_defer_item_toggled)
         hl.addWidget(self._defer_item_btn)
 
+        self._export_restricted_btn = QPushButton("Export restricted")
+        self._export_restricted_btn.setFixedHeight(32)
+        self._export_restricted_btn.setCheckable(True)
+        self._export_restricted_btn.setCursor(Qt.PointingHandCursor)
+        self._export_restricted_btn.setToolTip(
+            "Show only items marked Restrict in PDF and/or Restrict in Excel."
+        )
+        self._export_restricted_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T2};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            f"QPushButton:checked {{ background: {_AMBER_L}; color: {_AMBER};"
+            f" border-color: {_AMBER}; }}"
+            f"QPushButton:hover:!checked {{ background: {_BG}; }}"
+        )
+        self._export_restricted_btn.toggled.connect(self._on_export_restricted_toggled)
+        hl.addWidget(self._export_restricted_btn)
+
+        scopes_btn = QPushButton("Export scopes…")
+        scopes_btn.setFixedHeight(32)
+        scopes_btn.setCursor(Qt.PointingHandCursor)
+        scopes_btn.setToolTip(
+            "Choose which export destinations honour per-item PDF/Excel restrictions."
+        )
+        scopes_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T2};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            f"QPushButton:hover {{ background: {_BG}; }}"
+        )
+        scopes_btn.clicked.connect(self._on_export_scopes)
+        hl.addWidget(scopes_btn)
+
         self._inactive_btn = QPushButton("Show Inactive")
         self._inactive_btn.setFixedHeight(32)
         self._inactive_btn.setCheckable(True)
@@ -1104,24 +1218,40 @@ class ManageItemsWidget(QWidget):
         self._page = 0
         self._loading_overlay.show_loading("Loading items…")
         try:
-            search = self._search.text().strip()
-            items, total = await asyncio.gather(
-                list_categories(
-                    search=search,
-                    include_inactive=self._show_inactive,
-                    limit=_PAGE_SIZE,
-                    skip=0,
-                ),
-                count_categories(
-                    search=search,
-                    include_inactive=self._show_inactive,
-                ),
-            )
-            self._items = list(items)
-            self._visible = list(items)
-            self._total = total
+            search = self._search.text().strip().lower()
+            if self._show_export_restricted:
+                all_items = await get_all_categories(include_inactive=self._show_inactive)
+                filtered = [
+                    item for item in all_items
+                    if item.restrict_in_pdf or item.restrict_in_excel
+                ]
+                if search:
+                    filtered = [
+                        item for item in filtered
+                        if search in (item.name or "").lower()
+                        or search in (item.description or "").lower()
+                    ]
+                self._items = filtered
+                self._visible = list(filtered)
+                self._total = len(filtered)
+            else:
+                items, total = await asyncio.gather(
+                    list_categories(
+                        search=self._search.text().strip(),
+                        include_inactive=self._show_inactive,
+                        limit=_PAGE_SIZE,
+                        skip=0,
+                    ),
+                    count_categories(
+                        search=self._search.text().strip(),
+                        include_inactive=self._show_inactive,
+                    ),
+                )
+                self._items = list(items)
+                self._visible = list(items)
+                self._total = total
             self._usage_by_name = {}
-            await self._fetch_usage_for(items)
+            await self._fetch_usage_for(self._visible)
             self._populate(reset=True)
             self._update_scroll_footer()
             self._fill_if_needed()
@@ -1133,7 +1263,7 @@ class ManageItemsWidget(QWidget):
             self._update_scroll_footer()
 
     async def _load_more(self) -> None:
-        if self._scroll_loading or self._loading:
+        if self._scroll_loading or self._loading or self._show_export_restricted:
             return
         if len(self._visible) >= self._total:
             return
@@ -1315,13 +1445,25 @@ class ManageItemsWidget(QWidget):
             _GREEN if item.requires_truck else _TM, row_bg,
         ))
 
-        # Col 6: status
+        # Col 6: exclude from PDF export
         self._table.setItem(i, 6, _status_item(
+            "Yes" if item.restrict_in_pdf else "No",
+            _AMBER if item.restrict_in_pdf else _TM, row_bg,
+        ))
+
+        # Col 7: exclude from Excel export
+        self._table.setItem(i, 7, _status_item(
+            "Yes" if item.restrict_in_excel else "No",
+            _AMBER if item.restrict_in_excel else _TM, row_bg,
+        ))
+
+        # Col 8: status
+        self._table.setItem(i, 8, _status_item(
             "Active" if item.active else "Inactive",
             _GREEN if item.active else _RED, row_bg,
         ))
 
-        # Col 7: amount used (lifetime, always positive, black)
+        # Col 9: amount used (lifetime, always positive, black)
         usage = self._usage_by_name.get((item.name or "").strip().lower(), {})
         tzs_used = abs(float(usage.get("tzs") or 0.0))
         amt_it = QTableWidgetItem(f"{tzs_used:,.0f}" if tzs_used else "—")
@@ -1332,7 +1474,7 @@ class ManageItemsWidget(QWidget):
         amt_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
         self._table.setItem(i, self._COL_AMOUNT, amt_it)
 
-        # Col 8: actions
+        # Col 10: actions
         self._table.setCellWidget(i, self._COL_ACTIONS, self._action_btns(item, row_bg))
         self._table.setRowHeight(i, _ROW_H)
 
@@ -1355,6 +1497,28 @@ class ManageItemsWidget(QWidget):
         self._show_inactive = checked
         self._page = 0
         self.refresh()
+
+    def _on_export_restricted_toggled(self, checked: bool) -> None:
+        self._show_export_restricted = checked
+        self._page = 0
+        self.refresh()
+
+    def _on_export_scopes(self) -> None:
+        asyncio.ensure_future(self._do_export_scopes())
+
+    async def _do_export_scopes(self) -> None:
+        try:
+            enabled = await get_enabled_export_surfaces()
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to load export scopes:\n{exc}")
+            return
+        dlg = _ExportScopesDialog(enabled, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        try:
+            await set_enabled_export_surfaces(sorted(dlg.selected))
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to save export scopes:\n{exc}")
 
     def _on_import_coa(self) -> None:
         asyncio.ensure_future(self._do_import_coa())
@@ -1425,6 +1589,8 @@ class ManageItemsWidget(QWidget):
                 show_in_sidebar=data.get("show_in_sidebar", False),
                 show_in_cashier_sidebar=data.get("show_in_cashier_sidebar", False),
                 lock_description=data.get("lock_description", False),
+                restrict_in_pdf=data.get("restrict_in_pdf", False),
+                restrict_in_excel=data.get("restrict_in_excel", False),
             )
             self._selected_id = cat._id
             await self._load()

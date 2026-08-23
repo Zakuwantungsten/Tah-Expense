@@ -97,6 +97,8 @@ async def _create_category(
     show_in_cashier_sidebar: bool = False,
     sort_order: int = 0,
     lock_description: bool = False,
+    restrict_in_pdf: bool = False,
+    restrict_in_excel: bool = False,
 ) -> Category:
     document = await api_client.request(
         "POST",
@@ -113,6 +115,8 @@ async def _create_category(
             "requires_receipt": requires_receipt,
             "requires_truck": requires_truck,
             "lock_description": lock_description,
+            "restrict_in_pdf": restrict_in_pdf,
+            "restrict_in_excel": restrict_in_excel,
         },
     )
     return _category(document)
@@ -130,6 +134,8 @@ async def create_category(
     show_in_cashier_sidebar: bool = False,
     sort_order: int = 0,
     lock_description: bool = False,
+    restrict_in_pdf: bool = False,
+    restrict_in_excel: bool = False,
 ) -> Category:
     return await _create_category(
         "v1/categories",
@@ -144,6 +150,8 @@ async def create_category(
         show_in_cashier_sidebar,
         sort_order,
         lock_description,
+        restrict_in_pdf,
+        restrict_in_excel,
     )
 
 

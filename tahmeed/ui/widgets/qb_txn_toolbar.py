@@ -44,6 +44,7 @@ class QbTxnToolbar(QFrame):
     today_clicked = Signal()
     edit_clicked = Signal()
     submit_clicked = Signal()
+    clear_table_clicked = Signal()
 
     def __init__(
         self,
@@ -158,6 +159,7 @@ class QbTxnToolbar(QFrame):
         self._btn_new = self._tool_btn("mdi.file-plus-outline", "New", "New entry")
         self._btn_save = self._tool_btn("mdi.content-save-outline", "Save", "Save")
         self._btn_delete = self._tool_btn("mdi.close-box-outline", "Delete", "Delete entry")
+        self._btn_clear_table: Optional[QToolButton] = None
         self._btn_copy = self._tool_btn("mdi.content-copy", "Create a Copy", "Duplicate entry")
         self._btn_new.clicked.connect(self.new_clicked.emit)
         self._btn_save.clicked.connect(self.save_clicked.emit)
@@ -165,6 +167,15 @@ class QbTxnToolbar(QFrame):
         self._btn_copy.clicked.connect(self.copy_clicked.emit)
         for b in (self._btn_new, self._btn_save, self._btn_delete, self._btn_copy):
             lay.addWidget(b)
+
+        if register_actions:
+            self._btn_clear_table = self._tool_btn(
+                "mdi.table-remove",
+                "Clear Table",
+                "Clear all unsaved rows and typed data (saved entries stay)",
+            )
+            self._btn_clear_table.clicked.connect(self.clear_table_clicked.emit)
+            lay.addWidget(self._btn_clear_table)
 
         lay.addWidget(self._sep())
 

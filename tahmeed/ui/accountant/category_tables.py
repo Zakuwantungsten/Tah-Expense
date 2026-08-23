@@ -697,6 +697,20 @@ class CategoryTableWidget(QWidget):
                 await notify_export_info(self, "Export", "No records to export.")
                 return
 
+            from tahmeed.services.export_restriction_service import (
+                filter_transactions_for_export,
+            )
+
+            txs = await filter_transactions_for_export(
+                txs, surface="category_tables", fmt="excel",
+            )
+            if not txs:
+                await notify_export_info(
+                    self, "Export",
+                    "All records belong to items restricted from Excel export.",
+                )
+                return
+
             month_tag = dict(_MONTHS).get(self._month, "All").replace(" ", "")
             safe_title = self._title.replace(" ", "_").replace("&", "and").replace("/", "-")
             default = f"{safe_title}_FY{self._year}_{month_tag}.xlsx"

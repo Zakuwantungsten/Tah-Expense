@@ -167,6 +167,10 @@ class TruckCorrectionDialog(QDialog):
             f"QDialog {{ background: {_BG}; color: {_T1}; }}"
             f"QLabel {{ border: none; background: transparent; color: {_T1}; }}"
             "QFrame { border: none; }"
+            "QToolTip {"
+            f" background-color: {_WHITE}; color: {_T1};"
+            f" border: 1px solid {_BORDER}; border-radius: 4px;"
+            " padding: 6px 10px; font-size: 12px; }"
         )
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -194,7 +198,8 @@ class TruckCorrectionDialog(QDialog):
         else:
             intro_text = (
                 "All flagged trucks are listed here. Fix one, accept a place label "
-                "(YARD / GARAGE), or clear it — it will leave the list. "
+                "(YARD / GARAGE), allow a partner truck that is not in your fleet, "
+                "or clear it — it will leave the list. "
                 "Applying a fix can also update every other row with the same pasted value. "
                 "When nothing remains, this window closes."
             )
@@ -238,12 +243,12 @@ class TruckCorrectionDialog(QDialog):
             skip_all.setStyleSheet(_BTN_SECONDARY)
             skip_all.clicked.connect(self._skip_all_remaining)
             footer.addWidget(skip_all)
-            allow_all = QPushButton("Allow all remaining")
-            allow_all.setCursor(Qt.PointingHandCursor)
-            allow_all.setFixedHeight(_CTRL_H)
-            allow_all.setStyleSheet(_BTN_ORANGE)
-            allow_all.clicked.connect(self._allow_all_remaining)
-            footer.addWidget(allow_all)
+        allow_all = QPushButton("Allow all remaining")
+        allow_all.setCursor(Qt.PointingHandCursor)
+        allow_all.setFixedHeight(_CTRL_H)
+        allow_all.setStyleSheet(_BTN_ORANGE)
+        allow_all.clicked.connect(self._allow_all_remaining)
+        footer.addWidget(allow_all)
         footer.addStretch()
         done_btn = QPushButton("Done")
         done_btn.setDefault(True)
@@ -547,15 +552,17 @@ class TruckCorrectionDialog(QDialog):
         apply_btn.setFixedHeight(_CTRL_H)
         apply_btn.setStyleSheet(_BTN_PRIMARY)
 
-        allow_btn = None
+        allow_btn = QPushButton("Allow anyway")
+        allow_btn.setToolTip(
+            "Keep this truck on the row even though it is not in your fleet "
+            "(e.g. a partner vehicle)"
+        )
+        allow_btn.setCursor(Qt.PointingHandCursor)
+        allow_btn.setFixedHeight(_CTRL_H)
+        allow_btn.setStyleSheet(_BTN_ORANGE)
         skip_row_btn = None
         clear_btn = None
         if self._import_mode:
-            allow_btn = QPushButton("Allow anyway")
-            allow_btn.setToolTip("Import this row even if the truck is not in the fleet")
-            allow_btn.setCursor(Qt.PointingHandCursor)
-            allow_btn.setFixedHeight(_CTRL_H)
-            allow_btn.setStyleSheet(_BTN_ORANGE)
             skip_row_btn = QPushButton("Skip row")
             skip_row_btn.setToolTip("Park this row in Skipped — other rows still import")
             skip_row_btn.setCursor(Qt.PointingHandCursor)
@@ -563,6 +570,7 @@ class TruckCorrectionDialog(QDialog):
             skip_row_btn.setStyleSheet(_BTN_SECONDARY)
         else:
             clear_btn = QPushButton("Clear")
+            clear_btn.setToolTip("Clear the truck cell and remove this row from the list")
             clear_btn.setCursor(Qt.PointingHandCursor)
             clear_btn.setFixedHeight(_CTRL_H)
             clear_btn.setStyleSheet(_BTN_SECONDARY)
@@ -1021,15 +1029,23 @@ class TruckCorrectionDialog(QDialog):
                     self,
                     "Two trailers",
                     f'This row has two trailers:\n"{rw.issue.original}"\n\n'
-                    "Allow it anyway for this import?",
+                    + (
+                        "Allow it anyway for this import?"
+                        if self._import_mode
+                        else "Allow it anyway on this row?"
+                    ),
                 )
             else:
                 reply = show_question(
                     self,
                     "Not in vehicle registry",
-                    f'Your allowed truck "{value}" is not in the vehicle registry '
+                    f'"{value}" is not in your fleet registry '
                     "(trucks, trailers, or motorcycles & cars).\n\n"
-                    "Allow it anyway for this import?",
+                    + (
+                        "Allow it anyway for this import?"
+                        if self._import_mode
+                        else "Allow this partner / non-fleet truck anyway?"
+                    ),
                 )
             if reply != QMessageBox.Yes:
                 rw.edit.setFocus()

@@ -27,6 +27,7 @@ Save:
 
 import asyncio
 import csv
+import time
 from datetime import datetime, date
 from typing import List, Optional
 
@@ -38,10 +39,12 @@ from PySide6.QtWidgets import (
     QStyle, QComboBox, QDialog, QFrame, QListWidget, QListWidgetItem, QPushButton,
 )
 from PySide6.QtCore import (
-    Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer,
+    Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer, QEventLoop,
     QItemSelection, QItemSelectionModel,
 )
-from PySide6.QtGui import QAction, QKeyEvent, QColor, QBrush, QFont, QPen, QPainter
+from PySide6.QtGui import (
+    QAction, QKeyEvent, QColor, QBrush, QFont, QPen, QPainter, QMouseEvent, QCursor,
+)
 
 from tahmeed.models.category import Category
 from tahmeed.models.transaction import Transaction, pack_money
@@ -89,6 +92,7 @@ from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
     DEFAULT_EDITABLE_ROWS, _REF_FLOAT_OPTS, _COL_PREFERRED, _COL_FLEX, _COL_MIN,
     _is_refund_float, _ref_float_text, _parse_optional_date, format_register_date,
     SAVED_BG, NEW_BG, EMPTY_BG, NEG_COLOR, EDIT_BG, DIRTY_BG, DRAFT_BG, DUP_BG, MISMATCH_BG,
+    TRUCK_REQUIRED_BG,
     _FOOTER_BTN_STYLE,
     _accept_editor_completion, _upper_text,
     _ExcelCellDelegate, _DescriptionDelegate, _TruckDelegate, _DateDelegate,
@@ -98,7 +102,7 @@ from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
     _RCPT_COLORS, _RCPT_LABEL, _RECEIPT_OPTS, _RCPT_OPT_KEY, _RCPT_NORM, _VALID_RCPT,
 )
 
-_ROWS_CLIP_PREFIX = "TAHMEED_ROWS_V1\n"
+from tahmeed.ui.cashier.excel_cursors import excel_hover_cursor, excel_drag_cursor
 
 
 def _amount_item_from_raw(raw: str) -> QTableWidgetItem:
@@ -106,8 +110,6 @@ def _amount_item_from_raw(raw: str) -> QTableWidgetItem:
     text = f"{amt:,.2f}" if (raw or "").strip() else ""
     it = QTableWidgetItem(text)
     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-    if amt < 0:
-        it.setForeground(NEG_COLOR)
     return it
 
 
@@ -118,11 +120,9 @@ def _display_money_cells(tx: Transaction) -> tuple[str, str]:
     return tzs_txt, usd_txt
 
 
-def _money_item(text: str, amount: float) -> QTableWidgetItem:
+def _money_item(text: str) -> QTableWidgetItem:
     it = QTableWidgetItem(text)
     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-    if amount < 0:
-        it.setForeground(NEG_COLOR)
     return it
 
 
@@ -147,21 +147,406 @@ class _TableKeyFilter(QObject):
 # Table with Excel-like S/NO row selection
 # ---------------------------------------------------------------------------
 
-class _ExcelTableWidget(QTableWidget):
-    """QTableWidget that selects full rows when the S/NO column is clicked.
+_ROWS_CLIP_PREFIX = "TAHMEED_ROWS_V1\n"
+_FILL_HANDLE_SIZE = 7
+_FILL_HANDLE_HIT = 14   # corner target for hover / click / drag start
+# Excel autofill preview — green tint + ghost values (distinct from normal selection)
+_FILL_RANGE_BORDER = QPen(QColor("#217346"), 2, Qt.DashLine)
 
-    Other columns keep normal contiguous cell-range selection (copy/paste).
-    Clicking or dragging S/NO behaves like Excel's row-number gutter.
-    """
+
+class _ExcelTableViewport(QWidget):
+    """Table viewport that paints the Excel fill handle and drag preview."""
+
+    def __init__(self, table: "_ExcelTableWidget") -> None:
+        super().__init__(table)
+        self._table = table
+
+    def mouseMoveEvent(self, event) -> None:
+        table = self._table
+        if table._fill_dragging and (event.buttons() & Qt.LeftButton):
+            table._update_fill_drag_end(table._viewport_pos(event))
+            table.setCursor(table._drag_cursor)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        table = self._table
+        if table._fill_dragging and event.button() == Qt.LeftButton:
+            pos = table._viewport_pos(event)
+            table._update_fill_drag_end(pos)
+            table._finish_fill_drag(pos)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        try:
+            self._table._paint_excel_overlay(painter)
+        finally:
+            painter.end()
+
+
+class _ExcelTableWidget(QTableWidget):
+    """Excel-like grid: row gutter, cell cross cursor, fill handle + drag fill."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._grid_owner = None
         self._sn_dragging = False
         self._sn_anchor_row = -1
+        self._fill_dragging = False
+        self._fill_anchor: tuple[int, int, int, int] | None = None
+        self._fill_end: tuple[int, int] | None = None
+        self._cursor_zone = "arrow"
+        self.setViewport(_ExcelTableViewport(self))
+        self.viewport().setMouseTracking(True)
+        self.setMouseTracking(True)
+        self._hover_cursor = excel_hover_cursor()
+        self._drag_cursor = excel_drag_cursor()
 
-    def mousePressEvent(self, event):
+    def leaveEvent(self, event) -> None:
+        self.unsetCursor()
+        self._cursor_zone = "arrow"
+        super().leaveEvent(event)
+
+    def _owner(self):
+        return getattr(self, "_grid_owner", None)
+
+    def _selection_bounds(self) -> tuple[int, int, int, int] | None:
+        indexes = self.selectedIndexes()
+        if not indexes:
+            cur = self.currentIndex()
+            if not cur.isValid():
+                return None
+            r, c = cur.row(), cur.column()
+            return r, c, r, c
+        rows = [i.row() for i in indexes]
+        cols = [i.column() for i in indexes]
+        return min(rows), min(cols), max(rows), max(cols)
+
+    def _selection_viewport_rect(self) -> QRect | None:
+        bounds = self._selection_bounds()
+        if bounds is None:
+            return None
+        r0, c0, r1, c1 = bounds
+        tl = self.visualRect(self.model().index(r0, c0))
+        br = self.visualRect(self.model().index(r1, c1))
+        if not tl.isValid() or not br.isValid():
+            return None
+        return tl.united(br)
+
+    def _fill_handle_rect(self) -> QRect | None:
+        owner = self._owner()
+        if owner is None or not self._fill_handle_enabled():
+            return None
+        sel = self._selection_viewport_rect()
+        if sel is None or sel.width() <= 0 or sel.height() <= 0:
+            return None
+        size = _FILL_HANDLE_SIZE
+        return QRect(
+            sel.right() - size + 2,
+            sel.bottom() - size + 2,
+            size,
+            size,
+        )
+
+    def _fill_handle_enabled(self) -> bool:
+        owner = self._owner()
+        bounds = self._selection_bounds()
+        if owner is None or bounds is None:
+            return False
+        r0, c0, r1, c1 = bounds
+        for row in range(r0, r1 + 1):
+            for col in range(c0, c1 + 1):
+                if col in READONLY_COLS or col == COL_SNO:
+                    continue
+                if owner._cell_editable(row, col):
+                    return True
+        return False
+
+    def _viewport_pos(self, pos) -> QPoint:
+        if hasattr(pos, "position"):
+            return pos.position().toPoint()
+        return pos
+
+    def _cell_at_viewport_pos(self, pos) -> tuple[int, int] | None:
+        """Row/col under *pos* (viewport coords), even for empty cells."""
+        pt = self._viewport_pos(pos)
+        row = self.rowAt(pt.y())
+        col = self.columnAt(pt.x())
+        if col < 0 and self.columnCount():
+            col = self.columnAt(max(0, min(pt.x(), self.viewport().width() - 1)))
+        if row < 0 and self.rowCount():
+            if pt.y() >= self.viewport().height() - 2:
+                row = self.rowCount() - 1
+            elif pt.y() <= 0:
+                row = 0
+        if row < 0 or col < 0:
+            return None
+        return row, col
+
+    def _fill_handle_hit_rect(self) -> QRect | None:
+        """Bottom-right corner hit zone — cursor + click (wider than the painted square)."""
+        sel = self._selection_viewport_rect()
+        if sel is None or not self._fill_handle_enabled():
+            return None
+        hit = _FILL_HANDLE_HIT
+        return QRect(
+            sel.right() - hit + 1,
+            sel.bottom() - hit + 1,
+            hit,
+            hit,
+        )
+
+    def _pos_in_fill_handle(self, pos) -> bool:
+        hit = self._fill_handle_hit_rect()
+        return hit is not None and hit.contains(self._viewport_pos(pos))
+
+    def _wants_fill_drag(self, pos) -> bool:
+        return self._pos_in_fill_handle(pos) or self._cursor_zone == "fill"
+
+    def _begin_fill_drag(self, pos) -> bool:
+        if not self._wants_fill_drag(pos) or not self._fill_handle_enabled():
+            return False
+        bounds = self._selection_bounds()
+        if bounds is None:
+            return False
+        r0, c0, r1, c1 = bounds
+        self._fill_dragging = True
+        self._fill_anchor = bounds
+        self._fill_end = (r1, c1)
+        self._cursor_zone = "drag"
+        self.setCursor(self._drag_cursor)
+        self.viewport().grabMouse()
+        self._refresh_fill_drag_visual()
+        return True
+
+    def _is_fill_extension_cell(self, row: int, col: int) -> bool:
+        if not self._fill_dragging or self._fill_anchor is None or self._fill_end is None:
+            return False
+        r0, c0, r1, c1 = self._fill_anchor
+        er, ec = self._fill_end
+        er = max(r1, er)
+        ec = max(c1, ec)
+        if er <= r1 and ec <= c1:
+            return False
+        if row < r0 or row > er or col < c0 or col > ec:
+            return False
+        return not (r0 <= row <= r1 and c0 <= col <= c1)
+
+    def _update_fill_drag_end(self, pos) -> None:
+        if self._fill_anchor is None:
+            return
+        cell = self._cell_at_viewport_pos(pos)
+        if cell is None:
+            return
+        _r0, _c0, r1, c1 = self._fill_anchor
+        row, col = cell
+        self._fill_end = (max(row, r1), max(col, c1))
+        self._restore_fill_source_selection()
+        self._auto_scroll_for_fill(self._viewport_pos(pos))
+        self._refresh_fill_drag_visual()
+
+    def _refresh_fill_drag_visual(self) -> None:
+        """Force an immediate paint pass so fill preview shows while dragging."""
+        self.viewport().repaint()
+
+    def _fill_drag_target_bounds(self) -> tuple[int, int, int, int] | None:
+        if not self._fill_dragging or self._fill_anchor is None or self._fill_end is None:
+            return None
+        r0, c0, r1, c1 = self._fill_anchor
+        er, ec = self._fill_end
+        er = max(r1, er)
+        ec = max(c1, ec)
+        return r0, c0, er, ec
+
+    def _restore_fill_source_selection(self) -> None:
+        """Keep the original source block highlighted while previewing the extension."""
+        if self._fill_anchor is None:
+            return
+        r0, c0, r1, c1 = self._fill_anchor
+        sel = QItemSelection(
+            self.model().index(r0, c0),
+            self.model().index(r1, c1),
+        )
+        self.selectionModel().select(sel, QItemSelectionModel.ClearAndSelect)
+
+    def _select_fill_result_range(self, anchor, end) -> None:
+        r0, c0, r1, c1 = anchor
+        er, ec = end
+        er = max(r1, er)
+        ec = max(c1, ec)
+        sel = QItemSelection(
+            self.model().index(r0, c0),
+            self.model().index(er, ec),
+        )
+        self.selectionModel().select(sel, QItemSelectionModel.ClearAndSelect)
+
+    def _fill_preview_source_coords(
+        self, row: int, col: int,
+    ) -> tuple[int, int] | None:
+        if self._fill_anchor is None:
+            return None
+        r0, c0, r1, c1 = self._fill_anchor
+        sel_h = r1 - r0 + 1
+        sel_w = c1 - c0 + 1
+        return r0 + (row - r0) % sel_h, c0 + (col - c0) % sel_w
+
+    def _fill_preview_display_text(self, row: int, col: int) -> str:
+        owner = self._owner()
+        if owner is not None and (
+            col in READONLY_COLS
+            or col == COL_SNO
+            or not owner._cell_editable(row, col)
+        ):
+            return ""
+        src = self._fill_preview_source_coords(row, col)
+        if src is None:
+            return ""
+        src_row, src_col = src
+        item = self.item(src_row, src_col)
+        if item is None:
+            return ""
+        if src_col in CHECK_COLS:
+            return "✓" if item.data(Qt.UserRole) else ""
+        return item.text()
+
+    def _fill_preview_text_align(self, col: int) -> int:
+        if col in (COL_TZS, COL_USD, COL_REF):
+            return int(Qt.AlignRight | Qt.AlignVCenter)
+        return int(Qt.AlignLeft | Qt.AlignVCenter)
+
+    def _auto_scroll_for_fill(self, pos) -> None:
+        vp = self.viewport()
+        margin = 20
+        bounds = self._fill_drag_target_bounds()
+        if bounds is None:
+            return
+        _r0, _c0, er, ec = bounds
+        if pos.y() >= vp.height() - margin and er < self.rowCount() - 1:
+            self.scrollTo(
+                self.model().index(er + 1, ec),
+                QAbstractItemView.EnsureVisible,
+            )
+        elif pos.y() <= margin and er > self._fill_anchor[0]:
+            self.scrollTo(
+                self.model().index(max(self._fill_anchor[0], er - 1), ec),
+                QAbstractItemView.EnsureVisible,
+            )
+
+    def _finish_fill_drag(self, pos) -> None:
+        owner = self._owner()
+        anchor = self._fill_anchor
+        end = self._fill_end
+        if owner is not None and anchor is not None and end is not None:
+            owner._apply_fill_drag(anchor, end)
+            self._select_fill_result_range(anchor, end)
+        self._fill_dragging = False
+        self._fill_anchor = None
+        self._fill_end = None
+        self.viewport().releaseMouse()
+        self.viewport().update()
+        self._update_hover_cursor(pos)
+
+    def _update_hover_cursor(self, pos, buttons=Qt.NoButton) -> None:
+        pos = self._viewport_pos(pos)
+        if self._fill_dragging:
+            zone = "drag"
+        elif self._sn_dragging:
+            zone = "arrow"
+        elif buttons & Qt.LeftButton:
+            index = self.indexAt(pos)
+            if index.isValid() and index.column() != COL_SNO:
+                zone = "drag"
+            else:
+                zone = "arrow"
+        elif self._pos_in_fill_handle(pos):
+            zone = "fill"
+        else:
+            index = self.indexAt(pos)
+            if index.isValid() and index.column() == COL_SNO:
+                zone = "arrow"
+            elif index.isValid():
+                zone = "hover"
+            else:
+                zone = "arrow"
+        if zone == self._cursor_zone:
+            return
+        old_zone = self._cursor_zone
+        self._cursor_zone = zone
+        if zone == "hover":
+            self.setCursor(self._hover_cursor)
+        elif zone in ("fill", "drag"):
+            self.setCursor(self._drag_cursor)
+        else:
+            self.unsetCursor()
+        if old_zone == "fill" or zone == "fill":
+            self.viewport().update()
+
+    def _paint_excel_overlay(self, painter: QPainter) -> None:
+        handle = self._fill_handle_rect()
+        show_handle = (
+            handle is not None
+            and not self._fill_dragging
+            and self._cursor_zone == "fill"
+        )
+        if show_handle:
+            painter.save()
+            painter.setPen(QPen(QColor("#111827"), 1))
+            painter.setBrush(QColor("#ffffff"))
+            painter.drawRect(handle.adjusted(0, 0, -1, -1))
+            painter.restore()
+
+        if self._fill_dragging:
+            self._paint_fill_drag_preview(painter)
+
+    def _paint_fill_drag_preview(self, painter: QPainter) -> None:
+        """Dashed outline around the full autofill range (cells painted by delegate)."""
+        if self._fill_anchor is None or self._fill_end is None:
+            return
+        r0, c0, r1, c1 = self._fill_anchor
+        er, ec = self._fill_end
+        er = max(r1, er)
+        ec = max(c1, ec)
+        if er <= r1 and ec <= c1:
+            return
+
+        tl = self.visualRect(self.model().index(r0, c0))
+        br = self.visualRect(self.model().index(er, ec))
+        if tl.isNull() or br.isNull():
+            return
+        full = tl.united(br)
+
+        painter.save()
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(_FILL_RANGE_BORDER)
+        painter.drawRect(full.adjusted(0, 0, -1, -1))
+        painter.restore()
+
+    def _fill_preview_rect(self) -> QRect | None:
+        bounds = self._fill_drag_target_bounds()
+        if bounds is None:
+            return None
+        r0, c0, er, ec = bounds
+        if er <= self._fill_anchor[2] and ec <= self._fill_anchor[3]:
+            return None
+        tl = self.visualRect(self.model().index(r0, c0))
+        br = self.visualRect(self.model().index(er, ec))
+        if tl.isNull() or br.isNull():
+            return None
+        return tl.united(br)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        pos = self._viewport_pos(event)
+        if event.button() == Qt.LeftButton and self._begin_fill_drag(pos):
+            event.accept()
+            return
+
         if event.button() == Qt.LeftButton:
-            index = self.indexAt(event.pos())
+            index = self.indexAt(pos)
             if index.isValid() and index.column() == COL_SNO:
                 row = index.row()
                 self._sn_dragging = True
@@ -170,24 +555,47 @@ class _ExcelTableWidget(QTableWidget):
                 else:
                     self._sn_anchor_row = row
                     self._select_sn_rows(row, row)
+                self.unsetCursor()
                 return
+
         self._sn_dragging = False
         super().mousePressEvent(event)
         cur = self.currentIndex()
         if cur.isValid() and not (event.modifiers() & Qt.ShiftModifier):
             self._sn_anchor_row = cur.row()
+        self._update_hover_cursor(pos)
+        self.viewport().update()
 
-    def mouseMoveEvent(self, event):
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        pos = self._viewport_pos(event)
+        if self._fill_dragging and (event.buttons() & Qt.LeftButton):
+            self._update_fill_drag_end(pos)
+            self.setCursor(self._drag_cursor)
+            event.accept()
+            return
+
         if self._sn_dragging and (event.buttons() & Qt.LeftButton):
-            index = self.indexAt(event.pos())
+            index = self.indexAt(pos)
             if index.isValid() and self._sn_anchor_row >= 0:
                 self._select_sn_rows(self._sn_anchor_row, index.row())
+            self.unsetCursor()
             return
-        super().mouseMoveEvent(event)
 
-    def mouseReleaseEvent(self, event):
+        super().mouseMoveEvent(event)
+        self._update_hover_cursor(pos, event.buttons())
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        pos = self._viewport_pos(event)
+        if self._fill_dragging and event.button() == Qt.LeftButton:
+            self._update_fill_drag_end(pos)
+            self._finish_fill_drag(pos)
+            event.accept()
+            return
+
         self._sn_dragging = False
         super().mouseReleaseEvent(event)
+        self._update_hover_cursor(pos)
+        self.viewport().update()
 
     def _select_sn_rows(self, row_a: int, row_b: int) -> None:
         """Select every column in the contiguous row range (Excel row gutter)."""
@@ -439,6 +847,7 @@ class DailyRegister(QWidget):
         self._cat_by_name: dict = {c.name.lower(): c for c in categories}
         self._locked_subitems: dict = {}   # item name (lower) -> [sub-item names]
         self._restrict_items: bool = False
+        self._export_restrict_surfaces: set = set()
         self._defer_item_to_verify: bool = False
         self._restrict_trucks: bool = True  # always on — only registered fleet numbers
         self._fleet_numbers: set = set()   # uppercased valid fleet numbers
@@ -469,6 +878,8 @@ class DailyRegister(QWidget):
         self._suppress_truck_dialog: bool = False
         # Coalesce truck issues into one combined dialog (paste / import / edit).
         self._pending_truck_issues: dict = {}  # row -> TruckIssue
+        # row -> partner/non-fleet truck accepted via "Allow anyway"
+        self._truck_allow_anyway: dict[int, str] = {}
         self._truck_dialog_scheduled: bool = False
         self._open_truck_dialog: object = None
         # Excel cut marquee (cells stay until paste / Insert Cut Cells / Esc)
@@ -480,7 +891,15 @@ class DailyRegister(QWidget):
         self._redo_stack: list = []
         self._undo_limit: int = 100
         self._undo_redo_active: bool = False
-        self._pending_cell_edit: tuple | None = None  # (row, col, serialized value)
+        # Row-level edit transaction: snapshot whole row so side effects
+        # (S/N, Date, Item auto-fill) undo together with the edited cell.
+        self._pending_row_edit: dict | None = None
+        self._closing_row_edit: dict | None = None
+        self._auto_fill_row: int | None = None
+        self._edit_finalize_timer = QTimer(self)
+        self._edit_finalize_timer.setSingleShot(True)
+        self._edit_finalize_timer.setInterval(50)
+        self._edit_finalize_timer.timeout.connect(self._finalize_pending_row_edit)
         # Re-entrancy guards — prevent double-click duplicate inserts.
         self._save_in_flight = False
         self._submit_in_flight = False
@@ -549,7 +968,6 @@ class DailyRegister(QWidget):
             }
             QTableWidget::item         { padding: 2px 6px; color: #111827; }
             QTableWidget::item:selected { color: #1B2B4B; font-weight: 500; }
-            QTableWidget::item:hover   { background: #eaf3fb; }
             QLineEdit { color: #111827; background: #ffffff; }
         """)
 
@@ -572,6 +990,9 @@ class DailyRegister(QWidget):
         self._table.verticalHeader().setDefaultSectionSize(28)
         self._table.verticalHeader().setVisible(False)
         self._table.setTabKeyNavigation(False)
+        sm = self._table.selectionModel()
+        sm.selectionChanged.connect(lambda *_: self._table.viewport().update())
+        sm.currentChanged.connect(lambda *_: self._table.viewport().update())
 
         # Excel selection model on every column; per-column delegates override as needed
         self._table.setItemDelegate(_ExcelCellDelegate(self._table))
@@ -954,6 +1375,7 @@ class DailyRegister(QWidget):
             self._pending_highlight = ""
             # Small delay so Qt finishes laying out the rows before we scroll.
             QTimer.singleShot(80, lambda: self.scroll_and_highlight(term))
+        self._refresh_truck_required_highlights()
 
     # ------------------------------------------------------------------
     # Row initialisation helpers
@@ -1002,10 +1424,9 @@ class DailyRegister(QWidget):
         self._table.setItem(row, COL_MEMO,  saved_item(tx.memo or ""))
         self._table.setItem(row, COL_REF,   saved_item(_ref_float_text(tx)))
 
-        tzs_amt, usd_amt = tx.money_parts()
         tzs_txt, usd_txt = _display_money_cells(tx)
-        self._table.setItem(row, COL_TZS, _money_item(tzs_txt, tzs_amt))
-        self._table.setItem(row, COL_USD, _money_item(usd_txt, usd_amt))
+        self._table.setItem(row, COL_TZS, _money_item(tzs_txt))
+        self._table.setItem(row, COL_USD, _money_item(usd_txt))
 
         # Receipt
         rcpt_it = saved_item(tx.receipt_status or "pending")
@@ -1151,9 +1572,19 @@ class DailyRegister(QWidget):
             description = description.upper()
 
         truck_raw = txt(COL_TRUCK)
+        if cat is not None and getattr(cat, "requires_truck", True) and not truck_raw:
+            raise ValueError(
+                f'Truck number is required for item "{item_name}".'
+            )
         truck_number = ""
         if truck_raw:
-            if is_allowed_place_label(truck_raw, self._allowed_truck_labels):
+            allowed_anyway = self._truck_allow_anyway.get(row)
+            if (
+                allowed_anyway
+                and self._truck_key(truck_raw) == self._truck_key(allowed_anyway)
+            ):
+                truck_number = allowed_anyway
+            elif is_allowed_place_label(truck_raw, self._allowed_truck_labels):
                 truck_number = normalize_place_label(truck_raw)
             else:
                 matched = try_match_fleet(truck_raw, self._fleet_numbers)
@@ -1255,6 +1686,7 @@ class DailyRegister(QWidget):
         self._table.blockSignals(False)
         self.edit_state_changed.emit(True, 0)
         self._emit_active_payee_cheque()
+        self._refresh_truck_required_highlights()
 
     def _exit_edit_mode(self, discard: bool) -> None:
         """Leave edit mode. When discard is True the date is reloaded so the grid
@@ -1395,6 +1827,7 @@ class DailyRegister(QWidget):
         self._table.blockSignals(False)
         self.edit_state_changed.emit(True, len(self._dirty_rows))
         self._schedule_draft_autosave()
+        self._update_truck_required_highlight(row)
 
     def _updates_from_row(self, row: int) -> Optional[dict]:
         """Build the $set payload for an edited saved row from its cell values.
@@ -1463,6 +1896,12 @@ class DailyRegister(QWidget):
             QMessageBox.information(self, "Nothing to export",
                                     "There are no visible rows to export.")
             return
+        rows = self._apply_export_restriction(rows, fmt)
+        if not rows:
+            QMessageBox.information(self, "Nothing to export",
+                                    "All visible rows belong to items restricted "
+                                    f"from {fmt.upper()} export.")
+            return
         try:
             if fmt == "pdf":
                 self._write_pdf(path, rows)
@@ -1501,6 +1940,21 @@ class DailyRegister(QWidget):
                     rec.append(it.text().strip() if it else "")
             out.append(rec)
         return out
+
+    def _apply_export_restriction(self, rows: List[list], fmt: str) -> List[list]:
+        from tahmeed.services.export_restriction_service import (
+            filter_register_rows,
+            restricted_names_from_categories,
+        )
+
+        if "cashier_register" not in getattr(self, "_export_restrict_surfaces", set()):
+            return rows
+        export_fmt = "pdf" if fmt == "pdf" else "excel"
+        restricted = restricted_names_from_categories(self._categories, export_fmt)
+        if not restricted:
+            return rows
+        item_idx = self._EXPORT_COLS.index(COL_ITEM)
+        return filter_register_rows(rows, item_col_index=item_idx, restricted=restricted)
 
     def _write_csv(self, path: str, rows: List[list]) -> None:
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
@@ -1778,6 +2232,14 @@ class DailyRegister(QWidget):
                         0, lambda r=row, d=desc: self._kick_auto_fill_item(r, d)
                     )
             self._mark_dirty(row)
+            if col == COL_ITEM:
+                self._validate_item_cell(row, item)
+            elif col == COL_DESC and item.text().strip():
+                self._validate_locked_description(row, item)
+            elif col == COL_TRUCK and item.text().strip():
+                self._validate_truck_cell(row, item)
+            if col in (COL_ITEM, COL_DESC, COL_TRUCK):
+                self._update_truck_required_highlight(row)
             if col == COL_TZS or col == COL_USD:
                 self._update_footer()
             return
@@ -1803,7 +2265,7 @@ class DailyRegister(QWidget):
             self._table.blockSignals(False)
 
         # Item / Description / Truck validation (canonicalise, restrict, locked lists)
-        if col == COL_ITEM and item.text().strip():
+        if col == COL_ITEM:
             self._validate_item_cell(row, item)
         elif col == COL_DESC and item.text().strip():
             from tahmeed.services.cashier_service import remember_description
@@ -1818,6 +2280,8 @@ class DailyRegister(QWidget):
                 )
         elif col == COL_TRUCK and item.text().strip():
             self._validate_truck_cell(row, item)
+        if col in (COL_ITEM, COL_DESC, COL_TRUCK):
+            self._update_truck_required_highlight(row)
 
         # Dynamic row expansion near the bottom
         if row >= self._table.rowCount() - 5 and item.text().strip():
@@ -2142,9 +2606,17 @@ class DailyRegister(QWidget):
     def _snapshot_rows(self, rows: list) -> dict:
         snap = {}
         for row in rows:
-            for col in range(self._table.columnCount()):
-                if col == COL_SNO:
-                    continue
+            snap.update(self._snapshot_row_cells(row))
+        return snap
+
+    def _snapshot_row_cells(self, row: int) -> dict:
+        """Full row snapshot including S/N for undo of row activation."""
+        snap = {}
+        for col in range(self._table.columnCount()):
+            if col == COL_SNO:
+                sno_it = self._table.item(row, COL_SNO)
+                snap[(row, col)] = ("text", sno_it.text() if sno_it else "")
+            else:
                 snap[(row, col)] = self._serialize_cell(row, col)
         return snap
 
@@ -2160,6 +2632,14 @@ class DailyRegister(QWidget):
             touched_rows: set = set()
             for (row, col), val in cells.items():
                 if row < 0 or row >= self._table.rowCount():
+                    continue
+                if col == COL_SNO:
+                    if row >= self._saved_count:
+                        sno_it = self._table.item(row, COL_SNO)
+                        if sno_it is not None:
+                            kind, payload = self._normalize_cell_val(val)
+                            sno_it.setText(str(payload))
+                            touched_rows.add(row)
                     continue
                 if not self._cell_editable(row, col) and row < self._saved_count:
                     continue
@@ -2274,7 +2754,7 @@ class DailyRegister(QWidget):
     def _undo(self) -> None:
         if not self._undo_stack:
             return
-        self._finalize_pending_cell_undo()
+        self._flush_pending_row_edits()
         self._clear_cut_marquee()
         entry = self._undo_stack.pop()
         redo_entry = self._invert_undo_entry(entry)
@@ -2287,7 +2767,7 @@ class DailyRegister(QWidget):
     def _redo(self) -> None:
         if not self._redo_stack:
             return
-        self._finalize_pending_cell_undo()
+        self._flush_pending_row_edits()
         self._clear_cut_marquee()
         entry = self._redo_stack.pop()
         undo_entry = self._invert_undo_entry(entry)
@@ -2301,32 +2781,75 @@ class DailyRegister(QWidget):
         self, row: int, col: int, prev_row: int, prev_col: int,
     ) -> None:
         if prev_row >= 0 and prev_col >= 0:
-            self._finalize_pending_cell_undo(prev_row, prev_col)
+            self._begin_closing_row_edit()
         if row >= 0 and col >= 0 and self._cell_editable(row, col):
-            self._pending_cell_edit = (row, col, self._serialize_cell(row, col))
+            self._pending_row_edit = {
+                "row": row,
+                "col": col,
+                "before": self._snapshot_row_cells(row),
+            }
         else:
-            self._pending_cell_edit = None
+            self._pending_row_edit = None
 
-    def _finalize_pending_cell_undo(
-        self, row: int | None = None, col: int | None = None,
-    ) -> None:
+    def _begin_closing_row_edit(self) -> None:
+        if self._pending_row_edit is None:
+            return
+        self._closing_row_edit = self._pending_row_edit
+        self._pending_row_edit = None
+        self._schedule_finalize_row_edit()
+
+    def _schedule_finalize_row_edit(self) -> None:
+        self._edit_finalize_timer.start()
+
+    def _row_edit_cell_value(self, row: int, col: int) -> tuple:
+        if col == COL_SNO:
+            sno_it = self._table.item(row, COL_SNO)
+            return ("text", sno_it.text() if sno_it else "")
+        return self._serialize_cell(row, col)
+
+    def _finalize_one_row_edit(self, pending: dict) -> None:
         if self._undo_redo_active or self._bulk_mutating:
             return
-        pending = self._pending_cell_edit
+        row = pending["row"]
+        before = pending["before"]
+        changes = {}
+        for (r, c), old_val in before.items():
+            if r != row:
+                continue
+            new_val = self._row_edit_cell_value(r, c)
+            if new_val != old_val:
+                changes[(r, c)] = old_val
+        if changes:
+            self._record_undo({"cells": changes})
+
+    def _finalize_pending_row_edit(self) -> None:
+        pending = self._closing_row_edit
         if pending is None:
             return
-        pr, pc, old_val = pending
-        if row is not None and col is not None and (row, col) != (pr, pc):
-            pass
-        elif row is not None and col is not None:
-            pr, pc = row, col
-        if not self._cell_editable(pr, pc):
-            self._pending_cell_edit = None
+        row = pending["row"]
+        if self._auto_fill_row == row:
+            self._edit_finalize_timer.start(100)
             return
-        new_val = self._serialize_cell(pr, pc)
-        if new_val != old_val:
-            self._record_undo({"cells": {(pr, pc): old_val}})
-        self._pending_cell_edit = None
+        self._finalize_one_row_edit(pending)
+        self._closing_row_edit = None
+
+    def _flush_pending_row_edits(self) -> None:
+        """Finalize any open edit, waiting briefly for async Item auto-fill."""
+        self._edit_finalize_timer.stop()
+        if self._pending_row_edit is not None:
+            self._closing_row_edit = self._pending_row_edit
+            self._pending_row_edit = None
+        deadline = time.monotonic() + 2.0
+        while self._closing_row_edit is not None:
+            row = self._closing_row_edit["row"]
+            if self._auto_fill_row == row:
+                if time.monotonic() > deadline:
+                    break
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 50)
+                continue
+            self._finalize_one_row_edit(self._closing_row_edit)
+            self._closing_row_edit = None
+            break
 
     def _record_row_remove_undo(self, rows: list) -> None:
         ops = []
@@ -2740,6 +3263,10 @@ class DailyRegister(QWidget):
         self._pending_row_meta = _shift(self._pending_row_meta)
         self._saved_ids = _shift(self._saved_ids)
         self._saved_txs = _shift(self._saved_txs)
+        self._truck_allow_anyway = {
+            (k + 1 if k >= at_row else k): v
+            for k, v in self._truck_allow_anyway.items()
+        }
         self._dirty_rows = {(r + 1 if r >= at_row else r) for r in self._dirty_rows}
         if self._cut_cells:
             self._cut_cells = {
@@ -2761,6 +3288,11 @@ class DailyRegister(QWidget):
         self._pending_row_meta = _shift(self._pending_row_meta)
         self._saved_ids = _shift(self._saved_ids)
         self._saved_txs = _shift(self._saved_txs)
+        self._truck_allow_anyway = {
+            (k - 1 if k > at_row else k): v
+            for k, v in self._truck_allow_anyway.items()
+            if k != at_row
+        }
         self._dirty_rows = {
             (r - 1 if r > at_row else r)
             for r in self._dirty_rows
@@ -3017,6 +3549,104 @@ class DailyRegister(QWidget):
         self._table.blockSignals(False)
         self._renumber()
         self._finalize_truck_cells(truck_cells)
+
+    def _copy_cell_from_to(
+        self, src_row: int, src_col: int, dst_row: int, dst_col: int,
+    ) -> list:
+        """Copy one cell's value onto another editable cell. Returns truck finalize pairs."""
+        if src_col in READONLY_COLS or dst_col in READONLY_COLS:
+            return []
+        if not self._cell_editable(dst_row, dst_col):
+            return []
+        src = self._table.item(src_row, src_col)
+        truck_cells: list = []
+        if dst_col in CHECK_COLS:
+            it = self._table.item(dst_row, dst_col) or QTableWidgetItem()
+            checked = bool(src.data(Qt.UserRole)) if src else False
+            it.setData(Qt.UserRole, checked)
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            self._table.setItem(dst_row, dst_col, it)
+        elif dst_col == COL_TRUCK:
+            raw = src.text().strip() if src else ""
+            self._table.setItem(
+                dst_row, dst_col, QTableWidgetItem(raw.upper() if raw else "")
+            )
+            if raw:
+                truck_cells.append((dst_row, raw))
+        elif dst_col == COL_RECEIPT:
+            text = src.text().strip() if src else ""
+            it = QTableWidgetItem(_receipt_paste_value(text) if text else "")
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            self._table.setItem(dst_row, dst_col, it)
+        elif dst_col in (COL_TZS, COL_USD):
+            self._table.setItem(
+                dst_row, dst_col, _amount_item_from_raw(src.text() if src else "")
+            )
+        else:
+            text = src.text() if src else ""
+            self._table.setItem(
+                dst_row, dst_col, QTableWidgetItem(_upper_text(dst_col, text))
+            )
+        if dst_row < self._saved_count and self._edit_mode:
+            self._dirty_rows.add(dst_row)
+        return truck_cells
+
+    def _apply_fill_drag(
+        self,
+        anchor: tuple[int, int, int, int],
+        end: tuple[int, int],
+    ) -> None:
+        """Fill down/right from the selection when the user drags the fill handle."""
+        r0, c0, r1, c1 = anchor
+        end_row, end_col = end
+        er = max(r1, end_row)
+        ec = max(c1, end_col)
+        if er <= r1 and ec <= c1:
+            return
+
+        snap: dict = {}
+        for row in range(r0, er + 1):
+            for col in range(c0, ec + 1):
+                if r0 <= row <= r1 and c0 <= col <= c1:
+                    continue
+                if not self._cell_editable(row, col) or col in READONLY_COLS:
+                    continue
+                snap[(row, col)] = self._serialize_cell(row, col)
+        if not snap:
+            return
+        self._push_undo_cells(snap)
+
+        sel_h = r1 - r0 + 1
+        sel_w = c1 - c0 + 1
+        truck_cells: list = []
+        self._table.blockSignals(True)
+        try:
+            for row in range(r0, er + 1):
+                for col in range(c0, ec + 1):
+                    if r0 <= row <= r1 and c0 <= col <= c1:
+                        continue
+                    if not self._cell_editable(row, col) or col in READONLY_COLS:
+                        continue
+                    src_row = r0 + (row - r0) % sel_h
+                    src_col = c0 + (col - c0) % sel_w
+                    truck_cells.extend(
+                        self._copy_cell_from_to(src_row, src_col, row, col)
+                    )
+                if row >= self._saved_count:
+                    self._sync_row_date(row)
+                elif row in self._dirty_rows:
+                    for col_i in range(self._table.columnCount()):
+                        it = self._table.item(row, col_i)
+                        if it is not None:
+                            it.setBackground(QBrush(DIRTY_BG))
+        finally:
+            self._table.blockSignals(False)
+
+        self._renumber()
+        self._finalize_truck_cells(truck_cells)
+        self._update_footer()
+        self._schedule_draft_autosave()
+        self._table.viewport().update()
 
     def _fill_right(self) -> None:
         """Ctrl+R: copy the leftmost column of the selection into all cols to its right."""
@@ -3328,6 +3958,7 @@ class DailyRegister(QWidget):
     def _kick_auto_fill_item(self, row: int, description: str) -> None:
         if self._bulk_mutating or not description.strip():
             return
+        self._auto_fill_row = row
         asyncio.ensure_future(self._auto_fill_item_from_mapping(row, description))
 
     def _load_staged_import_rows(self, payloads: list) -> None:
@@ -3402,10 +4033,9 @@ class DailyRegister(QWidget):
                         else None
                     ),
                 )
-                tzs_amt, usd_amt = staged.money_parts()
                 tzs_txt, usd_txt = _display_money_cells(staged)
-                self._table.setItem(target, COL_TZS, _money_item(tzs_txt, tzs_amt))
-                self._table.setItem(target, COL_USD, _money_item(usd_txt, usd_amt))
+                self._table.setItem(target, COL_TZS, _money_item(tzs_txt))
+                self._table.setItem(target, COL_USD, _money_item(usd_txt))
 
                 rcpt = data.get("receipt_status") or ""
                 rcpt_it = QTableWidgetItem(str(rcpt))
@@ -3496,13 +4126,8 @@ class DailyRegister(QWidget):
                         formatted = raw
                     self._table.setItem(target, grid_col, QTableWidgetItem(formatted))
                 elif grid_col in (COL_TZS, COL_USD):
-                    amt = _parse_amount_text(raw if raw != "None" else "")
                     if raw and raw != "None":
-                        it = QTableWidgetItem(f"{amt:,.2f}")
-                        it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                        if amt < 0:
-                            it.setForeground(NEG_COLOR)
-                        self._table.setItem(target, grid_col, it)
+                        self._table.setItem(target, grid_col, _amount_item_from_raw(raw))
                 elif grid_col == COL_TRUCK:
                     if raw and raw != "None":
                         self._table.setItem(target, grid_col, QTableWidgetItem(raw.upper()))
@@ -3595,6 +4220,132 @@ class DailyRegister(QWidget):
             self._delete_saved_row(row)
             return
         self._delete_rows()
+
+    def toolbar_clear_table(self) -> None:
+        """Clear every unsaved new row and revert unsaved edits on saved rows."""
+        if not self.has_unsaved_work():
+            QMessageBox.information(
+                self,
+                "Clear Table",
+                "There is no unsaved data to clear.",
+            )
+            return
+        if QMessageBox.question(
+            self,
+            "Clear Table",
+            "Clear all unsaved rows and typed data?\n\n"
+            "Saved entries on this register will not be removed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self._commit_open_editor()
+        self._clear_unsaved_with_undo()
+
+    def _clear_unsaved_with_undo(self) -> None:
+        """Wipe unsaved work while recording one undo step."""
+        undo_cells: dict = {}
+        row_ops: list = []
+
+        for row in sorted(self._dirty_rows):
+            undo_cells.update(self._snapshot_row_cells(row))
+
+        min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+        extra_rows = list(range(min_rows, self._table.rowCount()))
+        for row in range(self._saved_count, self._table.rowCount()):
+            if self._row_has_data(row):
+                undo_cells.update(self._snapshot_row_cells(row))
+        for row in extra_rows:
+            row_ops.append({
+                "op": "remove",
+                "at": row,
+                "values": self._row_value_map(row),
+                "meta": self._capture_row_meta(row),
+            })
+
+        entry: dict = {}
+        if undo_cells:
+            entry["cells"] = undo_cells
+        if row_ops:
+            entry["row_ops"] = row_ops
+        if entry:
+            self._record_undo(entry)
+
+        self._bulk_mutating = True
+        self._table.blockSignals(True)
+        truck_cells: list = []
+        try:
+            for row in sorted(self._dirty_rows, reverse=True):
+                tx = self._saved_txs.get(row)
+                if tx is not None:
+                    truck_cells.extend(
+                        self._write_row_values(row, self._tx_to_row_values(tx))
+                    )
+                self._dirty_rows.discard(row)
+                for col in range(self._table.columnCount()):
+                    it = self._table.item(row, col)
+                    if it is not None and self._edit_mode:
+                        it.setBackground(QBrush(EDIT_BG))
+
+            for row in range(self._saved_count, min(self._table.rowCount(), min_rows)):
+                self._clear_editable_row(row)
+
+            for row in sorted(extra_rows, reverse=True):
+                self._shift_row_maps_on_remove(row)
+                self._table.removeRow(row)
+                self._pending_row_meta.pop(row, None)
+
+            if self._table.rowCount() < min_rows:
+                start = self._table.rowCount()
+                self._table.setRowCount(min_rows)
+                self._init_editable_rows(start, min_rows)
+        finally:
+            self._table.blockSignals(False)
+            self._bulk_mutating = False
+
+        self._renumber()
+        self._finalize_truck_cells(truck_cells)
+        self._clear_cut_marquee()
+        self._clear_local_draft()
+        self._update_footer()
+        self._refresh_truck_required_highlights()
+        self.edit_state_changed.emit(self._edit_mode, len(self._dirty_rows))
+        self._table.setCurrentCell(
+            max(self._saved_count, 0),
+            COL_DESC,
+        )
+
+    def _tx_to_row_values(self, tx: Transaction) -> dict:
+        tzs_txt, usd_txt = _display_money_cells(tx)
+        cashier = (
+            self._cashier_names.get(tx.cashier_id, "—") if tx.cashier_id else "—"
+        )
+        return {
+            COL_DATE: format_register_date(tx.date) if tx.date else "",
+            COL_ITEM: tx.item or "",
+            COL_DESC: tx.description or "",
+            COL_TRUCK: tx.truck_number or "",
+            COL_MEMO: tx.memo or "",
+            COL_REF: _ref_float_text(tx),
+            COL_TZS: tzs_txt,
+            COL_USD: usd_txt,
+            COL_RECEIPT: tx.receipt_status or "pending",
+            COL_OWN: tx.ownership or "",
+            COL_APR: tx.approver or "",
+            COL_PAYEE: getattr(tx, "payee", "") or "",
+            COL_CHEQUE: getattr(tx, "cheque", "") or "",
+            COL_CASHIER: cashier,
+        }
+
+    def _clear_editable_row(self, row: int) -> None:
+        """Blank one unsaved editable row back to the default empty grid state."""
+        for col in range(self._table.columnCount()):
+            if col in (COL_SNO, COL_CASHIER) or col in READONLY_COLS:
+                continue
+            self._table.takeItem(row, col)
+        self._pending_row_meta.pop(row, None)
+        self._sync_row_date(row)
+        self._deactivate_row(row)
 
     def toolbar_copy_row(self) -> None:
         """Duplicate the current row into a new unsaved editable row."""
@@ -3867,8 +4618,8 @@ class DailyRegister(QWidget):
         if w is not None and self._table.isAncestorOf(w):
             self._table.commitData(w)
             self._table.closeEditor(w, QAbstractItemDelegate.NoHint)
-        if row >= 0 and col >= 0:
-            self._finalize_pending_cell_undo(row, col)
+        self._begin_closing_row_edit()
+        self._flush_pending_row_edits()
 
     async def confirm_leave(self) -> bool:
         """Ask to save/discard before logout or app exit. False = stay put."""
@@ -3912,6 +4663,28 @@ class DailyRegister(QWidget):
         """Inner save implementation (caller holds `_save_in_flight`)."""
         saved, updated, errors = 0, 0, []
         self._commit_open_editor()
+
+        missing_truck_rows = self._rows_missing_required_truck()
+        if missing_truck_rows:
+            detail_lines = []
+            for row in missing_truck_rows[:12]:
+                item_label = self._cell_text(row, COL_ITEM) or "—"
+                detail_lines.append(f"  Row {row + 1}: {item_label}")
+            if len(missing_truck_rows) > 12:
+                detail_lines.append(
+                    f"  …and {len(missing_truck_rows) - 12} more"
+                )
+            plural = "s" if len(missing_truck_rows) != 1 else ""
+            QMessageBox.warning(
+                self,
+                "Truck Required",
+                f"{len(missing_truck_rows)} row{plural} require a truck number "
+                f"before saving:\n\n"
+                + "\n".join(detail_lines)
+                + "\n\nEnter the truck number for each row, then save again.",
+                QMessageBox.Ok,
+            )
+            return False
 
         # ── Pass 1: commit edits to already-saved rows (UPDATE) ──────────
         for row in sorted(self._dirty_rows):
@@ -4129,6 +4902,7 @@ class DailyRegister(QWidget):
         self._categories = categories
         self._cat_by_name = {c.name.lower(): c for c in categories}
         asyncio.ensure_future(self._load_locked_subitems())
+        self._refresh_truck_required_highlights()
 
     async def _load_categories(self) -> None:
         """Ensure the Item column has the live Manage Items catalog.
@@ -4175,31 +4949,45 @@ class DailyRegister(QWidget):
                 await set_setting("restrict_trucks", True)
         except Exception:
             self._restrict_trucks = True
+        try:
+            from tahmeed.services.export_restriction_service import (
+                get_enabled_export_surfaces,
+            )
+
+            self._export_restrict_surfaces = await get_enabled_export_surfaces()
+        except Exception:
+            self._export_restrict_surfaces = set()
 
     async def _auto_fill_item_from_mapping(self, row: int, description: str) -> None:
         """Pre-fill Item from a saved description map or prior entries."""
-        if not description.strip():
-            return
-        item_it = self._table.item(row, COL_ITEM)
-        if item_it and item_it.text().strip():
-            return
-        from tahmeed.services.cashier_service import resolve_item_name_for_description
-
         try:
-            cat_name = await resolve_item_name_for_description(description)
-        except Exception:
-            return
-        if not cat_name:
-            return
-        prev = self._table.blockSignals(True)
-        if item_it is None:
-            item_it = QTableWidgetItem(cat_name)
-            item_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-            self._table.setItem(row, COL_ITEM, item_it)
-        else:
-            item_it.setText(cat_name)
-        self._table.blockSignals(prev)
-        self._validate_item_cell(row, item_it)
+            if not description.strip():
+                return
+            item_it = self._table.item(row, COL_ITEM)
+            if item_it and item_it.text().strip():
+                return
+            from tahmeed.services.cashier_service import resolve_item_name_for_description
+
+            try:
+                cat_name = await resolve_item_name_for_description(description)
+            except Exception:
+                return
+            if not cat_name:
+                return
+            prev = self._table.blockSignals(True)
+            if item_it is None:
+                item_it = QTableWidgetItem(cat_name)
+                item_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                self._table.setItem(row, COL_ITEM, item_it)
+            else:
+                item_it.setText(cat_name)
+            self._table.blockSignals(prev)
+            self._validate_item_cell(row, item_it)
+            self._update_truck_required_highlight(row)
+        finally:
+            if self._auto_fill_row == row:
+                self._auto_fill_row = None
+            self._schedule_finalize_row_edit()
 
     async def _load_fleet_numbers(self) -> None:
         from tahmeed.services.truck_service import get_fleet_kinds, get_fleet_numbers
@@ -4287,6 +5075,7 @@ class DailyRegister(QWidget):
         text = item.text().strip()
         if not text:
             self._clear_item_flag(row, item)
+            self._update_truck_required_highlight(row)
             return
         cat = self._cat_by_name.get(text.lower())
         if cat is not None:
@@ -4297,9 +5086,11 @@ class DailyRegister(QWidget):
                 item.setText(canonical)
                 self._table.blockSignals(False)
             self._clear_item_flag(row, item)
+            self._update_truck_required_highlight(row)
             return
         if not self._restrict_items:
             self._clear_item_flag(row, item)
+            self._update_truck_required_highlight(row)
             return
         # Do not flag every cell when the catalog failed to load — that paints
         # known names red and makes Restrict look broken.
@@ -4308,9 +5099,107 @@ class DailyRegister(QWidget):
         # Unknown item with restriction on — keep the typed text and flag the cell.
         # Do not prompt to add; save still rejects unknown items.
         self._flag_unknown_item(item, text)
+        self._update_truck_required_highlight(row)
     # ------------------------------------------------------------------
     # Truck-column validation (format + restrict to fleet registry)
     # ------------------------------------------------------------------
+
+    def _cell_text(self, row: int, col: int) -> str:
+        it = self._table.item(row, col)
+        return it.text().strip() if it else ""
+
+    def _item_requires_truck(self, item_name: str) -> bool:
+        if not item_name:
+            return False
+        cat = self._cat_by_name.get(item_name.lower())
+        if cat is None:
+            return False
+        return bool(getattr(cat, "requires_truck", True))
+
+    def _row_missing_required_truck(self, row: int) -> bool:
+        if not self._cell_text(row, COL_DESC):
+            return False
+        item_name = self._cell_text(row, COL_ITEM)
+        if not self._item_requires_truck(item_name):
+            return False
+        return not self._cell_text(row, COL_TRUCK)
+
+    def _rows_missing_required_truck(self) -> list[int]:
+        missing: list[int] = []
+        seen: set[int] = set()
+        for row in self._dirty_rows:
+            if row in seen:
+                continue
+            if self._row_missing_required_truck(row):
+                missing.append(row)
+                seen.add(row)
+        for row in range(self._saved_count, self._table.rowCount()):
+            if row in seen or not self._row_has_data(row):
+                continue
+            if self._row_missing_required_truck(row):
+                missing.append(row)
+                seen.add(row)
+        return sorted(missing)
+
+    _TRUCK_REQUIRED_TIP = "Truck number is required for this item."
+
+    def _truck_cell_background(self, row: int) -> QBrush:
+        if row >= self._saved_count:
+            return QBrush(NEW_BG)
+        if row in self._dirty_rows:
+            return QBrush(DIRTY_BG)
+        if self._edit_mode:
+            return QBrush(EDIT_BG)
+        tx = self._saved_txs.get(row)
+        if tx is not None and (getattr(tx, "register_status", "") or "submitted") == "draft":
+            return QBrush(DRAFT_BG)
+        return QBrush(SAVED_BG)
+
+    def _ensure_truck_cell(self, row: int) -> QTableWidgetItem:
+        it = self._table.item(row, COL_TRUCK)
+        if it is not None:
+            return it
+        it = QTableWidgetItem("")
+        flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        if row >= self._saved_count or self._edit_mode:
+            flags |= Qt.ItemIsEditable
+        it.setFlags(flags)
+        it.setBackground(self._truck_cell_background(row))
+        self._table.setItem(row, COL_TRUCK, it)
+        return it
+
+    def _update_truck_required_highlight(self, row: int) -> None:
+        if row < 0 or row >= self._table.rowCount():
+            return
+        if row < self._saved_count and not self._edit_mode and not self._cell_text(row, COL_DESC):
+            return
+        truck_it = self._table.item(row, COL_TRUCK)
+        if self._row_missing_required_truck(row):
+            truck_it = self._ensure_truck_cell(row)
+            prev = self._table.blockSignals(True)
+            truck_it.setBackground(QBrush(TRUCK_REQUIRED_BG))
+            truck_it.setToolTip(self._TRUCK_REQUIRED_TIP)
+            self._table.blockSignals(prev)
+            return
+        if truck_it is None:
+            return
+        if truck_it.background().color() != TRUCK_REQUIRED_BG:
+            return
+        prev = self._table.blockSignals(True)
+        if (truck_it.toolTip() or "") == self._TRUCK_REQUIRED_TIP:
+            truck_it.setToolTip("")
+        truck_it.setBackground(self._truck_cell_background(row))
+        self._table.blockSignals(prev)
+
+    def _refresh_truck_required_highlights(self) -> None:
+        prev = self._table.blockSignals(True)
+        try:
+            for row in range(self._table.rowCount()):
+                if not self._cell_text(row, COL_DESC):
+                    continue
+                self._update_truck_required_highlight(row)
+        finally:
+            self._table.blockSignals(prev)
 
     def _can_add_fleet(self) -> bool:
         return getattr(self._user, "role", "") in ("admin", "accountant")
@@ -4325,8 +5214,14 @@ class DailyRegister(QWidget):
         else:
             it.setText(value)
         self._table.blockSignals(prev)
+        self._update_truck_required_highlight(row)
 
-    def _resolve_truck_text(self, raw: str) -> tuple[str, Optional[str]]:
+    def _truck_key(self, text: str) -> str:
+        return " ".join((text or "").upper().split())
+
+    def _resolve_truck_text(
+        self, raw: str, row: Optional[int] = None
+    ) -> tuple[str, Optional[str]]:
         """
         Return (status, value) where status is:
           'empty' | 'ok' | 'invalid_format' | 'not_in_registry'
@@ -4338,9 +5233,15 @@ class DailyRegister(QWidget):
         if norm.status == "place_label":
             return "ok", norm.value
         if norm.status == "invalid":
+            allowed = self._truck_allow_anyway.get(row) if row is not None else None
+            if allowed and self._truck_key(raw) == self._truck_key(allowed):
+                return "ok", allowed
             return "invalid_format", norm.value or raw.strip().upper()
         matched = try_match_fleet(norm.value, self._fleet_numbers)
         if matched is None:
+            allowed = self._truck_allow_anyway.get(row) if row is not None else None
+            if allowed and self._truck_key(raw) == self._truck_key(allowed):
+                return "ok", allowed
             return "not_in_registry", norm.value
         return "ok", matched
 
@@ -4353,7 +5254,7 @@ class DailyRegister(QWidget):
             return
 
         for row, raw in cells:
-            status, value = self._resolve_truck_text(raw)
+            status, value = self._resolve_truck_text(raw, row=row)
             if status == "empty":
                 self._set_truck_cell(row, "")
                 self._pending_truck_issues.pop(row, None)
@@ -4371,6 +5272,8 @@ class DailyRegister(QWidget):
                     row=row, original=raw, kind="not_in_registry"
                 )
 
+        for row, _raw in cells:
+            self._update_truck_required_highlight(row)
         self._schedule_truck_correction()
 
     def _schedule_truck_correction(self) -> None:
@@ -4412,7 +5315,7 @@ class DailyRegister(QWidget):
             current = (it.text().strip() if it else "")
             if not current:
                 continue
-            status, value = self._resolve_truck_text(current)
+            status, value = self._resolve_truck_text(current, row=issue.row)
             if status == "ok":
                 self._set_truck_cell(issue.row, value)
                 continue
@@ -4472,27 +5375,39 @@ class DailyRegister(QWidget):
     def _on_truck_issue_resolved_live(self, issue: TruckIssue) -> None:
         """Apply one resolved truck to the grid as soon as it leaves the dialog list."""
         if issue.skip or not issue.corrected:
+            self._truck_allow_anyway.pop(issue.row, None)
             self._set_truck_cell(issue.row, "")
             return
         if getattr(issue, "is_place_label", False):
+            self._truck_allow_anyway.pop(issue.row, None)
             self._allowed_truck_labels.add(normalize_place_label(issue.corrected))
+        elif getattr(issue, "allow_anyway", False):
+            self._truck_allow_anyway[issue.row] = issue.corrected
         else:
+            self._truck_allow_anyway.pop(issue.row, None)
             self._fleet_numbers.add(issue.corrected)
         self._set_truck_cell(issue.row, issue.corrected)
 
     def _validate_truck_cell(self, row: int, item: QTableWidgetItem) -> None:
         raw = item.text().strip()
         if not raw:
+            self._truck_allow_anyway.pop(row, None)
+            self._update_truck_required_highlight(row)
             return
-        status, value = self._resolve_truck_text(raw)
+        allowed = self._truck_allow_anyway.get(row)
+        if allowed and self._truck_key(raw) != self._truck_key(allowed):
+            self._truck_allow_anyway.pop(row, None)
+        status, value = self._resolve_truck_text(raw, row=row)
         if status == "ok":
             if item.text() != value:
                 prev = self._table.blockSignals(True)
                 item.setText(value)
                 self._table.blockSignals(prev)
             self._pending_truck_issues.pop(row, None)
+            self._update_truck_required_highlight(row)
             return
         if status == "empty":
+            self._update_truck_required_highlight(row)
             return
         kind = "invalid_format" if status == "invalid_format" else "not_in_registry"
         if item.text() != value:

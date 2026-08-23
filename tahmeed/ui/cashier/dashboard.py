@@ -537,6 +537,7 @@ class _TablePage(QWidget):
         self._qb_toolbar.new_clicked.connect(register.toolbar_new_row)
         self._qb_toolbar.save_clicked.connect(register.save_rows)
         self._qb_toolbar.delete_clicked.connect(register.toolbar_delete)
+        self._qb_toolbar.clear_table_clicked.connect(register.toolbar_clear_table)
         self._qb_toolbar.copy_clicked.connect(register.toolbar_copy_row)
         self._qb_toolbar.print_clicked.connect(register.toolbar_print)
         self._qb_toolbar.attach_clicked.connect(register.toolbar_attach)
@@ -757,6 +758,7 @@ class CashierDashboard(QWidget):
             self._register.reload_settings()
         elif key == "form":
             self._stack.setCurrentIndex(2)
+            self._form.reload_settings()
         elif key == "drafts":
             self._stack.setCurrentIndex(3)
             self._drafts_view.refresh()

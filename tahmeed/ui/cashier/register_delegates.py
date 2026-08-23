@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QDateEdit, QLineEdit, QStyle,
 )
 from PySide6.QtCore import Qt, QDate, QEvent, QSize, QTimer
-from PySide6.QtGui import QColor, QBrush, QPen, QPainter
+from PySide6.QtGui import QColor, QBrush, QPen, QPainter, QFont
 
 from tahmeed.services.truck_format import normalize_truck_number
 from tahmeed.services.cashier_service import (
@@ -151,6 +151,7 @@ DIRTY_BG  = QColor("#FEF3C7")   # stronger amber — a saved row that was modifi
 DRAFT_BG  = QColor("#FFF7ED")   # warm orange — saved draft (not yet submitted)
 DUP_BG    = QColor("#FEE2E2")   # light red — possible duplicate flag
 MISMATCH_BG = QColor("#FEF3C7") # amber — date mismatch (submitted vs transaction date)
+TRUCK_REQUIRED_BG = QColor("#FECDD3")  # rose — item requires truck but cell is empty
 
 # Footer QB-style icon+text-below action buttons
 _FOOTER_BTN_STYLE = """
@@ -204,6 +205,9 @@ class _ExcelCellDelegate(QStyledItemDelegate):
     _ACTIVE_PEN  = QColor("#0077C5")
     _SELECT_FILL = QColor("#cde0f5")
     _CUT_PEN     = QColor("#0077C5")
+    _FILL_EXT_BG = QColor("#EAF4E4")
+    _FILL_EXT_TEXT = QColor("#217346")
+    _FILL_EXT_BORDER = QColor("#70AD47")
 
     def _is_current(self, index) -> bool:
         t = self.parent()
@@ -277,6 +281,26 @@ class _ExcelCellDelegate(QStyledItemDelegate):
             align = int(align)
         painter.drawText(option.rect.adjusted(6, 0, -6, 0), align, text)
 
+    def _paint_fill_extension_preview(
+        self, painter: QPainter, option, index, table,
+    ) -> None:
+        rect = option.rect.adjusted(1, 1, -2, -2)
+        painter.fillRect(rect, self._FILL_EXT_BG)
+        painter.setPen(QPen(self._FILL_EXT_BORDER, 1, Qt.DotLine))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(rect)
+        text = table._fill_preview_display_text(index.row(), index.column())
+        if text:
+            preview_font = QFont(option.font)
+            preview_font.setItalic(True)
+            painter.setFont(preview_font)
+            painter.setPen(self._FILL_EXT_TEXT)
+            painter.drawText(
+                rect.adjusted(6, 0, -6, 0),
+                table._fill_preview_text_align(index.column()),
+                text,
+            )
+
     def eventFilter(self, obj, event) -> bool:
         """Intercept Tab/Enter in editors: accept autocomplete, commit, navigate."""
         if event.type() == QEvent.KeyPress:
@@ -306,6 +330,16 @@ class _ExcelCellDelegate(QStyledItemDelegate):
         return super().eventFilter(obj, event)
 
     def paint(self, painter: QPainter, option, index) -> None:
+        table = self.parent()
+        if (
+            table is not None
+            and getattr(table, "_fill_dragging", False)
+            and hasattr(table, "_is_fill_extension_cell")
+            and table._is_fill_extension_cell(index.row(), index.column())
+        ):
+            self.initStyleOption(option, index)
+            self._paint_fill_extension_preview(painter, option, index, table)
+            return
         self.initStyleOption(option, index)
         self._paint_bg(painter, option, index)
         self._paint_text(painter, option, index)

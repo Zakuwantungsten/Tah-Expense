@@ -1608,6 +1608,23 @@ class TruckOverviewWidget(QWidget):
             )
             return
 
+        from tahmeed.services.export_restriction_service import (
+            filter_overview_rows_for_export,
+        )
+        from tahmeed.services.accountant_service import _summarize_overview_rows
+
+        rows = await filter_overview_rows_for_export(
+            rows, surface="truck_overview", fmt="excel",
+        )
+        if not rows:
+            QMessageBox.information(
+                self,
+                "Export",
+                "All records belong to items restricted from Excel export.",
+            )
+            return
+        summary = _summarize_overview_rows(rows)
+
         source_tag = self._source_filter_tag()
         currency = self._currency_toggle.filter_value() or "ALL"
         default_name = (
@@ -1686,6 +1703,23 @@ class TruckOverviewWidget(QWidget):
                 "No records match the current truck, toolbar, and column filters.",
             )
             return
+
+        from tahmeed.services.export_restriction_service import (
+            filter_overview_rows_for_export,
+        )
+        from tahmeed.services.accountant_service import _summarize_overview_rows
+
+        rows = await filter_overview_rows_for_export(
+            rows, surface="truck_overview", fmt="pdf",
+        )
+        if not rows:
+            QMessageBox.information(
+                self,
+                "Export",
+                "All records belong to items restricted from PDF export.",
+            )
+            return
+        summary = _summarize_overview_rows(rows)
 
         currency = self._currency_toggle.filter_value() or "ALL"
         default_name = f"{self.EXPORT_PREFIX}_{truck}_{currency}_Report.pdf".replace(" ", "_")

@@ -186,8 +186,11 @@ class EntryForm(QWidget):
         super().__init__(parent)
         self._user        = user
         self._categories: List[Category] = []
+        self._cat_by_name: dict = {}
         self._people_names: List[str] = []
         self._confidence_threshold: int  = 75
+        self._restrict_items: bool = False
+        self._defer_item_to_verify: bool = False
         self._fleet_numbers: set = set()
         self._fleet_kinds: dict = {}
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
@@ -217,6 +220,15 @@ class EntryForm(QWidget):
         except Exception:
             pass
         try:
+            self._restrict_items = bool(await get_setting("restrict_items"))
+        except Exception:
+            self._restrict_items = False
+        try:
+            self._defer_item_to_verify = bool(await get_setting("defer_item_to_verify"))
+        except Exception:
+            self._defer_item_to_verify = False
+        self._refresh_item_optional_hint()
+        try:
             from tahmeed.services.people_service import get_people_names
             self.update_people(await get_people_names())
         except Exception:
@@ -240,6 +252,11 @@ class EntryForm(QWidget):
 
     def update_categories(self, cats: List[Category]) -> None:
         self._categories = cats
+        self._cat_by_name = {c.name.lower(): c for c in cats}
+
+    def reload_settings(self) -> None:
+        """Re-read cashier register toggles without clearing the form."""
+        asyncio.ensure_future(self._load_config())
 
     def update_people(self, names: List[str]) -> None:
         self._people_names = [str(n).strip().upper() for n in (names or []) if str(n).strip()]
@@ -635,11 +652,22 @@ class EntryForm(QWidget):
         except Exception:
             pass
 
+    def _refresh_item_optional_hint(self) -> None:
+        if self._defer_item_to_verify:
+            self._item.setPlaceholderText("Optional — assign on verify")
+            self._cat_input.setPlaceholderText("Optional — assign on verify")
+        else:
+            self._item.setPlaceholderText("e.g., Fuel, Parts, Tolls")
+            self._cat_input.setPlaceholderText("Type to search categories…")
+
     def _set_cat_waiting(self) -> None:
         self._cat_hint.setStyleSheet(
             "color:#9ca3af; font-size:11px; font-style:italic; padding:1px 0 6px 0;"
         )
-        self._cat_hint.setText("Auto-detect — start typing a description.")
+        if self._defer_item_to_verify:
+            self._cat_hint.setText("Item optional — enter description and save; accountant assigns on verify.")
+        else:
+            self._cat_hint.setText("Auto-detect — start typing a description.")
 
     def _set_cat_matched(self, cat_name: str, confidence: float) -> None:
         # Auto-fill the typeable category field without triggering autocomplete
@@ -652,6 +680,12 @@ class EntryForm(QWidget):
         self._cat_hint.setText(f"✓  Auto-detected ({int(confidence * 100)}% confidence)")
 
     def _set_cat_needs_selection(self) -> None:
+        if self._defer_item_to_verify:
+            self._cat_hint.setStyleSheet(
+                "color:#9ca3af; font-size:11px; font-style:italic; padding:1px 0 6px 0;"
+            )
+            self._cat_hint.setText("No auto-match — item is optional; save with description only.")
+            return
         self._cat_hint.setStyleSheet(
             "color:#ea580c; font-size:11px; font-weight:500; padding:1px 0 6px 0;"
         )
@@ -671,6 +705,23 @@ class EntryForm(QWidget):
             if typed_lower in cat.name.lower():
                 return cat.name, cat._id
         return None
+
+    def _resolve_item_for_submit(self) -> tuple[str, Optional[object]]:
+        """Resolve item/category like the register table (shared rules)."""
+        item_name = self._item.text().strip() or self._cat_input.text().strip()
+        if not item_name:
+            if self._defer_item_to_verify:
+                return "", None
+            raise ValueError(
+                "Item is required. Enter an item or ask the accountant to enable description-only entries."
+            )
+
+        cat = self._cat_by_name.get(item_name.lower())
+        if cat is not None:
+            return cat.name, cat._id
+        if self._restrict_items:
+            raise ValueError(f'"{item_name}" is not a known item.')
+        return item_name.upper(), None
 
     # ──────────────────────────────────────────────────────────────────
     # Submit
@@ -698,15 +749,11 @@ class EntryForm(QWidget):
             QMessageBox.warning(self, "Missing field", "Description is required.")
             return
 
-        cat_result = self._resolve_category()
-        if cat_result is None:
-            QMessageBox.warning(
-                self, "No category",
-                "Category not recognised. Type a category name or pick one from the dropdown.",
-            )
+        try:
+            cat_name, cat_id = self._resolve_item_for_submit()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Missing item", str(exc))
             return
-
-        cat_name, cat_id = cat_result
         qdate   = self._date.date()
         tx_date = datetime(qdate.year(), qdate.month(), qdate.day())
 
@@ -749,7 +796,7 @@ class EntryForm(QWidget):
                         truck_number = dlg.issues[0].corrected
                         if getattr(dlg.issues[0], "is_place_label", False):
                             self._allowed_truck_labels.add(normalize_place_label(truck_number))
-                        else:
+                        elif not getattr(dlg.issues[0], "allow_anyway", False):
                             self._fleet_numbers.add(truck_number)
                         pending_adds = list(getattr(dlg, "pending_registry_adds", None) or [])
                         if pending_adds:
@@ -839,12 +886,12 @@ class EntryForm(QWidget):
         tx = Transaction(
             date=tx_date,
             description=description,
-            item=self._item.text().strip(),
+            item=cat_name or "",
             truck_number=truck_number,
             amount=self._amount.value(),
             currency="TZS",
             category_id=cat_id,
-            category_name=cat_name,
+            category_name=cat_name or None,
             memo=self._memo.text().strip(),
             receipt_status=self._receipt.currentData() or "pending",
             notes_flag=self._notes.isChecked(),
@@ -998,6 +1045,9 @@ class EntryForm(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to delete:\n{exc}")
 
     def _toolbar_print(self) -> None:
+        asyncio.ensure_future(self._do_toolbar_print())
+
+    async def _do_toolbar_print(self) -> None:
         if not self._day_txs:
             QMessageBox.information(self, "Print", "No entries for this day to export.")
             return
@@ -1009,8 +1059,23 @@ class EntryForm(QWidget):
             return
         if not path.lower().endswith(".pdf"):
             path = f"{path}.pdf"
+
+        from tahmeed.services.export_restriction_service import (
+            filter_transactions_for_export,
+        )
+
+        txs = await filter_transactions_for_export(
+            self._day_txs, surface="cashier_print", fmt="pdf",
+        )
+        if not txs:
+            QMessageBox.information(
+                self, "Print",
+                "All entries for this day belong to items restricted from PDF export.",
+            )
+            return
+
         rows = []
-        for tx in self._day_txs:
+        for tx in txs:
             rows.append([
                 tx.date.strftime("%d/%m/%Y") if tx.date else "",
                 tx.reported_date.strftime("%d/%m/%Y") if tx.reported_date else "",

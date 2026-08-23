@@ -78,6 +78,23 @@ def test_similar_open_rows_match_same_pasted_value(qapp) -> None:
     dlg.close()
 
 
+def test_register_mode_shows_allow_anyway_button(qapp) -> None:
+    issues = [
+        TruckIssue(row=0, original="T128 EFP", kind="not_in_registry"),
+    ]
+    dlg = TruckCorrectionDialog(
+        issues,
+        fleet={"T880 CUL"},
+        fleet_kinds={"T880 CUL": "truck"},
+        import_mode=False,
+    )
+    rw = dlg._rows[0]
+    assert rw.allow_btn is not None
+    assert rw.skip_row_btn is None
+    assert rw.allow_btn.text() == "Allow anyway"
+    dlg.close()
+
+
 def test_combo_card_shows_truck_only(qapp) -> None:
     """SM Burhani fix dialog edits the truck; trailers stay on the saved cell."""
     issues = [

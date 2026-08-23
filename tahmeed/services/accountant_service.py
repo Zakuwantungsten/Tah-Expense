@@ -6218,6 +6218,7 @@ def _normalized_row(
     station: str = "",
     receipt_status: str = "",
     upload_description: str = "",
+    item_name: str = "",
 ) -> dict:
     amt = _safe_float_value(amount) if amount not in (None, "") else None
     ltrs = _safe_float_value(liters) if liters not in (None, "") else None
@@ -6237,6 +6238,7 @@ def _normalized_row(
         "station": station or "—",
         "receipt_status": receipt_status or "—",
         "upload_description": upload_description or "—",
+        "item_name": item_name or "",
     }
 
 
@@ -6277,6 +6279,7 @@ async def _truck_overview_master_rows(
             description=tx.description or tx.item or tx.category_name or "Verified transaction",
             reference=tx.memo or tx.do_number or tx.lpo_do or tx.category_name or "",
             currency=tx.currency or "",
+            item_name=tx.item or tx.category_name or "",
             amount=tx.amount,
             liters=(
                 parse_liters_from_description(tx.description or "")

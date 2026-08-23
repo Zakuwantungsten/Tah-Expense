@@ -1425,6 +1425,20 @@ class MasterExpensesWidget(QWidget):
                 )
                 return
 
+            from tahmeed.services.export_restriction_service import (
+                filter_transactions_for_export,
+            )
+
+            txs = await filter_transactions_for_export(
+                txs, surface="master_expenses", fmt="excel",
+            )
+            if not txs:
+                await notify_export_info(
+                    self, "Export",
+                    "All records belong to items restricted from Excel export.",
+                )
+                return
+
             export_cashier_ids = [tx.cashier_id for tx in txs if tx.cashier_id]
             export_cashier_names = (
                 await get_cashier_names(export_cashier_ids) if export_cashier_ids else {}

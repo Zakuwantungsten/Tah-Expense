@@ -24,6 +24,8 @@ class Category:
     requires_receipt: bool = False
     requires_truck: bool = True
     lock_description: bool = False  # if True, cashier may only pick from this item's sub-items
+    restrict_in_pdf: bool = False   # omit this item's rows from configured PDF exports
+    restrict_in_excel: bool = False # omit this item's rows from configured Excel/CSV exports
     active: bool = True
     # QuickBooks Chart of Accounts metadata (populated by CoA import).
     account_type: str = ""
@@ -52,6 +54,8 @@ class Category:
             "requires_receipt": self.requires_receipt,
             "requires_truck": self.requires_truck,
             "lock_description": self.lock_description,
+            "restrict_in_pdf": self.restrict_in_pdf,
+            "restrict_in_excel": self.restrict_in_excel,
             "active": self.active,
             "account_type": self.account_type,
             "ref_num": self.ref_num,
@@ -83,6 +87,8 @@ class Category:
             requires_receipt=doc.get("requires_receipt", False),
             requires_truck=doc.get("requires_truck", True),
             lock_description=doc.get("lock_description", False),
+            restrict_in_pdf=doc.get("restrict_in_pdf", False),
+            restrict_in_excel=doc.get("restrict_in_excel", False),
             active=doc.get("active", True),
             account_type=doc.get("account_type", ""),
             ref_num=doc.get("ref_num", ""),

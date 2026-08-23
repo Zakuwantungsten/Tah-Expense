@@ -277,11 +277,25 @@ class ItemDialog(QDialog):
             "When on, the cashier can only choose a description from this item's "
             "sub-items. When off, any description is allowed for this item."
         )
+        self._restrict_pdf = QCheckBox("Restrict in PDF")
+        self._restrict_pdf.setStyleSheet(f"color: {_T1}; font-size: 13px;")
+        self._restrict_pdf.setToolTip(
+            "When on, transactions for this item are omitted from PDF exports "
+            "on the export surfaces configured under Manage Items → Export scopes."
+        )
+        self._restrict_excel = QCheckBox("Restrict in Excel")
+        self._restrict_excel.setStyleSheet(f"color: {_T1}; font-size: 13px;")
+        self._restrict_excel.setToolTip(
+            "When on, transactions for this item are omitted from Excel and CSV "
+            "exports on the export surfaces configured under Manage Items → Export scopes."
+        )
         checks_vl.addWidget(self._req_receipt)
         checks_vl.addWidget(self._req_truck)
         checks_vl.addWidget(self._show_sidebar)
         checks_vl.addWidget(self._show_cashier_sidebar)
         checks_vl.addWidget(self._lock_desc)
+        checks_vl.addWidget(self._restrict_pdf)
+        checks_vl.addWidget(self._restrict_excel)
         form.addRow(_lbl("Options", size=12, weight=500, color=_T2), checks_w)
 
         # Sidebar icon picker — relevant when either sidebar option is on
@@ -385,6 +399,8 @@ class ItemDialog(QDialog):
         self._show_sidebar.setChecked(item.show_in_sidebar)
         self._show_cashier_sidebar.setChecked(item.show_in_cashier_sidebar)
         self._lock_desc.setChecked(item.lock_description)
+        self._restrict_pdf.setChecked(item.restrict_in_pdf)
+        self._restrict_excel.setChecked(item.restrict_in_excel)
         self._icon = item.icon or "mdi.tag-outline"
         self._sidebar_name.setText(item.sidebar_name or "")
         self._refresh_icon_btn()
@@ -443,6 +459,8 @@ class ItemDialog(QDialog):
             "requires_receipt": self._req_receipt.isChecked(),
             "requires_truck":   self._req_truck.isChecked(),
             "lock_description": self._lock_desc.isChecked(),
+            "restrict_in_pdf": self._restrict_pdf.isChecked(),
+            "restrict_in_excel": self._restrict_excel.isChecked(),
         }
         self.accept()
 

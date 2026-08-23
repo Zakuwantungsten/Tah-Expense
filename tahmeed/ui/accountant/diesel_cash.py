@@ -461,6 +461,20 @@ class _DieselCashAllEntries(QWidget):
             QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")
             return
 
+        from tahmeed.services.export_restriction_service import (
+            filter_transactions_for_export,
+        )
+
+        txs = await filter_transactions_for_export(
+            txs, surface="diesel_cash", fmt="excel",
+        )
+        if not txs:
+            QMessageBox.information(
+                self, "Export",
+                "All records belong to items restricted from Excel export.",
+            )
+            return
+
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Diesel Cash"
@@ -1024,6 +1038,20 @@ class _DieselCashMonthDetail(QWidget):
             )
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")
+            return
+
+        from tahmeed.services.export_restriction_service import (
+            filter_transactions_for_export,
+        )
+
+        txs = await filter_transactions_for_export(
+            txs, surface="diesel_cash", fmt="excel",
+        )
+        if not txs:
+            QMessageBox.information(
+                self, "Export",
+                "All records belong to items restricted from Excel export.",
+            )
             return
 
         wb = openpyxl.Workbook()

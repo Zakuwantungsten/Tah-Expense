@@ -349,7 +349,8 @@ _PATCH_FIELDS = {
     "categories": {
         "name", "description", "color", "icon", "sidebar_name", "show_in_sidebar",
         "show_in_cashier_sidebar", "sort_order",
-        "requires_receipt", "requires_truck", "lock_description", "active",
+        "requires_receipt", "requires_truck", "lock_description",
+        "restrict_in_pdf", "restrict_in_excel", "active",
         "account_type", "ref_num", "account_number", "currency", "coa_description",
     },
     "category_subtables": {

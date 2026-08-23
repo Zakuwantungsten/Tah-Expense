@@ -135,6 +135,7 @@ class RejectedView(QWidget):
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
         self._people_names: list = []
         self._restrict_items = False
+        self._defer_item_to_verify = False
 
         self._build()
         asyncio.ensure_future(self._load_lookups())
@@ -389,6 +390,10 @@ class RejectedView(QWidget):
             self._restrict_items = bool(await get_setting("restrict_items"))
         except Exception:
             self._restrict_items = False
+        try:
+            self._defer_item_to_verify = bool(await get_setting("defer_item_to_verify"))
+        except Exception:
+            self._defer_item_to_verify = False
         try:
             fleet = await get_fleet_numbers()
             self._fleet_numbers = {str(n).strip().upper() for n in fleet if n}
@@ -855,6 +860,11 @@ class RejectedView(QWidget):
         rcpt = _norm_receipt_text(self._txt(row, COL_RECEIPT))
         if rcpt not in _VALID_RCPT:
             rcpt = "pending"
+
+        if not item_name and not self._defer_item_to_verify:
+            raise ValueError(
+                "Item is required. Enter an item or ask the accountant to enable description-only entries."
+            )
 
         cat = self._cat_by_name.get(item_name.lower()) if item_name else None
         if cat is not None:

@@ -10,6 +10,7 @@ from pymongo.errors import DuplicateKeyError
 
 from app.api import (
     acquire_operation_lock,
+    allowed_patch,
     bootstrap,
     create_user,
     list_collection,
@@ -558,3 +559,15 @@ async def test_people_endpoint_returns_page_metadata_and_stable_sort() -> None:
     assert page["offset"] == 0
     assert page["items"][0]["name"] == "JOHN DOE"
     assert db["people"].cursor.sort_spec == [("name", 1), ("_id", 1)]
+
+
+def test_category_patch_allows_export_restriction_fields() -> None:
+    patched = allowed_patch(
+        "categories",
+        {"restrict_in_pdf": True, "restrict_in_excel": False, "name": "Fuel"},
+    )
+    assert patched == {
+        "restrict_in_pdf": True,
+        "restrict_in_excel": False,
+        "name": "Fuel",
+    }

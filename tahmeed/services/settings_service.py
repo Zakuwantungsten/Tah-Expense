@@ -20,6 +20,15 @@ DEFAULTS = {
     "allowed_truck_labels": ["YARD", "GARAGE"],
     # Item names whose verified transactions appear in Fuel Consumption → Diesel Cash.
     "diesel_cash_items": ["Diesel Cash"],
+    # Export surfaces that honour per-item restrict_in_pdf / restrict_in_excel flags.
+    "export_restrict_surfaces": [
+        "cashier_register",
+        "cashier_print",
+        "master_expenses",
+        "category_tables",
+        "truck_overview",
+        "diesel_cash",
+    ],
 }
 
 

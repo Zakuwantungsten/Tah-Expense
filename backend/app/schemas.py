@@ -48,6 +48,8 @@ class CategoryWrite(StrictModel):
     requires_receipt: bool = False
     requires_truck: bool = True
     lock_description: bool = False
+    restrict_in_pdf: bool = False
+    restrict_in_excel: bool = False
     active: bool = True
     account_type: str = ""
     ref_num: str = ""
