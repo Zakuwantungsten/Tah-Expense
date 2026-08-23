@@ -41,6 +41,20 @@ from tahmeed.ui.accountant.date_filters import (
     add_from_to_editors, read_from_to, sync_from_to,
 )
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.export_runner import (
+    attach_export_overlay,
+    export_file_ready,
+    fetch_records_with_progress,
+    hide_export_busy,
+    normalize_xlsx_path,
+    notify_export_error,
+    notify_export_info,
+    pick_export_path,
+    run_export_write,
+    show_export_busy,
+    FAST_STYLE_ROW_LIMIT,
+    PROGRESS_EVERY,
+)
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.accountant.feed_sort_helpers import (
     CATEGORY_TABLE_SORT, wire_feed_table_sort, sort_kw, reset_feed_sort,
@@ -240,6 +254,7 @@ class CategoryTableWidget(QWidget):
         self._page = 0
         self._total = 0
         self._loading = False
+        self._export_in_flight = False
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -634,20 +649,26 @@ class CategoryTableWidget(QWidget):
 
     # ── Excel export ───────────────────────────────────────────────────────
     def _on_export(self) -> None:
+        if self._export_in_flight:
+            return
         asyncio.ensure_future(self._do_export())
 
     async def _do_export(self) -> None:
+        if self._export_in_flight:
+            return
         try:
-            import openpyxl
-            from openpyxl.styles import Font, PatternFill, Alignment, Side, Border
+            import openpyxl  # noqa: F401
         except ImportError:
-            QMessageBox.critical(
+            await notify_export_error(
                 self, "Missing Dependency",
                 "openpyxl is required for Excel export.\n\nRun: pip install openpyxl",
             )
             return
 
         from tahmeed.services.accountant_service import get_master_transactions
+
+        self._export_in_flight = True
+        overlay = attach_export_overlay(self)
         date_from, date_to = self._date_filters()
         kw = dict(
             year=self._year, month=self._month,
@@ -657,97 +678,145 @@ class CategoryTableWidget(QWidget):
             date_from=date_from, date_to=date_to,
         )
         try:
-            txs = await get_master_transactions(
-                **kw, **sort_kw(self._sort_state), limit=10_000, skip=0,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")
-            return
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = self._title[:28]
-
-        ws.merge_cells("A1:K1")
-        ws["A1"] = "TAHMEED COACH TZ LTD"
-        ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
-        ws["A1"].alignment = Alignment(horizontal="center")
-        month_label = dict(_MONTHS).get(self._month, "All Months")
-        ws.merge_cells("A2:K2")
-        ws["A2"] = f"{self._title} — FY {self._year}  |  {month_label}"
-        ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
-        ws["A2"].alignment = Alignment(horizontal="center")
-        ws.append([])
-
-        headers = [c[0] for c in _COLS]
-        ws.append(headers)
-        hdr_row = ws.max_row
-        grey = PatternFill("solid", fgColor="F1F5F9")
-        for cell in ws[hdr_row]:
-            cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
-            cell.fill = grey
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        stripe = PatternFill("solid", fgColor="F1F5F9")
-        white = PatternFill("solid", fgColor="FFFFFF")
-        mono = Font(name="Cascadia Code", size=10)
-        red = Font(name="Cascadia Code", size=10, color="DC2626")
-        tzs_total = usd_total = 0.0
-        for i, tx in enumerate(txs):
-            if tx.currency == "TZS":
-                tzs_val, usd_val = tx.amount, None
-                tzs_total += tx.amount
-            else:
-                tzs_val, usd_val = None, tx.amount
-                usd_total += tx.amount
-            receipt_str = {"received": "Received", "pending": "Pending",
-                           "missing": "No Receipt"}.get(tx.receipt_status or "", "")
-            ws.append([
-                i + 1,
-                tx.date.strftime("%d-%b-%Y") if tx.date else "",
-                tx.item or "", tx.description or "", tx.truck_number or "",
-                tx.memo or "", "Yes" if tx.notes_flag else "",
-                tzs_val, receipt_str, tx.ownership or "", tx.approver or "",
-            ])
-            r = ws.max_row
-            fill = stripe if i % 2 else white
-            for cell in ws[r]:
-                cell.fill = fill
-                cell.alignment = Alignment(vertical="center")
-            c = ws.cell(r, 8)
-            if tzs_val is not None:
-                c.font = red if tzs_val < 0 else mono
-                c.number_format = "#,##0"
-                c.alignment = Alignment(horizontal="right", vertical="center")
-
-        ws.append([])
-        ws.append(["", "", "", "TOTAL", "", "", "", tzs_total or "", "", "", ""])
-        total_r = ws.max_row
-        ws.cell(total_r, 4).font = Font(name="Segoe UI", bold=True, size=11)
-        if tzs_total:
-            c = ws.cell(total_r, 8)
-            c.font = Font(name="Cascadia Code", bold=True, size=11,
-                          color="DC2626" if tzs_total < 0 else "111827")
-            c.number_format = "#,##0"
-            c.alignment = Alignment(horizontal="right", vertical="center")
-
-        widths = [6, 12, 14, 34, 12, 20, 7, 15, 13, 13, 12]
-        for idx, w in enumerate(widths, 1):
-            ws.column_dimensions[ws.cell(1, idx).column_letter].width = w
-        ws.freeze_panes = ws.cell(hdr_row + 1, 1)
-
-        month_tag = dict(_MONTHS).get(self._month, "All").replace(" ", "")
-        safe_title = self._title.replace(" ", "_").replace("&", "and").replace("/", "-")
-        default = f"{safe_title}_FY{self._year}_{month_tag}.xlsx"
-        path, _ = QFileDialog.getSaveFileName(
-            self, f"Export {self._title}", default, "Excel Files (*.xlsx)"
-        )
-        if path:
+            show_export_busy(overlay, f"Loading {self._title}…", maximum=0)
             try:
-                wb.save(path)
-                QMessageBox.information(
-                    self, "Export Complete",
-                    f"Exported {len(txs):,} records to:\n{path}",
+                txs = await fetch_records_with_progress(
+                    overlay,
+                    lambda *, limit, skip: get_master_transactions(
+                        **kw, **sort_kw(self._sort_state), limit=limit, skip=skip,
+                    ),
+                    phase=f"Loading {self._title}",
                 )
             except Exception as exc:
-                QMessageBox.critical(self, "Save Error", f"Could not save file:\n{exc}")
+                await notify_export_error(self, "Export Error", f"Failed to fetch data: {exc}")
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not txs:
+                await notify_export_info(self, "Export", "No records to export.")
+                return
+
+            month_tag = dict(_MONTHS).get(self._month, "All").replace(" ", "")
+            safe_title = self._title.replace(" ", "_").replace("&", "and").replace("/", "-")
+            default = f"{safe_title}_FY{self._year}_{month_tag}.xlsx"
+            path = await pick_export_path(self, f"Export {self._title}", default)
+            if not path:
+                return
+            path = normalize_xlsx_path(path)
+
+            title = self._title
+            year = self._year
+            month = self._month
+            total = len(txs)
+            fast = total >= FAST_STYLE_ROW_LIMIT
+
+            def _write(progress_cb) -> None:
+                from openpyxl.styles import Font, PatternFill, Alignment
+
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = title[:28]
+
+                ws.merge_cells("A1:K1")
+                ws["A1"] = "TAHMEED COACH TZ LTD"
+                ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
+                ws["A1"].alignment = Alignment(horizontal="center")
+                month_label = dict(_MONTHS).get(month, "All Months")
+                ws.merge_cells("A2:K2")
+                ws["A2"] = f"{title} — FY {year}  |  {month_label}"
+                ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
+                ws["A2"].alignment = Alignment(horizontal="center")
+                ws.append([])
+
+                headers = [c[0] for c in _COLS]
+                ws.append(headers)
+                hdr_row = ws.max_row
+                grey = PatternFill("solid", fgColor="F1F5F9")
+                for cell in ws[hdr_row]:
+                    cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
+                    cell.fill = grey
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                stripe = PatternFill("solid", fgColor="F1F5F9")
+                white = PatternFill("solid", fgColor="FFFFFF")
+                mono = Font(name="Cascadia Code", size=10)
+                red = Font(name="Cascadia Code", size=10, color="DC2626")
+                tzs_total = usd_total = 0.0
+                for i, tx in enumerate(txs):
+                    if tx.currency == "TZS":
+                        tzs_val, usd_val = tx.amount, None
+                        tzs_total += tx.amount
+                    else:
+                        tzs_val, usd_val = None, tx.amount
+                        usd_total += tx.amount
+                    receipt_str = {
+                        "received": "Received", "pending": "Pending",
+                        "missing": "No Receipt",
+                    }.get(tx.receipt_status or "", "")
+                    ws.append([
+                        i + 1,
+                        tx.date.strftime("%d-%b-%Y") if tx.date else "",
+                        tx.item or "", tx.description or "", tx.truck_number or "",
+                        tx.memo or "", "Yes" if tx.notes_flag else "",
+                        tzs_val, receipt_str, tx.ownership or "", tx.approver or "",
+                    ])
+                    if not fast:
+                        r = ws.max_row
+                        fill = stripe if i % 2 else white
+                        for cell in ws[r]:
+                            cell.fill = fill
+                            cell.alignment = Alignment(vertical="center")
+                        c = ws.cell(r, 8)
+                        if tzs_val is not None:
+                            c.font = red if tzs_val < 0 else mono
+                            c.number_format = "#,##0"
+                            c.alignment = Alignment(horizontal="right", vertical="center")
+
+                    if progress_cb and (
+                        (i + 1) % PROGRESS_EVERY == 0 or i + 1 == total
+                    ):
+                        progress_cb(i + 1, "Writing rows")
+
+                ws.append([])
+                ws.append(["", "", "", "TOTAL", "", "", "", tzs_total or "", "", "", ""])
+                total_r = ws.max_row
+                ws.cell(total_r, 4).font = Font(name="Segoe UI", bold=True, size=11)
+                if tzs_total:
+                    c = ws.cell(total_r, 8)
+                    c.font = Font(
+                        name="Cascadia Code", bold=True, size=11,
+                        color="DC2626" if tzs_total < 0 else "111827",
+                    )
+                    c.number_format = "#,##0"
+                    c.alignment = Alignment(horizontal="right", vertical="center")
+
+                widths = [6, 12, 14, 34, 12, 20, 7, 15, 13, 13, 12]
+                for idx, w in enumerate(widths, 1):
+                    ws.column_dimensions[ws.cell(1, idx).column_letter].width = w
+                ws.freeze_panes = ws.cell(hdr_row + 1, 1)
+                if progress_cb:
+                    progress_cb(total, "Saving file")
+                wb.save(path)
+
+            try:
+                await run_export_write(overlay, total, _write)
+            except Exception as exc:
+                await notify_export_error(self, "Save Error", f"Could not save file:\n{exc}")
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not export_file_ready(path):
+                await notify_export_error(
+                    self, "Save Error", f"The file could not be saved:\n{path}",
+                )
+                return
+
+            await notify_export_info(
+                self, "Export Complete",
+                f"Exported {len(txs):,} records to:\n{path}",
+            )
+        finally:
+            hide_export_busy(self)
+            self._export_in_flight = False

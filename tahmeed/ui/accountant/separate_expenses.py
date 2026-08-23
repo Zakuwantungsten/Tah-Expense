@@ -36,14 +36,30 @@ from tahmeed.ui.accountant.feed_sort_helpers import (
 import qtawesome as qta
 
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont
+from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSizePolicy,
-    QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QStackedWidget, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout,
     QWidget, QDateEdit,
 )
+
+from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.export_paging import EXPORT_PAGE_SIZE, fetch_all_pages
+from tahmeed.ui.widgets.export_runner import (
+    attach_export_overlay,
+    export_file_ready,
+    fetch_records_with_progress,
+    hide_export_busy,
+    normalize_xlsx_path,
+    notify_export_error,
+    notify_export_info,
+    pick_export_path,
+    run_export_write,
+    show_export_busy,
+)
+from tahmeed.ui.widgets.split_export_button import make_export_menu_btn
 
 # ── openpyxl (optional — fallback to csv-only if missing) ──────────────────────
 try:
@@ -217,6 +233,289 @@ def _make_table(headers: List[str]) -> QTableWidget:
     t.horizontalHeader().setStretchLastSection(True)
     t.setStyleSheet(_table_style())
     return t
+
+
+def _bind_feed_columns(table: QTableWidget, key: str) -> None:
+    """Auto-fit columns on first visit, then remember the user's widths."""
+    hdr = table.horizontalHeader()
+    hdr.setStretchLastSection(False)
+    hdr.setMinimumSectionSize(40)
+    defaults = [max(table.columnWidth(i), 72) for i in range(table.columnCount())]
+    bind_column_width_persistence(
+        table, f"sep_{key}", defaults, auto_fit_if_unset=True,
+    )
+
+
+def _export_num(val):
+    """Best-effort numeric cell for Excel (None when blank)."""
+    if val is None or val == "" or val == "—":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return val
+
+
+def _export_menu_btn(on_filtered, on_all, *, parent=None, height: int = 32) -> QToolButton:
+    """Split Export button: main click = filtered+sorted, menu also has Export All."""
+    return make_export_menu_btn(
+        on_filtered,
+        on_all,
+        parent=parent,
+        height=height,
+        btn_tip=(
+            "Export Filtered — current search, date filters, and column sort.\n"
+            "Use the ▾ menu for Export All (year/month only, no search or date range)."
+        ),
+        filtered_tip="Export rows matching the current filters and sort order.",
+        all_tip=(
+            "Export every record in the current year/month (ignores search and From/To)."
+        ),
+    )
+
+
+async def _fetch_export_pages(fetch, *, page: int = EXPORT_PAGE_SIZE) -> List[dict]:
+    """Walk a (limit, skip) fetch until exhausted."""
+    return await fetch_all_pages(fetch, page_size=page)
+
+
+def _write_feed_xlsx(
+    path: str,
+    *,
+    title: str,
+    headers: List[str],
+    rows: List[list],
+    subtitle: str = "",
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
+    if not _HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required for Excel export.")
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    from tahmeed.ui.widgets.export_runner import FAST_STYLE_ROW_LIMIT, PROGRESS_EVERY
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = title[:31] or "Export"
+
+    navy = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
+    sub_font = Font(name="Segoe UI", bold=True, size=11, color="374151")
+    hdr_font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
+    body_font = Font(name="Segoe UI", size=10)
+    grey = PatternFill("solid", fgColor="F1F5F9")
+    alt = PatternFill("solid", fgColor="F9FAFB")
+    thin = Border(bottom=Side(style="thin", color="E5E7EB"))
+    center = Alignment(horizontal="center", vertical="center")
+
+    last_col = get_column_letter(max(len(headers), 1))
+    ws.merge_cells(f"A1:{last_col}1")
+    ws["A1"] = "TAHMEED COACH TZ LTD"
+    ws["A1"].font = navy
+    ws["A1"].alignment = center
+    ws.merge_cells(f"A2:{last_col}2")
+    ws["A2"] = subtitle or title
+    ws["A2"].font = sub_font
+    ws["A2"].alignment = center
+    ws.append([])
+    ws.append(headers)
+    for cell in ws[ws.max_row]:
+        cell.font = hdr_font
+        cell.fill = grey
+        cell.alignment = center
+        cell.border = thin
+
+    fast = len(rows) >= FAST_STYLE_ROW_LIMIT
+    total = len(rows)
+    for i, row in enumerate(rows):
+        ws.append(list(row))
+        if not fast:
+            fill = alt if i % 2 else None
+            for cell in ws[ws.max_row]:
+                cell.font = body_font
+                cell.alignment = Alignment(vertical="center")
+                if fill:
+                    cell.fill = fill
+        if progress_cb and ((i + 1) % PROGRESS_EVERY == 0 or i + 1 == total):
+            progress_cb(i + 1, "Writing rows")
+
+    for idx, header in enumerate(headers, 1):
+        sample = [str(header)]
+        for row in rows[:80]:
+            if idx - 1 < len(row) and row[idx - 1] is not None:
+                sample.append(str(row[idx - 1]))
+        width = min(max(max(len(s) for s in sample) + 2, 10), 42)
+        ws.column_dimensions[get_column_letter(idx)].width = width
+
+    if progress_cb:
+        progress_cb(total, "Saving file")
+    wb.save(path)
+
+
+class _FeedExportMixin:
+    """Filtered / All Excel export for Separate Expenses feed tables."""
+
+    _export_title = "Export"
+    _export_filename = "export"
+    _export_headers: List[str] = []
+    _export_row_fn: Callable[[dict], list] = staticmethod(lambda rec: list(rec.values()))
+
+    def _on_export_filtered(self) -> None:
+        if getattr(self, "_export_in_flight", False):
+            return
+        asyncio.ensure_future(self._run_export(all_records=False))
+
+    def _on_export_all(self) -> None:
+        if getattr(self, "_export_in_flight", False):
+            return
+        asyncio.ensure_future(self._run_export(all_records=True))
+
+    def _add_export_btn(self, layout, *, height: int = 32) -> None:
+        layout.addWidget(_export_menu_btn(
+            self._on_export_filtered, self._on_export_all, parent=self, height=height,
+        ))
+
+    async def _run_export(self, *, all_records: bool) -> None:
+        if getattr(self, "_export_in_flight", False):
+            return
+        if not _HAS_OPENPYXL:
+            await notify_export_error(
+                self, "Missing Dependency",
+                "openpyxl is required for Excel export.\n\nRun: pip install openpyxl",
+            )
+            return
+
+        self._export_in_flight = True
+        overlay = attach_export_overlay(self)
+        scope = "All" if all_records else "Filtered"
+        try:
+            show_export_busy(overlay, f"Loading {scope.lower()} records…", maximum=0)
+            try:
+                recs = await fetch_records_with_progress(
+                    overlay,
+                    lambda *, limit, skip: self._fetch_export_page(
+                        all_records=all_records, limit=limit, skip=skip,
+                    ),
+                    phase=f"Loading {scope.lower()} records",
+                )
+            except Exception as exc:
+                await notify_export_error(self, "Export Error", str(exc))
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not recs:
+                await notify_export_info(
+                    self, "Export", "No records to export for the selected scope.",
+                )
+                return
+
+            default = f"{self._export_filename}_{scope}.xlsx"
+            if getattr(self, "_export_kind", "") == "upload":
+                upload_doc = getattr(self, "_upload_doc", None) or {}
+                source = str(upload_doc.get("source_filename") or "").strip()
+                if source:
+                    stem = Path(source).stem
+                    default = f"{stem}_{scope}.xlsx"
+            path = await pick_export_path(
+                self, f"Export {self._export_title}", default,
+            )
+            if not path:
+                return
+            path = normalize_xlsx_path(path)
+
+            headers = list(self._export_headers)
+            row_fn = self._export_row_fn
+            title = self._export_title
+            subtitle = (
+                f"{self._export_title} — {scope}  •  "
+                f"{datetime.now().strftime('%d %b %Y  %H:%M')}  •  {len(recs):,} rows"
+            )
+            total = len(recs)
+
+            def _write(progress_cb) -> None:
+                rows = [row_fn(rec) for rec in recs]
+                _write_feed_xlsx(
+                    path,
+                    title=title,
+                    headers=headers,
+                    rows=rows,
+                    subtitle=subtitle,
+                    progress_cb=progress_cb,
+                )
+
+            try:
+                await run_export_write(overlay, total, _write)
+            except Exception as exc:
+                await notify_export_error(self, "Export Error", str(exc))
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not export_file_ready(path):
+                await notify_export_error(
+                    self, "Export Error",
+                    f"The file could not be saved:\n{path}",
+                )
+                return
+
+            await notify_export_info(
+                self, "Export Complete",
+                f"Saved {len(recs):,} row(s) to:\n{path}",
+            )
+        finally:
+            hide_export_busy(self)
+            self._export_in_flight = False
+
+    async def _fetch_export_page(
+        self, *, all_records: bool, limit: int, skip: int,
+    ) -> List[dict]:
+        from tahmeed.services import accountant_service as svc
+
+        fn_name = getattr(self, "_export_svc", "") or ""
+        if not fn_name:
+            raise NotImplementedError(f"{type(self).__name__} is missing _export_svc")
+        fn = getattr(svc, fn_name)
+        kind = getattr(self, "_export_kind", "year_month")
+        search = "" if all_records else getattr(self, "_search", "")
+        sort = sort_kw(self._sort_state) if hasattr(self, "_sort_state") else {}
+
+        if kind == "year_month":
+            date_kw = {} if all_records else self._date_kw()
+            extra: dict = {}
+            if hasattr(self, "_amount_filter_kw"):
+                extra.update(self._amount_filter_kw())
+            if hasattr(self, "_credit_only"):
+                extra["credit_only"] = self._credit_only
+            month = self._effective_month()
+            return await fn(
+                search, self._year, month,
+                limit=limit, skip=skip, **date_kw, **sort, **extra,
+            )
+
+        if kind == "upload":
+            return await fn(self._upload_id, search, limit, skip, **sort)
+
+        if kind == "deposits":
+            date_kw = {} if all_records else self._date_kw()
+            return await fn(search, limit=limit, skip=skip, **date_kw)
+
+        if kind == "insurance":
+            month = getattr(self, "_month", "")
+            status = "" if all_records else getattr(self, "_status", "")
+            feed = self._export_feed
+            return await fn(feed, search, month, status, limit, skip, **sort)
+
+        raise NotImplementedError(kind)
+
+    async def _fetch_export_records(self, *, all_records: bool) -> List[dict]:
+        async def fetch(*, limit, skip):
+            return await self._fetch_export_page(
+                all_records=all_records, limit=limit, skip=skip,
+            )
+
+        return await _fetch_export_pages(fetch)
 
 
 def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
@@ -1023,6 +1322,144 @@ def _toll_fill_detail_row(t: QTableWidget, r: int, rec: dict) -> None:
     _finish_table_row(t, r)
 
 
+def _toll_export_row(rec: dict) -> list:
+    return [
+        rec.get("toll_date") or "",
+        rec.get("toll_plaza") or "",
+        rec.get("client_name") or "",
+        rec.get("card_no") or "",
+        rec.get("vehicle_reg") or "",
+        rec.get("vehicle_class") or "",
+        _export_num(rec.get("tender_amount")),
+        rec.get("receipt_no") or "",
+        rec.get("device") or "",
+        rec.get("lane") or "",
+        rec.get("cashier_name") or "",
+    ]
+
+
+def _pcongo_export_row(rec: dict) -> list:
+    return [
+        rec.get("sn") or "",
+        rec.get("ledger_id") or "",
+        rec.get("payment_date") or "",
+        rec.get("transaction_type") or "",
+        _export_num(rec.get("amount")),
+        rec.get("running_bal") or "",
+        rec.get("cashier") or "",
+        rec.get("vehicle_no") or "",
+        rec.get("direction") or "",
+        rec.get("gate_in") or "",
+        rec.get("transaction_details") or "",
+    ]
+
+
+def _pcongo_deposit_export_row(rec: dict) -> list:
+    import_dt = rec.get("import_date")
+    upload_str = (
+        import_dt.strftime("%d %b %Y  %H:%M")
+        if isinstance(import_dt, datetime)
+        else (str(import_dt) if import_dt else "")
+    )
+    return [
+        rec.get("payment_date") or "",
+        rec.get("ledger_id") or "",
+        _export_num(rec.get("amount")),
+        rec.get("running_bal") or "",
+        rec.get("cashier") or "",
+        rec.get("transaction_details") or "",
+        rec.get("source_filename") or "",
+        upload_str,
+    ]
+
+
+def _congo_export_row(rec: dict) -> list:
+    serial = rec.get("serial_no")
+    return [
+        "" if serial is None else str(serial),
+        rec.get("date_str") or "",
+        rec.get("lpo_no") or "",
+        rec.get("truck_no") or "",
+        rec.get("description") or "",
+        _export_num(rec.get("amount_usd")),
+    ]
+
+
+def _kimvi_export_row(rec: dict) -> list:
+    serial = rec.get("serial_no")
+    return [
+        "" if serial is None else str(serial),
+        rec.get("date_str") or "",
+        rec.get("truck_no") or "",
+        rec.get("description") or "",
+        _export_num(rec.get("amount_usd")),
+    ]
+
+
+def _zambia_export_row(rec: dict) -> list:
+    return [
+        rec.get("date") or "",
+        rec.get("type") or "",
+        rec.get("plate_num") or "",
+        rec.get("ticket_no") or "",
+        _export_num(rec.get("debit")),
+        _export_num(rec.get("credit")),
+        _export_num(rec.get("balance")),
+        rec.get("heading_to") or "",
+    ]
+
+
+def _afritrack_export_row(rec: dict) -> list:
+    return [
+        rec.get("row_index") or "",
+        rec.get("truck") or "",
+        _export_num(rec.get("days")),
+        _export_num(rec.get("non_trans_days")),
+        _export_num(rec.get("trans_days")),
+        _export_num(rec.get("rate_per_day")),
+        _export_num(rec.get("total_tahmeed")),
+        _export_num(rec.get("total_invoice")),
+        _export_num(rec.get("variance")),
+        rec.get("remarks") or "",
+    ]
+
+
+def _rahntech_export_row(rec: dict) -> list:
+    return [
+        rec.get("sn") or "",
+        rec.get("sales_date") or "",
+        rec.get("trip_number") or "",
+        rec.get("device_number") or "",
+        rec.get("truck_number") or "",
+        rec.get("driver_name") or "",
+        rec.get("do_number") or "",
+    ]
+
+
+def _comesa_export_row(rec: dict) -> list:
+    return [
+        rec.get("name") or "",
+        rec.get("card_no") or "",
+        rec.get("valid_from") or "",
+        rec.get("valid_to") or "",
+        rec.get("truck_reg") or "",
+        _export_num(rec.get("premium")),
+        rec.get("month") or "",
+    ]
+
+
+def _third_party_export_row(rec: dict) -> list:
+    return [
+        rec.get("name") or "",
+        rec.get("reg_no") or "",
+        _export_num(rec.get("premium")),
+        _export_num(rec.get("vat")),
+        _export_num(rec.get("total_premium")),
+        rec.get("month") or "",
+        rec.get("status") or "",
+    ]
+
+
 class _SegmentTabBar(QWidget):
     """Two-or-more-option segmented tab control."""
 
@@ -1091,8 +1528,13 @@ def _populate_year_combo(cb: QComboBox, years: List[int], selected_year: int) ->
     return active
 
 
-class _TollAllEntries(QWidget):
+class _TollAllEntries(_FeedExportMixin, QWidget):
     """Flat, filterable list of every Toll Plaza record — infinite scroll."""
+
+    _export_title = "Toll Plaza"
+    _export_filename = "TollPlaza"
+    _export_headers = _TOLL_DETAIL_HEADERS
+    _export_row_fn = staticmethod(_toll_export_row)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1149,20 +1591,20 @@ class _TollAllEntries(QWidget):
         tbl.addWidget(clear_btn)
 
         tbl.addStretch()
+        self._add_export_btn(tbl)
         vl.addWidget(tb)
 
         self._totals = _TotalsBar([("zmw", "ZMW "), ("count", "Total records: ")])
         vl.addWidget(self._totals)
 
         self._table = _make_table(_TOLL_DETAIL_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, TOLL_DETAIL_SORT,
             default_field="transaction_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "toll_all")
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -1265,6 +1707,20 @@ class _TollAllEntries(QWidget):
             self._table.insertRow(r)
             _toll_fill_detail_row(self._table, r, rec)
 
+    async def _fetch_export_records(self, *, all_records: bool) -> List[dict]:
+        from tahmeed.services import accountant_service as svc
+        month = self._effective_month()
+        search = "" if all_records else self._search
+        date_kw = {} if all_records else self._date_kw()
+
+        async def fetch(*, limit, skip):
+            return await svc.get_toll_plaza_all_records(
+                search, self._year, month,
+                limit=limit, skip=skip, **date_kw, **sort_kw(self._sort_state),
+            )
+
+        return await _fetch_export_pages(fetch)
+
     def _on_scroll(self, value: int) -> None:
         bar = self._table.verticalScrollBar()
         if bar.maximum() <= 0:
@@ -1350,6 +1806,7 @@ class _TollUploadBrowse(QWidget):
         self._table.setColumnWidth(2, 80)
         self._table.setColumnWidth(3, 120)
         self._table.setStyleSheet(_table_style())
+        _bind_feed_columns(self._table, "toll_browse")
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1422,8 +1879,15 @@ class _TollUploadBrowse(QWidget):
 #  Upload Detail sub-widget — all records for one import batch
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _TollUploadDetail(QWidget):
+class _TollUploadDetail(_FeedExportMixin, QWidget):
     """Full record table for a single Toll Plaza upload batch."""
+
+    _export_title = "Toll Plaza Upload"
+    _export_filename = "TollPlaza_Upload"
+    _export_headers = _TOLL_DETAIL_HEADERS
+    _export_row_fn = staticmethod(_toll_export_row)
+    _export_svc = "get_toll_plaza_upload_records"
+    _export_kind = "upload"
 
     back_requested = Signal()
     delete_requested = Signal(object)
@@ -1459,6 +1923,7 @@ class _TollUploadDetail(QWidget):
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
 
+        self._add_export_btn(navl, height=30)
         delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
         delete_btn.clicked.connect(self._request_delete)
         navl.addWidget(delete_btn)
@@ -1489,14 +1954,13 @@ class _TollUploadDetail(QWidget):
 
         # ── Full record table ─────────────────────────────────────────────
         self._table = _make_table(_TOLL_DETAIL_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, TOLL_DETAIL_SORT,
             default_field="transaction_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "toll_detail")
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("zmw", "ZMW "), ("count", "Records: ")])
@@ -1875,7 +2339,13 @@ def _pcongo_fill_detail_row(t: QTableWidget, r: int, rec: dict) -> None:
     _finish_table_row(t, r, bg=_GREEN_L if is_deposit else None)
 
 
-class _ParkingCongoAllEntries(QWidget):
+class _ParkingCongoAllEntries(_FeedExportMixin, QWidget):
+    _export_title = "Parking Congo"
+    _export_filename = "ParkingCongo"
+    _export_headers = _PCONGO_DETAIL_HEADERS
+    _export_row_fn = staticmethod(_pcongo_export_row)
+    _export_svc = "get_parking_congo_all_records"
+
     """Flat, filterable list of every Parking Congo record — infinite scroll."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -1933,20 +2403,20 @@ class _ParkingCongoAllEntries(QWidget):
         tbl.addWidget(clear_btn)
 
         tbl.addStretch()
+        self._add_export_btn(tbl)
         vl.addWidget(tb)
 
         self._totals = _TotalsBar([("amount", "Total: "), ("count", "Total records: ")])
         vl.addWidget(self._totals)
 
         self._table = _make_table(_PCONGO_DETAIL_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, PARKING_CONGO_DETAIL_SORT,
             default_field="transaction_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "pcongo")
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -2129,6 +2599,7 @@ class _ParkingCongoUploadBrowse(QWidget):
         self._table.setColumnWidth(1, 260)
         self._table.setColumnWidth(2, 80)
         self._table.setStyleSheet(_table_style())
+        _bind_feed_columns(self._table, "pcongo_browse")
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -2192,7 +2663,14 @@ class _ParkingCongoUploadBrowse(QWidget):
 #  Upload Detail sub-widget — all records for one import batch
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _ParkingCongoUploadDetail(QWidget):
+class _ParkingCongoUploadDetail(_FeedExportMixin, QWidget):
+    _export_title = "Parking Congo Upload"
+    _export_filename = "ParkingCongo_Upload"
+    _export_headers = _PCONGO_DETAIL_HEADERS
+    _export_row_fn = staticmethod(_pcongo_export_row)
+    _export_svc = "get_parking_congo_upload_records"
+    _export_kind = "upload"
+
     """Full record table for a single Parking Congo upload batch."""
 
     back_requested = Signal()
@@ -2228,6 +2706,7 @@ class _ParkingCongoUploadDetail(QWidget):
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
 
+        self._add_export_btn(navl, height=30)
         delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
         delete_btn.clicked.connect(self._request_delete)
         navl.addWidget(delete_btn)
@@ -2255,13 +2734,12 @@ class _ParkingCongoUploadDetail(QWidget):
         vl.addWidget(tb)
 
         self._table = _make_table(_PCONGO_DETAIL_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._sort_state = wire_feed_table_sort(
             self._table, PARKING_CONGO_DETAIL_SORT,
             default_field="payment_date", default_asc=False,
             on_sort_changed=lambda _f, _a: self._go_page(1),
         )
+        _bind_feed_columns(self._table, "pcongo")
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])
@@ -2349,7 +2827,14 @@ _PCONGO_DEPOSIT_HEADERS = [
 ]
 
 
-class _ParkingCongoDeposited(QWidget):
+class _ParkingCongoDeposited(_FeedExportMixin, QWidget):
+    _export_title = "Parking Congo Deposits"
+    _export_filename = "ParkingCongo_Deposits"
+    _export_headers = _PCONGO_DEPOSIT_HEADERS
+    _export_row_fn = staticmethod(_pcongo_deposit_export_row)
+    _export_svc = "get_parking_congo_deposits"
+    _export_kind = "deposits"
+
     """List of deposit credits with From/To filters; click opens the upload."""
 
     open_upload = Signal(object)
@@ -2399,14 +2884,14 @@ class _ParkingCongoDeposited(QWidget):
         clear_btn.clicked.connect(self._clear_filters)
         tbl.addWidget(clear_btn)
         tbl.addStretch()
+        self._add_export_btn(tbl)
         vl.addWidget(tb)
 
         self._totals = _TotalsBar([("amount", "Total deposited: "), ("count", "Deposits: ")])
         vl.addWidget(self._totals)
 
         self._table = _make_table(_PCONGO_DEPOSIT_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
+        _bind_feed_columns(self._table, "pcongo_deposits")
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -2925,7 +3410,13 @@ def _set_congo_summary(in_lbl: QLabel, out_lbl: QLabel, bal_lbl: QLabel,
     )
 
 
-class _CongoEntriesBase(QWidget):
+class _CongoEntriesBase(_FeedExportMixin, QWidget):
+    _export_title = "Congo Expenses"
+    _export_filename = "CongoExpenses"
+    _export_headers = _CONGO_HEADERS
+    _export_row_fn = staticmethod(_congo_export_row)
+    _export_svc = "get_congo_all_records"
+
     """Shared flat-list view for Congo All Entries / Money In / Called Out tabs."""
 
     def __init__(
@@ -2990,6 +3481,7 @@ class _CongoEntriesBase(QWidget):
         tbl.addWidget(clear_btn)
 
         tbl.addStretch()
+        self._add_export_btn(tbl)
         vl.addWidget(tb)
 
         self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
@@ -3001,14 +3493,13 @@ class _CongoEntriesBase(QWidget):
         vl.addWidget(self._totals)
 
         self._table = _make_kimvi_table(_CONGO_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, CONGO_SORT,
             default_field="expense_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "congo")
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -3422,6 +3913,7 @@ class _CongoExpUploadBrowse(QWidget):
         self._table.setColumnWidth(2, 80)
         self._table.setColumnWidth(3, 80)
         self._table.setColumnWidth(4, 120)
+        _bind_feed_columns(self._table, "congo_browse")
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -3503,7 +3995,14 @@ class _CongoExpUploadBrowse(QWidget):
             self.delete_clicked.emit(self._uploads[row])
 
 
-class _CongoExpUploadDetail(QWidget):
+class _CongoExpUploadDetail(_FeedExportMixin, QWidget):
+    _export_title = "Congo Expenses Upload"
+    _export_filename = "CongoExpenses_Upload"
+    _export_headers = _CONGO_HEADERS
+    _export_row_fn = staticmethod(_congo_export_row)
+    _export_svc = "get_congo_upload_records"
+    _export_kind = "upload"
+
     back_requested = Signal()
     delete_requested = Signal(object)
 
@@ -3537,6 +4036,7 @@ class _CongoExpUploadDetail(QWidget):
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
 
+        self._add_export_btn(navl, height=30)
         delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
         delete_btn.clicked.connect(self._request_delete)
         navl.addWidget(delete_btn)
@@ -3569,14 +4069,13 @@ class _CongoExpUploadDetail(QWidget):
         vl.addWidget(tb)
 
         self._table = _make_kimvi_table(_CONGO_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, CONGO_SORT,
             default_field="expense_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "congo")
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])
@@ -4630,7 +5129,13 @@ def _kimvi_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     t.setRowHeight(r, _ROW_H)
 
 
-class _KimviEntriesBase(QWidget):
+class _KimviEntriesBase(_FeedExportMixin, QWidget):
+    _export_title = "Ahmed Kimvi"
+    _export_filename = "AhmedKimvi"
+    _export_headers = _KIMVI_HEADERS
+    _export_row_fn = staticmethod(_kimvi_export_row)
+    _export_svc = "get_kimvi_all_records"
+
     """Shared flat-list view for Ahmed Kimvi All Entries / Money In / Called Out tabs."""
 
     def __init__(
@@ -4695,6 +5200,7 @@ class _KimviEntriesBase(QWidget):
         tbl.addWidget(clear_btn)
 
         tbl.addStretch()
+        self._add_export_btn(tbl)
         vl.addWidget(tb)
 
         self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
@@ -4706,14 +5212,13 @@ class _KimviEntriesBase(QWidget):
         vl.addWidget(self._totals)
 
         self._table = _make_kimvi_table(_KIMVI_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, KIMVI_SORT,
             default_field="expense_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "kimvi")
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -4931,6 +5436,7 @@ class _KimviUploadBrowse(QWidget):
         self._table.setColumnWidth(2, 80)
         self._table.setColumnWidth(3, 80)
         self._table.setColumnWidth(4, 120)
+        _bind_feed_columns(self._table, "kimvi_browse")
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -5012,7 +5518,14 @@ class _KimviUploadBrowse(QWidget):
             self.delete_clicked.emit(self._uploads[row])
 
 
-class _KimviUploadDetail(QWidget):
+class _KimviUploadDetail(_FeedExportMixin, QWidget):
+    _export_title = "Ahmed Kimvi Upload"
+    _export_filename = "AhmedKimvi_Upload"
+    _export_headers = _KIMVI_HEADERS
+    _export_row_fn = staticmethod(_kimvi_export_row)
+    _export_svc = "get_kimvi_upload_records"
+    _export_kind = "upload"
+
     """Full record table for a single Ahmed Kimvi import batch."""
 
     back_requested = Signal()
@@ -5048,6 +5561,7 @@ class _KimviUploadDetail(QWidget):
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
 
+        self._add_export_btn(navl, height=30)
         delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
         delete_btn.clicked.connect(self._request_delete)
         navl.addWidget(delete_btn)
@@ -5080,14 +5594,13 @@ class _KimviUploadDetail(QWidget):
         vl.addWidget(tb)
 
         self._table = _make_kimvi_table(_KIMVI_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, KIMVI_SORT,
             default_field="expense_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "kimvi")
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])
@@ -5619,7 +6132,13 @@ def _set_zambia_summary(
     )
 
 
-class _ZambiaParkingEntriesBase(QWidget):
+class _ZambiaParkingEntriesBase(_FeedExportMixin, QWidget):
+    _export_title = "Zambia Parking"
+    _export_filename = "ZambiaParking"
+    _export_headers = _ZAMBIA_PARK_HEADERS
+    _export_row_fn = staticmethod(_zambia_export_row)
+    _export_svc = "get_zambia_parking_all_records"
+
     """Shared flat-list view for Zambia Parking All Entries / Money In tabs."""
 
     def __init__(self, credit_only: bool = False, parent: QWidget | None = None) -> None:
@@ -5678,6 +6197,7 @@ class _ZambiaParkingEntriesBase(QWidget):
         tbl.addWidget(clear_btn)
 
         tbl.addStretch()
+        self._add_export_btn(tbl)
         vl.addWidget(tb)
 
         self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
@@ -5689,14 +6209,13 @@ class _ZambiaParkingEntriesBase(QWidget):
         vl.addWidget(self._totals)
 
         self._table = _make_table(_ZAMBIA_PARK_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, ZAMBIA_PARKING_SORT,
             default_field="transaction_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "zambia")
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -6168,6 +6687,7 @@ class _ZambiaParkingUploadBrowse(QWidget):
         self._table.setColumnWidth(2, 80)
         self._table.setColumnWidth(3, 80)
         self._table.setColumnWidth(4, 130)
+        _bind_feed_columns(self._table, "zambia_browse")
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -6246,7 +6766,14 @@ class _ZambiaParkingUploadBrowse(QWidget):
             self.delete_clicked.emit(self._uploads[row])
 
 
-class _ZambiaParkingUploadDetail(QWidget):
+class _ZambiaParkingUploadDetail(_FeedExportMixin, QWidget):
+    _export_title = "Zambia Parking Upload"
+    _export_filename = "ZambiaParking_Upload"
+    _export_headers = _ZAMBIA_PARK_HEADERS
+    _export_row_fn = staticmethod(_zambia_export_row)
+    _export_svc = "get_zambia_parking_upload_records"
+    _export_kind = "upload"
+
     back_requested = Signal()
     delete_requested = Signal(object)
 
@@ -6280,6 +6807,7 @@ class _ZambiaParkingUploadDetail(QWidget):
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
 
+        self._add_export_btn(navl, height=30)
         delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
         delete_btn.clicked.connect(self._request_delete)
         navl.addWidget(delete_btn)
@@ -6312,14 +6840,13 @@ class _ZambiaParkingUploadDetail(QWidget):
         vl.addWidget(tb)
 
         self._table = _make_table(_ZAMBIA_PARK_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, ZAMBIA_PARKING_SORT,
             default_field="transaction_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "zambia")
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("debit", "ZMW "), ("credit", "CR: ZMW ")])
@@ -7764,7 +8291,13 @@ def _afritrack_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     _finish_table_row(t, r)
 
 
-class _AfritrackAllEntries(QWidget):
+class _AfritrackAllEntries(_FeedExportMixin, QWidget):
+    _export_title = "Afritrack"
+    _export_filename = "Afritrack"
+    _export_headers = _AF_DETAIL_HEADERS
+    _export_row_fn = staticmethod(_afritrack_export_row)
+    _export_svc = "get_afritrack_all_records"
+
     """Flat, filterable list of every Afritrack record with infinite scroll."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -7822,6 +8355,7 @@ class _AfritrackAllEntries(QWidget):
         tbl.addWidget(clear_btn)
 
         tbl.addStretch()
+        self._add_export_btn(tbl)
         vl.addWidget(tb)
 
         self._totals = _TotalsBar([
@@ -7844,6 +8378,7 @@ class _AfritrackAllEntries(QWidget):
             default_field="import_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "afritrack")
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -8083,6 +8618,7 @@ class _AfritrackUploadBrowse(QWidget):
         self._table.setColumnWidth(4, 110)
         self._table.setColumnWidth(5, 110)
         self._table.setColumnWidth(6, 110)
+        _bind_feed_columns(self._table, "afritrack_browse")
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -8154,7 +8690,14 @@ class _AfritrackUploadBrowse(QWidget):
             self.delete_clicked.emit(self._uploads[row])
 
 
-class _AfritrackUploadDetail(QWidget):
+class _AfritrackUploadDetail(_FeedExportMixin, QWidget):
+    _export_title = "Afritrack Upload"
+    _export_filename = "Afritrack_Upload"
+    _export_headers = _AF_DETAIL_HEADERS
+    _export_row_fn = staticmethod(_afritrack_export_row)
+    _export_svc = "get_afritrack_upload_records"
+    _export_kind = "upload"
+
     back_requested = Signal()
     delete_requested = Signal(object)
 
@@ -8185,12 +8728,10 @@ class _AfritrackUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         nh.addWidget(self._crumb_lbl)
         nh.addStretch()
+        self._add_export_btn(nh, height=30)
         delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
         delete_btn.clicked.connect(self._request_delete)
         nh.addWidget(delete_btn)
-        self._export_btn = _btn("Export Upload", "mdi.download-outline", primary=False, height=30)
-        self._export_btn.clicked.connect(self._export_current_upload)
-        nh.addWidget(self._export_btn)
         vl.addWidget(nav)
 
         self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
@@ -8225,6 +8766,7 @@ class _AfritrackUploadDetail(QWidget):
             default_field="import_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "afritrack")
         vl.addWidget(self._table, 1)
 
         self._footer = _AfritrackFooter()
@@ -8355,47 +8897,6 @@ class _AfritrackUploadDetail(QWidget):
             return
         if value >= bar.maximum() - 24:
             asyncio.ensure_future(self._load_more())
-
-    def _export_current_upload(self) -> None:
-        asyncio.ensure_future(self._do_export_current_upload())
-
-    async def _do_export_current_upload(self) -> None:
-        from tahmeed.services import accountant_service as svc
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Afritrack Upload",
-            f"Afritrack_{(self._upload_doc.get('period') or 'upload').replace(' ', '_')}.xlsx",
-            "Excel Files (*.xlsx)",
-        )
-        if not path:
-            return
-        recs = await svc.get_afritrack_upload_records(
-            self._upload_id, "", 10000, 0, **sort_kw(self._sort_state),
-        )
-        grid = _AfritrackGrid()
-        grid.setRowCount(0)
-        for rec in recs:
-            grid.add_row([
-                str(rec.get("row_index", "")),
-                rec.get("truck", ""),
-                _af_fmt(float(rec.get("days", 0) or 0), 0),
-                _af_fmt(float(rec.get("non_trans_days", 0) or 0), 0),
-                _af_fmt(float(rec.get("trans_days", 0) or 0), 0),
-                _af_fmt(float(rec.get("rate_per_day", 0) or 0), 6),
-                _af_fmt(float(rec.get("total_tahmeed", 0) or 0)),
-                _af_fmt(float(rec.get("total_invoice", 0) or 0)),
-                _af_fmt(float(rec.get("variance", 0) or 0)),
-                rec.get("remarks", ""),
-            ])
-        _export_afritrack_xlsx(
-            path,
-            grid,
-            float(self._upload_doc.get("installation_tahmeed", 0) or 0),
-            float(self._upload_doc.get("installation_invoice", 0) or 0),
-            float(self._upload_doc.get("balance_mar", 0) or 0),
-            float(self._upload_doc.get("vat_rate") or 0) or 18.0,
-            self._upload_doc.get("period") or "Upload",
-        )
-        QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
 
 
 class AfritrackWidget(QWidget):
@@ -9140,7 +9641,15 @@ _COMESA_PREVIEW_KEYS    = ["name", "card_no", "valid_from", "valid_to",
                             "truck_reg", "premium", "month"]
 
 
-class ComesaWidget(QWidget):
+class ComesaWidget(_FeedExportMixin, QWidget):
+    _export_title = "COMESA Covers"
+    _export_filename = "COMESA_Covers"
+    _export_headers = _COMESA_PREVIEW_HEADERS
+    _export_row_fn = staticmethod(_comesa_export_row)
+    _export_svc = "get_insurance_feed"
+    _export_kind = "insurance"
+    _export_feed = "comesa"
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._page      = 1
@@ -9202,12 +9711,9 @@ class ComesaWidget(QWidget):
         tbl.addStretch()
 
         self._import_btn = _btn("Import", "mdi.upload-outline", height=32)
-        self._export_btn = _btn("Export", "mdi.download-outline",
-                                primary=False, height=32)
         self._import_btn.clicked.connect(self._do_import)
-        self._export_btn.clicked.connect(self._do_export)
         tbl.addWidget(self._import_btn)
-        tbl.addWidget(self._export_btn)
+        self._add_export_btn(tbl)
         evl.addWidget(tb)
 
         # Table card
@@ -9221,15 +9727,12 @@ class ComesaWidget(QWidget):
         cl.setSpacing(0)
 
         self._table = _ins_make_table(_COMESA_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeToContents
-        )
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._sort_state = wire_feed_table_sort(
             self._table, COMESA_SORT,
             default_field="month", default_asc=True,
             on_sort_changed=lambda _f, _a: self._go_page(1),
         )
+        _bind_feed_columns(self._table, "comesa")
         cl.addWidget(self._table, 1)
 
         self._totals_bar = _InsTotalsBar([
@@ -9328,29 +9831,6 @@ class ComesaWidget(QWidget):
             self._tabs.set_index(1)
             self._skipped.refresh()
 
-    def _do_export(self) -> None:
-        if self._total == 0:
-            QMessageBox.information(self, "Export", "No records to export.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export COMESA Covers", "COMESA_Covers.xlsx",
-            "Excel (*.xlsx)",
-        )
-        if path:
-            asyncio.ensure_future(self._async_export(path))
-
-    async def _async_export(self, path: str) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            recs = await svc.get_insurance_feed(
-                "comesa", self._search, self._month, "", 10000, 0,
-                **sort_kw(self._sort_state),
-            )
-            _export_comesa_xlsx(path, recs)
-            QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
-
     def _clear_filters(self) -> None:
         self._search = ""
         self._month = ""
@@ -9400,7 +9880,15 @@ _STATUS_COLORS = {
 }
 
 
-class ThirdPartyWidget(QWidget):
+class ThirdPartyWidget(_FeedExportMixin, QWidget):
+    _export_title = "Third Party Covers"
+    _export_filename = "ThirdParty_Covers"
+    _export_headers = _TP_PREVIEW_HEADERS
+    _export_row_fn = staticmethod(_third_party_export_row)
+    _export_svc = "get_insurance_feed"
+    _export_kind = "insurance"
+    _export_feed = "third_party"
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._page      = 1
@@ -9472,12 +9960,9 @@ class ThirdPartyWidget(QWidget):
         tbl.addStretch()
 
         self._import_btn = _btn("Import", "mdi.upload-outline", height=32)
-        self._export_btn = _btn("Export", "mdi.download-outline",
-                                primary=False, height=32)
         self._import_btn.clicked.connect(self._do_import)
-        self._export_btn.clicked.connect(self._do_export)
         tbl.addWidget(self._import_btn)
-        tbl.addWidget(self._export_btn)
+        self._add_export_btn(tbl)
         evl.addWidget(tb)
 
         # Table card
@@ -9491,15 +9976,12 @@ class ThirdPartyWidget(QWidget):
         cl.setSpacing(0)
 
         self._table = _ins_make_table(_TP_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeToContents
-        )
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._sort_state = wire_feed_table_sort(
             self._table, THIRD_PARTY_SORT,
             default_field="month", default_asc=True,
             on_sort_changed=lambda _f, _a: self._go_page(1),
         )
+        _bind_feed_columns(self._table, "third_party")
         cl.addWidget(self._table, 1)
 
         self._totals_bar = _InsTotalsBar([
@@ -9629,29 +10111,6 @@ class ThirdPartyWidget(QWidget):
         if skipped:
             self._tabs.set_index(1)
             self._skipped.refresh()
-
-    def _do_export(self) -> None:
-        if self._total == 0:
-            QMessageBox.information(self, "Export", "No records to export.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Third Party Covers", "ThirdParty_Covers.xlsx",
-            "Excel (*.xlsx)",
-        )
-        if path:
-            asyncio.ensure_future(self._async_export(path))
-
-    async def _async_export(self, path: str) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            recs = await svc.get_insurance_feed(
-                "third_party", self._search, self._month, self._status,
-                10000, 0, **sort_kw(self._sort_state),
-            )
-            _export_third_party_xlsx(path, recs)
-            QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
 
     def _clear_filters(self) -> None:
         self._search = ""
@@ -9792,7 +10251,13 @@ def _rahntech_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     _finish_table_row(t, r)
 
 
-class _RahnTechAllEntries(QWidget):
+class _RahnTechAllEntries(_FeedExportMixin, QWidget):
+    _export_title = "RahnTech"
+    _export_filename = "RahnTech"
+    _export_headers = _RAHNTECH_HEADERS
+    _export_row_fn = staticmethod(_rahntech_export_row)
+    _export_svc = "get_rahntech_all_records"
+
     """Flat, filterable list of every RahnTech record with infinite scroll."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -9850,20 +10315,20 @@ class _RahnTechAllEntries(QWidget):
         tbl.addWidget(clear_btn)
 
         tbl.addStretch()
+        self._add_export_btn(tbl)
         vl.addWidget(tb)
 
         self._totals = _TotalsBar([("count", "Total records: ")])
         vl.addWidget(self._totals)
 
         self._table = _make_table(_RAHNTECH_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, RAHNTECH_SORT,
             default_field="transaction_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "rahntech")
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -10037,6 +10502,7 @@ class _RahnTechUploadBrowse(QWidget):
         self._table.setColumnWidth(1, 260)
         self._table.setColumnWidth(2, 80)
         self._table.setStyleSheet(_table_style())
+        _bind_feed_columns(self._table, "rahntech_browse")
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -10097,7 +10563,14 @@ class _RahnTechUploadBrowse(QWidget):
             self.delete_clicked.emit(self._uploads[row])
 
 
-class _RahnTechUploadDetail(QWidget):
+class _RahnTechUploadDetail(_FeedExportMixin, QWidget):
+    _export_title = "RahnTech Upload"
+    _export_filename = "RahnTech_Upload"
+    _export_headers = _RAHNTECH_HEADERS
+    _export_row_fn = staticmethod(_rahntech_export_row)
+    _export_svc = "get_rahntech_upload_records"
+    _export_kind = "upload"
+
     """Full record table for a single RahnTech upload batch."""
 
     back_requested = Signal()
@@ -10130,6 +10603,7 @@ class _RahnTechUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
+        self._add_export_btn(navl, height=30)
         delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
         delete_btn.clicked.connect(self._request_delete)
         navl.addWidget(delete_btn)
@@ -10156,14 +10630,13 @@ class _RahnTechUploadDetail(QWidget):
         vl.addWidget(tb)
 
         self._table = _make_table(_RAHNTECH_HEADERS)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table, RAHNTECH_SORT,
             default_field="transaction_date", default_asc=False,
             on_sort_changed=_feed_sort_reload(self),
         )
+        _bind_feed_columns(self._table, "rahntech")
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])

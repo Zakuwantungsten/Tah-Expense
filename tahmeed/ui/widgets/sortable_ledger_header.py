@@ -31,6 +31,7 @@ class LedgerSortState:
         self._table = table
         self._columns = list(columns)
         self._default_field = default_field
+        self._default_asc = default_asc
         self._sort_field = default_field
         self._sort_asc = default_asc
         self._on_sort_changed = on_sort_changed

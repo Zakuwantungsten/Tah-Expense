@@ -34,6 +34,21 @@ from PySide6.QtGui import QColor, QAction
 from tahmeed.models.transaction import Transaction
 from tahmeed.app_state import app_state
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+from tahmeed.ui.widgets.split_export_button import make_export_menu_btn
+from tahmeed.ui.widgets.export_runner import (
+    attach_export_overlay,
+    export_file_ready,
+    fetch_records_with_progress,
+    hide_export_busy,
+    normalize_xlsx_path,
+    notify_export_error,
+    notify_export_info,
+    pick_export_path,
+    run_export_write,
+    show_export_busy,
+    FAST_STYLE_ROW_LIMIT,
+    PROGRESS_EVERY,
+)
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import _fmt_num, _SCROLL_CHUNK
 from tahmeed.ui.accountant.master_ledger_table import MasterLedgerTable
@@ -258,49 +273,21 @@ def _export_menu_btn(
     parent=None,
 ) -> QToolButton:
     """Export split button: main click = filtered, menu = filtered + all."""
-    btn = QToolButton(parent)
-    btn.setText("  Export")
-    btn.setCursor(Qt.PointingHandCursor)
-    btn.setFixedHeight(32)
-    btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-    btn.setPopupMode(QToolButton.MenuButtonPopup)
-    try:
-        btn.setIcon(qta.icon("mdi.microsoft-excel", color=_T2))
-        btn.setIconSize(QSize(15, 15))
-    except Exception:
-        pass
-    btn.setStyleSheet(
-        f"QToolButton {{ background: {_WHITE}; color: {_T1};"
-        f" border: 1px solid {_BORDER};"
-        " border-radius: 5px; font-size: 12px;"
-        " font-family:'Segoe UI'; padding: 0 12px; }}"
-        f"QToolButton:hover {{ background: {_BG}; }}"
-        "QToolButton::menu-indicator { subcontrol-origin: padding; subcontrol-position: center right;"
-        " width: 16px; padding-right: 6px; }"
+    return make_export_menu_btn(
+        on_filtered,
+        on_all,
+        parent=parent,
+        height=32,
+        btn_tip=(
+            "Export Filtered — current search, filters, column filters, and sort.\n"
+            "Use the ▾ menu for Export All (full FY/month tab, no extra filters)."
+        ),
+        filtered_tip="Export rows matching the current filters and sort order on screen.",
+        all_tip=(
+            "Export every record for the selected fiscal year and month tab "
+            "(ignores search, toolbar filters, and column filters)."
+        ),
     )
-    btn.setToolTip(
-        "Export Filtered — current search, filters, column filters, and sort.\n"
-        "Use the ▾ menu for Export All (full FY/month tab, no extra filters)."
-    )
-
-    act_filtered = QAction("Export Filtered", btn)
-    act_filtered.setToolTip(
-        "Export rows matching the current filters and sort order on screen."
-    )
-    act_filtered.triggered.connect(on_filtered)
-    act_all = QAction("Export All", btn)
-    act_all.setToolTip(
-        "Export every record for the selected fiscal year and month tab "
-        "(ignores search, toolbar filters, and column filters)."
-    )
-    act_all.triggered.connect(on_all)
-
-    menu = QMenu(btn)
-    menu.addAction(act_filtered)
-    menu.addAction(act_all)
-    btn.setMenu(menu)
-    btn.clicked.connect(on_filtered)
-    return btn
 
 
 def _receipt_text(status: str) -> tuple:
@@ -730,6 +717,7 @@ class MasterExpensesWidget(QWidget):
         self._filters_loaded = False
         self._reload_generation = 0
         self._import_in_flight = False
+        self._export_in_flight = False
         self._item_names: List[str] = []
         self._item_by_name: Dict = {}
         self._edit_in_flight = False
@@ -1373,43 +1361,33 @@ class MasterExpensesWidget(QWidget):
     # ── Excel Export ───────────────────────────────────────────────────────
 
     def _on_export_filtered(self) -> None:
+        if self._export_in_flight:
+            return
         asyncio.ensure_future(self._do_export(all_records=False))
 
     def _on_export_all(self) -> None:
+        if self._export_in_flight:
+            return
         asyncio.ensure_future(self._do_export(all_records=True))
 
-    async def _fetch_export_transactions(self, kw: dict) -> List[Transaction]:
-        from tahmeed.services.accountant_service import (
-            get_master_transactions, count_master_transactions,
+    async def _fetch_export_page(self, kw: dict, *, limit: int, skip: int) -> List[Transaction]:
+        from tahmeed.services.accountant_service import get_master_transactions
+
+        return await get_master_transactions(
+            **kw,
+            sort_field=self._sort_field,
+            sort_asc=self._sort_asc,
+            limit=limit,
+            skip=skip,
         )
 
-        total = await count_master_transactions(**kw)
-        if total == 0:
-            return []
-
-        chunk = 2000
-        txs: List[Transaction] = []
-        skip = 0
-        while skip < total:
-            batch = await get_master_transactions(
-                **kw,
-                sort_field=self._sort_field,
-                sort_asc=self._sort_asc,
-                limit=chunk,
-                skip=skip,
-            )
-            if not batch:
-                break
-            txs.extend(batch)
-            skip += len(batch)
-        return txs
-
     async def _do_export(self, *, all_records: bool) -> None:
+        if self._export_in_flight:
+            return
         try:
-            import openpyxl
-            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            import openpyxl  # noqa: F401
         except ImportError:
-            QMessageBox.critical(
+            await notify_export_error(
                 self, "Missing Dependency",
                 "openpyxl is required for Excel export.\n\nRun: pip install openpyxl",
             )
@@ -1417,182 +1395,225 @@ class MasterExpensesWidget(QWidget):
 
         from tahmeed.services.accountant_service import get_cashier_names
 
+        self._export_in_flight = True
+        overlay = attach_export_overlay(self)
         kw = self._export_scope_kw(all_records=all_records)
         mode_label = "All" if all_records else "Filtered"
-        self._loading_overlay.show_loading(f"Exporting {mode_label.lower()} master expenses…")
+        suffix = mode_label
         try:
-            txs = await self._fetch_export_transactions(kw)
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")
-            return
-        finally:
-            self._loading_overlay.hide_loading()
-
-        if not txs:
-            QMessageBox.information(
-                self, "Export",
-                "No records to export for the selected scope.",
+            show_export_busy(
+                overlay, f"Loading {mode_label.lower()} master expenses…", maximum=0,
             )
-            return
-
-        export_cashier_ids = [tx.cashier_id for tx in txs if tx.cashier_id]
-        export_cashier_names = await get_cashier_names(export_cashier_ids) if export_cashier_ids else {}
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = f"Master Expenses FY{self._year}"
-
-        # ── Header block ──────────────────────────────────────────────
-        ws.merge_cells("A1:M1")
-        ws["A1"] = "TAHMEED COACH TZ LTD"
-        ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
-        ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[1].height = 22
-
-        month_label = dict(_MONTHS).get(self._month, "All Months")
-        scope_note = (
-            f"All records — FY {self._year}  |  {month_label}"
-            if all_records
-            else f"Filtered view — FY {self._year}  |  {month_label}"
-        )
-        ws.merge_cells("A2:M2")
-        ws["A2"] = f"Master Expenses Report — {scope_note}"
-        ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
-        ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[2].height = 18
-
-        ws.merge_cells("A3:M3")
-        ws["A3"] = f"Exported: {datetime.now().strftime('%d %b %Y  %H:%M')}"
-        ws["A3"].font = Font(name="Segoe UI", italic=True, size=9, color="9CA3AF")
-        ws["A3"].alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[3].height = 15
-
-        ws.append([])  # blank separator row
-
-        # ── Column headers ────────────────────────────────────────────
-        all_col_names = [c[0] for c in _COLS]
-        ws.append(all_col_names)
-        hdr_row = ws.max_row
-        ws.row_dimensions[hdr_row].height = 18
-        grey_fill = PatternFill("solid", fgColor="F1F5F9")
-        thin = Side(style="thin", color="E5E7EB")
-        hdr_border = Border(bottom=Side(style="medium", color="9CA3AF"))
-        for cell in ws[hdr_row]:
-            cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
-            cell.fill = grey_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = hdr_border
-
-        # ── Data rows ─────────────────────────────────────────────────
-        tzs_total = 0.0
-        usd_total = 0.0
-
-        alt_fill = PatternFill("solid", fgColor="F9FAFB")
-        white_fill = PatternFill("solid", fgColor="FFFFFF")
-        red_font = Font(name="Cascadia Code", size=10, color="DC2626")
-        mono_font = Font(name="Cascadia Code", size=10)
-        amber_font = Font(name="Segoe UI", bold=True, size=10, color="D97706")
-        rcpt_green = Font(name="Segoe UI", bold=True, size=10, color="16A34A")
-        rcpt_red   = Font(name="Segoe UI", bold=True, size=10, color="DC2626")
-
-        for i, tx in enumerate(txs):
-            date_str    = _fmt_tx_date(tx.date)
-            item_str    = tx.item or tx.category_name or ""
-            ref_str     = _ref_float_display(tx)
-            cashier_str = _short_name(export_cashier_names.get(tx.cashier_id, "")) if tx.cashier_id else ""
-            rcpt_text, _ = _receipt_text(tx.receipt_status)
-            tzs_txt, usd_txt = _amount_cells(tx)
-            # Export blanks instead of em-dashes for empty currency cells.
-            tzs_export = "" if tzs_txt == "—" else tzs_txt
-            usd_export = "" if usd_txt == "—" else usd_txt
-
-            cur = _currency_key(tx)
-            if _is_tzs(cur):
-                tzs_total += tx.amount
-            elif cur == "USD":
-                usd_total += tx.amount
-
-            row_data = [
-                i + 1, date_str, item_str, tx.description or "",
-                tx.truck_number or "", tx.memo or "", ref_str,
-                tzs_export, usd_export,
-                rcpt_text, tx.ownership or "", tx.approver or "", cashier_str,
-            ]
-            ws.append(row_data)
-            r = ws.max_row
-            ws.row_dimensions[r].height = 16
-            fill = alt_fill if i % 2 else white_fill
-            for cell in ws[r]:
-                cell.fill = fill
-                cell.alignment = Alignment(vertical="center")
-
-            # TZS / USD amount columns (8 / 9)
-            for col_idx, txt in ((_COL_TZS + 1, tzs_export), (_COL_USD + 1, usd_export)):
-                if not txt:
-                    continue
-                c = ws.cell(r, col_idx)
-                c.font = red_font if tx.amount < 0 else mono_font
-                c.alignment = Alignment(horizontal="right", vertical="center")
-
-            # Ref_Float highlight when set (col 7)
-            if ref_str:
-                ws.cell(r, _COL_REF + 1).font = amber_font
-
-            # Receipt font color
-            rcpt_fonts = {"Received": rcpt_green, "Pending": amber_font, "No Receipt": rcpt_red}
-            rf = rcpt_fonts.get(rcpt_text)
-            if rf:
-                ws.cell(r, _COL_RCPT + 1).font = rf
-            ws.cell(r, _COL_RCPT + 1).alignment = Alignment(horizontal="center", vertical="center")
-
-        # ── Totals row ────────────────────────────────────────────────
-        ws.append([])
-        ws.append([
-            "", "", "", "TOTAL", "", "", "",
-            _fmt_num(tzs_total, "", 0) if tzs_total else "",
-            _fmt_num(usd_total, "", 2) if usd_total else "",
-            "", "", "", "",
-        ])
-        total_r = ws.max_row
-        ws.row_dimensions[total_r].height = 18
-        total_fill = PatternFill("solid", fgColor="EFF6FF")
-        for cell in ws[total_r]:
-            cell.fill = total_fill
-        ws.cell(total_r, 4).font = Font(name="Segoe UI", bold=True, size=11)
-        for col_idx, total in ((_COL_TZS + 1, tzs_total), (_COL_USD + 1, usd_total)):
-            if not total:
-                continue
-            c = ws.cell(total_r, col_idx)
-            c.font = Font(
-                name="Cascadia Code", bold=True, size=11,
-                color="DC2626" if total < 0 else "111827",
-            )
-            c.alignment = Alignment(horizontal="right", vertical="center")
-
-        # ── Column widths ─────────────────────────────────────────────
-        col_widths = [7, 10, 16, 35, 13, 20, 16, 14, 12, 14, 14, 14, 14]
-        for idx, w in enumerate(col_widths, 1):
-            ws.column_dimensions[ws.cell(1, idx).column_letter].width = w
-
-        # ── Freeze panes (header rows + first 4 columns incl. ITEM) ────
-        ws.freeze_panes = ws.cell(hdr_row + 1, 5)  # freeze rows above + cols A-D
-
-        # ── Save dialog ───────────────────────────────────────────────
-        month_tag = dict(_MONTHS).get(self._month, "All")
-        suffix = "All" if all_records else "Filtered"
-        default = f"Master_Expenses_FY{self._year}_{month_tag}_{suffix}.xlsx"
-        path, _ = QFileDialog.getSaveFileName(
-            self, f"Export Master Expenses ({suffix})", default, "Excel Files (*.xlsx)"
-        )
-        if path:
             try:
-                wb.save(path)
-                QMessageBox.information(
-                    self, "Export Complete",
-                    f"Exported {len(txs):,} {suffix.lower()} records to:\n{path}",
+                txs = await fetch_records_with_progress(
+                    overlay,
+                    lambda *, limit, skip: self._fetch_export_page(
+                        kw, limit=limit, skip=skip,
+                    ),
+                    phase=f"Loading {mode_label.lower()} records",
                 )
             except Exception as exc:
-                QMessageBox.critical(self, "Save Error", f"Could not save file:\n{exc}")
+                await notify_export_error(self, "Export Error", f"Failed to fetch data: {exc}")
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not txs:
+                await notify_export_info(
+                    self, "Export",
+                    "No records to export for the selected scope.",
+                )
+                return
+
+            export_cashier_ids = [tx.cashier_id for tx in txs if tx.cashier_id]
+            export_cashier_names = (
+                await get_cashier_names(export_cashier_ids) if export_cashier_ids else {}
+            )
+
+            month_tag = dict(_MONTHS).get(self._month, "All")
+            default = f"Master_Expenses_FY{self._year}_{month_tag}_{suffix}.xlsx"
+            path = await pick_export_path(
+                self, f"Export Master Expenses ({suffix})", default,
+            )
+            if not path:
+                return
+            path = normalize_xlsx_path(path)
+
+            year = self._year
+            month = self._month
+            month_label = dict(_MONTHS).get(month, "All Months")
+            scope_note = (
+                f"All records — FY {year}  |  {month_label}"
+                if all_records
+                else f"Filtered view — FY {year}  |  {month_label}"
+            )
+            total = len(txs)
+            fast = total >= FAST_STYLE_ROW_LIMIT
+
+            def _write(progress_cb) -> None:
+                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = f"Master Expenses FY{year}"
+
+                ws.merge_cells("A1:M1")
+                ws["A1"] = "TAHMEED COACH TZ LTD"
+                ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
+                ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+                ws.row_dimensions[1].height = 22
+
+                ws.merge_cells("A2:M2")
+                ws["A2"] = f"Master Expenses Report — {scope_note}"
+                ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
+                ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
+                ws.row_dimensions[2].height = 18
+
+                ws.merge_cells("A3:M3")
+                ws["A3"] = f"Exported: {datetime.now().strftime('%d %b %Y  %H:%M')}"
+                ws["A3"].font = Font(name="Segoe UI", italic=True, size=9, color="9CA3AF")
+                ws["A3"].alignment = Alignment(horizontal="center", vertical="center")
+                ws.row_dimensions[3].height = 15
+
+                ws.append([])
+
+                all_col_names = [c[0] for c in _COLS]
+                ws.append(all_col_names)
+                hdr_row = ws.max_row
+                ws.row_dimensions[hdr_row].height = 18
+                grey_fill = PatternFill("solid", fgColor="F1F5F9")
+                hdr_border = Border(bottom=Side(style="medium", color="9CA3AF"))
+                for cell in ws[hdr_row]:
+                    cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
+                    cell.fill = grey_fill
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = hdr_border
+
+                tzs_total = 0.0
+                usd_total = 0.0
+                alt_fill = PatternFill("solid", fgColor="F9FAFB")
+                white_fill = PatternFill("solid", fgColor="FFFFFF")
+                red_font = Font(name="Cascadia Code", size=10, color="DC2626")
+                mono_font = Font(name="Cascadia Code", size=10)
+                amber_font = Font(name="Segoe UI", bold=True, size=10, color="D97706")
+                rcpt_green = Font(name="Segoe UI", bold=True, size=10, color="16A34A")
+                rcpt_red = Font(name="Segoe UI", bold=True, size=10, color="DC2626")
+
+                for i, tx in enumerate(txs):
+                    date_str = _fmt_tx_date(tx.date)
+                    item_str = tx.item or tx.category_name or ""
+                    ref_str = _ref_float_display(tx)
+                    cashier_str = (
+                        _short_name(export_cashier_names.get(tx.cashier_id, ""))
+                        if tx.cashier_id else ""
+                    )
+                    rcpt_text, _ = _receipt_text(tx.receipt_status)
+                    tzs_txt, usd_txt = _amount_cells(tx)
+                    tzs_export = "" if tzs_txt == "—" else tzs_txt
+                    usd_export = "" if usd_txt == "—" else usd_txt
+
+                    cur = _currency_key(tx)
+                    if _is_tzs(cur):
+                        tzs_total += tx.amount
+                    elif cur == "USD":
+                        usd_total += tx.amount
+
+                    ws.append([
+                        i + 1, date_str, item_str, tx.description or "",
+                        tx.truck_number or "", tx.memo or "", ref_str,
+                        tzs_export, usd_export,
+                        rcpt_text, tx.ownership or "", tx.approver or "", cashier_str,
+                    ])
+                    if not fast:
+                        r = ws.max_row
+                        ws.row_dimensions[r].height = 16
+                        fill = alt_fill if i % 2 else white_fill
+                        for cell in ws[r]:
+                            cell.fill = fill
+                            cell.alignment = Alignment(vertical="center")
+
+                        for col_idx, txt in (
+                            (_COL_TZS + 1, tzs_export), (_COL_USD + 1, usd_export),
+                        ):
+                            if not txt:
+                                continue
+                            c = ws.cell(r, col_idx)
+                            c.font = red_font if tx.amount < 0 else mono_font
+                            c.alignment = Alignment(horizontal="right", vertical="center")
+
+                        if ref_str:
+                            ws.cell(r, _COL_REF + 1).font = amber_font
+
+                        rcpt_fonts = {
+                            "Received": rcpt_green, "Pending": amber_font, "No Receipt": rcpt_red,
+                        }
+                        rf = rcpt_fonts.get(rcpt_text)
+                        if rf:
+                            ws.cell(r, _COL_RCPT + 1).font = rf
+                        ws.cell(r, _COL_RCPT + 1).alignment = Alignment(
+                            horizontal="center", vertical="center",
+                        )
+
+                    if progress_cb and (
+                        (i + 1) % PROGRESS_EVERY == 0 or i + 1 == total
+                    ):
+                        progress_cb(i + 1, "Writing rows")
+
+                ws.append([])
+                ws.append([
+                    "", "", "", "TOTAL", "", "", "",
+                    _fmt_num(tzs_total, "", 0) if tzs_total else "",
+                    _fmt_num(usd_total, "", 2) if usd_total else "",
+                    "", "", "", "",
+                ])
+                total_r = ws.max_row
+                ws.row_dimensions[total_r].height = 18
+                total_fill = PatternFill("solid", fgColor="EFF6FF")
+                for cell in ws[total_r]:
+                    cell.fill = total_fill
+                ws.cell(total_r, 4).font = Font(name="Segoe UI", bold=True, size=11)
+                for col_idx, total_val in (
+                    (_COL_TZS + 1, tzs_total), (_COL_USD + 1, usd_total),
+                ):
+                    if not total_val:
+                        continue
+                    c = ws.cell(total_r, col_idx)
+                    c.font = Font(
+                        name="Cascadia Code", bold=True, size=11,
+                        color="DC2626" if total_val < 0 else "111827",
+                    )
+                    c.alignment = Alignment(horizontal="right", vertical="center")
+
+                col_widths = [7, 10, 16, 35, 13, 20, 16, 14, 12, 14, 14, 14, 14]
+                for idx, w in enumerate(col_widths, 1):
+                    ws.column_dimensions[ws.cell(1, idx).column_letter].width = w
+
+                ws.freeze_panes = ws.cell(hdr_row + 1, 5)
+                if progress_cb:
+                    progress_cb(total, "Saving file")
+                wb.save(path)
+
+            try:
+                await run_export_write(overlay, total, _write)
+            except Exception as exc:
+                await notify_export_error(self, "Save Error", f"Could not save file:\n{exc}")
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not export_file_ready(path):
+                await notify_export_error(
+                    self, "Save Error", f"The file could not be saved:\n{path}",
+                )
+                return
+
+            await notify_export_info(
+                self, "Export Complete",
+                f"Exported {len(txs):,} {suffix.lower()} records to:\n{path}",
+            )
+        finally:
+            hide_export_busy(self)
+            self._export_in_flight = False
 
     # ── Excel Import ─────────────────────────────────────────────────────
 

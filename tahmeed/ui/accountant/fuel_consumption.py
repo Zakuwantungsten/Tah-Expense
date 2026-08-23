@@ -46,8 +46,22 @@ from tahmeed.ui.accountant.date_filters import (
 )
 from tahmeed.ui.accountant.separate_expenses import (
     _SegmentTabBar, _populate_year_combo, _TOLL_MONTHS, _SCROLL_CHUNK,
-    _write_xlsx_template,
+    _write_feed_xlsx, _write_xlsx_template,
 )
+from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.export_runner import (
+    attach_export_overlay,
+    export_file_ready,
+    fetch_records_with_progress,
+    hide_export_busy,
+    normalize_xlsx_path,
+    notify_export_error,
+    notify_export_info,
+    pick_export_path,
+    run_export_write,
+    show_export_busy,
+)
+from tahmeed.ui.widgets.split_export_button import make_export_menu_btn
 from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
 from tahmeed.ui.accountant.fuel_sort_helpers import diesel_columns_sort
 from tahmeed.ui.accountant.feed_sort_helpers import (
@@ -207,6 +221,208 @@ def _display_columns(schema: dict) -> List[Tuple[str, str, str]]:
 def _row_label(rec: dict) -> str:
     from tahmeed.services.accountant_service import diesel_display_label
     return diesel_display_label(rec)
+
+
+def _diesel_export_row(
+    rec: dict,
+    columns: List[Tuple[str, str, str]],
+    *,
+    sn: int,
+) -> list:
+    """Map a diesel record to an Excel row (schema column order)."""
+    out: list = []
+    for _label, key, kind in columns:
+        if key == "sn":
+            val: Any = sn
+        elif key == "total_amount":
+            val = diesel_line_total(rec.get("ltrs"), rec.get("price_per_ltr"))
+        elif key == "upload_label":
+            val = _row_label(rec)
+        else:
+            val = rec.get(key, "")
+        if kind == "date":
+            out.append(_fmt_date_str(val) if val not in (None, "") else "")
+        elif kind in ("num", "money"):
+            try:
+                out.append(float(val) if val not in (None, "") else "")
+            except (TypeError, ValueError):
+                out.append(val)
+        else:
+            out.append("" if val in (None, "") else val)
+    return out
+
+
+class _DieselExportMixin:
+    """Filtered / All Excel export for fuel station feeds."""
+
+    _export_scope = "all_entries"  # all_entries | upload
+
+    def _on_export_filtered(self) -> None:
+        if getattr(self, "_export_in_flight", False):
+            return
+        asyncio.ensure_future(self._run_diesel_export(all_records=False))
+
+    def _on_export_all(self) -> None:
+        if getattr(self, "_export_in_flight", False):
+            return
+        asyncio.ensure_future(self._run_diesel_export(all_records=True))
+
+    def _add_export_btn(self, layout, *, height: int = 32) -> None:
+        if self._export_scope == "upload":
+            all_tip = "Export every record in this upload (ignores search)."
+        else:
+            all_tip = (
+                "Export every record in the current year/month "
+                "(ignores search, dates, and file filters)."
+            )
+        layout.addWidget(make_export_menu_btn(
+            self._on_export_filtered,
+            self._on_export_all,
+            parent=self,
+            height=height,
+            filtered_tip="Export rows matching the current filters and sort order.",
+            all_tip=all_tip,
+        ))
+
+    def _diesel_export_columns(self) -> List[Tuple[str, str, str]]:
+        schema = _FUEL_SCHEMAS[self._feed_type]
+        return _display_columns(schema)
+
+    def _diesel_export_headers(self) -> List[str]:
+        return [c[0] for c in self._diesel_export_columns()]
+
+    def _diesel_export_title(self) -> str:
+        return _FUEL_SCHEMAS[self._feed_type]["title"]
+
+    def _diesel_export_filename(self) -> str:
+        return self._diesel_export_title().replace(" ", "_")
+
+    async def _fetch_diesel_export_page(
+        self, *, all_records: bool, limit: int, skip: int,
+    ) -> List[dict]:
+        from tahmeed.services import accountant_service as svc
+
+        search = "" if all_records else getattr(self, "_search", "")
+        sort = sort_kw(self._sort_state)
+
+        if self._export_scope == "upload":
+            return await svc.get_diesel_upload_records(
+                self._feed_type,
+                self._upload_id,
+                search,
+                limit=limit,
+                skip=skip,
+                **sort,
+            )
+
+        list_kw = {} if all_records else self._list_kw()
+        return await svc.get_diesel_all_records(
+            self._feed_type,
+            search,
+            self._year,
+            self._effective_month(),
+            limit=limit,
+            skip=skip,
+            **list_kw,
+            **sort,
+        )
+
+    async def _run_diesel_export(self, *, all_records: bool) -> None:
+        if getattr(self, "_export_in_flight", False):
+            return
+        if not _HAS_OPENPYXL:
+            await notify_export_error(
+                self, "Missing Dependency",
+                "openpyxl is required for Excel export.\n\nRun: pip install openpyxl",
+            )
+            return
+
+        self._export_in_flight = True
+        overlay = attach_export_overlay(self)
+        scope = "All" if all_records else "Filtered"
+        title = self._diesel_export_title()
+        try:
+            show_export_busy(overlay, f"Loading {scope.lower()} records…", maximum=0)
+            try:
+                recs = await fetch_records_with_progress(
+                    overlay,
+                    lambda *, limit, skip: self._fetch_diesel_export_page(
+                        all_records=all_records, limit=limit, skip=skip,
+                    ),
+                    phase=f"Loading {scope.lower()} records",
+                )
+            except Exception as exc:
+                await notify_export_error(self, "Export Error", str(exc))
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not recs:
+                await notify_export_info(
+                    self, "Export", "No records to export for the selected scope.",
+                )
+                return
+
+            default = f"{self._diesel_export_filename()}_{scope}.xlsx"
+            if self._export_scope == "upload":
+                upload_doc = getattr(self, "_upload_doc", None) or {}
+                label = (
+                    upload_doc.get("upload_label")
+                    or upload_doc.get("source_filename")
+                    or ""
+                ).strip()
+                if label:
+                    default = f"{Path(label).stem}_{scope}.xlsx"
+
+            path = await pick_export_path(self, f"Export {title}", default)
+            if not path:
+                return
+            path = normalize_xlsx_path(path)
+
+            columns = self._diesel_export_columns()
+            headers = self._diesel_export_headers()
+            total = len(recs)
+            subtitle = (
+                f"{title} — {scope}  •  "
+                f"{datetime.now().strftime('%d %b %Y  %H:%M')}  •  {total:,} rows"
+            )
+
+            def _write(progress_cb) -> None:
+                rows = [
+                    _diesel_export_row(rec, columns, sn=i + 1)
+                    for i, rec in enumerate(recs)
+                ]
+                _write_feed_xlsx(
+                    path,
+                    title=title[:31],
+                    headers=headers,
+                    rows=rows,
+                    subtitle=subtitle,
+                    progress_cb=progress_cb,
+                )
+
+            try:
+                await run_export_write(overlay, total, _write)
+            except Exception as exc:
+                await notify_export_error(self, "Export Error", str(exc))
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not export_file_ready(path):
+                await notify_export_error(
+                    self, "Export Error",
+                    f"The file could not be saved:\n{path}",
+                )
+                return
+
+            await notify_export_info(
+                self, "Export Complete",
+                f"Saved {total:,} row(s) to:\n{path}",
+            )
+        finally:
+            hide_export_busy(self)
+            self._export_in_flight = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1064,8 +1280,10 @@ class _FuelImportDialog(QDialog):
 #  All entries — cross-upload flat list
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class _DieselAllEntries(QWidget):
+class _DieselAllEntries(_DieselExportMixin, QWidget):
     """Flat, filterable list of every diesel record with infinite scroll."""
+
+    _export_scope = "all_entries"
 
     def __init__(self, feed_type: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1080,6 +1298,7 @@ class _DieselAllEntries(QWidget):
         self._loaded = 0
         self._total = 0
         self._loading = False
+        self._export_in_flight = False
         self._build()
 
     def _build(self) -> None:
@@ -1138,6 +1357,7 @@ class _DieselAllEntries(QWidget):
         tbl.addWidget(clear_btn)
 
         tbl.addStretch()
+        self._add_export_btn(tbl)
         vl.addWidget(tb)
 
         totals_defs = [("ltrs", "Ltrs: ")]
@@ -1158,6 +1378,9 @@ class _DieselAllEntries(QWidget):
             default_field="transaction_date",
             default_asc=False,
             on_sort_changed=self._on_sort_changed,
+        )
+        bind_column_width_persistence(
+            self._table, f"fuel_{self._feed_type}_all", auto_fit_if_unset=True,
         )
         vl.addWidget(self._table, 1)
 
@@ -1455,9 +1678,11 @@ class _DieselUploadBrowse(QWidget):
 #  Upload detail — records within one batch
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class _DieselUploadDetail(QWidget):
+class _DieselUploadDetail(_DieselExportMixin, QWidget):
     back_requested = Signal()
     delete_requested = Signal(object)
+
+    _export_scope = "upload"
 
     def __init__(self, feed_type: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1472,6 +1697,7 @@ class _DieselUploadDetail(QWidget):
         self._loaded    = 0
         self._total     = 0
         self._loading   = False
+        self._export_in_flight = False
         self._build()
 
     def _build(self) -> None:
@@ -1491,6 +1717,7 @@ class _DieselUploadDetail(QWidget):
         self._crumb_lbl = _lbl("", size=12, color=_T2)
         navl.addWidget(self._crumb_lbl)
         navl.addStretch()
+        self._add_export_btn(navl, height=30)
         delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
         delete_btn.clicked.connect(self._request_delete)
         navl.addWidget(delete_btn)
@@ -1526,6 +1753,9 @@ class _DieselUploadDetail(QWidget):
             default_field="transaction_date",
             default_asc=False,
             on_sort_changed=self._on_sort_changed,
+        )
+        bind_column_width_persistence(
+            self._table, f"fuel_{self._feed_type}_upload", auto_fit_if_unset=True,
         )
         vl.addWidget(self._table, 1)
 
