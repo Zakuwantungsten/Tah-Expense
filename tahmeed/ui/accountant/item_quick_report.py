@@ -1,15 +1,15 @@
 """Item Account QuickReport — verified/master transactions for one catalog item.
 
 Column set matches Master Expenses. Filter bar: Dates preset, From/To,
-description kinds (sub-items), and Sort By.
+description multi-select (from DB), Excel column filters, header sort, export.
 """
 
 from __future__ import annotations
 
 import asyncio
 import calendar
-from datetime import date
-from typing import Dict, List, Optional, Tuple
+from datetime import date, datetime
+from typing import Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QBrush, QColor, QFont
@@ -20,13 +20,22 @@ from PySide6.QtWidgets import (
 )
 
 from tahmeed.models.transaction import Transaction
-from tahmeed.services.category_service import item_key
 from tahmeed.ui.accountant.date_filters import (
     add_from_to_editors, read_from_to, sync_from_to,
 )
-from tahmeed.ui.cashier.register_delegates import format_register_date
+from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.excel_column_filter import (
+    ExcelFilterHeaderView, SORT_ASC, cascade_column_values,
+)
+from tahmeed.ui.widgets.export_runner import (
+    FAST_STYLE_ROW_LIMIT, PROGRESS_EVERY,
+    attach_export_overlay, export_file_ready, fetch_records_with_progress,
+    hide_export_busy, normalize_xlsx_path, notify_export_error,
+    notify_export_info, pick_export_path, run_export_write, show_export_busy,
+)
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+from tahmeed.ui.widgets.split_export_button import make_export_menu_btn
 
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -41,22 +50,40 @@ _ROW_H = 28
 _PAGE_SIZE = 100
 
 # Master Expenses columns (no running Balance on this tab)
+# (label, default width, align, sort_field)
 _COLS = [
-    ("S/NO", 52, "center"),
-    ("DATE", 72, "left"),
-    ("ITEM", 110, "left"),
-    ("DESCRIPTION", 200, "left"),
-    ("TRUCK NO", 95, "left"),
-    ("MEMO", 120, "left"),
-    ("REF_FLOAT", 110, "left"),
-    ("TZS", 110, "right"),
-    ("USD", 100, "right"),
-    ("RECEIPT", 100, "center"),
-    ("OWNERSHIP", 90, "left"),
-    ("APPROVED BY", 100, "left"),
-    ("CASHIER", 100, "left"),
+    ("S/NO", 52, "center", None),
+    ("DATE", 72, "left", "date"),
+    ("ITEM", 110, "left", "item"),
+    ("DESCRIPTION", 200, "left", "description"),
+    ("TRUCK NO", 95, "left", "truck_number"),
+    ("MEMO", 120, "left", "memo"),
+    ("REF_FLOAT", 110, "left", "ref_float"),
+    ("TZS", 110, "right", "amount"),
+    ("USD", 100, "right", "amount"),
+    ("RECEIPT", 100, "center", "receipt_status"),
+    ("OWNERSHIP", 90, "left", "ownership"),
+    ("APPROVED BY", 100, "left", "approver"),
+    ("CASHIER", 100, "left", None),
 ]
 _COL_DEFAULTS = [c[1] for c in _COLS]
+_DESC_COL = 3
+_FILTERABLE_COLS: Set[int] = set(range(1, len(_COLS)))
+_SORT_KINDS = {1: "date", 7: "number", 8: "number", 4: "truck"}
+_COL_FIELD: Dict[int, str] = {
+    1: "date",
+    2: "item",
+    3: "description",
+    4: "truck_number",
+    5: "memo",
+    6: "ref_float",
+    7: "tzs",
+    8: "usd",
+    9: "receipt_status",
+    10: "ownership",
+    11: "approver",
+    12: "cashier",
+}
 
 _RECEIPT_LABELS = {
     "received": "Received",
@@ -64,15 +91,6 @@ _RECEIPT_LABELS = {
     "missing": "No Receipt",
     "no_receipt": "No Receipt",
 }
-
-_SORT_OPTS = [
-    ("Default", "date", True),
-    ("Date (newest)", "date", False),
-    ("Date (oldest)", "date", True),
-    ("Amount (high–low)", "amount", False),
-    ("Amount (low–high)", "amount", True),
-    ("Description", "description", True),
-]
 
 _TABLE_SS = (
     f"QTableWidget {{"
@@ -87,7 +105,7 @@ _TABLE_SS = (
     f"  font-size: 10px; font-weight: 600; font-family:'Segoe UI';"
     f"  border: none; border-bottom: 1px solid {_BORDER};"
     f"  border-right: 1px solid {_BORDER};"
-    f"  padding: 0 8px; min-height: 28px;"
+    f"  padding: 0 18px 0 8px; min-height: 28px;"
     f"}}"
     f"QHeaderView::section:hover {{ background: #E2E8F0; }}"
     f"QScrollBar:vertical {{ background: {_BG}; width: 8px; margin: 0; }}"
@@ -179,10 +197,24 @@ def _used_amount(value: float) -> float:
     return abs(float(value or 0.0))
 
 
+def _fmt_report_date(dt, *, all_years: bool) -> str:
+    if not dt:
+        return "—"
+    if hasattr(dt, "date") and not isinstance(dt, date):
+        try:
+            dt = dt.date()
+        except Exception:
+            pass
+    if isinstance(dt, datetime):
+        dt = dt.date()
+    if not isinstance(dt, date):
+        return "—"
+    return dt.strftime("%d %b %Y" if all_years else "%d %b")
+
+
 class ItemQuickReportView(QWidget):
     """Read-only master-column table for one item's verified transactions."""
 
-    # company year/label suffix, scope line under Account QuickReport
     header_context_changed = Signal(str, str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -194,6 +226,12 @@ class ItemQuickReportView(QWidget):
         self._scroll_loading = False
         self._loaded = 0
         self._syncing_dates = False
+        self._export_in_flight = False
+        self._reload_generation = 0
+        self._sort_field = "date"
+        self._sort_asc = False
+        self._col_filters: Dict[int, Set[str]] = {}
+        self._col_value_cache: Dict[int, Set[str]] = {}
         self._filter_debounce = QTimer(self)
         self._filter_debounce.setSingleShot(True)
         self._filter_debounce.setInterval(300)
@@ -233,15 +271,31 @@ class ItemQuickReportView(QWidget):
         self._table.setAlternatingRowColors(False)
         self._table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
+        filter_hdr = ExcelFilterHeaderView(
+            self._table,
+            filterable_columns=_FILTERABLE_COLS,
+            sort_kinds=_SORT_KINDS,
+        )
+        filter_hdr.set_value_provider(self._filter_menu_values)
+        filter_hdr.set_label_provider(
+            lambda c: _COLS[c][0] if 0 <= c < len(_COLS) else "",
+        )
+        filter_hdr.filter_changed.connect(self._on_col_filter_changed)
+        filter_hdr.sort_requested.connect(self._on_excel_sort)
+        self._table.setHorizontalHeader(filter_hdr)
+
         hdr = self._table.horizontalHeader()
         hdr.setSectionsMovable(False)
         hdr.setStretchLastSection(True)
-        for i, (_, width, _) in enumerate(_COLS):
+        hdr.setSortIndicatorShown(True)
+        for i, (_, width, _, _sf) in enumerate(_COLS):
             self._table.setColumnWidth(i, width)
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
         bind_column_width_persistence(
             self._table, "item_quick_report", _COL_DEFAULTS,
         )
+        hdr.sectionClicked.connect(self._on_header_click)
+        self._update_sort_indicator()
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         root.addWidget(self._table, 1)
 
@@ -298,23 +352,29 @@ class ItemQuickReportView(QWidget):
         )
 
         hl.addWidget(_lbl("Description", size=11, color=_T2))
-        self._desc_cb = QComboBox()
+        self._desc_cb = CheckableMultiCombo(
+            "All Descriptions", noun_plural="descriptions", parent=self,
+        )
         self._desc_cb.setFixedWidth(180)
         self._desc_cb.setStyleSheet(_INPUT_SS)
-        self._desc_cb.addItem("All", "")
-        self._desc_cb.currentIndexChanged.connect(self._on_filter_changed)
+        self._desc_cb.selectionChanged.connect(self._on_filter_changed)
         hl.addWidget(self._desc_cb)
 
-        hl.addWidget(_lbl("Sort By", size=11, color=_T2))
-        self._sort_cb = QComboBox()
-        self._sort_cb.setFixedWidth(150)
-        self._sort_cb.setStyleSheet(_INPUT_SS)
-        for label, field, asc in _SORT_OPTS:
-            self._sort_cb.addItem(label, (field, asc))
-        self._sort_cb.currentIndexChanged.connect(self._on_filter_changed)
-        hl.addWidget(self._sort_cb)
-
         hl.addStretch()
+
+        self._export_btn = make_export_menu_btn(
+            self._on_export_filtered,
+            self._on_export_all,
+            parent=self,
+            height=30,
+            btn_tip=(
+                "Export Filtered — current dates, descriptions, column filters, and sort.\n"
+                "Use the ▾ menu for Export All (full item report, no extra filters)."
+            ),
+            filtered_tip="Export rows matching the current filters and sort order.",
+            all_tip="Export every verified record for this item (ignores toolbar and column filters).",
+        )
+        hl.addWidget(self._export_btn)
 
         clear_btn = QPushButton("Clear")
         clear_btn.setFixedHeight(30)
@@ -330,16 +390,6 @@ class ItemQuickReportView(QWidget):
 
         self._rebuild_dates_options([])
         return bar
-
-    @staticmethod
-    def _pager_btn_ss() -> str:
-        return (
-            f"QPushButton {{ background: {_WHITE}; color: {_T1};"
-            f" border: 1px solid {_BORDER}; border-radius: 4px;"
-            " font-size: 11px; font-family:'Segoe UI'; }}"
-            f"QPushButton:hover {{ background: {_BG}; }}"
-            f"QPushButton:disabled {{ color: {_TM}; }}"
-        )
 
     def clear(self) -> None:
         self._category = ""
@@ -366,18 +416,25 @@ class ItemQuickReportView(QWidget):
         try:
             self._dates_cb.blockSignals(True)
             self._desc_cb.blockSignals(True)
-            self._sort_cb.blockSignals(True)
             self._rebuild_dates_options([])
             self._dates_cb.setCurrentIndex(0)
             sync_from_to(self._from_date, self._to_date, 0, 0, optional=True)
-            self._desc_cb.clear()
-            self._desc_cb.addItem("All", "")
-            self._sort_cb.setCurrentIndex(0)
+            self._desc_cb.reset_to_all(emit=False)
+            self._sort_field = "date"
+            self._sort_asc = False
+            self._clear_column_filters_ui()
+            self._update_sort_indicator()
         finally:
             self._dates_cb.blockSignals(False)
             self._desc_cb.blockSignals(False)
-            self._sort_cb.blockSignals(False)
             self._syncing_dates = False
+
+    def _clear_column_filters_ui(self) -> None:
+        self._col_filters.clear()
+        self._col_value_cache.clear()
+        hdr = self._table.horizontalHeader()
+        if isinstance(hdr, ExcelFilterHeaderView):
+            hdr.clear_filters()
 
     def _rebuild_dates_options(self, years: List[int]) -> None:
         current = self._dates_cb.currentData()
@@ -403,30 +460,42 @@ class ItemQuickReportView(QWidget):
         if not self._category:
             return
         try:
-            from tahmeed.services.accountant_service import get_master_available_years
-            from tahmeed.services.subtable_service import get_subtables
-
-            years, subs = await asyncio.gather(
-                get_master_available_years(),
-                get_subtables(item_key(self._category)),
+            from tahmeed.services.accountant_service import (
+                get_category_report_descriptions,
+                get_master_available_years,
             )
-            # Drop headroom-only padding years with no real need — keep unique sorted desc
+
+            date_from, date_to = read_from_to(
+                self._from_date, self._to_date, optional=True,
+            )
+            years, descs = await asyncio.gather(
+                get_master_available_years(),
+                get_category_report_descriptions(
+                    self._category, date_from=date_from, date_to=date_to,
+                ),
+            )
             years = sorted({int(y) for y in years}, reverse=True)
             self._rebuild_dates_options(years)
-
-            self._desc_cb.blockSignals(True)
-            self._desc_cb.clear()
-            self._desc_cb.addItem("All", "")
-            for sub in subs:
-                if not getattr(sub, "active", True):
-                    continue
-                match = (sub.match or sub.name or "").strip()
-                if match:
-                    self._desc_cb.addItem(sub.name, match)
-            self._desc_cb.blockSignals(False)
+            self._desc_cb.set_options(descs, keep_selected=True, emit=False)
         except Exception:
             pass
         await self._reload()
+
+    async def _refresh_description_options(self) -> None:
+        if not self._category:
+            return
+        try:
+            from tahmeed.services.accountant_service import get_category_report_descriptions
+
+            date_from, date_to = read_from_to(
+                self._from_date, self._to_date, optional=True,
+            )
+            descs = await get_category_report_descriptions(
+                self._category, date_from=date_from, date_to=date_to,
+            )
+            self._desc_cb.set_options(descs, keep_selected=True, emit=False)
+        except Exception:
+            pass
 
     def _on_filter_changed(self) -> None:
         self._page = 0
@@ -488,7 +557,6 @@ class ItemQuickReportView(QWidget):
     def _on_from_to_changed(self) -> None:
         if self._syncing_dates:
             return
-        # Manual From/To → mark Dates as Custom
         self._syncing_dates = True
         try:
             for i in range(self._dates_cb.count()):
@@ -508,40 +576,76 @@ class ItemQuickReportView(QWidget):
         try:
             self._dates_cb.blockSignals(True)
             self._desc_cb.blockSignals(True)
-            self._sort_cb.blockSignals(True)
             self._dates_cb.setCurrentIndex(0)
             sync_from_to(self._from_date, self._to_date, 0, 0, optional=True)
-            self._desc_cb.setCurrentIndex(0)
-            self._sort_cb.setCurrentIndex(0)
+            self._desc_cb.reset_to_all(emit=False)
+            self._sort_field = "date"
+            self._sort_asc = False
+            self._clear_column_filters_ui()
+            self._update_sort_indicator()
         finally:
             self._dates_cb.blockSignals(False)
             self._desc_cb.blockSignals(False)
-            self._sort_cb.blockSignals(False)
             self._syncing_dates = False
-        asyncio.ensure_future(self._reload())
+        asyncio.ensure_future(self._prepare_and_reload())
 
-    def _query_kwargs(self) -> dict:
+    def _all_years_scope(self) -> bool:
         date_from, date_to = read_from_to(
             self._from_date, self._to_date, optional=True,
         )
-        description = self._desc_cb.currentData() or ""
-        sort = self._sort_cb.currentData() or ("date", True)
-        sort_field, sort_asc = sort
-        return {
-            "description": description,
+        return date_from is None and date_to is None
+
+    def _description_filter(self) -> List[str]:
+        return self._desc_cb.selected_values()
+
+    def column_filters_for_query(self) -> Dict[str, List[str]]:
+        out: Dict[str, List[str]] = {}
+        for col, accepted in self._col_filters.items():
+            field = _COL_FIELD.get(col)
+            if not field or not accepted:
+                continue
+            vals = sorted(v for v in accepted if v and v != "—")
+            if vals:
+                out[field] = vals
+        return out
+
+    def _query_kwargs(self, *, all_records: bool = False) -> dict:
+        if all_records:
+            return {
+                "descriptions": None,
+                "date_from": None,
+                "date_to": None,
+                "column_filters": None,
+                "sort_field": self._sort_field,
+                "sort_asc": bool(self._sort_asc),
+            }
+        date_from, date_to = read_from_to(
+            self._from_date, self._to_date, optional=True,
+        )
+        descs = self._description_filter()
+        col_filters = self.column_filters_for_query()
+        kw = {
+            "descriptions": descs or None,
             "date_from": date_from,
             "date_to": date_to,
-            "sort_field": sort_field,
-            "sort_asc": bool(sort_asc),
+            "sort_field": self._sort_field,
+            "sort_asc": bool(self._sort_asc),
         }
+        if col_filters:
+            kw["column_filters"] = col_filters
+        return kw
 
     def _header_context(self) -> Tuple[str, str]:
-        """Return (year_label, scope_label) for the report header."""
         date_from, date_to = read_from_to(
             self._from_date, self._to_date, optional=True,
         )
-        desc = self._desc_cb.currentText() or "All"
-        desc_scope = "All Transactions" if desc == "All" else desc
+        descs = self._description_filter()
+        if not descs:
+            desc_scope = "All Transactions"
+        elif len(descs) == 1:
+            desc_scope = descs[0]
+        else:
+            desc_scope = f"{len(descs)} descriptions"
 
         if date_from is None and date_to is None:
             return str(date.today().year), desc_scope
@@ -576,12 +680,88 @@ class ItemQuickReportView(QWidget):
         assert date_to is not None
         return str(date_to.year), f"{desc_scope}  ·  To {date_to.strftime('%d %b %Y')}"
 
-    async def _reload(self) -> None:
+    def _cell_text(self, row: int, col: int) -> str:
+        it = self._table.item(row, col)
+        raw = (it.text() if it else "").strip()
+        if col == 9 and raw:
+            return _receipt_label(raw)
+        return raw
+
+    def _filter_source_rows(self) -> List[dict]:
+        rows: List[dict] = []
+        for r in range(self._table.rowCount()):
+            row: dict = {}
+            for c in _FILTERABLE_COLS:
+                txt = self._cell_text(r, c)
+                if txt and txt != "—":
+                    row[c] = txt
+            if row:
+                rows.append(row)
+        return rows
+
+    def _filter_menu_values(self, col: int) -> set:
+        if col in self._col_value_cache:
+            return set(self._col_value_cache.get(col) or set())
+        return cascade_column_values(
+            self._filter_source_rows(),
+            target_col=col,
+            active_filters=self._col_filters,
+        )
+
+    def _on_col_filter_changed(self, col: int, accepted) -> None:
+        accepted = set(accepted or [])
+        if accepted:
+            self._col_filters[col] = accepted
+        else:
+            self._col_filters.pop(col, None)
+        hdr = self._table.horizontalHeader()
+        if isinstance(hdr, ExcelFilterHeaderView):
+            hdr.sync_active(self._col_filters)
+        self._page = 0
+        asyncio.ensure_future(self._reload(keep_col_filters=True))
+
+    def _on_header_click(self, col: int) -> None:
+        sort_field = _COLS[col][3] if 0 <= col < len(_COLS) else None
+        if sort_field is None:
+            return
+        if self._sort_field == sort_field:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_field = sort_field
+            self._sort_asc = False
+        self._update_sort_indicator()
+        self._page = 0
+        asyncio.ensure_future(self._reload(keep_col_filters=True))
+
+    def _on_excel_sort(self, col: int, mode: str) -> None:
+        sort_field = _COLS[col][3] if 0 <= col < len(_COLS) else None
+        if sort_field is None:
+            return
+        self._sort_field = sort_field
+        self._sort_asc = mode == SORT_ASC
+        self._update_sort_indicator()
+        self._page = 0
+        asyncio.ensure_future(self._reload(keep_col_filters=True))
+
+    def _update_sort_indicator(self) -> None:
+        hdr = self._table.horizontalHeader()
+        col_idx = next(
+            (i for i, c in enumerate(_COLS) if c[3] == self._sort_field),
+            1,
+        )
+        order = Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
+        hdr.setSortIndicator(col_idx, order)
+
+    async def _reload(self, *, keep_col_filters: bool = False) -> None:
         if self._loading or not self._category:
             return
         self._loading = True
         self._page = 0
         self._loaded = 0
+        self._reload_generation += 1
+        generation = self._reload_generation
+        if not keep_col_filters:
+            self._clear_column_filters_ui()
         self._loading_overlay.show_loading("Loading report…")
         try:
             from tahmeed.services.accountant_service import (
@@ -598,9 +778,10 @@ class ItemQuickReportView(QWidget):
             txs, totals = await asyncio.gather(
                 get_category_report_transactions(
                     self._category,
-                    description=kw["description"],
+                    descriptions=kw["descriptions"],
                     date_from=kw["date_from"],
                     date_to=kw["date_to"],
+                    column_filters=kw.get("column_filters"),
                     sort_field=kw["sort_field"],
                     sort_asc=kw["sort_asc"],
                     limit=_PAGE_SIZE,
@@ -608,11 +789,14 @@ class ItemQuickReportView(QWidget):
                 ),
                 get_category_report_totals(
                     self._category,
-                    description=kw["description"],
+                    descriptions=kw["descriptions"],
                     date_from=kw["date_from"],
                     date_to=kw["date_to"],
+                    column_filters=kw.get("column_filters"),
                 ),
             )
+            if generation != self._reload_generation:
+                return
             self._total = int(totals.get("count") or 0)
             self._loaded = len(txs)
             cashier_ids = [tx.cashier_id for tx in txs if tx.cashier_id]
@@ -620,6 +804,8 @@ class ItemQuickReportView(QWidget):
             self._populate(txs, 0, names, append=False)
             self._update_footer(totals)
             self._fill_if_needed()
+            asyncio.ensure_future(self._load_column_values(generation, kw))
+            asyncio.ensure_future(self._refresh_description_options())
         except Exception as exc:
             self._table.setRowCount(0)
             self._loaded = 0
@@ -628,6 +814,38 @@ class ItemQuickReportView(QWidget):
             self._loading = False
             self._loading_overlay.hide_loading()
             self._update_footer_status()
+
+    async def _load_column_values(self, generation: int, kw: dict) -> None:
+        try:
+            from tahmeed.services.accountant_service import get_category_report_column_values
+
+            base_kw = {
+                k: v for k, v in kw.items()
+                if k not in ("column_filters", "sort_field", "sort_asc")
+            }
+            col_filters = kw.get("column_filters") or {}
+            fields = sorted(set(_COL_FIELD.values()))
+            results = await asyncio.gather(*[
+                get_category_report_column_values(
+                    field,
+                    self._category,
+                    descriptions=base_kw.get("descriptions"),
+                    date_from=base_kw.get("date_from"),
+                    date_to=base_kw.get("date_to"),
+                    column_filters=col_filters or None,
+                )
+                for field in fields
+            ])
+            if generation != self._reload_generation:
+                return
+            field_to_col = {f: c for c, f in _COL_FIELD.items()}
+            self._col_value_cache = {
+                field_to_col[field]: set(vals)
+                for field, vals in zip(fields, results)
+                if field in field_to_col
+            }
+        except Exception:
+            pass
 
     async def _load_more(self) -> None:
         if self._scroll_loading or self._loading or not self._category:
@@ -646,9 +864,10 @@ class ItemQuickReportView(QWidget):
             skip = self._loaded
             txs = await get_category_report_transactions(
                 self._category,
-                description=kw["description"],
+                descriptions=kw["descriptions"],
                 date_from=kw["date_from"],
                 date_to=kw["date_to"],
+                column_filters=kw.get("column_filters"),
                 sort_field=kw["sort_field"],
                 sort_asc=kw["sort_asc"],
                 limit=_PAGE_SIZE,
@@ -673,29 +892,21 @@ class ItemQuickReportView(QWidget):
         count = int(totals.get("count") or 0)
         self._total = count
         self._tzs_lbl.setText(f"TZS  {tzs:,.0f}")
-        self._tzs_lbl.setStyleSheet(
-            f"color: {_T1}; font-size: 13px; font-weight: 700;"
-            " font-family:'Cascadia Code','Consolas',monospace;"
-            " background: transparent;"
-        )
         self._usd_lbl.setText(f"USD  ${usd:,.2f}" if usd else "USD  —")
-        self._usd_lbl.setStyleSheet(
-            f"color: {_T1}; font-size: 12px; font-weight: 600;"
-            " font-family:'Cascadia Code','Consolas',monospace;"
-            " background: transparent;"
-        )
         self._count_lbl.setText(f"{count:,} entries")
         self._update_footer_status()
 
     def _update_footer_status(self) -> None:
         loaded = self._loaded
         total = self._total
+        filtered = bool(self.column_filters_for_query())
         if self._loading or self._scroll_loading:
             suffix = "  ·  Loading…"
         elif loaded >= total and total:
-            suffix = ""
+            suffix = "  ·  Column filters on" if filtered else ""
         elif total:
-            suffix = "  ·  Scroll for more"
+            extra = "  ·  Column filters on" if filtered else ""
+            suffix = f"  ·  Scroll for more{extra}"
         else:
             suffix = ""
         self._page_info.setText(f"Showing {loaded:,} of {total:,}{suffix}")
@@ -708,7 +919,7 @@ class ItemQuickReportView(QWidget):
         *,
         append: bool = False,
     ) -> None:
-        """Fill (or append) rows — black text; amounts shown as positive used."""
+        all_years = self._all_years_scope()
         start = self._table.rowCount() if append else 0
         if not append:
             self._table.setRowCount(len(txs))
@@ -728,10 +939,10 @@ class ItemQuickReportView(QWidget):
                 if tx.cashier_id else "—"
             )
             item_str = tx.item or tx.category_name or "—"
-            date_txt = format_register_date(tx.date) if tx.date else "—"
+            date_txt = _fmt_report_date(tx.date, all_years=all_years)
 
             _set_cell(self._table, r, 0, str(skip + i + 1), "center", row_bg)
-            _set_cell(self._table, r, 1, date_txt or "—", "left", row_bg)
+            _set_cell(self._table, r, 1, date_txt, "left", row_bg)
             _set_cell(self._table, r, 2, item_str, "left", row_bg)
             _set_cell(self._table, r, 3, tx.description or "—", "left", row_bg)
             _set_cell(self._table, r, 4, tx.truck_number or "—", "left", row_bg)
@@ -750,3 +961,216 @@ class ItemQuickReportView(QWidget):
             _set_cell(self._table, r, 11, tx.approver or "—", "left", row_bg)
             _set_cell(self._table, r, 12, cashier, "left", row_bg)
             self._table.setRowHeight(r, _ROW_H)
+
+    # ── Export ───────────────────────────────────────────────────────────────
+
+    def _on_export_filtered(self) -> None:
+        if self._export_in_flight:
+            return
+        asyncio.ensure_future(self._do_export(all_records=False))
+
+    def _on_export_all(self) -> None:
+        if self._export_in_flight:
+            return
+        asyncio.ensure_future(self._do_export(all_records=True))
+
+    async def _fetch_export_page(self, kw: dict, *, limit: int, skip: int) -> List[Transaction]:
+        from tahmeed.services.accountant_service import get_category_report_transactions
+
+        return await get_category_report_transactions(
+            self._category,
+            descriptions=kw.get("descriptions"),
+            date_from=kw.get("date_from"),
+            date_to=kw.get("date_to"),
+            column_filters=kw.get("column_filters"),
+            sort_field=kw["sort_field"],
+            sort_asc=kw["sort_asc"],
+            limit=limit,
+            skip=skip,
+        )
+
+    async def _do_export(self, *, all_records: bool) -> None:
+        if self._export_in_flight or not self._category:
+            return
+        try:
+            import openpyxl  # noqa: F401
+        except ImportError:
+            await notify_export_error(
+                self, "Missing Dependency",
+                "openpyxl is required for Excel export.\n\nRun: pip install openpyxl",
+            )
+            return
+
+        from tahmeed.services.accountant_service import get_cashier_names
+
+        self._export_in_flight = True
+        overlay = attach_export_overlay(self)
+        kw = self._query_kwargs(all_records=all_records)
+        mode_label = "All" if all_records else "Filtered"
+        safe_cat = self._category.replace(" ", "_").replace("&", "and").replace("/", "-")
+        try:
+            show_export_busy(
+                overlay, f"Loading {mode_label.lower()} report…", maximum=0,
+            )
+            try:
+                txs = await fetch_records_with_progress(
+                    overlay,
+                    lambda *, limit, skip: self._fetch_export_page(
+                        kw, limit=limit, skip=skip,
+                    ),
+                    phase=f"Loading {mode_label.lower()} records",
+                )
+            except Exception as exc:
+                await notify_export_error(self, "Export Error", f"Failed to fetch data: {exc}")
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not txs:
+                await notify_export_info(self, "Export", "No records to export.")
+                return
+
+            export_cashier_ids = [tx.cashier_id for tx in txs if tx.cashier_id]
+            export_cashier_names = (
+                await get_cashier_names(export_cashier_ids) if export_cashier_ids else {}
+            )
+
+            default = f"{safe_cat}_QuickReport_{mode_label}.xlsx"
+            path = await pick_export_path(
+                self, f"Export {self._category} ({mode_label})", default,
+            )
+            if not path:
+                return
+            path = normalize_xlsx_path(path)
+
+            scope_note = (
+                f"All verified records — {self._category}"
+                if all_records
+                else f"Filtered view — {self._category}"
+            )
+            total = len(txs)
+            fast = total >= FAST_STYLE_ROW_LIMIT
+            category = self._category
+
+            def _write(progress_cb) -> None:
+                from openpyxl.styles import Font, PatternFill, Alignment
+
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = category[:28]
+
+                ws.merge_cells("A1:M1")
+                ws["A1"] = "TAHMEED COACH TZ LTD"
+                ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
+                ws["A1"].alignment = Alignment(horizontal="center")
+                ws.merge_cells("A2:M2")
+                ws["A2"] = f"Account QuickReport — {scope_note}"
+                ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
+                ws["A2"].alignment = Alignment(horizontal="center")
+                ws.merge_cells("A3:M3")
+                ws["A3"] = f"Exported: {datetime.now().strftime('%d %b %Y  %H:%M')}"
+                ws["A3"].font = Font(name="Segoe UI", italic=True, size=9, color="9CA3AF")
+                ws["A3"].alignment = Alignment(horizontal="center")
+                ws.append([])
+
+                headers = [c[0] for c in _COLS]
+                ws.append(headers)
+                hdr_row = ws.max_row
+                grey = PatternFill("solid", fgColor="F1F5F9")
+                for cell in ws[hdr_row]:
+                    cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
+                    cell.fill = grey
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                stripe = PatternFill("solid", fgColor="F1F5F9")
+                white = PatternFill("solid", fgColor="FFFFFF")
+                mono = Font(name="Cascadia Code", size=10)
+                tzs_total = usd_total = 0.0
+
+                for i, tx in enumerate(txs):
+                    tzs_raw, usd_raw = tx.money_parts()
+                    tzs_val = _used_amount(tzs_raw) if tzs_raw else None
+                    usd_val = _used_amount(usd_raw) if usd_raw else None
+                    if tzs_val:
+                        tzs_total += tzs_val
+                    if usd_val:
+                        usd_total += usd_val
+                    ref = _ref_float_display(tx)
+                    rcpt = _receipt_label(tx.receipt_status or "pending")
+                    cashier = (
+                        _short_name(export_cashier_names.get(tx.cashier_id, ""))
+                        if tx.cashier_id else ""
+                    )
+                    date_str = tx.date.strftime("%d-%b-%Y") if tx.date else ""
+                    ws.append([
+                        i + 1, date_str, tx.item or tx.category_name or "",
+                        tx.description or "", tx.truck_number or "", tx.memo or "",
+                        ref or "", tzs_val or "", usd_val or "", rcpt,
+                        tx.ownership or "", tx.approver or "", cashier,
+                    ])
+                    if not fast:
+                        r = ws.max_row
+                        fill = stripe if i % 2 else white
+                        for cell in ws[r]:
+                            cell.fill = fill
+                            cell.alignment = Alignment(vertical="center")
+                        if tzs_val is not None:
+                            c = ws.cell(r, 8)
+                            c.font = mono
+                            c.number_format = "#,##0"
+                            c.alignment = Alignment(horizontal="right", vertical="center")
+                        if usd_val is not None:
+                            c = ws.cell(r, 9)
+                            c.font = mono
+                            c.number_format = "#,##0.00"
+                            c.alignment = Alignment(horizontal="right", vertical="center")
+
+                    if progress_cb and (
+                        (i + 1) % PROGRESS_EVERY == 0 or i + 1 == total
+                    ):
+                        progress_cb(i + 1, "Writing rows")
+
+                ws.append([])
+                ws.append(["", "", "", "TOTAL", "", "", "", tzs_total or "", usd_total or ""])
+                total_r = ws.max_row
+                ws.cell(total_r, 4).font = Font(name="Segoe UI", bold=True, size=11)
+                if tzs_total:
+                    c = ws.cell(total_r, 8)
+                    c.font = Font(name="Cascadia Code", bold=True, size=11)
+                    c.number_format = "#,##0"
+                    c.alignment = Alignment(horizontal="right", vertical="center")
+                if usd_total:
+                    c = ws.cell(total_r, 9)
+                    c.font = Font(name="Cascadia Code", bold=True, size=11)
+                    c.number_format = "#,##0.00"
+                    c.alignment = Alignment(horizontal="right", vertical="center")
+
+                widths = [6, 12, 14, 34, 12, 20, 16, 15, 12, 13, 13, 12, 12]
+                for idx, w in enumerate(widths, 1):
+                    ws.column_dimensions[ws.cell(1, idx).column_letter].width = w
+                ws.freeze_panes = ws.cell(hdr_row + 1, 1)
+                if progress_cb:
+                    progress_cb(total, "Saving file")
+                wb.save(path)
+
+            try:
+                await run_export_write(overlay, total, _write)
+            except Exception as exc:
+                await notify_export_error(self, "Save Error", f"Could not save file:\n{exc}")
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not export_file_ready(path):
+                await notify_export_error(
+                    self, "Save Error", f"The file could not be saved:\n{path}",
+                )
+                return
+
+            await notify_export_info(
+                self, "Export Complete",
+                f"Exported {len(txs):,} records to:\n{path}",
+            )
+        finally:
+            hide_export_busy(self)
+            self._export_in_flight = False

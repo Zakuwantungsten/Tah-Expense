@@ -2076,11 +2076,11 @@ def _master_short_name(name: str) -> str:
 
 
 def _parse_master_filter_date(value: str, year: int) -> Optional[datetime]:
-    """Parse Excel filter date labels like ``18 Jul`` against *year*."""
+    """Parse Excel filter date labels like ``18 Jul`` or ``18 Jul 2026``."""
     text = (value or "").strip()
     if not text or text == "—":
         return None
-    for fmt in ("%d %b", "%d %B", "%Y-%m-%d", "%d/%m/%Y"):
+    for fmt in ("%d %b %Y", "%d %B %Y", "%d %b", "%d %B", "%Y-%m-%d", "%d/%m/%Y"):
         try:
             if fmt in ("%d %b", "%d %B"):
                 parsed = datetime.strptime(f"{text} {year}", f"{fmt} %Y")
@@ -2488,14 +2488,28 @@ async def get_category_lifetime_usage(category: str) -> dict:
     return await get_category_report_totals(category)
 
 
+def _category_report_reference_year(
+    date_from: Optional[datetime],
+    date_to: Optional[datetime],
+) -> int:
+    if date_from is not None:
+        return date_from.year
+    if date_to is not None:
+        return date_to.year
+    return date.today().year
+
+
 def _category_report_query(
     category: str,
     *,
     description: str = "",
+    descriptions: Optional[List[str]] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    cashier_ids: Optional[Sequence[ObjectId]] = None,
 ) -> dict:
-    """Verified / not-trashed rows for one item; optional description + date range."""
+    """Verified / not-trashed rows for one item; optional filters + date range."""
     name = (category or "").strip()
     query: dict = {
         "verified": True,
@@ -2507,13 +2521,9 @@ def _category_report_query(
         },
     }
     and_clauses: list = []
-    if description.strip():
-        and_clauses.append({
-            "description": {
-                "$regex": re.escape(description.strip()),
-                "$options": "i",
-            },
-        })
+    desc_arg: object = descriptions if descriptions else description
+    if desc_arg:
+        _append_text_filters(and_clauses, description=desc_arg)
     if date_from is not None or date_to is not None:
         date_clause: dict = {}
         if date_from is not None:
@@ -2525,17 +2535,60 @@ def _category_report_query(
                 hour=23, minute=59, second=59, microsecond=0,
             )
         and_clauses.append({"date": date_clause})
-    if and_clauses:
-        query = {**query, "$and": and_clauses}
-    return query
+    ref_year = _category_report_reference_year(date_from, date_to)
+    _append_master_column_filters(
+        and_clauses,
+        column_filters,
+        year=ref_year,
+        cashier_ids=cashier_ids,
+    )
+    return _merge_and_clauses(query, and_clauses)
+
+
+async def _category_report_query_with_cashiers(
+    category: str,
+    *,
+    description: str = "",
+    descriptions: Optional[List[str]] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+) -> dict:
+    """Build item QuickReport query, resolving cashier short-name filters."""
+    filters = dict(column_filters or {})
+    cashier_names = list(filters.pop("cashier", []) or [])
+    base = _category_report_query(
+        category,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=filters or None,
+    )
+    if not cashier_names:
+        return base
+    ids = await _resolve_master_cashier_ids(cashier_names, base)
+    if not ids:
+        return {**base, "cashier_id": {"$in": []}}
+    return _category_report_query(
+        category,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=filters or None,
+        cashier_ids=ids,
+    )
 
 
 async def get_category_report_totals(
     category: str,
     *,
     description: str = "",
+    descriptions: Optional[List[str]] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
 ) -> dict:
     """Aggregate count / TZS / USD for an item report (all years by default)."""
     name = (category or "").strip()
@@ -2543,8 +2596,13 @@ async def get_category_report_totals(
         return {"count": 0, "tzs": 0.0, "usd": 0.0}
 
     db = get_db()
-    query = _category_report_query(
-        name, description=description, date_from=date_from, date_to=date_to,
+    query = await _category_report_query_with_cashiers(
+        name,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
     )
     result = await db.transactions.aggregate([
         {"$match": query},
@@ -2629,8 +2687,10 @@ async def get_category_report_transactions(
     category: str,
     *,
     description: str = "",
+    descriptions: Optional[List[str]] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
     sort_field: str = "date",
     sort_asc: bool = True,
     limit: int = 100,
@@ -2641,8 +2701,13 @@ async def get_category_report_transactions(
     if not name:
         return []
     db = get_db()
-    query = _category_report_query(
-        name, description=description, date_from=date_from, date_to=date_to,
+    query = await _category_report_query_with_cashiers(
+        name,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
     )
     sort_clauses = ledger_sort_clauses(
         sort_field, sort_asc, _MASTER_SORT_ALLOWED,
@@ -2676,8 +2741,10 @@ async def get_category_report_opening_balance(
     category: str,
     *,
     description: str = "",
+    descriptions: Optional[List[str]] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
     sort_field: str = "date",
     sort_asc: bool = True,
     skip: int = 0,
@@ -2690,8 +2757,13 @@ async def get_category_report_opening_balance(
         return {"tzs": 0.0, "usd": 0.0}
 
     db = get_db()
-    query = _category_report_query(
-        name, description=description, date_from=date_from, date_to=date_to,
+    query = await _category_report_query_with_cashiers(
+        name,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
     )
     field, direction = _category_report_sort(sort_field, sort_asc)
     result = await db.transactions.aggregate([
@@ -2719,6 +2791,155 @@ async def get_category_report_opening_balance(
         "tzs": float(row.get("tzs_total") or 0.0),
         "usd": float(row.get("usd_total") or 0.0),
     }
+
+
+async def get_category_report_descriptions(
+    category: str,
+    *,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> List[str]:
+    """Distinct transaction descriptions for an item QuickReport toolbar filter."""
+    name = (category or "").strip()
+    if not name:
+        return []
+    db = get_db()
+    query = _category_report_query(
+        name, date_from=date_from, date_to=date_to,
+    )
+    vals = await db.transactions.distinct("description", query)
+    return sorted((v for v in vals if v), key=str.lower)
+
+
+async def get_category_report_column_values(
+    field: str,
+    category: str,
+    *,
+    description: str = "",
+    descriptions: Optional[List[str]] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+) -> List[str]:
+    """Distinct Excel ▾ values for *field* on an item QuickReport (all years)."""
+    if field not in _MASTER_COL_FIELDS:
+        return []
+
+    name = (category or "").strip()
+    if not name:
+        return []
+
+    filters = {
+        k: v for k, v in (column_filters or {}).items()
+        if k != field and k in _MASTER_COL_FIELDS
+    }
+    query = await _category_report_query_with_cashiers(
+        name,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=filters or None,
+    )
+    db = get_db()
+    ref_year = _category_report_reference_year(date_from, date_to)
+    all_years = date_from is None and date_to is None
+
+    if field == "date":
+        vals = await db.transactions.distinct("date", query)
+        out: Set[str] = set()
+        for v in vals:
+            if v is None:
+                continue
+            try:
+                if hasattr(v, "date") and not isinstance(v, date):
+                    v = v.date() if not isinstance(v, datetime) else v
+                if isinstance(v, datetime):
+                    fmt = "%d %b %Y" if all_years else "%d %b"
+                    out.add(v.strftime(fmt))
+                elif isinstance(v, date):
+                    fmt = "%d %b %Y" if all_years else "%d %b"
+                    out.add(v.strftime(fmt))
+            except Exception:
+                continue
+        return sorted(out, key=lambda s: (
+            _parse_master_filter_date(s, ref_year) or datetime.max,
+            s,
+        ))
+
+    if field == "item":
+        items = await db.transactions.distinct("item", query)
+        cats = await db.transactions.distinct("category_name", query)
+        names = {*(v for v in items if v), *(v for v in cats if v)}
+        return sorted(names, key=str.lower)
+
+    if field == "receipt_status":
+        raw = await db.transactions.distinct("receipt_status", query)
+        labels: Set[str] = set()
+        for st in raw:
+            key = (st or "pending").strip().lower().replace(" ", "_")
+            if key in ("missing", "no_receipt", "no", "n/a", "none"):
+                labels.add("No Receipt")
+            elif key == "received":
+                labels.add("Received")
+            else:
+                labels.add("Pending")
+        return sorted(labels)
+
+    if field in ("tzs", "usd"):
+        cur_match = (
+            {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]}
+            if field == "tzs"
+            else {"$eq": [{"$toUpper": "$currency"}, "USD"]}
+        )
+        decimals = 0 if field == "tzs" else 2
+        docs = await db.transactions.aggregate([
+            {"$match": query},
+            {"$match": {"$expr": cur_match}},
+            {"$group": {"_id": "$amount"}},
+            {"$limit": 5000},
+        ]).to_list(5000)
+        return sorted(
+            {
+                _fmt_master_amount(float(d["_id"]), decimals=decimals)
+                for d in docs if d.get("_id") is not None
+            },
+            key=lambda s: _parse_master_filter_amount(s) or 0.0,
+        )
+
+    if field == "ref_float":
+        vals = await db.transactions.distinct("ref_float", query)
+        out = {(v or "").strip().upper() for v in vals if (v or "").strip()}
+        legacy_q = _merge_and_clauses(dict(query), [
+            {"notes_flag": True},
+            {"$or": [
+                {"ref_float": {"$exists": False}},
+                {"ref_float": ""},
+                {"ref_float": None},
+            ]},
+        ])
+        if await db.transactions.count_documents(legacy_q, limit=1):
+            out.add("REFUND TO FLOAT")
+        return sorted(out, key=str.lower)
+
+    if field == "cashier":
+        ids = await db.transactions.distinct("cashier_id", query)
+        ids = [i for i in ids if i is not None]
+        names = await get_cashier_names(ids) if ids else {}
+        labels = {_master_short_name(n) for n in names.values() if n}
+        return sorted(labels, key=str.lower)
+
+    db_field = {
+        "description": "description",
+        "truck_number": "truck_number",
+        "memo": "memo",
+        "ownership": "ownership",
+        "approver": "approver",
+    }.get(field)
+    if not db_field:
+        return []
+    vals = await db.transactions.distinct(db_field, query)
+    return sorted((v for v in vals if v), key=str.lower)
 
 
 async def get_master_column_values(
