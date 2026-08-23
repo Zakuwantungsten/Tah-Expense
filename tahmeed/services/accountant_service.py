@@ -5032,7 +5032,7 @@ def _diesel_date_filter(year: int, month: int) -> dict:
 
 
 def diesel_display_label(rec: dict) -> str:
-    """All Entries FILE NAME value: import description, else Excel file name."""
+    """Upload description entered at import time, else the Excel file name."""
     label = str(rec.get("upload_label") or "").strip()
     if label:
         return label
@@ -6217,6 +6217,7 @@ def _normalized_row(
     rate: Any = None,
     station: str = "",
     receipt_status: str = "",
+    upload_description: str = "",
 ) -> dict:
     amt = _safe_float_value(amount) if amount not in (None, "") else None
     ltrs = _safe_float_value(liters) if liters not in (None, "") else None
@@ -6235,6 +6236,7 @@ def _normalized_row(
         "rate": unit_rate,
         "station": station or "—",
         "receipt_status": receipt_status or "—",
+        "upload_description": upload_description or "—",
     }
 
 
@@ -6330,6 +6332,7 @@ async def _truck_overview_diesel_rows(
                 liters=doc.get("ltrs"),
                 rate=doc.get("price_per_ltr"),
                 station=doc.get("diesel_at") or "",
+                upload_description=diesel_display_label(doc),
             ))
     return rows
 
@@ -6965,6 +6968,8 @@ def _filter_fuel_overview_rows(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     currency: str = "",
+    *,
+    sort_rows: bool = True,
 ) -> list:
     wanted = _normalize_fuel_overview_sources(source)
     filtered = [
@@ -6973,8 +6978,201 @@ def _filter_fuel_overview_rows(
         and _truck_row_in_date_range(row, date_from, date_to)
         and _truck_row_matches_currency(row, currency)
     ]
-    filtered.sort(key=lambda row: (row.get("date") or datetime.min))
+    if sort_rows:
+        filtered.sort(key=lambda row: (row.get("date") or datetime.min))
     return filtered
+
+
+def _overview_amount_triple(row: dict) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Return (tzs, usd, zmw) with the amount only in its currency column."""
+    amount = row.get("amount")
+    if amount in (None, ""):
+        return None, None, None
+    try:
+        val = float(amount)
+    except (TypeError, ValueError):
+        return None, None, None
+    cur = _normalize_truck_overview_currency(row.get("currency") or "")
+    if cur == "TZS":
+        return val, None, None
+    if cur == "USD":
+        return None, val, None
+    if cur == "ZMW":
+        return None, None, val
+    return None, None, None
+
+
+def _fmt_overview_num(value, *, decimals: int = 0) -> str:
+    if value in (None, "", 0, 0.0):
+        return "—"
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if abs(val) < 1e-12:
+        return "—"
+    return f"{val:,.{decimals}f}"
+
+
+def _fmt_overview_currency_cell(currency: str, value) -> str:
+    if value is None:
+        return "—"
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    decimals = 2 if currency == "USD" else 0
+    return f"{val:,.{decimals}f}"
+
+
+def overview_row_display(row: dict, field: str) -> str:
+    """Display text for Fuel / Truck overview cells (matches on-screen table)."""
+    if field == "date":
+        dt = row.get("date")
+        if isinstance(dt, datetime) and dt.year > 1:
+            return dt.strftime("%d %b %Y")
+        return "—"
+    if field == "source":
+        return str(row.get("source") or "—")
+    if field == "description":
+        return str(row.get("description") or "—")
+    if field == "reference":
+        return str(row.get("reference") or "—")
+    if field == "truck_value":
+        return str(row.get("truck_value") or "—")
+    if field == "tzs":
+        tzs, _usd, _zmw = _overview_amount_triple(row)
+        return _fmt_overview_currency_cell("TZS", tzs)
+    if field == "usd":
+        _tzs, usd, _zmw = _overview_amount_triple(row)
+        return _fmt_overview_currency_cell("USD", usd)
+    if field == "zmw":
+        _tzs, _usd, zmw = _overview_amount_triple(row)
+        return _fmt_overview_currency_cell("ZMW", zmw)
+    if field == "liters":
+        return _fmt_overview_num(row.get("liters"), decimals=0)
+    if field == "rate":
+        return _fmt_overview_num(row.get("rate"), decimals=2)
+    if field == "station":
+        return str(row.get("station") or "—")
+    if field == "upload_description":
+        return str(row.get("upload_description") or "—")
+    if field == "receipt_status":
+        receipt = str(row.get("receipt_status") or "").strip()
+        return receipt if receipt and receipt != "—" else "—"
+    return str(row.get(field) or "—")
+
+
+def _apply_overview_column_filters(
+    rows: list,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+) -> list:
+    if not column_filters:
+        return list(rows)
+    out: list = []
+    for row in rows:
+        keep = True
+        for field, accepted in column_filters.items():
+            if not accepted:
+                continue
+            allowed = {str(v) for v in accepted}
+            if overview_row_display(row, field) not in allowed:
+                keep = False
+                break
+        if keep:
+            out.append(row)
+    return out
+
+
+def _overview_sort_key(row: dict, field: str):
+    if field == "date":
+        return row.get("date") or datetime.min
+    if field in ("liters", "rate"):
+        val = row.get(field)
+        if val in (None, ""):
+            return float("-inf")
+        return _safe_float_value(val)
+    if field in ("tzs", "usd", "zmw"):
+        cur_map = {"tzs": "TZS", "usd": "USD", "zmw": "ZMW"}
+        wanted = cur_map[field]
+        if _normalize_truck_overview_currency(row.get("currency") or "") != wanted:
+            return float("-inf")
+        amount = row.get("amount")
+        if amount in (None, ""):
+            return float("-inf")
+        return _safe_float_value(amount)
+    if field == "truck_value":
+        return str(row.get("truck_value") or "").upper()
+    text = overview_row_display(row, field)
+    return text.lower() if text != "—" else ""
+
+
+def _sort_overview_rows(rows: list, sort_field: str, sort_asc: bool) -> list:
+    field = (sort_field or "date").strip() or "date"
+    return sorted(rows, key=lambda row: _overview_sort_key(row, field), reverse=not sort_asc)
+
+
+def _finalize_fuel_overview_rows(
+    rows: list,
+    *,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    sort_field: str = "date",
+    sort_asc: bool = True,
+) -> list:
+    rows = _apply_overview_column_filters(rows, column_filters)
+    return _sort_overview_rows(rows, sort_field, sort_asc)
+
+
+FUEL_OVERVIEW_FILTER_FIELDS = (
+    "date",
+    "source",
+    "description",
+    "reference",
+    "truck_value",
+    "tzs",
+    "usd",
+    "zmw",
+    "liters",
+    "rate",
+    "station",
+    "upload_description",
+    "receipt_status",
+)
+
+
+async def get_fuel_overview_column_filter_cache(
+    truck: str,
+    source: Union[str, Sequence[str], None] = "all",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    currency: str = "",
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    fields: Sequence[str] = FUEL_OVERVIEW_FILTER_FIELDS,
+) -> Dict[str, Set[str]]:
+    """Distinct display values per column for Excel ▾ menus (cascaded)."""
+    if not truck.strip():
+        return {field: set() for field in fields}
+    base_rows = _filter_fuel_overview_rows(
+        await _load_fuel_overview_rows(truck.strip(), date_from, date_to),
+        source=source,
+        date_from=date_from,
+        date_to=date_to,
+        currency=currency,
+        sort_rows=False,
+    )
+    active = {
+        str(k): [str(v) for v in vals]
+        for k, vals in (column_filters or {}).items()
+        if vals
+    }
+    out: Dict[str, Set[str]] = {}
+    for field in fields:
+        cascaded = {k: v for k, v in active.items() if k != field}
+        scoped = _apply_overview_column_filters(base_rows, cascaded or None)
+        values = {overview_row_display(row, field) for row in scoped}
+        values.discard("")
+        out[field] = values
+    return out
 
 
 async def _fuel_overview_diesel_cash_rows(
@@ -7037,6 +7235,9 @@ async def get_fuel_overview_records(
     currency: str = "",
     limit: int = 50,
     skip: int = 0,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    sort_field: str = "date",
+    sort_asc: bool = True,
 ) -> list:
     if not truck.strip():
         return []
@@ -7046,6 +7247,13 @@ async def get_fuel_overview_records(
         date_from=date_from,
         date_to=date_to,
         currency=currency,
+        sort_rows=False,
+    )
+    rows = _finalize_fuel_overview_rows(
+        rows,
+        column_filters=column_filters,
+        sort_field=sort_field,
+        sort_asc=sort_asc,
     )
     return rows[skip: skip + limit]
 
@@ -7056,6 +7264,9 @@ async def count_fuel_overview_records(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     currency: str = "",
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    sort_field: str = "date",
+    sort_asc: bool = True,
 ) -> int:
     if not truck.strip():
         return 0
@@ -7065,6 +7276,13 @@ async def count_fuel_overview_records(
         date_from=date_from,
         date_to=date_to,
         currency=currency,
+        sort_rows=False,
+    )
+    rows = _finalize_fuel_overview_rows(
+        rows,
+        column_filters=column_filters,
+        sort_field=sort_field,
+        sort_asc=sort_asc,
     )
     return len(rows)
 
@@ -7075,6 +7293,9 @@ async def get_fuel_overview_summary(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     currency: str = "",
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    sort_field: str = "date",
+    sort_asc: bool = True,
 ) -> dict:
     if not truck.strip():
         return _empty_overview_summary()
@@ -7084,6 +7305,13 @@ async def get_fuel_overview_summary(
         date_from=date_from,
         date_to=date_to,
         currency=currency,
+        sort_rows=False,
+    )
+    rows = _finalize_fuel_overview_rows(
+        rows,
+        column_filters=column_filters,
+        sort_field=sort_field,
+        sort_asc=sort_asc,
     )
     return _summarize_overview_rows(rows)
 

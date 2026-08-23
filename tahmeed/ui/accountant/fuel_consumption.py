@@ -206,21 +206,42 @@ def _pretty_field(key: str) -> str:
         "clients_name": "Client", "destinations": "Destination",
         "truck_no": "Truck No.", "ltrs": "Litres",
         "price_per_ltr": "Price/Ltr", "total_amount": "Amount",
-        "upload_label": "File Name",
+        "upload_label": "Upload Description",
     }.get(key, key)
 
 
-_FILE_COL = ("FILE NAME", "upload_label", "text")
+_UPLOAD_DESC_COL = ("UPLOAD DESCRIPTION", "upload_label", "text")
 
 
 def _display_columns(schema: dict) -> List[Tuple[str, str, str]]:
-    """Station columns plus the last File Name (upload description) column."""
-    return list(schema["columns"]) + [_FILE_COL]
+    """Station columns plus the upload description entered at import (defaults to file name)."""
+    return list(schema["columns"]) + [_UPLOAD_DESC_COL]
 
 
 def _row_label(rec: dict) -> str:
     from tahmeed.services.accountant_service import diesel_display_label
     return diesel_display_label(rec)
+
+
+def _bind_fuel_columns(table: QTableWidget, key: str) -> None:
+    """Auto-fit on first visit, stretch upload description, allow manual resize elsewhere."""
+    hdr = table.horizontalHeader()
+    hdr.setStretchLastSection(False)
+    hdr.setMinimumSectionSize(44)
+    stretch_col = max(table.columnCount() - 1, 0)
+    for col in range(table.columnCount()):
+        if col == stretch_col:
+            hdr.setSectionResizeMode(col, QHeaderView.Stretch)
+        else:
+            hdr.setSectionResizeMode(col, QHeaderView.Interactive)
+    defaults = [max(table.columnWidth(i), 56) for i in range(table.columnCount())]
+    bind_column_width_persistence(
+        table,
+        key,
+        defaults,
+        stretch_columns=[stretch_col],
+        auto_fit_if_unset=True,
+    )
 
 
 def _diesel_export_row(
@@ -1315,7 +1336,7 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
 
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText(
-            "Search truck, LPO, client, destination, station, file name…"
+            "Search truck, LPO, client, destination, station, upload description…"
         )
         self._search_edit.setFixedWidth(260)
         self._search_edit.setStyleSheet(_input_ss())
@@ -1323,7 +1344,7 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
         tbl.addWidget(self._search_edit)
 
         self._file_cb = CheckableMultiCombo(
-            "All File Names", noun_plural="file names", parent=self,
+            "All Descriptions", noun_plural="descriptions", parent=self,
         )
         self._file_cb.setFixedWidth(180)
         self._file_cb.setStyleSheet(_input_ss())
@@ -1369,8 +1390,6 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
         vl.addWidget(self._totals)
 
         self._table = _make_table([c[0] for c in self._columns])
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table,
@@ -1379,9 +1398,7 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
             default_asc=False,
             on_sort_changed=self._on_sort_changed,
         )
-        bind_column_width_persistence(
-            self._table, f"fuel_{self._feed_type}_all", auto_fit_if_unset=True,
-        )
+        _bind_fuel_columns(self._table, f"fuel_{self._feed_type}_all")
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -1565,7 +1582,7 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
 
 def _browse_headers(currency: str | None) -> List[str]:
     total_hdr = f"TOTAL ({currency})" if currency else "TOTAL"
-    return ["UPLOAD DATE", "SHEET", "FILE NAME", "RECORDS", "LTRS", total_hdr]
+    return ["UPLOAD DATE", "SHEET", "UPLOAD DESCRIPTION", "RECORDS", "LTRS", total_hdr]
 
 
 class _DieselUploadBrowse(QWidget):
@@ -1744,8 +1761,6 @@ class _DieselUploadDetail(_DieselExportMixin, QWidget):
         vl.addWidget(tb)
 
         self._table = _make_table([c[0] for c in self._columns])
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._sort_state = wire_feed_table_sort(
             self._table,
@@ -1754,9 +1769,7 @@ class _DieselUploadDetail(_DieselExportMixin, QWidget):
             default_asc=False,
             on_sort_changed=self._on_sort_changed,
         )
-        bind_column_width_persistence(
-            self._table, f"fuel_{self._feed_type}_upload", auto_fit_if_unset=True,
-        )
+        _bind_fuel_columns(self._table, f"fuel_{self._feed_type}_upload")
         vl.addWidget(self._table, 1)
 
         totals_defs = [("ltrs", "Ltrs: ")]

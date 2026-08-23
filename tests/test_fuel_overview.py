@@ -34,12 +34,67 @@ def test_normalize_fuel_sources() -> None:
 def test_filter_fuel_rows_by_station() -> None:
     rows = [
         {"source_group": "diesel_cash", "date": datetime(2026, 1, 2), "description": "cash"},
-        {"source_group": "infinity", "date": datetime(2026, 1, 1), "description": "inf"},
-        {"source_group": "lake_zambia", "date": datetime(2026, 1, 3), "description": "zam"},
+        {"source_group": "infinity", "date": datetime(2026, 1, 1), "description": "inf", "source": "Infinity Diesel"},
+        {"source_group": "lake_zambia", "date": datetime(2026, 1, 3), "description": "zam", "source": "Lake Zambia Diesel"},
         {"source_group": "master", "date": datetime(2026, 1, 4), "description": "exp"},
     ]
     filtered = _filter_fuel_overview_rows(rows, source=["infinity", "lake_zambia"])
     assert [r["description"] for r in filtered] == ["inf", "zam"]
+
+
+def test_fuel_overview_column_filter_and_sort() -> None:
+    from tahmeed.services.accountant_service import (
+        _apply_overview_column_filters,
+        _finalize_fuel_overview_rows,
+        overview_row_display,
+    )
+
+    rows = [
+        {
+            "date": datetime(2026, 1, 10),
+            "source": "Infinity Diesel",
+            "description": "DAR",
+            "reference": "001",
+            "truck_value": "T102",
+            "currency": "TZS",
+            "amount": 1000,
+            "liters": 50,
+            "rate": 20,
+            "station": "INFINITY",
+            "upload_description": "Batch A",
+            "receipt_status": "received",
+        },
+        {
+            "date": datetime(2026, 2, 5),
+            "source": "Lake Zambia Diesel",
+            "description": "NDOLA",
+            "reference": "002",
+            "truck_value": "T102",
+            "currency": "USD",
+            "amount": 25.5,
+            "liters": 10,
+            "rate": 2.55,
+            "station": "LAKE NDOLA",
+            "upload_description": "Batch B",
+            "receipt_status": "pending",
+        },
+    ]
+    filtered = _apply_overview_column_filters(
+        rows,
+        {"source": ["Infinity Diesel"]},
+    )
+    assert len(filtered) == 1
+    assert filtered[0]["description"] == "DAR"
+
+    sorted_rows = _finalize_fuel_overview_rows(
+        rows,
+        sort_field="date",
+        sort_asc=False,
+    )
+    assert overview_row_display(sorted_rows[0], "source") == "Lake Zambia Diesel"
+
+    upload_vals = {overview_row_display(r, "upload_description") for r in rows}
+    assert upload_vals == {"Batch A", "Batch B"}
 
 
 def test_filter_fuel_rows_all_keeps_only_loaded_groups() -> None:
@@ -81,6 +136,13 @@ def test_summarize_fuel_rows_splits_currency_and_liters() -> None:
     assert summary["liters_total"] == 50.0
 
 
+def test_diesel_display_label_prefers_upload_description() -> None:
+    from tahmeed.services.accountant_service import diesel_display_label
+
+    assert diesel_display_label({"upload_label": "March batch", "source_filename": "fuel.xlsx"}) == "March batch"
+    assert diesel_display_label({"source_filename": "fuel.xlsx"}) == "fuel.xlsx"
+
+
 def test_fuel_overview_sidebar_is_first_in_fuel_section() -> None:
     from tahmeed.ui.accountant.sidebar import _SECTIONS
 
@@ -103,6 +165,7 @@ def test_fuel_overview_widget_defaults_and_sources() -> None:
 
     from tahmeed.app_state import app_state
     from tahmeed.ui.accountant.fuel_overview import FuelOverviewWidget, _FUEL_SOURCE_OPTIONS
+    from tahmeed.ui.accountant.truck_overview import _FUEL_OVERVIEW_COLS
 
     _app = QApplication.instance() or QApplication([])
     loop = asyncio.new_event_loop()
@@ -110,6 +173,9 @@ def test_fuel_overview_widget_defaults_and_sources() -> None:
     try:
         w = FuelOverviewWidget()
         assert w.PAGE_TITLE == "Fuel Overview"
+        assert w.USE_EXCEL_COLUMN_FILTERS is True
+        assert [c[0] for c in w.TABLE_COLS] == [c[0] for c in _FUEL_OVERVIEW_COLS]
+        assert "UPLOAD DESCRIPTION" in [c[0] for c in w.TABLE_COLS]
         assert w._year == app_state.fiscal_year
         assert w._month == 0
         assert w._year_cb.currentData() == app_state.fiscal_year
@@ -132,6 +198,8 @@ def test_fuel_overview_widget_defaults_and_sources() -> None:
         assert get_records.__name__ == "get_fuel_overview_records"
         assert count_records.__name__ == "count_fuel_overview_records"
         assert get_summary.__name__ == "get_fuel_overview_summary"
+        from tahmeed.ui.widgets.excel_column_filter import ExcelFilterHeaderView
+        assert isinstance(w._table.horizontalHeader(), ExcelFilterHeaderView)
     finally:
         pending = asyncio.all_tasks(loop)
         for task in pending:

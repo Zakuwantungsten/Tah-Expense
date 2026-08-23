@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from time import monotonic
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
 
 import qtawesome as qta
 
@@ -44,6 +44,11 @@ from tahmeed.ui.accountant.date_filters import (
     sync_from_to,
 )
 from tahmeed.ui.accountant.separate_expenses import _make_table, _cell, _finish_table_row
+from tahmeed.ui.widgets.excel_column_filter import (
+    ExcelFilterHeaderView,
+    SORT_ASC,
+    cascade_column_values,
+)
 
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -103,6 +108,23 @@ _COLS = [
     ("RECEIPT", 85, Qt.AlignCenter),
 ]
 _STRETCH_COLS = {2, 10}  # DESCRIPTION, STATION / OWNER
+_UPLOAD_DESCRIPTION_COL = ("UPLOAD DESCRIPTION", 160, Qt.AlignLeft)
+_FUEL_OVERVIEW_COLS = [
+    ("DATE", 82, Qt.AlignLeft),
+    ("SOURCE", 105, Qt.AlignLeft),
+    ("DESCRIPTION", 120, Qt.AlignLeft),
+    ("REFERENCE", 72, Qt.AlignLeft),
+    ("TRUCK FIELD", 78, Qt.AlignLeft),
+    ("TZS", 92, Qt.AlignRight),
+    ("USD", 82, Qt.AlignRight),
+    ("ZMW", 82, Qt.AlignRight),
+    ("LTRS", 52, Qt.AlignRight),
+    ("RATE", 62, Qt.AlignRight),
+    ("STATION / OWNER", 100, Qt.AlignLeft),
+    _UPLOAD_DESCRIPTION_COL,
+    ("RECEIPT", 72, Qt.AlignCenter),
+]
+_FUEL_OVERVIEW_STRETCH_COLS = {2, 10, 11}  # DESCRIPTION, STATION, UPLOAD DESCRIPTION
 _CTRL_H = 32
 
 
@@ -493,6 +515,51 @@ class _StatusFooter(QFrame):
         self._info.setText(text)
 
 
+def _overview_export_values(row: dict, cols: Sequence) -> list:
+    """Map an overview row to Excel cell values for the given column layout."""
+    tzs_amt, usd_amt, zmw_amt = _amount_columns(row.get("currency", ""), row.get("amount"))
+    date_value = row.get("date")
+    date_txt = (
+        date_value.strftime("%d/%m/%Y")
+        if hasattr(date_value, "strftime") and date_value.year > 1
+        else ""
+    )
+    receipt = (row.get("receipt_status") or "").strip().lower()
+    receipt_txt = receipt.title() if receipt else ""
+    values = []
+    for header, _, _align in cols:
+        if header == "DATE":
+            values.append(date_txt)
+        elif header == "SOURCE":
+            values.append(row.get("source", ""))
+        elif header == "DESCRIPTION":
+            values.append(row.get("description", ""))
+        elif header == "REFERENCE":
+            values.append(row.get("reference", ""))
+        elif header == "TRUCK FIELD":
+            values.append(row.get("truck_value", ""))
+        elif header == "TZS":
+            values.append(tzs_amt)
+        elif header == "USD":
+            values.append(usd_amt)
+        elif header == "ZMW":
+            values.append(zmw_amt)
+        elif header == "LTRS":
+            values.append(row.get("liters"))
+        elif header == "RATE":
+            values.append(row.get("rate"))
+        elif header == "STATION / OWNER":
+            values.append(row.get("station", ""))
+        elif header == "UPLOAD DESCRIPTION":
+            label = row.get("upload_description") or ""
+            values.append("" if label in ("", "—") else label)
+        elif header == "RECEIPT":
+            values.append(receipt_txt)
+        else:
+            values.append("")
+    return values
+
+
 def _write_truck_overview_excel(
     path: str,
     truck: str,
@@ -503,6 +570,7 @@ def _write_truck_overview_excel(
     *,
     sheet_title: str = "Truck Overview",
     banner_label: str = "TRUCK OVERVIEW",
+    cols: Sequence = _COLS,
 ) -> None:
     """Build and save the truck overview workbook (runs off the UI event loop)."""
     import openpyxl
@@ -514,7 +582,7 @@ def _write_truck_overview_excel(
 
     # Match results.xlsx style: green section banner, navy headers,
     # thin #CCCCCC borders, alternating #EEF2FF rows, Calibri.
-    n_cols = len(_COLS)
+    n_cols = len(cols)
     last_col = openpyxl.utils.get_column_letter(n_cols)
 
     title_fill = PatternFill("solid", fgColor="1F6B2E")
@@ -605,7 +673,7 @@ def _write_truck_overview_excel(
         elif isinstance(value, int):
             value_cell.number_format = '#,##0'
 
-    headers = [c[0] for c in _COLS]
+    headers = [c[0] for c in cols]
     table_row = 7
     for col, header in enumerate(headers, start=1):
         cell = ws.cell(table_row, col, header)
@@ -615,30 +683,23 @@ def _write_truck_overview_excel(
         cell.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[table_row].height = 18
 
+    header_index = {header: idx + 1 for idx, header in enumerate(headers)}
+    amount_cols = (
+        header_index.get("TZS"),
+        header_index.get("USD"),
+        header_index.get("ZMW"),
+        header_index.get("LTRS"),
+        header_index.get("RATE"),
+    )
+    wrap_cols = {
+        header_index[h]
+        for h in ("SOURCE", "DESCRIPTION", "REFERENCE", "STATION / OWNER", "UPLOAD DESCRIPTION")
+        if h in header_index
+    }
+    receipt_col = header_index.get("RECEIPT")
+
     for i, row in enumerate(rows, start=1):
-        date_value = row.get("date")
-        date_txt = (
-            date_value.strftime("%d/%m/%Y")
-            if hasattr(date_value, "strftime") and date_value.year > 1
-            else ""
-        )
-        receipt = (row.get("receipt_status") or "").strip().lower()
-        receipt_txt = receipt.title() if receipt else ""
-        tzs_amt, usd_amt, zmw_amt = _amount_columns(row.get("currency", ""), row.get("amount"))
-        values = [
-            date_txt,
-            row.get("source", ""),
-            row.get("description", ""),
-            row.get("reference", ""),
-            row.get("truck_value", ""),
-            tzs_amt,
-            usd_amt,
-            zmw_amt,
-            row.get("liters"),
-            row.get("rate"),
-            row.get("station", ""),
-            receipt_txt,
-        ]
+        values = _overview_export_values(row, cols)
         ws.append(values)
         excel_row = ws.max_row
         is_zmw = _normalize_currency(row.get("currency") or "") == "ZMW"
@@ -648,42 +709,69 @@ def _write_truck_overview_excel(
             cell.fill = fill
             cell.border = border
             cell.font = cell_font
-            cell.alignment = Alignment(vertical="center", wrap_text=col in (2, 3, 4, 11))
+            cell.alignment = Alignment(vertical="center", wrap_text=col in wrap_cols)
 
-        for col in (6, 7, 8, 9, 10):
+        for col in amount_cols:
+            if not col:
+                continue
             ws.cell(excel_row, col).font = amount_font
             ws.cell(excel_row, col).alignment = Alignment(horizontal="right", vertical="center")
-        ws.cell(excel_row, 6).number_format = '#,##0'
-        ws.cell(excel_row, 7).number_format = '#,##0.00'
-        ws.cell(excel_row, 8).number_format = '#,##0'
-        ws.cell(excel_row, 9).number_format = '#,##0.00'
-        ws.cell(excel_row, 10).number_format = '#,##0.00'
+        if header_index.get("TZS"):
+            ws.cell(excel_row, header_index["TZS"]).number_format = '#,##0'
+        if header_index.get("USD"):
+            ws.cell(excel_row, header_index["USD"]).number_format = '#,##0.00'
+        if header_index.get("ZMW"):
+            ws.cell(excel_row, header_index["ZMW"]).number_format = '#,##0'
+        if header_index.get("LTRS"):
+            ws.cell(excel_row, header_index["LTRS"]).number_format = '#,##0.00'
+        if header_index.get("RATE"):
+            ws.cell(excel_row, header_index["RATE"]).number_format = '#,##0.00'
 
         amount = row.get("amount")
         cur = _normalize_currency(row.get("currency") or "")
         if isinstance(amount, (int, float)):
-            amount_col = {"TZS": 6, "USD": 7, "ZMW": 8}.get(cur)
+            amount_col = {
+                "TZS": header_index.get("TZS"),
+                "USD": header_index.get("USD"),
+                "ZMW": header_index.get("ZMW"),
+            }.get(cur)
             if amount_col:
                 if amount < 0:
                     ws.cell(excel_row, amount_col).font = red_font
                 elif cur == "USD":
                     ws.cell(excel_row, amount_col).font = green_font
 
-        receipt_cell = ws.cell(excel_row, 12)
-        receipt_cell.alignment = Alignment(horizontal="center", vertical="center")
-        if receipt == "received":
-            receipt_cell.fill = receipt_ok_fill
-            receipt_cell.font = receipt_ok_font
-        elif receipt == "pending":
-            receipt_cell.fill = receipt_pending_fill
-            receipt_cell.font = receipt_pending_font
-        elif receipt == "missing":
-            receipt_cell.fill = receipt_missing_fill
-            receipt_cell.font = receipt_missing_font
+        if receipt_col:
+            receipt = (row.get("receipt_status") or "").strip().lower()
+            receipt_cell = ws.cell(excel_row, receipt_col)
+            receipt_cell.alignment = Alignment(horizontal="center", vertical="center")
+            if receipt == "received":
+                receipt_cell.fill = receipt_ok_fill
+                receipt_cell.font = receipt_ok_font
+            elif receipt == "pending":
+                receipt_cell.fill = receipt_pending_fill
+                receipt_cell.font = receipt_pending_font
+            elif receipt == "missing":
+                receipt_cell.fill = receipt_missing_fill
+                receipt_cell.font = receipt_missing_font
 
-    widths = [12, 18, 36, 22, 14, 14, 12, 12, 10, 10, 20, 12]
-    for idx, width in enumerate(widths, 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(idx)].width = width
+    default_widths = {
+        "DATE": 12,
+        "SOURCE": 18,
+        "DESCRIPTION": 36,
+        "REFERENCE": 22,
+        "TRUCK FIELD": 14,
+        "TZS": 14,
+        "USD": 12,
+        "ZMW": 12,
+        "LTRS": 10,
+        "RATE": 10,
+        "STATION / OWNER": 20,
+        "UPLOAD DESCRIPTION": 24,
+        "RECEIPT": 12,
+    }
+    for idx, header in enumerate(headers, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(idx)].width = default_widths.get(header, 14)
     ws.freeze_panes = f"A{table_row + 1}"
     ws.auto_filter.ref = f"A{table_row}:{last_col}{ws.max_row}"
     wb.save(path)
@@ -694,6 +782,8 @@ class TruckOverviewWidget(QWidget):
     PAGE_ICON = "mdi.truck-fast-outline"
     PAGE_OBJECT_NAME = "truckOverview"
     SOURCE_OPTIONS = _SOURCE_OPTIONS
+    TABLE_COLS = _COLS
+    TABLE_STRETCH_COLS = _STRETCH_COLS
     SUBTITLE_EMPTY = "Select a truck to gather cross-source expenses and fuel."
     LOADING_OVERLAY_TEXT = "Loading truck overview…"
     STATUS_EMPTY = "No truck selected yet."
@@ -709,6 +799,9 @@ class TruckOverviewWidget(QWidget):
     EXCEL_BANNER = "TRUCK OVERVIEW"
     PDF_EYEBROW = "FLEET EXPENSE REPORT"
     PDF_SUBTITLE = "Consolidated expense record across all logged sources"
+    USE_EXCEL_COLUMN_FILTERS = False
+    DEFAULT_SORT_FIELD = "date"
+    DEFAULT_SORT_ASC = True
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -721,6 +814,10 @@ class TruckOverviewWidget(QWidget):
         self._fleet_numbers: List[str] = []
         self._year = app_state.fiscal_year
         self._month = 0
+        self._sort_field = self.DEFAULT_SORT_FIELD
+        self._sort_asc = self.DEFAULT_SORT_ASC
+        self._col_filters: Dict[int, Set[str]] = {}
+        self._col_value_cache: Dict[int, Set[str]] = {}
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -789,19 +886,21 @@ class TruckOverviewWidget(QWidget):
         status_row.addWidget(self._currency_toggle, 0, Qt.AlignRight | Qt.AlignVCenter)
         root.addLayout(status_row)
 
-        self._table = _make_table([c[0] for c in _COLS])
+        self._table = _make_table([c[0] for c in self.TABLE_COLS])
         self._table.setShowGrid(True)
         self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
         hdr = self._table.horizontalHeader()
         hdr.setSectionsMovable(False)
         hdr.setStretchLastSection(False)
-        for idx, (_, width, _align) in enumerate(_COLS):
+        for idx, (_, width, _align) in enumerate(self.TABLE_COLS):
             self._table.setColumnWidth(idx, width)
-            if idx in _STRETCH_COLS:
+            if idx in self.TABLE_STRETCH_COLS:
                 hdr.setSectionResizeMode(idx, QHeaderView.Stretch)
             else:
                 hdr.setSectionResizeMode(idx, QHeaderView.Interactive)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        if type(self).USE_EXCEL_COLUMN_FILTERS:
+            self._attach_excel_column_filters()
         root.addWidget(self._table, 1)
 
         self._footer = _StatusFooter()
@@ -1009,15 +1108,165 @@ class TruckOverviewWidget(QWidget):
             QMessageBox.warning(self, "Invalid Date Range", "'From' date cannot be later than 'To' date.")
         return valid
 
+    def _column_filter_specs(self) -> List[tuple[str, Optional[str], str]]:
+        """Return (header label, sort/filter field, kind) per table column."""
+        return []
+
+    def _attach_excel_column_filters(self) -> None:
+        specs = self._column_filter_specs()
+        filterable: Set[int] = set()
+        sort_kinds: Dict[int, str] = {}
+        for idx, (_label, field, kind) in enumerate(specs):
+            if field:
+                filterable.add(idx)
+                sort_kinds[idx] = kind
+
+        filter_hdr = ExcelFilterHeaderView(
+            self._table,
+            filterable_columns=filterable,
+            sort_kinds=sort_kinds,
+        )
+        filter_hdr.set_value_provider(self._filter_menu_values)
+        filter_hdr.set_label_provider(
+            lambda c: specs[c][0] if 0 <= c < len(specs) else "",
+        )
+        filter_hdr.filter_changed.connect(self._on_col_filter_changed)
+        filter_hdr.sort_requested.connect(self._on_excel_sort)
+        self._table.setHorizontalHeader(filter_hdr)
+
+        hdr = self._table.horizontalHeader()
+        hdr.setSortIndicatorShown(True)
+        hdr.sectionClicked.connect(self._on_header_click)
+        self._update_sort_indicator()
+
+    def _field_for_col(self, col: int) -> Optional[str]:
+        specs = self._column_filter_specs()
+        if 0 <= col < len(specs):
+            return specs[col][1]
+        return None
+
+    def _column_filters_for_query(self) -> Optional[Dict[str, List[str]]]:
+        out: Dict[str, List[str]] = {}
+        for col, accepted in self._col_filters.items():
+            field = self._field_for_col(col)
+            if not field or not accepted:
+                continue
+            vals = sorted(v for v in accepted if v)
+            if vals:
+                out[field] = vals
+        return out or None
+
+    def _filter_menu_values(self, col: int) -> set:
+        if col in self._col_value_cache:
+            return set(self._col_value_cache.get(col) or set())
+        rows: List[dict] = []
+        for r in range(self._table.rowCount()):
+            row: dict = {}
+            field = self._field_for_col(col)
+            if not field:
+                continue
+            item = self._table.item(r, col)
+            txt = (item.text() if item else "").strip()
+            if txt:
+                row[col] = txt
+            if row:
+                rows.append(row)
+        return cascade_column_values(
+            rows,
+            target_col=col,
+            active_filters=self._col_filters,
+        )
+
+    def _clear_column_filters(self) -> None:
+        self._col_filters.clear()
+        self._col_value_cache.clear()
+        hdr = self._table.horizontalHeader()
+        if isinstance(hdr, ExcelFilterHeaderView):
+            hdr.clear_filters()
+        self._sort_field = self.DEFAULT_SORT_FIELD
+        self._sort_asc = self.DEFAULT_SORT_ASC
+        self._update_sort_indicator()
+
+    def _on_col_filter_changed(self, col: int, accepted) -> None:
+        accepted = set(accepted or [])
+        if accepted:
+            self._col_filters[col] = accepted
+        else:
+            self._col_filters.pop(col, None)
+        hdr = self._table.horizontalHeader()
+        if isinstance(hdr, ExcelFilterHeaderView):
+            hdr.sync_active(self._col_filters)
+        self._reset_and_load()
+
+    def _on_header_click(self, col: int) -> None:
+        field = self._field_for_col(col)
+        if not field:
+            return
+        if self._sort_field == field:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_field = field
+            self._sort_asc = False
+        self._update_sort_indicator()
+        self._reset_and_load()
+
+    def _on_excel_sort(self, col: int, mode: str) -> None:
+        field = self._field_for_col(col)
+        if not field:
+            return
+        self._sort_field = field
+        self._sort_asc = mode == SORT_ASC
+        self._update_sort_indicator()
+        self._reset_and_load()
+
+    def _update_sort_indicator(self) -> None:
+        if not type(self).USE_EXCEL_COLUMN_FILTERS:
+            return
+        order = Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
+        hdr = self._table.horizontalHeader()
+        for idx, (_label, field, _kind) in enumerate(self._column_filter_specs()):
+            if field == self._sort_field:
+                hdr.setSortIndicator(idx, order)
+                return
+
+    async def _refresh_column_filter_cache(self) -> None:
+        if not type(self).USE_EXCEL_COLUMN_FILTERS:
+            return
+        from tahmeed.services.accountant_service import get_fuel_overview_column_filter_cache
+
+        kw = self._filter_kw()
+        by_field = await get_fuel_overview_column_filter_cache(
+            truck=kw["truck"],
+            source=kw["source"],
+            date_from=kw["date_from"],
+            date_to=kw["date_to"],
+            currency=kw["currency"],
+            column_filters=self._column_filters_for_query(),
+        )
+        self._col_value_cache = {}
+        for idx, (_label, field, _kind) in enumerate(self._column_filter_specs()):
+            if field:
+                self._col_value_cache[idx] = set(by_field.get(field) or set())
+        hdr = self._table.horizontalHeader()
+        if isinstance(hdr, ExcelFilterHeaderView):
+            hdr.sync_active(self._col_filters)
+
     def _filter_kw(self) -> dict:
         date_from, date_to = self._date_filters()
-        return dict(
+        kw = dict(
             truck=self._active_truck or self._selected_truck(),
             source=self._source_filter_param(),
             date_from=date_from,
             date_to=date_to,
             currency=self._currency_toggle.filter_value(),
         )
+        if type(self).USE_EXCEL_COLUMN_FILTERS:
+            col_filters = self._column_filters_for_query()
+            if col_filters:
+                kw["column_filters"] = col_filters
+            kw["sort_field"] = self._sort_field
+            kw["sort_asc"] = self._sort_asc
+        return kw
 
     def _on_currency_changed(self, _currency: str) -> None:
         if not self._active_truck:
@@ -1042,9 +1291,12 @@ class TruckOverviewWidget(QWidget):
     def _status_loaded_text(self, truck: str, total: int) -> str:
         currency = self._currency_toggle.filter_value()
         noun = self.ROW_NOUN if total == 1 else f"{self.ROW_NOUN}s"
+        suffix = ""
+        if type(self).USE_EXCEL_COLUMN_FILTERS and self._column_filters_for_query():
+            suffix = "  ·  column filters applied"
         if currency:
-            return f"Loaded {total:,} {currency} {noun} for {truck}."
-        return f"Loaded {total:,} {noun} for {truck}.{self.STATUS_HINT}"
+            return f"Loaded {total:,} {currency} {noun} for {truck}.{suffix}"
+        return f"Loaded {total:,} {noun} for {truck}.{self.STATUS_HINT}{suffix}"
 
     def _update_footer(self) -> None:
         if not self._active_truck:
@@ -1158,6 +1410,8 @@ class TruckOverviewWidget(QWidget):
             self._fill_table(records, append=False)
             self._loaded = len(records)
             self._status.setText(self._status_loaded_text(truck, total))
+            if type(self).USE_EXCEL_COLUMN_FILTERS:
+                await self._refresh_column_filter_cache()
         except Exception as exc:
             if generation == self._reload_generation:
                 self._table.setRowCount(0)
@@ -1194,6 +1448,67 @@ class TruckOverviewWidget(QWidget):
             self._scroll_loading = False
             self._update_footer()
 
+    def _overview_cell(
+        self,
+        header: str,
+        row: dict,
+        *,
+        tzs_amt,
+        usd_amt,
+        zmw_amt,
+        amount_color: str,
+        source_color: str,
+        receipt: str,
+        receipt_color: str,
+    ) -> tuple[str, str, Optional[int]]:
+        """Return (text, color, optional alignment override) for one table column."""
+        date_value = row.get("date")
+        if header == "DATE":
+            text = (
+                date_value.strftime("%d %b %Y")
+                if hasattr(date_value, "strftime") and date_value.year > 1
+                else "—"
+            )
+            return text, _T1, None
+        if header == "SOURCE":
+            return row.get("source", "—"), source_color, None
+        if header == "DESCRIPTION":
+            return row.get("description", "—"), _T1, None
+        if header == "REFERENCE":
+            return row.get("reference", "—"), _T1, None
+        if header == "TRUCK FIELD":
+            return row.get("truck_value", "—"), _T1, None
+        if header == "TZS":
+            return (
+                _fmt_currency_cell("TZS", tzs_amt),
+                amount_color if tzs_amt is not None else _TM,
+                Qt.AlignRight | Qt.AlignVCenter,
+            )
+        if header == "USD":
+            return (
+                _fmt_currency_cell("USD", usd_amt),
+                (_GREEN if isinstance(usd_amt, float) and usd_amt >= 0 else amount_color)
+                if usd_amt is not None else _TM,
+                Qt.AlignRight | Qt.AlignVCenter,
+            )
+        if header == "ZMW":
+            return (
+                _fmt_currency_cell("ZMW", zmw_amt),
+                amount_color if zmw_amt is not None else _TM,
+                Qt.AlignRight | Qt.AlignVCenter,
+            )
+        if header == "LTRS":
+            return _fmt_num(row.get("liters"), 0), _T1, Qt.AlignRight | Qt.AlignVCenter
+        if header == "RATE":
+            return _fmt_num(row.get("rate"), 2), _T1, Qt.AlignRight | Qt.AlignVCenter
+        if header == "STATION / OWNER":
+            return row.get("station", "—"), _T1, None
+        if header == "UPLOAD DESCRIPTION":
+            return row.get("upload_description", "—"), _T2, None
+        if header == "RECEIPT":
+            return receipt, receipt_color, Qt.AlignCenter | Qt.AlignVCenter
+        return "—", _T1, None
+
     def _fill_table(self, rows: list, *, append: bool = False) -> None:
         if not append:
             self._table.setRowCount(0)
@@ -1213,50 +1528,23 @@ class TruckOverviewWidget(QWidget):
                 _TM
             )
 
-            date_value = row.get("date")
-            date_txt = date_value.strftime("%d %b %Y") if hasattr(date_value, "strftime") and date_value.year > 1 else "—"
-            self._table.setItem(r, 0, _cell(date_txt))
-            self._table.setItem(r, 1, _cell(row.get("source", "—"), color=source_color))
-            self._table.setItem(r, 2, _cell(row.get("description", "—")))
-            self._table.setItem(r, 3, _cell(row.get("reference", "—")))
-            self._table.setItem(r, 4, _cell(row.get("truck_value", "—")))
-            # Amounts use the same Segoe UI table font as Verify / Master / Fuel
-            # (no Cascadia mono) so TZS / USD / ZMW match other accountant tabs.
-            self._table.setItem(
-                r, 5,
-                _cell(
-                    _fmt_currency_cell("TZS", tzs_amt),
-                    align=Qt.AlignRight | Qt.AlignVCenter,
-                    color=amount_color if tzs_amt is not None else _TM,
-                ),
-            )
-            self._table.setItem(
-                r, 6,
-                _cell(
-                    _fmt_currency_cell("USD", usd_amt),
-                    align=Qt.AlignRight | Qt.AlignVCenter,
-                    color=(_GREEN if isinstance(usd_amt, float) and usd_amt >= 0 else amount_color)
-                    if usd_amt is not None else _TM,
-                ),
-            )
-            self._table.setItem(
-                r, 7,
-                _cell(
-                    _fmt_currency_cell("ZMW", zmw_amt),
-                    align=Qt.AlignRight | Qt.AlignVCenter,
-                    color=amount_color if zmw_amt is not None else _TM,
-                ),
-            )
-            self._table.setItem(
-                r, 8,
-                _cell(_fmt_num(row.get("liters"), 0), align=Qt.AlignRight | Qt.AlignVCenter)
-            )
-            self._table.setItem(
-                r, 9,
-                _cell(_fmt_num(row.get("rate"), 2), align=Qt.AlignRight | Qt.AlignVCenter)
-            )
-            self._table.setItem(r, 10, _cell(row.get("station", "—")))
-            self._table.setItem(r, 11, _cell(receipt, align=Qt.AlignCenter | Qt.AlignVCenter, color=receipt_color))
+            for col_idx, (header, _width, align) in enumerate(self.TABLE_COLS):
+                text, color, align_override = self._overview_cell(
+                    header,
+                    row,
+                    tzs_amt=tzs_amt,
+                    usd_amt=usd_amt,
+                    zmw_amt=zmw_amt,
+                    amount_color=amount_color,
+                    source_color=source_color,
+                    receipt=receipt,
+                    receipt_color=receipt_color,
+                )
+                self._table.setItem(
+                    r,
+                    col_idx,
+                    _cell(text, align=align_override or align, color=color),
+                )
             _finish_table_row(self._table, r)
 
             # Slightly tint ZMW rows so Zambia-related entries stand out.
@@ -1313,7 +1601,11 @@ class TruckOverviewWidget(QWidget):
             )
             return
         if not rows:
-            QMessageBox.information(self, "Export", "No records match the current truck and filters.")
+            QMessageBox.information(
+                self,
+                "Export",
+                "No records match the current truck, toolbar, and column filters.",
+            )
             return
 
         source_tag = self._source_filter_tag()
@@ -1342,6 +1634,7 @@ class TruckOverviewWidget(QWidget):
                 summary,
                 sheet_title=self.EXCEL_SHEET_TITLE,
                 banner_label=self.EXCEL_BANNER,
+                cols=self.TABLE_COLS,
             )
         except Exception as exc:
             write_error = exc
@@ -1374,7 +1667,7 @@ class TruckOverviewWidget(QWidget):
         prepare_error = None
         try:
             kw = self._filter_kw()
-            rows = await get_records(**kw, limit=5000, skip=0)
+            rows = await get_records(**kw, limit=100000, skip=0)
             summary = await get_summary(**kw)
         except Exception as exc:
             prepare_error = exc
@@ -1387,7 +1680,11 @@ class TruckOverviewWidget(QWidget):
             )
             return
         if not rows:
-            QMessageBox.information(self, "Export", "No records match the current truck and filters.")
+            QMessageBox.information(
+                self,
+                "Export",
+                "No records match the current truck, toolbar, and column filters.",
+            )
             return
 
         currency = self._currency_toggle.filter_value() or "ALL"
@@ -1499,6 +1796,8 @@ class TruckOverviewWidget(QWidget):
         sync_from_to(
             self._from_date, self._to_date, self._year, self._month, optional=True,
         )
+        if type(self).USE_EXCEL_COLUMN_FILTERS:
+            self._clear_column_filters()
         self._subtitle.setText(self.SUBTITLE_EMPTY)
         self._status.setText(self.STATUS_EMPTY)
         self._table.setRowCount(0)

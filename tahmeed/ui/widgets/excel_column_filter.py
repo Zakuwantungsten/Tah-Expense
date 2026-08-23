@@ -15,6 +15,20 @@ from PySide6.QtWidgets import (
 SORT_ASC = "asc"
 SORT_DESC = "desc"
 
+# Pixels reserved at the section's right edge for QHeaderView resize drag.
+_FILTER_RESIZE_MARGIN = 6
+# Clickable ▾ zone width (must match paintSection chevron placement).
+_CHEVRON_ZONE_WIDTH = 16
+
+
+def chevron_hit_contains(section_x: int, section_width: int, click_x: int) -> bool:
+    """True when *click_x* is on the ▾ affordance, not the resize handle."""
+    if section_width < 28:
+        return False
+    left = section_x + section_width - _CHEVRON_ZONE_WIDTH - _FILTER_RESIZE_MARGIN
+    right = section_x + section_width - _FILTER_RESIZE_MARGIN
+    return left <= click_x < right
+
 
 def cascade_column_values(
     rows: list,
@@ -342,15 +356,14 @@ class ExcelFilterHeaderView(QHeaderView):
         painter.restore()
 
     def mousePressEvent(self, event):
-        col = self.logicalIndexAt(event.pos())
-        if col in self._filterable:
-            x = event.pos().x()
-            col_x = self.sectionViewportPosition(col)
-            col_w = self.sectionSize(col)
-            # Chevron hit zone (right ~20px) — Excel filter affordance.
-            if x >= col_x + col_w - 20:
-                self._open_menu(col, event.globalPosition().toPoint())
-                return
+        if event.button() == Qt.LeftButton:
+            col = self.logicalIndexAt(event.pos())
+            if col in self._filterable:
+                col_x = self.sectionViewportPosition(col)
+                col_w = self.sectionSize(col)
+                if chevron_hit_contains(col_x, col_w, event.pos().x()):
+                    self._open_menu(col, event.globalPosition().toPoint())
+                    return
         super().mousePressEvent(event)
 
     def _open_menu(self, col: int, global_pos) -> None:

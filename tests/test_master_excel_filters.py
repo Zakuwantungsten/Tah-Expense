@@ -14,6 +14,7 @@ from tahmeed.ui.accountant.master_expenses import _amount_cells, _COLS, _COL_TZS
 from tahmeed.ui.widgets.excel_column_filter import (
     ExcelColumnFilterPopup,
     SORT_ASC,
+    chevron_hit_contains,
 )
 
 
@@ -63,6 +64,15 @@ def test_amount_cells_dual_tzs_and_usd() -> None:
         amount_usd=25.5,
     )
     assert _amount_cells(dual) == ("10,000", "25.50")
+
+
+def test_chevron_hit_zone_leaves_resize_handle() -> None:
+    """▾ clicks must not swallow the section resize drag at the right edge."""
+    section_x, width = 50, 100
+    right = section_x + width
+    assert chevron_hit_contains(section_x, width, right - 5) is False
+    assert chevron_hit_contains(section_x, width, right - 10) is True
+    assert chevron_hit_contains(section_x, width, section_x + 20) is False
 
 
 def test_excel_popup_sort_a_to_z_emits_asc() -> None:

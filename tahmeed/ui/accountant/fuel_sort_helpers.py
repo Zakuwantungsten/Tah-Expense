@@ -25,5 +25,5 @@ def diesel_columns_sort(columns: List[Tuple[str, str, str]]) -> List[ColumnSpec]
             continue
         sort_kind = "truck" if key in _TRUCK_KEYS else _KIND_MAP.get(kind, "text")
         specs.append((label, key, sort_kind))
-    specs.append(("FILE NAME", "upload_label", "text"))
+    specs.append(("UPLOAD DESCRIPTION", "upload_label", "text"))
     return specs
