@@ -57,7 +57,8 @@ class ExcelColumnFilterPopup(QFrame):
         parent=None,
         *,
         column_label: str = "Column",
-        sort_kind: str = "text",  # "text" | "number" | "date"
+        sort_kind: str = "text",  # "text" | "number" | "date" | "truck"
+        sort_only: bool = False,
     ):
         super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
         self.setObjectName("excelColFilterPopup")
@@ -73,6 +74,7 @@ class ExcelColumnFilterPopup(QFrame):
         self._current = set(current or [])
         self._column_label = column_label
         self._sort_kind = sort_kind
+        self._sort_only = bool(sort_only)
         self._build()
 
     def _build(self) -> None:
@@ -90,6 +92,8 @@ class ExcelColumnFilterPopup(QFrame):
             asc_lbl, desc_lbl = "Sort Smallest → Largest", "Sort Largest → Smallest"
         elif self._sort_kind == "date":
             asc_lbl, desc_lbl = "Sort Oldest → Newest", "Sort Newest → Oldest"
+        elif self._sort_kind == "truck":
+            asc_lbl, desc_lbl = "Sort Smallest No. → Largest", "Sort Largest No. → Smallest"
         else:
             asc_lbl, desc_lbl = "Sort A → Z", "Sort Z → A"
 
@@ -103,81 +107,86 @@ class ExcelColumnFilterPopup(QFrame):
         sort_desc.clicked.connect(lambda: self._emit_sort(SORT_DESC))
         root.addWidget(sort_desc)
 
-        clear_filter = QPushButton("  Clear Filter from Column")
-        clear_filter.setCursor(Qt.PointingHandCursor)
-        clear_filter.setEnabled(bool(self._current))
-        clear_filter.setStyleSheet(
-            "QPushButton{background:transparent;border:none;text-align:left;"
-            " padding:5px 8px;font-size:12px;color:#DC2626;border-radius:4px;}"
-            "QPushButton:hover{background:#FEF2F2;}"
-            "QPushButton:disabled{color:#D1D5DB;}"
-        )
-        clear_filter.clicked.connect(self._on_clear_filter)
-        root.addWidget(clear_filter)
+        if not self._sort_only:
+            clear_filter = QPushButton("  Clear Filter from Column")
+            clear_filter.setCursor(Qt.PointingHandCursor)
+            clear_filter.setEnabled(bool(self._current))
+            clear_filter.setStyleSheet(
+                "QPushButton{background:transparent;border:none;text-align:left;"
+                " padding:5px 8px;font-size:12px;color:#DC2626;border-radius:4px;}"
+                "QPushButton:hover{background:#FEF2F2;}"
+                "QPushButton:disabled{color:#D1D5DB;}"
+            )
+            clear_filter.clicked.connect(self._on_clear_filter)
+            root.addWidget(clear_filter)
 
-        sep = QFrame()
-        sep.setFixedHeight(1)
-        sep.setStyleSheet("background:#E5E7EB;border:none;")
-        root.addWidget(sep)
+            sep = QFrame()
+            sep.setFixedHeight(1)
+            sep.setStyleSheet("background:#E5E7EB;border:none;")
+            root.addWidget(sep)
 
-        hint = QLabel(f"{len(self._all_values)} value(s) in this table")
-        hint.setStyleSheet("font-size:10px;color:#6B7280;padding:2px 4px;")
-        root.addWidget(hint)
+            hint = QLabel(f"{len(self._all_values)} value(s) in this table")
+            hint.setStyleSheet("font-size:10px;color:#6B7280;padding:2px 4px;")
+            root.addWidget(hint)
 
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("Search…")
-        self._search.setClearButtonEnabled(True)
-        self._search.setStyleSheet(
-            "QLineEdit{border:1px solid #D1D5DB;border-radius:4px;"
-            "padding:4px 8px;font-size:12px;color:#111827;background:#fff;}"
-        )
-        self._search.textChanged.connect(self._refilter)
-        root.addWidget(self._search)
+            self._search = QLineEdit()
+            self._search.setPlaceholderText("Search…")
+            self._search.setClearButtonEnabled(True)
+            self._search.setStyleSheet(
+                "QLineEdit{border:1px solid #D1D5DB;border-radius:4px;"
+                "padding:4px 8px;font-size:12px;color:#111827;background:#fff;}"
+            )
+            self._search.textChanged.connect(self._refilter)
+            root.addWidget(self._search)
 
-        self._select_all = QCheckBox("Select All")
-        self._select_all.setTristate(True)
-        self._select_all.setStyleSheet(
-            "QCheckBox{font-size:12px;color:#111827;padding:2px 4px;}"
-        )
-        self._select_all.stateChanged.connect(self._on_select_all)
-        root.addWidget(self._select_all)
+            self._select_all = QCheckBox("Select All")
+            self._select_all.setTristate(True)
+            self._select_all.setStyleSheet(
+                "QCheckBox{font-size:12px;color:#111827;padding:2px 4px;}"
+            )
+            self._select_all.stateChanged.connect(self._on_select_all)
+            root.addWidget(self._select_all)
 
-        self._list = QListWidget()
-        self._list.setMinimumWidth(240)
-        self._list.setMaximumHeight(240)
-        self._list.setStyleSheet(
-            "QListWidget{border:1px solid #E5E7EB;border-radius:4px;font-size:12px;"
-            " color:#111827;background:#fff;}"
-            "QListWidget::item{padding:3px 6px;}"
-        )
-        self._list.itemChanged.connect(self._sync_select_all_state)
-        root.addWidget(self._list, 1)
+            self._list = QListWidget()
+            self._list.setMinimumWidth(240)
+            self._list.setMaximumHeight(240)
+            self._list.setStyleSheet(
+                "QListWidget{border:1px solid #E5E7EB;border-radius:4px;font-size:12px;"
+                " color:#111827;background:#fff;}"
+                "QListWidget::item{padding:3px 6px;}"
+            )
+            self._list.itemChanged.connect(self._sync_select_all_state)
+            root.addWidget(self._list, 1)
 
-        btns = QHBoxLayout()
-        btns.setSpacing(6)
-        clear_btn = QPushButton("Clear")
-        clear_btn.setCursor(Qt.PointingHandCursor)
-        clear_btn.setStyleSheet(
-            "QPushButton{background:#fff;color:#6B7280;border:1px solid #D1D5DB;"
-            " border-radius:4px;padding:5px 12px;font-size:12px;}"
-            "QPushButton:hover{background:#F3F4F6;}"
-        )
-        clear_btn.clicked.connect(self._on_uncheck_visible)
-        apply_btn = QPushButton("Apply")
-        apply_btn.setCursor(Qt.PointingHandCursor)
-        apply_btn.setStyleSheet(
-            "QPushButton{background:#0077C5;color:#fff;border:none;"
-            "border-radius:4px;padding:5px 14px;font-weight:600;font-size:12px;}"
-            "QPushButton:hover{background:#005EA3;}"
-        )
-        apply_btn.clicked.connect(self._on_apply)
-        btns.addWidget(clear_btn)
-        btns.addStretch()
-        btns.addWidget(apply_btn)
-        root.addLayout(btns)
+            btns = QHBoxLayout()
+            btns.setSpacing(6)
+            clear_btn = QPushButton("Clear")
+            clear_btn.setCursor(Qt.PointingHandCursor)
+            clear_btn.setStyleSheet(
+                "QPushButton{background:#fff;color:#6B7280;border:1px solid #D1D5DB;"
+                " border-radius:4px;padding:5px 12px;font-size:12px;}"
+                "QPushButton:hover{background:#F3F4F6;}"
+            )
+            clear_btn.clicked.connect(self._on_uncheck_visible)
+            apply_btn = QPushButton("Apply")
+            apply_btn.setCursor(Qt.PointingHandCursor)
+            apply_btn.setStyleSheet(
+                "QPushButton{background:#0077C5;color:#fff;border:none;"
+                "border-radius:4px;padding:5px 14px;font-weight:600;font-size:12px;}"
+                "QPushButton:hover{background:#005EA3;}"
+            )
+            apply_btn.clicked.connect(self._on_apply)
+            btns.addWidget(clear_btn)
+            btns.addStretch()
+            btns.addWidget(apply_btn)
+            root.addLayout(btns)
 
-        self._refilter("")
-        self._search.setFocus()
+            self._refilter("")
+            self._search.setFocus()
+        else:
+            self._search = None
+            self._select_all = None
+            self._list = None
 
     def _emit_sort(self, mode: str) -> None:
         self.sort_requested.emit(mode)
@@ -188,6 +197,8 @@ class ExcelColumnFilterPopup(QFrame):
         self.close()
 
     def _on_uncheck_visible(self) -> None:
+        if self._list is None:
+            return
         self._list.blockSignals(True)
         for i in range(self._list.count()):
             self._list.item(i).setCheckState(Qt.Unchecked)
@@ -222,6 +233,8 @@ class ExcelColumnFilterPopup(QFrame):
         self._select_all.blockSignals(False)
 
     def _refilter(self, text: str = "") -> None:
+        if self._sort_only or self._list is None:
+            return
         needle = (text or self._search.text() or "").strip().lower()
         self._list.blockSignals(True)
         self._list.clear()
@@ -238,6 +251,8 @@ class ExcelColumnFilterPopup(QFrame):
         self._sync_select_all_state()
 
     def _checked(self) -> set:
+        if self._list is None:
+            return set()
         # Preserve hidden (search-filtered-out) prior selections, sync visible.
         result = set(self._current) if self._current else set(self._all_values)
         for i in range(self._list.count()):
@@ -269,7 +284,8 @@ class ExcelFilterHeaderView(QHeaderView):
         parent=None,
         *,
         filterable_columns: Optional[Set[int]] = None,
-        sort_kinds: Optional[dict] = None,  # col -> "text"|"number"|"date"
+        sort_kinds: Optional[dict] = None,  # col -> "text"|"number"|"date"|"truck"
+        sort_only: bool = False,
     ):
         super().__init__(Qt.Horizontal, parent)
         self._active: dict = {}
@@ -277,6 +293,7 @@ class ExcelFilterHeaderView(QHeaderView):
         self._label_provider: Optional[Callable[[int], str]] = None
         self._filterable = set(filterable_columns or [])
         self._sort_kinds = dict(sort_kinds or {})
+        self._sort_only = bool(sort_only)
         self._popup = None
         self.setSectionsClickable(True)
         self.setHighlightSections(False)
@@ -337,9 +354,11 @@ class ExcelFilterHeaderView(QHeaderView):
         super().mousePressEvent(event)
 
     def _open_menu(self, col: int, global_pos) -> None:
-        if not callable(self._value_provider):
+        if not self._sort_only and not callable(self._value_provider):
             return
-        values = set(self._value_provider(col) or [])
+        values = set()
+        if callable(self._value_provider):
+            values = set(self._value_provider(col) or [])
         current = set(self._active.get(col, set()) or [])
         values |= current
         if not values and not current:
@@ -362,6 +381,7 @@ class ExcelFilterHeaderView(QHeaderView):
             parent=self,
             column_label=label,
             sort_kind=kind,
+            sort_only=self._sort_only,
         )
         self._popup = popup
 

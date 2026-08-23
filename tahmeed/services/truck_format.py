@@ -156,3 +156,55 @@ def merge_allowed_labels(*groups: Iterable[str]) -> Set[str]:
             if key:
                 out.add(key)
     return out
+
+
+def truck_sort_key(raw: str) -> str:
+    """Stable Mongo sort key for truck / reg / plate values.
+
+    Numbered plates sort by digit then suffix; place labels after plates;
+    empty values last.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "3|"
+
+    result = normalize_truck_number(text, allowed_labels=DEFAULT_PLACE_LABELS)
+    if result.status == "place_label":
+        return f"2|{normalize_place_label(result.value)}"
+    if result.status in ("ok", "normalized"):
+        m = _CANONICAL.match(result.value)
+        if m:
+            digits = int(m.group(1))
+            suffix = m.group(2)
+            return f"1|{digits:010d}|{suffix}"
+
+    collapsed = normalize_place_label(text)
+    if collapsed and is_place_label_candidate(collapsed):
+        return f"2|{collapsed}"
+    return f"2|{collapsed or text.upper()}"
+
+
+def truck_sort_key_for_doc(doc: dict, *field_names: str) -> str:
+    """Pick the first non-empty truck-like field from a Mongo document."""
+    for name in field_names:
+        val = doc.get(name)
+        if val is not None and str(val).strip():
+            return truck_sort_key(str(val))
+    return truck_sort_key("")
+
+
+_TRUCK_DOC_FIELDS = (
+    "truck_number",
+    "truck_no",
+    "vehicle_reg",
+    "vehicle_no",
+    "plate_num",
+    "truck_reg",
+    "reg_no",
+    "truck",
+)
+
+
+def stamp_truck_sort_key(doc: dict) -> None:
+    """Set ``truck_sort_key`` on a document from its truck-like fields (in place)."""
+    doc["truck_sort_key"] = truck_sort_key_for_doc(doc, *_TRUCK_DOC_FIELDS)

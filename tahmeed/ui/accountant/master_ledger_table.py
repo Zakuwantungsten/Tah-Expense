@@ -76,7 +76,7 @@ _EDITABLE_COLS: Set[int] = {
 _READONLY_COLS: Set[int] = {0, _COL_CASH}
 _UPPER_SKIP: Set[int] = {0, _COL_DATE, _COL_RCPT, _COL_TZS, _COL_USD, _COL_CASH}
 _FILTERABLE_COLS: Set[int] = set(range(len(_COLS))) - {0}
-_SORT_KINDS = {1: "date", _COL_TZS: "number", _COL_USD: "number"}
+_SORT_KINDS = {1: "date", _COL_TZS: "number", _COL_USD: "number", _COL_TRUCK: "truck"}
 # Excel ▾ col index → accountant_service column_filters key
 _COL_FIELD: Dict[int, str] = {
     _COL_DATE: "date",
@@ -490,6 +490,12 @@ class MasterLedgerTable(QFrame):
         if isinstance(hdr, ExcelFilterHeaderView):
             hdr.clear_filters()
         self._show_all_rows()
+
+    def reset_default_sort(self) -> None:
+        """Restore newest-first date sort (Clear filters)."""
+        self._sort_field = "date"
+        self._sort_asc = False
+        self._update_sort_indicator()
 
     def column_filters_for_query(self) -> Dict[str, List[str]]:
         """Map active Excel ▾ filters to accountant_service ``column_filters``."""

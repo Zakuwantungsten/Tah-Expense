@@ -18,6 +18,71 @@ from tahmeed.services.excel_dates import (
     normalize_date_fields,
     parse_excel_date,
 )
+from tahmeed.services.ledger_sort import ledger_sort_clauses
+from tahmeed.services.truck_format import stamp_truck_sort_key
+
+
+_MASTER_SORT_ALLOWED = frozenset({
+    "date", "description", "truck_number", "memo", "amount",
+    "category_name", "item", "approver", "ownership", "ref_float", "receipt_status",
+})
+
+_TOLL_SORT_ALLOWED = frozenset({
+    "transaction_date", "toll_date", "toll_plaza", "client_name", "card_no",
+    "vehicle_reg", "vehicle_class", "tender_amount", "receipt_no", "device",
+    "lane", "cashier_name", "import_date",
+})
+
+_PARKING_CONGO_SORT_ALLOWED = frozenset({
+    "transaction_date", "payment_date", "ledger_id", "transaction_type",
+    "amount", "running_balance", "cashier", "vehicle_no", "direction",
+    "gate_in", "transaction_details", "import_date", "sn",
+})
+
+_ZAMBIA_PARKING_SORT_ALLOWED = frozenset({
+    "transaction_date", "date", "transaction_type", "plate_num", "ticket_no",
+    "debit", "credit", "balance", "heading_to", "import_date",
+})
+
+_DIESEL_FEED_SORT_ALLOWED = frozenset({
+    "transaction_date", "date", "lpo_no", "do_sdo_no", "diesel_at",
+    "ownership", "clients_name", "destinations", "truck_no", "ltrs",
+    "price_per_ltr", "total_amount", "upload_label", "import_date",
+})
+
+_KIMVI_SORT_ALLOWED = frozenset({
+    "expense_date", "date_str", "truck_no", "description", "amount_usd",
+    "created_at", "row_index", "serial_no", "lpo_no",
+})
+
+_CONGO_SORT_ALLOWED = frozenset({
+    "expense_date", "date_str", "truck_no", "description", "amount_usd",
+    "created_at", "row_index", "serial_no", "lpo_no",
+})
+
+_AFRITRACK_SORT_ALLOWED = frozenset({
+    "import_date", "period", "row_index", "truck", "days", "non_trans_days",
+    "trans_days", "rate_per_day", "total_tahmeed", "total_invoice",
+    "variance", "remarks",
+})
+
+_RAHNTECH_SORT_ALLOWED = frozenset({
+    "transaction_date", "sales_date", "trip_number", "device_number",
+    "truck_number", "driver_name", "do_number", "import_date", "sn",
+})
+
+_COMESA_SORT_ALLOWED = frozenset({
+    "name", "card_no", "valid_from", "valid_to", "truck_reg", "premium", "month",
+})
+
+_THIRD_PARTY_SORT_ALLOWED = frozenset({
+    "name", "reg_no", "premium", "vat", "total_premium", "month", "status",
+})
+
+_DIESEL_CASH_SORT_ALLOWED = frozenset({
+    "date", "description", "truck_number", "memo", "amount",
+    "category_name", "item", "approver", "ownership", "receipt_status",
+})
 
 
 def _date_range_clause(
@@ -1892,6 +1957,9 @@ def prepare_master_updates(updates: dict) -> dict:
         if text_key in clean and clean[text_key] is not None:
             clean[text_key] = str(clean[text_key]).strip()
 
+    if "truck_number" in clean:
+        stamp_truck_sort_key(clean)
+
     return clean
 
 
@@ -2339,10 +2407,13 @@ async def get_master_transactions(
         year, month, search, truck, category, receipt, description,
         date_from, date_to, column_filters,
     )
-    direction = 1 if sort_asc else -1
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _MASTER_SORT_ALLOWED,
+        default="date", tie_break=(("created_at", -1),),
+    )
     cursor = (
         db.transactions.find(query)
-        .sort([(sort_field, direction), ("created_at", -1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -2573,10 +2644,16 @@ async def get_category_report_transactions(
     query = _category_report_query(
         name, description=description, date_from=date_from, date_to=date_to,
     )
-    field, direction = _category_report_sort(sort_field, sort_asc)
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _MASTER_SORT_ALLOWED,
+        default="date", tie_break=(),
+    )
+    tie_dir = 1 if sort_asc else -1
+    if ("created_at", tie_dir) not in sort_clauses and ("created_at", -tie_dir) not in sort_clauses:
+        sort_clauses.append(("created_at", tie_dir))
     cursor = (
         db.transactions.find(query)
-        .sort([(field, direction), ("created_at", direction)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -2588,11 +2665,11 @@ def _category_report_sort(
     sort_field: str = "date",
     sort_asc: bool = True,
 ) -> tuple[str, int]:
-    field = sort_field if sort_field in {
-        "date", "description", "truck_number", "memo", "amount",
-        "category_name", "item", "approver", "ownership", "ref_float",
-    } else "date"
-    return field, (1 if sort_asc else -1)
+    allowed = set(_MASTER_SORT_ALLOWED)
+    clauses = ledger_sort_clauses(
+        sort_field, sort_asc, allowed, default="date", tie_break=(),
+    )
+    return clauses[0] if clauses else ("date", 1 if sort_asc else -1)
 
 
 async def get_category_report_opening_balance(
@@ -3076,10 +3153,13 @@ async def get_diesel_cash_transactions(
         year, month, search, truck, receipt, date_from, date_to,
         item_names=await get_diesel_cash_item_names(),
     )
-    direction = 1 if sort_asc else -1
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _DIESEL_CASH_SORT_ALLOWED,
+        default="date", tie_break=(("created_at", -1),),
+    )
     cursor = (
         db.transactions.find(query)
-        .sort([(sort_field, direction), ("created_at", -1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -3361,14 +3441,21 @@ async def get_toll_plaza_all_records(
     date_to: Optional[datetime] = None,
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "transaction_date",
+    sort_asc: bool = False,
 ) -> list:
     """Return paginated Toll Plaza records across all uploads."""
     db = get_db()
     query = _toll_plaza_all_query(search, year, month, date_from, date_to)
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _TOLL_SORT_ALLOWED,
+        default="transaction_date",
+        tie_break=(("toll_date", -1), ("import_date", -1)),
+    )
     cursor = (
         db.imported_feeds
         .find(query)
-        .sort([("transaction_date", -1), ("toll_date", -1), ("import_date", -1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -3520,6 +3607,7 @@ async def save_imported_feed(records: list) -> int:
             normalize_date_fields(doc, "date", store_as="transaction_date")
             apply_diesel_computed_fields(doc)
         _uppercase_import_text(doc)
+        stamp_truck_sort_key(doc)
         docs.append(doc)
 
     # Stamp whole-batch content hash on Zambia Parking / diesel rows
@@ -3567,6 +3655,8 @@ async def get_toll_plaza_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "toll_date",
+    sort_asc: bool = True,
 ) -> list:
     """Return paginated records for a single toll plaza upload batch."""
     db = get_db()
@@ -3577,7 +3667,11 @@ async def get_toll_plaza_upload_records(
         ("vehicle_reg",),
         ("toll_plaza", "receipt_no", "cashier_name", "client_name", "card_no"),
     )
-    cursor = db.imported_feeds.find(query).sort("toll_date", 1).skip(skip).limit(limit)
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _TOLL_SORT_ALLOWED,
+        default="toll_date", tie_break=(("import_date", -1),),
+    )
+    cursor = db.imported_feeds.find(query).sort(sort_clauses).skip(skip).limit(limit)
     return await cursor.to_list(length=limit)
 
 
@@ -3628,6 +3722,8 @@ async def get_parking_congo_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "payment_date",
+    sort_asc: bool = False,
 ) -> list:
     """Return paginated records for a single parking_congo upload batch."""
     db = get_db()
@@ -3638,7 +3734,11 @@ async def get_parking_congo_upload_records(
         ("vehicle_no",),
         ("ledger_id", "transaction_type", "cashier", "transaction_details", "direction"),
     )
-    cursor = db.imported_feeds.find(query).sort("payment_date", -1).skip(skip).limit(limit)
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _PARKING_CONGO_SORT_ALLOWED,
+        default="payment_date", tie_break=(("import_date", -1),),
+    )
+    cursor = db.imported_feeds.find(query).sort(sort_clauses).skip(skip).limit(limit)
     return await cursor.to_list(length=limit)
 
 
@@ -3722,14 +3822,21 @@ async def get_parking_congo_all_records(
     date_to: Optional[datetime] = None,
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "transaction_date",
+    sort_asc: bool = False,
 ) -> list:
     """Return paginated Parking Congo records across all uploads."""
     db = get_db()
     query = _parking_congo_all_query(search, year, month, date_from, date_to)
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _PARKING_CONGO_SORT_ALLOWED,
+        default="transaction_date",
+        tie_break=(("payment_date", -1), ("import_date", -1)),
+    )
     cursor = (
         db.imported_feeds
         .find(query)
-        .sort([("transaction_date", -1), ("payment_date", -1), ("import_date", -1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -3918,6 +4025,8 @@ async def get_rahntech_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "sales_date",
+    sort_asc: bool = False,
 ) -> list:
     """Return paginated records for a single RahnTech upload batch."""
     db = get_db()
@@ -3928,7 +4037,11 @@ async def get_rahntech_upload_records(
         ("truck_number",),
         ("driver_name", "trip_number", "device_number", "do_number"),
     )
-    cursor = db.imported_feeds.find(query).sort("sales_date", -1).skip(skip).limit(limit)
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _RAHNTECH_SORT_ALLOWED,
+        default="sales_date", tie_break=(("import_date", -1),),
+    )
+    cursor = db.imported_feeds.find(query).sort(sort_clauses).skip(skip).limit(limit)
     return await cursor.to_list(length=limit)
 
 
@@ -4007,14 +4120,21 @@ async def get_rahntech_all_records(
     date_to: Optional[datetime] = None,
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "transaction_date",
+    sort_asc: bool = False,
 ) -> list:
     """Return paginated RahnTech records across all uploads."""
     db = get_db()
     query = _rahntech_all_query(search, year, month, date_from, date_to)
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _RAHNTECH_SORT_ALLOWED,
+        default="transaction_date",
+        tie_break=(("sales_date", -1), ("import_date", -1)),
+    )
     cursor = (
         db.imported_feeds
         .find(query)
-        .sort([("transaction_date", -1), ("sales_date", -1), ("import_date", -1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -4234,6 +4354,8 @@ async def get_zambia_parking_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "row_index",
+    sort_asc: bool = True,
 ) -> list:
     """Return paginated records for a single Zambia Parking upload batch."""
     db = get_db()
@@ -4244,10 +4366,14 @@ async def get_zambia_parking_upload_records(
         ("plate_num",),
         ("ticket_no", "heading_to", "type", "date"),
     )
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _ZAMBIA_PARKING_SORT_ALLOWED,
+        default="row_index", tie_break=(("import_date", 1),),
+    )
     cursor = (
         db.imported_feeds
         .find(query)
-        .sort([("row_index", 1), ("import_date", 1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -4333,14 +4459,21 @@ async def get_zambia_parking_all_records(
     date_to: Optional[datetime] = None,
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "transaction_date",
+    sort_asc: bool = False,
 ) -> list:
     """Return paginated Zambia Parking rows across all uploads."""
     db = get_db()
     query = _zambia_parking_all_query(search, year, month, date_from, date_to, credit_only)
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _ZAMBIA_PARKING_SORT_ALLOWED,
+        default="transaction_date",
+        tie_break=(("date", -1), ("import_date", -1)),
+    )
     cursor = (
         db.imported_feeds
         .find(query)
-        .sort([("transaction_date", -1), ("date", -1), ("import_date", -1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -4430,12 +4563,17 @@ async def get_insurance_feed(
     status: str = "",
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "month",
+    sort_asc: bool = True,
 ) -> list:
     db = get_db()
     query = _build_insurance_query(feed_type, search, month, status)
-    cursor = db.imported_feeds.find(query).sort(
-        [("month", 1), ("name", 1)]
-    ).skip(skip).limit(limit)
+    allowed = _COMESA_SORT_ALLOWED if feed_type == "comesa" else _THIRD_PARTY_SORT_ALLOWED
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, allowed,
+        default="month", tie_break=(("name", 1),),
+    )
+    cursor = db.imported_feeds.find(query).sort(sort_clauses).skip(skip).limit(limit)
     return await cursor.to_list(length=limit)
 
 
@@ -4592,11 +4730,17 @@ async def get_diesel_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "date",
+    sort_asc: bool = True,
 ) -> list:
     """Return paginated records for a single diesel upload batch."""
     db = get_db()
     query = _diesel_records_query(feed_type, upload_id, search)
-    cursor = db.imported_feeds.find(query).sort("date", 1).skip(skip).limit(limit)
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _DIESEL_FEED_SORT_ALLOWED,
+        default="date", tie_break=(("import_date", -1),),
+    )
+    cursor = db.imported_feeds.find(query).sort(sort_clauses).skip(skip).limit(limit)
     return await cursor.to_list(length=limit)
 
 
@@ -4783,15 +4927,22 @@ async def get_diesel_all_records(
     limit: int = 50,
     skip: int = 0,
     file_labels: Optional[Sequence[str]] = None,
+    sort_field: str = "transaction_date",
+    sort_asc: bool = False,
 ) -> list:
     """Return paginated diesel rows across all uploads."""
     db = get_db()
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _DIESEL_FEED_SORT_ALLOWED,
+        default="transaction_date",
+        tie_break=(("date", -1), ("import_date", -1)),
+    )
     cursor = (
         db.imported_feeds
         .find(_diesel_all_query(
             feed_type, search, year, month, date_from, date_to, file_labels,
         ))
-        .sort([("transaction_date", -1), ("date", -1), ("import_date", -1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -5076,6 +5227,7 @@ async def save_kimvi_import(records: list) -> int:
             if isinstance(doc.get("expense_date"), datetime):
                 doc["date_str"] = format_excel_date(doc["expense_date"], "%d %b %Y")
         _uppercase_import_text(doc)
+        stamp_truck_sort_key(doc)
         docs.append(doc)
     from tahmeed.db.import_idempotency import insert_many_idempotent
 
@@ -5125,6 +5277,8 @@ async def get_kimvi_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "row_index",
+    sort_asc: bool = True,
 ) -> list:
     """Return paginated rows for a single Ahmed Kimvi import batch."""
     db = get_db()
@@ -5133,10 +5287,14 @@ async def get_kimvi_upload_records(
         "upload_id":    upload_id,
     }
     _put_search(query, search, ("truck_no",), ("description", "date_str"))
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _KIMVI_SORT_ALLOWED,
+        default="row_index", tie_break=(("created_at", 1),),
+    )
     cursor = (
         db.separate_expenses
         .find(query)
-        .sort([("row_index", 1), ("created_at", 1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -5233,6 +5391,8 @@ async def get_kimvi_all_records(
     date_to: Optional[datetime] = None,
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "expense_date",
+    sort_asc: bool = False,
 ) -> list:
     """Return paginated Ahmed Kimvi rows across all uploads."""
     db = get_db()
@@ -5240,10 +5400,15 @@ async def get_kimvi_all_records(
         search, year, month, date_from, date_to,
         money_in_only=money_in_only, called_out_only=called_out_only,
     )
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _KIMVI_SORT_ALLOWED,
+        default="expense_date",
+        tie_break=(("date_str", -1), ("created_at", -1)),
+    )
     cursor = (
         db.separate_expenses
         .find(query)
-        .sort([("expense_date", -1), ("date_str", -1), ("created_at", -1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -5415,6 +5580,7 @@ async def save_congo_import(records: list) -> int:
             if isinstance(doc.get("expense_date"), datetime):
                 doc["date_str"] = format_excel_date(doc["expense_date"], "%d %b %Y")
         _uppercase_import_text(doc)
+        stamp_truck_sort_key(doc)
         docs.append(doc)
     from tahmeed.db.import_idempotency import insert_many_idempotent
 
@@ -5464,6 +5630,8 @@ async def get_congo_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "row_index",
+    sort_asc: bool = True,
 ) -> list:
     """Return paginated rows for a single Congo Expenses import batch."""
     db = get_db()
@@ -5472,10 +5640,14 @@ async def get_congo_upload_records(
         "upload_id":    upload_id,
     }
     _put_search(query, search, ("truck_no",), ("description", "lpo_no", "date_str"))
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _CONGO_SORT_ALLOWED,
+        default="row_index", tie_break=(("created_at", 1),),
+    )
     cursor = (
         db.separate_expenses
         .find(query)
-        .sort([("row_index", 1), ("created_at", 1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -5560,6 +5732,8 @@ async def get_congo_all_records(
     date_to: Optional[datetime] = None,
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "expense_date",
+    sort_asc: bool = False,
 ) -> list:
     """Return paginated Congo Expenses rows across all uploads."""
     db = get_db()
@@ -5567,10 +5741,15 @@ async def get_congo_all_records(
         search, year, month, date_from, date_to,
         money_in_only=money_in_only, called_out_only=called_out_only,
     )
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _CONGO_SORT_ALLOWED,
+        default="expense_date",
+        tie_break=(("date_str", -1), ("created_at", -1)),
+    )
     cursor = (
         db.separate_expenses
         .find(query)
-        .sort([("expense_date", -1), ("date_str", -1), ("created_at", -1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -6248,12 +6427,19 @@ async def get_afritrack_all_records(
     date_to: Optional[datetime] = None,
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "import_date",
+    sort_asc: bool = False,
 ) -> list:
     """Return paginated Afritrack rows across all uploads."""
     db = get_db()
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _AFRITRACK_SORT_ALLOWED,
+        default="import_date",
+        tie_break=(("period", -1), ("row_index", 1)),
+    )
     cursor = (
         db.imported_feeds.find(_afritrack_all_query(search, year, month, date_from, date_to))
-        .sort([("import_date", -1), ("period", -1), ("row_index", 1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )
@@ -6320,11 +6506,17 @@ async def get_afritrack_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
+    sort_field: str = "row_index",
+    sort_asc: bool = True,
 ) -> list:
     db = get_db()
+    sort_clauses = ledger_sort_clauses(
+        sort_field, sort_asc, _AFRITRACK_SORT_ALLOWED,
+        default="row_index", tie_break=(("import_date", 1),),
+    )
     cursor = (
         db.imported_feeds.find(_afritrack_record_query(upload_id, search))
-        .sort([("row_index", 1), ("import_date", 1)])
+        .sort(sort_clauses)
         .skip(skip)
         .limit(limit)
     )

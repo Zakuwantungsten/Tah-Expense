@@ -49,6 +49,10 @@ from tahmeed.ui.accountant.separate_expenses import (
     _write_xlsx_template,
 )
 from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
+from tahmeed.ui.accountant.fuel_sort_helpers import diesel_columns_sort
+from tahmeed.ui.accountant.feed_sort_helpers import (
+    wire_feed_table_sort, sort_kw, reset_feed_sort, clear_upload_detail_filters,
+)
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE   = "#FFFFFF"
@@ -1129,6 +1133,7 @@ class _DieselAllEntries(QWidget):
         )
 
         clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.setToolTip("Clear search, year, date, file filters, and column sort.")
         clear_btn.clicked.connect(self._clear_filters)
         tbl.addWidget(clear_btn)
 
@@ -1147,6 +1152,13 @@ class _DieselAllEntries(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table,
+            diesel_columns_sort(self._columns),
+            default_field="transaction_date",
+            default_asc=False,
+            on_sort_changed=self._on_sort_changed,
+        )
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -1184,6 +1196,9 @@ class _DieselAllEntries(QWidget):
         self._table.setRowCount(0)
         asyncio.ensure_future(self._load_initial())
 
+    def _on_sort_changed(self, field: str, asc: bool) -> None:
+        self._reset_and_load()
+
     def _update_status(self) -> None:
         if self._loading:
             suffix = "  •  Loading…"
@@ -1207,7 +1222,7 @@ class _DieselAllEntries(QWidget):
                 ),
                 svc.get_diesel_all_records(
                     self._feed_type, self._search, self._year, month,
-                    limit=_SCROLL_CHUNK, skip=0, **self._list_kw(),
+                    limit=_SCROLL_CHUNK, skip=0, **self._list_kw(), **sort_kw(self._sort_state),
                 ),
                 svc.count_diesel_all_records(
                     self._feed_type, self._search, self._year, month, **self._list_kw(),
@@ -1238,7 +1253,7 @@ class _DieselAllEntries(QWidget):
         try:
             recs = await svc.get_diesel_all_records(
                 self._feed_type, self._search, self._year, month,
-                limit=_SCROLL_CHUNK, skip=self._loaded, **self._list_kw(),
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._list_kw(), **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -1317,6 +1332,7 @@ class _DieselAllEntries(QWidget):
             from_edit=self._from_date,
             to_edit=self._to_date,
         )
+        reset_feed_sort(self._sort_state)
         self._reset_and_load()
 
 
@@ -1494,6 +1510,9 @@ class _DieselUploadDetail(QWidget):
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(lambda: clear_upload_detail_filters(self))
+        tbl.addWidget(clear_btn)
         tbl.addStretch()
         vl.addWidget(tb)
 
@@ -1501,6 +1520,13 @@ class _DieselUploadDetail(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table,
+            diesel_columns_sort(self._columns),
+            default_field="transaction_date",
+            default_asc=False,
+            on_sort_changed=self._on_sort_changed,
+        )
         vl.addWidget(self._table, 1)
 
         totals_defs = [("ltrs", "Ltrs: ")]
@@ -1547,6 +1573,9 @@ class _DieselUploadDetail(QWidget):
         self._table.setRowCount(0)
         asyncio.ensure_future(self._load_initial())
 
+    def _on_sort_changed(self, field: str, asc: bool) -> None:
+        self._reset_and_load()
+
     def _update_status(self) -> None:
         if self._loading:
             suffix = "  •  Loading…"
@@ -1566,6 +1595,7 @@ class _DieselUploadDetail(QWidget):
             recs, total, totals = await asyncio.gather(
                 svc.get_diesel_upload_records(
                     self._feed_type, self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                    **sort_kw(self._sort_state),
                 ),
                 svc.count_diesel_upload_records(
                     self._feed_type, self._upload_id, self._search,
@@ -1597,7 +1627,7 @@ class _DieselUploadDetail(QWidget):
         try:
             recs = await svc.get_diesel_upload_records(
                 self._feed_type, self._upload_id, self._search,
-                _SCROLL_CHUNK, self._loaded,
+                _SCROLL_CHUNK, self._loaded, **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False

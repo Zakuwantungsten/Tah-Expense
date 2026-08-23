@@ -19,13 +19,19 @@ import io
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from tahmeed.services.excel_dates import format_excel_date, parse_excel_date
 from tahmeed.ui.accountant.date_filters import (
     add_from_to_editors, read_from_to, sync_from_to, clear_list_filters,
 )
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+from tahmeed.ui.accountant.feed_sort_helpers import (
+    TOLL_DETAIL_SORT, PARKING_CONGO_DETAIL_SORT, KIMVI_SORT, CONGO_SORT,
+    ZAMBIA_PARKING_SORT, AFRITRACK_DETAIL_SORT, RAHNTECH_SORT,
+    COMESA_SORT, THIRD_PARTY_SORT, wire_feed_table_sort, sort_kw, reset_feed_sort,
+    clear_upload_detail_filters,
+)
 
 import qtawesome as qta
 
@@ -984,6 +990,19 @@ _TOLL_SCROLL_CHUNK = 50
 _SCROLL_CHUNK = 50
 
 
+def _feed_sort_reload(widget) -> Callable[[str, bool], None]:
+    """Return a sort-changed callback that reloads the feed widget from skip 0."""
+
+    def _on_sort(_field: str, _asc: bool) -> None:
+        widget._reset_and_load()
+
+    return _on_sort
+
+
+def _clear_upload_detail_filters(widget) -> None:
+    clear_upload_detail_filters(widget)
+
+
 def _toll_fill_detail_row(t: QTableWidget, r: int, rec: dict) -> None:
     """Populate one Toll Plaza record row (shared by detail + all-entries views)."""
     t.setItem(r,  0, _cell(str(rec.get("toll_date",    "") or "")))
@@ -1139,6 +1158,11 @@ class _TollAllEntries(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, TOLL_DETAIL_SORT,
+            default_field="transaction_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -1195,7 +1219,7 @@ class _TollAllEntries(QWidget):
                 svc.get_toll_plaza_all_totals(self._search, self._year, month, **self._date_kw()),
                 svc.get_toll_plaza_all_records(
                     self._search, self._year, month,
-                    limit=_TOLL_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                    limit=_TOLL_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
                 ),
                 svc.count_toll_plaza_all_records(self._search, self._year, month, **self._date_kw()),
             )
@@ -1222,7 +1246,7 @@ class _TollAllEntries(QWidget):
         try:
             recs = await svc.get_toll_plaza_all_records(
                 self._search, self._year, month,
-                limit=_TOLL_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+                limit=_TOLL_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(), **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -1289,6 +1313,7 @@ class _TollAllEntries(QWidget):
             from_edit=self._from_date,
             to_edit=self._to_date,
         )
+        reset_feed_sort(self._sort_state)
         self._reset_and_load()
 
 
@@ -1456,6 +1481,9 @@ class _TollUploadDetail(QWidget):
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
+        tbl.addWidget(clear_btn)
         tbl.addStretch()
         vl.addWidget(tb)
 
@@ -1464,6 +1492,11 @@ class _TollUploadDetail(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, TOLL_DETAIL_SORT,
+            default_field="transaction_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("zmw", "ZMW "), ("count", "Records: ")])
@@ -1529,6 +1562,7 @@ class _TollUploadDetail(QWidget):
             recs, total = await asyncio.gather(
                 svc.get_toll_plaza_upload_records(
                     self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                    **sort_kw(self._sort_state),
                 ),
                 svc.count_toll_plaza_upload_records(self._upload_id, self._search),
             )
@@ -1552,6 +1586,7 @@ class _TollUploadDetail(QWidget):
         try:
             recs = await svc.get_toll_plaza_upload_records(
                 self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+                **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -1907,6 +1942,11 @@ class _ParkingCongoAllEntries(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, PARKING_CONGO_DETAIL_SORT,
+            default_field="transaction_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -1963,7 +2003,7 @@ class _ParkingCongoAllEntries(QWidget):
                 svc.get_parking_congo_all_totals(self._search, self._year, month, **self._date_kw()),
                 svc.get_parking_congo_all_records(
                     self._search, self._year, month,
-                    limit=_PCONGO_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                    limit=_PCONGO_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
                 ),
                 svc.count_parking_congo_all_records(self._search, self._year, month, **self._date_kw()),
             )
@@ -1990,7 +2030,7 @@ class _ParkingCongoAllEntries(QWidget):
         try:
             recs = await svc.get_parking_congo_all_records(
                 self._search, self._year, month,
-                limit=_PCONGO_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+                limit=_PCONGO_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(), **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -2057,6 +2097,7 @@ class _ParkingCongoAllEntries(QWidget):
             from_edit=self._from_date,
             to_edit=self._to_date,
         )
+        reset_feed_sort(self._sort_state)
         self._reset_and_load()
 
 
@@ -2207,12 +2248,20 @@ class _ParkingCongoUploadDetail(QWidget):
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
+        tbl.addWidget(clear_btn)
         tbl.addStretch()
         vl.addWidget(tb)
 
         self._table = _make_table(_PCONGO_DETAIL_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._sort_state = wire_feed_table_sort(
+            self._table, PARKING_CONGO_DETAIL_SORT,
+            default_field="payment_date", default_asc=False,
+            on_sort_changed=lambda _f, _a: self._go_page(1),
+        )
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])
@@ -2257,7 +2306,8 @@ class _ParkingCongoUploadDetail(QWidget):
         skip = (self._page - 1) * self._page_size
         recs, total = await asyncio.gather(
             svc.get_parking_congo_upload_records(
-                self._upload_id, self._search, self._page_size, skip
+                self._upload_id, self._search, self._page_size, skip,
+                **sort_kw(self._sort_state),
             ),
             svc.count_parking_congo_upload_records(self._upload_id, self._search),
         )
@@ -2954,6 +3004,11 @@ class _CongoEntriesBase(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, CONGO_SORT,
+            default_field="expense_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -3014,7 +3069,7 @@ class _CongoEntriesBase(QWidget):
                 svc.get_congo_all_records(
                     self._search, self._year, month,
                     **self._amount_filter_kw(),
-                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
                 ),
                 svc.count_congo_all_records(
                     self._search, self._year, month,
@@ -3049,7 +3104,7 @@ class _CongoEntriesBase(QWidget):
             recs = await svc.get_congo_all_records(
                 self._search, self._year, month,
                 **self._amount_filter_kw(),
-                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(), **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -3121,6 +3176,7 @@ class _CongoEntriesBase(QWidget):
             from_edit=self._from_date,
             to_edit=self._to_date,
         )
+        reset_feed_sort(self._sort_state)
         self._reset_and_load()
 
 
@@ -3506,6 +3562,9 @@ class _CongoExpUploadDetail(QWidget):
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
+        tbl.addWidget(clear_btn)
         tbl.addStretch()
         vl.addWidget(tb)
 
@@ -3513,6 +3572,11 @@ class _CongoExpUploadDetail(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, CONGO_SORT,
+            default_field="expense_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])
@@ -3581,6 +3645,7 @@ class _CongoExpUploadDetail(QWidget):
             recs, total = await asyncio.gather(
                 svc.get_congo_upload_records(
                     self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                    **sort_kw(self._sort_state),
                 ),
                 svc.count_congo_upload_records(self._upload_id, self._search),
             )
@@ -3604,6 +3669,7 @@ class _CongoExpUploadDetail(QWidget):
         try:
             recs = await svc.get_congo_upload_records(
                 self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+                **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -4643,6 +4709,11 @@ class _KimviEntriesBase(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, KIMVI_SORT,
+            default_field="expense_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -4703,7 +4774,7 @@ class _KimviEntriesBase(QWidget):
                 svc.get_kimvi_all_records(
                     self._search, self._year, month,
                     **self._amount_filter_kw(),
-                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
                 ),
                 svc.count_kimvi_all_records(
                     self._search, self._year, month,
@@ -4738,7 +4809,7 @@ class _KimviEntriesBase(QWidget):
             recs = await svc.get_kimvi_all_records(
                 self._search, self._year, month,
                 **self._amount_filter_kw(),
-                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(), **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -4810,6 +4881,7 @@ class _KimviEntriesBase(QWidget):
             from_edit=self._from_date,
             to_edit=self._to_date,
         )
+        reset_feed_sort(self._sort_state)
         self._reset_and_load()
 
 
@@ -5001,6 +5073,9 @@ class _KimviUploadDetail(QWidget):
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
+        tbl.addWidget(clear_btn)
         tbl.addStretch()
         vl.addWidget(tb)
 
@@ -5008,6 +5083,11 @@ class _KimviUploadDetail(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, KIMVI_SORT,
+            default_field="expense_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])
@@ -5075,6 +5155,7 @@ class _KimviUploadDetail(QWidget):
             recs, total = await asyncio.gather(
                 svc.get_kimvi_upload_records(
                     self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                    **sort_kw(self._sort_state),
                 ),
                 svc.count_kimvi_upload_records(self._upload_id, self._search),
             )
@@ -5098,6 +5179,7 @@ class _KimviUploadDetail(QWidget):
         try:
             recs = await svc.get_kimvi_upload_records(
                 self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+                **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -5610,6 +5692,11 @@ class _ZambiaParkingEntriesBase(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, ZAMBIA_PARKING_SORT,
+            default_field="transaction_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -5670,7 +5757,7 @@ class _ZambiaParkingEntriesBase(QWidget):
                 svc.get_zambia_parking_all_records(
                     self._search, self._year, month,
                     credit_only=self._credit_only,
-                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
                 ),
                 svc.count_zambia_parking_all_records(
                     self._search, self._year, month,
@@ -5705,7 +5792,7 @@ class _ZambiaParkingEntriesBase(QWidget):
             recs = await svc.get_zambia_parking_all_records(
                 self._search, self._year, month,
                 credit_only=self._credit_only,
-                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(), **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -5771,6 +5858,7 @@ class _ZambiaParkingEntriesBase(QWidget):
             from_edit=self._from_date,
             to_edit=self._to_date,
         )
+        reset_feed_sort(self._sort_state)
         self._reset_and_load()
 
 
@@ -6217,6 +6305,9 @@ class _ZambiaParkingUploadDetail(QWidget):
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
+        tbl.addWidget(clear_btn)
         tbl.addStretch()
         vl.addWidget(tb)
 
@@ -6224,6 +6315,11 @@ class _ZambiaParkingUploadDetail(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, ZAMBIA_PARKING_SORT,
+            default_field="transaction_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("debit", "ZMW "), ("credit", "CR: ZMW ")])
@@ -6293,6 +6389,7 @@ class _ZambiaParkingUploadDetail(QWidget):
             recs, total = await asyncio.gather(
                 svc.get_zambia_parking_upload_records(
                     self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                    **sort_kw(self._sort_state),
                 ),
                 svc.count_zambia_parking_upload_records(self._upload_id, self._search),
             )
@@ -6315,6 +6412,7 @@ class _ZambiaParkingUploadDetail(QWidget):
         try:
             recs = await svc.get_zambia_parking_upload_records(
                 self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+                **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -7741,6 +7839,11 @@ class _AfritrackAllEntries(QWidget):
         for i, w in enumerate(widths):
             self._table.setColumnWidth(i, w)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, AFRITRACK_DETAIL_SORT,
+            default_field="import_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -7793,7 +7896,7 @@ class _AfritrackAllEntries(QWidget):
         try:
             totals, recs, total = await asyncio.gather(
                 svc.get_afritrack_all_totals(self._search, self._year, month, **self._date_kw()),
-                svc.get_afritrack_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw()),
+                svc.get_afritrack_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state)),
                 svc.count_afritrack_all_records(self._search, self._year, month, **self._date_kw()),
             )
         except Exception:
@@ -7822,7 +7925,7 @@ class _AfritrackAllEntries(QWidget):
         try:
             recs = await svc.get_afritrack_all_records(
                 self._search, self._year, month,
-                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(), **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -7898,6 +8001,7 @@ class _AfritrackAllEntries(QWidget):
             from_edit=self._from_date,
             to_edit=self._to_date,
         )
+        reset_feed_sort(self._sort_state)
         self._reset_and_load()
 
 
@@ -8103,6 +8207,9 @@ class _AfritrackUploadDetail(QWidget):
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tl.addWidget(self._search_edit)
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
+        tl.addWidget(clear_btn)
         tl.addStretch()
         vl.addWidget(tb)
 
@@ -8113,6 +8220,11 @@ class _AfritrackUploadDetail(QWidget):
         for i, w in enumerate(widths):
             self._table.setColumnWidth(i, w)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, AFRITRACK_DETAIL_SORT,
+            default_field="import_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._footer = _AfritrackFooter()
@@ -8177,7 +8289,10 @@ class _AfritrackUploadDetail(QWidget):
         self._update_status()
         try:
             recs, total, totals = await asyncio.gather(
-                svc.get_afritrack_upload_records(self._upload_id, self._search, _SCROLL_CHUNK, 0),
+                svc.get_afritrack_upload_records(
+                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                    **sort_kw(self._sort_state),
+                ),
                 svc.count_afritrack_upload_records(self._upload_id, self._search),
                 svc.get_afritrack_upload_totals(self._upload_id, ""),
             )
@@ -8202,6 +8317,7 @@ class _AfritrackUploadDetail(QWidget):
         try:
             recs = await svc.get_afritrack_upload_records(
                 self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+                **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -8252,7 +8368,9 @@ class _AfritrackUploadDetail(QWidget):
         )
         if not path:
             return
-        recs = await svc.get_afritrack_upload_records(self._upload_id, "", 10000, 0)
+        recs = await svc.get_afritrack_upload_records(
+            self._upload_id, "", 10000, 0, **sort_kw(self._sort_state),
+        )
         grid = _AfritrackGrid()
         grid.setRowCount(0)
         for rec in recs:
@@ -9078,6 +9196,9 @@ class ComesaWidget(QWidget):
         self._month_cb.setStyleSheet(_input_ss())
         self._month_cb.currentIndexChanged.connect(self._on_month)
         tbl.addWidget(self._month_cb)
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False, height=32)
+        clear_btn.clicked.connect(self._clear_filters)
+        tbl.addWidget(clear_btn)
         tbl.addStretch()
 
         self._import_btn = _btn("Import", "mdi.upload-outline", height=32)
@@ -9104,6 +9225,11 @@ class ComesaWidget(QWidget):
             QHeaderView.ResizeToContents
         )
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._sort_state = wire_feed_table_sort(
+            self._table, COMESA_SORT,
+            default_field="month", default_asc=True,
+            on_sort_changed=lambda _f, _a: self._go_page(1),
+        )
         cl.addWidget(self._table, 1)
 
         self._totals_bar = _InsTotalsBar([
@@ -9143,7 +9269,7 @@ class ComesaWidget(QWidget):
         recs, total, totals = await asyncio.gather(
             svc.get_insurance_feed(
                 "comesa", self._search, self._month, "",
-                self._page_size, skip,
+                self._page_size, skip, **sort_kw(self._sort_state),
             ),
             svc.count_insurance_feed("comesa", self._search, self._month),
             svc.get_insurance_totals("comesa", self._month),
@@ -9217,12 +9343,25 @@ class ComesaWidget(QWidget):
         from tahmeed.services import accountant_service as svc
         try:
             recs = await svc.get_insurance_feed(
-                "comesa", self._search, self._month, "", 10000, 0
+                "comesa", self._search, self._month, "", 10000, 0,
+                **sort_kw(self._sort_state),
             )
             _export_comesa_xlsx(path, recs)
             QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", str(exc))
+
+    def _clear_filters(self) -> None:
+        self._search = ""
+        self._month = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.clear()
+        self._search_edit.blockSignals(False)
+        self._month_cb.blockSignals(True)
+        self._month_cb.setCurrentIndex(0)
+        self._month_cb.blockSignals(False)
+        reset_feed_sort(self._sort_state)
+        self._go_page(1)
 
     def _on_search(self, text: str) -> None:
         self._search = text
@@ -9327,6 +9466,9 @@ class ThirdPartyWidget(QWidget):
         self._status_cb.setStyleSheet(_input_ss())
         self._status_cb.currentIndexChanged.connect(self._on_status)
         tbl.addWidget(self._status_cb)
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False, height=32)
+        clear_btn.clicked.connect(self._clear_filters)
+        tbl.addWidget(clear_btn)
         tbl.addStretch()
 
         self._import_btn = _btn("Import", "mdi.upload-outline", height=32)
@@ -9353,6 +9495,11 @@ class ThirdPartyWidget(QWidget):
             QHeaderView.ResizeToContents
         )
         self._table.horizontalHeader().setStretchLastSection(True)
+        self._sort_state = wire_feed_table_sort(
+            self._table, THIRD_PARTY_SORT,
+            default_field="month", default_asc=True,
+            on_sort_changed=lambda _f, _a: self._go_page(1),
+        )
         cl.addWidget(self._table, 1)
 
         self._totals_bar = _InsTotalsBar([
@@ -9394,7 +9541,7 @@ class ThirdPartyWidget(QWidget):
         recs, total, totals = await asyncio.gather(
             svc.get_insurance_feed(
                 "third_party", self._search, self._month, self._status,
-                self._page_size, skip,
+                self._page_size, skip, **sort_kw(self._sort_state),
             ),
             svc.count_insurance_feed(
                 "third_party", self._search, self._month, self._status
@@ -9499,12 +9646,28 @@ class ThirdPartyWidget(QWidget):
         try:
             recs = await svc.get_insurance_feed(
                 "third_party", self._search, self._month, self._status,
-                10000, 0,
+                10000, 0, **sort_kw(self._sort_state),
             )
             _export_third_party_xlsx(path, recs)
             QMessageBox.information(self, "Export Complete", f"Saved:\n{path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", str(exc))
+
+    def _clear_filters(self) -> None:
+        self._search = ""
+        self._month = ""
+        self._status = ""
+        self._search_edit.blockSignals(True)
+        self._search_edit.clear()
+        self._search_edit.blockSignals(False)
+        self._month_cb.blockSignals(True)
+        self._month_cb.setCurrentIndex(0)
+        self._month_cb.blockSignals(False)
+        self._status_cb.blockSignals(True)
+        self._status_cb.setCurrentIndex(0)
+        self._status_cb.blockSignals(False)
+        reset_feed_sort(self._sort_state)
+        self._go_page(1)
 
     def _on_search(self, text: str) -> None:
         self._search = text
@@ -9696,6 +9859,11 @@ class _RahnTechAllEntries(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, RAHNTECH_SORT,
+            default_field="transaction_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._status_lbl = _lbl("", size=11, color=_TM)
@@ -9748,7 +9916,7 @@ class _RahnTechAllEntries(QWidget):
         try:
             totals, recs, total = await asyncio.gather(
                 svc.get_rahntech_all_totals(self._search, self._year, month, **self._date_kw()),
-                svc.get_rahntech_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw()),
+                svc.get_rahntech_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state)),
                 svc.count_rahntech_all_records(self._search, self._year, month, **self._date_kw()),
             )
         except Exception:
@@ -9772,7 +9940,7 @@ class _RahnTechAllEntries(QWidget):
         try:
             recs = await svc.get_rahntech_all_records(
                 self._search, self._year, month,
-                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(),
+                limit=_SCROLL_CHUNK, skip=self._loaded, **self._date_kw(), **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False
@@ -9838,6 +10006,7 @@ class _RahnTechAllEntries(QWidget):
             from_edit=self._from_date,
             to_edit=self._to_date,
         )
+        reset_feed_sort(self._sort_state)
         self._reset_and_load()
 
 
@@ -9980,6 +10149,9 @@ class _RahnTechUploadDetail(QWidget):
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
         tbl.addWidget(self._search_edit)
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
+        tbl.addWidget(clear_btn)
         tbl.addStretch()
         vl.addWidget(tb)
 
@@ -9987,6 +10159,11 @@ class _RahnTechUploadDetail(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._sort_state = wire_feed_table_sort(
+            self._table, RAHNTECH_SORT,
+            default_field="transaction_date", default_asc=False,
+            on_sort_changed=_feed_sort_reload(self),
+        )
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([("count", "Records: ")])
@@ -10046,7 +10223,8 @@ class _RahnTechUploadDetail(QWidget):
         try:
             recs, total = await asyncio.gather(
                 svc.get_rahntech_upload_records(
-                    self._upload_id, self._search, _SCROLL_CHUNK, 0
+                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                    **sort_kw(self._sort_state),
                 ),
                 svc.count_rahntech_upload_records(self._upload_id, self._search),
             )
@@ -10069,7 +10247,8 @@ class _RahnTechUploadDetail(QWidget):
         self._update_status()
         try:
             recs = await svc.get_rahntech_upload_records(
-                self._upload_id, self._search, _SCROLL_CHUNK, self._loaded
+                self._upload_id, self._search, _SCROLL_CHUNK, self._loaded,
+                **sort_kw(self._sort_state),
             )
         except Exception:
             self._loading = False

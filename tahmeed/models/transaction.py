@@ -1,7 +1,10 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional
+
 from bson import ObjectId
+
+from tahmeed.services.truck_format import truck_sort_key
 
 
 def pack_money(
@@ -167,6 +170,7 @@ class Transaction:
             doc["amount_usd"] = self.amount_usd
         if self._id:
             doc["_id"] = self._id
+        doc["truck_sort_key"] = truck_sort_key(self.truck_number or "")
         return doc
 
     @classmethod

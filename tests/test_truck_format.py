@@ -2,6 +2,7 @@ from tahmeed.services.truck_format import (
     is_allowed_place_label,
     is_place_label_candidate,
     normalize_truck_number,
+    truck_sort_key,
     try_match_fleet,
 )
 
@@ -77,3 +78,22 @@ def test_try_match_fleet_exact_and_compact() -> None:
     assert try_match_fleet("T688EAF", fleet) == "T688 EAF"
     assert try_match_fleet("t880 cul", fleet) == "T880 CUL"
     assert try_match_fleet("XYZ 999", fleet) is None
+
+
+def test_truck_sort_key_numeric_order() -> None:
+    keys = [
+        truck_sort_key("T2 EAF"),
+        truck_sort_key("T10 EAF"),
+        truck_sort_key("T688 EAF"),
+    ]
+    assert keys == sorted(keys)
+
+
+def test_truck_sort_key_plates_before_places() -> None:
+    assert truck_sort_key("T2 EAF") < truck_sort_key("YARD")
+    assert truck_sort_key("GARAGE") > truck_sort_key("T999 ZZZ")
+
+
+def test_truck_sort_key_empty_last() -> None:
+    assert truck_sort_key("") > truck_sort_key("YARD")
+    assert truck_sort_key("") > truck_sort_key("T1 AAA")

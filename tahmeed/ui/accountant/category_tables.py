@@ -42,6 +42,9 @@ from tahmeed.ui.accountant.date_filters import (
 )
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+from tahmeed.ui.accountant.feed_sort_helpers import (
+    CATEGORY_TABLE_SORT, wire_feed_table_sort, sort_kw, reset_feed_sort,
+)
 
 # ── Design tokens (match accountant dashboard palette) ──────────────────────────
 _WHITE      = "#FFFFFF"
@@ -354,6 +357,11 @@ class CategoryTableWidget(QWidget):
         self._rcpt_cb.currentIndexChanged.connect(self._on_filter_changed)
         fl.addWidget(self._rcpt_cb)
 
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.setToolTip("Clear search, date, receipt filters, and column sort.")
+        clear_btn.clicked.connect(self._clear_filters)
+        fl.addWidget(clear_btn)
+
         fl.addStretch()
 
         export_btn = _btn("Export Excel", "mdi.microsoft-excel")
@@ -382,6 +390,13 @@ class CategoryTableWidget(QWidget):
             self._table,
             f"category_{item_key(self._category)}",
             [c[1] for c in _COLS],
+        )
+        self._sort_state = wire_feed_table_sort(
+            self._table,
+            CATEGORY_TABLE_SORT,
+            default_field="date",
+            default_asc=False,
+            on_sort_changed=self._on_sort_changed,
         )
         root.addWidget(self._table, 1)
 
@@ -469,6 +484,10 @@ class CategoryTableWidget(QWidget):
     def _page_size(self) -> int:
         return self._size_cb.currentData() or _PAGE_SIZES[0]
 
+    def _on_sort_changed(self, field: str, asc: bool) -> None:
+        self._page = 0
+        asyncio.ensure_future(self._reload())
+
     # ── Event handlers ─────────────────────────────────────────────────────
     def _on_year_changed(self) -> None:
         yr = self._fy_cb.currentData()
@@ -491,6 +510,24 @@ class CategoryTableWidget(QWidget):
     def _on_filter_changed(self) -> None:
         self._page = 0
         self._debounce.start()
+
+    def _clear_filters(self) -> None:
+        self._search.blockSignals(True)
+        self._month_cb.blockSignals(True)
+        self._rcpt_cb.blockSignals(True)
+        try:
+            self._search.clear()
+            self._month_cb.setCurrentIndex(0)
+            self._rcpt_cb.setCurrentIndex(0)
+        finally:
+            self._search.blockSignals(False)
+            self._month_cb.blockSignals(False)
+            self._rcpt_cb.blockSignals(False)
+        self._month = 0
+        sync_from_to(self._from_date, self._to_date, self._year, 0, optional=False)
+        reset_feed_sort(self._sort_state)
+        self._page = 0
+        asyncio.ensure_future(self._reload())
 
     def _on_size_changed(self) -> None:
         self._page = 0
@@ -530,7 +567,7 @@ class CategoryTableWidget(QWidget):
             )
             txs, total, totals = await asyncio.gather(
                 get_master_transactions(
-                    **kw, sort_field="date", sort_asc=False, limit=size, skip=skip,
+                    **kw, **sort_kw(self._sort_state), limit=size, skip=skip,
                 ),
                 count_master_transactions(**kw),
                 get_master_totals(**kw),
@@ -621,7 +658,7 @@ class CategoryTableWidget(QWidget):
         )
         try:
             txs = await get_master_transactions(
-                **kw, sort_field="date", sort_asc=False, limit=10_000, skip=0,
+                **kw, **sort_kw(self._sort_state), limit=10_000, skip=0,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")

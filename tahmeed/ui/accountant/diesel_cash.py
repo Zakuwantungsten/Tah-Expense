@@ -35,6 +35,9 @@ from tahmeed.ui.accountant.date_filters import (
 from tahmeed.ui.accountant.separate_expenses import (
     _make_table, _cell, _finish_table_row, _SegmentTabBar, _hsep,
 )
+from tahmeed.ui.accountant.feed_sort_helpers import (
+    DIESEL_CASH_SORT, wire_feed_table_sort, sort_kw, reset_feed_sort,
+)
 
 _MONTH_SHORT = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -210,6 +213,11 @@ class _DieselCashAllEntries(QWidget):
         self._rcpt_cb.setStyleSheet(_input_ss())
         self._rcpt_cb.currentIndexChanged.connect(self._on_filter_changed)
         tl.addWidget(self._rcpt_cb)
+
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.setToolTip("Clear search, date, receipt filters, and column sort.")
+        clear_btn.clicked.connect(self._clear_filters)
+        tl.addWidget(clear_btn)
         tl.addStretch()
 
         export_btn = _btn("Export Excel", "mdi.microsoft-excel")
@@ -225,6 +233,13 @@ class _DieselCashAllEntries(QWidget):
         for i, (_, width, _a, _m) in enumerate(_DIESEL_COLS):
             self._table.setColumnWidth(i, width)
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
+        self._sort_state = wire_feed_table_sort(
+            self._table,
+            DIESEL_CASH_SORT,
+            default_field="date",
+            default_asc=False,
+            on_sort_changed=self._on_sort_changed,
+        )
         vl.addWidget(self._table, 1)
 
         footer = QFrame()
@@ -288,6 +303,10 @@ class _DieselCashAllEntries(QWidget):
     def _page_size(self) -> int:
         return self._size_cb.currentData() or _PAGE_SIZES[0]
 
+    def _on_sort_changed(self, field: str, asc: bool) -> None:
+        self._page = 0
+        asyncio.ensure_future(self._reload())
+
     def _date_kw(self) -> dict:
         df, dt = read_from_to(self._from_date, self._to_date, optional=True)
         return {"date_from": df, "date_to": dt}
@@ -306,6 +325,29 @@ class _DieselCashAllEntries(QWidget):
     def _on_filter_changed(self) -> None:
         self._page = 0
         self._debounce.start()
+
+    def _clear_filters(self) -> None:
+        self._search.blockSignals(True)
+        self._year_cb.blockSignals(True)
+        self._month_cb.blockSignals(True)
+        self._rcpt_cb.blockSignals(True)
+        try:
+            self._search.clear()
+            self._year_cb.setCurrentIndex(0)
+            self._month_cb.setCurrentIndex(0)
+            self._month_cb.setEnabled(False)
+            self._rcpt_cb.setCurrentIndex(0)
+        finally:
+            self._search.blockSignals(False)
+            self._year_cb.blockSignals(False)
+            self._month_cb.blockSignals(False)
+            self._rcpt_cb.blockSignals(False)
+        self._year = 0
+        self._month = 0
+        sync_from_to(self._from_date, self._to_date, 0, 0, optional=True)
+        reset_feed_sort(self._sort_state)
+        self._page = 0
+        asyncio.ensure_future(self._reload())
 
     def _on_year(self, _idx: int) -> None:
         self._year = int(self._year_cb.currentData() or 0)
@@ -356,7 +398,7 @@ class _DieselCashAllEntries(QWidget):
             kw = self._filter_kw()
             txs, total, totals = await asyncio.gather(
                 get_diesel_cash_transactions(
-                    **kw, sort_field="date", sort_asc=False, limit=size, skip=skip,
+                    **kw, **sort_kw(self._sort_state), limit=size, skip=skip,
                 ),
                 count_diesel_cash_transactions(**kw),
                 get_diesel_cash_totals(**kw),
@@ -413,7 +455,7 @@ class _DieselCashAllEntries(QWidget):
         kw = self._filter_kw()
         try:
             txs = await get_diesel_cash_transactions(
-                **kw, sort_field="date", sort_asc=False, limit=10_000, skip=0,
+                **kw, **sort_kw(self._sort_state), limit=10_000, skip=0,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")
@@ -709,6 +751,11 @@ class _DieselCashMonthDetail(QWidget):
         self._rcpt_cb.setStyleSheet(_input_ss())
         self._rcpt_cb.currentIndexChanged.connect(self._on_filter_changed)
         tl.addWidget(self._rcpt_cb)
+
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.setToolTip("Clear search, date, receipt filters, and column sort.")
+        clear_btn.clicked.connect(self._clear_filters)
+        tl.addWidget(clear_btn)
         tl.addStretch()
 
         export_btn = _btn("Export Excel", "mdi.microsoft-excel")
@@ -724,6 +771,13 @@ class _DieselCashMonthDetail(QWidget):
         for i, (_, width, _a, _m) in enumerate(_DIESEL_COLS):
             self._table.setColumnWidth(i, width)
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
+        self._sort_state = wire_feed_table_sort(
+            self._table,
+            DIESEL_CASH_SORT,
+            default_field="date",
+            default_asc=False,
+            on_sort_changed=self._on_sort_changed,
+        )
         vl.addWidget(self._table, 1)
 
         footer = QFrame()
@@ -826,6 +880,10 @@ class _DieselCashMonthDetail(QWidget):
     def _page_size(self) -> int:
         return self._size_cb.currentData() or _PAGE_SIZES[0]
 
+    def _on_sort_changed(self, field: str, asc: bool) -> None:
+        self._page = 0
+        asyncio.ensure_future(self._reload())
+
     def _date_kw(self) -> dict:
         df, dt = read_from_to(self._from_date, self._to_date, optional=True)
         return {"date_from": df, "date_to": dt}
@@ -833,6 +891,22 @@ class _DieselCashMonthDetail(QWidget):
     def _on_filter_changed(self) -> None:
         self._page = 0
         self._debounce.start()
+
+    def _clear_filters(self) -> None:
+        self._search.blockSignals(True)
+        self._month_cb.blockSignals(True)
+        self._rcpt_cb.blockSignals(True)
+        try:
+            self._search.clear()
+            self._rcpt_cb.setCurrentIndex(0)
+        finally:
+            self._search.blockSignals(False)
+            self._month_cb.blockSignals(False)
+            self._rcpt_cb.blockSignals(False)
+        sync_from_to(self._from_date, self._to_date, self._year, self._month, optional=True)
+        reset_feed_sort(self._sort_state)
+        self._page = 0
+        asyncio.ensure_future(self._reload())
 
     def _on_month_changed(self) -> None:
         month = int(self._month_cb.currentData() or 0)
@@ -880,7 +954,7 @@ class _DieselCashMonthDetail(QWidget):
             )
             txs, total, totals = await asyncio.gather(
                 get_diesel_cash_transactions(
-                    **kw, sort_field="date", sort_asc=False, limit=size, skip=skip,
+                    **kw, **sort_kw(self._sort_state), limit=size, skip=skip,
                 ),
                 count_diesel_cash_transactions(**kw),
                 get_diesel_cash_totals(**kw),
@@ -946,7 +1020,7 @@ class _DieselCashMonthDetail(QWidget):
         )
         try:
             txs = await get_diesel_cash_transactions(
-                **kw, sort_field="date", sort_asc=False, limit=10_000, skip=0,
+                **kw, **sort_kw(self._sort_state), limit=10_000, skip=0,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")

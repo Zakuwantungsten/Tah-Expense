@@ -9,7 +9,7 @@ QuickBooks-style full verified ledger with:
   - ReceiptBadge color pill
   - Split TZS + USD amount columns + footer totals
   - Ref_Float column (cashier free-text; empty when unset)
-  - Export to Excel (openpyxl, QuickBooks-like layout)
+  - Export to Excel — Export Filtered (current view) or Export All (FY/month tab)
 """
 
 from __future__ import annotations
@@ -24,12 +24,12 @@ import qtawesome as qta
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QTableWidget, QTableWidgetItem,
-    QLineEdit, QComboBox, QPushButton, QDateEdit,
+    QLineEdit, QComboBox, QPushButton, QToolButton, QMenu, QDateEdit,
     QMessageBox, QFileDialog, QAbstractItemView, QDialog,
     QFormLayout, QDialogButtonBox,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QSize, QDate
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QAction
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.app_state import app_state
@@ -251,6 +251,58 @@ def _action_btn(text: str, icon_name: str, primary: bool = True) -> QPushButton:
     return b
 
 
+def _export_menu_btn(
+    on_filtered,
+    on_all,
+    *,
+    parent=None,
+) -> QToolButton:
+    """Export split button: main click = filtered, menu = filtered + all."""
+    btn = QToolButton(parent)
+    btn.setText("  Export")
+    btn.setCursor(Qt.PointingHandCursor)
+    btn.setFixedHeight(32)
+    btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+    btn.setPopupMode(QToolButton.MenuButtonPopup)
+    try:
+        btn.setIcon(qta.icon("mdi.microsoft-excel", color=_T2))
+        btn.setIconSize(QSize(15, 15))
+    except Exception:
+        pass
+    btn.setStyleSheet(
+        f"QToolButton {{ background: {_WHITE}; color: {_T1};"
+        f" border: 1px solid {_BORDER};"
+        " border-radius: 5px; font-size: 12px;"
+        " font-family:'Segoe UI'; padding: 0 12px; }}"
+        f"QToolButton:hover {{ background: {_BG}; }}"
+        "QToolButton::menu-indicator { subcontrol-origin: padding; subcontrol-position: center right;"
+        " width: 16px; padding-right: 6px; }"
+    )
+    btn.setToolTip(
+        "Export Filtered — current search, filters, column filters, and sort.\n"
+        "Use the ▾ menu for Export All (full FY/month tab, no extra filters)."
+    )
+
+    act_filtered = QAction("Export Filtered", btn)
+    act_filtered.setToolTip(
+        "Export rows matching the current filters and sort order on screen."
+    )
+    act_filtered.triggered.connect(on_filtered)
+    act_all = QAction("Export All", btn)
+    act_all.setToolTip(
+        "Export every record for the selected fiscal year and month tab "
+        "(ignores search, toolbar filters, and column filters)."
+    )
+    act_all.triggered.connect(on_all)
+
+    menu = QMenu(btn)
+    menu.addAction(act_filtered)
+    menu.addAction(act_all)
+    btn.setMenu(menu)
+    btn.clicked.connect(on_filtered)
+    return btn
+
+
 def _receipt_text(status: str) -> tuple:
     """Return (display text, text color) for a receipt status."""
     key = _normalize_receipt(status)
@@ -419,7 +471,7 @@ class _MonthTabBar(QFrame):
 
 class _FilterBar(QFrame):
     filter_changed = Signal()
-    export_requested = Signal()
+    filters_cleared = Signal()
     import_requested = Signal()
 
     def __init__(self, parent=None) -> None:
@@ -503,16 +555,13 @@ class _FilterBar(QFrame):
         hl.addWidget(self._to_date)
 
         clear_btn = _action_btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.setToolTip("Clear search, filters, column filters, and column sort.")
         clear_btn.clicked.connect(lambda *_: self.clear_filters())
         hl.addWidget(clear_btn)
 
         import_btn = _action_btn("Import Excel", "mdi.file-upload-outline", primary=False)
         import_btn.clicked.connect(lambda *_: self.import_requested.emit())
         hl.addWidget(import_btn)
-
-        export_btn = _action_btn("Export Excel", "mdi.microsoft-excel", primary=False)
-        export_btn.clicked.connect(lambda *_: self.export_requested.emit())
-        hl.addWidget(export_btn)
 
     def set_date_range(self, year: int, month: int = 0) -> None:
         """Sync date pickers to FY or month selection without firing filters."""
@@ -554,7 +603,7 @@ class _FilterBar(QFrame):
             self._rcpt_cb.blockSignals(False)
             self._from_date.blockSignals(False)
             self._to_date.blockSignals(False)
-        self.filter_changed.emit()
+        self.filters_cleared.emit()
 
     def populate_trucks(self, trucks: List[str]) -> None:
         cur = self._truck_cb.currentText()
@@ -759,6 +808,11 @@ class MasterExpensesWidget(QWidget):
         self._save_btn.clicked.connect(self._on_save_edits)
         tb.addWidget(self._save_btn)
 
+        export_btn = _export_menu_btn(
+            self._on_export_filtered, self._on_export_all, parent=self,
+        )
+        tb.addWidget(export_btn)
+
         # Refresh
         refresh_btn = QPushButton()
         refresh_btn.setFixedSize(32, 32)
@@ -785,7 +839,7 @@ class MasterExpensesWidget(QWidget):
         # ── Filter bar ───────────────────────────────────────────────────
         self._filter_bar = _FilterBar()
         self._filter_bar.filter_changed.connect(self._on_filter_changed)
-        self._filter_bar.export_requested.connect(self._on_export)
+        self._filter_bar.filters_cleared.connect(self._on_filters_cleared)
         self._filter_bar.import_requested.connect(self._on_import)
         root.addWidget(self._filter_bar)
 
@@ -861,6 +915,30 @@ class MasterExpensesWidget(QWidget):
             kw["column_filters"] = col_filters
         return kw
 
+    def _export_scope_kw(self, *, all_records: bool) -> dict:
+        """Query kwargs for export — filtered view or full FY/month scope."""
+        kw = dict(
+            year=self._year,
+            month=self._month,
+            search="",
+            truck="",
+            category="",
+            receipt="",
+            date_from=None,
+            date_to=None,
+        )
+        if not all_records:
+            kw["search"] = self._filter_bar.search_text()
+            kw["truck"] = self._filter_bar.truck_filter()
+            kw["category"] = self._filter_bar.category_filter()
+            kw["receipt"] = self._filter_bar.receipt_filter()
+            kw["date_from"] = self._filter_bar.date_from()
+            kw["date_to"] = self._filter_bar.date_to()
+            col_filters = self._table.column_filters_for_query()
+            if col_filters:
+                kw["column_filters"] = col_filters
+        return kw
+
     def _reset_and_load(self, *, keep_col_filters: bool = False) -> None:
         self._reload_generation += 1
         self._loaded = 0
@@ -906,6 +984,13 @@ class MasterExpensesWidget(QWidget):
 
     def _on_filter_changed(self) -> None:
         self._debounce.start()
+
+    def _on_filters_cleared(self) -> None:
+        """Reset toolbar filters, Excel column filters, and sort to defaults."""
+        self._sort_field = "date"
+        self._sort_asc = False
+        self._table.reset_default_sort()
+        self._reset_and_load()
 
     def _on_col_filter_changed(self) -> None:
         """Excel ▾ filters query the whole selected year/month range, not one page."""
@@ -1287,10 +1372,39 @@ class MasterExpensesWidget(QWidget):
 
     # ── Excel Export ───────────────────────────────────────────────────────
 
-    def _on_export(self) -> None:
-        asyncio.ensure_future(self._do_export())
+    def _on_export_filtered(self) -> None:
+        asyncio.ensure_future(self._do_export(all_records=False))
 
-    async def _do_export(self) -> None:
+    def _on_export_all(self) -> None:
+        asyncio.ensure_future(self._do_export(all_records=True))
+
+    async def _fetch_export_transactions(self, kw: dict) -> List[Transaction]:
+        from tahmeed.services.accountant_service import (
+            get_master_transactions, count_master_transactions,
+        )
+
+        total = await count_master_transactions(**kw)
+        if total == 0:
+            return []
+
+        chunk = 2000
+        txs: List[Transaction] = []
+        skip = 0
+        while skip < total:
+            batch = await get_master_transactions(
+                **kw,
+                sort_field=self._sort_field,
+                sort_asc=self._sort_asc,
+                limit=chunk,
+                skip=skip,
+            )
+            if not batch:
+                break
+            txs.extend(batch)
+            skip += len(batch)
+        return txs
+
+    async def _do_export(self, *, all_records: bool) -> None:
         try:
             import openpyxl
             from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -1301,16 +1415,24 @@ class MasterExpensesWidget(QWidget):
             )
             return
 
-        from tahmeed.services.accountant_service import get_master_transactions, get_cashier_names
+        from tahmeed.services.accountant_service import get_cashier_names
 
-        kw = self._filter_kw()
+        kw = self._export_scope_kw(all_records=all_records)
+        mode_label = "All" if all_records else "Filtered"
+        self._loading_overlay.show_loading(f"Exporting {mode_label.lower()} master expenses…")
         try:
-            txs = await get_master_transactions(
-                **kw, sort_field=self._sort_field,
-                sort_asc=self._sort_asc, limit=10_000, skip=0,
-            )
+            txs = await self._fetch_export_transactions(kw)
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")
+            return
+        finally:
+            self._loading_overlay.hide_loading()
+
+        if not txs:
+            QMessageBox.information(
+                self, "Export",
+                "No records to export for the selected scope.",
+            )
             return
 
         export_cashier_ids = [tx.cashier_id for tx in txs if tx.cashier_id]
@@ -1328,8 +1450,13 @@ class MasterExpensesWidget(QWidget):
         ws.row_dimensions[1].height = 22
 
         month_label = dict(_MONTHS).get(self._month, "All Months")
+        scope_note = (
+            f"All records — FY {self._year}  |  {month_label}"
+            if all_records
+            else f"Filtered view — FY {self._year}  |  {month_label}"
+        )
         ws.merge_cells("A2:M2")
-        ws["A2"] = f"Master Expenses Report — FY {self._year}  |  {month_label}"
+        ws["A2"] = f"Master Expenses Report — {scope_note}"
         ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
         ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
         ws.row_dimensions[2].height = 18
@@ -1452,16 +1579,17 @@ class MasterExpensesWidget(QWidget):
 
         # ── Save dialog ───────────────────────────────────────────────
         month_tag = dict(_MONTHS).get(self._month, "All")
-        default = f"Master_Expenses_FY{self._year}_{month_tag}.xlsx"
+        suffix = "All" if all_records else "Filtered"
+        default = f"Master_Expenses_FY{self._year}_{month_tag}_{suffix}.xlsx"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Master Expenses", default, "Excel Files (*.xlsx)"
+            self, f"Export Master Expenses ({suffix})", default, "Excel Files (*.xlsx)"
         )
         if path:
             try:
                 wb.save(path)
                 QMessageBox.information(
                     self, "Export Complete",
-                    f"Exported {len(txs):,} records to:\n{path}",
+                    f"Exported {len(txs):,} {suffix.lower()} records to:\n{path}",
                 )
             except Exception as exc:
                 QMessageBox.critical(self, "Save Error", f"Could not save file:\n{exc}")
