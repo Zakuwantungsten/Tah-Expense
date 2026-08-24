@@ -12,6 +12,11 @@ from bson import ObjectId
 from tahmeed.db.connection import get_db
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.diesel_amounts import apply_diesel_computed_fields, diesel_line_total
+from tahmeed.services.diesel_currency import (
+    LAKE_ZAMBIA_DIESEL_CURRENCIES,
+    diesel_amount_by_currency_groups,
+    diesel_record_currency,
+)
 from tahmeed.services.diesel_liters import parse_liters_from_description
 from tahmeed.services.excel_dates import (
     format_excel_date,
@@ -3827,6 +3832,9 @@ async def save_imported_feed(records: list) -> int:
         elif str(doc.get("feed_type", "")).startswith("diesel_"):
             normalize_date_fields(doc, "date", store_as="transaction_date")
             apply_diesel_computed_fields(doc)
+            if doc.get("feed_type") == "diesel_lake_zambia":
+                cur = str(doc.get("currency") or "").strip().upper()
+                doc["currency"] = cur if cur in LAKE_ZAMBIA_DIESEL_CURRENCIES else "USD"
         _uppercase_import_text(doc)
         stamp_truck_sort_key(doc)
         docs.append(doc)
@@ -4920,6 +4928,7 @@ async def get_diesel_uploads(feed_type: str) -> list:
             "upload_label":    {"$first": "$upload_label"},
             "sheet_label":     {"$first": "$sheet_label"},
             "import_date":     {"$first": "$import_date"},
+            "currency":        {"$first": "$currency"},
             "record_count":    {"$sum": 1},
             "ltrs":            {"$sum": _safe_double("ltrs")},
             "total_amount":    {"$sum": _diesel_computed_amount()},
@@ -5199,21 +5208,38 @@ async def get_diesel_all_totals(
 ) -> dict:
     """Return row count and litre/amount totals for filtered diesel rows."""
     db = get_db()
+    match = _diesel_all_query(
+        feed_type, search, year, month, date_from, date_to, file_labels,
+    )
     pipeline = [
-        {"$match": _diesel_all_query(
-            feed_type, search, year, month, date_from, date_to, file_labels,
-        )},
-        {"$group": {
-            "_id":          None,
-            "count":        {"$sum": 1},
-            "ltrs":         {"$sum": _safe_double("ltrs")},
-            "total_amount": {"$sum": _diesel_computed_amount()},
+        {"$match": match},
+        {"$facet": {
+            "summary": [{"$group": {
+                "_id":          None,
+                "count":        {"$sum": 1},
+                "ltrs":         {"$sum": _safe_double("ltrs")},
+                "total_amount": {"$sum": _diesel_computed_amount()},
+            }}],
+            "by_currency": [{"$group": {
+                "_id":    "$currency",
+                "amount": {"$sum": _diesel_computed_amount()},
+            }}],
         }},
     ]
     result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"count": 0, "ltrs": 0.0, "total_amount": 0.0}
+    if not result:
+        return {"count": 0, "ltrs": 0.0, "total_amount": 0.0}
+    summary = (result[0].get("summary") or [{}])[0]
+    out = {
+        "count": int(summary.get("count") or 0),
+        "ltrs": float(summary.get("ltrs") or 0.0),
+        "total_amount": float(summary.get("total_amount") or 0.0),
+    }
+    if feed_type == "diesel_lake_zambia":
+        out["amount_by_currency"] = diesel_amount_by_currency_groups(
+            result[0].get("by_currency") or [],
+        )
+    return out
 
 
 async def get_diesel_available_years(feed_type: str) -> List[int]:
@@ -6104,12 +6130,6 @@ _DIESEL_FEED_SOURCE_GROUP = {
     "diesel_lake_tunduma": "lake_tunduma",
     "diesel_gbp": "gbp_diesel",
 }
-_DIESEL_FEED_CURRENCY = {
-    "diesel_infinity": "TZS",
-    "diesel_lake_zambia": "USD",
-    "diesel_lake_tunduma": "TZS",
-    "diesel_gbp": "TZS",
-}
 _DIESEL_STATION_SOURCE_GROUPS = frozenset(_DIESEL_FEED_SOURCE_GROUP.values())
 
 _TRUCK_OVERVIEW_IMPORTED_FEEDS = (
@@ -6330,7 +6350,7 @@ async def _truck_overview_diesel_rows(
                 truck_value=str(doc.get("truck_no", "") or ""),
                 description=doc.get("destinations") or doc.get("clients_name") or "Diesel import",
                 reference=doc.get("lpo_no") or doc.get("do_sdo_no") or doc.get("sheet_label") or "",
-                currency=_DIESEL_FEED_CURRENCY.get(feed_type, "TZS"),
+                currency=diesel_record_currency(doc, feed_type) or "TZS",
                 amount=diesel_line_total(doc.get("ltrs"), doc.get("price_per_ltr")),
                 liters=doc.get("ltrs"),
                 rate=doc.get("price_per_ltr"),

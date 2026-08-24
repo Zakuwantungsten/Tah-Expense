@@ -34,6 +34,10 @@ from PySide6.QtWidgets import (
 
 from tahmeed.services.diesel_amounts import apply_diesel_computed_fields, diesel_line_total
 from tahmeed.services.excel_dates import format_excel_date, parse_excel_date
+from tahmeed.services.diesel_currency import (
+    LAKE_ZAMBIA_DIESEL_CURRENCIES,
+    diesel_record_currency,
+)
 
 try:
     import openpyxl
@@ -88,6 +92,21 @@ _ROW_ODD  = "#F1F5F9"   # slate-100
 _PAGE_SIZES = [25, 50, 100]
 _ROW_H      = 28
 _HDR_H      = 26
+
+_LAKE_ZAMBIA_FEED = "diesel_lake_zambia"
+
+
+def _lake_zambia_per_upload_currency(feed_type: str) -> bool:
+    return feed_type == _LAKE_ZAMBIA_FEED
+
+
+def _format_diesel_amount_by_currency(amounts: dict[str, float]) -> str:
+    parts: list[str] = []
+    for cur in ("USD", "ZMW"):
+        val = amounts.get(cur)
+        if val:
+            parts.append(f"{cur} {_fmt_num(val, decimals=0)}")
+    return "  ·  ".join(parts) if parts else "—"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -757,6 +776,10 @@ class _TotalsBar(QFrame):
         if key in self._lbl_map:
             self._lbl_map[key].setText(_fmt_num(value, prefix=prefix, decimals=0))
 
+    def set_text(self, key: str, text: str) -> None:
+        if key in self._lbl_map:
+            self._lbl_map[key].setText(text)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Drop zone
@@ -838,6 +861,7 @@ class _FuelImportDialog(QDialog):
         self._columns   = self._schema["columns"]
         self._required  = self._schema["required"]
         self._currency  = self._schema.get("currency")
+        self._import_currency = self._currency
         self._headers   = [c[0] for c in self._columns]
 
         self._wb: Any = None
@@ -906,6 +930,19 @@ class _FuelImportDialog(QDialog):
         self._desc_edit.setPlaceholderText("e.g. 16th - 31st Mar 2026")
         self._desc_edit.setStyleSheet(_input_ss())
         desc_hl.addWidget(self._desc_edit, 1)
+        if _lake_zambia_per_upload_currency(self._feed_type):
+            desc_hl.addSpacing(12)
+            desc_hl.addWidget(_lbl("Currency:", size=12, color=_T2))
+            self._currency_cb = QComboBox()
+            for code in sorted(LAKE_ZAMBIA_DIESEL_CURRENCIES):
+                self._currency_cb.addItem(code, code)
+            self._currency_cb.setCurrentIndex(
+                max(0, self._currency_cb.findData(self._import_currency or "USD"))
+            )
+            self._currency_cb.setFixedWidth(90)
+            self._currency_cb.setStyleSheet(_input_ss())
+            self._currency_cb.currentIndexChanged.connect(self._on_currency_changed)
+            desc_hl.addWidget(self._currency_cb)
         vl.addWidget(desc_row)
 
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
@@ -1199,6 +1236,16 @@ class _FuelImportDialog(QDialog):
             typed = self._desc_edit.text().strip()
         return typed or self._source_filename
 
+    def _selected_import_currency(self) -> str | None:
+        if _lake_zambia_per_upload_currency(self._feed_type):
+            return str(self._currency_cb.currentData() or "USD")
+        return self._currency
+
+    def _on_currency_changed(self, _idx: int) -> None:
+        self._import_currency = self._selected_import_currency()
+        if self._rows:
+            self._fill_preview(self._rows)
+
     def _fill_preview(self, rows: List[dict]) -> None:
         t = self._preview_tbl
         t.setRowCount(0)
@@ -1206,7 +1253,8 @@ class _FuelImportDialog(QDialog):
             r = t.rowCount()
             t.insertRow(r)
             _fill_diesel_row(
-                t, r, row, self._columns, sn_offset=i, currency=self._currency,
+                t, r, row, self._columns, sn_offset=i,
+                currency=self._selected_import_currency(),
             )
 
     # ── Import ─────────────────────────────────────────────────────────────────
@@ -1226,6 +1274,7 @@ class _FuelImportDialog(QDialog):
             (self._sheet_cb.currentData() or "") if self._wb is not None else ""
         )
         upload_label = self._resolved_upload_label()
+        import_currency = self._selected_import_currency()
         docs = []
         for rec in self._rows:
             doc = dict(rec)
@@ -1233,6 +1282,8 @@ class _FuelImportDialog(QDialog):
             doc["source_filename"] = self._source_filename
             doc["upload_label"] = upload_label
             doc["sheet_label"] = sheet_label
+            if _lake_zambia_per_upload_currency(self._feed_type):
+                doc["currency"] = import_currency
             docs.append(doc)
         try:
             matching = await svc.diesel_already_uploaded(
@@ -1383,8 +1434,11 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
 
         totals_defs = [("ltrs", "Ltrs: ")]
         if self._has_amount:
-            amt_prefix = f"{self._currency}: " if self._currency else "Amount: "
-            totals_defs.append(("amount", amt_prefix))
+            if _lake_zambia_per_upload_currency(self._feed_type):
+                totals_defs.append(("amount", "Total: "))
+            else:
+                amt_prefix = f"{self._currency}: " if self._currency else "Amount: "
+                totals_defs.append(("amount", amt_prefix))
         totals_defs.append(("count", "Records: "))
         self._totals = _TotalsBar(totals_defs)
         vl.addWidget(self._totals)
@@ -1404,6 +1458,23 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
         self._status_lbl = _lbl("", size=11, color=_TM)
         self._status_lbl.setAlignment(Qt.AlignCenter)
         vl.addWidget(self._status_lbl)
+
+    def _row_currency(self, rec: dict) -> str | None:
+        if _lake_zambia_per_upload_currency(self._feed_type):
+            return diesel_record_currency(rec, self._feed_type)
+        return self._currency
+
+    def _set_amount_total(self, totals: dict) -> None:
+        if not self._has_amount:
+            return
+        if _lake_zambia_per_upload_currency(self._feed_type):
+            by_cur = totals.get("amount_by_currency") or {}
+            if by_cur:
+                self._totals.set_text("amount", _format_diesel_amount_by_currency(by_cur))
+            else:
+                self._totals.set_total("amount", float(totals.get("total_amount", 0) or 0))
+        else:
+            self._totals.set_total("amount", float(totals.get("total_amount", 0) or 0))
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._reload_years_and_data())
@@ -1478,8 +1549,7 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
         self._loaded = len(recs)
         self._totals.set_total("count", int(totals.get("count", 0) or 0))
         self._totals.set_total("ltrs", float(totals.get("ltrs", 0) or 0))
-        if self._has_amount:
-            self._totals.set_total("amount", float(totals.get("total_amount", 0) or 0))
+        self._set_amount_total(totals)
         self._loading = False
         self._update_status()
 
@@ -1511,7 +1581,7 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
             self._table.insertRow(r)
             _fill_diesel_row(
                 self._table, r, rec, self._columns, self._loaded + i,
-                currency=self._currency,
+                currency=self._row_currency(rec),
             )
 
     def _on_scroll(self, value: int) -> None:
@@ -1580,7 +1650,12 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
 #  Upload browse — one row per import batch
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _browse_headers(currency: str | None) -> List[str]:
+def _browse_headers(currency: str | None, *, per_upload_currency: bool = False) -> List[str]:
+    if per_upload_currency:
+        return [
+            "UPLOAD DATE", "SHEET", "UPLOAD DESCRIPTION", "RECORDS", "LTRS",
+            "CURRENCY", "TOTAL",
+        ]
     total_hdr = f"TOTAL ({currency})" if currency else "TOTAL"
     return ["UPLOAD DATE", "SHEET", "UPLOAD DESCRIPTION", "RECORDS", "LTRS", total_hdr]
 
@@ -1593,6 +1668,7 @@ class _DieselUploadBrowse(QWidget):
         super().__init__(parent)
         self._feed_type = feed_type
         self._currency = _FUEL_SCHEMAS[feed_type].get("currency")
+        self._per_upload_currency = _lake_zambia_per_upload_currency(feed_type)
         self._uploads: List[dict] = []
         self._build()
 
@@ -1602,7 +1678,9 @@ class _DieselUploadBrowse(QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        self._table = _make_table(_browse_headers(self._currency))
+        self._table = _make_table(
+            _browse_headers(self._currency, per_upload_currency=self._per_upload_currency)
+        )
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setColumnWidth(0, 160)
@@ -1610,13 +1688,20 @@ class _DieselUploadBrowse(QWidget):
         self._table.setColumnWidth(2, 220)
         self._table.setColumnWidth(3, 90)
         self._table.setColumnWidth(4, 110)
+        if self._per_upload_currency:
+            self._table.setColumnWidth(5, 90)
+            self._table.setColumnWidth(6, 110)
         self._table.setCursor(Qt.PointingHandCursor)
         self._table.cellClicked.connect(self._on_row_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table, 1)
 
-        amt_prefix = f"{self._currency}: " if self._currency else "Total: "
+        amt_prefix = (
+            "Total: "
+            if self._per_upload_currency
+            else (f"{self._currency}: " if self._currency else "Total: ")
+        )
         self._totals = _TotalsBar([("count", "Total records: "),
                                    ("ltrs", "Ltrs: "), ("amount", amt_prefix)])
         vl.addWidget(self._totals)
@@ -1647,6 +1732,7 @@ class _DieselUploadBrowse(QWidget):
         tot_recs = 0
         tot_ltrs = 0.0
         tot_amt = 0.0
+        amount_by_currency: dict[str, float] = {}
         for up in uploads:
             r = t.rowCount()
             t.insertRow(r)
@@ -1659,6 +1745,7 @@ class _DieselUploadBrowse(QWidget):
             count = int(up.get("record_count", 0))
             ltrs  = float(up.get("ltrs", 0) or 0)
             amt   = float(up.get("total_amount", 0) or 0)
+            row_currency = diesel_record_currency(up, self._feed_type)
             t.setItem(r, 0, _cell(date_str))
             t.setItem(r, 1, _cell(up.get("sheet_label") or "—"))
             t.setItem(r, 2, _cell(
@@ -1667,15 +1754,29 @@ class _DieselUploadBrowse(QWidget):
             t.setItem(r, 3, _cell(f"{count:,}", Qt.AlignCenter | Qt.AlignVCenter))
             t.setItem(r, 4, _cell(_fmt_num(ltrs, decimals=0),
                                   Qt.AlignRight | Qt.AlignVCenter))
-            t.setItem(r, 5, _cell(_fmt_num(amt, decimals=0),
-                                  Qt.AlignRight | Qt.AlignVCenter))
+            if self._per_upload_currency:
+                t.setItem(r, 5, _cell(row_currency or "USD", Qt.AlignCenter | Qt.AlignVCenter))
+                t.setItem(r, 6, _cell(_fmt_num(amt, decimals=0),
+                                      Qt.AlignRight | Qt.AlignVCenter))
+                if row_currency:
+                    amount_by_currency[row_currency] = (
+                        amount_by_currency.get(row_currency, 0.0) + amt
+                    )
+            else:
+                t.setItem(r, 5, _cell(_fmt_num(amt, decimals=0),
+                                      Qt.AlignRight | Qt.AlignVCenter))
+                tot_amt += amt
             _finish_table_row(t, r)
             tot_recs += count
             tot_ltrs += ltrs
-            tot_amt  += amt
         self._totals.set_total("count", tot_recs)
         self._totals.set_total("ltrs", tot_ltrs)
-        self._totals.set_total("amount", tot_amt)
+        if self._per_upload_currency:
+            self._totals.set_text(
+                "amount", _format_diesel_amount_by_currency(amount_by_currency),
+            )
+        else:
+            self._totals.set_total("amount", tot_amt)
 
     def _on_row_clicked(self, row: int, _col: int) -> None:
         if 0 <= row < len(self._uploads):
@@ -1774,8 +1875,11 @@ class _DieselUploadDetail(_DieselExportMixin, QWidget):
 
         totals_defs = [("ltrs", "Ltrs: ")]
         if self._has_amount:
-            amt_prefix = f"{self._currency}: " if self._currency else "Amount: "
-            totals_defs.append(("amount", amt_prefix))
+            if _lake_zambia_per_upload_currency(self._feed_type):
+                totals_defs.append(("amount", "Total: "))
+            else:
+                amt_prefix = f"{self._currency}: " if self._currency else "Amount: "
+                totals_defs.append(("amount", amt_prefix))
         totals_defs.append(("count", "Records: "))
         self._totals = _TotalsBar(totals_defs)
         vl.addWidget(self._totals)
@@ -1784,9 +1888,16 @@ class _DieselUploadDetail(_DieselExportMixin, QWidget):
         self._status_lbl.setAlignment(Qt.AlignCenter)
         vl.addWidget(self._status_lbl)
 
+    def _row_currency(self, rec: dict) -> str | None:
+        if _lake_zambia_per_upload_currency(self._feed_type):
+            return diesel_record_currency(rec, self._feed_type)
+        return self._currency
+
     def load_upload(self, upload_doc: dict) -> None:
         self._upload_doc = upload_doc
         self._upload_id = str(upload_doc.get("_id") or "")
+        if _lake_zambia_per_upload_currency(self._feed_type):
+            self._currency = diesel_record_currency(upload_doc, self._feed_type)
         label     = (
             upload_doc.get("upload_label")
             or upload_doc.get("source_filename")
@@ -1796,9 +1907,10 @@ class _DieselUploadDetail(_DieselExportMixin, QWidget):
         count     = int(upload_doc.get("record_count", 0))
         import_dt = upload_doc.get("import_date")
         date_str  = import_dt.strftime("%d %b %Y") if isinstance(import_dt, datetime) else ""
+        cur_note  = f"   •   {self._currency}" if self._currency else ""
         self._crumb_lbl.setText(f"Uploads  ›  {sheet}")
         self._info_lbl.setText(
-            f"{label}   •   sheet: {sheet}   •   {count:,} records   •   {date_str}"
+            f"{label}   •   sheet: {sheet}   •   {count:,} records   •   {date_str}{cur_note}"
         )
         self._search = ""
         self._search_edit.blockSignals(True)
@@ -1857,7 +1969,12 @@ class _DieselUploadDetail(_DieselExportMixin, QWidget):
         self._totals.set_total("count", total)
         self._totals.set_total("ltrs", float(totals.get("ltrs", 0) or 0))
         if self._has_amount:
-            self._totals.set_total("amount", float(totals.get("total_amount", 0) or 0))
+            amt = float(totals.get("total_amount", 0) or 0)
+            if _lake_zambia_per_upload_currency(self._feed_type):
+                cur = self._currency or "USD"
+                self._totals.set_text("amount", f"{cur} {_fmt_num(amt, decimals=0)}")
+            else:
+                self._totals.set_total("amount", amt)
         self._loading = False
         self._update_status()
 
@@ -1888,7 +2005,7 @@ class _DieselUploadDetail(_DieselExportMixin, QWidget):
             self._table.insertRow(r)
             _fill_diesel_row(
                 self._table, r, rec, self._columns, self._loaded + i,
-                currency=self._currency,
+                currency=self._row_currency(rec),
             )
 
     def _on_search(self, text: str) -> None:
