@@ -122,7 +122,7 @@ async def run_daily_to_master_flow(
         if not ok:
             return None
 
-    # ── One register date for the whole upload ────────────────────────────
+    # ── One reconciled date for the whole upload ──────────────────────────
     if not resolve_import_date_policy(preview, parent=parent):
         return None
 

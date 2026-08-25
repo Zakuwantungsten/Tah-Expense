@@ -474,12 +474,13 @@ class _DateDelegate(_ExcelCellDelegate):
     def setEditorData(self, editor, index):
         text = index.data() or ""
         cur = self._get_current_date()
-        year = cur.year if cur is not None else date.today().year
+        fallback = cur if isinstance(cur, date) else date.today()
+        year = fallback.year
         dt = _parse_optional_date(text, default_year=year)
         if dt is not None:
             editor.setDate(QDate(dt.year, dt.month, dt.day))
         else:
-            editor.setDate(QDate(cur.year, cur.month, cur.day))
+            editor.setDate(QDate(fallback.year, fallback.month, fallback.day))
 
     def setModelData(self, editor, model, index):
         model.setData(index, format_register_date(editor.date().toPython()))

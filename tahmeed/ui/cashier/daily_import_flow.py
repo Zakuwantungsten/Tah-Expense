@@ -112,7 +112,7 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
         if not ok:
             return None
 
-    # ── One register date for the whole upload ────────────────────────────
+    # ── One reconciled date for the whole upload ──────────────────────────
     if not resolve_import_date_policy(preview, parent=parent):
         return None
 

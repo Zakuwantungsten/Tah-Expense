@@ -26,13 +26,14 @@ from typing import Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
     QFrame, QLabel, QLineEdit, QPushButton, QDialog, QMessageBox,
-    QSizePolicy,
+    QSizePolicy, QDateEdit,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QDate
 
 from tahmeed.models.user import User
 from tahmeed.services.category_service import get_all_categories
 from tahmeed.ui.accountant.header_bar import HeaderBar
+from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.dialogs.change_password_dialog import ChangePasswordDialog
 from tahmeed.ui.cashier.sidebar import CashierSidebarWidget
 from tahmeed.ui.cashier.excel_grid import DailyRegister
@@ -128,7 +129,7 @@ class _QBDocHeader(QFrame):
             "  border-bottom: 2px solid #0077C5;"
             "}"
         )
-        self._view_date: date = date.today()
+        self._view_date: Optional[date] = date.today()
 
         hl = QHBoxLayout(self)
         hl.setContentsMargins(0, 0, 16, 0)
@@ -272,11 +273,23 @@ class _QBDocHeader(QFrame):
         self._val_total_usd.setText(f"USD {total_usd:,.2f}" if total_usd else "—")
         self._val_total.setText(f"TZS {total_tzs:,.0f}" if total_tzs else "—")
         self._val_refund.setText(f"TZS {refund_total:,.0f}" if refund_total else "—")
-        if register_date is not None:
+        if register_date is None:
+            self.clear_view_date()
+        else:
             self.set_view_date(register_date)
+
+    def clear_view_date(self) -> None:
+        """Blank New table — no reconciled day yet."""
+        self._view_date = None
+        self._val_today.setText("—")
+        if self._lbl_date is not None:
+            self._lbl_date.setText("DATE")
 
     def set_view_date(self, d: date) -> None:
         """Show the register's calendar day — label is TODAY only when it is today."""
+        if d is None:
+            self.clear_view_date()
+            return
         if hasattr(d, "date"):
             d = d.date()
         self._view_date = d
@@ -343,15 +356,59 @@ def _qb_inline_field(label: str, placeholder: str, width: int) -> tuple[QWidget,
     return wrap, edit
 
 
+# Sentinel so QDateEdit can show "-" via specialValueText (date == minimumDate).
+_RECONCILED_DATE_UNSET = QDate(1000, 1, 1)
+
+
+def _qb_inline_date_field(label: str) -> tuple[QWidget, QDateEdit]:
+    """Label + calendar: Reconciled Date [____] (shows "-" when unset)."""
+    wrap = QWidget()
+    wrap.setStyleSheet("background: transparent;")
+    wrap.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    row = QHBoxLayout(wrap)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    lbl = _qb_field_label(label)
+    lbl.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    row.addWidget(lbl, 0, Qt.AlignVCenter)
+    edit = QDateEdit()
+    edit.setCalendarPopup(True)
+    edit.setDisplayFormat("dd MMM yyyy")
+    edit.setMinimumDate(_RECONCILED_DATE_UNSET)
+    edit.setSpecialValueText("-")
+    edit.setDate(QDate.currentDate())
+    edit.setFixedHeight(_BTN_H)
+    edit.setFixedWidth(132)
+    edit.setStyleSheet(
+        "QDateEdit {"
+        "  border: 1px solid #D1D5DB; border-radius: 5px;"
+        "  padding: 0 6px; font-size: 12px;"
+        "  color: #111827; background: #F3F4F6;"
+        "  font-family: 'Segoe UI', sans-serif;"
+        "}"
+        "QDateEdit:focus {"
+        "  border-color: #0077C5; background: #FFFFFF;"
+        "}"
+        "QDateEdit:read-only {"
+        "  color: #6B7280; background: #F9FAFB;"
+        "}"
+    )
+    style_calendar_popup(edit)
+    edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+    row.addWidget(edit, 0, Qt.AlignVCenter)
+    return wrap, edit
+
+
 # ── Action bar (mode / search / payee / cheque) ─────────────────────────────────
 
 class _ActionBar(QFrame):
-    """My entries / Merged / Search on the left; Payee / Cheque opposite on the right."""
+    """My entries / Merged / Search on the left; Reconciled Date / Payee / Cheque on the right."""
 
     search_changed = Signal(str)
     mode_changed   = Signal(bool)  # True = Merged
     payee_edited   = Signal(str)
     cheque_edited  = Signal(str)
+    reconciled_date_changed = Signal(object)  # date
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -472,15 +529,45 @@ class _ActionBar(QFrame):
         fields_hl.setContentsMargins(0, 0, 0, 0)
         fields_hl.setSpacing(14)
 
-        payee_wrap, self._payee = _qb_inline_field("Payee", "Payee name…", 180)
+        date_wrap, self._reconciled = _qb_inline_date_field("Reconciled Date")
+        self._reconciled.dateChanged.connect(self._on_reconciled_date)
+        fields_hl.addWidget(date_wrap)
+
+        payee_wrap, self._payee = _qb_inline_field("Payee", "Payee name…", 160)
         self._payee.textEdited.connect(self.payee_edited.emit)
         fields_hl.addWidget(payee_wrap)
 
-        cheque_wrap, self._cheque = _qb_inline_field("Cheque", "Cheque no.…", 110)
+        cheque_wrap, self._cheque = _qb_inline_field("Cheque", "Cheque no.…", 100)
         self._cheque.textEdited.connect(self.cheque_edited.emit)
         fields_hl.addWidget(cheque_wrap)
 
         hl.addWidget(fields, 0, Qt.AlignVCenter)
+
+    def _on_reconciled_date(self, qd: QDate) -> None:
+        if not qd.isValid() or qd == _RECONCILED_DATE_UNSET:
+            return
+        self.reconciled_date_changed.emit(date(qd.year(), qd.month(), qd.day()))
+
+    def set_reconciled_date(self, d) -> None:
+        """Sync the header calendar with the open Simple day without navigating.
+
+        ``None`` shows "-" (unset reconciled date after New table).
+        """
+        if d is None:
+            if self._reconciled.date() == _RECONCILED_DATE_UNSET:
+                return
+            self._reconciled.blockSignals(True)
+            self._reconciled.setDate(_RECONCILED_DATE_UNSET)
+            self._reconciled.blockSignals(False)
+            return
+        if hasattr(d, "date"):
+            d = d.date()
+        qd = QDate(d.year, d.month, d.day)
+        if self._reconciled.date() == qd:
+            return
+        self._reconciled.blockSignals(True)
+        self._reconciled.setDate(qd)
+        self._reconciled.blockSignals(False)
 
     def set_payee_cheque_values(self, payee: str, cheque: str, editable: bool) -> None:
         """Refresh day-level Payee/Cheque header fields without emitting edits."""
@@ -534,7 +621,7 @@ class _TablePage(QWidget):
         self._qb_toolbar.redo_clicked.connect(register.toolbar_redo)
         self._qb_toolbar.find_prev.connect(lambda: register.toolbar_find(-1))
         self._qb_toolbar.find_next.connect(lambda: register.toolbar_find(1))
-        self._qb_toolbar.new_clicked.connect(register.toolbar_new_row)
+        self._qb_toolbar.new_clicked.connect(register.toolbar_new_table)
         self._qb_toolbar.save_clicked.connect(register.save_rows)
         self._qb_toolbar.delete_clicked.connect(register.toolbar_delete)
         self._qb_toolbar.clear_table_clicked.connect(register.toolbar_clear_table)
@@ -568,25 +655,36 @@ class _TablePage(QWidget):
             can_redo=bool(register._redo_stack),
         )
 
+        self._register = register
         self._action_bar = _ActionBar()
         self._action_bar.search_changed.connect(register.set_search)
         self._action_bar.mode_changed.connect(register.set_merged_mode)
         self._action_bar.payee_edited.connect(register.set_active_payee)
         self._action_bar.cheque_edited.connect(register.set_active_cheque)
+        self._action_bar.reconciled_date_changed.connect(self._on_reconciled_date)
         register.edit_state_changed.connect(self._action_bar.set_edit_state)
         register.mode_changed.connect(self._action_bar.sync_mode)
         register.mode_changed.connect(self._doc_header.set_merged)
         register.active_payee_cheque_changed.connect(
             self._action_bar.set_payee_cheque_values
         )
+        register.stats_updated.connect(self._sync_reconciled_date)
+        self._action_bar.set_reconciled_date(register.current_date())
 
         # 1) Icon toolbar (incl. Export/Import/Today/Edit/Submit)
         # 2) Daily Register + totals
-        # 3) My/Merged + Search  ···  Payee / Cheque
+        # 3) My/Merged + Search  ···  Reconciled Date / Payee / Cheque
         vl.addWidget(self._qb_toolbar)
         vl.addWidget(self._doc_header)
         vl.addWidget(self._action_bar)
         vl.addWidget(register, 1)
+
+    def _sync_reconciled_date(self, *_args) -> None:
+        self._action_bar.set_reconciled_date(self._register.current_date())
+
+    def _on_reconciled_date(self, d) -> None:
+        if not self._register.navigate_to_date(d):
+            self._action_bar.set_reconciled_date(self._register.current_date())
 
 
 

@@ -645,6 +645,26 @@ def apply_date_policy(
     preview.flag_date_discrepancy = False
 
 
+def suggested_reconciled_date(preview: DailyImportPreview) -> Optional[date]:
+    """Default Simple/Uploads filing day: majority row date when known.
+
+    Excel row dates are not changed. This is only the day the batch is opened
+    under (same role as ``import_primary_date``).
+    """
+    if preview.primary_date is not None:
+        return preview.primary_date
+    counts = preview.date_counts or {}
+    if counts:
+        top = max(counts.values())
+        tied = sorted(d for d, n in counts.items() if n == top)
+        if tied:
+            return tied[0]
+    detected = list(preview.detected_dates or [])
+    if detected:
+        return sorted(detected)[0]
+    return None
+
+
 def _register_dt(primary: Optional[date]) -> Optional[datetime]:
     if primary is None:
         return None

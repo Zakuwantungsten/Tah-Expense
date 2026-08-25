@@ -197,3 +197,22 @@ async def test_persist_header_updates_only_payee_cheque(register, monkeypatch):
     assert tx.payee == "VENDOR"
     assert tx.cheque == "55"
     assert register._dirty_rows == set()
+
+
+def test_action_bar_reconciled_date_emits_and_syncs(qapp):
+    from datetime import date
+
+    from PySide6.QtCore import QDate
+
+    from tahmeed.ui.cashier.dashboard import _ActionBar
+
+    bar = _ActionBar()
+    seen: list = []
+    bar.reconciled_date_changed.connect(seen.append)
+
+    bar.set_reconciled_date(date(2026, 8, 19))
+    assert bar._reconciled.date() == QDate(2026, 8, 19)
+    assert seen == []
+
+    bar._reconciled.setDate(QDate(2026, 8, 20))
+    assert seen == [date(2026, 8, 20)]

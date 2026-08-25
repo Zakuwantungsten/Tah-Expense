@@ -856,7 +856,7 @@ class DailyRegister(QWidget):
         self._people_names: list = []      # Ownership / APR BY suggestions (unrestricted)
         self._cashier_names: dict = {}     # ObjectId -> display name
         self._merged_mode: bool = False    # Shared/Merged day (all cashiers)
-        self._current_date: date = date.today()
+        self._current_date: Optional[date] = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
         self._saved_txs: dict    = {}   # row_index -> original Transaction (saved rows)
@@ -866,6 +866,8 @@ class DailyRegister(QWidget):
         self._search_text: str    = ""
         self._pending_highlight: str = ""  # set by navigate_to_date; consumed in _populate
         self._load_upload_id: str = ""     # one-shot: load this Excel batch instead of a day
+        # When True, skip local draft restore (used while staging a daily import).
+        self._skip_draft_restore: bool = False
         # Day-level Payee / Cheque stamp (header fields → all data rows)
         self._header_payee: str = ""
         self._header_cheque: str = ""
@@ -1097,7 +1099,7 @@ class DailyRegister(QWidget):
 
     def navigate_to_date(
         self, d: date, highlight_term: str = "", *, merged: bool | None = None
-    ) -> None:
+    ) -> bool:
         """Called by dashboard when TransactionBrowser 'Go To' is used.
 
         highlight_term — if provided, the register scrolls to the first row
@@ -1107,7 +1109,35 @@ class DailyRegister(QWidget):
         if isinstance(d, datetime):
             d = d.date()
         if not isinstance(d, date):
-            return
+            return False
+
+        # Blank New table → user picked a Reconciled Date.
+        if self._current_date is None:
+            self._pending_highlight = highlight_term
+            self._commit_open_editor()
+            if merged is True and not self._merged_mode:
+                self._merged_mode = True
+                self.mode_changed.emit(True)
+            if self.has_unsaved_work():
+                # Keep typed rows; stamp them onto the chosen day.
+                self._current_date = d
+                self._stamp_empty_row_dates()
+                self._update_footer()
+                self._schedule_draft_autosave()
+                return True
+            self._reset_edit_state()
+            self._current_date = d
+            self._show_register_loading(f"Loading {d.strftime('%d %b %Y')}…")
+            asyncio.ensure_future(self._load_date(d))
+            return True
+
+        if (
+            d == self._current_date
+            and not highlight_term
+            and not getattr(self, "_load_upload_id", "")
+            and merged is not True
+        ):
+            return True
         self._pending_highlight = highlight_term
         self._commit_open_editor()
         if merged is True and not self._merged_mode:
@@ -1115,19 +1145,17 @@ class DailyRegister(QWidget):
             self.mode_changed.emit(True)
         if self.has_unsaved_work():
             self._flush_local_draft()
-            resp = QMessageBox.question(
-                self, "Unsaved changes",
-                "You have unsaved changes on this date.\nSave them before leaving?",
-                QMessageBox.Yes | QMessageBox.Discard | QMessageBox.Cancel,
-                QMessageBox.Yes,
+            choice = self._prompt_unsaved_work(
+                "You have unsaved changes on this date.\n"
+                "Save as draft before leaving?"
             )
-            if resp == QMessageBox.Cancel:
+            if choice == "cancel":
                 self._pending_highlight = ""
                 self._load_upload_id = ""
-                return
-            if resp == QMessageBox.Yes:
+                return False
+            if choice == "save":
                 asyncio.ensure_future(self._save_then_navigate(d))
-                return
+                return True
             # Discard → clear local recovery draft for this date, then leave.
             self._clear_local_draft()
         self._reset_edit_state()
@@ -1137,6 +1165,11 @@ class DailyRegister(QWidget):
         else:
             self._show_register_loading(f"Loading {d.strftime('%d %b %Y')}…")
         asyncio.ensure_future(self._load_date(d))
+        return True
+
+    def current_date(self) -> Optional[date]:
+        """Reconciled / register day Simple is currently open on (or None if unset)."""
+        return self._current_date
 
     def navigate_to_upload(self, upload_id: str, primary_date=None) -> None:
         """Open every row of one Excel upload on the register table."""
@@ -1149,6 +1182,8 @@ class DailyRegister(QWidget):
             d = d.date()
         if not isinstance(d, date):
             d = self._current_date
+        if not isinstance(d, date):
+            d = date.today()
         self.navigate_to_date(d, merged=True)
 
     async def _save_then_navigate(self, d: date) -> None:
@@ -1212,9 +1247,10 @@ class DailyRegister(QWidget):
             self._populate(txs)
             show_cashier = self._merged_mode or bool(upload_id)
             self._table.setColumnHidden(COL_CASHIER, not show_cashier)
-            restored = self._restore_local_draft()
-            if restored:
-                self._show_draft_restored_notice(*restored)
+            if not self._skip_draft_restore:
+                restored = self._restore_local_draft()
+                if restored:
+                    self._show_draft_restored_notice(*restored)
         except Exception as exc:
             if seq == self._load_gen:
                 QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
@@ -1229,22 +1265,22 @@ class DailyRegister(QWidget):
         self._commit_open_editor()
         if self.has_unsaved_work():
             self._flush_local_draft()
-            resp = QMessageBox.question(
-                self, "Unsaved changes",
-                "You have unsaved changes.\nSave them before switching mode?",
-                QMessageBox.Yes | QMessageBox.Discard | QMessageBox.Cancel,
-                QMessageBox.Yes,
+            choice = self._prompt_unsaved_work(
+                "You have unsaved changes.\nSave as draft before switching mode?"
             )
-            if resp == QMessageBox.Cancel:
+            if choice == "cancel":
                 self.mode_changed.emit(self._merged_mode)
                 return
-            if resp == QMessageBox.Yes:
+            if choice == "save":
                 asyncio.ensure_future(self._save_then_switch_mode(bool(merged)))
                 return
             self._clear_local_draft()
         self._merged_mode = bool(merged)
         self._reset_edit_state()
         self.mode_changed.emit(self._merged_mode)
+        if self._current_date is None:
+            self._populate([])
+            return
         self._show_register_loading("Loading…")
         asyncio.ensure_future(self._load_date(self._current_date))
 
@@ -1255,6 +1291,9 @@ class DailyRegister(QWidget):
             return
         self._merged_mode = merged
         self.mode_changed.emit(self._merged_mode)
+        if self._current_date is None:
+            self._populate([])
+            return
         self._show_register_loading("Loading…")
         await self._load_date(self._current_date)
 
@@ -1271,6 +1310,13 @@ class DailyRegister(QWidget):
         self.save_busy_changed.emit(True)
         try:
             self._commit_open_editor()
+            if self._current_date is None:
+                QMessageBox.warning(
+                    self,
+                    "Reconciled Date required",
+                    "Set Reconciled Date before submitting for verify.",
+                )
+                return
             if self.has_unsaved_work():
                 resp = QMessageBox.question(
                     self, "Unsaved changes",
@@ -1309,7 +1355,10 @@ class DailyRegister(QWidget):
                 self.save_busy_changed.emit(False)
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._load_date(self._current_date))
+        if self._current_date is None:
+            self._populate([])
+        else:
+            asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_cashier_settings())
 
     def reload_settings(self) -> None:
@@ -1524,13 +1573,10 @@ class DailyRegister(QWidget):
             return None
 
         date_str = txt(COL_DATE)
-        tx_date = _parse_optional_date(date_str, default_year=self._current_date.year)
+        day = self._current_date or date.today()
+        tx_date = _parse_optional_date(date_str, default_year=day.year)
         if tx_date is None:
-            tx_date = datetime(
-                self._current_date.year,
-                self._current_date.month,
-                self._current_date.day,
-            )
+            tx_date = datetime(day.year, day.month, day.day)
 
         raw_tzs = txt(COL_TZS)
         raw_usd = txt(COL_USD)
@@ -1696,6 +1742,8 @@ class DailyRegister(QWidget):
             self._flush_local_draft(include_dirty=False)
         self._reset_edit_state()
         if discard:
+            if self._current_date is None:
+                return
             asyncio.ensure_future(self._load_date(self._current_date))
 
     def _reset_edit_state(self) -> None:
@@ -1881,7 +1929,12 @@ class DailyRegister(QWidget):
             "pdf": ("PDF Report (*.pdf)", ".pdf"),
         }
         file_filter, ext = filters[fmt]
-        default_name = f"register_{self._current_date.isoformat()}{ext}"
+        date_slug = (
+            self._current_date.isoformat()
+            if isinstance(self._current_date, date)
+            else "new"
+        )
+        default_name = f"register_{date_slug}{ext}"
         path, _ = QFileDialog.getSaveFileName(
             self, f"Export register as {ext.lstrip('.').upper()}",
             default_name, file_filter,
@@ -2329,8 +2382,29 @@ class DailyRegister(QWidget):
 
     def _register_primary_dt(self) -> datetime:
         """Register calendar day as datetime (same shape as daily-import primary)."""
-        d = self._current_date
+        d = self._current_date or date.today()
         return datetime(d.year, d.month, d.day)
+
+    def _stamp_empty_row_dates(self) -> None:
+        """Fill blank Date cells on typed rows after Reconciled Date is chosen."""
+        if not isinstance(self._current_date, date):
+            return
+        stamp = self._register_date_str()
+        if not stamp:
+            return
+        prev = self._table.blockSignals(True)
+        try:
+            for row in range(self._saved_count, self._table.rowCount()):
+                if not self._row_has_data(row):
+                    continue
+                date_it = self._table.item(row, COL_DATE)
+                if date_it is not None and date_it.text().strip():
+                    continue
+                new_it = QTableWidgetItem(stamp)
+                new_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                self._table.setItem(row, COL_DATE, new_it)
+        finally:
+            self._table.blockSignals(prev)
 
     def _resolve_import_primary_date(self, row: int):
         """Register day ownership for this row (upload meta, existing stamp, or open day).
@@ -3918,15 +3992,42 @@ class DailyRegister(QWidget):
         from tahmeed.ui.widgets.upload_busy import UploadBusy
 
         primary = preview.primary_date or self._current_date
-        if primary != self._current_date:
-            if self.has_unsaved_work():
-                ok = await self.confirm_leave()
-                if not ok:
-                    return
-            self._reset_edit_state()
-            self._current_date = primary
-            with UploadBusy(self, "Opening import date…", title="Import"):
-                await self._load_date(primary)
+        if not isinstance(primary, date):
+            QMessageBox.warning(
+                self,
+                "Reconciled Date required",
+                "This import has no reconciled date. Set Reconciled Date and try again.",
+            )
+            return
+
+        # Always resolve unsaved work first — same-date imports used to append on
+        # top of recovered local-draft / typed rows (extra rows vs the Excel file).
+        if self.has_unsaved_work():
+            ok = await self.confirm_leave()
+            if not ok:
+                return
+
+        # Drop any crash-recovery draft for the target day so load cannot re-inject
+        # old rows under the fresh import.
+        try:
+            clear_register_draft(
+                self._user._id, primary, merged=self._merged_mode
+            )
+        except Exception:
+            pass
+
+        self._skip_draft_restore = True
+        try:
+            if primary != self._current_date:
+                self._reset_edit_state()
+                self._current_date = primary
+                with UploadBusy(self, "Opening import date…", title="Import"):
+                    await self._load_date(primary)
+            else:
+                # Same day: wipe leftover unsaved editable rows before staging.
+                self._wipe_unsaved_editable_rows()
+        finally:
+            self._skip_draft_restore = False
 
         payloads = [staged_row_payload(row, preview) for row in preview.rows]
         # Queue truck issues now, but open the correction dialog only after this
@@ -3945,15 +4046,31 @@ class DailyRegister(QWidget):
                 self,
                 "Import ready",
                 f"Loaded {len(payloads):,} row(s) from \"{preview.source_filename}\" "
-                f"under register date {primary.strftime('%d/%m/%Y')}.\n\n"
-                "Excel row dates are kept as written. Open this upload anytime to "
-                "see every row in the batch.\n\n"
+                f"under reconciled date {primary.strftime('%d/%m/%Y')}.\n\n"
+                "Excel row dates are kept as written. Open this upload (or this "
+                "reconciled day in Simple) anytime to see every row in the batch.\n\n"
                 "Review the Table, make any edits, then click Save.\n"
                 "Saved entries go to the accountant Verify inbox.",
             )
         finally:
             self._suppress_truck_dialog = False
         QTimer.singleShot(0, self._flush_truck_correction)
+
+    def _wipe_unsaved_editable_rows(self) -> None:
+        """Clear typed / staged unsaved rows without undo (import staging prep)."""
+        self._commit_open_editor()
+        self._draft_timer.stop()
+        txs = [
+            self._saved_txs[r]
+            for r in range(self._saved_count)
+            if self._saved_txs.get(r) is not None
+        ]
+        show_cashier = not self._table.isColumnHidden(COL_CASHIER)
+        self._pending_row_meta.clear()
+        self._truck_allow_anyway.clear()
+        self._pending_truck_issues.clear()
+        self._populate(txs)
+        self._table.setColumnHidden(COL_CASHIER, not show_cashier)
 
     def _kick_auto_fill_item(self, row: int, description: str) -> None:
         if self._bulk_mutating or not description.strip():
@@ -4156,6 +4273,13 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
 
     def save_rows(self) -> None:
+        if self._current_date is None:
+            QMessageBox.warning(
+                self,
+                "Reconciled Date required",
+                "Set Reconciled Date before saving.",
+            )
+            return
         if self._save_in_flight or self._submit_in_flight:
             return
         asyncio.ensure_future(self._do_save())
@@ -4192,17 +4316,72 @@ class DailyRegister(QWidget):
             QAbstractItemView.PositionAtCenter,
         )
 
-    def toolbar_new_row(self) -> None:
-        """Insert a blank editable row (same as Insert Row Below)."""
-        self._insert_below()
-        row = self._table.currentRow()
-        if row < 0:
-            row = self._saved_count
-        self._table.selectRow(row)
-        self._table.setCurrentCell(row, COL_DESC)
-        item = self._table.item(row, COL_DESC)
-        if item is not None:
-            self._table.editItem(item)
+    def toolbar_new_table(self) -> None:
+        """Open a blank register for fresh entry (Reconciled Date shows '-')."""
+        asyncio.ensure_future(self._toolbar_new_table())
+
+    # Back-compat alias — New no longer inserts a row.
+    toolbar_new_row = toolbar_new_table
+
+    async def _toolbar_new_table(self) -> None:
+        self._commit_open_editor()
+        if self.has_unsaved_work():
+            if self._current_date is None:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle("Unsaved changes")
+                box.setText(
+                    "This blank table has unsaved entries but no Reconciled Date.\n\n"
+                    "Set Reconciled Date to save as draft, or discard this work."
+                )
+                discard_btn = box.addButton("Discard", QMessageBox.DestructiveRole)
+                cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+                box.setDefaultButton(cancel_btn)
+                box.exec()
+                if box.clickedButton() != discard_btn:
+                    return
+            else:
+                choice = self._prompt_unsaved_work(
+                    "You have unsaved entries in the Daily Register.\n"
+                    "Save as draft under the current Reconciled Date, "
+                    "discard, or cancel?"
+                )
+                if choice == "cancel":
+                    return
+                if choice == "save":
+                    if not await self._do_save():
+                        return
+                else:
+                    self._clear_local_draft()
+        else:
+            self._clear_local_draft()
+        self._open_blank_register()
+
+    def _open_blank_register(self) -> None:
+        """Empty editable grid with unset reconciled date (New table)."""
+        self._draft_timer.stop()
+        if isinstance(self._current_date, date):
+            try:
+                clear_register_draft(
+                    self._user._id, self._current_date, merged=self._merged_mode
+                )
+            except Exception:
+                pass
+        self._load_gen += 1  # cancel any in-flight date load
+        self._load_upload_id = ""
+        self._skip_draft_restore = False
+        self._reset_edit_state()
+        self._pending_row_meta.clear()
+        self._truck_allow_anyway.clear()
+        self._pending_truck_issues.clear()
+        self._header_payee = ""
+        self._header_cheque = ""
+        self._current_date = None
+        self._table.setColumnHidden(COL_CASHIER, True)
+        self._populate([])
+        self._hide_register_loading()
+        if self._table.rowCount() > 0:
+            self._table.setCurrentCell(0, COL_DESC)
 
     def toolbar_delete(self) -> None:
         """Delete selected saved entries or clear/remove selected unsaved rows."""
@@ -4448,13 +4627,18 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
 
     def _schedule_draft_autosave(self) -> None:
-        if self._restoring_draft or self._save_in_flight or self._bulk_mutating:
+        if (
+            self._restoring_draft
+            or self._save_in_flight
+            or self._bulk_mutating
+            or self._current_date is None
+        ):
             return
         self._draft_timer.start()
 
     def _flush_local_draft(self, *, include_dirty: bool = True) -> None:
         """Persist current unsaved grid state to disk (or clear if empty)."""
-        if self._restoring_draft:
+        if self._restoring_draft or self._current_date is None:
             return
         try:
             self._commit_open_editor()
@@ -4466,6 +4650,8 @@ class DailyRegister(QWidget):
 
     def _clear_local_draft(self) -> None:
         self._draft_timer.stop()
+        if self._current_date is None:
+            return
         try:
             clear_register_draft(
                 self._user._id, self._current_date, merged=self._merged_mode
@@ -4512,6 +4698,8 @@ class DailyRegister(QWidget):
 
         Returns ``(dirty_count, new_count)`` when anything was restored, else None.
         """
+        if self._current_date is None:
+            return None
         draft = load_register_draft(
             self._user._id, self._current_date, merged=self._merged_mode
         )
@@ -4611,6 +4799,24 @@ class DailyRegister(QWidget):
             "Click Save to store them on the server.",
         )
 
+    def _prompt_unsaved_work(self, message: str) -> str:
+        """Return ``save``, ``discard``, or ``cancel`` for unsaved register work."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Unsaved changes")
+        box.setText(message)
+        save_btn = box.addButton("Save as Draft", QMessageBox.AcceptRole)
+        discard_btn = box.addButton("Discard", QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(save_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == save_btn:
+            return "save"
+        if clicked == discard_btn:
+            return "discard"
+        return "cancel"
+
     def _commit_open_editor(self) -> None:
         """Flush the active cell editor into the model before save/leave checks."""
         row, col = self._table.currentRow(), self._table.currentColumn()
@@ -4628,19 +4834,32 @@ class DailyRegister(QWidget):
             self._clear_local_draft()
             return True
         self._flush_local_draft()
-        resp = QMessageBox.question(
-            self, "Unsaved changes",
-            "You have unsaved entries in the Daily Register.\n"
-            "Save them before leaving?",
-            QMessageBox.Yes | QMessageBox.Discard | QMessageBox.Cancel,
-            QMessageBox.Yes,
-        )
-        if resp == QMessageBox.Cancel:
-            return False
-        if resp == QMessageBox.Discard:
+        if self._current_date is None:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Unsaved changes")
+            box.setText(
+                "You have unsaved entries but no Reconciled Date.\n\n"
+                "Set Reconciled Date to save as draft, or discard before leaving."
+            )
+            discard_btn = box.addButton("Discard", QMessageBox.DestructiveRole)
+            cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(cancel_btn)
+            box.exec()
+            if box.clickedButton() != discard_btn:
+                return False
             self._clear_local_draft()
             return True
-        # Yes — save; if the user cancels mid-save (duplicates / off-date), stay.
+        choice = self._prompt_unsaved_work(
+            "You have unsaved entries in the Daily Register.\n"
+            "Save as draft before leaving?"
+        )
+        if choice == "cancel":
+            return False
+        if choice == "discard":
+            self._clear_local_draft()
+            return True
+        # Save as draft; if the user cancels mid-save (duplicates / off-date), stay.
         return await self._do_save()
 
     async def _do_save(self) -> bool:
@@ -4663,6 +4882,14 @@ class DailyRegister(QWidget):
         """Inner save implementation (caller holds `_save_in_flight`)."""
         saved, updated, errors = 0, 0, []
         self._commit_open_editor()
+
+        if self._current_date is None:
+            QMessageBox.warning(
+                self,
+                "Reconciled Date required",
+                "Set Reconciled Date before saving as draft.",
+            )
+            return False
 
         missing_truck_rows = self._rows_missing_required_truck()
         if missing_truck_rows:

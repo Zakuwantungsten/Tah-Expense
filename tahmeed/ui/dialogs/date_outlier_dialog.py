@@ -1,26 +1,27 @@
-"""Dialogs / helpers for assigning one register day to a daily Excel upload."""
+"""Dialogs / helpers for assigning one reconciled day to a daily Excel upload."""
 
 from __future__ import annotations
 
 from datetime import date
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
-    QButtonGroup,
+    QDateEdit,
     QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QRadioButton,
     QVBoxLayout,
 )
 
 from tahmeed.services.daily_import_service import (
     DailyImportPreview,
     apply_date_policy,
+    suggested_reconciled_date,
 )
+from tahmeed.ui.accountant.date_filters import style_calendar_popup
 
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -36,7 +37,7 @@ KEEP_AS_IS = "keep_as_is"
 
 
 class DateAllocationDialog(QDialog):
-    """Ask which register day to file the upload under when majority is unclear."""
+    """Require an explicit reconciled date for the upload (majority is the default)."""
 
     def __init__(
         self,
@@ -44,19 +45,24 @@ class DateAllocationDialog(QDialog):
         counts: Dict[date, int],
         total_rows: int,
         parent=None,
+        *,
+        default_date: Optional[date] = None,
     ) -> None:
         super().__init__(parent)
-        self._chosen: Optional[date] = candidates[0] if candidates else None
-        self.setWindowTitle("Choose Register Date")
+        self._chosen: Optional[date] = default_date or (
+            candidates[0] if candidates else date.today()
+        )
+        self.setWindowTitle("Choose Reconciled Date")
         self.setMinimumWidth(540)
         self.setModal(True)
-        self._build(candidates, counts, total_rows)
+        self._build(candidates, counts, total_rows, self._chosen)
 
     def _build(
         self,
         candidates: List[date],
         counts: Dict[date, int],
         total_rows: int,
+        default_date: date,
     ) -> None:
         self.setStyleSheet(
             f"QDialog {{ background: {_BG}; color: {_T1}; }}"
@@ -66,7 +72,7 @@ class DateAllocationDialog(QDialog):
         root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(12)
 
-        title = QLabel("No clear majority register date")
+        title = QLabel("Reconciled Date")
         title.setStyleSheet(
             f"color: {_T1}; font-size: 16px; font-weight: 700;"
             " border: none; background: transparent;"
@@ -83,33 +89,62 @@ class DateAllocationDialog(QDialog):
         cvl.setContentsMargins(14, 12, 14, 12)
         cvl.setSpacing(6)
         info = QLabel(
-            f"This file has <b>{total_rows}</b> rows and several dates are tied "
-            "for most common. Pick <b>one register date</b> for the whole upload "
-            "(how it is filed and opened). Excel row dates stay as written — "
-            "they are not changed and are not treated as discrepancies."
+            f"This file has <b>{total_rows}</b> row(s). Pick <b>Reconciled Date</b> "
+            "for the whole upload — how it is filed and opened in Simple and Uploads. "
+            "Excel row dates stay as written and still appear that way in Master "
+            "and reports."
         )
         info.setWordWrap(True)
         info.setStyleSheet(f"color: {_T2}; font-size: 12px;")
         cvl.addWidget(info)
+
+        if counts:
+            bits = [
+                f"{d.strftime('%d/%m/%Y')} ({n} row{'s' if n != 1 else ''})"
+                for d, n in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            ]
+            breakdown = QLabel("Dates in file: " + " · ".join(bits))
+            breakdown.setWordWrap(True)
+            breakdown.setStyleSheet(f"color: {_T2}; font-size: 12px;")
+            cvl.addWidget(breakdown)
         root.addWidget(card)
 
-        self._group = QButtonGroup(self)
-        ordered = list(candidates)
-        for d in sorted(counts.keys()):
-            if d not in ordered:
-                ordered.append(d)
-        for i, d in enumerate(ordered):
-            n = int(counts.get(d, 0))
-            label = f"{d.strftime('%d/%m/%Y')}  ({n} row{'s' if n != 1 else ''})"
-            rb = QRadioButton(label)
-            rb.setProperty("alloc_date", d.isoformat())
-            rb.setStyleSheet(
-                f"color: {_T1}; font-size: 13px; font-weight: 600;"
-            )
-            if i == 0:
-                rb.setChecked(True)
-            self._group.addButton(rb, i)
-            root.addWidget(rb)
+        picker_row = QHBoxLayout()
+        picker_row.setSpacing(8)
+        lbl = QLabel("Reconciled Date")
+        lbl.setStyleSheet(
+            f"color: {_T1}; font-size: 13px; font-weight: 600;"
+        )
+        picker_row.addWidget(lbl)
+
+        self._date_edit = QDateEdit()
+        self._date_edit.setCalendarPopup(True)
+        self._date_edit.setDisplayFormat("dd MMM yyyy")
+        self._date_edit.setDate(
+            QDate(default_date.year, default_date.month, default_date.day)
+        )
+        self._date_edit.setFixedHeight(34)
+        self._date_edit.setMinimumWidth(150)
+        self._date_edit.setStyleSheet(
+            "QDateEdit {"
+            f"  border: 1px solid {_BORDER}; border-radius: 5px;"
+            "  padding: 0 8px; font-size: 13px; font-weight: 600;"
+            f"  color: {_T1}; background: {_WHITE};"
+            "}"
+            f"QDateEdit:focus {{ border-color: {_BLUE}; }}"
+        )
+        style_calendar_popup(self._date_edit)
+        picker_row.addWidget(self._date_edit)
+        picker_row.addStretch()
+        root.addLayout(picker_row)
+
+        hint = QLabel(
+            "Default is the majority date in the file. Change it if this batch "
+            "should open under a different reconciled day."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {_T2}; font-size: 12px;")
+        root.addWidget(hint)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -123,7 +158,7 @@ class DateAllocationDialog(QDialog):
         cancel.clicked.connect(self.reject)
         btn_row.addWidget(cancel)
 
-        ok = QPushButton("Use As Register Date")
+        ok = QPushButton("Use As Reconciled Date")
         ok.setCursor(Qt.PointingHandCursor)
         ok.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
@@ -136,11 +171,10 @@ class DateAllocationDialog(QDialog):
         root.addLayout(btn_row)
 
     def _on_ok(self) -> None:
-        btn = self._group.checkedButton()
-        if btn is not None:
-            raw = btn.property("alloc_date")
-            if raw:
-                self._chosen = date.fromisoformat(str(raw))
+        qd = self._date_edit.date()
+        if not qd.isValid():
+            return
+        self._chosen = date(qd.year(), qd.month(), qd.day())
         self.accept()
 
     def chosen_date(self) -> Optional[date]:
@@ -169,57 +203,43 @@ class DateOutlierDialog(DateAllocationDialog):
             counts=counts,
             total_rows=total_rows,
             parent=parent,
+            default_date=primary_date,
         )
         self._choice = FORCE_PRIMARY
-        self.setWindowTitle("Choose Register Date")
+        self.setWindowTitle("Choose Reconciled Date")
 
     def choice(self) -> str:
         return FORCE_PRIMARY
 
 
 def resolve_import_date_policy(preview: DailyImportPreview, parent=None) -> bool:
-    """Pick the upload's register day; keep every Excel row date as-is.
+    """Require an explicit reconciled day; keep every Excel row date as-is.
 
-    - Clear majority (or single date): that day is the register date.
-    - Unclear tie: ask which register date to file the batch under.
-    Returns False if the user cancels.
+    Majority (or filename fallback) is the calendar default. The user must
+    confirm before the import can continue. Returns False if they cancel.
     """
     if not preview.rows:
         apply_date_policy(preview)
         return True
 
-    if preview.outlier_count == 0 and preview.primary_date is not None:
-        apply_date_policy(preview)
-        return True
-
-    if preview.date_majority_clear and preview.primary_date is not None:
-        apply_date_policy(preview)
-        return True
-
+    suggested = suggested_reconciled_date(preview)
     candidates = sorted(
         preview.date_counts.keys(),
         key=lambda d: (-int(preview.date_counts.get(d, 0)), d),
     )
     if not candidates:
         candidates = list(preview.detected_dates)
-    if not candidates and preview.primary_date is not None:
-        candidates = [preview.primary_date]
-    if not candidates:
-        apply_date_policy(preview)
-        return True
-
-    if preview.date_counts:
-        max_n = max(preview.date_counts.values())
-        tied = sorted(d for d, n in preview.date_counts.items() if n == max_n)
-        prompt_candidates = tied or candidates
-    else:
-        prompt_candidates = candidates
+    if not candidates and suggested is not None:
+        candidates = [suggested]
+    if suggested is None:
+        suggested = date.today()
 
     dlg = DateAllocationDialog(
-        prompt_candidates,
+        candidates,
         preview.date_counts or {d: 0 for d in candidates},
         len(preview.rows),
         parent=parent,
+        default_date=suggested,
     )
     if dlg.exec() != DateAllocationDialog.Accepted:
         return False

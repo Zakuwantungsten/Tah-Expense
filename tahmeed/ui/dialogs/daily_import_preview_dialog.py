@@ -82,7 +82,7 @@ class DailyImportPreviewDialog(QDialog):
             reason_bits.append(f"{reasons['total_row']:,} total line(s)")
         summary = QLabel(
             f"<b>{p.source_filename}</b><br>"
-            f"{len(p.rows):,} row(s) ready · Register date <b>{primary}</b>"
+            f"{len(p.rows):,} row(s) ready · Reconciled date <b>{primary}</b>"
             + (
                 f" · Excel dates kept"
                 f" ({p.outlier_count:,} row(s) on other dates)"

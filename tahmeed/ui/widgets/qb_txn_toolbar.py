@@ -156,7 +156,9 @@ class QbTxnToolbar(QFrame):
 
         lay.addWidget(self._sep())
 
-        self._btn_new = self._tool_btn("mdi.file-plus-outline", "New", "New entry")
+        self._btn_new = self._tool_btn(
+            "mdi.file-plus-outline", "New", "New blank table for fresh data entry"
+        )
         self._btn_save = self._tool_btn("mdi.content-save-outline", "Save", "Save")
         self._btn_delete = self._tool_btn("mdi.close-box-outline", "Delete", "Delete entry")
         self._btn_clear_table: Optional[QToolButton] = None

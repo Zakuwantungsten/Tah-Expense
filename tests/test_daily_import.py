@@ -25,6 +25,7 @@ from tahmeed.services.daily_import_service import (
     pick_primary_date,
     problem_to_import_row,
     staged_row_payload,
+    suggested_reconciled_date,
 )
 
 
@@ -114,6 +115,126 @@ def test_pick_primary_date_filename_fallback() -> None:
     assert pick_primary_date(
         [], filename="MATUMIZI YA 23-07-2026.xlsx", sheet_name="Sheet1"
     ) == date(2026, 7, 23)
+
+
+def test_suggested_reconciled_date_uses_primary() -> None:
+    preview = DailyImportPreview(
+        source_filename="x.xlsx",
+        source_path="x.xlsx",
+        primary_date=date(2026, 7, 21),
+        date_counts={date(2026, 7, 21): 10, date(2026, 6, 28): 2},
+        date_majority_clear=True,
+    )
+    assert suggested_reconciled_date(preview) == date(2026, 7, 21)
+
+
+def test_suggested_reconciled_date_tie_picks_earliest_top() -> None:
+    preview = DailyImportPreview(
+        source_filename="x.xlsx",
+        source_path="x.xlsx",
+        primary_date=None,
+        date_counts={date(2026, 7, 22): 5, date(2026, 7, 21): 5},
+        date_majority_clear=False,
+    )
+    assert suggested_reconciled_date(preview) == date(2026, 7, 21)
+
+
+def test_resolve_import_date_policy_always_prompts(monkeypatch) -> None:
+    pytest.importorskip("PySide6")
+    from tahmeed.ui.dialogs import date_outlier_dialog as mod
+
+    rows = [
+        DailyImportRow(
+            serial=1,
+            date=datetime(2026, 7, 21),
+            description="Fuel",
+            truck_number="",
+            lpo_do="",
+            do_number="",
+            memo="",
+            notes="",
+            amount=100.0,
+            currency="TZS",
+            receipt_status="pending",
+            ownership="",
+            approver="",
+        ),
+    ]
+    preview = DailyImportPreview(
+        source_filename="x.xlsx",
+        source_path="x.xlsx",
+        rows=rows,
+        primary_date=date(2026, 7, 21),
+        date_counts={date(2026, 7, 21): 1},
+        date_majority_clear=True,
+        outlier_count=0,
+    )
+    seen: dict = {}
+
+    class _FakeDlg:
+        Accepted = 1
+
+        def __init__(self, *args, parent=None, default_date=None, **kwargs):
+            seen["default"] = default_date
+
+        def exec(self):
+            return 1
+
+        def chosen_date(self):
+            return date(2026, 8, 1)
+
+    monkeypatch.setattr(mod, "DateAllocationDialog", _FakeDlg)
+    assert mod.resolve_import_date_policy(preview) is True
+    assert seen["default"] == date(2026, 7, 21)
+    assert preview.primary_date == date(2026, 8, 1)
+    assert preview.outlier_count == 1
+
+
+def test_resolve_import_date_policy_cancel(monkeypatch) -> None:
+    pytest.importorskip("PySide6")
+    from tahmeed.ui.dialogs import date_outlier_dialog as mod
+
+    rows = [
+        DailyImportRow(
+            serial=1,
+            date=datetime(2026, 7, 21),
+            description="Fuel",
+            truck_number="",
+            lpo_do="",
+            do_number="",
+            memo="",
+            notes="",
+            amount=100.0,
+            currency="TZS",
+            receipt_status="pending",
+            ownership="",
+            approver="",
+        ),
+    ]
+    preview = DailyImportPreview(
+        source_filename="x.xlsx",
+        source_path="x.xlsx",
+        rows=rows,
+        primary_date=date(2026, 7, 21),
+        date_counts={date(2026, 7, 21): 1},
+        date_majority_clear=True,
+    )
+
+    class _CancelDlg:
+        Accepted = 1
+
+        def __init__(self, *args, parent=None, default_date=None, **kwargs):
+            pass
+
+        def exec(self):
+            return 0
+
+        def chosen_date(self):
+            return None
+
+    monkeypatch.setattr(mod, "DateAllocationDialog", _CancelDlg)
+    assert mod.resolve_import_date_policy(preview) is False
+    assert preview.primary_date == date(2026, 7, 21)
 
 
 def test_apply_date_policy_keeps_excel_row_dates() -> None:
