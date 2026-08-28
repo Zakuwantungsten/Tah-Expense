@@ -75,6 +75,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     ]),
     ("MANAGE", [
         ("manage_categories", "Items",             "mdi.tag-multiple-outline", {}),
+        ("manage_suppliers",  "Suppliers",         "mdi.truck-delivery-outline", {}),
         ("manage_description_maps", "Description Maps", "mdi.link-variant", {}),
         ("manage_people",     "People",           "mdi.account-outline", {}),
         ("manage_trucks",     "Trucks",           "mdi.truck",           {}),

@@ -38,7 +38,7 @@ from tahmeed.services.truck_format import (
 )
 from tahmeed.services.truck_service import get_fleet_numbers
 from tahmeed.services.settings_service import get_setting
-from tahmeed.services.category_service import get_all_categories
+from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.services.subtable_service import get_subtables
 
 # ── Design tokens ────────────────────────────────────────────────────────────
@@ -381,7 +381,7 @@ class RejectedView(QWidget):
 
     async def _load_lookups(self) -> None:
         try:
-            cats = await get_all_categories()
+            cats = await get_payment_target_categories()
             self._categories = cats
             self._cat_by_name = {c.name.lower(): c for c in cats}
         except Exception:

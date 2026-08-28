@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from tahmeed.models.category import Category
+from tahmeed.services.category_service import sort_payment_targets
 from tahmeed.services.mapping_assignment_service import MappingAssignment
 from tahmeed.ui.dialogs.item_dialog import ItemDialog
 
@@ -51,7 +52,7 @@ class DescriptionMappingDialog(QDialog):
         total: Optional[int] = None,
     ) -> None:
         super().__init__(parent)
-        self._categories = categories
+        self._categories = sort_payment_targets(categories)
         self._description = description
         self._selected: Optional[Category] = None
         self._action = ACTION_ASSIGN
@@ -81,7 +82,7 @@ class DescriptionMappingDialog(QDialog):
         root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(14)
 
-        title = QLabel("Assign Item for Description")
+        title = QLabel("Assign Item or Supplier for Description")
         title.setStyleSheet(
             f"color: {_T1}; font-size: 16px; font-weight: 700;"
             " border: none; background: transparent;"
@@ -139,7 +140,7 @@ class DescriptionMappingDialog(QDialog):
         cvl.addWidget(count_lbl)
         root.addWidget(card)
 
-        item_lbl = QLabel("Item (from Items tab) — remembered for next time")
+        item_lbl = QLabel("Item / Supplier — remembered for next time")
         item_lbl.setStyleSheet(
             f"color: {_T2}; font-size: 12px; border: none; background: transparent;"
         )
@@ -237,6 +238,24 @@ class DescriptionMappingDialog(QDialog):
         new_item_btn.clicked.connect(self._on_assign_new)
         btn_row.addWidget(new_item_btn)
 
+        new_supplier_btn = QPushButton("Assign to a New Supplier…")
+        new_supplier_btn.setCursor(Qt.PointingHandCursor)
+        new_supplier_btn.setFixedHeight(34)
+        new_supplier_btn.setAutoDefault(False)
+        new_supplier_btn.setDefault(False)
+        new_supplier_btn.setToolTip(
+            "Create a supplier payment target, then map this description to it."
+        )
+        new_supplier_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T1};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 13px; padding: 0 14px;"
+            " min-height: 34px; max-height: 34px; }}"
+            f"QPushButton:hover {{ background: {_BG}; }}"
+        )
+        new_supplier_btn.clicked.connect(self._on_assign_new_supplier)
+        btn_row.addWidget(new_supplier_btn)
+
         assign_btn = QPushButton("Assign && Continue")
         assign_btn.setCursor(Qt.PointingHandCursor)
         assign_btn.setFixedHeight(34)
@@ -280,12 +299,35 @@ class DescriptionMappingDialog(QDialog):
         self._action = ACTION_ASSIGN
         self.accept()
 
+    def _on_assign_new_supplier(self) -> None:
+        from tahmeed.ui.accountant.manage_suppliers import _SupplierDialog
+        from tahmeed.ui.dialog_theme import show_warning
+
+        dlg = _SupplierDialog(parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        data = dict(dlg.result_data or {})
+        name = (data.get("name") or "").strip()
+        if not name:
+            show_warning(self, "New Supplier", "Supplier name is required.")
+            return
+        existing = next(
+            (c for c in self._categories if c.name.strip().lower() == name.lower()),
+            None,
+        )
+        self._create_new = existing is None
+        self._new_item_name = name
+        self._new_item_fields = data
+        self._selected = existing or Category(name=name, is_supplier=True)
+        self._action = ACTION_ASSIGN
+        self.accept()
+
     def _on_assign(self) -> None:
         from tahmeed.ui.dialog_theme import show_warning
 
         name = self._combo.currentText().strip()
         if not name:
-            show_warning(self, "Select Item", "Please choose an item for this description.")
+            show_warning(self, "Select Item", "Please choose an item or supplier for this description.")
             return
         idx = self._combo.findText(name)
         cat_id = self._combo.itemData(idx) if idx >= 0 else None
@@ -299,8 +341,8 @@ class DescriptionMappingDialog(QDialog):
             show_warning(
                 self,
                 "Select Item",
-                "Please pick an existing item from the Items list, "
-                "or click Assign to a New Item.",
+                "Please pick an existing item or supplier from the list, "
+                "or click Assign to a New Item / Supplier.",
             )
             return
         if match is not None:

@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QDate
 
 from tahmeed.models.user import User
-from tahmeed.services.category_service import get_all_categories
+from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.ui.accountant.header_bar import HeaderBar
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.dialogs.change_password_dialog import ChangePasswordDialog
@@ -913,7 +913,7 @@ class CashierDashboard(QWidget):
 
     async def _load_categories(self) -> None:
         try:
-            cats = await get_all_categories()
+            cats = await get_payment_target_categories()
             self._register.update_categories(cats)
             self._form.update_categories(cats)
             self._overview.refresh()

@@ -350,7 +350,7 @@ _PATCH_FIELDS = {
         "name", "description", "color", "icon", "sidebar_name", "show_in_sidebar",
         "show_in_cashier_sidebar", "sort_order",
         "requires_receipt", "requires_truck", "lock_description",
-        "restrict_in_pdf", "restrict_in_excel", "active",
+        "restrict_in_pdf", "restrict_in_excel", "is_supplier", "active",
         "account_type", "ref_num", "account_number", "currency", "coa_description",
     },
     "category_subtables": {
@@ -418,8 +418,19 @@ def page_params(
 
 
 @categories.get("")
-async def list_categories(request: Request, _user: Authenticated, page: Annotated[dict, Depends(page_params)]) -> dict:
-    return await list_collection(request, "categories", **page)
+async def list_categories(
+    request: Request,
+    _user: Authenticated,
+    page: Annotated[dict, Depends(page_params)],
+    is_supplier: bool | None = Query(None),
+) -> dict:
+    exact: dict[str, Any] | None = None
+    if is_supplier is True:
+        exact = {"is_supplier": True}
+    elif is_supplier is False:
+        # Legacy docs omit the flag — treat missing as expense items.
+        exact = {"is_supplier": {"$ne": True}}
+    return await list_collection(request, "categories", exact=exact, **page)
 
 
 @categories.post("", status_code=201)

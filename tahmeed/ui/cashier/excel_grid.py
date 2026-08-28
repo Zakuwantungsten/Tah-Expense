@@ -60,7 +60,7 @@ from tahmeed.services.cashier_service import (
     check_for_duplicates, submit_day_for_verify, recount_day_order,
     next_day_order,
 )
-from tahmeed.services.category_service import get_all_categories, item_key
+from tahmeed.services.category_service import get_payment_target_categories, item_key
 from tahmeed.services.subtable_service import get_subtables
 from tahmeed.services.settings_service import get_setting, set_setting
 from tahmeed.services.register_draft_service import (
@@ -5132,13 +5132,9 @@ class DailyRegister(QWidget):
         self._refresh_truck_required_highlights()
 
     async def _load_categories(self) -> None:
-        """Ensure the Item column has the live Manage Items catalog.
-
-        Dashboard also pushes categories, but the register reloads on its own so
-        autocomplete / restrict still work if that push failed or is stale.
-        """
+        """Ensure the Item column lists expense items and suppliers."""
         try:
-            cats = await get_all_categories()
+            cats = await get_payment_target_categories()
         except Exception:
             return
         if cats:

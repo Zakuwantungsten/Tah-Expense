@@ -6,7 +6,7 @@ from typing import Optional
 
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QWidget
 
-from tahmeed.services.category_service import get_all_categories
+from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.services.daily_import_service import (
     DailyImportCancelled,
     DailyImportPreview,
@@ -55,7 +55,7 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
             if preview.rows and preview.unmapped:
                 busy.update("Loading items…")
                 try:
-                    categories = await busy.await_or_cancel(get_all_categories())
+                    categories = await busy.await_or_cancel(get_payment_target_categories())
                 except UploadCancelled:
                     raise
                 except Exception as exc:
@@ -94,7 +94,7 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
     if preview.unmapped:
         if categories is None:
             try:
-                categories = await get_all_categories()
+                categories = await get_payment_target_categories()
             except Exception as exc:
                 QMessageBox.critical(
                     parent, "Import Error", f"Could not load items:\n{exc}"

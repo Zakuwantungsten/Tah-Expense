@@ -184,7 +184,7 @@ class _MappingEditorDialog(QDialog):
                 )
             vl.addWidget(self._desc)
 
-        vl.addWidget(_lbl("Item *", size=12, color=_T2))
+        vl.addWidget(_lbl("Item / Supplier *", size=12, color=_T2))
         self._combo = QComboBox()
         self._combo.setEditable(True)
         self._combo.setInsertPolicy(QComboBox.NoInsert)
@@ -228,6 +228,14 @@ class _MappingEditorDialog(QDialog):
         )
         new_item.clicked.connect(self._on_assign_new)
         btn_row.addWidget(new_item)
+        new_supplier = _btn("Assign to a New Supplier…", primary=False, height=32)
+        new_supplier.setAutoDefault(False)
+        new_supplier.setDefault(False)
+        new_supplier.setToolTip(
+            "Create a supplier payment target, then map the selected description(s) to it."
+        )
+        new_supplier.clicked.connect(self._on_assign_new_supplier)
+        btn_row.addWidget(new_supplier)
         save_label = "Re-assign" if bulk else "Save"
         save = _btn(save_label, primary=True, height=32)
         save.setAutoDefault(True)
@@ -275,6 +283,39 @@ class _MappingEditorDialog(QDialog):
         descriptions = self._descriptions()
         self.result_description = descriptions[0] if descriptions else name
         self.result_category = existing or Category(name=name)
+        self.result_assignment = MappingAssignment(
+            action="assign",
+            description=self.result_description or "",
+            category=self.result_category,
+            create_new=existing is None,
+            new_item_name=name,
+            new_item_fields=data,
+        )
+        self.accept()
+
+    def _on_assign_new_supplier(self) -> None:
+        if not self._entries:
+            desc = self._desc.text().strip()
+            if not desc:
+                show_warning(self, "Validation", "Description is required.")
+                return
+        from tahmeed.ui.accountant.manage_suppliers import _SupplierDialog
+
+        dlg = _SupplierDialog(parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        data = dict(dlg.result_data or {})
+        name = (data.get("name") or "").strip()
+        if not name:
+            show_warning(self, "New Supplier", "Supplier name is required.")
+            return
+        existing = next(
+            (c for c in self._categories if c.name.strip().lower() == name.lower()),
+            None,
+        )
+        descriptions = self._descriptions()
+        self.result_description = descriptions[0] if descriptions else name
+        self.result_category = existing or Category(name=name, is_supplier=True)
         self.result_assignment = MappingAssignment(
             action="assign",
             description=self.result_description or "",
@@ -422,7 +463,7 @@ class DescriptionMapsWidget(QWidget):
         table_vl.setSpacing(0)
 
         self._table = QTableWidget(0, 3)
-        self._table.setHorizontalHeaderLabels(["#", "Description", "Item"])
+        self._table.setHorizontalHeaderLabels(["#", "Description", "Item / Supplier"])
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -492,10 +533,10 @@ class DescriptionMapsWidget(QWidget):
     async def _ensure_categories(self, *, refresh: bool = False) -> bool:
         if self._categories and not refresh:
             return True
-        from tahmeed.services.category_service import get_all_categories
+        from tahmeed.services.category_service import get_payment_target_categories
 
         try:
-            self._categories = await get_all_categories()
+            self._categories = await get_payment_target_categories()
         except Exception as exc:
             show_critical(self, "Error", f"Could not load items:\n{exc}")
             return False

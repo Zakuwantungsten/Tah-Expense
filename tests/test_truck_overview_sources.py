@@ -144,6 +144,30 @@ def test_diesel_overview_query_uses_transaction_date_not_display_date() -> None:
     assert "$regex" in query["truck_no"]
 
 
+def test_imported_feed_overview_queries_use_transaction_date() -> None:
+    """Toll / Parking Congo / RahnTech tabs range on transaction_date, not display strings."""
+    from tahmeed.services.accountant_service import _imported_feed_overview_query
+
+    cases = (
+        ("toll_plaza", "vehicle_reg", "toll_date"),
+        ("parking_congo", "vehicle_no", "payment_date"),
+        ("rahntech", "truck_number", "sales_date"),
+    )
+    for feed_type, truck_field, display_field in cases:
+        query = _imported_feed_overview_query(
+            feed_type,
+            truck_field,
+            "T103 DVL",
+            datetime(2026, 1, 1),
+            datetime(2026, 12, 31),
+        )
+        assert query["feed_type"] == feed_type
+        assert "transaction_date" in query
+        assert display_field not in query
+        assert query["transaction_date"]["$gte"] == datetime(2026, 1, 1, 0, 0, 0)
+        assert query["transaction_date"]["$lte"] == datetime(2026, 12, 31, 23, 59, 59)
+        assert "$regex" in query[truck_field]
+
 def test_truck_overview_covers_separate_expense_tabs() -> None:
     from tahmeed.services.accountant_service import _TRUCK_OVERVIEW_SOURCES
 

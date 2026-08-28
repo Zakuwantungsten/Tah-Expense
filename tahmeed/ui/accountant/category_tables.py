@@ -170,7 +170,7 @@ def _input_ss() -> str:
         f"  border: 1px solid {_BORDER}; border-radius: 5px;"
         f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
         "  font-family:'Segoe UI'; padding: 0 8px;"
-        "  min-height: 32px; max-height: 32px; }}"
+        "  min-height: 32px; max-height: 32px; }"
         f"QLineEdit:focus, QComboBox:focus, QDateEdit:focus {{ border-color: {_BLUE}; }}"
         "QComboBox::drop-down { border: none; width: 20px; }"
     )
@@ -190,7 +190,7 @@ def _btn(text: str, icon_name: str = "", primary: bool = False) -> QPushButton:
         b.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 12px; font-weight: 600;"
-            " font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-family:'Segoe UI'; padding: 0 12px; }"
             "QPushButton:hover { background: #005EA3; }"
             "QPushButton:disabled { background: #93C5FD; }"
         )
@@ -198,7 +198,7 @@ def _btn(text: str, icon_name: str = "", primary: bool = False) -> QPushButton:
         b.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px; font-size: 12px;"
-            " font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
     return b

@@ -1220,7 +1220,10 @@ class ManageItemsWidget(QWidget):
         try:
             search = self._search.text().strip().lower()
             if self._show_export_restricted:
-                all_items = await get_all_categories(include_inactive=self._show_inactive)
+                all_items = await get_all_categories(
+                    include_inactive=self._show_inactive,
+                    is_supplier=False,
+                )
                 filtered = [
                     item for item in all_items
                     if item.restrict_in_pdf or item.restrict_in_excel
@@ -1239,12 +1242,14 @@ class ManageItemsWidget(QWidget):
                     list_categories(
                         search=self._search.text().strip(),
                         include_inactive=self._show_inactive,
+                        is_supplier=False,
                         limit=_PAGE_SIZE,
                         skip=0,
                     ),
                     count_categories(
                         search=self._search.text().strip(),
                         include_inactive=self._show_inactive,
+                        is_supplier=False,
                     ),
                 )
                 self._items = list(items)
@@ -1275,6 +1280,7 @@ class ManageItemsWidget(QWidget):
             items = await list_categories(
                 search=search,
                 include_inactive=self._show_inactive,
+                is_supplier=False,
                 limit=_PAGE_SIZE,
                 skip=skip,
             )

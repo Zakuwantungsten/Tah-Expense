@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt, Signal, QTimer
 
 from tahmeed.config import APP_NAME, APP_VERSION
 from tahmeed.models.user import User
-from tahmeed.services.category_service import get_all_categories
+from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.ui.dialogs.change_password_dialog import ChangePasswordDialog
 from tahmeed.ui.accountant.menu_bar import AccountantMenuBar
 from tahmeed.ui.accountant.sidebar import SidebarWidget
@@ -48,6 +48,7 @@ _LAZY_PAGE_KEYS = frozenset({
     "manage_trailers",
     "manage_motor_vehicles",
     "manage_categories",
+    "manage_suppliers",
     "manage_description_maps",
     "manage_people",
     "manage_users",
@@ -79,6 +80,16 @@ class AccountantDashboard(QWidget):
         self._notification_poll_task: asyncio.Task | None = None
         self._notification_timer.start()
         self._poll_notification_counts()
+        # Preload the heavy separate-expenses module after the UI is up so the
+        # first sidebar click into those tabs does not stall on cold import.
+        QTimer.singleShot(0, self._warm_import_separate_expenses)
+
+    @staticmethod
+    def _warm_import_separate_expenses() -> None:
+        try:
+            import tahmeed.ui.accountant.separate_expenses  # noqa: F401
+        except Exception:
+            pass
 
     def _build(self) -> None:
         self.setObjectName("accountantDashboard")
@@ -293,6 +304,14 @@ class AccountantDashboard(QWidget):
             widget = ManageItemsWidget()
             widget.items_changed.connect(self._sidebar.refresh_items)
             widget.subitems_changed.connect(self._sidebar.refresh_subitems)
+            return widget
+
+        if key == "manage_suppliers":
+            from tahmeed.ui.accountant.manage_suppliers import ManageSuppliersWidget
+            widget = ManageSuppliersWidget()
+            widget.suppliers_changed.connect(
+                lambda: asyncio.ensure_future(self._load_categories())
+            )
             return widget
 
         if key == "manage_description_maps":
@@ -631,7 +650,7 @@ class AccountantDashboard(QWidget):
 
     async def _load_categories(self) -> None:
         try:
-            cats = await get_all_categories()
+            cats = await get_payment_target_categories()
             if self._register is not None:
                 self._register.update_categories(cats)
             else:

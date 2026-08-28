@@ -26,6 +26,7 @@ class Category:
     lock_description: bool = False  # if True, cashier may only pick from this item's sub-items
     restrict_in_pdf: bool = False   # omit this item's rows from configured PDF exports
     restrict_in_excel: bool = False # omit this item's rows from configured Excel/CSV exports
+    is_supplier: bool = False       # supplier payment target; excluded from Master Expenses
     active: bool = True
     # QuickBooks Chart of Accounts metadata (populated by CoA import).
     account_type: str = ""
@@ -56,6 +57,7 @@ class Category:
             "lock_description": self.lock_description,
             "restrict_in_pdf": self.restrict_in_pdf,
             "restrict_in_excel": self.restrict_in_excel,
+            "is_supplier": self.is_supplier,
             "active": self.active,
             "account_type": self.account_type,
             "ref_num": self.ref_num,
@@ -89,6 +91,7 @@ class Category:
             lock_description=doc.get("lock_description", False),
             restrict_in_pdf=doc.get("restrict_in_pdf", False),
             restrict_in_excel=doc.get("restrict_in_excel", False),
+            is_supplier=bool(doc.get("is_supplier", False)),
             active=doc.get("active", True),
             account_type=doc.get("account_type", ""),
             ref_num=doc.get("ref_num", ""),

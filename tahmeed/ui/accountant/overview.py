@@ -624,7 +624,7 @@ class _ActivityCard(QFrame):
         view_all.setCursor(Qt.PointingHandCursor)
         view_all.setStyleSheet(
             f"QPushButton {{ border: none; color: {_BLUE}; font-size: 12px;"
-            " font-family:'Segoe UI'; background: transparent; }}"
+            " font-family:'Segoe UI'; background: transparent; }"
             f"QPushButton:hover {{ color: #005fa3; }}"
         )
         view_all.clicked.connect(self.view_all_clicked.emit)

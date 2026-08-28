@@ -3382,7 +3382,7 @@ def _make_congo_summary_cards() -> Tuple[QFrame, QLabel, QLabel, QLabel]:
     frame = QFrame()
     frame.setStyleSheet(
         f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
-        "border-radius:6px;padding:8px;}}"
+        "border-radius:6px;padding:8px;}"
     )
     sl = QHBoxLayout(frame)
     sl.setContentsMargins(12, 8, 12, 8)
@@ -6102,7 +6102,7 @@ def _make_zambia_summary_cards() -> Tuple[QFrame, QLabel, QLabel, QLabel]:
     frame = QFrame()
     frame.setStyleSheet(
         f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
-        "border-radius:6px;padding:8px;}}"
+        "border-radius:6px;padding:8px;}"
     )
     sl = QHBoxLayout(frame)
     sl.setContentsMargins(12, 8, 12, 8)
@@ -7203,7 +7203,7 @@ class _PlaceholderExpenseWidget(QWidget):
         card = QFrame()
         card.setStyleSheet(
             f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};"
-            "border-radius:8px;}}"
+            "border-radius:8px;}"
         )
         card_vl = QVBoxLayout(card)
         card_vl.setContentsMargins(0, 60, 0, 60)
@@ -7623,7 +7623,7 @@ class _AfritrackGrid(QTableWidget):
     def _grid_ss(self) -> str:
         return (
             f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-            "border:none;font-size:12px;font-family:'Segoe UI';}}"
+            "border:none;font-size:12px;font-family:'Segoe UI';}"
             f"QTableWidget::item{{padding:0 6px;color:{_T1};}}"
             f"QTableWidget::item:selected{{background:{_QB_SEL_BG};color:{_QB_SEL_FG};}}"
             f"QHeaderView::section{{background:{_QB_HDR_BG};color:{_QB_HDR_FG};"
@@ -8037,7 +8037,7 @@ class _AfritrackFooter(QWidget):
     def _foot_ss(self) -> str:
         return (
             f"QTableWidget{{background:{_QB_FOOT_BG};gridline-color:{_BORDER};"
-            "border:none;font-size:12px;font-family:'Segoe UI';}}"
+            "border:none;font-size:12px;font-family:'Segoe UI';}"
             f"QTableWidget::item{{padding:0 8px;color:{_T1};}}"
         )
 
@@ -9131,7 +9131,7 @@ class _InsTotalsBar(QFrame):
         self.setFixedHeight(38)
         self.setStyleSheet(
             f"QFrame{{background:{_QB_HDR_BG};border-top:2px solid #BFDBFE;"
-            "border-bottom-left-radius:6px;border-bottom-right-radius:6px;}}"
+            "border-bottom-left-radius:6px;border-bottom-right-radius:6px;}"
         )
         hl = QHBoxLayout(self)
         hl.setContentsMargins(16, 0, 16, 0)
@@ -9475,7 +9475,7 @@ def _ins_info_card(title: str, icon_name: str) -> Tuple[QFrame, QLabel]:
     card.setObjectName("ins_info_card")
     card.setStyleSheet(
         f"QFrame#ins_info_card{{background:{_QB_HDR_BG};"
-        "border:1px solid #BFDBFE;border-radius:8px;}}"
+        "border:1px solid #BFDBFE;border-radius:8px;}"
     )
     hl = QHBoxLayout(card)
     hl.setContentsMargins(20, 14, 20, 14)
@@ -9720,7 +9720,7 @@ class ComesaWidget(_FeedExportMixin, QWidget):
         card = QFrame()
         card.setStyleSheet(
             f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};"
-            "border-radius:6px;}}"
+            "border-radius:6px;}"
         )
         cl = QVBoxLayout(card)
         cl.setContentsMargins(0, 0, 0, 0)
@@ -9969,7 +9969,7 @@ class ThirdPartyWidget(_FeedExportMixin, QWidget):
         card = QFrame()
         card.setStyleSheet(
             f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};"
-            "border-radius:6px;}}"
+            "border-radius:6px;}"
         )
         cl = QVBoxLayout(card)
         cl.setContentsMargins(0, 0, 0, 0)

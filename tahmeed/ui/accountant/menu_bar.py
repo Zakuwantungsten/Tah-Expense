@@ -181,6 +181,8 @@ class AccountantMenuBar(QMenuBar):
         self._edit_menu()
         self._view_menu()
         self._lists_menu()
+        self._manage_menu()
+        self._suppliers_menu()
         self._import_menu()
         self._accountant_menu()
         self._company_menu()
@@ -245,6 +247,25 @@ class AccountantMenuBar(QMenuBar):
         m.addSeparator()
         self._add(m, "&Users", lambda: self._nav("manage_users"))
 
+    def _manage_menu(self) -> None:
+        m = self.addMenu("&Manage")
+        self._add(m, "Manage &Items…", lambda: self._nav("manage_categories"))
+        self._add(m, "Manage &Suppliers…", lambda: self._nav("manage_suppliers"))
+        m.addSeparator()
+        self._add(m, "&Description Maps…", lambda: self._nav("manage_description_maps"))
+        self._add(m, "&People…", lambda: self._nav("manage_people"))
+        m.addSeparator()
+        self._add(m, "&Trucks…", lambda: self._nav("manage_trucks"))
+        self._add(m, "T&railers…", lambda: self._nav("manage_trailers"))
+        self._add(m, "&Motorcycles & Cars…", lambda: self._nav("manage_motor_vehicles"))
+        m.addSeparator()
+        self._add(m, "&Users…", lambda: self._nav("manage_users"))
+        self._add(m, "&Backups…", lambda: self._nav("backup"))
+
+    def _suppliers_menu(self) -> None:
+        m = self.addMenu("&Suppliers")
+        self._add(m, "&Manage Suppliers", lambda: self._nav("manage_suppliers"))
+
     def _import_menu(self) -> None:
         """Shortcuts to every import surface in the app."""
         m = self.addMenu("&Import")
@@ -297,6 +318,7 @@ class AccountantMenuBar(QMenuBar):
         m.addSeparator()
         lists = m.addMenu("&Lists / Setup")
         self._add(lists, "&Items (Chart of Accounts)", lambda: self._nav("manage_categories"))
+        self._add(lists, "&Suppliers", lambda: self._nav("manage_suppliers"))
         self._add(lists, "&Trucks", lambda: self._nav("manage_trucks"))
         self._add(lists, "T&railers", lambda: self._nav("manage_trailers"))
         self._add(lists, "&Motorcycles & Cars", lambda: self._nav("manage_motor_vehicles"))

@@ -1399,7 +1399,7 @@ class VerifyInboxWidget(QWidget):
             get_deletion_requested_items, get_deletion_requested_descriptions,
             get_cashier_names,
         )
-        from tahmeed.services.category_service import get_all_categories
+        from tahmeed.services.category_service import get_payment_target_categories
 
         selected_items = self._filter_bar.item_filter()
         selected_descs = self._filter_bar.description_filter()
@@ -1408,7 +1408,7 @@ class VerifyInboxWidget(QWidget):
         async def _cats() -> List[Category]:
             if self._category_objects:
                 return self._category_objects
-            return await get_all_categories()
+            return await get_payment_target_categories()
 
         if tab == 2:
             cats, trucks, cashier_ids, items, descs = await asyncio.gather(
@@ -1952,12 +1952,12 @@ class VerifyInboxWidget(QWidget):
     async def _ensure_mapping_categories(self) -> List[Category]:
         """Load the item catalog used by the mapping dialog (always fresh)."""
         from tahmeed.services.api_models import desktop_document
-        from tahmeed.services.category_service import get_all_categories
+        from tahmeed.services.category_service import get_payment_target_categories
 
         self._set_busy("Loading items…")
         categories: List[Category] = []
         try:
-            categories = await get_all_categories(include_inactive=True)
+            categories = await get_payment_target_categories(include_inactive=True)
         except Exception as exc:
             self._clear_busy()
             await self._await_ui(lambda: QMessageBox.critical(

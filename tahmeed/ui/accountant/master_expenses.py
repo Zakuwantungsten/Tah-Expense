@@ -199,7 +199,7 @@ def _input_ss() -> str:
         f"  border: 1px solid {_BORDER}; border-radius: 5px;"
         f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
         "  font-family:'Segoe UI'; padding: 0 8px;"
-        "  min-height: 32px; max-height: 32px; }}"
+        "  min-height: 32px; max-height: 32px; }"
         f"QLineEdit:focus, QComboBox:focus, QDateEdit:focus {{ border-color: {_BLUE}; }}"
         "QComboBox::drop-down { border: none; width: 20px; }"
     )
@@ -250,7 +250,7 @@ def _action_btn(text: str, icon_name: str, primary: bool = True) -> QPushButton:
         ss = (
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 12px; font-weight: 600;"
-            " font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-family:'Segoe UI'; padding: 0 12px; }"
             "QPushButton:hover { background: #005EA3; }"
             "QPushButton:disabled { background: #93C5FD; }"
         )
@@ -259,7 +259,7 @@ def _action_btn(text: str, icon_name: str, primary: bool = True) -> QPushButton:
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER};"
             " border-radius: 5px; font-size: 12px;"
-            " font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
     b.setStyleSheet(ss)
@@ -410,14 +410,14 @@ class _MonthTabBar(QFrame):
                 f"QPushButton {{ background: {_BLUE}; color: #fff;"
                 " border: none; border-radius: 14px;"
                 " font-size: 11px; font-weight: 700;"
-                " font-family:'Segoe UI'; padding: 0 10px; }}"
+                " font-family:'Segoe UI'; padding: 0 10px; }"
             )
         else:
             btn.setStyleSheet(
                 f"QPushButton {{ background: transparent; color: {_T2};"
                 f" border: 1px solid {_BORDER}; border-radius: 14px;"
                 " font-size: 11px;"
-                " font-family:'Segoe UI'; padding: 0 10px; }}"
+                " font-family:'Segoe UI'; padding: 0 10px; }"
                 f"QPushButton:hover {{ background: {_BG}; color: {_T1}; }}"
             )
 
@@ -1009,7 +1009,7 @@ class MasterExpensesWidget(QWidget):
         names: List[str] = []
         try:
             from tahmeed.services.category_service import get_all_categories
-            cats = await get_all_categories(include_inactive=True)
+            cats = await get_all_categories(include_inactive=True, is_supplier=False)
             names = [c.name for c in cats if getattr(c, "name", None)]
             self._item_by_name = {
                 (c.name or "").strip().lower(): c
@@ -1668,7 +1668,7 @@ class MasterExpensesWidget(QWidget):
 
         self._loading_overlay.show_loading("Reading master Excel file…")
         try:
-            categories = await get_all_categories()
+            categories = await get_all_categories(is_supplier=False)
         except Exception as exc:
             self._loading_overlay.hide_loading()
             QMessageBox.critical(self, "Import Error", f"Could not load items:\n{exc}")

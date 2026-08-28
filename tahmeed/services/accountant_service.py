@@ -2359,6 +2359,38 @@ async def _resolve_master_cashier_ids(
     return matched
 
 
+async def _supplier_category_names_lower() -> List[str]:
+    """Active supplier item names (lowered) — excluded from Master Expenses."""
+    db = get_db()
+    docs = await db.categories.find(
+        {"is_supplier": True, "active": {"$ne": False}},
+        {"name": 1},
+    ).to_list(length=None)
+    names: List[str] = []
+    for doc in docs:
+        name = str(doc.get("name") or "").strip().lower()
+        if name:
+            names.append(name)
+    return names
+
+
+def _exclude_supplier_payments(query: dict, supplier_names_lower: Sequence[str]) -> dict:
+    """Keep supplier payments out of Master Expenses (still visible on Suppliers)."""
+    if not supplier_names_lower:
+        return query
+    clause = {
+        "$expr": {
+            "$not": {
+                "$in": [
+                    {"$toLower": {"$ifNull": ["$category_name", ""]}},
+                    list(supplier_names_lower),
+                ]
+            }
+        }
+    }
+    return _merge_and_clauses(query, [clause])
+
+
 async def _master_query_with_cashiers(
     year: Optional[int] = None,
     month: int = 0,
@@ -2374,10 +2406,12 @@ async def _master_query_with_cashiers(
     """Build master query, resolving cashier short-name filters when present."""
     filters = dict(column_filters or {})
     cashier_names = list(filters.pop("cashier", []) or [])
+    supplier_names = await _supplier_category_names_lower()
     base = _build_master_query(
         year, month, search, truck, category, receipt, description,
         date_from, date_to, column_filters=filters or None,
     )
+    base = _exclude_supplier_payments(base, supplier_names)
     if not cashier_names:
         return base
     # Resolve against the range *without* cashier filter so options stay valid.
@@ -2385,10 +2419,11 @@ async def _master_query_with_cashiers(
     if not ids:
         # No matching cashiers → force empty result set.
         return {**base, "cashier_id": {"$in": []}}
-    return _build_master_query(
+    resolved = _build_master_query(
         year, month, search, truck, category, receipt, description,
         date_from, date_to, column_filters=filters or None, cashier_ids=ids,
     )
+    return _exclude_supplier_payments(resolved, supplier_names)
 
 
 async def get_master_transactions(
@@ -6322,8 +6357,26 @@ def _diesel_overview_query(
     Imports store the real datetime on ``transaction_date``; ``date`` is often
     a display string, so ranging on ``date`` returns nothing.
     """
+    return _imported_feed_overview_query(
+        feed_type, "truck_no", truck, date_from, date_to,
+    )
+
+
+def _imported_feed_overview_query(
+    feed_type: str,
+    truck_field: str,
+    truck: str,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> dict:
+    """Match imported-feed rows the same way their All Entries tabs do.
+
+    Imports store the real datetime on ``transaction_date``; display fields
+    (``toll_date`` / ``payment_date`` / ``sales_date``) are often strings, so
+    ranging on those returns nothing under the fiscal-year From/To filter.
+    """
     return _with_date_range(
-        {"feed_type": feed_type, "truck_no": _truck_exact(truck)},
+        {"feed_type": feed_type, truck_field: _truck_exact(truck)},
         "transaction_date",
         date_from,
         date_to,
@@ -6369,18 +6422,15 @@ async def _truck_overview_imported_feed_rows(
     rows: list = []
 
     toll_docs = await db.imported_feeds.find(
-        _with_date_range(
-            {"feed_type": "toll_plaza", "vehicle_reg": _truck_exact(truck)},
-            "toll_date",
-            date_from,
-            date_to,
+        _imported_feed_overview_query(
+            "toll_plaza", "vehicle_reg", truck, date_from, date_to,
         )
-    ).sort([("toll_date", -1), ("import_date", -1)]).to_list(length=None)
+    ).sort([("transaction_date", -1), ("toll_date", -1), ("import_date", -1)]).to_list(length=None)
     for doc in toll_docs:
         rows.append(_normalized_row(
             source_group="toll_plaza",
             source="Toll Plaza",
-            date_value=doc.get("toll_date"),
+            date_value=doc.get("transaction_date") or doc.get("toll_date"),
             truck_value=str(doc.get("vehicle_reg", "") or ""),
             description=doc.get("toll_plaza") or "Toll transaction",
             reference=doc.get("receipt_no") or doc.get("card_no") or doc.get("device") or "",
@@ -6390,18 +6440,15 @@ async def _truck_overview_imported_feed_rows(
         ))
 
     parking_docs = await db.imported_feeds.find(
-        _with_date_range(
-            {"feed_type": "parking_congo", "vehicle_no": _truck_exact(truck)},
-            "payment_date",
-            date_from,
-            date_to,
+        _imported_feed_overview_query(
+            "parking_congo", "vehicle_no", truck, date_from, date_to,
         )
-    ).sort([("payment_date", -1), ("import_date", -1)]).to_list(length=None)
+    ).sort([("transaction_date", -1), ("payment_date", -1), ("import_date", -1)]).to_list(length=None)
     for doc in parking_docs:
         rows.append(_normalized_row(
             source_group="parking_congo",
             source="Parking Congo",
-            date_value=doc.get("payment_date"),
+            date_value=doc.get("transaction_date") or doc.get("payment_date"),
             truck_value=str(doc.get("vehicle_no", "") or ""),
             description=doc.get("transaction_details") or doc.get("transaction_type") or "Parking transaction",
             reference=doc.get("ledger_id") or doc.get("direction") or "",
@@ -6517,18 +6564,15 @@ async def _truck_overview_extra_sidebar_rows(
         ))
 
     rahn_docs = await db.imported_feeds.find(
-        _with_date_range(
-            {"feed_type": "rahntech", "truck_number": _truck_exact(truck)},
-            "sales_date",
-            date_from,
-            date_to,
+        _imported_feed_overview_query(
+            "rahntech", "truck_number", truck, date_from, date_to,
         )
-    ).sort([("sales_date", -1), ("import_date", -1)]).to_list(length=None)
+    ).sort([("transaction_date", -1), ("sales_date", -1), ("import_date", -1)]).to_list(length=None)
     for doc in rahn_docs:
         rows.append(_normalized_row(
             source_group="rahntech",
             source="RahnTech",
-            date_value=doc.get("sales_date"),
+            date_value=doc.get("transaction_date") or doc.get("sales_date"),
             truck_value=str(doc.get("truck_number", "") or ""),
             description=doc.get("driver_name") or doc.get("device_number") or "RahnTech transaction",
             reference=doc.get("trip_number") or doc.get("do_number") or "",
@@ -6597,7 +6641,7 @@ async def _truck_overview_extra_sidebar_rows(
             truck_value=str(doc.get("truck_and_trailer", "") or ""),
             description=doc.get("consignment") or doc.get("importer") or "Reconciliation entry",
             reference=doc.get("prn_number") or doc.get("entry_reg_no") or doc.get("station") or "",
-            currency="TZS",
+            currency="USD",
             amount=doc.get("charge"),
             station=doc.get("station") or "",
         ))

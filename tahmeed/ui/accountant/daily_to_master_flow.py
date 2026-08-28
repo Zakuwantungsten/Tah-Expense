@@ -7,7 +7,7 @@ from typing import Optional
 from bson import ObjectId
 from PySide6.QtWidgets import QFileDialog, QWidget
 
-from tahmeed.services.category_service import get_all_categories
+from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.services.daily_import_service import (
     DailyImportCancelled,
     apply_mapping_to_preview,
@@ -67,7 +67,7 @@ async def run_daily_to_master_flow(
             if preview.rows and preview.unmapped:
                 busy.update("Loading items…")
                 try:
-                    categories = await busy.await_or_cancel(get_all_categories())
+                    categories = await busy.await_or_cancel(get_payment_target_categories())
                 except UploadCancelled:
                     raise
                 except Exception as exc:
@@ -106,7 +106,7 @@ async def run_daily_to_master_flow(
     if preview.unmapped:
         if categories is None:
             try:
-                categories = await get_all_categories()
+                categories = await get_payment_target_categories()
             except Exception as exc:
                 show_critical(
                     parent, "Import Error", f"Could not load items:\n{exc}"

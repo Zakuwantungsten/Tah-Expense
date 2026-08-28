@@ -93,6 +93,7 @@ async def create_item_for_mapping(name: str, fields: Optional[dict] = None) -> C
         "show_in_sidebar": bool(data.get("show_in_sidebar", False)),
         "show_in_cashier_sidebar": bool(data.get("show_in_cashier_sidebar", False)),
         "lock_description": bool(data.get("lock_description", False)),
+        "is_supplier": bool(data.get("is_supplier", False)),
     }
     try:
         return await create_category(

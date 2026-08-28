@@ -21,7 +21,7 @@ from tahmeed.services.truck_format import (
     is_allowed_place_label, DEFAULT_PLACE_LABELS, merge_allowed_labels,
 )
 from tahmeed.services.rule_service import test_description
-from tahmeed.services.category_service import get_all_categories
+from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.services.settings_service import get_setting, set_setting
 from tahmeed.services.cashier_service import (
     save_transaction, get_transactions_by_date, check_for_duplicates,
@@ -216,7 +216,7 @@ class EntryForm(QWidget):
             self._confidence_threshold = int(
                 await get_setting("confidence_threshold") or 75
             )
-            self._categories = await get_all_categories()
+            self._categories = await get_payment_target_categories()
         except Exception:
             pass
         try:

@@ -50,6 +50,7 @@ class CategoryWrite(StrictModel):
     lock_description: bool = False
     restrict_in_pdf: bool = False
     restrict_in_excel: bool = False
+    is_supplier: bool = False
     active: bool = True
     account_type: str = ""
     ref_num: str = ""
