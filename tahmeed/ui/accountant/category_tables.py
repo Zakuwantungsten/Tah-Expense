@@ -9,7 +9,7 @@ DailyRegister (excel_grid.py):
          · TZS · RECEIPT · OWNERSHIP · APR BY
 
 Design matches the Master Expenses / Verify grid: slate zebra stripes,
-muted grey headers, colored receipt pill, red negatives.
+muted grey headers, colored receipt pill, infinite scroll.
 
 The widget reuses the existing Master Expenses service queries
 (``get_master_transactions`` etc.) with a fixed ``category`` filter — no data
@@ -78,8 +78,8 @@ _T2         = "#6B7280"
 _TM         = "#9CA3AF"
 _HDR_BG     = "#F1F5F9"
 
-_PAGE_SIZES = [25, 50, 100]
-_ROW_H      = 28
+_SCROLL_CHUNK = 50
+_ROW_H        = 28
 _HDR_H      = 28
 
 # (label, pixel width, right-aligned?, mono?)
@@ -91,7 +91,7 @@ _COLS = [
     ("TRUCK NO.",   95,  "left",   False),
     ("MEMO",        140, "left",   False),
     ("NOTES",       56,  "center", False),
-    ("TZS",         120, "right",  True),
+    ("TZS",         120, "right",  False),
     ("RECEIPT",     110, "center", False),
     ("OWNERSHIP",   95,  "left",   False),
     ("APR BY",      90,  "left",   False),
@@ -251,15 +251,17 @@ class CategoryTableWidget(QWidget):
 
         self._year = app_state.fiscal_year
         self._month = 0
-        self._page = 0
+        self._loaded = 0
         self._total = 0
         self._loading = False
+        self._scroll_loading = False
+        self._reload_generation = 0
         self._export_in_flight = False
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(350)
-        self._debounce.timeout.connect(lambda: asyncio.ensure_future(self._reload()))
+        self._debounce.timeout.connect(self._reset_and_reload)
 
         self._build()
 
@@ -413,6 +415,7 @@ class CategoryTableWidget(QWidget):
             default_asc=False,
             on_sort_changed=self._on_sort_changed,
         )
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
         root.addWidget(self._table, 1)
 
         # ── Footer totals ──────────────────────────────────────────────────
@@ -426,10 +429,6 @@ class CategoryTableWidget(QWidget):
         fol.setSpacing(20)
         fol.addWidget(_lbl("TOTAL (filtered view)", size=11, weight=700, color=_T2))
         self._tzs_lbl = _lbl("TZS  —", size=13, weight=700)
-        self._tzs_lbl.setStyleSheet(
-            f"color: {_T1}; font-size: 13px; font-weight: 700;"
-            " font-family: 'Cascadia Code', 'Consolas', monospace; background: transparent;"
-        )
         fol.addWidget(self._tzs_lbl)
 
         sep = QFrame()
@@ -439,54 +438,37 @@ class CategoryTableWidget(QWidget):
         fol.addWidget(sep)
 
         self._usd_lbl = _lbl("USD  —", size=13, weight=700)
-        self._usd_lbl.setStyleSheet(
-            f"color: {_T1}; font-size: 13px; font-weight: 700;"
-            " font-family: 'Cascadia Code', 'Consolas', monospace; background: transparent;"
-        )
         fol.addWidget(self._usd_lbl)
         fol.addStretch()
         self._footer_count = _lbl("", size=11, color=_T2)
         fol.addWidget(self._footer_count)
         root.addWidget(footer)
 
-        # ── Pagination ─────────────────────────────────────────────────────
-        pager = QFrame()
-        pager.setFixedHeight(44)
-        pager.setStyleSheet(
+        # ── Scroll status ──────────────────────────────────────────────────
+        status_bar = QFrame()
+        status_bar.setFixedHeight(36)
+        status_bar.setStyleSheet(
             f"QFrame {{ background: {_WHITE}; border-top: 1px solid {_BORDER}; }}"
         )
-        pl = QHBoxLayout(pager)
-        pl.setContentsMargins(16, 0, 16, 0)
-        pl.setSpacing(10)
-
-        self._size_cb = QComboBox()
-        for sz in _PAGE_SIZES:
-            self._size_cb.addItem(f"Show {sz}", sz)
-        self._size_cb.setFixedWidth(100)
-        self._size_cb.setStyleSheet(_input_ss())
-        self._size_cb.currentIndexChanged.connect(self._on_size_changed)
-        pl.addWidget(self._size_cb)
-
-        self._page_info = _lbl("—", size=12, color=_T2)
-        pl.addWidget(self._page_info)
-        pl.addStretch()
-
-        self._prev_btn = _btn("← Prev", "mdi.chevron-left")
-        self._prev_btn.setFixedWidth(88)
-        self._prev_btn.clicked.connect(self._on_prev)
-        pl.addWidget(self._prev_btn)
-
-        self._next_btn = _btn("Next →", "mdi.chevron-right")
-        self._next_btn.setFixedWidth(88)
-        self._next_btn.clicked.connect(self._on_next)
-        pl.addWidget(self._next_btn)
-        root.addWidget(pager)
+        sl = QHBoxLayout(status_bar)
+        sl.setContentsMargins(16, 0, 16, 0)
+        self._scroll_status = _lbl("—", size=12, color=_T2)
+        sl.addWidget(self._scroll_status)
+        sl.addStretch()
+        root.addWidget(status_bar)
 
         self._loading_overlay = LoadingOverlay(self, "Loading…")
 
     # ── Public API ───────────────────────────────────────────────────────────
     def refresh(self) -> None:
-        self._page = 0
+        self._reset_and_reload()
+
+    def _reset_and_reload(self) -> None:
+        self._reload_generation += 1
+        self._loaded = 0
+        self._total = 0
+        self._table.setRowCount(0)
+        self._update_status()
         asyncio.ensure_future(self._reload())
 
     # ── Filter helpers ─────────────────────────────────────────────────────
@@ -496,12 +478,18 @@ class CategoryTableWidget(QWidget):
     def _receipt_filter(self) -> str:
         return self._rcpt_cb.currentData() or "all"
 
-    def _page_size(self) -> int:
-        return self._size_cb.currentData() or _PAGE_SIZES[0]
+    def _filter_kw(self) -> dict:
+        date_from, date_to = self._date_filters()
+        return dict(
+            year=self._year, month=self._month,
+            search=self._search_text(), truck="",
+            category=self._category, receipt=self._receipt_filter(),
+            description=self._description_filter,
+            date_from=date_from, date_to=date_to,
+        )
 
     def _on_sort_changed(self, field: str, asc: bool) -> None:
-        self._page = 0
-        asyncio.ensure_future(self._reload())
+        self._reset_and_reload()
 
     # ── Event handlers ─────────────────────────────────────────────────────
     def _on_year_changed(self) -> None:
@@ -510,20 +498,17 @@ class CategoryTableWidget(QWidget):
             self._year = yr
             app_state.fiscal_year = yr
             sync_from_to(self._from_date, self._to_date, self._year, self._month, optional=False)
-            self._page = 0
-            asyncio.ensure_future(self._reload())
+            self._reset_and_reload()
 
     def _on_month_changed(self) -> None:
         self._month = self._month_cb.currentData() or 0
         sync_from_to(self._from_date, self._to_date, self._year, self._month, optional=False)
-        self._page = 0
-        asyncio.ensure_future(self._reload())
+        self._reset_and_reload()
 
     def _date_filters(self):
         return read_from_to(self._from_date, self._to_date, optional=False)
 
     def _on_filter_changed(self) -> None:
-        self._page = 0
         self._debounce.start()
 
     def _clear_filters(self) -> None:
@@ -541,111 +526,124 @@ class CategoryTableWidget(QWidget):
         self._month = 0
         sync_from_to(self._from_date, self._to_date, self._year, 0, optional=False)
         reset_feed_sort(self._sort_state)
-        self._page = 0
-        asyncio.ensure_future(self._reload())
+        self._reset_and_reload()
 
-    def _on_size_changed(self) -> None:
-        self._page = 0
-        asyncio.ensure_future(self._reload())
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more())
 
-    def _on_prev(self) -> None:
-        if self._page > 0:
-            self._page -= 1
-            asyncio.ensure_future(self._reload())
-
-    def _on_next(self) -> None:
-        size = self._page_size()
-        max_pg = max(0, (self._total - 1) // size) if self._total else 0
-        if self._page < max_pg:
-            self._page += 1
-            asyncio.ensure_future(self._reload())
+    def _update_status(self) -> None:
+        if self._loading and self._loaded == 0:
+            self._scroll_status.setText("Loading…")
+        elif self._total == 0:
+            self._scroll_status.setText("No records match the current filters.")
+        elif self._loaded >= self._total:
+            self._scroll_status.setText(f"Showing all {self._total:,} records")
+        else:
+            self._scroll_status.setText(
+                f"Showing {self._loaded:,} of {self._total:,}  •  Scroll down for more"
+            )
 
     # ── Reload ─────────────────────────────────────────────────────────────
     async def _reload(self) -> None:
-        if self._loading:
-            return
+        gen = self._reload_generation
         self._loading = True
         self._loading_overlay.show_loading(f"Loading {self._title}…")
+        self._update_status()
         try:
             from tahmeed.services.accountant_service import (
                 get_master_transactions, count_master_transactions, get_master_totals,
             )
-            size = self._page_size()
-            skip = self._page * size
-            date_from, date_to = self._date_filters()
-            kw = dict(
-                year=self._year, month=self._month,
-                search=self._search_text(), truck="",
-                category=self._category, receipt=self._receipt_filter(),
-                description=self._description_filter,
-                date_from=date_from, date_to=date_to,
-            )
+            kw = self._filter_kw()
             txs, total, totals = await asyncio.gather(
                 get_master_transactions(
-                    **kw, **sort_kw(self._sort_state), limit=size, skip=skip,
+                    **kw, **sort_kw(self._sort_state),
+                    limit=_SCROLL_CHUNK, skip=0,
                 ),
                 count_master_transactions(**kw),
                 get_master_totals(**kw),
             )
+            if gen != self._reload_generation:
+                return
             self._total = total
-            self._populate(txs, skip)
+            self._populate(txs, 0, append=False)
+            self._loaded = len(txs)
             self._tzs_lbl.setText(f"TZS  {totals['tzs']:,.0f}")
-            self._tzs_lbl.setStyleSheet(
-                f"color: {_RED if totals['tzs'] < 0 else _T1};"
-                " font-size: 13px; font-weight: 700;"
-                " font-family: 'Cascadia Code', 'Consolas', monospace; background: transparent;"
-            )
             usd = totals["usd"]
             self._usd_lbl.setText(f"USD  ${usd:,.2f}" if usd else "USD  —")
             self._footer_count.setText(f"{total:,} records")
             self._count_lbl.setText(f"{total:,} records")
-            self._update_pager(total, size)
         except Exception as exc:
-            self._table.setRowCount(0)
-            self._page_info.setText(f"Failed to load: {exc}")
+            if gen == self._reload_generation:
+                self._table.setRowCount(0)
+                self._scroll_status.setText(f"Failed to load: {exc}")
         finally:
-            self._loading = False
-            self._loading_overlay.hide_loading()
+            if gen == self._reload_generation:
+                self._loading = False
+                self._loading_overlay.hide_loading()
+                self._update_status()
 
-    def _populate(self, txs: List[Transaction], skip: int) -> None:
-        self._table.setRowCount(len(txs))
+    async def _load_more(self) -> None:
+        if self._scroll_loading or self._loading:
+            return
+        if self._loaded >= self._total:
+            return
+        self._scroll_loading = True
+        self._update_status()
+        try:
+            from tahmeed.services.accountant_service import get_master_transactions
+
+            gen = self._reload_generation
+            kw = self._filter_kw()
+            txs = await get_master_transactions(
+                **kw, **sort_kw(self._sort_state),
+                limit=_SCROLL_CHUNK, skip=self._loaded,
+            )
+            if gen != self._reload_generation:
+                return
+            if txs:
+                self._populate(txs, self._loaded, append=True)
+                self._loaded += len(txs)
+        except Exception:
+            pass
+        finally:
+            self._scroll_loading = False
+            self._update_status()
+
+    def _populate(self, txs: List[Transaction], skip: int, *, append: bool = False) -> None:
+        if not append:
+            self._table.setRowCount(0)
+        start_row = self._table.rowCount()
         for i, tx in enumerate(txs):
-            row_bg = _STRIPE if i % 2 else _WHITE
-            _set_cell(self._table, i, 0, str(skip + i + 1), "center", row_bg)
-            _set_cell(self._table, i, 1,
+            r = start_row + i
+            self._table.insertRow(r)
+            row_bg = _STRIPE if (skip + i) % 2 else _WHITE
+            _set_cell(self._table, r, 0, str(skip + i + 1), "center", row_bg)
+            _set_cell(self._table, r, 1,
                       tx.date.strftime("%d %b %Y") if tx.date else "—", "left", row_bg)
-            _set_cell(self._table, i, 2, tx.item or "—", "left", row_bg)
-            _set_cell(self._table, i, 3, tx.description or "—", "left", row_bg)
-            _set_cell(self._table, i, 4, tx.truck_number or "—", "left", row_bg)
-            _set_cell(self._table, i, 5, tx.memo or "—", "left", row_bg)
-            _set_cell(self._table, i, 6, "✓" if tx.notes_flag else "—", "center",
+            _set_cell(self._table, r, 2, tx.item or "—", "left", row_bg)
+            _set_cell(self._table, r, 3, tx.description or "—", "left", row_bg)
+            _set_cell(self._table, r, 4, tx.truck_number or "—", "left", row_bg)
+            _set_cell(self._table, r, 5, tx.memo or "—", "left", row_bg)
+            _set_cell(self._table, r, 6, "✓" if tx.notes_flag else "—", "center",
                       row_bg, color=_BLUE if tx.notes_flag else _TM)
 
-            # TZS
             if tx.currency == "TZS":
                 tzs_txt = f"{tx.amount:,.0f}"
-                tzs_col = _RED if tx.amount < 0 else _T1
+                tzs_col = _T1
             else:
                 tzs_txt, tzs_col = "—", _TM
-            _set_cell(self._table, i, 7, tzs_txt, "right", row_bg, color=tzs_col, mono=True)
+            _set_cell(self._table, r, 7, tzs_txt, "right", row_bg, color=tzs_col)
 
-            # Receipt — plain colored text on the normal row background
             rcpt_text, rcpt_fg = _receipt_text(tx.receipt_status or "pending")
-            _set_cell(self._table, i, 8, rcpt_text, "center", row_bg, color=rcpt_fg)
+            _set_cell(self._table, r, 8, rcpt_text, "center", row_bg, color=rcpt_fg)
 
-            _set_cell(self._table, i, 9, tx.ownership or "—", "left", row_bg)
-            _set_cell(self._table, i, 10, tx.approver or "—", "left", row_bg)
-            self._table.setRowHeight(i, _ROW_H)
-
-    def _update_pager(self, total: int, size: int) -> None:
-        max_pg = max(0, (total - 1) // size) if total else 0
-        self._prev_btn.setEnabled(self._page > 0)
-        self._next_btn.setEnabled(self._page < max_pg)
-        start = self._page * size + 1 if total else 0
-        end = min((self._page + 1) * size, total)
-        self._page_info.setText(
-            f"Showing {start:,}–{end:,} of {total:,}  ·  Page {self._page + 1} of {max_pg + 1}"
-        )
+            _set_cell(self._table, r, 9, tx.ownership or "—", "left", row_bg)
+            _set_cell(self._table, r, 10, tx.approver or "—", "left", row_bg)
+            self._table.setRowHeight(r, _ROW_H)
 
     # ── Excel export ───────────────────────────────────────────────────────
     def _on_export(self) -> None:
@@ -754,8 +752,7 @@ class CategoryTableWidget(QWidget):
 
                 stripe = PatternFill("solid", fgColor="F1F5F9")
                 white = PatternFill("solid", fgColor="FFFFFF")
-                mono = Font(name="Cascadia Code", size=10)
-                red = Font(name="Cascadia Code", size=10, color="DC2626")
+                body_font = Font(name="Segoe UI", size=10)
                 tzs_total = usd_total = 0.0
                 for i, tx in enumerate(txs):
                     if tx.currency == "TZS":
@@ -783,7 +780,7 @@ class CategoryTableWidget(QWidget):
                             cell.alignment = Alignment(vertical="center")
                         c = ws.cell(r, 8)
                         if tzs_val is not None:
-                            c.font = red if tzs_val < 0 else mono
+                            c.font = body_font
                             c.number_format = "#,##0"
                             c.alignment = Alignment(horizontal="right", vertical="center")
 
@@ -798,10 +795,7 @@ class CategoryTableWidget(QWidget):
                 ws.cell(total_r, 4).font = Font(name="Segoe UI", bold=True, size=11)
                 if tzs_total:
                     c = ws.cell(total_r, 8)
-                    c.font = Font(
-                        name="Cascadia Code", bold=True, size=11,
-                        color="DC2626" if tzs_total < 0 else "111827",
-                    )
+                    c.font = Font(name="Segoe UI", bold=True, size=11, color="111827")
                     c.number_format = "#,##0"
                     c.alignment = Alignment(horizontal="right", vertical="center")
 

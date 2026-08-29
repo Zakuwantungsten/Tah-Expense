@@ -1,3 +1,2 @@
-- Give accountants user management and backup restore privileges (same as admin for those actions)
-- Accountant restore uses the signed Backups page and API manager role
-- Keep admin-only control over creating or modifying administrator accounts
+- Fixed minor bugs
+- Implemented new supplier functionality

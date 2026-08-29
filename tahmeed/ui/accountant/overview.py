@@ -246,6 +246,8 @@ class _KPICard(QFrame):
         value: str,
         label: str,
         parent=None,
+        *,
+        compact: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("overviewCard")
@@ -257,30 +259,37 @@ class _KPICard(QFrame):
             "}"
         )
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setMinimumHeight(110)
+        pad_x, pad_y = (12, 10) if compact else (18, 16)
+        icon_px = 26 if compact else 32
+        icon_img = 16 if compact else 18
+        val_size = 22 if compact else 28
+        lbl_size = 11 if compact else 12
+        min_h = 92 if compact else 110
+        icon_gap = 8 if compact else 12
+        self.setMinimumHeight(min_h)
 
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(18, 16, 18, 16)
+        vl.setContentsMargins(pad_x, pad_y, pad_x, pad_y)
         vl.setSpacing(0)
 
         icon_w = QLabel()
-        icon_w.setFixedSize(32, 32)
+        icon_w.setFixedSize(icon_px, icon_px)
         icon_w.setAlignment(Qt.AlignCenter)
         icon_w.setStyleSheet(
             f"QLabel {{ background: {icon_bg}; border: none; border-radius: 8px; }}"
         )
         try:
-            icon_w.setPixmap(qta.icon(icon_name, color=icon_color).pixmap(18, 18))
+            icon_w.setPixmap(qta.icon(icon_name, color=icon_color).pixmap(icon_img, icon_img))
         except Exception:
             pass
         vl.addWidget(icon_w)
-        vl.addSpacing(12)
+        vl.addSpacing(icon_gap)
 
-        self._val_lbl = _lbl(value, size=28, weight=700)
+        self._val_lbl = _lbl(value, size=val_size, weight=700)
         vl.addWidget(self._val_lbl)
         vl.addSpacing(4)
 
-        self._label_lbl = _lbl(label, size=12, color=_T2, wrap=True)
+        self._label_lbl = _lbl(label, size=lbl_size, color=_T2, wrap=True)
         vl.addWidget(self._label_lbl)
 
     def set_value(self, value: str) -> None:
@@ -690,6 +699,8 @@ class OverviewWidget(QWidget):
         self._kpi_tzs: Optional[_KPICard] = None
         self._kpi_usd: Optional[_KPICard] = None
         self._kpi_zmw: Optional[_KPICard] = None
+        self._kpi_supplier_tzs: Optional[_KPICard] = None
+        self._kpi_supplier_usd: Optional[_KPICard] = None
         self._bar_chart: Optional[_BarChartWidget] = None
         self._bar_subtitle: Optional[QLabel] = None
         self._trend_toggle: Optional[_CurrencyToggle] = None
@@ -751,6 +762,14 @@ class OverviewWidget(QWidget):
             self._kpi_usd.set_value(_fmt_currency_short("USD", kpis.get("total_usd_ytd", 0.0)))
         if self._kpi_zmw:
             self._kpi_zmw.set_value(_fmt_currency_short("ZMW", kpis.get("total_zmw_ytd", 0.0)))
+        if self._kpi_supplier_tzs:
+            self._kpi_supplier_tzs.set_value(
+                _fmt_currency_short("TZS", kpis.get("supplier_tzs_ytd", 0.0)),
+            )
+        if self._kpi_supplier_usd:
+            self._kpi_supplier_usd.set_value(
+                _fmt_currency_short("USD", kpis.get("supplier_usd_ytd", 0.0)),
+            )
 
         self._refresh_trend_chart()
         self._refresh_category_chart()
@@ -940,39 +959,50 @@ class OverviewWidget(QWidget):
         header.addWidget(self._fy_btn)
         vl.addLayout(header)
 
-        # KPI row — counts + per-currency totals (same height)
+        # KPI row — counts + per-currency totals (compact to fit 8 cards)
         kpi_row = QHBoxLayout()
-        kpi_row.setSpacing(16)
+        kpi_row.setSpacing(10)
+        _kc = dict(compact=True)
         self._kpi_pending = _KPICard(
             "mdi.inbox-arrow-down", _BLUE, _BLUE_L,
-            "—", "Entries awaiting review",
+            "—", "Awaiting review", **_kc,
         )
         kpi_row.addWidget(self._kpi_pending)
         self._kpi_master = _KPICard(
             "mdi.table-large", _BLUE, _BLUE_L,
-            "—", "Master entries YTD",
+            "—", "Master entries YTD", **_kc,
         )
         kpi_row.addWidget(self._kpi_master)
         self._kpi_verified = _KPICard(
             "mdi.check-circle-outline", _GREEN, _GREEN_L,
-            "—", "Verified this month",
+            "—", "Verified this month", **_kc,
         )
         kpi_row.addWidget(self._kpi_verified)
         self._kpi_tzs = _KPICard(
             "mdi.cash", _BLUE, _BLUE_L,
-            "—", "TZS expenses YTD",
+            "—", "TZS expenses YTD", **_kc,
         )
         kpi_row.addWidget(self._kpi_tzs)
         self._kpi_usd = _KPICard(
             "mdi.currency-usd", _GREEN, _GREEN_L,
-            "—", "USD expenses YTD",
+            "—", "USD expenses YTD", **_kc,
         )
         kpi_row.addWidget(self._kpi_usd)
         self._kpi_zmw = _KPICard(
             "mdi.cash-multiple", _AMBER, _AMBER_L,
-            "—", "ZMW expenses YTD",
+            "—", "ZMW expenses YTD", **_kc,
         )
         kpi_row.addWidget(self._kpi_zmw)
+        self._kpi_supplier_tzs = _KPICard(
+            "mdi.truck-delivery-outline", _NAVY, "#E8EEF4",
+            "—", "TZS suppliers YTD", **_kc,
+        )
+        kpi_row.addWidget(self._kpi_supplier_tzs)
+        self._kpi_supplier_usd = _KPICard(
+            "mdi.truck-delivery-outline", _PURPLE, "#EDE9FE",
+            "—", "USD suppliers YTD", **_kc,
+        )
+        kpi_row.addWidget(self._kpi_supplier_usd)
         vl.addLayout(kpi_row)
 
         # Charts row

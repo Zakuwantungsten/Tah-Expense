@@ -302,7 +302,7 @@ class _QBDocHeader(QFrame):
                 self._lbl_date.setText(d.strftime("%a").upper())
 
 
-# ── Payee / Cheque inline label + field helpers ──────────────────────────────────
+# ── Cheque inline label + field helpers ──────────────────────────────────────
 
 def _qb_field_label(text: str) -> QLabel:
     lbl = QLabel(text)
@@ -340,7 +340,7 @@ def _qb_field_input(placeholder: str = "", *, width: int | None = None) -> QLine
 
 
 def _qb_inline_field(label: str, placeholder: str, width: int) -> tuple[QWidget, QLineEdit]:
-    """Label and input packed tight: Payee [____]"""
+    """Label and input packed tight: Cheque [____]"""
     wrap = QWidget()
     wrap.setStyleSheet("background: transparent;")
     wrap.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
@@ -399,14 +399,13 @@ def _qb_inline_date_field(label: str) -> tuple[QWidget, QDateEdit]:
     return wrap, edit
 
 
-# ── Action bar (mode / search / payee / cheque) ─────────────────────────────────
+# ── Action bar (mode / search / cheque) ─────────────────────────────────────
 
 class _ActionBar(QFrame):
-    """My entries / Merged / Search on the left; Reconciled Date / Payee / Cheque on the right."""
+    """My entries / Merged / Search on the left; Reconciled Date / Cheque on the right."""
 
     search_changed = Signal(str)
     mode_changed   = Signal(bool)  # True = Merged
-    payee_edited   = Signal(str)
     cheque_edited  = Signal(str)
     reconciled_date_changed = Signal(object)  # date
 
@@ -533,10 +532,6 @@ class _ActionBar(QFrame):
         self._reconciled.dateChanged.connect(self._on_reconciled_date)
         fields_hl.addWidget(date_wrap)
 
-        payee_wrap, self._payee = _qb_inline_field("Payee", "Payee name…", 160)
-        self._payee.textEdited.connect(self.payee_edited.emit)
-        fields_hl.addWidget(payee_wrap)
-
         cheque_wrap, self._cheque = _qb_inline_field("Cheque", "Cheque no.…", 100)
         self._cheque.textEdited.connect(self.cheque_edited.emit)
         fields_hl.addWidget(cheque_wrap)
@@ -569,14 +564,13 @@ class _ActionBar(QFrame):
         self._reconciled.setDate(qd)
         self._reconciled.blockSignals(False)
 
-    def set_payee_cheque_values(self, payee: str, cheque: str, editable: bool) -> None:
-        """Refresh day-level Payee/Cheque header fields without emitting edits."""
-        for edit, value in ((self._payee, payee or ""), (self._cheque, cheque or "")):
-            edit.blockSignals(True)
-            if edit.text() != value:
-                edit.setText(value)
-            edit.setReadOnly(not editable)
-            edit.blockSignals(False)
+    def set_cheque_value(self, cheque: str, editable: bool) -> None:
+        """Refresh day-level Cheque header field without emitting edits."""
+        self._cheque.blockSignals(True)
+        if self._cheque.text() != (cheque or ""):
+            self._cheque.setText(cheque or "")
+        self._cheque.setReadOnly(not editable)
+        self._cheque.blockSignals(False)
 
     def _set_mode(self, merged: bool) -> None:
         self._my_btn.setChecked(not merged)
@@ -603,7 +597,7 @@ class _ActionBar(QFrame):
 
 
 class _TablePage(QWidget):
-    """QB icon toolbar → Daily Register totals → My/Merged/Search/Payee/Cheque → grid."""
+    """QB icon toolbar → Daily Register totals → My/Merged/Search/Cheque → grid."""
 
     def __init__(self, register: DailyRegister, parent=None):
         super().__init__(parent)
@@ -659,21 +653,18 @@ class _TablePage(QWidget):
         self._action_bar = _ActionBar()
         self._action_bar.search_changed.connect(register.set_search)
         self._action_bar.mode_changed.connect(register.set_merged_mode)
-        self._action_bar.payee_edited.connect(register.set_active_payee)
         self._action_bar.cheque_edited.connect(register.set_active_cheque)
         self._action_bar.reconciled_date_changed.connect(self._on_reconciled_date)
         register.edit_state_changed.connect(self._action_bar.set_edit_state)
         register.mode_changed.connect(self._action_bar.sync_mode)
         register.mode_changed.connect(self._doc_header.set_merged)
-        register.active_payee_cheque_changed.connect(
-            self._action_bar.set_payee_cheque_values
-        )
+        register.active_cheque_changed.connect(self._action_bar.set_cheque_value)
         register.stats_updated.connect(self._sync_reconciled_date)
         self._action_bar.set_reconciled_date(register.current_date())
 
         # 1) Icon toolbar (incl. Export/Import/Today/Edit/Submit)
         # 2) Daily Register + totals
-        # 3) My/Merged + Search  ···  Reconciled Date / Payee / Cheque
+        # 3) My/Merged + Search  ···  Reconciled Date / Cheque
         vl.addWidget(self._qb_toolbar)
         vl.addWidget(self._doc_header)
         vl.addWidget(self._action_bar)

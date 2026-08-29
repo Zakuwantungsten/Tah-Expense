@@ -802,12 +802,13 @@ async def get_overview_month_totals(year: int) -> Dict:
 
 async def get_overview_dashboard(year: int) -> dict:
     """All data needed by the accountant Overview tab."""
-    kpis, month_payload, categories, fuel_liters, recent = await asyncio.gather(
+    kpis, month_payload, categories, fuel_liters, recent, supplier_totals = await asyncio.gather(
         get_overview_kpis(year),
         get_overview_month_totals(year),
         get_overview_category_breakdown(year),
         get_overview_fuel_liters(year),
         get_verified_transactions(year=year, limit=8),
+        get_supplier_payments_totals(year),
     )
     kpis = dict(kpis)
     kpis["total_usd_ytd"] = (
@@ -818,6 +819,8 @@ async def get_overview_dashboard(year: int) -> dict:
         float(kpis.get("total_zmw_ytd", 0.0) or 0.0)
         + float(month_payload.get("feed_zmw_ytd", 0.0) or 0.0)
     )
+    kpis["supplier_tzs_ytd"] = float(supplier_totals.get("tzs", 0.0) or 0.0)
+    kpis["supplier_usd_ytd"] = float(supplier_totals.get("usd", 0.0) or 0.0)
     return {
         "kpis": kpis,
         "month_totals": month_payload.get("months", {}),
@@ -2721,6 +2724,55 @@ async def get_categories_usage_totals(
             "usd": float(row.get("usd_total") or 0.0),
         }
     return out
+
+
+async def get_supplier_payments_totals(year: int) -> dict:
+    """FY totals for all verified supplier payments (Manage Suppliers KPI cards).
+
+    Matches payments whose ``category_name`` is an active supplier item.
+    Returns ``{count, tzs, usd}``.
+    """
+    supplier_names = await _supplier_category_names_lower()
+    if not supplier_names:
+        return {"count": 0, "tzs": 0.0, "usd": 0.0}
+
+    year_start = datetime(year, 1, 1)
+    year_end = datetime(year, 12, 31, 23, 59, 59)
+
+    db = get_db()
+    result = await db.transactions.aggregate([
+        {"$match": {
+            "verified": True,
+            "deletion_requested": {"$ne": True},
+            "trashed": {"$ne": True},
+            "category_name": {"$type": "string", "$ne": ""},
+            "date": {"$gte": year_start, "$lte": year_end},
+        }},
+        {"$addFields": {"_cat_l": {"$toLower": {"$ifNull": ["$category_name", ""]}}}},
+        {"$match": {"_cat_l": {"$in": supplier_names}}},
+        {"$group": {
+            "_id": None,
+            "count": {"$sum": 1},
+            "tzs_total": {"$sum": {"$cond": [
+                {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]},
+                "$amount",
+                0,
+            ]}},
+            "usd_total": {"$sum": {"$cond": [
+                {"$eq": [{"$toUpper": "$currency"}, "USD"]},
+                "$amount",
+                0,
+            ]}},
+        }},
+    ]).to_list(1)
+    if not result:
+        return {"count": 0, "tzs": 0.0, "usd": 0.0}
+    row = result[0]
+    return {
+        "count": int(row.get("count") or 0),
+        "tzs": float(row.get("tzs_total") or 0.0),
+        "usd": float(row.get("usd_total") or 0.0),
+    }
 
 
 async def get_category_report_transactions(

@@ -1,4 +1,4 @@
-"""Payee/Cheque header fields stamp all data rows without Verify dirtying."""
+"""Cheque header field stamps all data rows without Verify dirtying."""
 from __future__ import annotations
 
 import sys
@@ -56,7 +56,7 @@ def register(qapp, monkeypatch):
             it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
             it.setBackground(QBrush(NEW_BG))
             reg._table.setItem(row, col, it)
-    reg._table.setCurrentCell(0, COL_PAYEE)
+    reg._table.setCurrentCell(0, COL_CHEQUE)
     return reg
 
 
@@ -67,15 +67,13 @@ def test_header_stamps_all_filled_rows_not_blanks(register):
     _put_desc(register, 1, "OIL")
     # Row 2 stays blank — must not receive the stamp.
 
-    register.set_active_payee("alnic logistics")
     register.set_active_cheque("chq-441")
 
-    assert register._table.item(0, COL_PAYEE).text() == "ALNIC LOGISTICS"
     assert register._table.item(0, COL_CHEQUE).text() == "CHQ-441"
-    assert register._table.item(1, COL_PAYEE).text() == "ALNIC LOGISTICS"
     assert register._table.item(1, COL_CHEQUE).text() == "CHQ-441"
-    assert register._table.item(2, COL_PAYEE).text() == ""
     assert register._table.item(2, COL_CHEQUE).text() == ""
+    assert register._table.item(0, COL_PAYEE).text() == ""
+    assert register._table.item(1, COL_PAYEE).text() == ""
 
 
 def test_header_stamps_saved_rows_without_edit_mode(register):
@@ -95,13 +93,11 @@ def test_header_stamps_saved_rows_without_edit_mode(register):
             payee="", cheque="", register_status="submitted", verified=False,
         )
 
-    register.set_active_payee("shared payee")
     register.set_active_cheque("99")
 
-    assert register._table.item(0, COL_PAYEE).text() == "SHARED PAYEE"
-    assert register._table.item(1, COL_PAYEE).text() == "SHARED PAYEE"
     assert register._table.item(0, COL_CHEQUE).text() == "99"
     assert register._table.item(1, COL_CHEQUE).text() == "99"
+    assert register._table.item(0, COL_PAYEE).text() == ""
     # Must not enter the Verify → Edited dirty path.
     assert register._dirty_rows == set()
 
@@ -125,43 +121,38 @@ def test_header_stamp_does_not_mark_saved_rows_dirty_in_edit_mode(register):
         payee="OLD", cheque="1", register_status="submitted", verified=False,
     )
 
-    register.set_active_payee("new payee")
     register.set_active_cheque("2")
 
-    assert register._table.item(0, COL_PAYEE).text() == "NEW PAYEE"
     assert register._table.item(0, COL_CHEQUE).text() == "2"
+    assert register._table.item(0, COL_PAYEE).text() == "OLD"
     assert register._dirty_rows == set()
 
 
-def test_header_emit_uses_day_level_values(register):
+def test_header_emit_uses_day_level_cheque(register):
     seen = []
-    register.active_payee_cheque_changed.connect(
-        lambda p, c, e: seen.append((p, c, e))
+    register.active_cheque_changed.connect(
+        lambda c, e: seen.append((c, e))
     )
     _put_desc(register, 0, "TOLLS")
-    register.set_active_payee("supplier a")
     register.set_active_cheque("99")
-    register._emit_active_payee_cheque()
+    register._emit_active_cheque()
 
-    assert seen[-1][0] == "SUPPLIER A"
-    assert seen[-1][1] == "99"
-    assert seen[-1][2] is True
+    assert seen[-1][0] == "99"
+    assert seen[-1][1] is True
 
 
-def test_new_row_inherits_header_stamp_on_activate(register):
-    from tahmeed.ui.cashier.register_delegates import COL_CHEQUE, COL_PAYEE
+def test_new_row_inherits_header_cheque_on_activate(register):
+    from tahmeed.ui.cashier.register_delegates import COL_CHEQUE
 
-    register._header_payee = "ACME"
     register._header_cheque = "77"
     _put_desc(register, 0, "WATER")
 
-    assert register._table.item(0, COL_PAYEE).text() == "ACME"
     assert register._table.item(0, COL_CHEQUE).text() == "77"
 
 
 @pytest.mark.asyncio
-async def test_persist_header_updates_only_payee_cheque(register, monkeypatch):
-    from tahmeed.ui.cashier.register_delegates import COL_CHEQUE, COL_DESC, COL_PAYEE
+async def test_persist_header_updates_only_cheque(register, monkeypatch):
+    from tahmeed.ui.cashier.register_delegates import COL_CHEQUE, COL_DESC
     from PySide6.QtWidgets import QTableWidgetItem
     from PySide6.QtCore import Qt
 
@@ -179,22 +170,20 @@ async def test_persist_header_updates_only_payee_cheque(register, monkeypatch):
     it = QTableWidgetItem("FUEL")
     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
     register._table.setItem(0, COL_DESC, it)
-    register._table.setItem(0, COL_PAYEE, QTableWidgetItem(""))
+    register._table.setItem(0, COL_CHEQUE, QTableWidgetItem(""))
     register._saved_ids[0] = "oid-1"
     tx = SimpleNamespace(payee="", cheque="", verified=True, register_status="submitted")
     register._saved_txs[0] = tx
-    register._header_payee = "VENDOR"
     register._header_cheque = "55"
-    register._write_payee_cheque_cell(0, COL_PAYEE, "VENDOR")
-    register._write_payee_cheque_cell(0, COL_CHEQUE, "55")
+    register._write_cheque_cell(0, "55")
 
-    await register._persist_header_payee_cheque()
+    await register._persist_header_cheque()
 
     assert len(calls) == 1
     assert calls[0][0] == "oid-1"
-    assert calls[0][1] == {"payee": "VENDOR", "cheque": "55"}
+    assert calls[0][1] == {"cheque": "55"}
+    assert "payee" not in calls[0][1]
     assert "edited_after_verification" not in calls[0][1]
-    assert tx.payee == "VENDOR"
     assert tx.cheque == "55"
     assert register._dirty_rows == set()
 
