@@ -40,6 +40,7 @@ from tahmeed.services.truck_service import get_fleet_numbers
 from tahmeed.services.settings_service import get_setting
 from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.services.subtable_service import get_subtables
+from tahmeed.ui.cashier.excel_row_header import ExcelRowHeaderView, ROW_HEADER_QSS, sync_row_header_labels
 
 # ── Design tokens ────────────────────────────────────────────────────────────
 _WHITE = "#FFFFFF"
@@ -275,19 +276,22 @@ class RejectedView(QWidget):
         t.setSelectionBehavior(QAbstractItemView.SelectItems)
         t.setSelectionMode(QAbstractItemView.ExtendedSelection)
         t.setAlternatingRowColors(False)
-        t.verticalHeader().setVisible(False)
-        t.verticalHeader().setDefaultSectionSize(28)
+        t.setVerticalHeader(ExcelRowHeaderView(t, owner=self))
         t.setShowGrid(True)
         t.setTabKeyNavigation(False)
         t.setStyleSheet(
             f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-            "border:none;font-size:12px;font-family:'Segoe UI',sans-serif;"
+            "border:none;font-family:Calibri;font-size:11pt;"
             "selection-background-color:#cde0f5;selection-color:#1B2B4B;}}"
-            f"QTableWidget::item{{padding:2px 6px;color:{_T1};}}"
-            f"QHeaderView::section{{background:{_HDR_BG};color:{_HDR_FG};"
+            f"QTableWidget::item{{padding:2px 3px;color:{_T1};}}"
+            f"QHeaderView::section:horizontal{{background:{_HDR_BG};color:{_HDR_FG};"
             "font-size:11px;font-weight:700;font-family:'Segoe UI',sans-serif;"
             f"border:none;border-right:1px solid {_BORDER};"
             f"border-bottom:2px solid {_RED};padding:5px 4px;}}"
+            f"QTableCornerButton::section{{background:#F2F2F2;border:none;"
+            f"border-right:1px solid #D4D4D4;border-bottom:2px solid {_RED};}}"
+            + ROW_HEADER_QSS
+            + "QLineEdit{color:#111827;background:#ffffff;font-family:Calibri;font-size:11pt;}"
             "QScrollBar:vertical{width:8px;background:transparent;}"
             "QScrollBar::handle:vertical{background:#D1D5DB;border-radius:4px;}"
         )
@@ -337,6 +341,9 @@ class RejectedView(QWidget):
         t._grid_owner = self  # used by cell delegates for Tab/Enter navigation
         self._key_filter = _TableKeyFilter(self._table_key_press)
         t.installEventFilter(self._key_filter)
+        vh = t.verticalHeader()
+        if vh is not None:
+            vh.installEventFilter(self._key_filter)
         return t
 
     # ── Mode / chrome ────────────────────────────────────────────────────────
@@ -458,6 +465,7 @@ class RejectedView(QWidget):
 
         if not txs:
             t.blockSignals(False)
+            sync_row_header_labels(t)
             msg = (
                 "No rejected entries."
                 if self._mode == "rejected"
@@ -474,6 +482,7 @@ class RejectedView(QWidget):
             self._fill_row(r, tx, i + 1)
 
         t.blockSignals(False)
+        sync_row_header_labels(t)
 
     def _fill_row(self, row: int, tx: Transaction, sn: int) -> None:
         bg = QBrush(_RED_ROW if self._mode == "rejected" else SAVED_BG)
@@ -534,6 +543,7 @@ class RejectedView(QWidget):
         t.setItem(0, 0, item)
         t.setSpan(0, 0, 1, len(REJECTED_HEADERS))
         t.blockSignals(False)
+        sync_row_header_labels(t)
 
     # ── Selection helpers ────────────────────────────────────────────────────
 
@@ -791,6 +801,15 @@ class RejectedView(QWidget):
 
     def _show_context_menu(self, pos) -> None:
         menu = QMenu(self)
+        self._populate_context_menu(menu)
+        menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    def _show_row_header_context_menu(self, global_pos) -> None:
+        menu = QMenu(self)
+        self._populate_context_menu(menu)
+        menu.exec(global_pos)
+
+    def _populate_context_menu(self, menu: QMenu) -> None:
         menu.addAction("Copy", self._copy)
         menu.addAction("Cut", self._cut)
         menu.addAction("Paste", self._paste)
@@ -802,7 +821,6 @@ class RejectedView(QWidget):
         else:
             menu.addAction("Restore selected", self._on_restore)
             menu.addAction("Delete permanently", self._on_delete)
-        menu.exec(self._table.viewport().mapToGlobal(pos))
 
     # ── Navigation hooks for delegates ───────────────────────────────────────
 

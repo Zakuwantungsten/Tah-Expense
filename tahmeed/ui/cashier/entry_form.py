@@ -35,6 +35,7 @@ from tahmeed.ui.widgets.qb_txn_toolbar import QbTxnToolbar
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
 from tahmeed.ui.dialogs.attachment_dialog import AttachmentDialog
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
+from tahmeed.ui.cashier.excel_row_header import ExcelRowHeaderView, ROW_HEADER_QSS, sync_row_header_labels
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,14 +88,20 @@ QPushButton:disabled { background:#fdba74; border-color:#fdba74; }
 _TABLE_STYLE = """
 QTableWidget {
     background:#ffffff; gridline-color:#e5e7eb; border:none;
+    font-family:Calibri; font-size:11pt;
     selection-background-color:#fff3e8; selection-color:#111827;
 }
-QHeaderView::section {
+QHeaderView::section:horizontal {
     background:#f1f5f9; color:#334155; font-weight:600; font-size:11px;
     padding:5px 8px; border:none;
     border-right:1px solid #cbd5e1; border-bottom:2px solid #cbd5e1;
 }
-QTableWidget::item          { padding:2px 6px; color:#111827; font-size:12px; }
+QTableCornerButton::section {
+    background:#F2F2F2; border:none;
+    border-right:1px solid #D4D4D4; border-bottom:2px solid #cbd5e1;
+}
+""" + ROW_HEADER_QSS + """
+QTableWidget::item          { padding:2px 3px; color:#111827; }
 QTableWidget::item:selected { color:#111827; }
 """
 
@@ -140,7 +147,7 @@ class _ReceiptDelegate(QStyledItemDelegate):
         status = index.data(Qt.UserRole) or "pending"
         label  = _RCPT_LABEL.get(status, status.upper() if status else status)
         bg, fg = _RCPT_COLORS.get(status, ("#f3f4f6", "#6b7280"))
-        rect   = option.rect.adjusted(6, 5, -6, -5)
+        rect   = option.rect.adjusted(3, 2, -3, -2)
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setBrush(QColor(bg))
@@ -153,7 +160,7 @@ class _ReceiptDelegate(QStyledItemDelegate):
         painter.restore()
 
     def sizeHint(self, option, index):
-        return QSize(90, 28)
+        return QSize(90, 20)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,8 +366,7 @@ class EntryForm(QWidget):
         self._day_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._day_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._day_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self._day_table.verticalHeader().setVisible(False)
-        self._day_table.verticalHeader().setDefaultSectionSize(28)
+        self._day_table.setVerticalHeader(ExcelRowHeaderView(self._day_table, focus_column=_DESC))
         self._day_table.setSortingEnabled(False)
         self._day_table.setItemDelegateForColumn(_RCPT, self._rcpt_delegate)
 
@@ -622,6 +628,7 @@ class EntryForm(QWidget):
 
         n = len(txs)
         self._count_label.setText(f"{n} entr{'y' if n == 1 else 'ies'}")
+        sync_row_header_labels(self._day_table)
         if n > 0:
             self._day_table.scrollToBottom()
         self._sync_attach_badge()

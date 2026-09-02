@@ -103,6 +103,10 @@ from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
 )
 
 from tahmeed.ui.cashier.excel_cursors import excel_hover_cursor, excel_drag_cursor
+from tahmeed.ui.cashier.excel_row_header import (
+    ExcelRowHeaderView,
+    sync_row_header_labels,
+)
 
 
 def _amount_item_from_raw(raw: str) -> QTableWidgetItem:
@@ -144,7 +148,7 @@ class _TableKeyFilter(QObject):
 
 
 # ---------------------------------------------------------------------------
-# Table with Excel-like S/NO row selection
+# Table with Excel-like row gutter + fill handle
 # ---------------------------------------------------------------------------
 
 _ROWS_CLIP_PREFIX = "TAHMEED_ROWS_V1\n"
@@ -195,8 +199,6 @@ class _ExcelTableWidget(QTableWidget):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._grid_owner = None
-        self._sn_dragging = False
-        self._sn_anchor_row = -1
         self._fill_dragging = False
         self._fill_anchor: tuple[int, int, int, int] | None = None
         self._fill_end: tuple[int, int] | None = None
@@ -455,21 +457,13 @@ class _ExcelTableWidget(QTableWidget):
         pos = self._viewport_pos(pos)
         if self._fill_dragging:
             zone = "drag"
-        elif self._sn_dragging:
-            zone = "arrow"
         elif buttons & Qt.LeftButton:
-            index = self.indexAt(pos)
-            if index.isValid() and index.column() != COL_SNO:
-                zone = "drag"
-            else:
-                zone = "arrow"
+            zone = "drag"
         elif self._pos_in_fill_handle(pos):
             zone = "fill"
         else:
             index = self.indexAt(pos)
-            if index.isValid() and index.column() == COL_SNO:
-                zone = "arrow"
-            elif index.isValid():
+            if index.isValid():
                 zone = "hover"
             else:
                 zone = "arrow"
@@ -545,24 +539,7 @@ class _ExcelTableWidget(QTableWidget):
             event.accept()
             return
 
-        if event.button() == Qt.LeftButton:
-            index = self.indexAt(pos)
-            if index.isValid() and index.column() == COL_SNO:
-                row = index.row()
-                self._sn_dragging = True
-                if (event.modifiers() & Qt.ShiftModifier) and self._sn_anchor_row >= 0:
-                    self._select_sn_rows(self._sn_anchor_row, row)
-                else:
-                    self._sn_anchor_row = row
-                    self._select_sn_rows(row, row)
-                self.unsetCursor()
-                return
-
-        self._sn_dragging = False
         super().mousePressEvent(event)
-        cur = self.currentIndex()
-        if cur.isValid() and not (event.modifiers() & Qt.ShiftModifier):
-            self._sn_anchor_row = cur.row()
         self._update_hover_cursor(pos)
         self.viewport().update()
 
@@ -572,13 +549,6 @@ class _ExcelTableWidget(QTableWidget):
             self._update_fill_drag_end(pos)
             self.setCursor(self._drag_cursor)
             event.accept()
-            return
-
-        if self._sn_dragging and (event.buttons() & Qt.LeftButton):
-            index = self.indexAt(pos)
-            if index.isValid() and self._sn_anchor_row >= 0:
-                self._select_sn_rows(self._sn_anchor_row, index.row())
-            self.unsetCursor()
             return
 
         super().mouseMoveEvent(event)
@@ -592,26 +562,9 @@ class _ExcelTableWidget(QTableWidget):
             event.accept()
             return
 
-        self._sn_dragging = False
         super().mouseReleaseEvent(event)
         self._update_hover_cursor(pos)
         self.viewport().update()
-
-    def _select_sn_rows(self, row_a: int, row_b: int) -> None:
-        """Select every column in the contiguous row range (Excel row gutter)."""
-        r0, r1 = min(row_a, row_b), max(row_a, row_b)
-        model = self.model()
-        selection = QItemSelection(
-            model.index(r0, 0),
-            model.index(r1, self.columnCount() - 1),
-        )
-        self.selectionModel().select(
-            selection, QItemSelectionModel.ClearAndSelect
-        )
-        self.selectionModel().setCurrentIndex(
-            model.index(row_b, COL_SNO),
-            QItemSelectionModel.NoUpdate,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -954,10 +907,12 @@ class DailyRegister(QWidget):
                 background: #ffffff;
                 gridline-color: #e5e7eb;
                 border: none;
+                font-family: Calibri;
+                font-size: 11pt;
                 selection-background-color: #cde0f5;
                 selection-color: #1B2B4B;
             }
-            QHeaderView::section {
+            QHeaderView::section:horizontal {
                 background: #253A5C;
                 color: #F9FAFB;
                 font-weight: 600;
@@ -967,9 +922,29 @@ class DailyRegister(QWidget):
                 border-right: 1px solid #1B2B4B;
                 border-bottom: 2px solid #0077C5;
             }
-            QTableWidget::item         { padding: 2px 6px; color: #111827; }
+            QHeaderView::section:vertical {
+                background: #F2F2F2;
+                color: #333333;
+                font-family: Calibri;
+                font-size: 11pt;
+                padding: 0 2px;
+                border: none;
+                border-right: 1px solid #D4D4D4;
+                border-bottom: 1px solid #D4D4D4;
+            }
+            QHeaderView:vertical {
+                background: #ffffff;
+                border: none;
+            }
+            QTableCornerButton::section {
+                background: #F2F2F2;
+                border: none;
+                border-right: 1px solid #D4D4D4;
+                border-bottom: 2px solid #0077C5;
+            }
+            QTableWidget::item         { padding: 2px 3px; color: #111827; }
             QTableWidget::item:selected { color: #1B2B4B; font-weight: 500; }
-            QLineEdit { color: #111827; background: #ffffff; }
+            QLineEdit { color: #111827; background: #ffffff; font-family: Calibri; font-size: 11pt; }
         """)
 
         hh = self._table.horizontalHeader()
@@ -988,8 +963,7 @@ class DailyRegister(QWidget):
         self._table.setColumnHidden(COL_CASHIER, True)
 
         self._table.setSelectionMode(QAbstractItemView.ContiguousSelection)
-        self._table.verticalHeader().setDefaultSectionSize(28)
-        self._table.verticalHeader().setVisible(False)
+        self._table.setVerticalHeader(ExcelRowHeaderView(self._table, owner=self))
         self._table.setTabKeyNavigation(False)
         sm = self._table.selectionModel()
         sm.selectionChanged.connect(lambda *_: self._table.viewport().update())
@@ -1058,6 +1032,7 @@ class DailyRegister(QWidget):
 
         # Init blank rows
         self._init_editable_rows(0, DEFAULT_EDITABLE_ROWS)
+        self._sync_row_header_labels()
         self._install_key_handler()
 
     def resizeEvent(self, event) -> None:
@@ -2212,6 +2187,9 @@ class DailyRegister(QWidget):
     # Row numbering
     # ------------------------------------------------------------------
 
+    def _sync_row_header_labels(self) -> None:
+        sync_row_header_labels(self._table)
+
     def _renumber(self) -> None:
         self._table.blockSignals(True)
         for row in range(self._table.rowCount()):
@@ -2228,6 +2206,7 @@ class DailyRegister(QWidget):
                         ri.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                         self._table.setItem(row, COL_RECEIPT, ri)
         self._table.blockSignals(False)
+        self._sync_row_header_labels()
         # Keep header KPIs (entries / refund / total) in sync after row ops
         # that block itemChanged (delete, clear, paste, import).
         self._update_footer()
@@ -2532,6 +2511,9 @@ class DailyRegister(QWidget):
     def _install_key_handler(self) -> None:
         self._key_filter = _TableKeyFilter(self._table_key_press)
         self._table.installEventFilter(self._key_filter)
+        vh = self._table.verticalHeader()
+        if vh is not None:
+            vh.installEventFilter(self._key_filter)
 
     def _commit_date_suggestion(self) -> None:
         """If the focused cell is an empty Date cell, write the register date."""
@@ -2939,7 +2921,12 @@ class DailyRegister(QWidget):
         if not indexes:
             return
         rows = sorted({i.row() for i in indexes})
-        cols = sorted({i.column() for i in indexes})
+        if self._selection_is_full_rows(rows):
+            cols = sorted(
+                c for c in range(self._table.columnCount()) if c not in READONLY_COLS
+            )
+        else:
+            cols = sorted({i.column() for i in indexes})
         lines = []
         for row in rows:
             row_cells = []
@@ -3005,16 +2992,26 @@ class DailyRegister(QWidget):
 
     def _selection_is_full_rows(self, rows: list) -> bool:
         """True when the selection covers every data column for each row."""
+        if not rows:
+            return False
+        indexes = self._table.selectedIndexes()
+        if not indexes:
+            return False
+        sel_rows = {i.row() for i in indexes}
+        if sel_rows != set(rows):
+            return False
+        sel_cols = {i.column() for i in indexes}
         ncols = self._table.columnCount()
         data_cols = {c for c in range(ncols) if c not in READONLY_COLS}
         if not data_cols:
             return False
-        selected = {(i.row(), i.column()) for i in self._table.selectedIndexes()}
-        for row in rows:
-            for col in data_cols:
-                if (row, col) not in selected:
-                    return False
-        return True
+        if data_cols.issubset(sel_cols):
+            return True
+        # Row gutter select: empty cells may be omitted from selectedIndexes().
+        if COL_SNO in sel_cols and max(sel_cols) >= max(data_cols):
+            span = set(range(min(sel_cols), max(sel_cols) + 1))
+            return data_cols.issubset(span)
+        return False
 
     def _serialize_row(self, row: int) -> list:
         cells = []
@@ -3745,9 +3742,8 @@ class DailyRegister(QWidget):
     # Context menu
     # ------------------------------------------------------------------
 
-    def _show_context_menu(self, pos) -> None:
-        row = self._table.rowAt(pos.y())
-        menu = QMenu(self._table)
+    def _populate_context_menu(self, menu: QMenu) -> None:
+        row = self._table.currentRow()
         sel_rows = sorted({i.row() for i in self._table.selectedIndexes()})
         saved_sel = [r for r in sel_rows if r < self._saved_count]
         if (
@@ -3779,7 +3775,16 @@ class DailyRegister(QWidget):
                 menu.addAction("Undo", self._undo)
             if self._redo_stack:
                 menu.addAction("Redo", self._redo)
+
+    def _show_context_menu(self, pos) -> None:
+        menu = QMenu(self._table)
+        self._populate_context_menu(menu)
         menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    def _show_row_header_context_menu(self, global_pos) -> None:
+        menu = QMenu(self._table)
+        self._populate_context_menu(menu)
+        menu.exec(global_pos)
 
     def _insert_above(self) -> None:
         row = max(self._table.currentRow(), self._saved_count)

@@ -153,6 +153,9 @@ DUP_BG    = QColor("#FEE2E2")   # light red — possible duplicate flag
 MISMATCH_BG = QColor("#FEF3C7") # amber — date mismatch (submitted vs transaction date)
 TRUCK_REQUIRED_BG = QColor("#FECDD3")  # rose — item requires truck but cell is empty
 
+# Excel-like cell text inset (matches QTableWidget::item horizontal padding)
+_CELL_H_INSET = 3
+
 # Footer QB-style icon+text-below action buttons
 _FOOTER_BTN_STYLE = """
 QToolButton {
@@ -279,7 +282,8 @@ class _ExcelCellDelegate(QStyledItemDelegate):
             )
         else:
             align = int(align)
-        painter.drawText(option.rect.adjusted(6, 0, -6, 0), align, text)
+        inset = _CELL_H_INSET
+        painter.drawText(option.rect.adjusted(inset, 0, -inset, 0), align, text)
 
     def _paint_fill_extension_preview(
         self, painter: QPainter, option, index, table,
@@ -295,8 +299,9 @@ class _ExcelCellDelegate(QStyledItemDelegate):
             preview_font.setItalic(True)
             painter.setFont(preview_font)
             painter.setPen(self._FILL_EXT_TEXT)
+            inset = _CELL_H_INSET
             painter.drawText(
-                rect.adjusted(6, 0, -6, 0),
+                rect.adjusted(inset, 0, -inset, 0),
                 table._fill_preview_text_align(index.column()),
                 text,
             )
@@ -440,8 +445,9 @@ class _DateDelegate(_ExcelCellDelegate):
             suggestion = format_register_date(cur)
             painter.save()
             painter.setPen(QColor("#0077C5"))
+            inset = _CELL_H_INSET
             painter.drawText(
-                option.rect.adjusted(6, 0, -22, 0),
+                option.rect.adjusted(inset, 0, -22, 0),
                 Qt.AlignVCenter | Qt.AlignLeft,
                 suggestion,
             )
