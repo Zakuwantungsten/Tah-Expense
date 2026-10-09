@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,41 +13,31 @@ from tahmeed.services.connectivity_service import (
 
 
 def test_status_labels():
-    online = ConnectivityStatus(api_ok=True, mongo_ok=True)
+    online = ConnectivityStatus(api_ok=True)
     assert online.online
+    assert not online.degraded
     assert online.short_label() == "Connected"
     assert online.banner_message() == ""
     assert online.dot_color() == "#16A34A"
+    assert "API" in online.status_bar_text()
 
-    offline = ConnectivityStatus(api_ok=False, mongo_ok=False)
+    offline = ConnectivityStatus(api_ok=False)
     assert not offline.online
     assert offline.short_label() == "Offline"
-    assert "No connection" in offline.banner_message()
+    assert "API" in offline.banner_message()
     assert offline.dot_color() == "#DC2626"
 
-    api_down = ConnectivityStatus(api_ok=False, mongo_ok=True)
-    assert api_down.degraded
-    assert api_down.short_label() == "API unreachable"
-    assert "API" in api_down.banner_message()
-    assert api_down.dot_color() == "#D97706"
-
-    mongo_down = ConnectivityStatus(api_ok=True, mongo_ok=False)
-    assert mongo_down.degraded
-    assert mongo_down.short_label() == "Database unreachable"
-    assert "database" in mongo_down.banner_message().lower()
+    db_down = ConnectivityStatus(api_ok=False, api_detail="database_unavailable")
+    assert not db_down.online
+    assert db_down.short_label() == "Server unavailable"
+    assert "database" in db_down.banner_message().lower()
 
 
 @pytest.mark.asyncio
-async def test_probe_connectivity_both_ok():
-    with (
-        patch(
-            "tahmeed.services.connectivity_service._probe_api",
-            new=AsyncMock(return_value=(True, "")),
-        ),
-        patch(
-            "tahmeed.services.connectivity_service._probe_mongo",
-            new=AsyncMock(return_value=(True, "")),
-        ),
+async def test_probe_connectivity_ok():
+    with patch(
+        "tahmeed.services.connectivity_service._probe_api",
+        new=AsyncMock(return_value=(True, "")),
     ):
         status = await probe_connectivity()
     assert status.online
@@ -56,7 +45,7 @@ async def test_probe_connectivity_both_ok():
 
 
 @pytest.mark.asyncio
-async def test_probe_api_treats_503_db_as_api_up():
+async def test_probe_api_treats_503_db_as_offline():
     from tahmeed.services.api_client import ApiError
     from tahmeed.services.connectivity_service import _probe_api
 
@@ -73,25 +62,5 @@ async def test_probe_api_treats_503_db_as_api_up():
         mock_client,
     ):
         ok, detail = await _probe_api(2.0)
-    assert ok is True
-    assert detail == "api_up_db_not_ready"
-
-
-@pytest.mark.asyncio
-async def test_probe_mongo_timeout():
-    from tahmeed.services.connectivity_service import _probe_mongo
-
-    client = MagicMock()
-    client.admin.command = AsyncMock(side_effect=asyncio.TimeoutError())
-    with patch("tahmeed.db.connection.get_client", return_value=client):
-        # wait_for will wrap our timeout from the mock if command hangs;
-        # simulate command raising TimeoutError via wait_for by making
-        # command sleep forever then cancelling — simpler: raise TimeoutError
-        # from wait_for by using a slow coroutine.
-        async def _slow(*_a, **_k):
-            await asyncio.sleep(10)
-
-        client.admin.command = _slow
-        ok, detail = await _probe_mongo(0.05)
     assert ok is False
-    assert detail == "timeout"
+    assert detail == "database_unavailable"

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import calendar
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -12,8 +11,9 @@ from typing import Dict, List, Optional, Tuple
 import openpyxl
 from bson import ObjectId
 
-from tahmeed.db.connection import get_db
-from tahmeed.models.transaction import Transaction, pack_money
+from tahmeed.models.transaction import pack_money
+from tahmeed.services.api_client import api_client
+from tahmeed.services.api_models import desktop_document, jsonable_document
 from tahmeed.services.description_mapping_service import (
     get_mappings_for_descriptions,
     normalize_description,
@@ -21,12 +21,6 @@ from tahmeed.services.description_mapping_service import (
 )
 from tahmeed.services.excel_dates import parse_excel_date
 from tahmeed.services.daily_import_service import parse_amount
-
-
-_MONTH_LABELS = [
-    "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-]
 
 
 @dataclass
@@ -70,21 +64,6 @@ def _parse_date(val) -> Optional[datetime]:
     if parsed is None:
         return None
     return parsed.replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def _normalize_receipt(val: str) -> str:
-    s = (val or "").strip().lower()
-    if not s:
-        return "pending"
-    if "no receipt" in s or s in {"missing", "no", "n/a"}:
-        return "missing"
-    if "received" in s or s in {"yes", "receipt", "rcvd"}:
-        return "received"
-    return "pending"
-
-
-def _month_label(dt: datetime) -> str:
-    return f"{_MONTH_LABELS[dt.month]} {str(dt.year)[-2:]}"
 
 
 def parse_master_expenses_excel(
@@ -202,46 +181,27 @@ async def apply_mapping_to_preview(
     preview.unmapped.pop(description_key, None)
 
 
-def _build_memo(row: MasterImportRow) -> str:
-    parts = []
-    if row.memo:
-        parts.append(row.memo)
-    if row.notes:
-        parts.append(row.notes)
-    return " | ".join(parts)
-
-
-def _row_to_transaction(
-    row: MasterImportRow,
-    *,
-    upload_id: str,
-    source_filename: str,
-    verified_by: Optional[ObjectId] = None,
-) -> Transaction:
-    return Transaction(
-        date=row.date,
-        description=row.description,
-        truck_number=row.truck_number,
-        amount=row.amount,
-        currency=row.currency,
-        amount_usd=row.amount_usd,
-        category_id=row.category_id,
-        category_name=row.category_name,
-        category_confidence=1.0 if row.category_name else 0.0,
-        item=row.category_name or "",
-        lpo_do=row.lpo_do,
-        do_number=row.do_number,
-        memo=_build_memo(row),
-        receipt_status=_normalize_receipt(row.receipt_raw),
-        notes_flag=bool(row.notes),
-        ownership=row.ownership,
-        approver=row.approver,
-        verified=True,
-        verified_by=verified_by,
-        verified_at=datetime.utcnow(),
-        month=_month_label(row.date),
-        year=row.date.year,
-        created_at=datetime.utcnow(),
+def _row_commit_payload(row: MasterImportRow) -> dict:
+    """JSON-ready staged row for ``POST /v1/imports/master/commit``."""
+    return jsonable_document(
+        {
+            "serial": row.serial,
+            "date": row.date,
+            "description": row.description,
+            "truck_number": row.truck_number,
+            "lpo_do": row.lpo_do,
+            "do_number": row.do_number,
+            "memo": row.memo,
+            "notes": row.notes,
+            "amount": row.amount,
+            "currency": row.currency,
+            "amount_usd": row.amount_usd,
+            "receipt_raw": row.receipt_raw,
+            "ownership": row.ownership,
+            "approver": row.approver,
+            "category_id": row.category_id,
+            "category_name": row.category_name,
+        }
     )
 
 
@@ -251,83 +211,24 @@ async def commit_master_import(
     verified_by: Optional[ObjectId] = None,
     skip_duplicates: bool = True,
 ) -> dict:
-    """Insert all preview rows as verified master transactions.
+    """Insert all preview rows as verified master transactions via API.
 
-    Soft pre-check skips known serials; a unique index on
-    ``(master_import_source, master_serial)`` makes retries after a partial
-    insert safe (duplicate keys are counted, not raised).
+    ``verified_by`` is attributed server-side from the authenticated manager;
+    the argument is kept for call-site compatibility.
     """
-    from tahmeed.db.import_idempotency import ensure_import_indexes, insert_many_idempotent
-
+    del verified_by
     if preview.unmapped:
         raise ValueError(
             f"{len(preview.unmapped)} description(s) still need an item mapping."
         )
 
-    upload_id = str(uuid.uuid4())
-    db = get_db()
-    await ensure_import_indexes()
-    inserted = 0
-    duplicates = 0
-    batch: List[dict] = []
-
-    existing_serials: set[int] = set()
-    if skip_duplicates:
-        serials = [r.serial for r in preview.rows if r.serial is not None]
-        if serials:
-            cursor = db.transactions.find(
-                {
-                    "master_import_source": preview.source_filename,
-                    "master_serial": {"$in": serials},
-                },
-                {"master_serial": 1},
-            )
-            docs = await cursor.to_list(length=None)
-            existing_serials = {d["master_serial"] for d in docs if "master_serial" in d}
-
-    for row in preview.rows:
-        if skip_duplicates and row.serial is not None and row.serial in existing_serials:
-            duplicates += 1
-            continue
-        tx = _row_to_transaction(
-            row,
-            upload_id=upload_id,
-            source_filename=preview.source_filename,
-            verified_by=verified_by,
-        )
-        doc = tx.to_doc()
-        doc["master_import_id"] = upload_id
-        doc["master_import_source"] = preview.source_filename
-        if row.serial is not None:
-            doc["master_serial"] = row.serial
-        batch.append(doc)
-        if len(batch) >= 500:
-            n, d = await insert_many_idempotent(db.transactions, batch)
-            inserted += n
-            duplicates += d
-            batch.clear()
-
-    if batch:
-        n, d = await insert_many_idempotent(db.transactions, batch)
-        inserted += n
-        duplicates += d
-
-    result = {
-        "inserted": inserted,
-        "duplicates_skipped": duplicates,
-        "upload_id": upload_id,
-        "source": preview.source_filename,
-    }
-    try:
-        from tahmeed.services.audit_service import record_event
-
-        await record_event(
-            "import.master",
-            actor_id=verified_by,
-            entity_type="import_batch",
-            upload_id=upload_id,
-            details=result,
-        )
-    except Exception:
-        pass
-    return result
+    payload = await api_client.request(
+        "POST",
+        "v1/imports/master/commit",
+        json={
+            "source_filename": preview.source_filename,
+            "skip_duplicates": skip_duplicates,
+            "rows": [_row_commit_payload(row) for row in preview.rows],
+        },
+    )
+    return desktop_document(payload)

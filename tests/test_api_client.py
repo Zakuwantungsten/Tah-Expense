@@ -106,3 +106,22 @@ def test_transport_errors_are_normalized() -> None:
         await client.close()
 
     asyncio.run(scenario())
+
+
+def test_request_bytes_returns_raw_body() -> None:
+    async def scenario() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers.get("authorization") == "Bearer access"
+            return httpx.Response(
+                200,
+                content=b"%PDF-binary",
+                headers={"content-type": "application/octet-stream"},
+            )
+
+        client = ApiClient("https://api.test", transport=httpx.MockTransport(handler))
+        client.set_tokens({"access_token": "access", "refresh_token": "refresh"})
+        body = await client.request_bytes("GET", "v1/transactions/x/attachments/y/file")
+        assert body == b"%PDF-binary"
+        await client.close()
+
+    asyncio.run(scenario())

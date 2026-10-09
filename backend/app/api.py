@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import re
 import secrets
+import uuid
 from datetime import timedelta
 from typing import Annotated, Any
 
@@ -14,6 +15,7 @@ from pymongo.errors import DuplicateKeyError
 from .dependencies import Authenticated, Cashier, Manager, require_roles
 from .errors import ApiError
 from .schemas import (
+    AuditEventWrite,
     BackupRestoreRequest,
     CategoryWrite,
     ChangePasswordRequest,
@@ -24,6 +26,7 @@ from .schemas import (
     PeopleWrite,
     RefreshRequest,
     RuleWrite,
+    SettingWrite,
     SubtableWrite,
     UserCreate,
     UserUpdate,
@@ -39,6 +42,26 @@ from .security import (
     verify_password,
 )
 from .serialization import json_safe, object_id
+from .accountant_actions_api import actions as accountant_actions_router
+from .accountant_deletions_api import deletions as accountant_deletions_router
+from .accountant_inbox_api import inbox as accountant_inbox_router
+from .accountant_diesel_api import diesel_cash as accountant_diesel_router
+from .accountant_master_api import master as accountant_master_router
+from .accountant_ops import pending_inbox_count_query
+from .accountant_overview_api import overview as accountant_overview_router
+from .accountant_rejected_api import rejected as accountant_rejected_router
+from .accountant_reports_api import reports as accountant_reports_router
+from .accountant_trash_api import trash as accountant_trash_router
+from .accountant_fuel_overview_api import (
+    fuel_overview as accountant_fuel_overview_router,
+)
+from .accountant_truck_overview_api import (
+    truck_overview as accountant_truck_overview_router,
+)
+from .feeds_api import feeds as feeds_router
+from .imports_api import imports as imports_router
+from .reconciliation_api import reconciliation as reconciliation_router
+from .transactions_api import transactions as transactions_router
 
 api = APIRouter(prefix="/v1")
 auth = APIRouter(prefix="/auth", tags=["auth"])
@@ -51,8 +74,56 @@ fleet = APIRouter(tags=["fleet"])
 people = APIRouter(prefix="/people", tags=["people"])
 backups = APIRouter(prefix="/backups", tags=["backups"])
 accountant = APIRouter(prefix="/accountant", tags=["accountant"])
+accountant.include_router(accountant_inbox_router)
+accountant.include_router(accountant_actions_router)
+accountant.include_router(accountant_rejected_router)
+accountant.include_router(accountant_deletions_router)
+accountant.include_router(accountant_trash_router)
+accountant.include_router(accountant_master_router)
+accountant.include_router(accountant_reports_router)
+accountant.include_router(accountant_diesel_router)
+accountant.include_router(accountant_overview_router)
+accountant.include_router(accountant_truck_overview_router)
+accountant.include_router(accountant_fuel_overview_router)
+settings_api = APIRouter(prefix="/settings", tags=["settings"])
+audit_api = APIRouter(prefix="/audit", tags=["audit"])
 
 _OPERATION_LOCK_SECONDS = 60
+
+# Keep in sync with tahmeed.services.settings_service.DEFAULTS
+SETTINGS_DEFAULTS: dict[str, Any] = {
+    "default_currency": "TZS",
+    "confidence_threshold": 75,
+    "restrict_items": False,
+    "defer_item_to_verify": False,
+    "restrict_trucks": True,
+    "duplicate_check_days": 5,
+    "allowed_truck_labels": ["YARD", "GARAGE"],
+    "diesel_cash_items": ["Diesel Cash"],
+    "export_restrict_surfaces": [
+        "cashier_register",
+        "cashier_print",
+        "master_expenses",
+        "category_tables",
+        "truck_overview",
+        "diesel_cash",
+    ],
+}
+
+_SETTING_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def validate_setting_key(key: str) -> str:
+    if not _SETTING_KEY_RE.match(key):
+        raise ApiError(422, "invalid_setting_key", "Setting key is invalid")
+    return key
+
+
+async def merged_settings(db: Any) -> dict[str, Any]:
+    result = dict(SETTINGS_DEFAULTS)
+    docs = await db.system_settings.find({}).to_list(length=None)
+    result.update({doc["key"]: doc["value"] for doc in docs if "key" in doc})
+    return result
 
 
 def database(request: Request) -> Any:
@@ -255,21 +326,72 @@ async def accountant_notification_counts(
     request: Request,
     _manager: Annotated[dict, Depends(require_roles("admin", "accountant"))],
 ) -> dict[str, int]:
+    """Badge total — same formula as ``GET /v1/accountant/counts/pending``."""
     db = database(request)
-    # Match desktop get_pending_count: submitted/legacy inbox + deletion requests
-    # (exclude cashier drafts that are not yet submitted for verify).
-    pending = await db.transactions.count_documents(
-        {
-            "verified": False,
-            "rejected": {"$ne": True},
-            "$or": [
-                {"register_status": "submitted"},
-                {"register_status": {"$exists": False}},
-            ],
-        }
-    )
+    pending = await db.transactions.count_documents(pending_inbox_count_query())
     deletions = await db.transactions.count_documents({"deletion_requested": True})
     return {"verify": int(pending) + int(deletions)}
+
+
+@settings_api.get("")
+async def get_all_settings(request: Request, _user: Authenticated) -> dict[str, Any]:
+    return json_safe(await merged_settings(database(request)))
+
+
+@settings_api.get("/{key}")
+async def get_setting(key: str, request: Request, _user: Authenticated) -> dict[str, Any]:
+    key = validate_setting_key(key)
+    db = database(request)
+    doc = await db.system_settings.find_one({"key": key})
+    if doc is not None and "value" in doc:
+        return json_safe({"key": key, "value": doc["value"]})
+    if key in SETTINGS_DEFAULTS:
+        return {"key": key, "value": SETTINGS_DEFAULTS[key]}
+    raise ApiError(404, "setting_not_found", f"Unknown setting '{key}'")
+
+
+@settings_api.put("/{key}")
+async def put_setting(
+    key: str, body: SettingWrite, request: Request, _user: Authenticated
+) -> dict[str, Any]:
+    # Matches desktop: cashiers may update labels / force restrict_trucks; managers
+    # update the rest. All authenticated roles may write known UI settings.
+    key = validate_setting_key(key)
+    db = database(request)
+    await db.system_settings.update_one(
+        {"key": key},
+        {"$set": {"key": key, "value": body.value}},
+        upsert=True,
+    )
+    return json_safe({"key": key, "value": body.value})
+
+
+@audit_api.post("/events", status_code=201)
+async def create_audit_event(
+    body: AuditEventWrite, request: Request, user: Authenticated
+) -> dict[str, Any]:
+    """Append-only operation_events row (desktop audit trail)."""
+    actor_id = body.actor_id or str(user.get("_id") or "")
+    actor_username = body.actor_username or user.get("username")
+    actor_role = body.actor_role or user.get("role")
+    doc = {
+        "ts": utcnow(),
+        "action": body.action,
+        "actor_id": actor_id or None,
+        "actor_username": actor_username,
+        "actor_role": actor_role,
+        "entity_type": body.entity_type,
+        "entity_ids": list(body.entity_ids),
+        "upload_id": body.upload_id,
+        "outcome": body.outcome,
+        "error": body.error,
+        "request_id": body.request_id or uuid.uuid4().hex,
+        "client": body.client or "desktop",
+        "app_version": body.app_version,
+        "details": body.details or {},
+    }
+    result = await database(request).operation_events.insert_one(doc)
+    return json_safe({"id": result.inserted_id})
 
 
 @users.get("")
@@ -830,5 +952,22 @@ async def restore_backup_job(
     return json_safe(result)
 
 
-for router in (auth, users, categories, subtables, rules, mappings, fleet, people, backups, accountant):
+for router in (
+    auth,
+    users,
+    categories,
+    subtables,
+    rules,
+    mappings,
+    fleet,
+    people,
+    backups,
+    accountant,
+    settings_api,
+    audit_api,
+    transactions_router,
+    reconciliation_router,
+    imports_router,
+    feeds_router,
+):
     api.include_router(router)

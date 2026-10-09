@@ -1,3 +1,9 @@
+"""Optional Motor client for admin scripts / tests.
+
+The desktop app is API-only and must not call these helpers. Prefer the
+backend process (``backend/.env``) for application data access.
+"""
+
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from tahmeed.config import MONGODB_URI, DB_NAME
 
@@ -9,7 +15,9 @@ def get_client() -> AsyncIOMotorClient:
     if _client is None:
         if not MONGODB_URI:
             raise RuntimeError(
-                "MONGODB_URI is not set. Copy .env.example to .env and fill in your Atlas URI."
+                "MONGODB_URI is not set. Desktop builds do not need it; "
+                "for admin scripts set MONGODB_URI in the environment "
+                "(loopback for local work — see LOCAL_DEV.md)."
             )
         _client = AsyncIOMotorClient(MONGODB_URI)
     return _client

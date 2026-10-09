@@ -133,7 +133,6 @@ def main() -> None:
     splash.show_centered()
     splash.set_status("Starting…")
 
-    from tahmeed.db.connection import close as close_db
     from tahmeed.services.api_client import api_client, close_api
     from tahmeed.services.update_controller import UpdateController
     from tahmeed.services.update_service import (
@@ -278,14 +277,12 @@ def main() -> None:
     with loop:
         QTimer.singleShot(0, _reveal_login)
         loop.run_forever()
-        # Clean up the DB client while the loop is still open (exiting the
+        # Clean up the API client while the loop is still open (exiting the
         # `with` block closes the loop, so this must run inside it).
         from tahmeed.services.connectivity_service import connectivity_monitor
 
         connectivity_monitor.stop()
-        loop.run_until_complete(
-            asyncio.gather(close_api(), close_db(), return_exceptions=True)
-        )
+        loop.run_until_complete(close_api())
 
     installer = pending_installer[0] if pending_installer else install_on_exit_path()
     app_lock.unlock()

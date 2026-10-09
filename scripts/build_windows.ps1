@@ -35,8 +35,11 @@ $ProductionEnv = Get-Content ".env.production" -Raw
 if ($ProductionEnv -notmatch '(?m)^UPDATE_MANIFEST_URL=https://[^/\s]+/.+$') {
     throw "UPDATE_MANIFEST_URL must be an HTTPS R2 custom-domain URL."
 }
-if ($ProductionEnv -match 'YOUR-|REPLACE_|yourdomain\.com|example\.com|HOSTNAME\.TAILNET') {
+if ($ProductionEnv -match 'YOUR-|REPLACE_|yourdomain\.com|example\.com|HOSTNAME\.TAILNET|PRIVATE_HOST') {
     throw ".env.production still contains a placeholder."
+}
+if ($ProductionEnv -notmatch '(?m)^API_BASE_URL=https://api\.meedexpe\.com\s*$') {
+    throw "API_BASE_URL must be https://api.meedexpe.com for production builds."
 }
 
 try {

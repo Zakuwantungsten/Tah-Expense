@@ -130,14 +130,14 @@ class ApiClient:
             request_id=request_id,
         )
 
-    async def request(
+    async def _send(
         self,
         method: str,
         path: str,
         *,
         auth: bool = True,
         **kwargs: Any,
-    ) -> Any:
+    ) -> httpx.Response:
         rejected_token = self._access_token
         headers = dict(kwargs.pop("headers", {}))
         if auth:
@@ -172,6 +172,17 @@ class ApiClient:
 
         if response.status_code >= 400:
             raise self._error(response)
+        return response
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        auth: bool = True,
+        **kwargs: Any,
+    ) -> Any:
+        response = await self._send(method, path, auth=auth, **kwargs)
         if response.status_code == 204 or not response.content:
             return None
         try:
@@ -182,6 +193,20 @@ class ApiClient:
                 status_code=response.status_code,
                 code="invalid_response",
             ) from exc
+
+    async def request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        auth: bool = True,
+        **kwargs: Any,
+    ) -> bytes:
+        """Authenticated request returning raw body (attachments / downloads)."""
+        # Attachments can be large; allow a longer read timeout when caller omits one.
+        kwargs.setdefault("timeout", httpx.Timeout(120.0, connect=5.0))
+        response = await self._send(method, path, auth=auth, **kwargs)
+        return response.content
 
     async def logout(self) -> None:
         try:

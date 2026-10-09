@@ -1,2 +1,7 @@
 - Fixed minor bugs
 - Implemented new supplier functionality
+- Phase 11: desktop is API-only (no Mongo URI in production builds; connectivity probes `/health/ready` only)
+- Phase 12: production ingress docs — Cloudflare Tunnel to `https://api.meedexpe.com` (see `deployment/docker/CLOUDFLARE.md`); Tailscale Serve is overlap-only until cutover
+- Phase 1 API-only: settings + audit trail go through the local/backend API (desktop no longer reads those collections over Mongo)
+- Phase 5 API-only: transaction attachments upload/download/list/remove via HTTPS API; files stored on the server (`ATTACHMENTS_DIRECTORY`), desktop keeps only a local open-cache
+- Phase 6 API-only: SM Burhani Bonds / RPA reconciliation (list, import save, uploads, stations) via `/v1/reconciliation/{table}/...`

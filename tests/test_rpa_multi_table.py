@@ -164,59 +164,52 @@ def test_station_helpers_keep_file_order_and_all_filter() -> None:
     assert [d["_id"] for d in alpha_trap] == ["nakonde", "kasumbalesa"]
 
 
-def test_ensure_recon_stations_registers_new_chips() -> None:
+def test_ensure_recon_stations_posts_unique_slugs(monkeypatch) -> None:
     import asyncio
 
     from tahmeed.services import reconciliation_service as recon_svc
 
-    added: list[tuple[str, str]] = []
+    calls: list[dict] = []
 
-    async def fake_add(name: str, border_post: str = "", table: str = "bonds"):
-        added.append((name, table))
-        return {"name": name, "table": table}
+    async def request(method, path, **kwargs):
+        calls.append({"method": method, "path": path, "json": kwargs.get("json")})
+        return {"ok": True}
 
-    original = recon_svc.add_recon_station
-    recon_svc.add_recon_station = fake_add
-    try:
-        asyncio.run(recon_svc.ensure_recon_stations(
-            "bonds", ["nakonde", "kasumbalesa", "nakonde", "", "mwami"],
-        ))
-    finally:
-        recon_svc.add_recon_station = original
-
-    assert added == [
-        ("Nakonde", "bonds"),
-        ("Kasumbalesa", "bonds"),
-        ("Mwami", "bonds"),
+    monkeypatch.setattr(recon_svc.api_client, "request", request)
+    asyncio.run(
+        recon_svc.ensure_recon_stations(
+            "bonds", ["nakonde", "kasumbalesa", "nakonde", "", "mwami"]
+        )
+    )
+    assert calls == [
+        {
+            "method": "POST",
+            "path": "v1/reconciliation/bonds/stations/ensure",
+            "json": {"slugs": ["nakonde", "kasumbalesa", "mwami"]},
+        }
     ]
 
 
-def test_existing_recon_keys_are_scoped_to_table() -> None:
+def test_existing_recon_keys_are_scoped_to_table(monkeypatch) -> None:
     import asyncio
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock
 
     from tahmeed.services import reconciliation_service as recon_svc
 
-    captured: list[dict] = []
+    calls: list[dict] = []
 
-    def find(query, _proj):
-        captured.append(query)
-        return SimpleNamespace(to_list=AsyncMock(return_value=[
-            {"dedup_key": "111|S1"},
-        ]))
+    async def request(method, path, **kwargs):
+        calls.append({"method": method, "path": path, "json": kwargs.get("json")})
+        return {"keys": ["111|S1"]}
 
-    db = SimpleNamespace(reconciliation_entries=SimpleNamespace(find=find))
-    original = recon_svc.get_db
-    recon_svc.get_db = lambda: db
-    try:
-        found = asyncio.run(recon_svc.get_existing_recon_keys(["111|S1", "222|S2"], "bonds"))
-    finally:
-        recon_svc.get_db = original
-
+    monkeypatch.setattr(recon_svc.api_client, "request", request)
+    found = asyncio.run(
+        recon_svc.get_existing_recon_keys(["111|S1", "222|S2"], "bonds")
+    )
     assert found == {"111|S1"}
-    assert captured == [{
-        "entity": "sm_burhani",
-        "table": "bonds",
-        "dedup_key": {"$in": ["111|S1", "222|S2"]},
-    }]
+    assert calls == [
+        {
+            "method": "POST",
+            "path": "v1/reconciliation/bonds/existing-keys",
+            "json": {"keys": ["111|S1", "222|S2"]},
+        }
+    ]

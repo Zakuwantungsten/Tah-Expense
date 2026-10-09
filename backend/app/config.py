@@ -1,8 +1,22 @@
+import os
+import re
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_TAILSCALE_CGNAT = re.compile(
+    r"(?:^|[@/])100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?::|/|\?|$)"
+)
+
+
+def _remote_db_override_enabled() -> bool:
+    return os.getenv("TAHMEED_ALLOW_REMOTE_DB", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 class Settings(BaseSettings):
@@ -23,6 +37,7 @@ class Settings(BaseSettings):
     mongorestore_path: str = "mongorestore"
     backup_directory: Path = Path("./var/backups")
     backup_lock_file: Path = Path("./var/backup.lock")
+    attachments_directory: Path = Path("./var/attachments")
     backup_s3_bucket: str = ""
     backup_s3_region: str = ""
     backup_s3_endpoint_url: str = ""
@@ -51,6 +66,16 @@ class Settings(BaseSettings):
     def validate_mongodb_uri(cls, value: str) -> str:
         if not value.startswith(("mongodb://", "mongodb+srv://")):
             raise ValueError("must be a MongoDB URI")
+        # Protect local coding sessions from accidentally using production/Tailscale Mongo.
+        # Server production sets TAHMEED_ALLOW_REMOTE_DB=1 (or uses 127.0.0.1 on-box).
+        if not _remote_db_override_enabled() and (
+            ".ts.net" in value.lower() or _TAILSCALE_CGNAT.search(value)
+        ):
+            raise ValueError(
+                "refuses Tailscale/production Mongo URI in local mode; "
+                "use mongodb://127.0.0.1/... (LOCAL_DEV.md) or set "
+                "TAHMEED_ALLOW_REMOTE_DB=1 on the server only"
+            )
         return value
 
     @field_validator("backup_mongodb_uri")

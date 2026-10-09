@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime
-from types import SimpleNamespace
 
 from tahmeed.services.accountant_service import (
     accumulate_diesel_cash_fuel_liters,
@@ -128,42 +127,24 @@ def test_bucket_ignores_days_outside_selected_period() -> None:
 
 
 def test_get_overview_fuel_liters_merges_cash_and_stations(monkeypatch) -> None:
-    cash = [
-        {"date": datetime(2026, 8, 10), "description": "DIESEL 400 LTRS"},
-    ]
-    stations = [
-        {
-            "_id": {"feed": "diesel_infinity", "y": 2026, "m": 8, "d": 10},
-            "liters": 250,
-        },
-        {
-            "_id": {"feed": "diesel_lake_zambia", "y": 2026, "m": 8, "d": 12},
-            "liters": 90,
-        },
-    ]
-
-    class _Cursor:
-        def __init__(self, docs):
-            self._docs = docs
-
-        async def to_list(self, length=None):
-            return list(self._docs)
-
-    db = SimpleNamespace(
-        transactions=SimpleNamespace(find=lambda *a, **k: _Cursor(cash)),
-        imported_feeds=SimpleNamespace(aggregate=lambda *a, **k: _Cursor(stations)),
-    )
-    monkeypatch.setattr(
-        "tahmeed.services.accountant_service.get_db",
-        lambda: db,
-    )
-
-    async def _names():
-        return ["Diesel Cash"]
+    async def request(method: str, path: str, *, params: dict | None = None, **_kw):
+        assert method == "GET"
+        assert path == "v1/accountant/overview/fuel-liters"
+        assert params == {"year": 2026}
+        return {
+            "year": 2026,
+            "series": {
+                "diesel_cash": {"2026-08-10": 400.0},
+                "infinity": {"2026-08-10": 250.0},
+                "lake_zambia": {"2026-08-12": 90.0},
+                "lake_tunduma": {},
+                "gbp_diesel": {},
+            },
+        }
 
     monkeypatch.setattr(
-        "tahmeed.services.accountant_service.get_diesel_cash_item_names",
-        _names,
+        "tahmeed.services.accountant_service.api_client.request",
+        request,
     )
 
     payload = asyncio.run(get_overview_fuel_liters(2026))

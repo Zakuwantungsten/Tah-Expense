@@ -1,3 +1,4 @@
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -113,6 +114,296 @@ class PatchDocument(StrictModel):
         if blocked.intersection(value):
             raise ValueError("immutable or sensitive field included")
         return value
+
+
+class SettingWrite(StrictModel):
+    value: Any
+
+
+class TransactionCreate(BaseModel):
+    """Cashier register row create — mirrors desktop Transaction.to_doc() JSON.
+
+    Extra keys (e.g. ``truck_sort_key``, accountant fields) are ignored so the
+    desktop can POST its full document shape.
+    """
+
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    date: datetime
+    description: str = ""
+    truck_number: str = ""
+    amount: float = 0.0
+    currency: str = "TZS"
+    amount_usd: float | None = None
+    category_id: str | None = None
+    category_name: str | None = None
+    category_confidence: float = 0.0
+    item: str = ""
+    lpo_do: str = ""
+    do_number: str = ""
+    memo: str = ""
+    receipt_status: str = "pending"
+    notes_flag: bool = False
+    ref_float: str = ""
+    ownership: str = ""
+    approver: str = ""
+    payee: str = ""
+    cheque: str = ""
+    reported_date: datetime | None = None
+    cashier_id: str | None = None
+    verified: bool = False
+    verified_by: str | None = None
+    verified_at: datetime | None = None
+    rejection_reason: str | None = None
+    rejected: bool = False
+    discarded: bool = False
+    deletion_requested: bool = False
+    deletion_requested_at: datetime | None = None
+    deletion_requested_by: str | None = None
+    trashed: bool = False
+    trashed_at: datetime | None = None
+    trashed_by: str | None = None
+    edited_after_verification: bool = False
+    last_edited_at: datetime | None = None
+    last_edited_by: str | None = None
+    day_order: int | None = None
+    register_status: str = "draft"
+    month: str | None = None
+    year: int | None = None
+    possible_duplicate: bool = False
+    daily_import_id: str | None = None
+    daily_import_source: str | None = None
+    date_discrepancy: bool = False
+    import_primary_date: datetime | None = None
+    original_transaction_id: str | None = None
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: datetime | None = None
+
+
+class TransactionPatch(StrictModel):
+    values: dict[str, Any]
+
+    @field_validator("values")
+    @classmethod
+    def prevent_unsafe_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
+        blocked = {"_id", "created_at"}
+        if blocked.intersection(value):
+            raise ValueError("immutable field included")
+        return value
+
+
+class SubmitDayRequest(StrictModel):
+    date: date
+
+
+class DayOrderRequest(StrictModel):
+    date: date
+    ordered_ids: list[str] = Field(default_factory=list, max_length=2000)
+
+
+class DuplicateCheckRequest(StrictModel):
+    truck_number: str = ""
+    amount: float = 0.0
+    item: str = ""
+    description: str = ""
+    days: int = Field(5, ge=1, le=365)
+    exclude_id: str | None = None
+
+
+class PendingEditRequest(StrictModel):
+    updates: dict[str, Any] = Field(default_factory=dict)
+    cashier_id: str | None = None
+
+    @field_validator("updates")
+    @classmethod
+    def prevent_unsafe_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
+        blocked = {"_id", "created_at", "original_transaction_id"}
+        if blocked.intersection(value):
+            raise ValueError("immutable field included")
+        return value
+
+
+class RequestDeleteBody(StrictModel):
+    cashier_id: str | None = None
+
+
+class TransactionIdsRequest(StrictModel):
+    ids: list[str] = Field(default_factory=list, max_length=500)
+    cashier_id: str | None = None
+    allow_any_cashier: bool = False
+
+
+class ResubmitRejectedRequest(StrictModel):
+    cashier_id: str | None = None
+    updates_by_id: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class RejectRequest(StrictModel):
+    reason: str = Field("", max_length=2000)
+
+
+class BulkRejectRequest(StrictModel):
+    ids: list[str] = Field(default_factory=list, max_length=500)
+    reason: str = Field("", max_length=2000)
+
+
+class BulkIdsRequest(StrictModel):
+    ids: list[str] = Field(default_factory=list, max_length=500)
+
+
+class CategoryAssignRequest(StrictModel):
+    category_name: str = Field(min_length=1, max_length=200)
+    category_id: str | None = None
+
+
+class BulkCategoryAssignRequest(StrictModel):
+    ids: list[str] = Field(default_factory=list, max_length=500)
+    category_name: str = Field(min_length=1, max_length=200)
+    category_id: str | None = None
+
+
+class MasterPatchRequest(StrictModel):
+    updates: dict[str, Any] = Field(default_factory=dict)
+
+
+class BulkMasterUpdateRequest(StrictModel):
+    ids: list[str] = Field(default_factory=list, max_length=500)
+    updates: dict[str, Any] = Field(default_factory=dict)
+
+
+class CategoriesUsageTotalsRequest(StrictModel):
+    names: list[str] = Field(default_factory=list, max_length=2000)
+
+
+class DieselCashItemsRequest(StrictModel):
+    names: list[str] = Field(default_factory=list, max_length=200)
+
+
+class ReconExistingKeysRequest(StrictModel):
+    keys: list[str] = Field(default_factory=list, max_length=5000)
+
+
+class ReconRowWrite(StrictModel):
+    station: str = ""
+    schedule_period: str = ""
+    sr_no: int | None = None
+    sm_ref_no: str = ""
+    prn_number: str = ""
+    entry_reg_no: str = ""
+    t1_no: str = ""
+    t1_date: datetime | None = None
+    importer: str = ""
+    consignment: str = ""
+    truck_and_trailer: str = ""
+    charge: float = 0.0
+    asycuda_amount: float | None = None
+    exporter: str = ""
+    confirmed: bool = False
+    disputed: bool = False
+    dispute_note: str = ""
+    import_date: datetime | None = None
+    upload_id: str = ""
+    source_filename: str = ""
+
+
+class ReconRowsCreateRequest(StrictModel):
+    rows: list[ReconRowWrite] = Field(default_factory=list, max_length=5000)
+
+
+class ReconRowStatusPatch(StrictModel):
+    confirmed: bool | None = None
+    disputed: bool | None = None
+    dispute_note: str | None = None
+
+
+class ReconStationsEnsureRequest(StrictModel):
+    slugs: list[str] = Field(default_factory=list, max_length=500)
+
+
+class ReconStationCreateRequest(StrictModel):
+    name: str = Field(min_length=1, max_length=200)
+    border_post: str = Field("", max_length=200)
+
+
+class DailyImportCommitRequest(StrictModel):
+    """Staged daily Excel rows — field shapes vary; validated in import_ops."""
+
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
+
+
+class MasterImportCommitRequest(StrictModel):
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
+    source_filename: str = Field("", max_length=500)
+    skip_duplicates: bool = True
+
+
+class ChartOfAccountsImportRequest(StrictModel):
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
+    replace_existing: bool = True
+    source_filename: str = Field("", max_length=500)
+
+
+class FeedExistingKeysRequest(StrictModel):
+    keys: list[str] = Field(default_factory=list, max_length=10000)
+
+
+class FeedImportRequest(StrictModel):
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
+
+
+class ZambiaSheetLabelsRequest(StrictModel):
+    labels: list[str] = Field(default_factory=list, max_length=500)
+
+
+class ZambiaContentHashRequest(StrictModel):
+    content_hash: str = Field("", max_length=128)
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
+
+
+class DieselDupCheckRequest(StrictModel):
+    content_hash: str = Field("", max_length=128)
+    source_filename: str = Field("", max_length=500)
+    sheet_label: str = Field("", max_length=200)
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
+
+
+class SkippedImportSaveRequest(StrictModel):
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
+
+
+class SkippedImportIdsRequest(StrictModel):
+    ids: list[str] = Field(default_factory=list, max_length=5000)
+
+
+class SkippedImportTruckPatch(StrictModel):
+    truck_value: str = Field("", max_length=200)
+
+
+class AuditEventWrite(StrictModel):
+
+    action: str = Field(min_length=1, max_length=200)
+    actor_id: str | None = Field(None, max_length=64)
+    actor_username: str | None = Field(None, max_length=100)
+    actor_role: str | None = Field(None, max_length=40)
+    entity_type: str | None = Field(None, max_length=80)
+    entity_ids: list[str] = Field(default_factory=list, max_length=500)
+    upload_id: str | None = Field(None, max_length=120)
+    outcome: str = Field("ok", max_length=40)
+    error: str | None = Field(None, max_length=2000)
+    details: dict[str, Any] = Field(default_factory=dict)
+    request_id: str | None = Field(None, max_length=64)
+    client: str = Field("desktop", max_length=40)
+    app_version: str | None = Field(None, max_length=40)
+
+    @field_validator("entity_ids")
+    @classmethod
+    def normalize_entity_ids(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for raw in value:
+            text = str(raw).strip()
+            if text and text not in cleaned:
+                cleaned.append(text[:64])
+        return cleaned
 
 
 class BackupRestoreRequest(StrictModel):

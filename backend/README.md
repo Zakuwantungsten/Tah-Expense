@@ -5,15 +5,20 @@ import the desktop package, so the API can be deployed independently.
 
 ## Setup
 
+Local coding must use loopback Mongo (`tahmeed_expense_dev`), never the
+production/Tailscale host. Full workflow: [`../LOCAL_DEV.md`](../LOCAL_DEV.md).
+
 ```powershell
 cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 Copy-Item .env.example .env
+# Confirm MONGODB_URI=mongodb://127.0.0.1:... and DB_NAME=tahmeed_expense_dev
 python -m app.cli.migrate --check
 python -m app.cli.migrate
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+# From repo root: .\scripts\dev_api.ps1
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 The migration first prints duplicate conflicts and refuses to create any index

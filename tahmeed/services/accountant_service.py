@@ -3,14 +3,17 @@
 import asyncio
 import calendar
 import hashlib
+import json
 import re
 from datetime import datetime, date, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from urllib.parse import quote
 
 from bson import ObjectId
 
-from tahmeed.db.connection import get_db
 from tahmeed.models.transaction import Transaction
+from tahmeed.services.api_client import api_client
+from tahmeed.services.api_models import desktop_document
 from tahmeed.services.diesel_amounts import apply_diesel_computed_fields, diesel_line_total
 from tahmeed.services.diesel_currency import (
     LAKE_ZAMBIA_DIESEL_CURRENCIES,
@@ -127,17 +130,240 @@ def _with_date_range(
 UNVERIFIED_INBOX_SORT = [("date", -1), ("day_order", 1), ("created_at", 1)]
 
 
+def _tx_from_api(document: dict) -> Transaction:
+    return Transaction.from_doc(desktop_document(document))
+
+
+def _csv_param(value) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(v).strip() for v in value if str(v).strip())
+    return str(value).strip()
+
+
+def _oids_from_api_items(items) -> List[ObjectId]:
+    out: List[ObjectId] = []
+    for raw in items or []:
+        if raw is None:
+            continue
+        text = str(raw)
+        if ObjectId.is_valid(text):
+            out.append(ObjectId(text))
+    return out
+
+
+def _iso_dt(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    return value.isoformat()
+
+
+def _trash_params(
+    *,
+    search: str = "",
+    truck: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: Optional[int] = None,
+    skip: Optional[int] = None,
+) -> dict:
+    params: dict = {}
+    if search:
+        params["search"] = search
+    if truck:
+        params["truck"] = truck
+    if date_from is not None:
+        params["date_from"] = _iso_dt(date_from)
+    if date_to is not None:
+        params["date_to"] = _iso_dt(date_to)
+    if limit is not None:
+        params["limit"] = limit
+    if skip is not None:
+        params["skip"] = skip
+    return params
+
+
+def _inbox_params(
+    *,
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    edited: Optional[bool] = None,
+    item="",
+    description="",
+    limit: Optional[int] = None,
+    skip: Optional[int] = None,
+) -> dict:
+    params: dict = {}
+    if search:
+        params["search"] = search
+    if truck:
+        params["truck"] = truck
+    if cashier_id is not None:
+        params["cashier_id"] = str(cashier_id)
+    if date_from is not None:
+        params["date_from"] = _iso_dt(date_from)
+    if date_to is not None:
+        params["date_to"] = _iso_dt(date_to)
+    if edited is True:
+        params["edited"] = "true"
+    elif edited is False:
+        params["edited"] = "false"
+    item_csv = _csv_param(item)
+    if item_csv:
+        params["item"] = item_csv
+    desc_csv = _csv_param(description)
+    if desc_csv:
+        params["description"] = desc_csv
+    if limit is not None:
+        params["limit"] = limit
+    if skip is not None:
+        params["skip"] = skip
+    return params
+
+
+def _master_params(
+    *,
+    year: Optional[int] = None,
+    month: int = 0,
+    search: str = "",
+    truck: str = "",
+    category: str = "",
+    receipt: str = "",
+    description: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    sort_field: Optional[str] = None,
+    sort_asc: Optional[bool] = None,
+    limit: Optional[int] = None,
+    skip: Optional[int] = None,
+    field: Optional[str] = None,
+) -> dict:
+    params: dict = {}
+    if year is not None:
+        params["year"] = int(year)
+    if month:
+        params["month"] = int(month)
+    if search:
+        params["search"] = search
+    if truck:
+        params["truck"] = truck
+    if category:
+        params["category"] = category
+    if receipt:
+        params["receipt"] = receipt
+    if description:
+        params["description"] = description
+    if date_from is not None:
+        params["date_from"] = _iso_dt(date_from)
+    if date_to is not None:
+        params["date_to"] = _iso_dt(date_to)
+    if column_filters:
+        cleaned = {
+            str(k): [str(v) for v in (vals or []) if str(v).strip()]
+            for k, vals in column_filters.items()
+            if vals
+        }
+        if cleaned:
+            params["column_filters"] = json.dumps(cleaned)
+    if sort_field is not None:
+        params["sort_field"] = sort_field
+    if sort_asc is not None:
+        params["sort_asc"] = "true" if sort_asc else "false"
+    if limit is not None:
+        params["limit"] = limit
+    if skip is not None:
+        params["skip"] = skip
+    if field:
+        params["field"] = field
+    return params
+
+
+def _jsonable_master_updates(updates: dict) -> dict:
+    """Serialize ObjectId / datetime values for the master PATCH/bulk JSON body."""
+    out: dict = {}
+    for key, value in (updates or {}).items():
+        if isinstance(value, ObjectId):
+            out[key] = str(value)
+        elif isinstance(value, datetime):
+            out[key] = value.isoformat()
+        elif isinstance(value, date):
+            out[key] = value.isoformat()
+        else:
+            out[key] = value
+    return out
+
+
+def _category_report_path(category: str, suffix: str) -> str:
+    name = quote((category or "").strip(), safe="")
+    return f"v1/accountant/reports/category/{name}/{suffix}"
+
+
+def _category_report_params(
+    *,
+    description: str = "",
+    descriptions: Optional[List[str]] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    sort_field: Optional[str] = None,
+    sort_asc: Optional[bool] = None,
+    limit: Optional[int] = None,
+    skip: Optional[int] = None,
+    field: Optional[str] = None,
+) -> dict:
+    params: dict = {}
+    if description:
+        params["description"] = description
+    if descriptions:
+        csv = _csv_param(descriptions)
+        if csv:
+            params["descriptions"] = csv
+    if date_from is not None:
+        params["date_from"] = _iso_dt(date_from)
+    if date_to is not None:
+        params["date_to"] = _iso_dt(date_to)
+    if column_filters:
+        cleaned = {
+            str(k): [str(v) for v in (vals or []) if str(v).strip()]
+            for k, vals in column_filters.items()
+            if vals
+        }
+        if cleaned:
+            params["column_filters"] = json.dumps(cleaned)
+    if sort_field is not None:
+        params["sort_field"] = sort_field
+    if sort_asc is not None:
+        params["sort_asc"] = "true" if sort_asc else "false"
+    if limit is not None:
+        params["limit"] = limit
+    if skip is not None:
+        params["skip"] = skip
+    if field:
+        params["field"] = field
+    return params
+
+
+def _totals_from_payload(payload: dict | None) -> dict:
+    body = payload or {}
+    return {
+        "count": int(body.get("count") or 0),
+        "tzs": float(body.get("tzs") or 0.0),
+        "usd": float(body.get("usd") or 0.0),
+    }
+
+
 async def get_unverified_transactions(limit: int = 50, skip: int = 0) -> List[Transaction]:
-    db = get_db()
-    cursor = (
-        db.transactions
-        .find({"verified": False})
-        .sort(list(UNVERIFIED_INBOX_SORT))
-        .skip(skip)
-        .limit(limit)
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/inbox",
+        params={"limit": limit, "skip": skip},
     )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def get_verified_transactions(
@@ -147,74 +373,37 @@ async def get_verified_transactions(
     limit: int = 50,
     skip: int = 0,
 ) -> List[Transaction]:
-    db = get_db()
-    query: dict = {
-        "verified": True,
-        "deletion_requested": {"$ne": True},
-        "trashed": {"$ne": True},
-    }
-
-    if year or month:
-        date_filter: dict = {}
-        _year = year or date.today().year
-        if month:
-            last_day = calendar.monthrange(_year, month)[1]
-            date_filter["$gte"] = datetime(_year, month, 1)
-            date_filter["$lte"] = datetime(_year, month, last_day, 23, 59, 59)
-        else:
-            date_filter["$gte"] = datetime(_year, 1, 1)
-            date_filter["$lte"] = datetime(_year, 12, 31, 23, 59, 59)
-        query["date"] = date_filter
-
+    params: dict = {"limit": limit, "skip": skip}
+    if year is not None:
+        params["year"] = year
+    if month is not None:
+        params["month"] = month
     if category:
-        query["category_name"] = category
-
-    cursor = (
-        db.transactions
-        .find(query)
-        .sort([("date", -1), ("created_at", -1)])
-        .skip(skip)
-        .limit(limit)
+        params["category"] = category
+    payload = await api_client.request(
+        "GET", "v1/accountant/verified", params=params
     )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def get_transactions_by_ids(tx_ids: List[ObjectId]) -> List[Transaction]:
     if not tx_ids:
         return []
-    db = get_db()
-    docs = await db.transactions.find({"_id": {"$in": tx_ids}}).to_list(length=len(tx_ids))
-    return [Transaction.from_doc(d) for d in docs]
+    payload = await api_client.request(
+        "GET",
+        "v1/transactions",
+        params={"ids": ",".join(str(oid) for oid in tx_ids)},
+    )
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bool:
-    db = get_db()
-    result = await db.transactions.update_one(
-        {"_id": tx_id, "verified": False},
-        {"$set": {
-            "verified": True,
-            "verified_by": accountant_id,
-            "verified_at": datetime.utcnow(),
-            "rejection_reason": None,
-            "possible_duplicate": False,
-            "date_discrepancy": False,
-        }},
+    # Actor comes from the API session; accountant_id kept for call-site compatibility.
+    _ = accountant_id
+    payload = await api_client.request(
+        "POST", f"v1/accountant/transactions/{tx_id}/approve"
     )
-    ok = result.modified_count == 1
-    if ok:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.approve",
-                actor_id=accountant_id,
-                entity_type="transaction",
-                entity_ids=[tx_id],
-            )
-        except Exception:
-            pass
-    return ok
+    return bool(payload.get("ok"))
 
 
 async def reject_transaction(
@@ -223,31 +412,13 @@ async def reject_transaction(
     *,
     actor_id: ObjectId | None = None,
 ) -> bool:
-    db = get_db()
-    result = await db.transactions.update_one(
-        {"_id": tx_id},
-        {"$set": {
-            "verified": False,
-            "rejection_reason": reason,
-            "rejected": True,
-            "discarded": False,
-        }},
+    _ = actor_id
+    payload = await api_client.request(
+        "POST",
+        f"v1/accountant/transactions/{tx_id}/reject",
+        json={"reason": reason or ""},
     )
-    ok = result.modified_count == 1
-    if ok:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.reject",
-                actor_id=actor_id,
-                entity_type="transaction",
-                entity_ids=[tx_id],
-                details={"reason": (reason or "")[:240]},
-            )
-        except Exception:
-            pass
-    return ok
+    return bool(payload.get("ok"))
 
 
 def _normalize_user_id(value: ObjectId | str | None) -> ObjectId | None:
@@ -266,33 +437,15 @@ async def bulk_reject_transactions(
     *,
     actor_id: ObjectId | None = None,
 ) -> int:
+    _ = actor_id
     if not tx_ids:
         return 0
-    db = get_db()
-    result = await db.transactions.update_many(
-        {"_id": {"$in": tx_ids}},
-        {"$set": {
-            "verified": False,
-            "rejection_reason": reason,
-            "rejected": True,
-            "discarded": False,
-        }},
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/transactions/bulk-reject",
+        json={"ids": [str(oid) for oid in tx_ids], "reason": reason or ""},
     )
-    n = int(result.modified_count)
-    if n:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.reject_bulk",
-                actor_id=actor_id,
-                entity_type="transaction",
-                entity_ids=tx_ids,
-                details={"count": n, "reason": (reason or "")[:240]},
-            )
-        except Exception:
-            pass
-    return n
+    return int(payload.get("updated") or 0)
 
 
 async def get_cashier_names(cashier_ids: List[ObjectId]) -> Dict[ObjectId, str]:
@@ -311,18 +464,17 @@ async def get_cashier_names(cashier_ids: List[ObjectId]) -> Dict[ObjectId, str]:
     if not query_ids:
         return {}
 
-    db = get_db()
-    docs = await db.users.find(
-        {"_id": {"$in": list(set(query_ids))}},
-        {"_id": 1, "full_name": 1, "username": 1},
-    ).to_list(length=None)
-
+    unique = list({str(oid) for oid in query_ids})
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/cashier-names",
+        params={"ids": ",".join(unique)},
+    )
+    names_raw = payload.get("names") or {}
     names_by_oid: Dict[ObjectId, str] = {}
-    for doc in docs:
-        name = (doc.get("full_name") or "").strip()
-        if not name:
-            name = (doc.get("username") or "").strip()
-        names_by_oid[doc["_id"]] = name or "Unknown cashier"
+    for raw_id, name in names_raw.items():
+        if ObjectId.is_valid(str(raw_id)):
+            names_by_oid[ObjectId(str(raw_id))] = name or "Unknown cashier"
 
     return {
         cid: names_by_oid.get(id_by_original[cid], "Unknown cashier")
@@ -333,17 +485,8 @@ async def get_cashier_names(cashier_ids: List[ObjectId]) -> Dict[ObjectId, str]:
 
 async def get_pending_count() -> int:
     """Sidebar / inbox badge: submitted unverified + deletion requests."""
-    db = get_db()
-    inbox = await db.transactions.count_documents({
-        "verified": False,
-        "rejected": {"$ne": True},
-        "$or": [
-            {"register_status": "submitted"},
-            {"register_status": {"$exists": False}},
-        ],
-    })
-    deletions = await db.transactions.count_documents({"deletion_requested": True})
-    return int(inbox) + int(deletions)
+    payload = await api_client.request("GET", "v1/accountant/counts/pending")
+    return int(payload.get("count") or 0)
 
 
 def _sum_amount_if_currency(*codes: str, absolute: bool = False) -> dict:
@@ -408,137 +551,106 @@ async def _overview_usd_feed_month_totals(year: int) -> Dict[int, float]:
     return dict(pairs)
 
 
+def _overview_int_months(raw: dict | None) -> Dict[int, dict]:
+    """Convert API month-totals keys (often strings) to int keys for the UI."""
+    out: Dict[int, dict] = {}
+    for key, row in (raw or {}).items():
+        try:
+            month = int(key)
+        except (TypeError, ValueError):
+            continue
+        out[month] = {
+            "tzs": float((row or {}).get("tzs") or 0.0),
+            "usd": float((row or {}).get("usd") or 0.0),
+            "zmw": float((row or {}).get("zmw") or 0.0),
+            "count": int((row or {}).get("count") or 0),
+        }
+    return out
+
+
+def _deserialize_fuel_liters_series(
+    raw: dict | None,
+) -> Dict[str, Dict[date, float]]:
+    """Convert API ISO date keys back to ``date`` keys for chart bucketing."""
+    store = empty_fuel_liters_daily()
+    for source, days in (raw or {}).items():
+        if source not in store or not isinstance(days, dict):
+            continue
+        for day_key, liters in days.items():
+            day: Optional[date] = None
+            if isinstance(day_key, date) and not isinstance(day_key, datetime):
+                day = day_key
+            elif isinstance(day_key, datetime):
+                day = day_key.date()
+            elif isinstance(day_key, str):
+                try:
+                    day = date.fromisoformat(day_key[:10])
+                except ValueError:
+                    continue
+            if day is None:
+                continue
+            try:
+                qty = float(liters or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if qty > 0:
+                store[source][day] = store[source].get(day, 0.0) + qty
+    return store
+
+
 async def get_overview_kpis(year: Optional[int] = None) -> dict:
     """Aggregate real counts for the Overview KPI cards (TZS / USD / ZMW).
 
     USD/ZMW from imported separate-expense feeds are merged by
     ``get_overview_dashboard`` so feed aggregations run once per refresh.
     """
-    today = date.today()
-    _year = year if year is not None else today.year
-    month_start = datetime(today.year, today.month, 1)
-    year_start = datetime(_year, 1, 1)
-    year_end = datetime(_year, 12, 31, 23, 59, 59)
-
-    db = get_db()
-    pending_count, ytd_res, month_res = await asyncio.gather(
-        db.transactions.count_documents({"verified": False, "rejected": {"$ne": True}}),
-        db.transactions.aggregate([
-            {"$match": {"verified": True, "date": {"$gte": year_start, "$lte": year_end}}},
-            {"$group": {
-                "_id": None,
-                "count": {"$sum": 1},
-                "tzs_total": _sum_amount_if_currency("TZS", "TSH", "TZ"),
-                "usd_total": _sum_amount_if_currency("USD"),
-                "zmw_total": _sum_amount_if_currency("ZMW", "ZMB", "ZK"),
-            }},
-        ]).to_list(1),
-        db.transactions.aggregate([
-            {"$match": {"date": {"$gte": month_start}}},
-            {"$group": {
-                "_id": None,
-                "verified": {"$sum": {"$cond": ["$verified", 1, 0]}},
-                "total": {"$sum": 1},
-            }},
-        ]).to_list(1),
+    params: dict = {}
+    if year is not None:
+        params["year"] = int(year)
+    payload = await api_client.request(
+        "GET", "v1/accountant/overview/kpis", params=params
     )
-
-    ytd = ytd_res[0] if ytd_res else {
-        "count": 0, "tzs_total": 0.0, "usd_total": 0.0, "zmw_total": 0.0,
-    }
-    month = month_res[0] if month_res else {"verified": 0, "total": 0}
-
     return {
-        "pending_count": pending_count,
-        "master_count": ytd.get("count", 0),
-        "verified_this_month": month.get("verified", 0),
-        "submitted_this_month": month.get("total", 0),
-        "total_tzs_ytd": float(ytd.get("tzs_total", 0.0) or 0.0),
-        "total_usd_ytd": float(ytd.get("usd_total", 0.0) or 0.0),
-        "total_zmw_ytd": float(ytd.get("zmw_total", 0.0) or 0.0),
+        "pending_count": int(payload.get("pending_count") or 0),
+        "master_count": int(payload.get("master_count") or 0),
+        "verified_this_month": int(payload.get("verified_this_month") or 0),
+        "submitted_this_month": int(payload.get("submitted_this_month") or 0),
+        "total_tzs_ytd": float(payload.get("total_tzs_ytd") or 0.0),
+        "total_usd_ytd": float(payload.get("total_usd_ytd") or 0.0),
+        "total_zmw_ytd": float(payload.get("total_zmw_ytd") or 0.0),
     }
 
 
 async def get_overview_category_breakdown(year: int, top_n: int = 4) -> List[dict]:
     """Top expense categories with per-currency verified spend for a fiscal year."""
-    db = get_db()
-    year_start = datetime(year, 1, 1)
-    year_end = datetime(year, 12, 31, 23, 59, 59)
-    docs = await db.transactions.aggregate([
-        {"$match": {"verified": True, "date": {"$gte": year_start, "$lte": year_end}}},
-        {"$group": {
-            "_id": {"$ifNull": ["$category_name", "Uncategorised"]},
-            "tzs": _sum_amount_if_currency("TZS", "TSH", "TZ", absolute=True),
-            "usd": _sum_amount_if_currency("USD", absolute=True),
-            "zmw": _sum_amount_if_currency("ZMW", "ZMB", "ZK", absolute=True),
-        }},
-        {"$sort": {"tzs": -1, "usd": -1, "zmw": -1}},
-    ]).to_list(None)
-
-    if not docs:
-        return []
-
-    # Rank by whichever currency has the largest absolute total across categories
-    # so empty TZS years still surface USD/ZMW categories.
-    def _rank_key(doc: dict) -> float:
-        return max(
-            float(doc.get("tzs", 0) or 0),
-            float(doc.get("usd", 0) or 0),
-            float(doc.get("zmw", 0) or 0),
-        )
-
-    ranked = sorted(docs, key=_rank_key, reverse=True)
-    if _rank_key(ranked[0]) <= 0:
-        return []
-
-    top = ranked[:top_n]
-    rest = ranked[top_n:]
-    slices: List[dict] = []
-    for doc in top:
-        name = doc["_id"] or "Uncategorised"
-        slices.append({
-            "name": name,
-            "tzs": float(doc.get("tzs", 0.0) or 0.0),
-            "usd": float(doc.get("usd", 0.0) or 0.0),
-            "zmw": float(doc.get("zmw", 0.0) or 0.0),
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/overview/categories",
+        params={"year": int(year), "top_n": int(top_n)},
+    )
+    items = []
+    for row in payload.get("items") or []:
+        items.append({
+            "name": row.get("name") or "Uncategorised",
+            "tzs": float(row.get("tzs") or 0.0),
+            "usd": float(row.get("usd") or 0.0),
+            "zmw": float(row.get("zmw") or 0.0),
         })
-    if rest:
-        slices.append({
-            "name": "Other",
-            "tzs": sum(float(d.get("tzs", 0) or 0) for d in rest),
-            "usd": sum(float(d.get("usd", 0) or 0) for d in rest),
-            "zmw": sum(float(d.get("zmw", 0) or 0) for d in rest),
-        })
-    return slices
+    return items
 
 
 async def get_overview_receipt_breakdown(year: int) -> dict:
     """Receipt status counts for verified transactions in a fiscal year."""
-    db = get_db()
-    year_start = datetime(year, 1, 1)
-    year_end = datetime(year, 12, 31, 23, 59, 59)
-    docs = await db.transactions.aggregate([
-        {"$match": {"verified": True, "date": {"$gte": year_start, "$lte": year_end}}},
-        {"$group": {"_id": "$receipt_status", "count": {"$sum": 1}}},
-    ]).to_list(None)
-
-    received = pending = missing = 0
-    for doc in docs:
-        status = (doc.get("_id") or "pending").lower()
-        count = doc.get("count", 0)
-        if status == "received":
-            received += count
-        elif status in ("missing", "no_receipt"):
-            missing += count
-        else:
-            pending += count
-
-    total = received + pending + missing
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/overview/receipts",
+        params={"year": int(year)},
+    )
     return {
-        "received": received,
-        "pending": pending,
-        "missing": missing,
-        "total": total,
+        "received": int(payload.get("received") or 0),
+        "pending": int(payload.get("pending") or 0),
+        "missing": int(payload.get("missing") or 0),
+        "total": int(payload.get("total") or 0),
     }
 
 
@@ -727,47 +839,15 @@ def bucket_daily_fuel_liters(
 
 async def get_overview_fuel_liters(year: int) -> dict:
     """Daily litres for Diesel Cash and each fuel station in *year*."""
-    store = empty_fuel_liters_daily()
-    db = get_db()
-    start = datetime(year, 1, 1)
-    end = datetime(year, 12, 31, 23, 59, 59)
-
-    diesel_match = _diesel_cash_verified_match(await get_diesel_cash_item_names())
-    diesel_match["date"] = {"$gte": start, "$lte": end}
-
-    feed_types = list(_DIESEL_FEED_SOURCE_GROUP.keys())
-    station_pipeline = [
-        {"$match": {
-            "feed_type": {"$in": feed_types},
-            "transaction_date": {"$gte": start, "$lte": end},
-        }},
-        {"$group": {
-            "_id": {
-                "feed": "$feed_type",
-                "y": {"$year": "$transaction_date"},
-                "m": {"$month": "$transaction_date"},
-                "d": {"$dayOfMonth": "$transaction_date"},
-            },
-            "liters": {"$sum": _safe_double("ltrs")},
-        }},
-    ]
-
-    cash_docs, station_docs = await asyncio.gather(
-        db.transactions.find(
-            diesel_match, projection={"date": 1, "description": 1}
-        ).to_list(length=None),
-        db.imported_feeds.aggregate(station_pipeline).to_list(length=None),
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/overview/fuel-liters",
+        params={"year": int(year)},
     )
-    accumulate_diesel_cash_fuel_liters(cash_docs, store)
-    for doc in station_docs:
-        ident = doc.get("_id") or {}
-        source = _DIESEL_FEED_SOURCE_GROUP.get(str(ident.get("feed") or ""), "")
-        try:
-            day = date(int(ident["y"]), int(ident["m"]), int(ident["d"]))
-        except (KeyError, TypeError, ValueError):
-            continue
-        add_fuel_liters_day(store, source, day, doc.get("liters"))
-    return {"year": year, "series": store}
+    return {
+        "year": int(payload.get("year") or year),
+        "series": _deserialize_fuel_liters_series(payload.get("series")),
+    }
 
 
 async def get_overview_month_totals(year: int) -> Dict:
@@ -779,54 +859,49 @@ async def get_overview_month_totals(year: int) -> Dict:
 
     Returns ``{"months": {1: {...}, ...}, "feed_usd_ytd": float, "feed_zmw_ytd": float}``.
     """
-    master, feed_usd, feed_zmw = await asyncio.gather(
-        get_master_month_totals(year),
-        _overview_usd_feed_month_totals(year),
-        _overview_zmw_feed_month_totals(year),
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/overview/month-totals",
+        params={"year": int(year)},
     )
-    months: Dict[int, dict] = {}
+    months = _overview_int_months(payload.get("months"))
     for month in range(1, 13):
-        row = master.get(month, {"tzs": 0.0, "usd": 0.0, "zmw": 0.0, "count": 0})
-        months[month] = {
-            "tzs": float(row.get("tzs", 0.0) or 0.0),
-            "usd": float(row.get("usd", 0.0) or 0.0) + float(feed_usd.get(month, 0.0) or 0.0),
-            "zmw": float(row.get("zmw", 0.0) or 0.0) + float(feed_zmw.get(month, 0.0) or 0.0),
-            "count": int(row.get("count", 0) or 0),
-        }
+        months.setdefault(month, {"tzs": 0.0, "usd": 0.0, "zmw": 0.0, "count": 0})
     return {
         "months": months,
-        "feed_usd_ytd": float(sum(feed_usd.values())),
-        "feed_zmw_ytd": float(sum(feed_zmw.values())),
+        "feed_usd_ytd": float(payload.get("feed_usd_ytd") or 0.0),
+        "feed_zmw_ytd": float(payload.get("feed_zmw_ytd") or 0.0),
     }
 
 
 async def get_overview_dashboard(year: int) -> dict:
     """All data needed by the accountant Overview tab."""
-    kpis, month_payload, categories, fuel_liters, recent, supplier_totals = await asyncio.gather(
-        get_overview_kpis(year),
-        get_overview_month_totals(year),
-        get_overview_category_breakdown(year),
-        get_overview_fuel_liters(year),
-        get_verified_transactions(year=year, limit=8),
-        get_supplier_payments_totals(year),
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/overview",
+        params={"year": int(year)},
     )
-    kpis = dict(kpis)
-    kpis["total_usd_ytd"] = (
-        float(kpis.get("total_usd_ytd", 0.0) or 0.0)
-        + float(month_payload.get("feed_usd_ytd", 0.0) or 0.0)
-    )
-    kpis["total_zmw_ytd"] = (
-        float(kpis.get("total_zmw_ytd", 0.0) or 0.0)
-        + float(month_payload.get("feed_zmw_ytd", 0.0) or 0.0)
-    )
-    kpis["supplier_tzs_ytd"] = float(supplier_totals.get("tzs", 0.0) or 0.0)
-    kpis["supplier_usd_ytd"] = float(supplier_totals.get("usd", 0.0) or 0.0)
+    kpis = dict(payload.get("kpis") or {})
+    fuel = payload.get("fuel_liters") or {}
     return {
-        "kpis": kpis,
-        "month_totals": month_payload.get("months", {}),
-        "categories": categories,
-        "fuel_liters": fuel_liters,
-        "recent": recent,
+        "kpis": {
+            "pending_count": int(kpis.get("pending_count") or 0),
+            "master_count": int(kpis.get("master_count") or 0),
+            "verified_this_month": int(kpis.get("verified_this_month") or 0),
+            "submitted_this_month": int(kpis.get("submitted_this_month") or 0),
+            "total_tzs_ytd": float(kpis.get("total_tzs_ytd") or 0.0),
+            "total_usd_ytd": float(kpis.get("total_usd_ytd") or 0.0),
+            "total_zmw_ytd": float(kpis.get("total_zmw_ytd") or 0.0),
+            "supplier_tzs_ytd": float(kpis.get("supplier_tzs_ytd") or 0.0),
+            "supplier_usd_ytd": float(kpis.get("supplier_usd_ytd") or 0.0),
+        },
+        "month_totals": _overview_int_months(payload.get("month_totals")),
+        "categories": list(payload.get("categories") or []),
+        "fuel_liters": {
+            "year": int(fuel.get("year") or year),
+            "series": _deserialize_fuel_liters_series(fuel.get("series")),
+        },
+        "recent": [_tx_from_api(doc) for doc in payload.get("recent") or []],
     }
 
 
@@ -951,18 +1026,22 @@ async def get_unverified_filtered(
     item="",
     description="",
 ) -> List[Transaction]:
-    db = get_db()
-    query = _build_inbox_query(
-        search, truck, cashier_id, date_from, date_to, edited, item, description,
+    params = _inbox_params(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        edited=edited,
+        item=item,
+        description=description,
+        limit=limit,
+        skip=skip,
     )
-    cursor = (
-        db.transactions.find(query)
-        .sort(list(UNVERIFIED_INBOX_SORT))
-        .skip(skip)
-        .limit(limit)
+    payload = await api_client.request(
+        "GET", "v1/accountant/inbox", params=params
     )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def count_unverified_filtered(
@@ -975,11 +1054,20 @@ async def count_unverified_filtered(
     item="",
     description="",
 ) -> int:
-    db = get_db()
-    query = _build_inbox_query(
-        search, truck, cashier_id, date_from, date_to, edited, item, description,
+    params = _inbox_params(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        edited=edited,
+        item=item,
+        description=description,
     )
-    return await db.transactions.count_documents(query)
+    payload = await api_client.request(
+        "GET", "v1/accountant/inbox/count", params=params
+    )
+    return int(payload.get("count") or 0)
 
 
 # ── Edited-after-verification queries (accountant "Edited" sub-tab) ───────────
@@ -997,19 +1085,21 @@ async def get_edited_transactions(
 ) -> List[Transaction]:
     """Rows the cashier edited after save (verified=False AND
     edited_after_verification=True). Sorted by most-recently-edited first."""
-    db = get_db()
-    query = _build_inbox_query(
-        search, truck, cashier_id, date_from, date_to,
-        edited=True, item=item, description=description,
+    params = _inbox_params(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        item=item,
+        description=description,
+        limit=limit,
+        skip=skip,
     )
-    cursor = (
-        db.transactions.find(query)
-        .sort([("last_edited_at", -1), ("date", -1)])
-        .skip(skip)
-        .limit(limit)
+    payload = await api_client.request(
+        "GET", "v1/accountant/inbox/edited", params=params
     )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def count_edited_transactions(
@@ -1021,28 +1111,25 @@ async def count_edited_transactions(
     item="",
     description="",
 ) -> int:
-    db = get_db()
-    query = _build_inbox_query(
-        search, truck, cashier_id, date_from, date_to,
-        edited=True, item=item, description=description,
+    params = _inbox_params(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        item=item,
+        description=description,
     )
-    return await db.transactions.count_documents(query)
+    payload = await api_client.request(
+        "GET", "v1/accountant/inbox/edited/count", params=params
+    )
+    return int(payload.get("count") or 0)
 
 
 async def get_edited_count() -> int:
     """Total edited rows awaiting re-approval (for the badge)."""
-    db = get_db()
-    return await db.transactions.count_documents(
-        {
-            "verified": False,
-            "edited_after_verification": True,
-            "rejected": {"$ne": True},
-            "$or": [
-                {"register_status": "submitted"},
-                {"register_status": {"$exists": False}},
-            ],
-        }
-    )
+    payload = await api_client.request("GET", "v1/accountant/counts/edited")
+    return int(payload.get("count") or 0)
 
 
 # ── Deletion-request queries (accountant "Deleted" sub-tab) ───────────────────
@@ -1090,18 +1177,21 @@ async def get_deletion_requested_filtered(
     description="",
 ) -> List[Transaction]:
     """Approved rows the cashier asked to permanently remove."""
-    db = get_db()
-    query = _build_deletion_query(
-        search, truck, cashier_id, date_from, date_to, item, description,
+    params = _inbox_params(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        item=item,
+        description=description,
+        limit=limit,
+        skip=skip,
     )
-    cursor = (
-        db.transactions.find(query)
-        .sort([("deletion_requested_at", -1), ("date", -1)])
-        .skip(skip)
-        .limit(limit)
+    payload = await api_client.request(
+        "GET", "v1/accountant/deletions", params=params
     )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def count_deletion_requested_filtered(
@@ -1113,70 +1203,65 @@ async def count_deletion_requested_filtered(
     item="",
     description="",
 ) -> int:
-    db = get_db()
-    query = _build_deletion_query(
-        search, truck, cashier_id, date_from, date_to, item, description,
+    params = _inbox_params(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        item=item,
+        description=description,
     )
-    return await db.transactions.count_documents(query)
+    payload = await api_client.request(
+        "GET", "v1/accountant/deletions/count", params=params
+    )
+    return int(payload.get("count") or 0)
 
 
 async def get_deletion_requested_count() -> int:
     """Total deletion requests awaiting accountant confirm/restore."""
-    db = get_db()
-    return await db.transactions.count_documents({
-        "deletion_requested": True,
-        "trashed": {"$ne": True},
-    })
+    payload = await api_client.request("GET", "v1/accountant/counts/deletions")
+    return int(payload.get("count") or 0)
 
 
 async def get_deletion_requested_trucks() -> List[str]:
-    db = get_db()
-    vals = await db.transactions.distinct(
-        "truck_number",
-        {"deletion_requested": True, "trashed": {"$ne": True}},
+    payload = await api_client.request(
+        "GET", "v1/accountant/deletions/meta/trucks"
     )
-    return sorted(v for v in vals if v)
+    return list(payload.get("items") or [])
 
 
 async def get_deletion_requested_cashier_ids() -> List[ObjectId]:
-    db = get_db()
-    vals = await db.transactions.distinct(
-        "cashier_id",
-        {"deletion_requested": True, "trashed": {"$ne": True}},
+    payload = await api_client.request(
+        "GET", "v1/accountant/deletions/meta/cashiers"
     )
-    return [v for v in vals if v]
+    return _oids_from_api_items(payload.get("items") or [])
 
 
 async def get_deletion_requested_items(
     descriptions: Optional[List[str]] = None,
 ) -> List[str]:
-    db = get_db()
-    base: dict = {"deletion_requested": True, "trashed": {"$ne": True}}
-    descs = _normalize_multi_filter(descriptions or "")
-    if descs:
-        base["$or"] = [
-            {"description": {"$regex": re.escape(d), "$options": "i"}} for d in descs
-        ]
-    items = await db.transactions.distinct("item", base)
-    cats = await db.transactions.distinct("category_name", base)
-    return sorted({*(v for v in items if v), *(v for v in cats if v)})
+    params: dict = {}
+    csv = _csv_param(descriptions or [])
+    if csv:
+        params["descriptions"] = csv
+    payload = await api_client.request(
+        "GET", "v1/accountant/deletions/meta/items", params=params
+    )
+    return list(payload.get("items") or [])
 
 
 async def get_deletion_requested_descriptions(
     items: Optional[List[str]] = None,
 ) -> List[str]:
-    db = get_db()
-    base: dict = {"deletion_requested": True, "trashed": {"$ne": True}}
-    item_list = _normalize_multi_filter(items or "")
-    if item_list:
-        ors: list = []
-        for it in item_list:
-            esc = re.escape(it)
-            ors.append({"item": {"$regex": f"^{esc}$", "$options": "i"}})
-            ors.append({"category_name": {"$regex": f"^{esc}$", "$options": "i"}})
-        base["$or"] = ors
-    vals = await db.transactions.distinct("description", base)
-    return sorted(v for v in vals if v)
+    params: dict = {}
+    csv = _csv_param(items or [])
+    if csv:
+        params["items"] = csv
+    payload = await api_client.request(
+        "GET", "v1/accountant/deletions/meta/descriptions", params=params
+    )
+    return list(payload.get("items") or [])
 
 
 async def confirm_deletion(
@@ -1186,58 +1271,13 @@ async def confirm_deletion(
 ) -> bool:
     """Move a deletion-requested approved row into Trash (soft delete).
 
-    Also removes any pending-edit clones that still point at this original.
+    Pending-edit clones for this original are removed on the API.
     """
-    from tahmeed.db.mongo_txn import run_in_transaction, session_kwargs
-
-    db = get_db()
-    doc = await db.transactions.find_one({
-        "_id": tx_id,
-        "deletion_requested": True,
-        "trashed": {"$ne": True},
-    })
-    if not doc:
-        return False
-
-    now = datetime.utcnow()
-
-    async def _body(session):
-        kw = session_kwargs(session)
-        await db.transactions.delete_many(
-            {"original_transaction_id": tx_id}, **kw
-        )
-        result = await db.transactions.update_one(
-            {
-                "_id": tx_id,
-                "deletion_requested": True,
-                "trashed": {"$ne": True},
-            },
-            {"$set": {
-                "trashed": True,
-                "trashed_at": now,
-                "trashed_by": actor_id,
-                "deletion_requested": False,
-                "deletion_requested_at": None,
-                "deletion_requested_by": None,
-            }},
-            **kw,
-        )
-        return result.modified_count == 1
-
-    ok = await run_in_transaction(_body)
-    if ok:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.trash",
-                actor_id=actor_id,
-                entity_type="transaction",
-                entity_ids=[tx_id],
-            )
-        except Exception:
-            pass
-    return ok
+    _ = actor_id
+    payload = await api_client.request(
+        "POST", f"v1/accountant/deletions/{tx_id}/confirm"
+    )
+    return bool(payload.get("ok"))
 
 
 async def bulk_confirm_deletions(
@@ -1245,115 +1285,37 @@ async def bulk_confirm_deletions(
     *,
     actor_id: ObjectId | None = None,
 ) -> int:
+    _ = actor_id
     if not tx_ids:
         return 0
-    from tahmeed.db.mongo_txn import run_in_transaction, session_kwargs
-
-    db = get_db()
-    now = datetime.utcnow()
-
-    async def _body(session):
-        kw = session_kwargs(session)
-        await db.transactions.delete_many(
-            {"original_transaction_id": {"$in": tx_ids}}, **kw
-        )
-        result = await db.transactions.update_many(
-            {
-                "_id": {"$in": tx_ids},
-                "deletion_requested": True,
-                "trashed": {"$ne": True},
-            },
-            {"$set": {
-                "trashed": True,
-                "trashed_at": now,
-                "trashed_by": actor_id,
-                "deletion_requested": False,
-                "deletion_requested_at": None,
-                "deletion_requested_by": None,
-            }},
-            **kw,
-        )
-        return int(result.modified_count)
-
-    n = await run_in_transaction(_body)
-    if n:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.trash_bulk",
-                actor_id=actor_id,
-                entity_type="transaction",
-                entity_ids=tx_ids,
-                details={"count": n},
-            )
-        except Exception:
-            pass
-    return n
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/deletions/bulk-confirm",
+        json={"ids": [str(oid) for oid in tx_ids]},
+    )
+    return int(payload.get("updated") or 0)
 
 
 async def restore_deletion(tx_id: ObjectId) -> bool:
     """Clear deletion request flags so the row returns to Master / register."""
-    db = get_db()
-    result = await db.transactions.update_one(
-        {"_id": tx_id, "deletion_requested": True, "trashed": {"$ne": True}},
-        {"$set": {
-            "deletion_requested": False,
-            "deletion_requested_at": None,
-            "deletion_requested_by": None,
-        }},
+    payload = await api_client.request(
+        "POST", f"v1/accountant/deletions/{tx_id}/restore"
     )
-    return result.modified_count == 1
+    return bool(payload.get("ok"))
 
 
 async def bulk_restore_deletions(tx_ids: List[ObjectId]) -> int:
     if not tx_ids:
         return 0
-    db = get_db()
-    result = await db.transactions.update_many(
-        {
-            "_id": {"$in": tx_ids},
-            "deletion_requested": True,
-            "trashed": {"$ne": True},
-        },
-        {"$set": {
-            "deletion_requested": False,
-            "deletion_requested_at": None,
-            "deletion_requested_by": None,
-        }},
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/deletions/bulk-restore",
+        json={"ids": [str(oid) for oid in tx_ids]},
     )
-    return int(result.modified_count)
+    return int(payload.get("updated") or 0)
 
 
 # ── Trash (soft-deleted confirmed removals) ───────────────────────────────────
-
-def _build_trash_query(
-    search: str = "",
-    truck: str = "",
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-) -> dict:
-    query: dict = {"trashed": True}
-    and_clauses: list = []
-    if search.strip():
-        clause = _feed_search_clause(
-            search, ("truck_number",), ("description", "item", "category_name"),
-        )
-        if clause:
-            and_clauses.append(clause)
-    if and_clauses:
-        query["$and"] = and_clauses
-    if truck.strip():
-        query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
-    if date_from or date_to:
-        df: dict = {}
-        if date_from:
-            df["$gte"] = date_from
-        if date_to:
-            df["$lte"] = date_to
-        query["trashed_at"] = df
-    return query
-
 
 async def get_trashed_transactions(
     search: str = "",
@@ -1363,16 +1325,16 @@ async def get_trashed_transactions(
     limit: int = 100,
     skip: int = 0,
 ) -> List[Transaction]:
-    db = get_db()
-    query = _build_trash_query(search, truck, date_from, date_to)
-    cursor = (
-        db.transactions.find(query)
-        .sort([("trashed_at", -1), ("date", -1)])
-        .skip(skip)
-        .limit(limit)
+    params = _trash_params(
+        search=search,
+        truck=truck,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+        skip=skip,
     )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    payload = await api_client.request("GET", "v1/accountant/trash", params=params)
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def count_trashed_transactions(
@@ -1381,44 +1343,37 @@ async def count_trashed_transactions(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> int:
-    db = get_db()
-    return await db.transactions.count_documents(
-        _build_trash_query(search, truck, date_from, date_to)
+    params = _trash_params(
+        search=search, truck=truck, date_from=date_from, date_to=date_to
     )
+    payload = await api_client.request(
+        "GET", "v1/accountant/trash/count", params=params
+    )
+    return int(payload.get("count") or 0)
 
 
 async def get_trash_count() -> int:
-    db = get_db()
-    return await db.transactions.count_documents({"trashed": True})
+    payload = await api_client.request("GET", "v1/accountant/counts/trash")
+    return int(payload.get("count") or 0)
 
 
 async def restore_from_trash(tx_id: ObjectId) -> bool:
     """Restore a trashed row back to Master / register."""
-    db = get_db()
-    result = await db.transactions.update_one(
-        {"_id": tx_id, "trashed": True},
-        {"$set": {
-            "trashed": False,
-            "trashed_at": None,
-            "trashed_by": None,
-        }},
+    payload = await api_client.request(
+        "POST", f"v1/accountant/trash/{tx_id}/restore"
     )
-    return result.modified_count == 1
+    return bool(payload.get("ok"))
 
 
 async def bulk_restore_from_trash(tx_ids: List[ObjectId]) -> int:
     if not tx_ids:
         return 0
-    db = get_db()
-    result = await db.transactions.update_many(
-        {"_id": {"$in": tx_ids}, "trashed": True},
-        {"$set": {
-            "trashed": False,
-            "trashed_at": None,
-            "trashed_by": None,
-        }},
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/trash/bulk-restore",
+        json={"ids": [str(oid) for oid in tx_ids]},
     )
-    return int(result.modified_count)
+    return int(payload.get("updated") or 0)
 
 
 async def permanently_delete_trashed(
@@ -1427,22 +1382,11 @@ async def permanently_delete_trashed(
     actor_id: ObjectId | None = None,
 ) -> bool:
     """Hard-delete a row that is already in Trash."""
-    db = get_db()
-    result = await db.transactions.delete_one({"_id": tx_id, "trashed": True})
-    ok = result.deleted_count == 1
-    if ok:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.trash_purge",
-                actor_id=actor_id,
-                entity_type="transaction",
-                entity_ids=[tx_id],
-            )
-        except Exception:
-            pass
-    return ok
+    _ = actor_id
+    payload = await api_client.request(
+        "DELETE", f"v1/accountant/trash/{tx_id}"
+    )
+    return bool(payload.get("ok"))
 
 
 async def bulk_permanently_delete_trashed(
@@ -1450,27 +1394,15 @@ async def bulk_permanently_delete_trashed(
     *,
     actor_id: ObjectId | None = None,
 ) -> int:
+    _ = actor_id
     if not tx_ids:
         return 0
-    db = get_db()
-    result = await db.transactions.delete_many(
-        {"_id": {"$in": tx_ids}, "trashed": True},
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/trash/bulk-delete",
+        json={"ids": [str(oid) for oid in tx_ids]},
     )
-    n = int(result.deleted_count)
-    if n:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.trash_purge_bulk",
-                actor_id=actor_id,
-                entity_type="transaction",
-                entity_ids=tx_ids,
-                details={"count": n},
-            )
-        except Exception:
-            pass
-    return n
+    return int(payload.get("deleted") or 0)
 
 
 # ── Rejected queries ──────────────────────────────────────────────────────────
@@ -1516,18 +1448,21 @@ async def get_rejected_transactions(
     item="",
     description="",
 ) -> List[Transaction]:
-    db = get_db()
-    query = _build_rejected_query(
-        search, truck, cashier_id, date_from, date_to, item, description,
+    params = _inbox_params(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        item=item,
+        description=description,
+        limit=limit,
+        skip=skip,
     )
-    cursor = (
-        db.transactions.find(query)
-        .sort([("date", -1), ("created_at", -1)])
-        .skip(skip)
-        .limit(limit)
+    payload = await api_client.request(
+        "GET", "v1/accountant/rejected", params=params
     )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def count_rejected_transactions(
@@ -1539,167 +1474,67 @@ async def count_rejected_transactions(
     item="",
     description="",
 ) -> int:
-    db = get_db()
-    query = _build_rejected_query(
-        search, truck, cashier_id, date_from, date_to, item, description,
+    params = _inbox_params(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        item=item,
+        description=description,
     )
-    return await db.transactions.count_documents(query)
+    payload = await api_client.request(
+        "GET", "v1/accountant/rejected/count", params=params
+    )
+    return int(payload.get("count") or 0)
 
 
 async def get_rejected_count() -> int:
     """Total rejected entries across all cashiers (for the badge)."""
-    db = get_db()
-    return await db.transactions.count_documents({
-        "rejected": True,
-        "discarded": {"$ne": True},
-    })
+    payload = await api_client.request("GET", "v1/accountant/counts/rejected")
+    return int(payload.get("count") or 0)
 
 
 async def return_to_inbox(tx_id: ObjectId) -> bool:
     """Undo a rejection — clears rejected flag so the entry reappears in its original inbox tab."""
-    db = get_db()
-    result = await db.transactions.update_one(
-        {"_id": tx_id, "rejected": True},
-        {"$set": {"rejected": False, "rejection_reason": None, "discarded": False}},
+    payload = await api_client.request(
+        "POST", f"v1/accountant/transactions/{tx_id}/return-to-inbox"
     )
-    return result.modified_count == 1
+    return bool(payload.get("ok"))
 
 
 # ── Re-approve (edited entries) ───────────────────────────────────────────────
 
-_CASCADE_FIELDS = {
-    "date", "description", "truck_number", "amount", "currency",
-    "lpo_do", "do_number", "memo", "receipt_status", "notes_flag",
-    "ref_float", "ownership", "approver", "payee", "cheque", "reported_date",
-    "category_name", "category_id", "item",
-    "category_confidence", "month", "year",
-}
-
-
 async def re_approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bool:
     """Approve an edited row.
 
-    If the pending-edit document carries an original_transaction_id, the edited
-    values cascade to the original approved record and the pending doc is deleted.
-    Otherwise (legacy in-place edits) the document is flipped verified=True directly.
+    Pending-edit cascade (copy onto original + delete clone) runs on the API.
+    ``accountant_id`` is kept for call-site compatibility; the API uses the session user.
     """
-    from tahmeed.db.mongo_txn import run_in_transaction, session_kwargs
-
-    db = get_db()
-    pending_doc = await db.transactions.find_one({"_id": tx_id, "verified": False})
-    if not pending_doc:
-        return False
-
-    original_id = pending_doc.get("original_transaction_id")
-
-    if original_id:
-        updates = {k: pending_doc[k] for k in _CASCADE_FIELDS if k in pending_doc}
-        updates.update({
-            "verified": True,
-            "verified_by": accountant_id,
-            "verified_at": datetime.utcnow(),
-            "rejection_reason": None,
-            "rejected": False,
-            "edited_after_verification": False,
-            "last_edited_at": pending_doc.get("last_edited_at"),
-            "last_edited_by": pending_doc.get("last_edited_by"),
-        })
-
-        async def _cascade(session):
-            kw = session_kwargs(session)
-            result = await db.transactions.update_one(
-                {"_id": original_id}, {"$set": updates}, **kw
-            )
-            if result.modified_count != 1:
-                return False
-            await db.transactions.delete_one({"_id": tx_id}, **kw)
-            return True
-
-        ok = await run_in_transaction(_cascade)
-        if ok:
-            try:
-                from tahmeed.services.audit_service import record_event
-
-                await record_event(
-                    "txn.re_approve",
-                    actor_id=accountant_id,
-                    entity_type="transaction",
-                    entity_ids=[original_id, tx_id],
-                    details={"cascade": True},
-                )
-            except Exception:
-                pass
-        return ok
-
-    result = await db.transactions.update_one(
-        {"_id": tx_id, "verified": False},
-        {"$set": {
-            "verified": True,
-            "verified_by": accountant_id,
-            "verified_at": datetime.utcnow(),
-            "rejection_reason": None,
-            "rejected": False,
-            "edited_after_verification": False,
-        }},
+    _ = accountant_id
+    payload = await api_client.request(
+        "POST", f"v1/accountant/transactions/{tx_id}/re-approve"
     )
-    ok = result.modified_count == 1
-    if ok:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.re_approve",
-                actor_id=accountant_id,
-                entity_type="transaction",
-                entity_ids=[tx_id],
-            )
-        except Exception:
-            pass
-    return ok
+    return bool(payload.get("ok"))
 
 
 async def bulk_re_approve_transactions(
     tx_ids: List[ObjectId], accountant_id: ObjectId
 ) -> int:
+    _ = accountant_id
     if not tx_ids:
         return 0
-    db = get_db()
-    docs = await db.transactions.find(
-        {"_id": {"$in": tx_ids}, "verified": False},
-        {"_id": 1, "original_transaction_id": 1},
-    ).to_list(length=None)
-
-    cascade_ids = [d["_id"] for d in docs if d.get("original_transaction_id")]
-    simple_ids = [d["_id"] for d in docs if not d.get("original_transaction_id")]
-
-    count = 0
-    for tx_id in cascade_ids:
-        if await re_approve_transaction(tx_id, accountant_id):
-            count += 1
-
-    if simple_ids:
-        result = await db.transactions.update_many(
-            {"_id": {"$in": simple_ids}, "verified": False},
-            {"$set": {
-                "verified": True,
-                "verified_by": accountant_id,
-                "verified_at": datetime.utcnow(),
-                "rejection_reason": None,
-                "rejected": False,
-                "edited_after_verification": False,
-            }},
-        )
-        count += result.modified_count
-
-    return count
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/transactions/bulk-re-approve",
+        json={"ids": [str(oid) for oid in tx_ids]},
+    )
+    return int(payload.get("updated") or 0)
 
 
 async def get_unverified_trucks() -> List[str]:
-    db = get_db()
-    vals = await db.transactions.distinct(
-        "truck_number", _inbox_base_query(rejected=False),
-    )
-    return sorted(v for v in vals if v)
+    payload = await api_client.request("GET", "v1/accountant/inbox/meta/trucks")
+    return list(payload.get("items") or [])
 
 
 def _inbox_base_query(*, rejected: bool = False) -> dict:
@@ -1741,112 +1576,87 @@ async def get_unverified_items(
     descriptions: Optional[List[str]] = None,
 ) -> List[str]:
     """Distinct item / category names for Verify filter dropdowns."""
-    db = get_db()
-    base = _apply_cascade_filters(
-        _inbox_base_query(rejected=False),
-        descriptions=descriptions,
+    params: dict = {}
+    csv = _csv_param(descriptions or [])
+    if csv:
+        params["descriptions"] = csv
+    payload = await api_client.request(
+        "GET", "v1/accountant/inbox/meta/items", params=params
     )
-    items = await db.transactions.distinct("item", base)
-    cats = await db.transactions.distinct("category_name", base)
-    names = {*(v for v in items if v), *(v for v in cats if v)}
-    return sorted(names, key=str.lower)
+    return list(payload.get("items") or [])
 
 
 async def get_unverified_descriptions(
     items: Optional[List[str]] = None,
 ) -> List[str]:
     """Distinct descriptions on unverified inbox rows (optionally scoped by items)."""
-    db = get_db()
-    base = _apply_cascade_filters(
-        _inbox_base_query(rejected=False),
-        items=items,
+    params: dict = {}
+    csv = _csv_param(items or [])
+    if csv:
+        params["items"] = csv
+    payload = await api_client.request(
+        "GET", "v1/accountant/inbox/meta/descriptions", params=params
     )
-    vals = await db.transactions.distinct("description", base)
-    return sorted((v for v in vals if v), key=str.lower)
+    return list(payload.get("items") or [])
 
 
 async def get_unverified_cashier_ids() -> List[ObjectId]:
-    db = get_db()
-    vals = await db.transactions.distinct(
-        "cashier_id", _inbox_base_query(rejected=False),
-    )
-    return [v for v in vals if v is not None]
+    payload = await api_client.request("GET", "v1/accountant/inbox/meta/cashiers")
+    return _oids_from_api_items(payload.get("items") or [])
 
 
 async def get_rejected_trucks() -> List[str]:
-    db = get_db()
-    vals = await db.transactions.distinct(
-        "truck_number",
-        {"rejected": True, "discarded": {"$ne": True}},
+    payload = await api_client.request(
+        "GET", "v1/accountant/rejected/meta/trucks"
     )
-    return sorted(v for v in vals if v)
+    return list(payload.get("items") or [])
 
 
 async def get_rejected_items(
     descriptions: Optional[List[str]] = None,
 ) -> List[str]:
-    db = get_db()
-    base = _apply_cascade_filters(
-        _inbox_base_query(rejected=True),
-        descriptions=descriptions,
+    params: dict = {}
+    csv = _csv_param(descriptions or [])
+    if csv:
+        params["descriptions"] = csv
+    payload = await api_client.request(
+        "GET", "v1/accountant/rejected/meta/items", params=params
     )
-    items = await db.transactions.distinct("item", base)
-    cats = await db.transactions.distinct("category_name", base)
-    names = {*(v for v in items if v), *(v for v in cats if v)}
-    return sorted(names, key=str.lower)
+    return list(payload.get("items") or [])
 
 
 async def get_rejected_descriptions(
     items: Optional[List[str]] = None,
 ) -> List[str]:
-    db = get_db()
-    base = _apply_cascade_filters(
-        _inbox_base_query(rejected=True),
-        items=items,
+    params: dict = {}
+    csv = _csv_param(items or [])
+    if csv:
+        params["items"] = csv
+    payload = await api_client.request(
+        "GET", "v1/accountant/rejected/meta/descriptions", params=params
     )
-    vals = await db.transactions.distinct("description", base)
-    return sorted((v for v in vals if v), key=str.lower)
+    return list(payload.get("items") or [])
 
 
 async def get_rejected_cashier_ids() -> List[ObjectId]:
-    db = get_db()
-    vals = await db.transactions.distinct(
-        "cashier_id",
-        {"rejected": True, "discarded": {"$ne": True}},
+    payload = await api_client.request(
+        "GET", "v1/accountant/rejected/meta/cashiers"
     )
-    return [v for v in vals if v is not None]
+    return _oids_from_api_items(payload.get("items") or [])
 
 
 async def bulk_approve_transactions(
     tx_ids: List[ObjectId], accountant_id: ObjectId
 ) -> int:
+    _ = accountant_id
     if not tx_ids:
         return 0
-    db = get_db()
-    result = await db.transactions.update_many(
-        {"_id": {"$in": tx_ids}, "verified": False},
-        {"$set": {
-            "verified": True,
-            "verified_by": accountant_id,
-            "verified_at": datetime.utcnow(),
-            "rejection_reason": None,
-        }},
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/transactions/bulk-approve",
+        json={"ids": [str(oid) for oid in tx_ids]},
     )
-    n = int(result.modified_count)
-    if n:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.approve_bulk",
-                actor_id=accountant_id,
-                entity_type="transaction",
-                entity_ids=tx_ids,
-                details={"count": n},
-            )
-        except Exception:
-            pass
-    return n
+    return int(payload.get("updated") or 0)
 
 
 async def update_transaction_category(
@@ -1854,13 +1664,15 @@ async def update_transaction_category(
     category_name: str,
     category_id: Optional[ObjectId] = None,
 ) -> bool:
-    db = get_db()
-    # Keep item and category_name in sync — they represent the same thing.
-    update: dict = {"category_name": category_name, "item": category_name}
-    if category_id:
-        update["category_id"] = category_id
-    result = await db.transactions.update_one({"_id": tx_id}, {"$set": update})
-    return result.modified_count == 1
+    body: dict = {"category_name": category_name}
+    if category_id is not None:
+        body["category_id"] = str(category_id)
+    payload = await api_client.request(
+        "PATCH",
+        f"v1/accountant/transactions/{tx_id}/category",
+        json=body,
+    )
+    return bool(payload.get("ok"))
 
 
 async def bulk_update_transaction_category(
@@ -1871,15 +1683,18 @@ async def bulk_update_transaction_category(
     """Assign the same item/category to many transactions in one round-trip."""
     if not tx_ids:
         return 0
-    db = get_db()
-    update: dict = {"category_name": category_name, "item": category_name}
-    if category_id:
-        update["category_id"] = category_id
-    result = await db.transactions.update_many(
-        {"_id": {"$in": tx_ids}},
-        {"$set": update},
+    body: dict = {
+        "ids": [str(oid) for oid in tx_ids],
+        "category_name": category_name,
+    }
+    if category_id is not None:
+        body["category_id"] = str(category_id)
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/transactions/bulk-category",
+        json=body,
     )
-    return int(result.modified_count)
+    return int(payload.get("updated") or 0)
 
 
 # ── Master Expenses in-place edits (accountant) ───────────────────────────────
@@ -1976,36 +1791,21 @@ async def update_master_transaction(
     updates: dict,
     accountant_id: Optional[ObjectId] = None,
 ) -> bool:
-    """Apply accountant edits directly on a verified Master row.
+    """Apply accountant edits on a verified Master row via API.
 
-    Updates the shared ``transactions`` document in place so category tables,
-    truck overview, and other Master-sourced views pick up the same values.
+    Actor comes from the API session; *accountant_id* kept for call-site
+    compatibility. Server prepares fields and writes the audit event.
     """
-    prepared = prepare_master_updates(updates)
-    if not prepared:
+    _ = accountant_id
+    body = _jsonable_master_updates(updates)
+    if not body:
         return False
-    if accountant_id is not None:
-        prepared["last_edited_at"] = datetime.utcnow()
-        prepared["last_edited_by"] = accountant_id
-
-    db = get_db()
-    query = {"_id": tx_id, **_MASTER_EDIT_FILTER}
-    result = await db.transactions.update_one(query, {"$set": prepared})
-    if result.matched_count == 1:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.master_update",
-                actor_id=accountant_id,
-                entity_type="transaction",
-                entity_ids=[tx_id],
-                details={"fields": sorted(str(k) for k in prepared.keys())},
-            )
-        except Exception:
-            pass
-        return True
-    return False
+    payload = await api_client.request(
+        "PATCH",
+        f"v1/accountant/master/{tx_id}",
+        json={"updates": body},
+    )
+    return bool(payload.get("ok"))
 
 
 async def bulk_update_master_transactions(
@@ -2013,39 +1813,22 @@ async def bulk_update_master_transactions(
     updates: dict,
     accountant_id: Optional[ObjectId] = None,
 ) -> int:
-    """Apply the same field updates to many verified Master rows."""
+    """Apply the same field updates to many verified Master rows via API."""
+    _ = accountant_id
     if not tx_ids:
         return 0
-    prepared = prepare_master_updates(updates)
-    if not prepared:
+    body = _jsonable_master_updates(updates)
+    if not body:
         return 0
-    if accountant_id is not None:
-        prepared["last_edited_at"] = datetime.utcnow()
-        prepared["last_edited_by"] = accountant_id
-
-    db = get_db()
-    result = await db.transactions.update_many(
-        {"_id": {"$in": list(tx_ids)}, **_MASTER_EDIT_FILTER},
-        {"$set": prepared},
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/master/bulk-update",
+        json={
+            "ids": [str(oid) for oid in tx_ids],
+            "updates": body,
+        },
     )
-    n = int(result.matched_count)
-    if n:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            await record_event(
-                "txn.master_update_bulk",
-                actor_id=accountant_id,
-                entity_type="transaction",
-                entity_ids=list(tx_ids),
-                details={
-                    "count": n,
-                    "fields": sorted(str(k) for k in prepared.keys()),
-                },
-            )
-        except Exception:
-            pass
-    return n
+    return int(payload.get("updated") or 0)
 
 
 # ── Master Expenses Table queries ────────────────────────────────────────────
@@ -2338,45 +2121,6 @@ def _build_master_query(
     return _merge_and_clauses(query, and_clauses)
 
 
-async def _resolve_master_cashier_ids(
-    short_names: Sequence[str],
-    base_query: dict,
-) -> List[ObjectId]:
-    """Map Excel cashier short labels back to ``cashier_id`` values in range."""
-    wanted = {s.strip() for s in short_names if s and s.strip() and s.strip() != "—"}
-    if not wanted:
-        return []
-    db = get_db()
-    ids = await db.transactions.distinct("cashier_id", base_query)
-    ids = [i for i in ids if i is not None]
-    if not ids:
-        return []
-    names = await get_cashier_names(ids)
-    matched: List[ObjectId] = []
-    for cid, full in names.items():
-        label = _master_short_name(full)
-        if label in wanted or (full or "").strip() in wanted:
-            oid = _normalize_user_id(cid)
-            if oid is not None:
-                matched.append(oid)
-    return matched
-
-
-async def _supplier_category_names_lower() -> List[str]:
-    """Active supplier item names (lowered) — excluded from Master Expenses."""
-    db = get_db()
-    docs = await db.categories.find(
-        {"is_supplier": True, "active": {"$ne": False}},
-        {"name": 1},
-    ).to_list(length=None)
-    names: List[str] = []
-    for doc in docs:
-        name = str(doc.get("name") or "").strip().lower()
-        if name:
-            names.append(name)
-    return names
-
-
 def _exclude_supplier_payments(query: dict, supplier_names_lower: Sequence[str]) -> dict:
     """Keep supplier payments out of Master Expenses (still visible on Suppliers)."""
     if not supplier_names_lower:
@@ -2392,41 +2136,6 @@ def _exclude_supplier_payments(query: dict, supplier_names_lower: Sequence[str])
         }
     }
     return _merge_and_clauses(query, [clause])
-
-
-async def _master_query_with_cashiers(
-    year: Optional[int] = None,
-    month: int = 0,
-    search: str = "",
-    truck: str = "",
-    category: str = "",
-    receipt: str = "",
-    description: str = "",
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-    column_filters: Optional[Dict[str, Sequence[str]]] = None,
-) -> dict:
-    """Build master query, resolving cashier short-name filters when present."""
-    filters = dict(column_filters or {})
-    cashier_names = list(filters.pop("cashier", []) or [])
-    supplier_names = await _supplier_category_names_lower()
-    base = _build_master_query(
-        year, month, search, truck, category, receipt, description,
-        date_from, date_to, column_filters=filters or None,
-    )
-    base = _exclude_supplier_payments(base, supplier_names)
-    if not cashier_names:
-        return base
-    # Resolve against the range *without* cashier filter so options stay valid.
-    ids = await _resolve_master_cashier_ids(cashier_names, base)
-    if not ids:
-        # No matching cashiers → force empty result set.
-        return {**base, "cashier_id": {"$in": []}}
-    resolved = _build_master_query(
-        year, month, search, truck, category, receipt, description,
-        date_from, date_to, column_filters=filters or None, cashier_ids=ids,
-    )
-    return _exclude_supplier_payments(resolved, supplier_names)
 
 
 async def get_master_transactions(
@@ -2445,23 +2154,26 @@ async def get_master_transactions(
     limit: int = 50,
     skip: int = 0,
 ) -> List[Transaction]:
-    db = get_db()
-    query = await _master_query_with_cashiers(
-        year, month, search, truck, category, receipt, description,
-        date_from, date_to, column_filters,
+    params = _master_params(
+        year=year,
+        month=month,
+        search=search,
+        truck=truck,
+        category=category,
+        receipt=receipt,
+        description=description,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+        sort_field=sort_field,
+        sort_asc=sort_asc,
+        limit=limit,
+        skip=skip,
     )
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _MASTER_SORT_ALLOWED,
-        default="date", tie_break=(("created_at", -1),),
+    payload = await api_client.request(
+        "GET", "v1/accountant/master", params=params
     )
-    cursor = (
-        db.transactions.find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def count_master_transactions(
@@ -2476,12 +2188,22 @@ async def count_master_transactions(
     date_to: Optional[datetime] = None,
     column_filters: Optional[Dict[str, Sequence[str]]] = None,
 ) -> int:
-    db = get_db()
-    query = await _master_query_with_cashiers(
-        year, month, search, truck, category, receipt, description,
-        date_from, date_to, column_filters,
+    params = _master_params(
+        year=year,
+        month=month,
+        search=search,
+        truck=truck,
+        category=category,
+        receipt=receipt,
+        description=description,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
     )
-    return await db.transactions.count_documents(query)
+    payload = await api_client.request(
+        "GET", "v1/accountant/master/count", params=params
+    )
+    return int(payload.get("count") or 0)
 
 
 async def get_master_totals(
@@ -2497,30 +2219,25 @@ async def get_master_totals(
     column_filters: Optional[Dict[str, Sequence[str]]] = None,
 ) -> dict:
     """Aggregate TZS + USD totals for the current filter (all pages, not just current)."""
-    db = get_db()
-    query = await _master_query_with_cashiers(
-        year, month, search, truck, category, receipt, description,
-        date_from, date_to, column_filters,
+    params = _master_params(
+        year=year,
+        month=month,
+        search=search,
+        truck=truck,
+        category=category,
+        receipt=receipt,
+        description=description,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
     )
-    result = await db.transactions.aggregate([
-        {"$match": query},
-        {"$group": {
-            "_id": None,
-            "tzs_total": {"$sum": {"$cond": [
-                {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]},
-                "$amount",
-                0,
-            ]}},
-            "usd_total": {"$sum": {"$cond": [
-                {"$eq": [{"$toUpper": "$currency"}, "USD"]},
-                "$amount",
-                0,
-            ]}},
-        }},
-    ]).to_list(1)
-    if result:
-        return {"tzs": result[0]["tzs_total"], "usd": result[0]["usd_total"]}
-    return {"tzs": 0.0, "usd": 0.0}
+    payload = await api_client.request(
+        "GET", "v1/accountant/master/totals", params=params
+    )
+    return {
+        "tzs": float(payload.get("tzs") or 0.0),
+        "usd": float(payload.get("usd") or 0.0),
+    }
 
 
 async def get_category_lifetime_usage(category: str) -> dict:
@@ -2528,7 +2245,13 @@ async def get_category_lifetime_usage(category: str) -> dict:
 
     Returns ``{"count": int, "tzs": float, "usd": float}``.
     """
-    return await get_category_report_totals(category)
+    name = (category or "").strip()
+    if not name:
+        return {"count": 0, "tzs": 0.0, "usd": 0.0}
+    payload = await api_client.request(
+        "GET", _category_report_path(name, "lifetime")
+    )
+    return _totals_from_payload(payload)
 
 
 def _category_report_reference_year(
@@ -2588,42 +2311,6 @@ def _category_report_query(
     return _merge_and_clauses(query, and_clauses)
 
 
-async def _category_report_query_with_cashiers(
-    category: str,
-    *,
-    description: str = "",
-    descriptions: Optional[List[str]] = None,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-    column_filters: Optional[Dict[str, Sequence[str]]] = None,
-) -> dict:
-    """Build item QuickReport query, resolving cashier short-name filters."""
-    filters = dict(column_filters or {})
-    cashier_names = list(filters.pop("cashier", []) or [])
-    base = _category_report_query(
-        category,
-        description=description,
-        descriptions=descriptions,
-        date_from=date_from,
-        date_to=date_to,
-        column_filters=filters or None,
-    )
-    if not cashier_names:
-        return base
-    ids = await _resolve_master_cashier_ids(cashier_names, base)
-    if not ids:
-        return {**base, "cashier_id": {"$in": []}}
-    return _category_report_query(
-        category,
-        description=description,
-        descriptions=descriptions,
-        date_from=date_from,
-        date_to=date_to,
-        column_filters=filters or None,
-        cashier_ids=ids,
-    )
-
-
 async def get_category_report_totals(
     category: str,
     *,
@@ -2637,41 +2324,17 @@ async def get_category_report_totals(
     name = (category or "").strip()
     if not name:
         return {"count": 0, "tzs": 0.0, "usd": 0.0}
-
-    db = get_db()
-    query = await _category_report_query_with_cashiers(
-        name,
+    params = _category_report_params(
         description=description,
         descriptions=descriptions,
         date_from=date_from,
         date_to=date_to,
         column_filters=column_filters,
     )
-    result = await db.transactions.aggregate([
-        {"$match": query},
-        {"$group": {
-            "_id": None,
-            "count": {"$sum": 1},
-            "tzs_total": {"$sum": {"$cond": [
-                {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]},
-                "$amount",
-                0,
-            ]}},
-            "usd_total": {"$sum": {"$cond": [
-                {"$eq": [{"$toUpper": "$currency"}, "USD"]},
-                "$amount",
-                0,
-            ]}},
-        }},
-    ]).to_list(1)
-    if not result:
-        return {"count": 0, "tzs": 0.0, "usd": 0.0}
-    row = result[0]
-    return {
-        "count": int(row.get("count") or 0),
-        "tzs": float(row.get("tzs_total") or 0.0),
-        "usd": float(row.get("usd_total") or 0.0),
-    }
+    payload = await api_client.request(
+        "GET", _category_report_path(name, "totals"), params=params
+    )
+    return _totals_from_payload(payload)
 
 
 async def get_categories_usage_totals(
@@ -2684,44 +2347,21 @@ async def get_categories_usage_totals(
     names = sorted({(n or "").strip() for n in category_names if (n or "").strip()})
     if not names:
         return {}
-
-    db = get_db()
-    # Case-insensitive match via lowercasing both sides.
-    lowered = [n.lower() for n in names]
-    result = await db.transactions.aggregate([
-        {"$match": {
-            "verified": True,
-            "deletion_requested": {"$ne": True},
-            "trashed": {"$ne": True},
-            "category_name": {"$type": "string", "$ne": ""},
-        }},
-        {"$addFields": {"_cat_l": {"$toLower": {"$ifNull": ["$category_name", ""]}}}},
-        {"$match": {"_cat_l": {"$in": lowered}}},
-        {"$group": {
-            "_id": "$_cat_l",
-            "count": {"$sum": 1},
-            "tzs_total": {"$sum": {"$cond": [
-                {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]},
-                "$amount",
-                0,
-            ]}},
-            "usd_total": {"$sum": {"$cond": [
-                {"$eq": [{"$toUpper": "$currency"}, "USD"]},
-                "$amount",
-                0,
-            ]}},
-        }},
-    ]).to_list(length=None)
-
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/reports/categories/usage-totals",
+        json={"names": names},
+    )
+    totals = payload.get("totals") or {}
     out: Dict[str, dict] = {}
-    for row in result:
-        key = (row.get("_id") or "").strip().lower()
-        if not key:
+    for key, row in totals.items():
+        name = str(key or "").strip().lower()
+        if not name:
             continue
-        out[key] = {
-            "count": int(row.get("count") or 0),
-            "tzs": float(row.get("tzs_total") or 0.0),
-            "usd": float(row.get("usd_total") or 0.0),
+        out[name] = {
+            "count": int((row or {}).get("count") or 0),
+            "tzs": float((row or {}).get("tzs") or 0.0),
+            "usd": float((row or {}).get("usd") or 0.0),
         }
     return out
 
@@ -2732,47 +2372,12 @@ async def get_supplier_payments_totals(year: int) -> dict:
     Matches payments whose ``category_name`` is an active supplier item.
     Returns ``{count, tzs, usd}``.
     """
-    supplier_names = await _supplier_category_names_lower()
-    if not supplier_names:
-        return {"count": 0, "tzs": 0.0, "usd": 0.0}
-
-    year_start = datetime(year, 1, 1)
-    year_end = datetime(year, 12, 31, 23, 59, 59)
-
-    db = get_db()
-    result = await db.transactions.aggregate([
-        {"$match": {
-            "verified": True,
-            "deletion_requested": {"$ne": True},
-            "trashed": {"$ne": True},
-            "category_name": {"$type": "string", "$ne": ""},
-            "date": {"$gte": year_start, "$lte": year_end},
-        }},
-        {"$addFields": {"_cat_l": {"$toLower": {"$ifNull": ["$category_name", ""]}}}},
-        {"$match": {"_cat_l": {"$in": supplier_names}}},
-        {"$group": {
-            "_id": None,
-            "count": {"$sum": 1},
-            "tzs_total": {"$sum": {"$cond": [
-                {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]},
-                "$amount",
-                0,
-            ]}},
-            "usd_total": {"$sum": {"$cond": [
-                {"$eq": [{"$toUpper": "$currency"}, "USD"]},
-                "$amount",
-                0,
-            ]}},
-        }},
-    ]).to_list(1)
-    if not result:
-        return {"count": 0, "tzs": 0.0, "usd": 0.0}
-    row = result[0]
-    return {
-        "count": int(row.get("count") or 0),
-        "tzs": float(row.get("tzs_total") or 0.0),
-        "usd": float(row.get("usd_total") or 0.0),
-    }
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/reports/supplier-payments/totals",
+        params={"year": int(year)},
+    )
+    return _totals_from_payload(payload)
 
 
 async def get_category_report_transactions(
@@ -2792,41 +2397,23 @@ async def get_category_report_transactions(
     name = (category or "").strip()
     if not name:
         return []
-    db = get_db()
-    query = await _category_report_query_with_cashiers(
-        name,
+    params = _category_report_params(
         description=description,
         descriptions=descriptions,
         date_from=date_from,
         date_to=date_to,
         column_filters=column_filters,
+        sort_field=sort_field,
+        sort_asc=sort_asc,
+        limit=limit,
+        skip=skip,
     )
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _MASTER_SORT_ALLOWED,
-        default="date", tie_break=(),
+    payload = await api_client.request(
+        "GET",
+        _category_report_path(name, "transactions"),
+        params=params,
     )
-    tie_dir = 1 if sort_asc else -1
-    if ("created_at", tie_dir) not in sort_clauses and ("created_at", -tie_dir) not in sort_clauses:
-        sort_clauses.append(("created_at", tie_dir))
-    cursor = (
-        db.transactions.find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
-
-
-def _category_report_sort(
-    sort_field: str = "date",
-    sort_asc: bool = True,
-) -> tuple[str, int]:
-    allowed = set(_MASTER_SORT_ALLOWED)
-    clauses = ledger_sort_clauses(
-        sort_field, sort_asc, allowed, default="date", tie_break=(),
-    )
-    return clauses[0] if clauses else ("date", 1 if sort_asc else -1)
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def get_category_report_opening_balance(
@@ -2847,41 +2434,24 @@ async def get_category_report_opening_balance(
     name = (category or "").strip()
     if not name:
         return {"tzs": 0.0, "usd": 0.0}
-
-    db = get_db()
-    query = await _category_report_query_with_cashiers(
-        name,
+    params = _category_report_params(
         description=description,
         descriptions=descriptions,
         date_from=date_from,
         date_to=date_to,
         column_filters=column_filters,
+        sort_field=sort_field,
+        sort_asc=sort_asc,
+        skip=skip,
     )
-    field, direction = _category_report_sort(sort_field, sort_asc)
-    result = await db.transactions.aggregate([
-        {"$match": query},
-        {"$sort": {field: direction, "created_at": direction}},
-        {"$limit": int(skip)},
-        {"$group": {
-            "_id": None,
-            "tzs_total": {"$sum": {"$cond": [
-                {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]},
-                "$amount",
-                0,
-            ]}},
-            "usd_total": {"$sum": {"$cond": [
-                {"$eq": [{"$toUpper": "$currency"}, "USD"]},
-                "$amount",
-                0,
-            ]}},
-        }},
-    ]).to_list(1)
-    if not result:
-        return {"tzs": 0.0, "usd": 0.0}
-    row = result[0]
+    payload = await api_client.request(
+        "GET",
+        _category_report_path(name, "opening-balance"),
+        params=params,
+    )
     return {
-        "tzs": float(row.get("tzs_total") or 0.0),
-        "usd": float(row.get("usd_total") or 0.0),
+        "tzs": float((payload or {}).get("tzs") or 0.0),
+        "usd": float((payload or {}).get("usd") or 0.0),
     }
 
 
@@ -2895,12 +2465,13 @@ async def get_category_report_descriptions(
     name = (category or "").strip()
     if not name:
         return []
-    db = get_db()
-    query = _category_report_query(
-        name, date_from=date_from, date_to=date_to,
+    params = _category_report_params(date_from=date_from, date_to=date_to)
+    payload = await api_client.request(
+        "GET",
+        _category_report_path(name, "descriptions"),
+        params=params,
     )
-    vals = await db.transactions.distinct("description", query)
-    return sorted((v for v in vals if v), key=str.lower)
+    return [str(v) for v in (payload.get("items") or []) if v]
 
 
 async def get_category_report_column_values(
@@ -2916,122 +2487,27 @@ async def get_category_report_column_values(
     """Distinct Excel ▾ values for *field* on an item QuickReport (all years)."""
     if field not in _MASTER_COL_FIELDS:
         return []
-
     name = (category or "").strip()
     if not name:
         return []
-
     filters = {
         k: v for k, v in (column_filters or {}).items()
         if k != field and k in _MASTER_COL_FIELDS
     }
-    query = await _category_report_query_with_cashiers(
-        name,
+    params = _category_report_params(
         description=description,
         descriptions=descriptions,
         date_from=date_from,
         date_to=date_to,
         column_filters=filters or None,
+        field=field,
     )
-    db = get_db()
-    ref_year = _category_report_reference_year(date_from, date_to)
-    all_years = date_from is None and date_to is None
-
-    if field == "date":
-        vals = await db.transactions.distinct("date", query)
-        out: Set[str] = set()
-        for v in vals:
-            if v is None:
-                continue
-            try:
-                if hasattr(v, "date") and not isinstance(v, date):
-                    v = v.date() if not isinstance(v, datetime) else v
-                if isinstance(v, datetime):
-                    fmt = "%d %b %Y" if all_years else "%d %b"
-                    out.add(v.strftime(fmt))
-                elif isinstance(v, date):
-                    fmt = "%d %b %Y" if all_years else "%d %b"
-                    out.add(v.strftime(fmt))
-            except Exception:
-                continue
-        return sorted(out, key=lambda s: (
-            _parse_master_filter_date(s, ref_year) or datetime.max,
-            s,
-        ))
-
-    if field == "item":
-        items = await db.transactions.distinct("item", query)
-        cats = await db.transactions.distinct("category_name", query)
-        names = {*(v for v in items if v), *(v for v in cats if v)}
-        return sorted(names, key=str.lower)
-
-    if field == "receipt_status":
-        raw = await db.transactions.distinct("receipt_status", query)
-        labels: Set[str] = set()
-        for st in raw:
-            key = (st or "pending").strip().lower().replace(" ", "_")
-            if key in ("missing", "no_receipt", "no", "n/a", "none"):
-                labels.add("No Receipt")
-            elif key == "received":
-                labels.add("Received")
-            else:
-                labels.add("Pending")
-        return sorted(labels)
-
-    if field in ("tzs", "usd"):
-        cur_match = (
-            {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]}
-            if field == "tzs"
-            else {"$eq": [{"$toUpper": "$currency"}, "USD"]}
-        )
-        decimals = 0 if field == "tzs" else 2
-        docs = await db.transactions.aggregate([
-            {"$match": query},
-            {"$match": {"$expr": cur_match}},
-            {"$group": {"_id": "$amount"}},
-            {"$limit": 5000},
-        ]).to_list(5000)
-        return sorted(
-            {
-                _fmt_master_amount(float(d["_id"]), decimals=decimals)
-                for d in docs if d.get("_id") is not None
-            },
-            key=lambda s: _parse_master_filter_amount(s) or 0.0,
-        )
-
-    if field == "ref_float":
-        vals = await db.transactions.distinct("ref_float", query)
-        out = {(v or "").strip().upper() for v in vals if (v or "").strip()}
-        legacy_q = _merge_and_clauses(dict(query), [
-            {"notes_flag": True},
-            {"$or": [
-                {"ref_float": {"$exists": False}},
-                {"ref_float": ""},
-                {"ref_float": None},
-            ]},
-        ])
-        if await db.transactions.count_documents(legacy_q, limit=1):
-            out.add("REFUND TO FLOAT")
-        return sorted(out, key=str.lower)
-
-    if field == "cashier":
-        ids = await db.transactions.distinct("cashier_id", query)
-        ids = [i for i in ids if i is not None]
-        names = await get_cashier_names(ids) if ids else {}
-        labels = {_master_short_name(n) for n in names.values() if n}
-        return sorted(labels, key=str.lower)
-
-    db_field = {
-        "description": "description",
-        "truck_number": "truck_number",
-        "memo": "memo",
-        "ownership": "ownership",
-        "approver": "approver",
-    }.get(field)
-    if not db_field:
-        return []
-    vals = await db.transactions.distinct(db_field, query)
-    return sorted((v for v in vals if v), key=str.lower)
+    payload = await api_client.request(
+        "GET",
+        _category_report_path(name, "column-values"),
+        params=params,
+    )
+    return [str(v) for v in (payload.get("items") or []) if v]
 
 
 async def get_master_column_values(
@@ -3048,214 +2524,79 @@ async def get_master_column_values(
     date_to: Optional[datetime] = None,
     column_filters: Optional[Dict[str, Sequence[str]]] = None,
 ) -> List[str]:
-    """Distinct Excel ▾ values for *field* across the whole selected range.
-
-    Other active column filters cascade (same field is excluded). Results are
-    display labels matching the Master Expenses table cells.
-    """
+    """Distinct Excel ▾ values for *field* across the whole selected range."""
     if field not in _MASTER_COL_FIELDS:
         return []
-
     filters = {
         k: v for k, v in (column_filters or {}).items()
         if k != field and k in _MASTER_COL_FIELDS
     }
-    query = await _master_query_with_cashiers(
-        year, month, search, truck, category, receipt, description,
-        date_from, date_to, filters or None,
+    params = _master_params(
+        year=year,
+        month=month,
+        search=search,
+        truck=truck,
+        category=category,
+        receipt=receipt,
+        description=description,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=filters or None,
+        field=field,
     )
-    db = get_db()
-    _year = year or date.today().year
-
-    if field == "date":
-        vals = await db.transactions.distinct("date", query)
-        out: Set[str] = set()
-        for v in vals:
-            if v is None:
-                continue
-            try:
-                if hasattr(v, "date") and not isinstance(v, date):
-                    v = v.date() if not isinstance(v, datetime) else v
-                if isinstance(v, datetime):
-                    out.add(v.strftime("%d %b"))
-                elif isinstance(v, date):
-                    out.add(v.strftime("%d %b"))
-            except Exception:
-                continue
-        return sorted(out, key=lambda s: (
-            _parse_master_filter_date(s, _year) or datetime.max,
-            s,
-        ))
-
-    if field == "item":
-        items = await db.transactions.distinct("item", query)
-        cats = await db.transactions.distinct("category_name", query)
-        names = {*(v for v in items if v), *(v for v in cats if v)}
-        return sorted(names, key=str.lower)
-
-    if field == "receipt_status":
-        raw = await db.transactions.distinct("receipt_status", query)
-        labels: Set[str] = set()
-        for st in raw:
-            key = (st or "pending").strip().lower().replace(" ", "_")
-            if key in ("missing", "no_receipt", "no", "n/a", "none"):
-                labels.add("No Receipt")
-            elif key == "received":
-                labels.add("Received")
-            else:
-                labels.add("Pending")
-        return sorted(labels)
-
-    if field in ("tzs", "usd"):
-        cur_match = (
-            {"$in": [{"$toUpper": "$currency"}, ["TZS", "TSH", "TZ"]]}
-            if field == "tzs"
-            else {"$eq": [{"$toUpper": "$currency"}, "USD"]}
-        )
-        decimals = 0 if field == "tzs" else 2
-        docs = await db.transactions.aggregate([
-            {"$match": query},
-            {"$match": {"$expr": cur_match}},
-            {"$group": {"_id": "$amount"}},
-            {"$limit": 5000},
-        ]).to_list(5000)
-        return sorted(
-            {
-                _fmt_master_amount(float(d["_id"]), decimals=decimals)
-                for d in docs if d.get("_id") is not None
-            },
-            key=lambda s: _parse_master_filter_amount(s) or 0.0,
-        )
-
-    if field == "ref_float":
-        vals = await db.transactions.distinct("ref_float", query)
-        out = {(v or "").strip().upper() for v in vals if (v or "").strip()}
-        # Legacy rows flagged without free-text.
-        legacy_q = _merge_and_clauses(dict(query), [
-            {"notes_flag": True},
-            {"$or": [
-                {"ref_float": {"$exists": False}},
-                {"ref_float": ""},
-                {"ref_float": None},
-            ]},
-        ])
-        if await db.transactions.count_documents(legacy_q, limit=1):
-            out.add("REFUND TO FLOAT")
-        return sorted(out, key=str.lower)
-
-    if field == "cashier":
-        ids = await db.transactions.distinct("cashier_id", query)
-        ids = [i for i in ids if i is not None]
-        names = await get_cashier_names(ids) if ids else {}
-        labels = {_master_short_name(n) for n in names.values() if n}
-        return sorted(labels, key=str.lower)
-
-    db_field = {
-        "description": "description",
-        "truck_number": "truck_number",
-        "memo": "memo",
-        "ownership": "ownership",
-        "approver": "approver",
-    }.get(field)
-    if not db_field:
-        return []
-    vals = await db.transactions.distinct(db_field, query)
-    return sorted((v for v in vals if v), key=str.lower)
+    payload = await api_client.request(
+        "GET", "v1/accountant/master/meta/column-values", params=params
+    )
+    return [str(v) for v in (payload.get("items") or []) if v]
 
 
 async def get_master_month_totals(year: int) -> Dict:
     """Per-month TZS / USD / ZMW totals for the year (master ledger)."""
-    db = get_db()
-    _year = year
-    start = datetime(_year, 1, 1)
-    end = datetime(_year, 12, 31, 23, 59, 59)
-    pipeline = [
-        {"$match": {
-            "verified": True,
-            "deletion_requested": {"$ne": True},
-            "trashed": {"$ne": True},
-            **_master_period_clause(start, end),
-        }},
-        {"$group": {
-            "_id": {"$month": "$date"},
-            "tzs": _sum_amount_if_currency("TZS", "TSH", "TZ"),
-            "usd": _sum_amount_if_currency("USD"),
-            "zmw": _sum_amount_if_currency("ZMW", "ZMB", "ZK"),
-            "count": {"$sum": 1},
-        }},
-    ]
-    docs = await db.transactions.aggregate(pipeline).to_list(12)
-    return {
-        doc["_id"]: {
-            "tzs": doc.get("tzs", 0.0),
-            "usd": doc.get("usd", 0.0),
-            "zmw": doc.get("zmw", 0.0),
-            "count": doc["count"],
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/master/month-totals",
+        params={"year": int(year)},
+    )
+    months = payload.get("months") or {}
+    out: Dict[int, dict] = {}
+    for key, row in months.items():
+        try:
+            month = int(key)
+        except (TypeError, ValueError):
+            continue
+        out[month] = {
+            "tzs": float((row or {}).get("tzs") or 0.0),
+            "usd": float((row or {}).get("usd") or 0.0),
+            "zmw": float((row or {}).get("zmw") or 0.0),
+            "count": int((row or {}).get("count") or 0),
         }
-        for doc in docs
-    }
+    return out
 
 
 async def get_master_available_years() -> List[int]:
     """Calendar years that have verified Master rows (Excel date or register day)."""
-    db = get_db()
-    pipeline = [
-        {"$match": {"verified": True, "deletion_requested": {"$ne": True}, "trashed": {"$ne": True}}},
-        {"$project": {
-            "years": {
-                "$setUnion": [
-                    {"$cond": [
-                        {"$ne": [{"$ifNull": ["$date", None]}, None]},
-                        [{"$year": "$date"}],
-                        [],
-                    ]},
-                    {"$cond": [
-                        {"$ne": [{"$ifNull": ["$import_primary_date", None]}, None]},
-                        [{"$year": "$import_primary_date"}],
-                        [],
-                    ]},
-                ]
-            }
-        }},
-        {"$unwind": "$years"},
-        {"$group": {"_id": "$years"}},
-        {"$sort": {"_id": -1}},
-    ]
-    docs = await db.transactions.aggregate(pipeline).to_list(50)
-    years = [int(d["_id"]) for d in docs if d.get("_id") is not None]
-    if not years:
-        y = date.today().year
-        return [y - 1, y, y + 1]
-    # Keep a little headroom around the data so new FY entry is easy.
-    lo = min(years) - 1
-    hi = max(max(years), date.today().year) + 1
-    return list(range(hi, lo - 1, -1))
+    payload = await api_client.request("GET", "v1/accountant/master/years")
+    return [int(y) for y in (payload.get("items") or []) if y is not None]
 
 
 async def get_master_trucks(year: Optional[int] = None) -> List[str]:
-    db = get_db()
-    _year = year or date.today().year
-    start = datetime(_year, 1, 1)
-    end = datetime(_year, 12, 31, 23, 59, 59)
-    query = {
-        "verified": True,
-        **_master_period_clause(start, end),
-    }
-    vals = await db.transactions.distinct("truck_number", query)
-    return sorted(v for v in vals if v)
+    params: dict = {}
+    if year is not None:
+        params["year"] = int(year)
+    payload = await api_client.request(
+        "GET", "v1/accountant/master/meta/trucks", params=params
+    )
+    return [str(v) for v in (payload.get("items") or []) if v]
 
 
 async def get_master_categories(year: Optional[int] = None) -> List[str]:
-    db = get_db()
-    _year = year or date.today().year
-    start = datetime(_year, 1, 1)
-    end = datetime(_year, 12, 31, 23, 59, 59)
-    query = {
-        "verified": True,
-        **_master_period_clause(start, end),
-    }
-    vals = await db.transactions.distinct("category_name", query)
-    return sorted(v for v in vals if v)
+    params: dict = {}
+    if year is not None:
+        params["year"] = int(year)
+    payload = await api_client.request(
+        "GET", "v1/accountant/master/meta/categories", params=params
+    )
+    return [str(v) for v in (payload.get("items") or []) if v]
 
 
 # ── Diesel Cash (cashier-fed, verified transactions) ─────────────────────────
@@ -3299,24 +2640,22 @@ def normalize_diesel_cash_item_names(raw: Any = None) -> List[str]:
 
 async def get_diesel_cash_item_names() -> List[str]:
     """Configured item names that feed Fuel Consumption → Diesel Cash."""
-    from tahmeed.services.settings_service import get_setting
-
-    try:
-        raw = await get_setting(DIESEL_CASH_ITEMS_SETTING)
-    except Exception:
-        raw = None
-    if raw is None:
+    payload = await api_client.request("GET", "v1/accountant/diesel-cash/items")
+    items = payload.get("items")
+    if items is None:
         return list(DIESEL_CASH_CATEGORIES)
-    return normalize_diesel_cash_item_names(raw)
+    return normalize_diesel_cash_item_names(items)
 
 
 async def set_diesel_cash_item_names(names: Sequence[str]) -> List[str]:
     """Persist the item names that feed Diesel Cash. Empty list catches nothing."""
-    from tahmeed.services.settings_service import set_setting
-
     cleaned = normalize_diesel_cash_item_names(list(names or []))
-    await set_setting(DIESEL_CASH_ITEMS_SETTING, cleaned)
-    return cleaned
+    payload = await api_client.request(
+        "PUT",
+        "v1/accountant/diesel-cash/items",
+        json={"names": cleaned},
+    )
+    return normalize_diesel_cash_item_names(payload.get("items") or cleaned)
 
 
 def _diesel_cash_name_filter(names: Optional[Sequence[str]] = None) -> Optional[dict]:
@@ -3406,44 +2745,84 @@ def _build_diesel_cash_query(
     return query
 
 
+def _diesel_cash_params(
+    *,
+    year: Optional[int] = None,
+    month: int = 0,
+    search: str = "",
+    truck: str = "",
+    receipt: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    sort_field: Optional[str] = None,
+    sort_asc: Optional[bool] = None,
+    limit: Optional[int] = None,
+    skip: Optional[int] = None,
+    station: Optional[str] = None,
+) -> dict:
+    params: dict = {}
+    if year is not None:
+        params["year"] = int(year)
+    if month:
+        params["month"] = int(month)
+    if search:
+        params["search"] = search
+    if truck:
+        params["truck"] = truck
+    if receipt:
+        params["receipt"] = receipt
+    if date_from is not None:
+        params["date_from"] = _iso_dt(date_from)
+    if date_to is not None:
+        params["date_to"] = _iso_dt(date_to)
+    if sort_field is not None:
+        params["sort_field"] = sort_field
+    if sort_asc is not None:
+        params["sort_asc"] = "true" if sort_asc else "false"
+    if limit is not None:
+        params["limit"] = limit
+    if skip is not None:
+        params["skip"] = skip
+    if station:
+        params["station"] = station
+    return params
+
+
+def _parse_api_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=None)
+        except ValueError:
+            return None
+    return None
+
+
 async def get_diesel_cash_month_summaries(year: int) -> list:
     """One summary row per calendar month for verified Diesel Cash transactions."""
-    db = get_db()
-    match = _diesel_cash_verified_match(await get_diesel_cash_item_names())
-    match["date"] = {
-        "$gte": datetime(year, 1, 1),
-        "$lte": datetime(year, 12, 31, 23, 59, 59),
-    }
-    pipeline = [
-        {"$match": match},
-        {"$group": {
-            "_id": {"$month": "$date"},
-            "record_count": {"$sum": 1},
-            "tzs_total": {
-                "$sum": {"$cond": [{"$eq": ["$currency", "TZS"]}, "$amount", 0]},
-            },
-            "usd_total": {
-                "$sum": {"$cond": [{"$eq": ["$currency", "USD"]}, "$amount", 0]},
-            },
-            "min_date": {"$min": "$date"},
-            "max_date": {"$max": "$date"},
-        }},
-        {"$sort": {"_id": 1}},
-    ]
-    docs = await db.transactions.aggregate(pipeline).to_list(length=12)
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/diesel-cash/month-summaries",
+        params={"year": int(year)},
+    )
     summaries = []
-    for doc in docs:
-        month_idx = int(doc["_id"])
-        min_d = doc.get("min_date")
-        max_d = doc.get("max_date")
+    for doc in payload.get("items") or []:
+        month_idx = int(doc.get("month") or 0)
         summaries.append({
             "month": month_idx,
-            "month_name": _MONTH_NAMES[month_idx] if 1 <= month_idx <= 12 else str(month_idx),
-            "record_count": int(doc.get("record_count", 0)),
-            "tzs_total": float(doc.get("tzs_total", 0)),
-            "usd_total": float(doc.get("usd_total", 0)),
-            "min_date": min_d,
-            "max_date": max_d,
+            "month_name": (
+                doc.get("month_name")
+                or (_MONTH_NAMES[month_idx] if 1 <= month_idx <= 12 else str(month_idx))
+            ),
+            "record_count": int(doc.get("record_count") or 0),
+            "tzs_total": float(doc.get("tzs_total") or 0.0),
+            "usd_total": float(doc.get("usd_total") or 0.0),
+            "min_date": _parse_api_datetime(doc.get("min_date")),
+            "max_date": _parse_api_datetime(doc.get("max_date")),
         })
     return summaries
 
@@ -3461,23 +2840,23 @@ async def get_diesel_cash_transactions(
     limit: int = 50,
     skip: int = 0,
 ) -> List[Transaction]:
-    db = get_db()
-    query = _build_diesel_cash_query(
-        year, month, search, truck, receipt, date_from, date_to,
-        item_names=await get_diesel_cash_item_names(),
+    params = _diesel_cash_params(
+        year=year,
+        month=month,
+        search=search,
+        truck=truck,
+        receipt=receipt,
+        date_from=date_from,
+        date_to=date_to,
+        sort_field=sort_field,
+        sort_asc=sort_asc,
+        limit=limit,
+        skip=skip,
     )
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _DIESEL_CASH_SORT_ALLOWED,
-        default="date", tie_break=(("created_at", -1),),
+    payload = await api_client.request(
+        "GET", "v1/accountant/diesel-cash/transactions", params=params
     )
-    cursor = (
-        db.transactions.find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def count_diesel_cash_transactions(
@@ -3489,12 +2868,19 @@ async def count_diesel_cash_transactions(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> int:
-    db = get_db()
-    query = _build_diesel_cash_query(
-        year, month, search, truck, receipt, date_from, date_to,
-        item_names=await get_diesel_cash_item_names(),
+    params = _diesel_cash_params(
+        year=year,
+        month=month,
+        search=search,
+        truck=truck,
+        receipt=receipt,
+        date_from=date_from,
+        date_to=date_to,
     )
-    return await db.transactions.count_documents(query)
+    payload = await api_client.request(
+        "GET", "v1/accountant/diesel-cash/transactions/count", params=params
+    )
+    return int(payload.get("count") or 0)
 
 
 async def get_diesel_cash_totals(
@@ -3506,22 +2892,22 @@ async def get_diesel_cash_totals(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> dict:
-    db = get_db()
-    query = _build_diesel_cash_query(
-        year, month, search, truck, receipt, date_from, date_to,
-        item_names=await get_diesel_cash_item_names(),
+    params = _diesel_cash_params(
+        year=year,
+        month=month,
+        search=search,
+        truck=truck,
+        receipt=receipt,
+        date_from=date_from,
+        date_to=date_to,
     )
-    result = await db.transactions.aggregate([
-        {"$match": query},
-        {"$group": {
-            "_id": None,
-            "tzs_total": {"$sum": {"$cond": [{"$eq": ["$currency", "TZS"]}, "$amount", 0]}},
-            "usd_total": {"$sum": {"$cond": [{"$eq": ["$currency", "USD"]}, "$amount", 0]}},
-        }},
-    ]).to_list(1)
-    if result:
-        return {"tzs": result[0]["tzs_total"], "usd": result[0]["usd_total"]}
-    return {"tzs": 0.0, "usd": 0.0}
+    payload = await api_client.request(
+        "GET", "v1/accountant/diesel-cash/totals", params=params
+    )
+    return {
+        "tzs": float(payload.get("tzs") or 0.0),
+        "usd": float(payload.get("usd") or 0.0),
+    }
 
 
 # ── stubs (diesel / reconciliation) ──────────────────────────────────────────
@@ -3531,7 +2917,11 @@ async def get_diesel_entries(
     limit: int = 50,
     skip: int = 0,
 ) -> list:
-    return []
+    params = _diesel_cash_params(station=station, limit=limit, skip=skip)
+    payload = await api_client.request(
+        "GET", "v1/accountant/diesel-cash/entries", params=params
+    )
+    return list(payload.get("items") or [])
 
 
 async def get_reconciliation_entries(
@@ -3539,8 +2929,20 @@ async def get_reconciliation_entries(
     station: Optional[str] = None,
     limit: int = 50,
     skip: int = 0,
+    *,
+    table: str = "bonds",
 ) -> list:
-    return []
+    """Alias for reconciliation rows (Phase 6). ``entity`` is unused (always SM Burhani)."""
+    _ = entity
+    from tahmeed.services.reconciliation_service import get_reconciliation_rows
+
+    entries = await get_reconciliation_rows(
+        table,
+        station=station or "",
+        limit=limit,
+        skip=skip,
+    )
+    return [entry.to_doc() for entry in entries]
 
 
 # ── Imported feeds (toll_plaza / parking_congo / zambia_parking) ──────────────
@@ -3610,16 +3012,13 @@ async def get_imported_feed(
     limit: int = 50,
     skip: int = 0,
 ) -> list:
-    db = get_db()
-    query = _build_feed_query(feed_type, search, extra)
-    cursor = db.imported_feeds.find(query).sort("import_date", -1).skip(skip).limit(limit)
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_imported_feed(feed_type=feed_type, search=search, extra=extra, limit=limit, skip=skip)
 
 
 async def count_imported_feed(feed_type: str, search: str = "", extra: str = "") -> int:
-    db = get_db()
-    query = _build_feed_query(feed_type, search, extra)
-    return await db.imported_feeds.count_documents(query)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_imported_feed(feed_type=feed_type, search=search, extra=extra)
 
 
 def _safe_double(field: str) -> dict:
@@ -3632,47 +3031,13 @@ def _safe_double(field: str) -> dict:
 
 
 async def get_imported_feed_totals(feed_type: str) -> dict:
-    db = get_db()
-    pipeline = [
-        {"$match": {"feed_type": feed_type}},
-        {"$group": {
-            "_id": None,
-            "tender_amount": {"$sum": _safe_double("tender_amount")},
-            "amount":        {"$sum": _safe_double("amount")},
-            "debit":         {"$sum": _safe_double("debit")},
-            "credit":        {"$sum": _safe_double("credit")},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"tender_amount": 0.0, "amount": 0.0, "debit": 0.0, "credit": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_imported_feed_totals(feed_type=feed_type)
 
 
-async def get_existing_feed_keys(keys: List[str]) -> set:
-    """Return the set of dedup key values already in the imported_feeds collection."""
-    if not keys:
-        return set()
-    db = get_db()
-    docs = await db.imported_feeds.find(
-        {"$or": [
-            {"receipt_no":  {"$in": keys}},
-            {"serial":      {"$in": keys}},
-            {"ticket_no":   {"$in": keys}},
-            {"lpo_no":      {"$in": keys}},
-            {"ledger_id":   {"$in": keys}},
-            {"trip_number": {"$in": keys}},
-        ]},
-        {"receipt_no": 1, "serial": 1, "ticket_no": 1, "lpo_no": 1,
-         "ledger_id": 1, "trip_number": 1},
-    ).to_list(length=None)
-    found: set = set()
-    for doc in docs:
-        for field in ("receipt_no", "serial", "ticket_no", "lpo_no", "ledger_id", "trip_number"):
-            v = doc.get(field)
-            if v:
-                found.add(v)
-    return found
+async def get_existing_feed_keys(keys: List[str], feed_type: str = "toll_plaza") -> set:
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_existing_feed_keys(keys=keys, feed_type=feed_type)
 
 
 def _parse_toll_date(val) -> Optional[datetime]:
@@ -3757,22 +3122,8 @@ async def get_toll_plaza_all_records(
     sort_field: str = "transaction_date",
     sort_asc: bool = False,
 ) -> list:
-    """Return paginated Toll Plaza records across all uploads."""
-    db = get_db()
-    query = _toll_plaza_all_query(search, year, month, date_from, date_to)
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _TOLL_SORT_ALLOWED,
-        default="transaction_date",
-        tie_break=(("toll_date", -1), ("import_date", -1)),
-    )
-    cursor = (
-        db.imported_feeds
-        .find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_toll_plaza_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_toll_plaza_all_records(
@@ -3782,11 +3133,8 @@ async def count_toll_plaza_all_records(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> int:
-    """Count Toll Plaza records across all uploads."""
-    db = get_db()
-    return await db.imported_feeds.count_documents(
-        _toll_plaza_all_query(search, year, month, date_from, date_to)
-    )
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_toll_plaza_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to)
 
 
 async def get_toll_plaza_all_totals(
@@ -3796,73 +3144,26 @@ async def get_toll_plaza_all_totals(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> dict:
-    """Return record count and total ZMW for filtered Toll Plaza records."""
-    db = get_db()
-    pipeline = [
-        {"$match": _toll_plaza_all_query(search, year, month, date_from, date_to)},
-        {"$group": {
-            "_id": None,
-            "count":     {"$sum": 1},
-            "total_zmw": {"$sum": _safe_double("tender_amount")},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"count": 0, "total_zmw": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_toll_plaza_all_totals(search=search, year=year, month=month, date_from=date_from, date_to=date_to)
 
 
 async def _feed_available_years(feed_type: str, date_field: str) -> List[int]:
     """Return distinct calendar years present in uploaded records, newest first."""
-    db = get_db()
-    years: set[int] = set()
+    del date_field
+    from tahmeed.services import feed_service as _feeds
 
-    pipeline = [
-        {"$match": {
-            "feed_type": feed_type,
-            "transaction_date": {"$exists": True, "$ne": None},
-        }},
-        {"$group": {"_id": {"$year": "$transaction_date"}}},
-    ]
-    for doc in await db.imported_feeds.aggregate(pipeline).to_list(length=None):
-        yr = doc.get("_id")
-        if isinstance(yr, int) and 1990 <= yr <= 2100:
-            years.add(yr)
-
-    legacy_dates = await db.imported_feeds.distinct(
-        date_field,
-        {
-            "feed_type": feed_type,
-            "$or": [
-                {"transaction_date": {"$exists": False}},
-                {"transaction_date": None},
-            ],
-        },
-    )
-    for val in legacy_dates:
-        parsed = _parse_toll_date(val)
-        if parsed and 1990 <= parsed.year <= 2100:
-            years.add(parsed.year)
-
-    return sorted(years, reverse=True)
+    return await _feeds.years(_feeds.feed_slug(feed_type))
 
 
 async def get_toll_plaza_available_years() -> List[int]:
-    """Years that appear in uploaded Toll Plaza records."""
-    return await _feed_available_years("toll_plaza", "toll_date")
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_toll_plaza_available_years()
 
 
 async def get_parking_congo_available_years() -> List[int]:
-    """Years that appear in uploaded Parking Congo records."""
-    return await _feed_available_years("parking_congo", "payment_date")
-
-
-_IMPORT_UPPER_SKIP = frozenset({
-    "feed_type", "upload_id", "source_filename", "upload_label", "content_hash",
-    "import_date", "created_at",
-    "transaction_date", "expense_date", "expense_type", "row_index", "_id",
-    "installation_label", "total_payable_label", "skipped_row_id",
-})
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_parking_congo_available_years()
 
 
 def _uppercase_import_text(doc: dict) -> None:
@@ -3875,95 +3176,13 @@ def _uppercase_import_text(doc: dict) -> None:
 
 
 async def save_imported_feed(records: list) -> int:
-    """Insert a batch of imported feed records; returns the count inserted.
-
-    Records are expected to carry upload_id and source_filename already (set by
-    ImportDialog before calling this function).
-    """
-    if not records:
-        return 0
-    db = get_db()
-    now = datetime.utcnow()
-    docs = []
-    for rec in records:
-        doc = dict(rec)
-        doc.pop("_raw", None)
-        doc["import_date"] = now
-        if doc.get("feed_type") == "toll_plaza":
-            normalize_date_fields(doc, "toll_date", store_as="transaction_date")
-        elif doc.get("feed_type") == "parking_congo":
-            normalize_date_fields(doc, "payment_date", store_as="transaction_date")
-            # Deposits are account credits (no truck) — tag for Deposited tab
-            tt = str(doc.get("transaction_type", "") or "").strip().lower()
-            if tt == "deposit" or doc.get("is_deposit"):
-                doc["is_deposit"] = True
-                vn = str(doc.get("vehicle_no", "") or "").strip()
-                if vn.lower() in ("", "-", "–", "—", "−", ".", "n/a", "na", "none"):
-                    doc["vehicle_no"] = ""
-                for _k in ("direction", "gate_in"):
-                    val = str(doc.get(_k, "") or "").strip()
-                    if val.lower() in ("", "-", "–", "—", "−", ".", "n/a", "na", "none"):
-                        doc[_k] = ""
-        elif doc.get("feed_type") == "rahntech":
-            normalize_date_fields(doc, "sales_date", store_as="transaction_date")
-        elif doc.get("feed_type") == "zambia_parking":
-            # Prefer existing transaction_date; fall back to Date column (serials OK).
-            if isinstance(doc.get("transaction_date"), datetime):
-                pretty = format_excel_date(doc["transaction_date"], "%d %b %Y")
-                if pretty:
-                    doc["date"] = pretty
-            else:
-                normalize_date_fields(
-                    doc, "date", "transaction_date", store_as="transaction_date",
-                )
-        elif str(doc.get("feed_type", "")).startswith("diesel_"):
-            normalize_date_fields(doc, "date", store_as="transaction_date")
-            apply_diesel_computed_fields(doc)
-            if doc.get("feed_type") == "diesel_lake_zambia":
-                cur = str(doc.get("currency") or "").strip().upper()
-                doc["currency"] = cur if cur in LAKE_ZAMBIA_DIESEL_CURRENCIES else "USD"
-        _uppercase_import_text(doc)
-        stamp_truck_sort_key(doc)
-        docs.append(doc)
-
-    # Stamp whole-batch content hash on Zambia Parking / diesel rows
-    # (exact-file gate). Keep a pre-set hash (from the full file before
-    # truck-gate filtering).
-    zambia_docs = [d for d in docs if d.get("feed_type") == "zambia_parking"]
-    if zambia_docs and not str(zambia_docs[0].get("content_hash") or "").strip():
-        batch_hash = zambia_batch_content_hash(zambia_docs)
-        for d in zambia_docs:
-            d["content_hash"] = batch_hash
-
-    diesel_docs = [d for d in docs if str(d.get("feed_type", "")).startswith("diesel_")]
-    if diesel_docs and not str(diesel_docs[0].get("content_hash") or "").strip():
-        batch_hash = diesel_batch_content_hash(diesel_docs)
-        for d in diesel_docs:
-            d["content_hash"] = batch_hash
-
-    from tahmeed.db.import_idempotency import insert_many_idempotent
-
-    inserted, _dupes = await insert_many_idempotent(db.imported_feeds, docs)
-    return inserted
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.save_imported_feed(records=records)
 
 
 async def get_toll_plaza_uploads() -> list:
-    """Return one summary doc per upload batch for the toll_plaza feed."""
-    db = get_db()
-    pipeline = [
-        {"$match": {"feed_type": "toll_plaza"}},
-        {"$group": {
-            "_id":             "$upload_id",
-            "source_filename": {"$first": "$source_filename"},
-            "import_date":     {"$first": "$import_date"},
-            "record_count":    {"$sum": 1},
-            "total_zmw":       {"$sum": _safe_double("tender_amount")},
-            "min_toll_date":   {"$min": "$toll_date"},
-            "max_toll_date":   {"$max": "$toll_date"},
-        }},
-        {"$sort": {"import_date": -1}},
-    ]
-    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_toll_plaza_uploads()
 
 
 async def get_toll_plaza_upload_records(
@@ -3974,63 +3193,23 @@ async def get_toll_plaza_upload_records(
     sort_field: str = "toll_date",
     sort_asc: bool = True,
 ) -> list:
-    """Return paginated records for a single toll plaza upload batch."""
-    db = get_db()
-    query: dict = {"feed_type": "toll_plaza", "upload_id": upload_id}
-    _put_search(
-        query,
-        search,
-        ("vehicle_reg",),
-        ("toll_plaza", "receipt_no", "cashier_name", "client_name", "card_no"),
-    )
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _TOLL_SORT_ALLOWED,
-        default="toll_date", tie_break=(("import_date", -1),),
-    )
-    cursor = db.imported_feeds.find(query).sort(sort_clauses).skip(skip).limit(limit)
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_toll_plaza_upload_records(upload_id=upload_id, search=search, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_toll_plaza_upload_records(upload_id: str, search: str = "") -> int:
-    """Count records for a single toll plaza upload batch."""
-    db = get_db()
-    query: dict = {"feed_type": "toll_plaza", "upload_id": upload_id}
-    _put_search(
-        query,
-        search,
-        ("vehicle_reg",),
-        ("toll_plaza", "receipt_no", "cashier_name", "client_name", "card_no"),
-    )
-    return await db.imported_feeds.count_documents(query)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_toll_plaza_upload_records(upload_id=upload_id, search=search)
 
 
 async def delete_toll_plaza_upload(upload_id: str) -> int:
-    """Delete every Toll Plaza record belonging to one upload batch."""
-    if not upload_id:
-        return 0
-    db = get_db()
-    result = await db.imported_feeds.delete_many(
-        {"feed_type": "toll_plaza", "upload_id": upload_id}
-    )
-    return result.deleted_count
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.delete_toll_plaza_upload(upload_id=upload_id)
 
 
 async def get_parking_congo_uploads() -> list:
-    """Return one summary doc per upload batch for the parking_congo feed."""
-    db = get_db()
-    pipeline = [
-        {"$match": {"feed_type": "parking_congo"}},
-        {"$group": {
-            "_id":             "$upload_id",
-            "source_filename": {"$first": "$source_filename"},
-            "import_date":     {"$first": "$import_date"},
-            "record_count":    {"$sum": 1},
-            "min_date":        {"$min": "$payment_date"},
-            "max_date":        {"$max": "$payment_date"},
-        }},
-        {"$sort": {"import_date": -1}},
-    ]
-    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_parking_congo_uploads()
 
 
 async def get_parking_congo_upload_records(
@@ -4041,34 +3220,13 @@ async def get_parking_congo_upload_records(
     sort_field: str = "payment_date",
     sort_asc: bool = False,
 ) -> list:
-    """Return paginated records for a single parking_congo upload batch."""
-    db = get_db()
-    query: dict = {"feed_type": "parking_congo", "upload_id": upload_id}
-    _put_search(
-        query,
-        search,
-        ("vehicle_no",),
-        ("ledger_id", "transaction_type", "cashier", "transaction_details", "direction"),
-    )
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _PARKING_CONGO_SORT_ALLOWED,
-        default="payment_date", tie_break=(("import_date", -1),),
-    )
-    cursor = db.imported_feeds.find(query).sort(sort_clauses).skip(skip).limit(limit)
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_parking_congo_upload_records(upload_id=upload_id, search=search, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_parking_congo_upload_records(upload_id: str, search: str = "") -> int:
-    """Count records for a single parking_congo upload batch."""
-    db = get_db()
-    query: dict = {"feed_type": "parking_congo", "upload_id": upload_id}
-    _put_search(
-        query,
-        search,
-        ("vehicle_no",),
-        ("ledger_id", "transaction_type", "cashier", "transaction_details", "direction"),
-    )
-    return await db.imported_feeds.count_documents(query)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_parking_congo_upload_records(upload_id=upload_id, search=search)
 
 
 def _parking_month_regex_patterns(year: int, month: int) -> List[str]:
@@ -4141,22 +3299,8 @@ async def get_parking_congo_all_records(
     sort_field: str = "transaction_date",
     sort_asc: bool = False,
 ) -> list:
-    """Return paginated Parking Congo records across all uploads."""
-    db = get_db()
-    query = _parking_congo_all_query(search, year, month, date_from, date_to)
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _PARKING_CONGO_SORT_ALLOWED,
-        default="transaction_date",
-        tie_break=(("payment_date", -1), ("import_date", -1)),
-    )
-    cursor = (
-        db.imported_feeds
-        .find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_parking_congo_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_parking_congo_all_records(
@@ -4166,11 +3310,8 @@ async def count_parking_congo_all_records(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> int:
-    """Count Parking Congo records across all uploads."""
-    db = get_db()
-    return await db.imported_feeds.count_documents(
-        _parking_congo_all_query(search, year, month, date_from, date_to)
-    )
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_parking_congo_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to)
 
 
 async def get_parking_congo_all_totals(
@@ -4180,31 +3321,13 @@ async def get_parking_congo_all_totals(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> dict:
-    """Return record count and total amount for filtered Parking Congo records."""
-    db = get_db()
-    pipeline = [
-        {"$match": _parking_congo_all_query(search, year, month, date_from, date_to)},
-        {"$group": {
-            "_id": None,
-            "count":  {"$sum": 1},
-            "amount": {"$sum": _safe_double("amount")},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"count": 0, "amount": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_parking_congo_all_totals(search=search, year=year, month=month, date_from=date_from, date_to=date_to)
 
 
 async def delete_parking_congo_upload(upload_id: str) -> int:
-    """Delete every Parking Congo record belonging to one upload batch."""
-    if not upload_id:
-        return 0
-    db = get_db()
-    result = await db.imported_feeds.delete_many(
-        {"feed_type": "parking_congo", "upload_id": upload_id}
-    )
-    return result.deleted_count
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.delete_parking_congo_upload(upload_id=upload_id)
 
 
 def _parking_congo_deposit_clause() -> dict:
@@ -4247,17 +3370,8 @@ async def get_parking_congo_deposits(
     limit: int = 50,
     skip: int = 0,
 ) -> list:
-    """Return paginated Parking Congo deposit records."""
-    db = get_db()
-    query = _parking_congo_deposits_query(search, date_from, date_to)
-    cursor = (
-        db.imported_feeds
-        .find(query)
-        .sort([("transaction_date", -1), ("payment_date", -1), ("import_date", -1)])
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_parking_congo_deposits(search=search, date_from=date_from, date_to=date_to, limit=limit, skip=skip)
 
 
 async def count_parking_congo_deposits(
@@ -4265,11 +3379,8 @@ async def count_parking_congo_deposits(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> int:
-    """Count Parking Congo deposit records."""
-    db = get_db()
-    return await db.imported_feeds.count_documents(
-        _parking_congo_deposits_query(search, date_from, date_to)
-    )
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_parking_congo_deposits(search=search, date_from=date_from, date_to=date_to)
 
 
 async def get_parking_congo_deposit_totals(
@@ -4277,63 +3388,18 @@ async def get_parking_congo_deposit_totals(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> dict:
-    """Return count and total amount for filtered Parking Congo deposits."""
-    db = get_db()
-    pipeline = [
-        {"$match": _parking_congo_deposits_query(search, date_from, date_to)},
-        {"$group": {
-            "_id": None,
-            "count":  {"$sum": 1},
-            "amount": {"$sum": _safe_double("amount")},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"count": 0, "amount": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_parking_congo_deposit_totals(search=search, date_from=date_from, date_to=date_to)
 
 
 async def get_parking_congo_upload_by_id(upload_id: str) -> Optional[dict]:
-    """Return a browse-style summary doc for one Parking Congo upload batch."""
-    if not upload_id:
-        return None
-    db = get_db()
-    pipeline = [
-        {"$match": {"feed_type": "parking_congo", "upload_id": upload_id}},
-        {"$group": {
-            "_id":             "$upload_id",
-            "source_filename": {"$first": "$source_filename"},
-            "import_date":     {"$first": "$import_date"},
-            "record_count":    {"$sum": 1},
-            "min_date":        {"$min": "$payment_date"},
-            "max_date":        {"$max": "$payment_date"},
-        }},
-    ]
-    rows = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    return rows[0] if rows else None
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_parking_congo_upload_by_id(upload_id=upload_id)
 
-
-# ── RahnTech — transacted devices import ─────────────────────────────────────
 
 async def get_rahntech_uploads() -> list:
-    """Return one summary doc per upload batch for the rahntech feed."""
-    db = get_db()
-    pipeline = [
-        {"$match": {
-            "feed_type": "rahntech",
-            "upload_id": {"$exists": True, "$ne": ""},
-        }},
-        {"$group": {
-            "_id":             "$upload_id",
-            "source_filename": {"$first": "$source_filename"},
-            "import_date":     {"$first": "$import_date"},
-            "record_count":    {"$sum": 1},
-            "min_sales_date":  {"$min": "$sales_date"},
-            "max_sales_date":  {"$max": "$sales_date"},
-        }},
-        {"$sort": {"import_date": -1}},
-    ]
-    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_rahntech_uploads()
 
 
 async def get_rahntech_upload_records(
@@ -4344,34 +3410,13 @@ async def get_rahntech_upload_records(
     sort_field: str = "sales_date",
     sort_asc: bool = False,
 ) -> list:
-    """Return paginated records for a single RahnTech upload batch."""
-    db = get_db()
-    query: dict = {"feed_type": "rahntech", "upload_id": upload_id}
-    _put_search(
-        query,
-        search,
-        ("truck_number",),
-        ("driver_name", "trip_number", "device_number", "do_number"),
-    )
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _RAHNTECH_SORT_ALLOWED,
-        default="sales_date", tie_break=(("import_date", -1),),
-    )
-    cursor = db.imported_feeds.find(query).sort(sort_clauses).skip(skip).limit(limit)
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_rahntech_upload_records(upload_id=upload_id, search=search, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_rahntech_upload_records(upload_id: str, search: str = "") -> int:
-    """Count records for a single RahnTech upload batch."""
-    db = get_db()
-    query: dict = {"feed_type": "rahntech", "upload_id": upload_id}
-    _put_search(
-        query,
-        search,
-        ("truck_number",),
-        ("driver_name", "trip_number", "device_number", "do_number"),
-    )
-    return await db.imported_feeds.count_documents(query)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_rahntech_upload_records(upload_id=upload_id, search=search)
 
 
 def _rahntech_date_filter(year: int, month: int) -> dict:
@@ -4439,67 +3484,35 @@ async def get_rahntech_all_records(
     sort_field: str = "transaction_date",
     sort_asc: bool = False,
 ) -> list:
-    """Return paginated RahnTech records across all uploads."""
-    db = get_db()
-    query = _rahntech_all_query(search, year, month, date_from, date_to)
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _RAHNTECH_SORT_ALLOWED,
-        default="transaction_date",
-        tie_break=(("sales_date", -1), ("import_date", -1)),
-    )
-    cursor = (
-        db.imported_feeds
-        .find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_rahntech_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_rahntech_all_records(search: str = "", year: int = 0, month: int = 0,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> int:
-    """Count RahnTech records across all uploads."""
-    db = get_db()
-    return await db.imported_feeds.count_documents(_rahntech_all_query(search, year, month, date_from, date_to))
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_rahntech_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to)
 
 
 async def get_rahntech_all_totals(search: str = "", year: int = 0, month: int = 0,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> dict:
-    """Return record count for filtered RahnTech records."""
-    db = get_db()
-    pipeline = [
-        {"$match": _rahntech_all_query(search, year, month, date_from, date_to)},
-        {"$group": {
-            "_id": None,
-            "count": {"$sum": 1},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"count": 0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_rahntech_all_totals(search=search, year=year, month=month, date_from=date_from, date_to=date_to)
 
 
 async def get_rahntech_available_years() -> List[int]:
-    """Years that appear in uploaded RahnTech records."""
-    return await _feed_available_years("rahntech", "sales_date")
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_rahntech_available_years()
 
 
 async def delete_rahntech_upload(upload_id: str) -> int:
-    """Delete every RahnTech record belonging to one upload batch."""
-    if not upload_id:
-        return 0
-    db = get_db()
-    result = await db.imported_feeds.delete_many({"feed_type": "rahntech", "upload_id": upload_id})
-    return result.deleted_count
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.delete_rahntech_upload(upload_id=upload_id)
 
-
-# ── Zambia Parking — weekly statement import (sheet tab = week label) ─────────
 
 def _norm_sheet_label(label: str) -> str:
     return str(label or "").strip().upper()
@@ -4516,153 +3529,35 @@ def _zambia_hash_field(value: Any) -> str:
 
 
 def zambia_batch_content_hash(records: List[dict]) -> str:
-    """SHA-256 of the exact ordered statement rows (whole-file duplicate gate).
-
-    Does not use ticket-only matching — the full row set must match.
-    """
-    lines: List[str] = []
-    for rec in records:
-        lines.append("|".join([
-            _zambia_hash_field(rec.get("date")),
-            _zambia_hash_field(rec.get("type")),
-            _zambia_hash_field(rec.get("plate_num")),
-            _zambia_hash_field(rec.get("ticket_no")),
-            _zambia_hash_field(rec.get("debit")),
-            _zambia_hash_field(rec.get("credit")),
-            _zambia_hash_field(rec.get("balance")),
-            _zambia_hash_field(rec.get("heading_to")),
-        ]))
-    payload = "\n".join(lines).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    from tahmeed.services import feed_service as _feeds
+    return _feeds.zambia_batch_content_hash(records=records)
 
 
 async def zambia_sheet_exists(sheet_label: str) -> bool:
-    """True when a weekly sheet tab was already imported (case-insensitive)."""
-    if not sheet_label.strip():
-        return False
-    db = get_db()
-    count = await db.imported_feeds.count_documents({
-        "feed_type": "zambia_parking",
-        "sheet_label": {"$regex": f"^{re.escape(sheet_label.strip())}$", "$options": "i"},
-    })
-    return count > 0
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.zambia_sheet_exists(sheet_label=sheet_label)
 
 
 async def zambia_existing_sheet_labels(labels: List[str]) -> set:
-    """Return sheet tab names from *labels* that were already imported (case-insensitive)."""
-    clean = [l.strip() for l in labels if l and str(l).strip()]
-    if not clean:
-        return set()
-    db = get_db()
-    clauses = [
-        {"sheet_label": {"$regex": f"^{re.escape(l)}$", "$options": "i"}}
-        for l in clean
-    ]
-    found = await db.imported_feeds.distinct(
-        "sheet_label",
-        {"feed_type": "zambia_parking", "$or": clauses},
-    )
-    found_upper = {_norm_sheet_label(s) for s in found if s}
-    return {l for l in clean if _norm_sheet_label(l) in found_upper}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.zambia_existing_sheet_labels(labels=labels)
 
 
 async def find_zambia_uploads_by_content_hash(content_hash: str) -> List[dict]:
-    """Return existing Zambia Parking upload summaries that match *content_hash*."""
-    if not content_hash:
-        return []
-    db = get_db()
-
-    # Fast path: rows stamped with content_hash on save.
-    stamped_ids = await db.imported_feeds.distinct(
-        "upload_id",
-        {"feed_type": "zambia_parking", "content_hash": content_hash},
-    )
-    matches: Dict[str, dict] = {}
-    uploads = await get_zambia_parking_uploads()
-    by_id = {str(u.get("_id") or ""): u for u in uploads}
-
-    for uid in stamped_ids:
-        key = str(uid or "").strip()
-        if not key:
-            continue
-        up = by_id.get(key)
-        if up:
-            matches[key] = {
-                "upload_id": key,
-                "sheet_label": up.get("sheet_label") or "",
-                "source_filename": up.get("source_filename") or "",
-                "import_date": up.get("import_date"),
-                "record_count": int(up.get("record_count", 0) or 0),
-                "content_hash": content_hash,
-            }
-
-    # Legacy uploads (no content_hash): re-hash each batch once.
-    for up in uploads:
-        uid = str(up.get("_id") or "").strip()
-        if not uid or uid in matches:
-            continue
-        rows = await db.imported_feeds.find(
-            {"feed_type": "zambia_parking", "upload_id": uid},
-            {
-                "date": 1, "type": 1, "plate_num": 1, "ticket_no": 1,
-                "debit": 1, "credit": 1, "balance": 1, "heading_to": 1,
-                "row_index": 1, "content_hash": 1,
-            },
-        ).sort([("row_index", 1)]).to_list(length=None)
-        if not rows:
-            continue
-        # If any row already has a different stored hash, skip; if same, caught above.
-        stored = {
-            str(r.get("content_hash") or "").strip()
-            for r in rows
-            if str(r.get("content_hash") or "").strip()
-        }
-        if stored:
-            continue
-        if zambia_batch_content_hash(rows) == content_hash:
-            matches[uid] = {
-                "upload_id": uid,
-                "sheet_label": up.get("sheet_label") or "",
-                "source_filename": up.get("source_filename") or "",
-                "import_date": up.get("import_date"),
-                "record_count": int(up.get("record_count", 0) or 0),
-                "content_hash": content_hash,
-            }
-
-    return list(matches.values())
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.find_zambia_uploads_by_content_hash(content_hash=content_hash)
 
 
 async def zambia_exact_content_already_uploaded(records: List[dict]) -> List[dict]:
     """If this exact statement body was imported before, return matching upload(s)."""
-    if not records:
-        return []
-    return await find_zambia_uploads_by_content_hash(zambia_batch_content_hash(records))
+    from tahmeed.services import feed_service as _feeds
+
+    return await _feeds.zambia_already_uploaded(records=records)
 
 
 async def get_zambia_parking_uploads() -> list:
-    """Return one summary doc per Zambia Parking import batch."""
-    db = get_db()
-    pipeline = [
-        {"$match": {
-            "feed_type": "zambia_parking",
-            "upload_id": {"$exists": True, "$ne": ""},
-        }},
-        {"$sort": {"row_index": 1}},
-        {"$group": {
-            "_id":             "$upload_id",
-            "sheet_label":     {"$first": "$sheet_label"},
-            "source_filename": {"$first": "$source_filename"},
-            "import_date":     {"$first": "$import_date"},
-            "record_count":    {"$sum": 1},
-            "total_debit":     {"$sum": _safe_double("debit")},
-            "total_credit":    {"$sum": _safe_double("credit")},
-            "closing_balance": {"$last": _safe_double("balance")},
-            "min_transaction_date": {"$min": "$transaction_date"},
-            "max_transaction_date": {"$max": "$transaction_date"},
-        }},
-        {"$sort": {"import_date": -1}},
-    ]
-    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_zambia_parking_uploads()
 
 
 async def get_zambia_parking_upload_records(
@@ -4673,40 +3568,13 @@ async def get_zambia_parking_upload_records(
     sort_field: str = "row_index",
     sort_asc: bool = True,
 ) -> list:
-    """Return paginated records for a single Zambia Parking upload batch."""
-    db = get_db()
-    query: dict = {"feed_type": "zambia_parking", "upload_id": upload_id}
-    _put_search(
-        query,
-        search,
-        ("plate_num",),
-        ("ticket_no", "heading_to", "type", "date"),
-    )
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _ZAMBIA_PARKING_SORT_ALLOWED,
-        default="row_index", tie_break=(("import_date", 1),),
-    )
-    cursor = (
-        db.imported_feeds
-        .find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_zambia_parking_upload_records(upload_id=upload_id, search=search, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_zambia_parking_upload_records(upload_id: str, search: str = "") -> int:
-    """Count records for a single Zambia Parking upload batch."""
-    db = get_db()
-    query: dict = {"feed_type": "zambia_parking", "upload_id": upload_id}
-    _put_search(
-        query,
-        search,
-        ("plate_num",),
-        ("ticket_no", "heading_to", "type", "date"),
-    )
-    return await db.imported_feeds.count_documents(query)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_zambia_parking_upload_records(upload_id=upload_id, search=search)
 
 
 def _zambia_parking_date_filter(year: int, month: int) -> dict:
@@ -4778,22 +3646,8 @@ async def get_zambia_parking_all_records(
     sort_field: str = "transaction_date",
     sort_asc: bool = False,
 ) -> list:
-    """Return paginated Zambia Parking rows across all uploads."""
-    db = get_db()
-    query = _zambia_parking_all_query(search, year, month, date_from, date_to, credit_only)
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _ZAMBIA_PARKING_SORT_ALLOWED,
-        default="transaction_date",
-        tie_break=(("date", -1), ("import_date", -1)),
-    )
-    cursor = (
-        db.imported_feeds
-        .find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_zambia_parking_all_records(search=search, year=year, month=month, credit_only=credit_only, date_from=date_from, date_to=date_to, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_zambia_parking_all_records(
@@ -4804,11 +3658,8 @@ async def count_zambia_parking_all_records(
     date_to: Optional[datetime] = None,
     credit_only: bool = False,
 ) -> int:
-    """Count Zambia Parking rows across all uploads."""
-    db = get_db()
-    return await db.imported_feeds.count_documents(
-        _zambia_parking_all_query(search, year, month, date_from, date_to, credit_only)
-    )
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_zambia_parking_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to, credit_only=credit_only)
 
 
 async def get_zambia_parking_all_totals(
@@ -4819,46 +3670,19 @@ async def get_zambia_parking_all_totals(
     date_to: Optional[datetime] = None,
     credit_only: bool = False,
 ) -> dict:
-    """Return record count and debit/credit totals for filtered Zambia Parking rows."""
-    db = get_db()
-    pipeline = [
-        {"$match": _zambia_parking_all_query(search, year, month, date_from, date_to, credit_only)},
-        {"$group": {
-            "_id": None,
-            "count":        {"$sum": 1},
-            "total_debit":  {"$sum": _safe_double("debit")},
-            "total_credit": {"$sum": _safe_double("credit")},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        row = result[0]
-        row["balance_zmw"] = (
-            float(row.get("total_credit", 0) or 0)
-            - float(row.get("total_debit", 0) or 0)
-        )
-        return row
-    return {"count": 0, "total_debit": 0.0, "total_credit": 0.0, "balance_zmw": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_zambia_parking_all_totals(search=search, year=year, month=month, date_from=date_from, date_to=date_to, credit_only=credit_only)
 
 
 async def get_zambia_parking_available_years() -> List[int]:
-    """Years present in uploaded Zambia Parking records."""
-    return await _feed_available_years("zambia_parking", "date")
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_zambia_parking_available_years()
 
 
 async def delete_zambia_parking_upload(upload_id: str) -> int:
-    """Delete every Zambia Parking row belonging to one upload batch."""
-    if not upload_id:
-        return 0
-    db = get_db()
-    result = await db.imported_feeds.delete_many({
-        "feed_type": "zambia_parking",
-        "upload_id": upload_id,
-    })
-    return result.deleted_count
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.delete_zambia_parking_upload(upload_id=upload_id)
 
-
-# ── Insurance feeds (comesa / third_party) ────────────────────────────────────
 
 def _build_insurance_query(
     feed_type: str, search: str = "", month: str = "", status: str = ""
@@ -4882,63 +3706,28 @@ async def get_insurance_feed(
     sort_field: str = "month",
     sort_asc: bool = True,
 ) -> list:
-    db = get_db()
-    query = _build_insurance_query(feed_type, search, month, status)
-    allowed = _COMESA_SORT_ALLOWED if feed_type == "comesa" else _THIRD_PARTY_SORT_ALLOWED
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, allowed,
-        default="month", tie_break=(("name", 1),),
-    )
-    cursor = db.imported_feeds.find(query).sort(sort_clauses).skip(skip).limit(limit)
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_insurance_feed(feed_type=feed_type, search=search, month=month, status=status, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_insurance_feed(
     feed_type: str, search: str = "", month: str = "", status: str = ""
 ) -> int:
-    db = get_db()
-    query = _build_insurance_query(feed_type, search, month, status)
-    return await db.imported_feeds.count_documents(query)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_insurance_feed(feed_type=feed_type, search=search, month=month, status=status)
 
 
 async def get_insurance_totals(
     feed_type: str, month: str = "", status: str = ""
 ) -> dict:
-    db = get_db()
-    match: dict = {"feed_type": feed_type}
-    if month.strip() and month.upper() != "ALL":
-        match["month"] = {"$regex": re.escape(month.strip()), "$options": "i"}
-    if status.strip() and status.upper() != "ALL":
-        match["status"] = status.strip()
-    pipeline = [
-        {"$match": match},
-        {"$group": {
-            "_id": None,
-            "premium":       {"$sum": {"$toDouble": {"$ifNull": ["$premium", 0]}}},
-            "vat":           {"$sum": {"$toDouble": {"$ifNull": ["$vat", 0]}}},
-            "total_premium": {"$sum": {"$toDouble": {"$ifNull": ["$total_premium", 0]}}},
-            "count":         {"$sum": 1},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"premium": 0.0, "vat": 0.0, "total_premium": 0.0, "count": 0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_insurance_totals(feed_type=feed_type, month=month, status=status)
 
 
 async def get_existing_insurance_keys(feed_type: str, keys: List[str]) -> set:
-    """Return dedup_id values already stored for this insurance feed type."""
-    if not keys:
-        return set()
-    db = get_db()
-    docs = await db.imported_feeds.find(
-        {"feed_type": feed_type, "dedup_id": {"$in": keys}},
-        {"dedup_id": 1},
-    ).to_list(length=None)
-    return {d["dedup_id"] for d in docs if "dedup_id" in d}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_existing_insurance_keys(feed_type=feed_type, keys=keys)
 
-
-# ── Diesel fuel feeds (infinity / lake_zambia / lake_tunduma / gbp) ──────────
 
 async def get_diesel_feed(
     feed_type: str,
@@ -4947,32 +3736,13 @@ async def get_diesel_feed(
     limit: int = 50,
     skip: int = 0,
 ) -> list:
-    db = get_db()
-    query: dict = {"feed_type": feed_type}
-    _put_search(
-        query,
-        search,
-        ("truck_no",),
-        ("lpo_no", "clients_name", "destinations", "do_sdo_no"),
-    )
-    if truck.strip():
-        query["truck_no"] = _truck_exact(truck)
-    cursor = db.imported_feeds.find(query).sort("import_date", -1).skip(skip).limit(limit)
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_diesel_feed(feed_type=feed_type, search=search, truck=truck, limit=limit, skip=skip)
 
 
 async def count_diesel_feed(feed_type: str, search: str = "", truck: str = "") -> int:
-    db = get_db()
-    query: dict = {"feed_type": feed_type}
-    _put_search(
-        query,
-        search,
-        ("truck_no",),
-        ("lpo_no", "clients_name", "destinations"),
-    )
-    if truck.strip():
-        query["truck_no"] = _truck_exact(truck)
-    return await db.imported_feeds.count_documents(query)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_diesel_feed(feed_type=feed_type, search=search, truck=truck)
 
 
 def _diesel_computed_amount() -> dict:
@@ -4981,50 +3751,13 @@ def _diesel_computed_amount() -> dict:
 
 
 async def get_diesel_totals(feed_type: str) -> dict:
-    db = get_db()
-    pipeline = [
-        {"$match": {"feed_type": feed_type}},
-        {"$group": {
-            "_id":          None,
-            "ltrs":         {"$sum": _safe_double("ltrs")},
-            "total_amount": {"$sum": _diesel_computed_amount()},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"ltrs": 0.0, "total_amount": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_diesel_totals(feed_type=feed_type)
 
-
-# ── Diesel feed — per-upload batch browse/detail ─────────────────────────────
-#  Each Import tags its rows with a shared upload_id + source_filename +
-#  sheet_label so the fuel pages can browse imports as batches (like Toll
-#  Plaza / Parking Congo) and drill into a single upload's records.
 
 async def get_diesel_uploads(feed_type: str) -> list:
-    """Return one summary doc per import batch for a diesel feed_type."""
-    db = get_db()
-    pipeline = [
-        {"$match": {
-            "feed_type": feed_type,
-            "upload_id": {"$exists": True, "$ne": ""},
-        }},
-        {"$group": {
-            "_id":             "$upload_id",
-            "source_filename": {"$first": "$source_filename"},
-            "upload_label":    {"$first": "$upload_label"},
-            "sheet_label":     {"$first": "$sheet_label"},
-            "import_date":     {"$first": "$import_date"},
-            "currency":        {"$first": "$currency"},
-            "record_count":    {"$sum": 1},
-            "ltrs":            {"$sum": _safe_double("ltrs")},
-            "total_amount":    {"$sum": _diesel_computed_amount()},
-            "min_date":        {"$min": "$date"},
-            "max_date":        {"$max": "$date"},
-        }},
-        {"$sort": {"import_date": -1}},
-    ]
-    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_diesel_uploads(feed_type=feed_type)
 
 
 def _diesel_records_query(feed_type: str, upload_id: str, search: str) -> dict:
@@ -5050,53 +3783,27 @@ async def get_diesel_upload_records(
     sort_field: str = "date",
     sort_asc: bool = True,
 ) -> list:
-    """Return paginated records for a single diesel upload batch."""
-    db = get_db()
-    query = _diesel_records_query(feed_type, upload_id, search)
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _DIESEL_FEED_SORT_ALLOWED,
-        default="date", tie_break=(("import_date", -1),),
-    )
-    cursor = db.imported_feeds.find(query).sort(sort_clauses).skip(skip).limit(limit)
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_diesel_upload_records(feed_type=feed_type, upload_id=upload_id, search=search, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_diesel_upload_records(
     feed_type: str, upload_id: str, search: str = "",
 ) -> int:
-    """Count records for a single diesel upload batch."""
-    db = get_db()
-    return await db.imported_feeds.count_documents(
-        _diesel_records_query(feed_type, upload_id, search)
-    )
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_diesel_upload_records(feed_type=feed_type, upload_id=upload_id, search=search)
 
 
 async def get_diesel_upload_totals(
     feed_type: str, upload_id: str, search: str = "",
 ) -> dict:
-    """Ltrs + amount totals for the (optionally searched) upload batch."""
-    db = get_db()
-    pipeline = [
-        {"$match": _diesel_records_query(feed_type, upload_id, search)},
-        {"$group": {
-            "_id":          None,
-            "ltrs":         {"$sum": _safe_double("ltrs")},
-            "total_amount": {"$sum": _diesel_computed_amount()},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"ltrs": 0.0, "total_amount": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_diesel_upload_totals(feed_type=feed_type, upload_id=upload_id, search=search)
 
 
 async def delete_diesel_upload(feed_type: str, upload_id: str) -> int:
-    """Delete every record belonging to one diesel upload batch."""
-    db = get_db()
-    result = await db.imported_feeds.delete_many(
-        {"feed_type": feed_type, "upload_id": upload_id}
-    )
-    return result.deleted_count
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.delete_diesel_upload(feed_type=feed_type, upload_id=upload_id)
 
 
 def _diesel_date_filter(year: int, month: int) -> dict:
@@ -5209,29 +3916,8 @@ def _diesel_all_query(
 
 
 async def get_diesel_file_labels(feed_type: str) -> List[str]:
-    """Distinct FILE NAME / description labels for a diesel station."""
-    db = get_db()
-    pipeline = [
-        {"$match": {"feed_type": feed_type}},
-        {"$project": {
-            "label": {
-                "$let": {
-                    "vars": {
-                        "ul": {"$trim": {"input": {"$ifNull": ["$upload_label", ""]}}},
-                        "fn": {"$trim": {"input": {"$ifNull": ["$source_filename", ""]}}},
-                    },
-                    "in": {"$cond": [{"$ne": ["$$ul", ""]}, "$$ul", "$$fn"]},
-                }
-            }
-        }},
-        {"$match": {"label": {"$nin": ["", None]}}},
-        {"$group": {"_id": "$label"}},
-        {"$sort": {"_id": 1}},
-    ]
-    docs = await db.imported_feeds.aggregate(pipeline).to_list(length=None)
-    return unique_diesel_file_labels(
-        str(d.get("_id") or "") for d in docs
-    )
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_diesel_file_labels(feed_type=feed_type)
 
 
 async def get_diesel_all_records(
@@ -5247,23 +3933,8 @@ async def get_diesel_all_records(
     sort_field: str = "transaction_date",
     sort_asc: bool = False,
 ) -> list:
-    """Return paginated diesel rows across all uploads."""
-    db = get_db()
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _DIESEL_FEED_SORT_ALLOWED,
-        default="transaction_date",
-        tie_break=(("date", -1), ("import_date", -1)),
-    )
-    cursor = (
-        db.imported_feeds
-        .find(_diesel_all_query(
-            feed_type, search, year, month, date_from, date_to, file_labels,
-        ))
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_diesel_all_records(feed_type=feed_type, search=search, year=year, month=month, date_from=date_from, date_to=date_to, limit=limit, skip=skip, file_labels=file_labels, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_diesel_all_records(
@@ -5275,13 +3946,8 @@ async def count_diesel_all_records(
     date_to: Optional[datetime] = None,
     file_labels: Optional[Sequence[str]] = None,
 ) -> int:
-    """Count diesel rows across all uploads."""
-    db = get_db()
-    return await db.imported_feeds.count_documents(
-        _diesel_all_query(
-            feed_type, search, year, month, date_from, date_to, file_labels,
-        )
-    )
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_diesel_all_records(feed_type=feed_type, search=search, year=year, month=month, date_from=date_from, date_to=date_to, file_labels=file_labels)
 
 
 async def get_diesel_all_totals(
@@ -5293,64 +3959,18 @@ async def get_diesel_all_totals(
     date_to: Optional[datetime] = None,
     file_labels: Optional[Sequence[str]] = None,
 ) -> dict:
-    """Return row count and litre/amount totals for filtered diesel rows."""
-    db = get_db()
-    match = _diesel_all_query(
-        feed_type, search, year, month, date_from, date_to, file_labels,
-    )
-    pipeline = [
-        {"$match": match},
-        {"$facet": {
-            "summary": [{"$group": {
-                "_id":          None,
-                "count":        {"$sum": 1},
-                "ltrs":         {"$sum": _safe_double("ltrs")},
-                "total_amount": {"$sum": _diesel_computed_amount()},
-            }}],
-            "by_currency": [{"$group": {
-                "_id":    "$currency",
-                "amount": {"$sum": _diesel_computed_amount()},
-            }}],
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if not result:
-        return {"count": 0, "ltrs": 0.0, "total_amount": 0.0}
-    summary = (result[0].get("summary") or [{}])[0]
-    out = {
-        "count": int(summary.get("count") or 0),
-        "ltrs": float(summary.get("ltrs") or 0.0),
-        "total_amount": float(summary.get("total_amount") or 0.0),
-    }
-    if feed_type == "diesel_lake_zambia":
-        out["amount_by_currency"] = diesel_amount_by_currency_groups(
-            result[0].get("by_currency") or [],
-        )
-    return out
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_diesel_all_totals(feed_type=feed_type, search=search, year=year, month=month, date_from=date_from, date_to=date_to, file_labels=file_labels)
 
 
 async def get_diesel_available_years(feed_type: str) -> List[int]:
-    """Years that appear in uploaded diesel records."""
-    return await _feed_available_years(feed_type, "date")
-
-
-# Fields hashed for the diesel whole-file duplicate gate (order matters).
-_DIESEL_HASH_FIELDS = (
-    "date", "lpo_no", "do_sdo_no", "diesel_at", "ownership",
-    "clients_name", "destinations", "truck_no", "ltrs",
-    "price_per_ltr", "total_amount",
-)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_diesel_available_years(feed_type=feed_type)
 
 
 def diesel_batch_content_hash(records: List[dict]) -> str:
-    """SHA-256 of the exact ordered diesel rows (whole-file duplicate gate)."""
-    lines: List[str] = []
-    for rec in records:
-        lines.append("|".join(
-            _zambia_hash_field(rec.get(field)) for field in _DIESEL_HASH_FIELDS
-        ))
-    payload = "\n".join(lines).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    from tahmeed.services import feed_service as _feeds
+    return _feeds.diesel_batch_content_hash(records=records)
 
 
 def _diesel_filename_sheet_query(
@@ -5402,84 +4022,15 @@ async def diesel_filename_already_uploaded(
     source_filename: str,
     sheet_label: str = "",
 ) -> List[dict]:
-    """Prior diesel batches with the same file name and sheet tab."""
-    query = _diesel_filename_sheet_query(feed_type, source_filename, sheet_label)
-    if not query:
-        return []
-    db = get_db()
-    pipeline = [
-        {"$match": query},
-        {"$group": {
-            "_id":             "$upload_id",
-            "source_filename": {"$first": "$source_filename"},
-            "sheet_label":     {"$first": "$sheet_label"},
-            "import_date":     {"$first": "$import_date"},
-            "record_count":    {"$sum": 1},
-        }},
-        {"$sort": {"import_date": -1}},
-    ]
-    found = await db.imported_feeds.aggregate(pipeline).to_list(length=None)
-    matches: List[dict] = []
-    for up in found:
-        uid = str(up.get("_id") or "").strip()
-        if not uid:
-            continue
-        matches.append(_diesel_upload_summary({**up, "upload_id": uid}))
-    return matches
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.diesel_filename_already_uploaded(feed_type=feed_type, source_filename=source_filename, sheet_label=sheet_label)
 
 
 async def find_diesel_uploads_by_content_hash(
     feed_type: str, content_hash: str,
 ) -> List[dict]:
-    """Return existing diesel upload summaries that match *content_hash*."""
-    if not feed_type or not content_hash:
-        return []
-    db = get_db()
-
-    stamped_ids = await db.imported_feeds.distinct(
-        "upload_id",
-        {"feed_type": feed_type, "content_hash": content_hash},
-    )
-    matches: Dict[str, dict] = {}
-    uploads = await get_diesel_uploads(feed_type)
-    by_id = {str(u.get("_id") or ""): u for u in uploads}
-
-    for uid in stamped_ids:
-        key = str(uid or "").strip()
-        if not key:
-            continue
-        up = by_id.get(key)
-        if up:
-            matches[key] = _diesel_upload_summary(
-                {**up, "upload_id": key}, content_hash=content_hash,
-            )
-
-    # Legacy uploads (no content_hash): re-hash each batch once.
-    projection = {field: 1 for field in _DIESEL_HASH_FIELDS}
-    projection["content_hash"] = 1
-    for up in uploads:
-        uid = str(up.get("_id") or "").strip()
-        if not uid or uid in matches:
-            continue
-        rows = await db.imported_feeds.find(
-            {"feed_type": feed_type, "upload_id": uid},
-            projection,
-        ).to_list(length=None)
-        if not rows:
-            continue
-        stored = {
-            str(r.get("content_hash") or "").strip()
-            for r in rows
-            if str(r.get("content_hash") or "").strip()
-        }
-        if stored:
-            continue
-        if diesel_batch_content_hash(rows) == content_hash:
-            matches[uid] = _diesel_upload_summary(
-                {**up, "upload_id": uid}, content_hash=content_hash,
-            )
-
-    return list(matches.values())
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.find_diesel_uploads_by_content_hash(feed_type=feed_type, content_hash=content_hash)
 
 
 async def diesel_already_uploaded(
@@ -5488,122 +4039,28 @@ async def diesel_already_uploaded(
     source_filename: str = "",
     sheet_label: str = "",
 ) -> List[dict]:
-    """Matching prior diesel uploads by file/sheet identity or exact contents."""
-    matches: Dict[str, dict] = {}
-    for up in await diesel_filename_already_uploaded(
-        feed_type, source_filename, sheet_label,
-    ):
-        uid = str(up.get("upload_id") or "").strip()
-        if uid:
-            matches[uid] = up
-    if records:
-        file_hash = diesel_batch_content_hash(records)
-        for up in await find_diesel_uploads_by_content_hash(feed_type, file_hash):
-            uid = str(up.get("upload_id") or "").strip()
-            if uid:
-                matches[uid] = up
-    return list(matches.values())
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.diesel_already_uploaded(feed_type=feed_type, records=records, source_filename=source_filename, sheet_label=sheet_label)
 
-
-# ── Ahmed Kimvi — Excel import (last sheet per workbook) ─────────────────────
 
 async def kimvi_sheet_exists(sheet_label: str) -> bool:
-    """True when a sheet with this tab name was already imported (case-insensitive)."""
-    if not sheet_label.strip():
-        return False
-    db = get_db()
-    count = await db.separate_expenses.count_documents({
-        "expense_type": "ahmed_kimvi",
-        "sheet_label": {
-            "$regex": f"^{re.escape(sheet_label.strip())}$",
-            "$options": "i",
-        },
-    })
-    return count > 0
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.kimvi_sheet_exists(sheet_label=sheet_label)
 
 
 async def kimvi_existing_sheet_labels(labels: List[str]) -> set:
-    """Return sheet tab names from *labels* that were already imported (case-insensitive)."""
-    clean = [l.strip() for l in labels if l and str(l).strip()]
-    if not clean:
-        return set()
-    db = get_db()
-    clauses = [
-        {"sheet_label": {"$regex": f"^{re.escape(l)}$", "$options": "i"}}
-        for l in clean
-    ]
-    found = await db.separate_expenses.distinct(
-        "sheet_label",
-        {"expense_type": "ahmed_kimvi", "$or": clauses},
-    )
-    found_upper = {_norm_sheet_label(s) for s in found if s}
-    return {l for l in clean if _norm_sheet_label(l) in found_upper}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.kimvi_existing_sheet_labels(labels=labels)
 
 
 async def save_kimvi_import(records: list) -> int:
-    """Insert a batch of Ahmed Kimvi rows from an Excel import."""
-    if not records:
-        return 0
-    db = get_db()
-    now = datetime.utcnow()
-    docs = []
-    for rec in records:
-        doc = dict(rec)
-        doc.pop("_raw", None)
-        doc["expense_type"] = "ahmed_kimvi"
-        doc["import_date"]  = now
-        doc["created_at"]   = now
-        if not isinstance(doc.get("expense_date"), datetime):
-            normalize_date_fields(
-                doc, "date_str", "expense_date", store_as="expense_date",
-                display_fmt="%d %b %Y",
-            )
-            if isinstance(doc.get("expense_date"), datetime):
-                doc["date_str"] = format_excel_date(doc["expense_date"], "%d %b %Y")
-        _uppercase_import_text(doc)
-        stamp_truck_sort_key(doc)
-        docs.append(doc)
-    from tahmeed.db.import_idempotency import insert_many_idempotent
-
-    inserted, _dupes = await insert_many_idempotent(db.separate_expenses, docs)
-    return inserted
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.save_kimvi_import(records=records)
 
 
 async def get_kimvi_uploads() -> list:
-    """Return one summary doc per import batch."""
-    db = get_db()
-    pipeline = [
-        {"$match": {
-            "expense_type": "ahmed_kimvi",
-            "upload_id":    {"$exists": True, "$ne": ""},
-        }},
-        {"$group": {
-            "_id":             "$upload_id",
-            "sheet_label":     {"$first": "$sheet_label"},
-            "source_filename": {"$first": "$source_filename"},
-            "import_date":     {"$first": "$import_date"},
-            "record_count":    {"$sum": 1},
-            "balance_usd":     {"$sum": {"$ifNull": ["$amount_usd", 0]}},
-            "money_in":        {"$sum": {
-                "$cond": [
-                    {"$lt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
-                    {"$ifNull": ["$amount_usd", 0]},
-                    0,
-                ],
-            }},
-            "money_out":       {"$sum": {
-                "$cond": [
-                    {"$gt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
-                    {"$ifNull": ["$amount_usd", 0]},
-                    0,
-                ],
-            }},
-            "min_expense_date": {"$min": "$expense_date"},
-            "max_expense_date": {"$max": "$expense_date"},
-        }},
-        {"$sort": {"import_date": -1}},
-    ]
-    return await db.separate_expenses.aggregate(pipeline).to_list(length=None)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_kimvi_uploads()
 
 
 async def get_kimvi_upload_records(
@@ -5614,36 +4071,13 @@ async def get_kimvi_upload_records(
     sort_field: str = "row_index",
     sort_asc: bool = True,
 ) -> list:
-    """Return paginated rows for a single Ahmed Kimvi import batch."""
-    db = get_db()
-    query: dict = {
-        "expense_type": "ahmed_kimvi",
-        "upload_id":    upload_id,
-    }
-    _put_search(query, search, ("truck_no",), ("description", "date_str"))
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _KIMVI_SORT_ALLOWED,
-        default="row_index", tie_break=(("created_at", 1),),
-    )
-    cursor = (
-        db.separate_expenses
-        .find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_kimvi_upload_records(upload_id=upload_id, search=search, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_kimvi_upload_records(upload_id: str, search: str = "") -> int:
-    """Count rows for a single Ahmed Kimvi import batch."""
-    db = get_db()
-    query: dict = {
-        "expense_type": "ahmed_kimvi",
-        "upload_id":    upload_id,
-    }
-    _put_search(query, search, ("truck_no",), ("description", "date_str"))
-    return await db.separate_expenses.count_documents(query)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_kimvi_upload_records(upload_id=upload_id, search=search)
 
 
 def _kimvi_date_filter(year: int, month: int) -> dict:
@@ -5728,25 +4162,8 @@ async def get_kimvi_all_records(
     sort_field: str = "expense_date",
     sort_asc: bool = False,
 ) -> list:
-    """Return paginated Ahmed Kimvi rows across all uploads."""
-    db = get_db()
-    query = _kimvi_entries_query(
-        search, year, month, date_from, date_to,
-        money_in_only=money_in_only, called_out_only=called_out_only,
-    )
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _KIMVI_SORT_ALLOWED,
-        default="expense_date",
-        tie_break=(("date_str", -1), ("created_at", -1)),
-    )
-    cursor = (
-        db.separate_expenses
-        .find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_kimvi_all_records(search=search, year=year, month=month, money_in_only=money_in_only, called_out_only=called_out_only, date_from=date_from, date_to=date_to, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_kimvi_all_records(
@@ -5758,14 +4175,8 @@ async def count_kimvi_all_records(
     money_in_only: bool = False,
     called_out_only: bool = False,
 ) -> int:
-    """Count Ahmed Kimvi rows across all uploads."""
-    db = get_db()
-    return await db.separate_expenses.count_documents(
-        _kimvi_entries_query(
-            search, year, month, date_from, date_to,
-            money_in_only=money_in_only, called_out_only=called_out_only,
-        )
-    )
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_kimvi_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to, money_in_only=money_in_only, called_out_only=called_out_only)
 
 
 async def get_kimvi_all_totals(
@@ -5777,186 +4188,38 @@ async def get_kimvi_all_totals(
     money_in_only: bool = False,
     called_out_only: bool = False,
 ) -> dict:
-    """Return record count and money in/out totals for filtered Ahmed Kimvi rows."""
-    db = get_db()
-    pipeline = [
-        {"$match": _kimvi_entries_query(
-            search, year, month, date_from, date_to,
-            money_in_only=money_in_only, called_out_only=called_out_only,
-        )},
-        {"$group": {
-            "_id": None,
-            "count":     {"$sum": 1},
-            "money_in":  {"$sum": {
-                "$cond": [
-                    {"$lt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
-                    {"$ifNull": ["$amount_usd", 0]},
-                    0,
-                ],
-            }},
-            "money_out": {"$sum": {
-                "$cond": [
-                    {"$gt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
-                    {"$ifNull": ["$amount_usd", 0]},
-                    0,
-                ],
-            }},
-        }},
-    ]
-    result = await db.separate_expenses.aggregate(pipeline).to_list(1)
-    if result:
-        row = result[0]
-        row["balance_usd"] = row.get("money_in", 0) + row.get("money_out", 0)
-        return row
-    return {"count": 0, "money_in": 0.0, "money_out": 0.0, "balance_usd": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_kimvi_all_totals(search=search, year=year, month=month, date_from=date_from, date_to=date_to, money_in_only=money_in_only, called_out_only=called_out_only)
 
 
 async def get_kimvi_available_years() -> List[int]:
-    """Years present in uploaded Ahmed Kimvi records."""
-    db = get_db()
-    years: set[int] = set()
-
-    pipeline = [
-        {"$match": {
-            "expense_type": "ahmed_kimvi",
-            "expense_date": {"$exists": True, "$ne": None},
-        }},
-        {"$group": {"_id": {"$year": "$expense_date"}}},
-    ]
-    for doc in await db.separate_expenses.aggregate(pipeline).to_list(length=None):
-        yr = doc.get("_id")
-        if isinstance(yr, int) and 1990 <= yr <= 2100:
-            years.add(yr)
-
-    legacy_dates = await db.separate_expenses.distinct(
-        "date_str",
-        {
-            "expense_type": "ahmed_kimvi",
-            "$or": [
-                {"expense_date": {"$exists": False}},
-                {"expense_date": None},
-            ],
-        },
-    )
-    for val in legacy_dates:
-        parsed = _parse_toll_date(val)
-        if parsed and 1990 <= parsed.year <= 2100:
-            years.add(parsed.year)
-
-    return sorted(years, reverse=True)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_kimvi_available_years()
 
 
 async def delete_kimvi_upload(upload_id: str) -> int:
-    """Delete every Ahmed Kimvi row belonging to one upload batch."""
-    if not upload_id:
-        return 0
-    db = get_db()
-    result = await db.separate_expenses.delete_many({
-        "expense_type": "ahmed_kimvi",
-        "upload_id": upload_id,
-    })
-    return result.deleted_count
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.delete_kimvi_upload(upload_id=upload_id)
 
-
-# ── Congo Expenses — Excel import (last sheet per workbook) ──────────────────
 
 async def congo_sheet_exists(sheet_label: str) -> bool:
-    """True when a sheet with this tab name was already imported (case-insensitive)."""
-    if not sheet_label.strip():
-        return False
-    db = get_db()
-    count = await db.separate_expenses.count_documents({
-        "expense_type": "congo_expenses",
-        "sheet_label": {
-            "$regex": f"^{re.escape(sheet_label.strip())}$",
-            "$options": "i",
-        },
-    })
-    return count > 0
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.congo_sheet_exists(sheet_label=sheet_label)
 
 
 async def congo_existing_sheet_labels(labels: List[str]) -> set:
-    """Return sheet tab names from *labels* that were already imported (case-insensitive)."""
-    clean = [l.strip() for l in labels if l and str(l).strip()]
-    if not clean:
-        return set()
-    db = get_db()
-    clauses = [
-        {"sheet_label": {"$regex": f"^{re.escape(l)}$", "$options": "i"}}
-        for l in clean
-    ]
-    found = await db.separate_expenses.distinct(
-        "sheet_label",
-        {"expense_type": "congo_expenses", "$or": clauses},
-    )
-    found_upper = {_norm_sheet_label(s) for s in found if s}
-    return {l for l in clean if _norm_sheet_label(l) in found_upper}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.congo_existing_sheet_labels(labels=labels)
 
 
 async def save_congo_import(records: list) -> int:
-    """Insert a batch of Congo Expenses rows from an Excel import."""
-    if not records:
-        return 0
-    db = get_db()
-    now = datetime.utcnow()
-    docs = []
-    for rec in records:
-        doc = dict(rec)
-        doc.pop("_raw", None)
-        doc["expense_type"] = "congo_expenses"
-        doc["import_date"]  = now
-        doc["created_at"]   = now
-        if not isinstance(doc.get("expense_date"), datetime):
-            normalize_date_fields(
-                doc, "date_str", "expense_date", store_as="expense_date",
-                display_fmt="%d %b %Y",
-            )
-            if isinstance(doc.get("expense_date"), datetime):
-                doc["date_str"] = format_excel_date(doc["expense_date"], "%d %b %Y")
-        _uppercase_import_text(doc)
-        stamp_truck_sort_key(doc)
-        docs.append(doc)
-    from tahmeed.db.import_idempotency import insert_many_idempotent
-
-    inserted, _dupes = await insert_many_idempotent(db.separate_expenses, docs)
-    return inserted
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.save_congo_import(records=records)
 
 
 async def get_congo_uploads() -> list:
-    """Return one summary doc per Congo Expenses import batch."""
-    db = get_db()
-    pipeline = [
-        {"$match": {
-            "expense_type": "congo_expenses",
-            "upload_id":    {"$exists": True, "$ne": ""},
-        }},
-        {"$group": {
-            "_id":             "$upload_id",
-            "sheet_label":     {"$first": "$sheet_label"},
-            "source_filename": {"$first": "$source_filename"},
-            "import_date":     {"$first": "$import_date"},
-            "record_count":    {"$sum": 1},
-            "balance_usd":     {"$sum": {"$ifNull": ["$amount_usd", 0]}},
-            "money_in":        {"$sum": {
-                "$cond": [
-                    {"$lt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
-                    {"$ifNull": ["$amount_usd", 0]},
-                    0,
-                ],
-            }},
-            "money_out":       {"$sum": {
-                "$cond": [
-                    {"$gt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
-                    {"$ifNull": ["$amount_usd", 0]},
-                    0,
-                ],
-            }},
-            "min_expense_date": {"$min": "$expense_date"},
-            "max_expense_date": {"$max": "$expense_date"},
-        }},
-        {"$sort": {"import_date": -1}},
-    ]
-    return await db.separate_expenses.aggregate(pipeline).to_list(length=None)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_congo_uploads()
 
 
 async def get_congo_upload_records(
@@ -5967,36 +4230,13 @@ async def get_congo_upload_records(
     sort_field: str = "row_index",
     sort_asc: bool = True,
 ) -> list:
-    """Return paginated rows for a single Congo Expenses import batch."""
-    db = get_db()
-    query: dict = {
-        "expense_type": "congo_expenses",
-        "upload_id":    upload_id,
-    }
-    _put_search(query, search, ("truck_no",), ("description", "lpo_no", "date_str"))
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _CONGO_SORT_ALLOWED,
-        default="row_index", tie_break=(("created_at", 1),),
-    )
-    cursor = (
-        db.separate_expenses
-        .find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_congo_upload_records(upload_id=upload_id, search=search, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_congo_upload_records(upload_id: str, search: str = "") -> int:
-    """Count rows for a single Congo Expenses import batch."""
-    db = get_db()
-    query: dict = {
-        "expense_type": "congo_expenses",
-        "upload_id":    upload_id,
-    }
-    _put_search(query, search, ("truck_no",), ("description", "lpo_no", "date_str"))
-    return await db.separate_expenses.count_documents(query)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_congo_upload_records(upload_id=upload_id, search=search)
 
 
 def _congo_date_filter(year: int, month: int) -> dict:
@@ -6069,25 +4309,8 @@ async def get_congo_all_records(
     sort_field: str = "expense_date",
     sort_asc: bool = False,
 ) -> list:
-    """Return paginated Congo Expenses rows across all uploads."""
-    db = get_db()
-    query = _congo_entries_query(
-        search, year, month, date_from, date_to,
-        money_in_only=money_in_only, called_out_only=called_out_only,
-    )
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _CONGO_SORT_ALLOWED,
-        default="expense_date",
-        tie_break=(("date_str", -1), ("created_at", -1)),
-    )
-    cursor = (
-        db.separate_expenses
-        .find(query)
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_congo_all_records(search=search, year=year, month=month, money_in_only=money_in_only, called_out_only=called_out_only, date_from=date_from, date_to=date_to, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_congo_all_records(
@@ -6099,14 +4322,8 @@ async def count_congo_all_records(
     money_in_only: bool = False,
     called_out_only: bool = False,
 ) -> int:
-    """Count Congo Expenses rows across all uploads."""
-    db = get_db()
-    return await db.separate_expenses.count_documents(
-        _congo_entries_query(
-            search, year, month, date_from, date_to,
-            money_in_only=money_in_only, called_out_only=called_out_only,
-        )
-    )
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_congo_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to, money_in_only=money_in_only, called_out_only=called_out_only)
 
 
 async def get_congo_all_totals(
@@ -6118,95 +4335,19 @@ async def get_congo_all_totals(
     money_in_only: bool = False,
     called_out_only: bool = False,
 ) -> dict:
-    """Return record count and money in/out totals for filtered Congo rows."""
-    db = get_db()
-    pipeline = [
-        {"$match": _congo_entries_query(
-            search, year, month, date_from, date_to,
-            money_in_only=money_in_only, called_out_only=called_out_only,
-        )},
-        {"$group": {
-            "_id": None,
-            "count":     {"$sum": 1},
-            "money_in":  {"$sum": {
-                "$cond": [
-                    {"$lt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
-                    {"$ifNull": ["$amount_usd", 0]},
-                    0,
-                ],
-            }},
-            "money_out": {"$sum": {
-                "$cond": [
-                    {"$gt": [{"$ifNull": ["$amount_usd", 0]}, 0]},
-                    {"$ifNull": ["$amount_usd", 0]},
-                    0,
-                ],
-            }},
-        }},
-    ]
-    result = await db.separate_expenses.aggregate(pipeline).to_list(1)
-    if result:
-        row = result[0]
-        row["balance_usd"] = row.get("money_in", 0) + row.get("money_out", 0)
-        return row
-    return {"count": 0, "money_in": 0.0, "money_out": 0.0, "balance_usd": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_congo_all_totals(search=search, year=year, month=month, date_from=date_from, date_to=date_to, money_in_only=money_in_only, called_out_only=called_out_only)
 
 
 async def get_congo_available_years() -> List[int]:
-    """Years present in uploaded Congo Expenses records."""
-    db = get_db()
-    years: set[int] = set()
-
-    pipeline = [
-        {"$match": {
-            "expense_type": "congo_expenses",
-            "expense_date": {"$exists": True, "$ne": None},
-        }},
-        {"$group": {"_id": {"$year": "$expense_date"}}},
-    ]
-    for doc in await db.separate_expenses.aggregate(pipeline).to_list(length=None):
-        yr = doc.get("_id")
-        if isinstance(yr, int) and 1990 <= yr <= 2100:
-            years.add(yr)
-
-    legacy_dates = await db.separate_expenses.distinct(
-        "date_str",
-        {
-            "expense_type": "congo_expenses",
-            "$or": [
-                {"expense_date": {"$exists": False}},
-                {"expense_date": None},
-            ],
-        },
-    )
-    for val in legacy_dates:
-        parsed = _parse_toll_date(val)
-        if parsed and 1990 <= parsed.year <= 2100:
-            years.add(parsed.year)
-
-    return sorted(years, reverse=True)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_congo_available_years()
 
 
 async def delete_congo_upload(upload_id: str) -> int:
-    """Delete every Congo Expenses row belonging to one upload batch."""
-    if not upload_id:
-        return 0
-    db = get_db()
-    result = await db.separate_expenses.delete_many({
-        "expense_type": "congo_expenses",
-        "upload_id": upload_id,
-    })
-    return result.deleted_count
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.delete_congo_upload(upload_id=upload_id)
 
-
-# ── Truck Overview — cross-source normalized rollup ───────────────────────────
-
-_TRUCK_OVERVIEW_DIESEL_FEEDS = (
-    ("diesel_infinity", "Infinity Diesel"),
-    ("diesel_lake_zambia", "Lake Zambia Diesel"),
-    ("diesel_lake_tunduma", "Lake Tunduma Diesel"),
-    ("diesel_gbp", "GBP Diesel"),
-)
 
 # Per-station source_group keys (sidebar keys) so Fuel Overview can filter
 # Infinity vs Lake Zambia vs … while Truck Overview still treats them as one
@@ -6218,12 +4359,6 @@ _DIESEL_FEED_SOURCE_GROUP = {
     "diesel_gbp": "gbp_diesel",
 }
 _DIESEL_STATION_SOURCE_GROUPS = frozenset(_DIESEL_FEED_SOURCE_GROUP.values())
-
-_TRUCK_OVERVIEW_IMPORTED_FEEDS = (
-    ("toll_plaza", "Toll Plaza"),
-    ("parking_congo", "Parking Congo"),
-    ("zambia_parking", "Zambia Parking"),
-)
 
 _TRUCK_OVERVIEW_SOURCES = {
     "all",
@@ -6310,94 +4445,6 @@ def _truck_row_in_date_range(
     return True
 
 
-def _normalized_row(
-    *,
-    source_group: str,
-    source: str,
-    date_value: Any,
-    truck_value: str,
-    description: str,
-    reference: str = "",
-    currency: str = "",
-    amount: Any = None,
-    liters: Any = None,
-    rate: Any = None,
-    station: str = "",
-    receipt_status: str = "",
-    upload_description: str = "",
-    item_name: str = "",
-) -> dict:
-    amt = _safe_float_value(amount) if amount not in (None, "") else None
-    ltrs = _safe_float_value(liters) if liters not in (None, "") else None
-    unit_rate = _safe_float_value(rate) if rate not in (None, "") else None
-    dt = _as_date_value(date_value)
-    return {
-        "source_group": source_group,
-        "source": source,
-        "date": dt,
-        "truck_value": truck_value or "—",
-        "description": description or "—",
-        "reference": reference or "—",
-        "currency": currency or "",
-        "amount": amt,
-        "liters": ltrs,
-        "rate": unit_rate,
-        "station": station or "—",
-        "receipt_status": receipt_status or "—",
-        "upload_description": upload_description or "—",
-        "item_name": item_name or "",
-    }
-
-
-async def _truck_overview_master_rows(
-    truck: str,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-) -> list:
-    db = get_db()
-    diesel_items = await get_diesel_cash_item_names()
-    query = _with_date_range(
-        {
-            "verified": True,
-            "deletion_requested": {"$ne": True},
-            "trashed": {"$ne": True},
-            "truck_number": _truck_exact(truck),
-        },
-        "date",
-        date_from,
-        date_to,
-    )
-    docs = await db.transactions.find(query).sort(
-        [("date", -1), ("created_at", -1)]
-    ).to_list(length=None)
-
-    rows = []
-    for doc in docs:
-        tx = Transaction.from_doc(doc)
-        is_diesel_cash = (
-            is_diesel_cash_item(tx.category_name, diesel_items)
-            or is_diesel_cash_item(tx.item, diesel_items)
-        )
-        rows.append(_normalized_row(
-            source_group="diesel_cash" if is_diesel_cash else "master",
-            source="Diesel Cash" if is_diesel_cash else "Master Expenses",
-            date_value=tx.date,
-            truck_value=tx.truck_number,
-            description=tx.description or tx.item or tx.category_name or "Verified transaction",
-            reference=tx.memo or tx.do_number or tx.lpo_do or tx.category_name or "",
-            currency=tx.currency or "",
-            item_name=tx.item or tx.category_name or "",
-            amount=tx.amount,
-            liters=(
-                parse_liters_from_description(tx.description or "")
-                if is_diesel_cash else None
-            ),
-            station=tx.ownership or "",
-            receipt_status=tx.receipt_status or "",
-        ))
-    return rows
-
-
 def _diesel_overview_query(
     feed_type: str,
     truck: str,
@@ -6435,301 +4482,9 @@ def _imported_feed_overview_query(
     )
 
 
-async def _truck_overview_diesel_rows(
-    truck: str,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-) -> list:
-    db = get_db()
-    rows: list = []
-    for feed_type, label in _TRUCK_OVERVIEW_DIESEL_FEEDS:
-        query = _diesel_overview_query(feed_type, truck, date_from, date_to)
-        docs = await db.imported_feeds.find(query).sort(
-            [("transaction_date", -1), ("date", -1), ("import_date", -1)]
-        ).to_list(length=None)
-        for doc in docs:
-            rows.append(_normalized_row(
-                source_group=_DIESEL_FEED_SOURCE_GROUP.get(feed_type, "diesel_imports"),
-                source=label,
-                date_value=doc.get("transaction_date") or doc.get("date"),
-                truck_value=str(doc.get("truck_no", "") or ""),
-                description=doc.get("destinations") or doc.get("clients_name") or "Diesel import",
-                reference=doc.get("lpo_no") or doc.get("do_sdo_no") or doc.get("sheet_label") or "",
-                currency=diesel_record_currency(doc, feed_type) or "TZS",
-                amount=diesel_line_total(doc.get("ltrs"), doc.get("price_per_ltr")),
-                liters=doc.get("ltrs"),
-                rate=doc.get("price_per_ltr"),
-                station=doc.get("diesel_at") or "",
-                upload_description=diesel_display_label(doc),
-            ))
-    return rows
-
-
-async def _truck_overview_imported_feed_rows(
-    truck: str,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-) -> list:
-    db = get_db()
-    rows: list = []
-
-    toll_docs = await db.imported_feeds.find(
-        _imported_feed_overview_query(
-            "toll_plaza", "vehicle_reg", truck, date_from, date_to,
-        )
-    ).sort([("transaction_date", -1), ("toll_date", -1), ("import_date", -1)]).to_list(length=None)
-    for doc in toll_docs:
-        rows.append(_normalized_row(
-            source_group="toll_plaza",
-            source="Toll Plaza",
-            date_value=doc.get("transaction_date") or doc.get("toll_date"),
-            truck_value=str(doc.get("vehicle_reg", "") or ""),
-            description=doc.get("toll_plaza") or "Toll transaction",
-            reference=doc.get("receipt_no") or doc.get("card_no") or doc.get("device") or "",
-            currency="ZMW",
-            amount=doc.get("tender_amount"),
-            station=doc.get("cashier_name") or "",
-        ))
-
-    parking_docs = await db.imported_feeds.find(
-        _imported_feed_overview_query(
-            "parking_congo", "vehicle_no", truck, date_from, date_to,
-        )
-    ).sort([("transaction_date", -1), ("payment_date", -1), ("import_date", -1)]).to_list(length=None)
-    for doc in parking_docs:
-        rows.append(_normalized_row(
-            source_group="parking_congo",
-            source="Parking Congo",
-            date_value=doc.get("transaction_date") or doc.get("payment_date"),
-            truck_value=str(doc.get("vehicle_no", "") or ""),
-            description=doc.get("transaction_details") or doc.get("transaction_type") or "Parking transaction",
-            reference=doc.get("ledger_id") or doc.get("direction") or "",
-            currency="USD",
-            amount=doc.get("amount"),
-            station=doc.get("cashier") or "",
-        ))
-
-    zambia_docs = await db.imported_feeds.find(
-        _with_date_range(
-            {"feed_type": "zambia_parking", "plate_num": _truck_exact(truck)},
-            "transaction_date",
-            date_from,
-            date_to,
-        )
-    ).sort([("transaction_date", -1), ("import_date", -1)]).to_list(length=None)
-    for doc in zambia_docs:
-        debit = _safe_float_value(doc.get("debit"))
-        credit = _safe_float_value(doc.get("credit"))
-        amount = debit if debit else (-credit if credit else None)
-        rows.append(_normalized_row(
-            source_group="zambia_parking",
-            source="Zambia Parking",
-            date_value=doc.get("transaction_date") or doc.get("date"),
-            truck_value=str(doc.get("plate_num", "") or ""),
-            description=doc.get("heading_to") or doc.get("type") or "Zambia parking transaction",
-            reference=doc.get("ticket_no") or doc.get("sheet_label") or "",
-            currency="ZMW",
-            amount=amount,
-        ))
-
-    return rows
-
-
-async def _truck_overview_separate_rows(
-    truck: str,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-) -> list:
-    db = get_db()
-    rows: list = []
-
-    congo_docs = await db.separate_expenses.find(
-        _with_date_range(
-            {"expense_type": "congo_expenses", "truck_no": _truck_exact(truck)},
-            "expense_date",
-            date_from,
-            date_to,
-        )
-    ).sort([("expense_date", -1), ("created_at", -1)]).to_list(length=None)
-    for doc in congo_docs:
-        rows.append(_normalized_row(
-            source_group="congo_expenses",
-            source="Congo Expenses",
-            date_value=doc.get("expense_date") or doc.get("date_str"),
-            truck_value=str(doc.get("truck_no", "") or ""),
-            description=doc.get("description") or "Congo expense",
-            reference=doc.get("lpo_no") or doc.get("sheet_label") or "",
-            currency="USD",
-            amount=doc.get("amount_usd"),
-        ))
-
-    kimvi_docs = await db.separate_expenses.find(
-        _with_date_range(
-            {"expense_type": "ahmed_kimvi", "truck_no": _truck_exact(truck)},
-            "expense_date",
-            date_from,
-            date_to,
-        )
-    ).sort([("expense_date", -1), ("created_at", -1)]).to_list(length=None)
-    for doc in kimvi_docs:
-        rows.append(_normalized_row(
-            source_group="ahmed_kimvi",
-            source="Ahmed Kimvi",
-            date_value=doc.get("expense_date") or doc.get("date_str"),
-            truck_value=str(doc.get("truck_no", "") or ""),
-            description=doc.get("description") or "Ahmed Kimvi expense",
-            reference=doc.get("sheet_label") or "",
-            currency="USD",
-            amount=doc.get("amount_usd"),
-        ))
-
-    return rows
-
-
-async def _truck_overview_extra_sidebar_rows(
-    truck: str,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-) -> list:
-    db = get_db()
-    rows: list = []
-
-    afritrack_docs = await db.imported_feeds.find(
-        _with_date_range(
-            {"feed_type": "afritrack", "truck": _truck_exact(truck)},
-            "import_date",
-            date_from,
-            date_to,
-        )
-    ).sort([("import_date", -1), ("row_index", 1)]).to_list(length=None)
-    for doc in afritrack_docs:
-        rows.append(_normalized_row(
-            source_group="afritrack",
-            source="Afritrack",
-            date_value=doc.get("import_date"),
-            truck_value=str(doc.get("truck", "") or ""),
-            description=doc.get("remarks") or "Afritrack schedule row",
-            reference=doc.get("period") or doc.get("source_filename") or "",
-            currency="USD",
-            amount=doc.get("total_invoice"),
-            rate=doc.get("rate_per_day"),
-        ))
-
-    rahn_docs = await db.imported_feeds.find(
-        _imported_feed_overview_query(
-            "rahntech", "truck_number", truck, date_from, date_to,
-        )
-    ).sort([("transaction_date", -1), ("sales_date", -1), ("import_date", -1)]).to_list(length=None)
-    for doc in rahn_docs:
-        rows.append(_normalized_row(
-            source_group="rahntech",
-            source="RahnTech",
-            date_value=doc.get("transaction_date") or doc.get("sales_date"),
-            truck_value=str(doc.get("truck_number", "") or ""),
-            description=doc.get("driver_name") or doc.get("device_number") or "RahnTech transaction",
-            reference=doc.get("trip_number") or doc.get("do_number") or "",
-        ))
-
-    comesa_docs = await db.imported_feeds.find(
-        _with_date_range(
-            {"feed_type": "comesa", "truck_reg": _truck_exact(truck)},
-            "import_date",
-            date_from,
-            date_to,
-        )
-    ).sort([("month", -1), ("import_date", -1)]).to_list(length=None)
-    for doc in comesa_docs:
-        rows.append(_normalized_row(
-            source_group="comesa",
-            source="COMESA",
-            date_value=doc.get("import_date"),
-            truck_value=str(doc.get("truck_reg", "") or ""),
-            description=doc.get("name") or "COMESA cover",
-            reference=doc.get("card_no") or doc.get("month") or "",
-            currency="TZS",
-            amount=doc.get("premium"),
-        ))
-
-    third_party_docs = await db.imported_feeds.find(
-        _with_date_range(
-            {"feed_type": "third_party", "reg_no": _truck_exact(truck)},
-            "import_date",
-            date_from,
-            date_to,
-        )
-    ).sort([("month", -1), ("import_date", -1)]).to_list(length=None)
-    for doc in third_party_docs:
-        rows.append(_normalized_row(
-            source_group="third_party",
-            source="Third Party Covers",
-            date_value=doc.get("import_date"),
-            truck_value=str(doc.get("reg_no", "") or ""),
-            description=(doc.get("name") or "Third Party cover") + (
-                f" [{doc.get('status')}]" if doc.get("status") else ""
-            ),
-            reference=doc.get("month") or "",
-            currency="TZS",
-            amount=doc.get("total_premium"),
-        ))
-
-    recon_docs = await db.reconciliation_entries.find(
-        _with_date_range(
-            {
-                "entity": "sm_burhani",
-                "truck_and_trailer": _truck_and_trailer_match(truck),
-            },
-            "t1_date",
-            date_from,
-            date_to,
-        )
-    ).sort([("t1_date", -1), ("import_date", -1)]).to_list(length=None)
-    for doc in recon_docs:
-        table = doc.get("table", "bonds")
-        source_label = "SM Burhani Bonds" if table == "bonds" else "SM Burhani RPA"
-        rows.append(_normalized_row(
-            source_group="sm_burhani",
-            source=source_label,
-            date_value=doc.get("t1_date") or doc.get("import_date"),
-            truck_value=str(doc.get("truck_and_trailer", "") or ""),
-            description=doc.get("consignment") or doc.get("importer") or "Reconciliation entry",
-            reference=doc.get("prn_number") or doc.get("entry_reg_no") or doc.get("station") or "",
-            currency="USD",
-            amount=doc.get("charge"),
-            station=doc.get("station") or "",
-        ))
-
-    return rows
-
-
 async def get_afritrack_uploads() -> list:
-    """Return one summary doc per upload batch for the afritrack feed."""
-    db = get_db()
-    pipeline = [
-        {"$match": {
-            "feed_type": "afritrack",
-            "upload_id": {"$exists": True, "$ne": ""},
-        }},
-        {"$group": {
-            "_id":                  "$upload_id",
-            "source_filename":      {"$first": "$source_filename"},
-            "import_date":          {"$first": "$import_date"},
-            "period":               {"$first": "$period"},
-            "record_count":         {"$sum": 1},
-            "total_tahmeed":        {"$sum": _safe_double("total_tahmeed")},
-            "total_invoice":        {"$sum": _safe_double("total_invoice")},
-            "total_variance":       {"$sum": _safe_double("variance")},
-            "installation_tahmeed": {"$first": "$installation_tahmeed"},
-            "installation_invoice": {"$first": "$installation_invoice"},
-            "balance_mar":          {"$first": "$balance_mar"},
-            "vat_rate":             {"$first": "$vat_rate"},
-            "installation_label":   {"$first": "$installation_label"},
-            "total_payable_label":  {"$first": "$total_payable_label"},
-            "statement_tahmeed":    {"$first": "$statement_tahmeed"},
-            "statement_invoice":    {"$first": "$statement_invoice"},
-        }},
-        {"$sort": {"import_date": -1}},
-    ]
-    return await db.imported_feeds.aggregate(pipeline).to_list(length=None)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_afritrack_uploads()
 
 
 def _afritrack_all_query(
@@ -6773,75 +4528,29 @@ async def get_afritrack_all_records(
     sort_field: str = "import_date",
     sort_asc: bool = False,
 ) -> list:
-    """Return paginated Afritrack rows across all uploads."""
-    db = get_db()
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _AFRITRACK_SORT_ALLOWED,
-        default="import_date",
-        tie_break=(("period", -1), ("row_index", 1)),
-    )
-    cursor = (
-        db.imported_feeds.find(_afritrack_all_query(search, year, month, date_from, date_to))
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_afritrack_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_afritrack_all_records(search: str = "", year: int = 0, month: int = 0,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> int:
-    """Count Afritrack rows across all uploads."""
-    db = get_db()
-    return await db.imported_feeds.count_documents(_afritrack_all_query(search, year, month, date_from, date_to))
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_afritrack_all_records(search=search, year=year, month=month, date_from=date_from, date_to=date_to)
 
 
 async def get_afritrack_all_totals(search: str = "", year: int = 0, month: int = 0,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
 ) -> dict:
-    """Return row count and totals for filtered Afritrack rows."""
-    db = get_db()
-    pipeline = [
-        {"$match": _afritrack_all_query(search, year, month, date_from, date_to)},
-        {"$group": {
-            "_id": None,
-            "count": {"$sum": 1},
-            "total_tahmeed": {"$sum": _safe_double("total_tahmeed")},
-            "total_invoice": {"$sum": _safe_double("total_invoice")},
-            "total_variance": {"$sum": _safe_double("variance")},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"count": 0, "total_tahmeed": 0.0, "total_invoice": 0.0, "total_variance": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_afritrack_all_totals(search=search, year=year, month=month, date_from=date_from, date_to=date_to)
 
 
 async def get_afritrack_available_years() -> List[int]:
-    """Years present in uploaded Afritrack records."""
-    db = get_db()
-    years: set[int] = set()
-    pipeline = [
-        {"$match": {
-            "feed_type": "afritrack",
-            "import_date": {"$exists": True, "$ne": None},
-        }},
-        {"$group": {"_id": {"$year": "$import_date"}}},
-    ]
-    for doc in await db.imported_feeds.aggregate(pipeline).to_list(length=None):
-        yr = doc.get("_id")
-        if isinstance(yr, int) and 1990 <= yr <= 2100:
-            years.add(yr)
-    return sorted(years, reverse=True)
-
-
-def _afritrack_record_query(upload_id: str, search: str = "") -> dict:
-    query: dict = {"feed_type": "afritrack", "upload_id": upload_id}
-    _put_search(query, search, ("truck",), ("remarks", "period"))
-    return query
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_afritrack_available_years()
 
 
 async def get_afritrack_upload_records(
@@ -6852,62 +4561,23 @@ async def get_afritrack_upload_records(
     sort_field: str = "row_index",
     sort_asc: bool = True,
 ) -> list:
-    db = get_db()
-    sort_clauses = ledger_sort_clauses(
-        sort_field, sort_asc, _AFRITRACK_SORT_ALLOWED,
-        default="row_index", tie_break=(("import_date", 1),),
-    )
-    cursor = (
-        db.imported_feeds.find(_afritrack_record_query(upload_id, search))
-        .sort(sort_clauses)
-        .skip(skip)
-        .limit(limit)
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_afritrack_upload_records(upload_id=upload_id, search=search, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
 
 
 async def count_afritrack_upload_records(upload_id: str, search: str = "") -> int:
-    db = get_db()
-    return await db.imported_feeds.count_documents(_afritrack_record_query(upload_id, search))
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_afritrack_upload_records(upload_id=upload_id, search=search)
 
 
 async def get_afritrack_upload_totals(upload_id: str, search: str = "") -> dict:
-    db = get_db()
-    pipeline = [
-        {"$match": _afritrack_record_query(upload_id, search)},
-        {"$group": {
-            "_id": None,
-            "count": {"$sum": 1},
-            "total_tahmeed": {"$sum": _safe_double("total_tahmeed")},
-            "total_invoice": {"$sum": _safe_double("total_invoice")},
-            "total_variance": {"$sum": _safe_double("variance")},
-        }},
-    ]
-    result = await db.imported_feeds.aggregate(pipeline).to_list(1)
-    if result:
-        return result[0]
-    return {"count": 0, "total_tahmeed": 0.0, "total_invoice": 0.0, "total_variance": 0.0}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.get_afritrack_upload_totals(upload_id=upload_id, search=search)
 
 
 async def delete_afritrack_upload(upload_id: str) -> int:
-    db = get_db()
-    result = await db.imported_feeds.delete_many({"feed_type": "afritrack", "upload_id": upload_id})
-    return result.deleted_count
-
-
-async def _load_truck_overview_rows(
-    truck: str,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-) -> list:
-    master_rows, diesel_rows, imported_rows, separate_rows, extra_rows = await asyncio.gather(
-        _truck_overview_master_rows(truck, date_from, date_to),
-        _truck_overview_diesel_rows(truck, date_from, date_to),
-        _truck_overview_imported_feed_rows(truck, date_from, date_to),
-        _truck_overview_separate_rows(truck, date_from, date_to),
-        _truck_overview_extra_sidebar_rows(truck, date_from, date_to),
-    )
-    return master_rows + diesel_rows + imported_rows + separate_rows + extra_rows
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.delete_afritrack_upload(upload_id=upload_id)
 
 
 def _normalize_truck_overview_sources(
@@ -6967,6 +4637,43 @@ def _filter_truck_overview_rows(
     return filtered
 
 
+def _truck_fuel_overview_params(
+    *,
+    truck: str,
+    source: Union[str, Sequence[str], None] = "all",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    currency: str = "",
+    limit: Optional[int] = None,
+    skip: Optional[int] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    sort_field: Optional[str] = None,
+    sort_asc: Optional[bool] = None,
+) -> dict:
+    params: dict = {"truck": truck.strip()}
+    src = _csv_param(source) if source not in (None, "") else "all"
+    params["source"] = src or "all"
+    if currency:
+        params["currency"] = currency
+    if date_from is not None:
+        params["date_from"] = _iso_dt(date_from)
+    if date_to is not None:
+        params["date_to"] = _iso_dt(date_to)
+    if limit is not None:
+        params["limit"] = limit
+    if skip is not None:
+        params["skip"] = skip
+    if column_filters:
+        params["column_filters"] = json.dumps(
+            {str(k): [str(v) for v in vals] for k, vals in column_filters.items() if vals}
+        )
+    if sort_field is not None:
+        params["sort_field"] = sort_field
+    if sort_asc is not None:
+        params["sort_asc"] = "true" if sort_asc else "false"
+    return params
+
+
 async def get_truck_overview_records(
     truck: str,
     source: Union[str, Sequence[str], None] = "all",
@@ -6978,14 +4685,20 @@ async def get_truck_overview_records(
 ) -> list:
     if not truck.strip():
         return []
-    rows = _filter_truck_overview_rows(
-        await _load_truck_overview_rows(truck.strip(), date_from, date_to),
-        source=source,
-        date_from=date_from,
-        date_to=date_to,
-        currency=currency,
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/truck-overview/records",
+        params=_truck_fuel_overview_params(
+            truck=truck,
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+            currency=currency,
+            limit=limit,
+            skip=skip,
+        ),
     )
-    return rows[skip: skip + limit]
+    return [desktop_document(dict(row)) for row in (payload or [])]
 
 
 async def count_truck_overview_records(
@@ -6997,14 +4710,18 @@ async def count_truck_overview_records(
 ) -> int:
     if not truck.strip():
         return 0
-    rows = _filter_truck_overview_rows(
-        await _load_truck_overview_rows(truck.strip(), date_from, date_to),
-        source=source,
-        date_from=date_from,
-        date_to=date_to,
-        currency=currency,
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/truck-overview/records/count",
+        params=_truck_fuel_overview_params(
+            truck=truck,
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+            currency=currency,
+        ),
     )
-    return len(rows)
+    return int((payload or {}).get("count") or 0)
 
 
 def _empty_overview_summary() -> dict:
@@ -7055,14 +4772,18 @@ async def get_truck_overview_summary(
 ) -> dict:
     if not truck.strip():
         return _empty_overview_summary()
-    rows = _filter_truck_overview_rows(
-        await _load_truck_overview_rows(truck.strip(), date_from, date_to),
-        source=source,
-        date_from=date_from,
-        date_to=date_to,
-        currency=currency,
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/truck-overview/summary",
+        params=_truck_fuel_overview_params(
+            truck=truck,
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+            currency=currency,
+        ),
     )
-    return _summarize_overview_rows(rows)
+    return dict(payload or _empty_overview_summary())
 
 
 def _normalize_fuel_overview_sources(
@@ -7271,79 +4992,24 @@ async def get_fuel_overview_column_filter_cache(
     """Distinct display values per column for Excel ▾ menus (cascaded)."""
     if not truck.strip():
         return {field: set() for field in fields}
-    base_rows = _filter_fuel_overview_rows(
-        await _load_fuel_overview_rows(truck.strip(), date_from, date_to),
-        source=source,
-        date_from=date_from,
-        date_to=date_to,
-        currency=currency,
-        sort_rows=False,
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/fuel-overview/column-filters",
+        params=_truck_fuel_overview_params(
+            truck=truck,
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+            currency=currency,
+            column_filters=column_filters,
+        ),
     )
-    active = {
-        str(k): [str(v) for v in vals]
-        for k, vals in (column_filters or {}).items()
-        if vals
-    }
+    filters = (payload or {}).get("filters") or {}
     out: Dict[str, Set[str]] = {}
     for field in fields:
-        cascaded = {k: v for k, v in active.items() if k != field}
-        scoped = _apply_overview_column_filters(base_rows, cascaded or None)
-        values = {overview_row_display(row, field) for row in scoped}
-        values.discard("")
-        out[field] = values
+        raw = filters.get(field) or []
+        out[field] = {str(v) for v in raw if str(v)}
     return out
-
-
-async def _fuel_overview_diesel_cash_rows(
-    truck: str,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-) -> list:
-    """Diesel-cash transactions only — does not load the rest of Master."""
-    db = get_db()
-    diesel_items = await get_diesel_cash_item_names()
-    query = _with_date_range(
-        {
-            **_diesel_cash_verified_match(diesel_items),
-            "truck_number": _truck_exact(truck),
-        },
-        "date",
-        date_from,
-        date_to,
-    )
-    docs = await db.transactions.find(query).sort(
-        [("date", -1), ("created_at", -1)]
-    ).to_list(length=None)
-
-    rows = []
-    for doc in docs:
-        tx = Transaction.from_doc(doc)
-        rows.append(_normalized_row(
-            source_group="diesel_cash",
-            source="Diesel Cash",
-            date_value=tx.date,
-            truck_value=tx.truck_number,
-            description=tx.description or tx.item or tx.category_name or "Diesel cash",
-            reference=tx.memo or tx.do_number or tx.lpo_do or tx.category_name or "",
-            currency=tx.currency or "",
-            amount=tx.amount,
-            liters=parse_liters_from_description(tx.description or ""),
-            station=tx.ownership or "",
-            receipt_status=tx.receipt_status or "",
-        ))
-    return rows
-
-
-async def _load_fuel_overview_rows(
-    truck: str,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-) -> list:
-    cash_rows, diesel_rows = await asyncio.gather(
-        _fuel_overview_diesel_cash_rows(truck, date_from, date_to),
-        _truck_overview_diesel_rows(truck, date_from, date_to),
-    )
-    return cash_rows + diesel_rows
 
 
 async def get_fuel_overview_records(
@@ -7360,21 +5026,23 @@ async def get_fuel_overview_records(
 ) -> list:
     if not truck.strip():
         return []
-    rows = _filter_fuel_overview_rows(
-        await _load_fuel_overview_rows(truck.strip(), date_from, date_to),
-        source=source,
-        date_from=date_from,
-        date_to=date_to,
-        currency=currency,
-        sort_rows=False,
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/fuel-overview/records",
+        params=_truck_fuel_overview_params(
+            truck=truck,
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+            currency=currency,
+            limit=limit,
+            skip=skip,
+            column_filters=column_filters,
+            sort_field=sort_field,
+            sort_asc=sort_asc,
+        ),
     )
-    rows = _finalize_fuel_overview_rows(
-        rows,
-        column_filters=column_filters,
-        sort_field=sort_field,
-        sort_asc=sort_asc,
-    )
-    return rows[skip: skip + limit]
+    return [desktop_document(dict(row)) for row in (payload or [])]
 
 
 async def count_fuel_overview_records(
@@ -7389,21 +5057,21 @@ async def count_fuel_overview_records(
 ) -> int:
     if not truck.strip():
         return 0
-    rows = _filter_fuel_overview_rows(
-        await _load_fuel_overview_rows(truck.strip(), date_from, date_to),
-        source=source,
-        date_from=date_from,
-        date_to=date_to,
-        currency=currency,
-        sort_rows=False,
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/fuel-overview/records/count",
+        params=_truck_fuel_overview_params(
+            truck=truck,
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+            currency=currency,
+            column_filters=column_filters,
+            sort_field=sort_field,
+            sort_asc=sort_asc,
+        ),
     )
-    rows = _finalize_fuel_overview_rows(
-        rows,
-        column_filters=column_filters,
-        sort_field=sort_field,
-        sort_asc=sort_asc,
-    )
-    return len(rows)
+    return int((payload or {}).get("count") or 0)
 
 
 async def get_fuel_overview_summary(
@@ -7418,38 +5086,28 @@ async def get_fuel_overview_summary(
 ) -> dict:
     if not truck.strip():
         return _empty_overview_summary()
-    rows = _filter_fuel_overview_rows(
-        await _load_fuel_overview_rows(truck.strip(), date_from, date_to),
-        source=source,
-        date_from=date_from,
-        date_to=date_to,
-        currency=currency,
-        sort_rows=False,
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/fuel-overview/summary",
+        params=_truck_fuel_overview_params(
+            truck=truck,
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+            currency=currency,
+            column_filters=column_filters,
+            sort_field=sort_field,
+            sort_asc=sort_asc,
+        ),
     )
-    rows = _finalize_fuel_overview_rows(
-        rows,
-        column_filters=column_filters,
-        sort_field=sort_field,
-        sort_asc=sort_asc,
-    )
-    return _summarize_overview_rows(rows)
+    return dict(payload or _empty_overview_summary())
 
 
 # ── Skipped import rows (fleet check park-for-follow-up) ──────────────────────
 
 async def save_skipped_import_rows(docs: list) -> int:
-    """Persist rows skipped during fleet validation for later edit / re-upload."""
-    if not docs:
-        return 0
-    db = get_db()
-    now = datetime.utcnow()
-    payload = []
-    for doc in docs:
-        item = dict(doc)
-        item["skipped_at"] = now
-        payload.append(item)
-    result = await db.skipped_import_rows.insert_many(payload, ordered=False)
-    return len(result.inserted_ids)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.save_skipped_import_rows(docs=docs)
 
 
 async def list_skipped_import_rows(
@@ -7459,154 +5117,27 @@ async def list_skipped_import_rows(
     limit: int = 200,
     skip: int = 0,
 ) -> list:
-    db = get_db()
-    query: dict = {"feed_key": feed_key}
-    term = (search or "").strip()
-    if term:
-        query.update(_skipped_import_search_clause(term))
-    cursor = (
-        db.skipped_import_rows.find(query)
-        .sort([("skipped_at", -1), ("source_row", 1)])
-        .skip(max(0, skip))
-        .limit(max(1, limit))
-    )
-    return await cursor.to_list(length=limit)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.list_skipped_import_rows(feed_key=feed_key, search=search, limit=limit, skip=skip)
 
 
 async def count_skipped_import_rows(feed_key: str, search: str = "") -> int:
-    db = get_db()
-    query: dict = {"feed_key": feed_key}
-    term = (search or "").strip()
-    if term:
-        query.update(_skipped_import_search_clause(term))
-    return await db.skipped_import_rows.count_documents(query)
-
-
-def _skipped_import_search_clause(term: str) -> dict:
-    """Build ``$or`` search across parked-row metadata and nested record fields."""
-    rx = {"$regex": re.escape(term), "$options": "i"}
-    clauses: list = [
-        {"truck_value": rx},
-        {"original_truck": rx},
-        {"source_filename": rx},
-        {"sheet_label": rx},
-        {"target_upload_id": rx},
-        {"reason": rx},
-        {"record.receipt_no": rx},
-        {"record.ledger_id": rx},
-        {"record.lpo_no": rx},
-        {"record.serial": rx},
-        {"record.toll_plaza": rx},
-        {"record.vehicle_reg": rx},
-        {"record.vehicle_no": rx},
-        {"record.plate_num": rx},
-        {"record.client_name": rx},
-        {"record.cashier_name": rx},
-        {"record.description": rx},
-        {"record.transaction_details": rx},
-    ]
-    if term.isdigit():
-        clauses.append({"source_row": int(term)})
-    return {"$or": clauses}
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_skipped_import_rows(feed_key=feed_key, search=search)
 
 
 async def update_skipped_import_truck(doc_id: str, truck_value: str) -> bool:
-    """Update the parked truck value (and nested record field) before re-upload."""
-    from bson import ObjectId
-
-    db = get_db()
-    try:
-        oid = ObjectId(doc_id)
-    except Exception:
-        return False
-    doc = await db.skipped_import_rows.find_one({"_id": oid})
-    if not doc:
-        return False
-    field = doc.get("truck_field") or "truck_no"
-    record = dict(doc.get("record") or {})
-    record[field] = truck_value
-    result = await db.skipped_import_rows.update_one(
-        {"_id": oid},
-        {"$set": {"truck_value": truck_value, "record": record}},
-    )
-    return result.modified_count > 0 or result.matched_count > 0
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.update_skipped_import_truck(doc_id=doc_id, truck_value=truck_value)
 
 
 async def delete_skipped_import_rows(ids: list[str]) -> int:
-    from bson import ObjectId
-
-    db = get_db()
-    oids = []
-    for raw in ids:
-        try:
-            oids.append(ObjectId(raw))
-        except Exception:
-            continue
-    if not oids:
-        return 0
-    result = await db.skipped_import_rows.delete_many({"_id": {"$in": oids}})
-    return int(result.deleted_count)
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.delete_skipped_import_rows(ids=ids)
 
 
 async def reupload_skipped_import_rows(ids: list[str]) -> int:
-    """Insert parked records into their original upload batch, then delete skips.
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.reupload_skipped_import_rows(ids=ids)
 
-    Uses each doc's ``target_upload_id`` and ``save_target`` so rows join the
-    upload they were skipped from (not a new batch).
 
-    Each inserted feed/expense doc carries ``skipped_row_id`` so a retry after a
-    crash cannot duplicate rows (unique sparse index).
-    """
-    from bson import ObjectId
-
-    from tahmeed.db.import_idempotency import ensure_import_indexes
-
-    db = get_db()
-    await ensure_import_indexes()
-    oids = []
-    for raw in ids:
-        try:
-            oids.append(ObjectId(raw))
-        except Exception:
-            continue
-    if not oids:
-        return 0
-    docs = await db.skipped_import_rows.find({"_id": {"$in": oids}}).to_list(length=None)
-    if not docs:
-        return 0
-
-    feed_records: dict[str, list] = {}
-    for doc in docs:
-        rec = dict(doc.get("record") or {})
-        rec.pop("_raw", None)
-        upload_id = doc.get("target_upload_id") or rec.get("upload_id") or ""
-        rec["upload_id"] = upload_id
-        rec["skipped_row_id"] = str(doc["_id"])
-        if doc.get("source_filename") and not rec.get("source_filename"):
-            rec["source_filename"] = doc["source_filename"]
-        if doc.get("sheet_label") and not rec.get("sheet_label"):
-            rec["sheet_label"] = doc["sheet_label"]
-        field = doc.get("truck_field")
-        if field:
-            rec[field] = doc.get("truck_value") or rec.get(field, "")
-        feed_key = doc.get("feed_key") or ""
-        feed_records.setdefault(feed_key, []).append(rec)
-
-    saved = 0
-    for feed_key, records in feed_records.items():
-        if feed_key == "congo_expenses":
-            saved += await save_congo_import(records)
-        elif feed_key == "ahmed_kimvi":
-            saved += await save_kimvi_import(records)
-        elif feed_key in ("rpa_schedule", "bonds", "sm_burhani"):
-            from tahmeed.models.reconciliation import ReconciliationEntry
-            from tahmeed.services.reconciliation_service import save_reconciliation_rows
-
-            saved += await save_reconciliation_rows(
-                [ReconciliationEntry.from_doc(rec) for rec in records]
-            )
-        else:
-            saved += await save_imported_feed(records)
-
-    await db.skipped_import_rows.delete_many({"_id": {"$in": oids}})
-    return saved

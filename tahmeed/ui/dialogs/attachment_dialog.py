@@ -15,7 +15,10 @@ from PySide6.QtWidgets import (
 )
 
 from tahmeed.services.attachment_service import (
-    add_attachment, get_attachments, remove_attachment, resolve_attachment_path,
+    add_attachment,
+    ensure_attachment_local,
+    get_attachments,
+    remove_attachment,
 )
 
 
@@ -132,11 +135,19 @@ class AttachmentDialog(QDialog):
         if not meta:
             QMessageBox.information(self, "Attachments", "Select a file first.")
             return
-        path = resolve_attachment_path(self._tx_id, meta)
+        asyncio.ensure_future(self._do_open(meta))
+
+    async def _do_open(self, meta: dict) -> None:
+        try:
+            path = await ensure_attachment_local(self._tx_id, meta)
+        except Exception as exc:
+            QMessageBox.warning(self, "Open failed", str(exc))
+            return
         if path is None:
             QMessageBox.warning(
-                self, "Missing file",
-                "The file is recorded but missing on this computer.",
+                self,
+                "Missing file",
+                "The file could not be downloaded from the server.",
             )
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))

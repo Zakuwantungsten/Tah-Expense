@@ -1,18 +1,15 @@
-"""Import QuickBooks Chart of Accounts into the Items (categories) collection."""
+"""Import QuickBooks Chart of Accounts into Items (categories) via the API.
+
+Excel parsing stays on the desktop; wipe + insert runs on
+``POST /v1/imports/chart-of-accounts``.
+"""
 
 from pathlib import Path
 from typing import List
 
 import openpyxl
 
-from tahmeed.db.connection import get_db
-from tahmeed.models.category import Category
-from tahmeed.services.description_mapping_service import delete_all_mappings
-
-_PALETTE = [
-    "#4A90D9", "#16A34A", "#D97706", "#7C3AED", "#DC2626",
-    "#0891B2", "#DB2777", "#65A30D", "#EA580C", "#6366F1",
-]
+from tahmeed.services.api_client import api_client
 
 
 def _cell_str(val) -> str:
@@ -54,77 +51,34 @@ async def import_chart_of_accounts(
     *,
     replace_existing: bool = True,
 ) -> dict:
-    """Load all Chart of Accounts rows into ``categories`` (Items tab).
+    """Load Chart of Accounts rows into ``categories`` (Items tab) via the API.
 
-    When ``replace_existing`` is True (default), all existing items, sub-items,
-    keyword rules, and description mappings are removed first.
-
-    Category / subtable / keyword wipe + insert run in one Mongo transaction
-    when the server supports it (replica set). Description mappings are cleared
-    via the API after the Mongo replace succeeds.
+    When ``replace_existing`` is True (default), the server removes existing
+    items, sub-items, keyword rules, and description mappings first.
     """
-    from tahmeed.db.mongo_txn import run_in_transaction, session_kwargs
-
     parsed = _parse_chart_of_accounts(path)
     if not parsed:
         raise ValueError("No accounts found in the Chart of Accounts file.")
 
-    db = get_db()
-    removed = {"categories": 0, "subtables": 0, "keyword_rules": 0, "mappings": 0}
-
-    docs = []
-    for i, row in enumerate(parsed):
-        cat = Category(
-            name=row["name"],
-            description=row["coa_description"],
-            color=_PALETTE[i % len(_PALETTE)],
-            sort_order=i,
-            account_type=row["account_type"],
-            ref_num=row["ref_num"],
-            account_number=row["account_number"],
-            currency=row["currency"],
-            coa_description=row["coa_description"],
-            show_in_sidebar=False,
-            show_in_cashier_sidebar=False,
-            requires_truck=False,
-            requires_receipt=False,
-        )
-        docs.append(cat.to_doc())
-
-    async def _replace(session):
-        kw = session_kwargs(session)
-        local_removed = {"categories": 0, "subtables": 0, "keyword_rules": 0}
-        if replace_existing:
-            r = await db.categories.delete_many({}, **kw)
-            local_removed["categories"] = r.deleted_count
-            r = await db.category_subtables.delete_many({}, **kw)
-            local_removed["subtables"] = r.deleted_count
-            r = await db.keyword_rules.delete_many({}, **kw)
-            local_removed["keyword_rules"] = r.deleted_count
-        if docs:
-            await db.categories.insert_many(docs, **kw)
-        return local_removed
-
-    mongo_removed = await run_in_transaction(_replace)
-    removed.update(mongo_removed)
-
-    if replace_existing:
-        # After Mongo catalog is replaced — clear mappings (API path).
-        removed["mappings"] = await delete_all_mappings()
-
-    result = {
-        "imported": len(docs),
-        "removed": removed,
-        "source": str(path),
-    }
-    try:
-        from tahmeed.services.audit_service import record_event
-
-        await record_event(
-            "coa.replace",
-            entity_type="category",
-            details=result,
-        )
-    except Exception:
-        pass
+    payload = await api_client.request(
+        "POST",
+        "v1/imports/chart-of-accounts",
+        json={
+            "rows": parsed,
+            "replace_existing": bool(replace_existing),
+            "source_filename": Path(path).name,
+        },
+    )
+    result = dict(payload or {})
+    result.setdefault("imported", 0)
+    result.setdefault(
+        "removed",
+        {
+            "categories": 0,
+            "subtables": 0,
+            "keyword_rules": 0,
+            "mappings": 0,
+        },
+    )
+    result["source"] = str(path)
     return result

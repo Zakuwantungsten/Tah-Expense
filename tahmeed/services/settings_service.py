@@ -1,6 +1,8 @@
 from typing import Any
-from tahmeed.db.connection import get_db
 
+from tahmeed.services.api_client import ApiError, api_client
+
+# Keep in sync with backend.app.api.SETTINGS_DEFAULTS
 DEFAULTS = {
     "default_currency": "TZS",
     "confidence_threshold": 75,  # percent — below this goes to review queue
@@ -33,24 +35,22 @@ DEFAULTS = {
 
 
 async def get_setting(key: str) -> Any:
-    db = get_db()
-    doc = await db.system_settings.find_one({"key": key})
-    return doc["value"] if doc else DEFAULTS.get(key)
+    try:
+        payload = await api_client.request("GET", f"v1/settings/{key}")
+    except ApiError as exc:
+        if exc.status_code == 404:
+            return DEFAULTS.get(key)
+        raise
+    return payload.get("value", DEFAULTS.get(key))
 
 
 async def set_setting(key: str, value: Any) -> None:
-    db = get_db()
-    await db.system_settings.update_one(
-        {"key": key},
-        {"$set": {"key": key, "value": value}},
-        upsert=True,
-    )
+    await api_client.request("PUT", f"v1/settings/{key}", json={"value": value})
 
 
 async def get_all_settings() -> dict:
-    db = get_db()
-    cursor = db.system_settings.find({})
-    docs = await cursor.to_list(length=None)
+    payload = await api_client.request("GET", "v1/settings")
     result = dict(DEFAULTS)
-    result.update({d["key"]: d["value"] for d in docs})
+    if isinstance(payload, dict):
+        result.update(payload)
     return result

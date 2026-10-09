@@ -1,72 +1,21 @@
 import asyncio
-import re
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import List, Optional
 from bson import ObjectId
 
-from tahmeed.db.connection import get_db
 from tahmeed.models.transaction import Transaction
-
-# Effective register day for Simple day-transaction grouping.
-_REGISTER_DAY_EXPR = {"$ifNull": ["$import_primary_date", "$date"]}
-
-
-def _day_bounds(target_date: date) -> tuple:
-    start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
-    end = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
-    return start, end
+from tahmeed.services.api_client import ApiError, api_client
+from tahmeed.services.api_models import desktop_document, jsonable_document
 
 
-def _register_day_clause(target_date: date) -> dict:
-    """Match rows that belong on this register calendar day.
-
-    Daily-import rows are owned by ``import_primary_date`` even when their
-    Excel ``date`` is earlier. Manual/legacy rows without a primary date use
-    Excel ``date``. Prior-day Excel rows filed under another register day are
-    excluded from this day.
-    """
-    start, end = _day_bounds(target_date)
-    return {
-        "$or": [
-            {"import_primary_date": {"$gte": start, "$lte": end}},
-            {
-                "$and": [
-                    {"date": {"$gte": start, "$lte": end}},
-                    {"import_primary_date": None},
-                ]
-            },
-        ]
-    }
+def _tx_from_api(document: dict) -> Transaction:
+    return Transaction.from_doc(desktop_document(document))
 
 
-def _register_day_range_clause(
-    date_from: date = None,
-    date_to: date = None,
-) -> dict:
-    """Match rows whose effective register day falls in the browse window."""
-    primary: dict = {}
-    excel: dict = {}
-    if date_from:
-        start = datetime(date_from.year, date_from.month, date_from.day, 0, 0, 0)
-        primary["$gte"] = start
-        excel["$gte"] = start
-    if date_to:
-        end = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59)
-        primary["$lte"] = end
-        excel["$lte"] = end
-    if not primary:
-        return {}
-    return {
-        "$or": [
-            {"import_primary_date": primary},
-            {
-                "$and": [
-                    {"date": excel},
-                    {"import_primary_date": None},
-                ]
-            },
-        ]
-    }
+def _tx_create_body(tx: Transaction) -> dict:
+    doc = tx.to_doc()
+    doc.pop("_id", None)
+    return jsonable_document(doc)
 
 
 async def get_transactions_by_date(
@@ -85,29 +34,14 @@ async def get_transactions_by_date(
     Otherwise ``cashier_id`` scopes to one user when provided.
     Sorted by ``day_order`` then ``created_at``.
     """
-    db = get_db()
-    query: dict = {
-        **_register_day_clause(target_date),
-        "rejected": {"$ne": True},
-        "deletion_requested": {"$ne": True},
-        "trashed": {"$ne": True},
+    params: dict = {
+        "date": target_date.isoformat(),
+        "merged": "true" if merged else "false",
     }
     if not merged and cashier_id is not None:
-        query["cashier_id"] = cashier_id
-    cursor = db.transactions.find(query).sort(
-        [("day_order", 1), ("created_at", 1)]
-    )
-    docs = await cursor.to_list(length=None)
-    # Prefer open pending-edit clones over their master originals so the
-    # register does not show both after a verified row was edited.
-    pending_original_ids = {
-        d.get("original_transaction_id")
-        for d in docs
-        if d.get("original_transaction_id") and not d.get("verified")
-    }
-    if pending_original_ids:
-        docs = [d for d in docs if d.get("_id") not in pending_original_ids]
-    return [Transaction.from_doc(d) for d in docs]
+        params["cashier_id"] = str(cashier_id)
+    payload = await api_client.request("GET", "v1/transactions/by-date", params=params)
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def submit_day_for_verify(target_date: date) -> int:
@@ -116,58 +50,47 @@ async def submit_day_for_verify(target_date: date) -> int:
     Includes daily-import rows filed under this register day via
     ``import_primary_date``. Returns the number of documents updated.
     """
-    db = get_db()
-    result = await db.transactions.update_many(
-        {
-            "$and": [
-                _register_day_clause(target_date),
-                {"verified": {"$ne": True}},
-                {"rejected": {"$ne": True}},
-                {"discarded": {"$ne": True}},
-                {"$or": [
-                    {"register_status": "draft"},
-                    {"register_status": {"$exists": False}},
-                ]},
-            ],
-        },
-        {"$set": {"register_status": "submitted"}},
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/submit-day",
+        json={"date": target_date.isoformat()},
     )
-    return int(result.modified_count)
+    return int(payload.get("updated") or 0)
 
 
 async def recount_day_order(target_date: date, ordered_ids: List[ObjectId]) -> None:
     """Persist ``day_order`` = index for each id in *ordered_ids*."""
     if not ordered_ids:
         return
-    db = get_db()
-    ops = []
-    from pymongo import UpdateOne
-    for i, oid in enumerate(ordered_ids):
-        ops.append(UpdateOne({"_id": oid}, {"$set": {"day_order": i}}))
-    if ops:
-        await db.transactions.bulk_write(ops, ordered=False)
+    await api_client.request(
+        "POST",
+        "v1/transactions/day-order",
+        json={
+            "date": target_date.isoformat(),
+            "ordered_ids": [str(oid) for oid in ordered_ids],
+        },
+    )
 
 
 async def next_day_order(target_date: date) -> int:
     """Next ``day_order`` for *target_date* (append after every cashier's rows)."""
-    db = get_db()
-    docs = await db.transactions.aggregate([
-        {"$match": _register_day_clause(target_date)},
-        {"$group": {"_id": None, "mx": {"$max": "$day_order"}}},
-    ]).to_list(1)
-    mx = docs[0].get("mx") if docs else None
-    if mx is None:
-        return 0
+    payload = await api_client.request(
+        "GET",
+        "v1/transactions/next-day-order",
+        params={"date": target_date.isoformat()},
+    )
     try:
-        return int(mx) + 1
+        return int(payload.get("next") or 0)
     except (TypeError, ValueError):
         return 0
 
 
 async def save_transaction(tx: Transaction) -> Transaction:
-    db = get_db()
-    result = await db.transactions.insert_one(tx.to_doc())
-    tx._id = result.inserted_id
+    payload = await api_client.request(
+        "POST", "v1/transactions", json=_tx_create_body(tx)
+    )
+    saved = _tx_from_api(payload)
+    tx._id = saved._id
     try:
         from tahmeed.services.audit_service import record_event
 
@@ -184,7 +107,7 @@ async def save_transaction(tx: Transaction) -> Transaction:
         )
     except Exception:
         pass
-    return tx
+    return saved
 
 
 async def update_transaction(tx_id: ObjectId, updates: dict) -> bool:
@@ -192,32 +115,35 @@ async def update_transaction(tx_id: ObjectId, updates: dict) -> bool:
     Save action when committing edits to already-saved rows. The caller is
     responsible for building `updates` from the edited cell values (excluding
     immutable / accountant-managed fields)."""
-    db = get_db()
-    result = await db.transactions.update_one(
-        {"_id": tx_id},
-        {"$set": updates},
-    )
-    if result.modified_count == 1:
-        try:
-            from tahmeed.services.audit_service import record_event
+    try:
+        await api_client.request(
+            "PATCH",
+            f"v1/transactions/{tx_id}",
+            json={"values": jsonable_document(dict(updates))},
+        )
+    except ApiError as exc:
+        if exc.status_code == 404:
+            return False
+        raise
+    try:
+        from tahmeed.services.audit_service import record_event
 
-            await record_event(
-                "txn.update",
-                actor_id=updates.get("last_edited_by"),
-                entity_type="transaction",
-                entity_ids=[tx_id],
-                details={"fields": sorted(str(k) for k in updates.keys())},
-            )
-        except Exception:
-            pass
-    return result.modified_count == 1
+        await record_event(
+            "txn.update",
+            actor_id=updates.get("last_edited_by"),
+            entity_type="transaction",
+            entity_ids=[tx_id],
+            details={"fields": sorted(str(k) for k in updates.keys())},
+        )
+    except Exception:
+        pass
+    return True
 
 
 async def delete_transaction(tx_id: ObjectId) -> None:
     """Hard-delete a transaction by id (no status guards). Prefer
     ``request_or_delete_transaction`` from the cashier register UI."""
-    db = get_db()
-    await db.transactions.delete_one({"_id": tx_id})
+    await api_client.request("DELETE", f"v1/transactions/{tx_id}")
 
 
 async def request_or_delete_transaction(
@@ -231,25 +157,18 @@ async def request_or_delete_transaction(
       - ``"deletion_requested"`` — approved row flagged for accountant confirm
       - ``"not_found"`` — no matching document
     """
-    db = get_db()
-    doc = await db.transactions.find_one({"_id": tx_id})
-    if not doc:
-        return "not_found"
-
-    is_pending_edit = bool(doc.get("original_transaction_id")) and not doc.get("verified")
-    if is_pending_edit or not doc.get("verified"):
-        await db.transactions.delete_one({"_id": tx_id})
-        return "deleted"
-
-    await db.transactions.update_one(
-        {"_id": tx_id},
-        {"$set": {
-            "deletion_requested": True,
-            "deletion_requested_at": datetime.utcnow(),
-            "deletion_requested_by": cashier_id or doc.get("cashier_id"),
-        }},
+    body: dict = {}
+    if cashier_id is not None:
+        body["cashier_id"] = str(cashier_id)
+    payload = await api_client.request(
+        "POST",
+        f"v1/transactions/{tx_id}/request-delete",
+        json=body,
     )
-    return "deletion_requested"
+    result = str(payload.get("result") or "not_found")
+    if result in {"deleted", "deletion_requested", "not_found"}:
+        return result
+    return "not_found"
 
 
 async def search_transactions(
@@ -259,77 +178,69 @@ async def search_transactions(
     truck: str = "",
     limit: int = 500,
 ) -> List[Transaction]:
-    db = get_db()
-    query: dict = {
-        "trashed": {"$ne": True},
-        "deletion_requested": {"$ne": True},
-    }
-    if date_from or date_to:
-        date_filter: dict = {}
-        if date_from:
-            date_filter["$gte"] = datetime(date_from.year, date_from.month, date_from.day)
-        if date_to:
-            date_filter["$lte"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59)
-        query["date"] = date_filter
+    params: dict = {"limit": limit}
+    if date_from:
+        params["date_from"] = date_from.isoformat()
+    if date_to:
+        params["date_to"] = date_to.isoformat()
     if keyword.strip():
-        query["description"] = {"$regex": re.escape(keyword.strip()), "$options": "i"}
+        params["keyword"] = keyword.strip()
     if truck.strip():
-        query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
-    cursor = db.transactions.find(query).sort([("date", -1), ("created_at", -1)]).limit(limit)
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+        params["truck"] = truck.strip()
+    payload = await api_client.request("GET", "v1/transactions/search", params=params)
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def get_overview_stats() -> dict:
     """Aggregate today stats, this-month stats, and recent 8 transactions."""
-    db = get_db()
-    today = date.today()
-
-    today_start = datetime(today.year, today.month, today.day)
-    today_end   = datetime(today.year, today.month, today.day, 23, 59, 59)
-    month_start = datetime(today.year, today.month, 1)
-
-    def _money_group(match: dict) -> list:
-        return [
-            {"$match": match},
-            {"$group": {
-                "_id": None,
-                "count":            {"$sum": 1},
-                "tzs_total":        {"$sum": "$amount"},
-                "receipt_received": {"$sum": {"$cond": [{"$eq": ["$receipt_status", "received"]}, 1, 0]}},
-                "receipt_pending":  {"$sum": {"$cond": [{"$eq": ["$receipt_status", "pending"]},  1, 0]}},
-                "receipt_missing":  {"$sum": {"$cond": [{"$eq": ["$receipt_status", "missing"]},  1, 0]}},
-                "unverified":       {"$sum": {"$cond": [{"$eq": ["$verified", False]}, 1, 0]}},
-            }},
-        ]
-
-    today_res, month_res, recent_docs = await asyncio.gather(
-        db.transactions.aggregate(_money_group({"date": {"$gte": today_start, "$lte": today_end}})).to_list(1),
-        db.transactions.aggregate(_money_group({"date": {"$gte": month_start}})).to_list(1),
-        db.transactions.find({}).sort([("date", -1), ("created_at", -1)]).limit(8).to_list(8),
-    )
-
-    _empty = {"count": 0, "tzs_total": 0.0,
-              "receipt_received": 0, "receipt_pending": 0, "receipt_missing": 0, "unverified": 0}
+    payload = await api_client.request("GET", "v1/transactions/overview-stats")
+    recent = [_tx_from_api(doc) for doc in payload.get("recent") or []]
+    _empty = {
+        "count": 0,
+        "tzs_total": 0.0,
+        "receipt_received": 0,
+        "receipt_pending": 0,
+        "receipt_missing": 0,
+        "unverified": 0,
+    }
     return {
-        "today":  today_res[0]  if today_res  else _empty,
-        "month":  month_res[0]  if month_res  else _empty,
-        "recent": [Transaction.from_doc(d) for d in recent_docs],
+        "today": payload.get("today") or _empty,
+        "month": payload.get("month") or _empty,
+        "recent": recent,
     }
 
 
 async def get_transactions_by_category(
     cashier_id, category_name: str, description: str = "", limit: int = 500
 ) -> List[Transaction]:
-    db = get_db()
-    query: dict = {"category_name": category_name}
+    params: dict = {"category_name": category_name, "limit": limit}
     if cashier_id is not None:
-        query["cashier_id"] = cashier_id
+        params["cashier_id"] = str(cashier_id)
     if description.strip():
-        query["description"] = {"$regex": re.escape(description.strip()), "$options": "i"}
-    cursor = db.transactions.find(query).sort([("date", -1), ("created_at", -1)]).limit(limit)
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+        params["description"] = description.strip()
+    payload = await api_client.request(
+        "GET", "v1/transactions/by-category", params=params
+    )
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
+
+
+def _csv_param(value) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(v).strip() for v in value if str(v).strip())
+    return str(value).strip()
+
+
+def _parse_summary_date(raw) -> date:
+    if isinstance(raw, date) and not isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, datetime):
+        return raw.date()
+    text = str(raw or "").strip()
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    return date.fromisoformat(text)
 
 
 async def get_daily_summaries(
@@ -356,155 +267,39 @@ async def get_daily_summaries(
     ``category_name`` / ``descriptions`` accept a string or list (multi-select).
     ``sub_item_match`` is kept for backward compatibility (maps into descriptions).
     """
-    db = get_db()
     desc_filter = descriptions if descriptions not in ("", None, []) else sub_item_match
-    uid = (daily_import_id or "").strip()
-    # Date window is applied via register-day clause below (not Excel date alone).
-    match = _browse_match(
-        date_from=date_from if uid else None,
-        date_to=date_to if uid else None,
-        keyword=keyword,
-        truck=truck,
-        category_name=category_name,
-        descriptions=desc_filter,
-        daily_import_id=daily_import_id,
-    )
-    if not uid and (date_from or date_to):
-        range_clause = _register_day_range_clause(date_from, date_to)
-        if range_clause:
-            if "$and" in match:
-                match["$and"] = [range_clause, *match["$and"]]
-            elif match:
-                match = {"$and": [range_clause, match]}
-            else:
-                match = range_clause
-
-    pipeline = [
-        {"$match": match},
-        {"$group": {
-            "_id": {
-                "year":  {"$year":  _REGISTER_DAY_EXPR},
-                "month": {"$month": _REGISTER_DAY_EXPR},
-                "day":   {"$dayOfMonth": _REGISTER_DAY_EXPR},
-            },
-            "entries_count": {"$sum": 1},
-            "total_tzs":     {"$sum": "$amount"},
-            "total_refund":  {"$sum": {
-                "$cond": [{"$eq": ["$notes_flag", True]}, "$amount", 0]
-            }},
-            "cashier_ids": {"$addToSet": "$cashier_id"},
-            "draft_count": {"$sum": {
-                "$cond": [{"$eq": ["$register_status", "draft"]}, 1, 0]
-            }},
-            "submitted_count": {"$sum": {
-                "$cond": [
-                    {"$or": [
-                        {"$eq": ["$register_status", "submitted"]},
-                        {"$eq": [{"$type": "$register_status"}, "missing"]},
-                    ]},
-                    1,
-                    0,
-                ]
-            }},
-        }},
-        {"$sort": {"_id.year": -1, "_id.month": -1, "_id.day": -1}},
-        {"$limit": limit},
-    ]
-    cursor = db.transactions.aggregate(pipeline)
-    docs = await cursor.to_list(length=limit)
-    result = []
-    for d in docs:
-        g = d["_id"]
-        cashier_ids = [cid for cid in (d.get("cashier_ids") or []) if cid is not None]
-        result.append({
-            "date":             date(g["year"], g["month"], g["day"]),
-            "entries_count":    d["entries_count"],
-            "total_tzs":        d["total_tzs"],
-            "total_refund":     d["total_refund"],
-            "cashier_ids":      cashier_ids,
-            "draft_count":      int(d.get("draft_count") or 0),
-            "submitted_count":  int(d.get("submitted_count") or 0),
-        })
-    return result
-
-
-def _normalize_multi_filter(value) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        s = value.strip()
-        return [s] if s else []
-    out: List[str] = []
-    for v in value:
-        s = str(v).strip()
-        if s:
-            out.append(s)
-    return out
-
-
-def _browse_match(
-    *,
-    date_from: date = None,
-    date_to: date = None,
-    keyword: str = "",
-    truck: str = "",
-    category_name="",
-    descriptions="",
-    daily_import_id: str = "",
-) -> dict:
-    """Shared match clause for browse list / distinct-option queries."""
-    match: dict = {}
-    and_clauses: list = []
-
-    uid = (daily_import_id or "").strip()
-    if uid:
-        # Whole upload — do not also clip by Excel date range.
-        match["daily_import_id"] = uid
-    elif date_from or date_to:
-        date_filter: dict = {}
-        if date_from:
-            date_filter["$gte"] = datetime(date_from.year, date_from.month, date_from.day)
-        if date_to:
-            date_filter["$lte"] = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59)
-        match["date"] = date_filter
-
-    cats = _normalize_multi_filter(category_name)
-    if cats:
-        cat_ors: list = []
-        for c in cats:
-            esc = re.escape(c)
-            cat_ors.append({"category_name": {"$regex": f"^{esc}$", "$options": "i"}})
-            cat_ors.append({"item": {"$regex": f"^{esc}$", "$options": "i"}})
-        and_clauses.append({"$or": cat_ors})
-
-    descs = _normalize_multi_filter(descriptions)
-    if descs:
-        if isinstance(descriptions, str):
-            and_clauses.append({
-                "description": {
-                    "$regex": re.escape(descs[0]),
-                    "$options": "i",
-                },
-            })
-        else:
-            and_clauses.append({"$or": [
-                {"description": {"$regex": f"^{re.escape(d)}$", "$options": "i"}}
-                for d in descs
-            ]})
-    elif keyword.strip():
-        kw_re = {"$regex": re.escape(keyword.strip()), "$options": "i"}
-        and_clauses.append({"$or": [
-            {"description":  kw_re},
-            {"truck_number": kw_re},
-            {"memo":         kw_re},
-        ]})
-
+    params: dict = {"limit": limit}
+    if date_from:
+        params["date_from"] = date_from.isoformat()
+    if date_to:
+        params["date_to"] = date_to.isoformat()
+    if keyword.strip():
+        params["keyword"] = keyword.strip()
     if truck.strip():
-        match["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
-
-    if and_clauses:
-        match["$and"] = and_clauses
-    return match
+        params["truck"] = truck.strip()
+    cat = _csv_param(category_name)
+    if cat:
+        params["category_name"] = cat
+    desc = _csv_param(desc_filter)
+    if desc:
+        params["descriptions"] = desc
+    if daily_import_id:
+        params["daily_import_id"] = str(daily_import_id).strip()
+    payload = await api_client.request(
+        "GET", "v1/transactions/daily-summaries", params=params
+    )
+    result = []
+    for row in payload.get("items") or []:
+        item = dict(row)
+        item["date"] = _parse_summary_date(item.get("date"))
+        cashier_ids = []
+        for cid in item.get("cashier_ids") or []:
+            if cid is None:
+                continue
+            cashier_ids.append(ObjectId(str(cid)) if ObjectId.is_valid(str(cid)) else cid)
+        item["cashier_ids"] = cashier_ids
+        result.append(item)
+    return result
 
 
 async def get_transactions_flat(
@@ -518,19 +313,26 @@ async def get_transactions_flat(
     limit: int = 1000,
 ) -> List[Transaction]:
     """Return individual transactions matching all supplied filters."""
-    db = get_db()
     desc_filter = descriptions if descriptions not in ("", None, []) else sub_item_match
-    match = _browse_match(
-        date_from=date_from,
-        date_to=date_to,
-        keyword=keyword,
-        category_name=category_name,
-        descriptions=desc_filter,
-        daily_import_id=daily_import_id,
-    )
-    cursor = db.transactions.find(match).sort([("date", -1), ("created_at", -1)]).limit(limit)
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    params: dict = {"limit": limit}
+    if date_from:
+        params["date_from"] = date_from.isoformat()
+    if date_to:
+        params["date_to"] = date_to.isoformat()
+    if keyword.strip():
+        params["keyword"] = keyword.strip()
+    if daily_import_id:
+        params["daily_import_id"] = str(daily_import_id).strip()
+    if isinstance(category_name, (list, tuple)):
+        params["category_name"] = ",".join(str(v) for v in category_name if str(v).strip())
+    elif category_name:
+        params["category_name"] = str(category_name)
+    if isinstance(desc_filter, (list, tuple)):
+        params["descriptions"] = ",".join(str(v) for v in desc_filter if str(v).strip())
+    elif desc_filter:
+        params["descriptions"] = str(desc_filter)
+    payload = await api_client.request("GET", "v1/transactions/flat", params=params)
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def get_browse_items(
@@ -539,16 +341,18 @@ async def get_browse_items(
     descriptions=None,
 ) -> List[str]:
     """Distinct item / category names in the browse date window (cascading)."""
-    db = get_db()
-    match = _browse_match(
-        date_from=date_from,
-        date_to=date_to,
-        descriptions=descriptions or [],
+    params: dict = {}
+    if date_from:
+        params["date_from"] = date_from.isoformat()
+    if date_to:
+        params["date_to"] = date_to.isoformat()
+    desc = _csv_param(descriptions)
+    if desc:
+        params["descriptions"] = desc
+    payload = await api_client.request(
+        "GET", "v1/transactions/browse/items", params=params
     )
-    items = await db.transactions.distinct("item", match)
-    cats = await db.transactions.distinct("category_name", match)
-    names = {*(v for v in items if v), *(v for v in cats if v)}
-    return sorted(names, key=str.lower)
+    return list(payload.get("items") or [])
 
 
 async def get_browse_descriptions(
@@ -557,46 +361,34 @@ async def get_browse_descriptions(
     category_name=None,
 ) -> List[str]:
     """Distinct descriptions in the browse date window (cascading by items)."""
-    db = get_db()
-    match = _browse_match(
-        date_from=date_from,
-        date_to=date_to,
-        category_name=category_name or [],
+    params: dict = {}
+    if date_from:
+        params["date_from"] = date_from.isoformat()
+    if date_to:
+        params["date_to"] = date_to.isoformat()
+    cat = _csv_param(category_name)
+    if cat:
+        params["category_name"] = cat
+    payload = await api_client.request(
+        "GET", "v1/transactions/browse/descriptions", params=params
     )
-    vals = await db.transactions.distinct("description", match)
-    return sorted((v for v in vals if v), key=str.lower)
+    return list(payload.get("items") or [])
 
 
 async def get_available_months() -> list:
     """Return (year, month) tuples for every month that has transactions, newest first."""
-    db = get_db()
-    pipeline = [
-        {"$group": {
-            "_id": {
-                "year":  {"$year":  "$date"},
-                "month": {"$month": "$date"},
-            }
-        }},
-        {"$sort": {"_id.year": -1, "_id.month": -1}},
+    payload = await api_client.request("GET", "v1/transactions/meta/months")
+    return [
+        (int(row["year"]), int(row["month"]))
+        for row in payload.get("items") or []
+        if row.get("year") is not None and row.get("month") is not None
     ]
-    docs = await db.transactions.aggregate(pipeline).to_list(length=None)
-    return [(d["_id"]["year"], d["_id"]["month"]) for d in docs]
 
 
 async def get_available_years() -> list:
     """Calendar years that have transactions, newest first (always includes recent years)."""
-    db = get_db()
-    pipeline = [
-        {"$group": {"_id": {"$year": "$date"}}},
-        {"$sort": {"_id": -1}},
-    ]
-    docs = await db.transactions.aggregate(pipeline).to_list(length=40)
-    years = [int(d["_id"]) for d in docs if d.get("_id") is not None]
-    today_y = date.today().year
-    for y in (today_y + 1, today_y, today_y - 1):
-        if y not in years:
-            years.append(y)
-    return sorted(set(years), reverse=True)
+    payload = await api_client.request("GET", "v1/transactions/meta/years")
+    return [int(year) for year in payload.get("items") or []]
 
 
 # In-memory description history for Excel-style autocomplete across all days.
@@ -626,27 +418,17 @@ async def ensure_description_cache() -> List[str]:
     async with _desc_lock:
         if _desc_ranked is not None:
             return _desc_ranked
-        db = get_db()
-        pipeline = [
-            {"$match": {"description": {"$type": "string", "$ne": ""}}},
-            {"$group": {
-                "_id": {"$toUpper": "$description"},
-                "n": {"$sum": 1},
-            }},
-            {"$sort": {"n": -1, "_id": 1}},
-            {"$limit": _DESC_CACHE_LIMIT},
-        ]
-        docs = await db.transactions.aggregate(pipeline).to_list(
-            length=_DESC_CACHE_LIMIT
+        payload = await api_client.request(
+            "GET",
+            "v1/transactions/descriptions",
+            params={"prefix": "", "limit": _DESC_CACHE_LIMIT},
         )
-        counts: dict = {}
-        ranked: list = []
-        for doc in docs:
-            name = str(doc.get("_id") or "").strip()
-            if not name:
-                continue
-            counts[name] = int(doc.get("n") or 0)
-            ranked.append(name)
+        ranked = [
+            str(name).strip()
+            for name in payload.get("items") or []
+            if str(name).strip()
+        ]
+        counts = {name: max(_DESC_CACHE_LIMIT - index, 1) for index, name in enumerate(ranked)}
         _desc_counts = counts
         _desc_ranked = ranked
         return _desc_ranked
@@ -694,8 +476,15 @@ async def search_descriptions(prefix: str, limit: int = 12) -> List[str]:
     """
     if not prefix.strip():
         return []
-    await ensure_description_cache()
-    return search_descriptions_sync(prefix, limit) or []
+    cached = search_descriptions_sync(prefix, limit)
+    if cached is not None:
+        return cached
+    payload = await api_client.request(
+        "GET",
+        "v1/transactions/descriptions",
+        params={"prefix": prefix.strip(), "limit": limit},
+    )
+    return [str(name) for name in payload.get("items") or [] if str(name).strip()]
 
 
 async def resolve_item_name_for_description(description: str) -> Optional[str]:
@@ -719,31 +508,13 @@ async def resolve_item_name_for_description(description: str) -> Optional[str]:
     except Exception:
         pass
 
-    db = get_db()
-    desc_match = {"description": {"$regex": f"^{re.escape(key)}$", "$options": "i"}}
-    has_item = {
-        "$or": [
-            {"item": {"$type": "string", "$ne": ""}},
-            {"category_name": {"$type": "string", "$ne": ""}},
-        ]
-    }
-    projection = {"item": 1, "category_name": 1}
-
-    async def _first(extra: dict) -> Optional[dict]:
-        cursor = (
-            db.transactions.find({**desc_match, **has_item, **extra}, projection)
-            .sort([("date", -1), ("created_at", -1)])
-            .limit(1)
-        )
-        docs = await cursor.to_list(length=1)
-        return docs[0] if docs else None
-
-    doc = await _first({"verified": True})
-    if not doc:
-        doc = await _first({})
-    if not doc:
-        return None
-    return (doc.get("item") or doc.get("category_name") or "").strip() or None
+    payload = await api_client.request(
+        "GET",
+        "v1/transactions/resolve-item",
+        params={"description": key},
+    )
+    item = payload.get("item")
+    return (str(item).strip() if item else None) or None
 
 
 async def get_rejected_transactions_for_cashier(
@@ -751,19 +522,12 @@ async def get_rejected_transactions_for_cashier(
     limit: int = 200,
 ) -> List[Transaction]:
     """Active rejected entries for this cashier (excludes discarded), newest first."""
-    db = get_db()
-    cursor = (
-        db.transactions
-        .find({
-            "cashier_id": cashier_id,
-            "rejected": True,
-            "discarded": {"$ne": True},
-        })
-        .sort([("date", -1), ("created_at", -1)])
-        .limit(limit)
+    payload = await api_client.request(
+        "GET",
+        "v1/transactions/cashier/rejected",
+        params={"cashier_id": str(cashier_id), "limit": limit},
     )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def get_discarded_transactions_for_cashier(
@@ -771,18 +535,12 @@ async def get_discarded_transactions_for_cashier(
     limit: int = 200,
 ) -> List[Transaction]:
     """Soft-discarded rejected entries for this cashier, newest first."""
-    db = get_db()
-    cursor = (
-        db.transactions
-        .find({
-            "cashier_id": cashier_id,
-            "discarded": True,
-        })
-        .sort([("date", -1), ("created_at", -1)])
-        .limit(limit)
+    payload = await api_client.request(
+        "GET",
+        "v1/transactions/cashier/discarded",
+        params={"cashier_id": str(cashier_id), "limit": limit},
     )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def discard_transactions(
@@ -792,17 +550,15 @@ async def discard_transactions(
     """Soft-discard rejected entries owned by this cashier. Returns modified count."""
     if not tx_ids:
         return 0
-    db = get_db()
-    result = await db.transactions.update_many(
-        {
-            "_id": {"$in": list(tx_ids)},
-            "cashier_id": cashier_id,
-            "rejected": True,
-            "discarded": {"$ne": True},
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/cashier/discard",
+        json={
+            "ids": [str(oid) for oid in tx_ids],
+            "cashier_id": str(cashier_id),
         },
-        {"$set": {"discarded": True}},
     )
-    return result.modified_count
+    return int(payload.get("updated") or 0)
 
 
 async def restore_discarded_transactions(
@@ -812,16 +568,15 @@ async def restore_discarded_transactions(
     """Move discarded entries back to the active Rejected list. Returns modified count."""
     if not tx_ids:
         return 0
-    db = get_db()
-    result = await db.transactions.update_many(
-        {
-            "_id": {"$in": list(tx_ids)},
-            "cashier_id": cashier_id,
-            "discarded": True,
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/cashier/restore-discarded",
+        json={
+            "ids": [str(oid) for oid in tx_ids],
+            "cashier_id": str(cashier_id),
         },
-        {"$set": {"discarded": False}},
     )
-    return result.modified_count
+    return int(payload.get("updated") or 0)
 
 
 async def delete_discarded_transactions(
@@ -831,15 +586,15 @@ async def delete_discarded_transactions(
     """Permanently delete discarded entries owned by this cashier. Returns deleted count."""
     if not tx_ids:
         return 0
-    db = get_db()
-    result = await db.transactions.delete_many(
-        {
-            "_id": {"$in": list(tx_ids)},
-            "cashier_id": cashier_id,
-            "discarded": True,
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/cashier/delete-discarded",
+        json={
+            "ids": [str(oid) for oid in tx_ids],
+            "cashier_id": str(cashier_id),
         },
     )
-    return result.deleted_count
+    return int(payload.get("deleted") or 0)
 
 
 async def resubmit_rejected_transactions(
@@ -853,30 +608,17 @@ async def resubmit_rejected_transactions(
     """
     if not updates_by_id:
         return 0
-    db = get_db()
-    now = datetime.utcnow()
-    updated = 0
-    for tx_id, field_updates in updates_by_id.items():
-        payload = dict(field_updates or {})
-        payload.update({
-            "rejected": False,
-            "rejection_reason": None,
-            "discarded": False,
-            "last_edited_at": now,
-            "last_edited_by": cashier_id,
-        })
-        result = await db.transactions.update_one(
-            {
-                "_id": tx_id,
-                "cashier_id": cashier_id,
-                "rejected": True,
-                "discarded": {"$ne": True},
-            },
-            {"$set": payload},
-        )
-        if result.modified_count:
-            updated += 1
-    return updated
+    body = {
+        "cashier_id": str(cashier_id),
+        "updates_by_id": {
+            str(tx_id): jsonable_document(dict(fields or {}))
+            for tx_id, fields in updates_by_id.items()
+        },
+    }
+    payload = await api_client.request(
+        "POST", "v1/transactions/cashier/resubmit", json=body
+    )
+    return int(payload.get("updated") or 0)
 
 
 async def check_for_duplicates(
@@ -889,34 +631,19 @@ async def check_for_duplicates(
 ) -> List[Transaction]:
     """Return existing transactions within the last `days` days that share
     truck_number, amount, item, and description with the candidate entry."""
-    db = get_db()
-    cutoff = datetime.utcnow() - timedelta(days=days)
-    query: dict = {
-        "date": {"$gte": cutoff},
-        "rejected": {"$ne": True},
-        "amount": amount,
+    body: dict = {
+        "truck_number": truck_number or "",
+        "amount": float(amount or 0.0),
+        "item": item or "",
+        "description": description or "",
+        "days": int(days),
     }
-    if truck_number:
-        query["truck_number"] = {"$regex": f"^{re.escape(truck_number)}$", "$options": "i"}
-    if item:
-        query["item"] = {"$regex": f"^{re.escape(item)}$", "$options": "i"}
-    if description:
-        query["description"] = {"$regex": f"^{re.escape(description)}$", "$options": "i"}
-    if exclude_id:
-        query["_id"] = {"$ne": exclude_id}
-    cursor = db.transactions.find(query).sort("date", -1).limit(10)
-    docs = await cursor.to_list(length=10)
-    return [Transaction.from_doc(d) for d in docs]
-
-
-_DRAFT_BASE_MATCH = {
-    "register_status": "draft",
-    "verified": {"$ne": True},
-    "rejected": {"$ne": True},
-    "discarded": {"$ne": True},
-    "deletion_requested": {"$ne": True},
-    "trashed": {"$ne": True},
-}
+    if exclude_id is not None:
+        body["exclude_id"] = str(exclude_id)
+    payload = await api_client.request(
+        "POST", "v1/transactions/check-duplicates", json=body
+    )
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def count_draft_transactions(
@@ -925,11 +652,13 @@ async def count_draft_transactions(
     all_cashiers: bool = False,
 ) -> int:
     """Count unsubmitted draft rows (for sidebar badge)."""
-    db = get_db()
-    query: dict = dict(_DRAFT_BASE_MATCH)
+    params: dict = {"all_cashiers": "true" if all_cashiers else "false"}
     if not all_cashiers and cashier_id is not None:
-        query["cashier_id"] = cashier_id
-    return int(await db.transactions.count_documents(query))
+        params["cashier_id"] = str(cashier_id)
+    payload = await api_client.request(
+        "GET", "v1/transactions/drafts/count", params=params
+    )
+    return int(payload.get("count") or 0)
 
 
 async def get_draft_day_summaries(
@@ -939,38 +668,28 @@ async def get_draft_day_summaries(
     limit: int = 120,
 ) -> List[dict]:
     """Calendar days that have at least one draft entry, newest first."""
-    db = get_db()
-    match: dict = dict(_DRAFT_BASE_MATCH)
+    params: dict = {
+        "all_cashiers": "true" if all_cashiers else "false",
+        "limit": limit,
+    }
     if not all_cashiers and cashier_id is not None:
-        match["cashier_id"] = cashier_id
-
-    pipeline = [
-        {"$match": match},
-        {"$addFields": {"register_day": _REGISTER_DAY_EXPR}},
-        {"$group": {
-            "_id": {
-                "year": {"$year": "$register_day"},
-                "month": {"$month": "$register_day"},
-                "day": {"$dayOfMonth": "$register_day"},
-            },
-            "entries_count": {"$sum": 1},
-            "total_tzs": {"$sum": "$amount"},
-            "cashier_ids": {"$addToSet": "$cashier_id"},
-        }},
-        {"$sort": {"_id.year": -1, "_id.month": -1, "_id.day": -1}},
-        {"$limit": limit},
-    ]
-    docs = await db.transactions.aggregate(pipeline).to_list(length=limit)
+        params["cashier_id"] = str(cashier_id)
+    payload = await api_client.request(
+        "GET", "v1/transactions/drafts/day-summaries", params=params
+    )
     result = []
-    for d in docs:
-        g = d["_id"]
-        cashier_ids = [cid for cid in (d.get("cashier_ids") or []) if cid is not None]
-        result.append({
-            "date": date(g["year"], g["month"], g["day"]),
-            "entries_count": int(d.get("entries_count") or 0),
-            "total_tzs": float(d.get("total_tzs") or 0.0),
-            "cashier_ids": cashier_ids,
-        })
+    for row in payload.get("items") or []:
+        item = dict(row)
+        item["date"] = _parse_summary_date(item.get("date"))
+        cashier_ids = []
+        for cid in item.get("cashier_ids") or []:
+            if cid is None:
+                continue
+            cashier_ids.append(
+                ObjectId(str(cid)) if ObjectId.is_valid(str(cid)) else cid
+            )
+        item["cashier_ids"] = cashier_ids
+        result.append(item)
     return result
 
 
@@ -981,16 +700,14 @@ async def get_draft_transactions(
     merged: bool = False,
 ) -> List[Transaction]:
     """Draft rows for one register calendar day."""
-    db = get_db()
-    query: dict = {
-        **_register_day_clause(register_date),
-        **_DRAFT_BASE_MATCH,
+    params: dict = {
+        "date": register_date.isoformat(),
+        "merged": "true" if merged else "false",
     }
     if not merged and cashier_id is not None:
-        query["cashier_id"] = cashier_id
-    cursor = db.transactions.find(query).sort([("day_order", 1), ("created_at", 1)])
-    docs = await cursor.to_list(length=None)
-    return [Transaction.from_doc(d) for d in docs]
+        params["cashier_id"] = str(cashier_id)
+    payload = await api_client.request("GET", "v1/transactions/drafts", params=params)
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
 
 async def discard_draft_transactions(
@@ -1003,15 +720,16 @@ async def discard_draft_transactions(
     ``allow_any_cashier`` is True (accountant merged register)."""
     if not tx_ids:
         return 0
-    db = get_db()
-    query: dict = {
-        "_id": {"$in": list(tx_ids)},
-        **_DRAFT_BASE_MATCH,
-    }
-    if not allow_any_cashier:
-        query["cashier_id"] = actor_id
-    result = await db.transactions.delete_many(query)
-    return int(result.deleted_count)
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/drafts/discard",
+        json={
+            "ids": [str(oid) for oid in tx_ids],
+            "cashier_id": str(actor_id),
+            "allow_any_cashier": allow_any_cashier,
+        },
+    )
+    return int(payload.get("deleted") or 0)
 
 
 async def insert_pending_edit(
@@ -1026,42 +744,22 @@ async def insert_pending_edit(
     re_approve_transaction can cascade the new values back to the original.
     Re-editing the same original updates the existing pending doc in place.
     """
-    db = get_db()
-    original_doc = await db.transactions.find_one({"_id": original_tx_id})
-    if not original_doc:
-        raise ValueError(f"Original transaction {original_tx_id} not found")
-
-    now = datetime.utcnow()
-    meta = {
-        "original_transaction_id": original_tx_id,
-        "edited_after_verification": True,
-        "verified": False,
-        "verified_by": None,
-        "verified_at": None,
-        "rejection_reason": None,
-        "rejected": False,
-        "discarded": False,
-        "last_edited_at": now,
-        "last_edited_by": cashier_id,
-    }
-
-    existing = await db.transactions.find_one({
-        "original_transaction_id": original_tx_id,
-        "verified": False,
-        "edited_after_verification": True,
-        "rejected": {"$ne": True},
-    })
-    if existing:
-        patch = dict(updates)
-        patch.update(meta)
-        await db.transactions.update_one({"_id": existing["_id"]}, {"$set": patch})
-        return existing["_id"]
-
-    pending = dict(original_doc)
-    pending.pop("_id", None)
-    pending.update(updates)
-    pending.update(meta)
-    pending["created_at"] = now
-
-    result = await db.transactions.insert_one(pending)
-    return result.inserted_id
+    try:
+        payload = await api_client.request(
+            "POST",
+            f"v1/transactions/{original_tx_id}/pending-edit",
+            json={
+                "updates": jsonable_document(dict(updates)),
+                "cashier_id": str(cashier_id),
+            },
+        )
+    except ApiError as exc:
+        if exc.status_code == 404:
+            raise ValueError(
+                f"Original transaction {original_tx_id} not found"
+            ) from exc
+        raise
+    pending_id = payload.get("_id") or payload.get("id")
+    if not pending_id:
+        raise ValueError("Pending edit response missing id")
+    return ObjectId(str(pending_id))

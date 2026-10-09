@@ -1,4 +1,4 @@
-"""Live reachability probes for the desktop app (API + direct MongoDB)."""
+"""Live reachability probe for the desktop app (API /health/ready only)."""
 
 from __future__ import annotations
 
@@ -15,46 +15,38 @@ from tahmeed.ui.async_utils import create_task, in_running_task
 
 @dataclass(frozen=True)
 class ConnectivityStatus:
-    """Snapshot of desktop reachability to the API and MongoDB."""
+    """Snapshot of desktop reachability to the Tahmeed API."""
 
     api_ok: bool
-    mongo_ok: bool
     checked_at: Optional[datetime] = None
     api_detail: str = ""
-    mongo_detail: str = ""
 
     @property
     def online(self) -> bool:
-        return self.api_ok and self.mongo_ok
+        return self.api_ok
 
     @property
     def degraded(self) -> bool:
-        return (self.api_ok or self.mongo_ok) and not self.online
+        # API-only: no partial “API up / DB down” split on the desktop.
+        return False
 
     def short_label(self) -> str:
         if self.online:
             return "Connected"
-        if not self.api_ok and not self.mongo_ok:
-            return "Offline"
-        if not self.api_ok:
-            return "API unreachable"
-        return "Database unreachable"
+        if self.api_detail == "database_unavailable":
+            return "Server unavailable"
+        return "Offline"
 
     def banner_message(self) -> str:
         if self.online:
             return ""
-        if not self.api_ok and not self.mongo_ok:
+        if self.api_detail == "database_unavailable":
             return (
-                "No connection — cannot reach the server or database. "
-                "Connect to the internet to use the app."
-            )
-        if not self.api_ok:
-            return (
-                "Cannot reach the Tahmeed API. "
-                "Check your internet connection and try again."
+                "The server is up but the database is not ready. "
+                "Try again in a moment."
             )
         return (
-            "Cannot reach the database. "
+            "Cannot reach the Tahmeed API. "
             "Check your internet connection and try again."
         )
 
@@ -64,7 +56,7 @@ class ConnectivityStatus:
             checked = f"     |     Checked {self.checked_at.strftime('%H:%M:%S')}"
         mode_part = f"     |     {mode}" if mode else ""
         return (
-            f"{self.short_label()} · MongoDB Atlas"
+            f"{self.short_label()} · API"
             f"{checked}{mode_part}"
             f"     |     v{APP_VERSION}"
         )
@@ -72,8 +64,6 @@ class ConnectivityStatus:
     def dot_color(self) -> str:
         if self.online:
             return "#16A34A"
-        if self.degraded:
-            return "#D97706"
         return "#DC2626"
 
 
@@ -81,15 +71,12 @@ _PROBE_TIMEOUT_S = 5.0
 
 
 async def probe_connectivity(*, timeout: float = _PROBE_TIMEOUT_S) -> ConnectivityStatus:
-    """Ping API /health/ready and MongoDB; never raises."""
+    """Ping API /health/ready; never raises."""
     api_ok, api_detail = await _probe_api(timeout)
-    mongo_ok, mongo_detail = await _probe_mongo(timeout)
     return ConnectivityStatus(
         api_ok=api_ok,
-        mongo_ok=mongo_ok,
         checked_at=datetime.now(),
         api_detail=api_detail,
-        mongo_detail=mongo_detail,
     )
 
 
@@ -107,25 +94,12 @@ async def _probe_api(timeout: float) -> tuple[bool, str]:
     except ApiConnectionError as exc:
         return False, str(exc) or "connection_error"
     except ApiError as exc:
-        # 503 database_unavailable still means the API process answered.
+        # Desktop cannot work without the DB behind the API.
         if exc.status_code == 503 and exc.code == "database_unavailable":
-            return True, "api_up_db_not_ready"
+            return False, "database_unavailable"
         return False, str(exc) or (exc.code or "api_error")
     except Exception as exc:
         return False, str(exc) or "api_error"
-
-
-async def _probe_mongo(timeout: float) -> tuple[bool, str]:
-    try:
-        from tahmeed.db.connection import get_client
-
-        client = get_client()
-        await asyncio.wait_for(client.admin.command("ping"), timeout=timeout)
-        return True, ""
-    except asyncio.TimeoutError:
-        return False, "timeout"
-    except Exception as exc:
-        return False, str(exc) or "mongo_error"
 
 
 class ConnectivityMonitor(QObject):
@@ -206,8 +180,8 @@ class ConnectivityMonitor(QObject):
             if (
                 prev is None
                 or prev.api_ok != status.api_ok
-                or prev.mongo_ok != status.mongo_ok
                 or prev.online != status.online
+                or prev.api_detail != status.api_detail
             ):
                 from tahmeed.signals import app_signals
 

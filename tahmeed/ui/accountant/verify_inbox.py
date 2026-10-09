@@ -1951,7 +1951,6 @@ class VerifyInboxWidget(QWidget):
 
     async def _ensure_mapping_categories(self) -> List[Category]:
         """Load the item catalog used by the mapping dialog (always fresh)."""
-        from tahmeed.services.api_models import desktop_document
         from tahmeed.services.category_service import get_payment_target_categories
 
         self._set_busy("Loading items…")
@@ -1966,20 +1965,6 @@ class VerifyInboxWidget(QWidget):
                 f"Could not load items from the server:\n{exc}",
             ))
             return []
-
-        if not categories:
-            try:
-                from tahmeed.db.connection import get_db
-
-                db = get_db()
-                docs = await db.categories.find({"active": {"$ne": False}}).sort("name", 1).to_list(
-                    length=None
-                )
-                categories = [
-                    Category.from_doc(desktop_document(doc)) for doc in docs
-                ]
-            except Exception:
-                pass
 
         self._category_objects = categories
         self._categories = [c.name for c in categories]

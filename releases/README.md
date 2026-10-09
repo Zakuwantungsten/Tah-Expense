@@ -23,9 +23,10 @@ password. Never place either in `.env`, source control, CI logs, or R2.
 
 ## Build and publish
 
-Fill `.env.production` with the final Tailscale API URL, temporary restricted
-MongoDB URI, and an HTTPS Cloudflare R2 custom-domain manifest URL. The R2
-`r2.dev` development URL and S3 API endpoint are not client update URLs.
+Fill `.env.production` with `API_BASE_URL=https://api.meedexpe.com` (Cloudflare
+Tunnel) and an HTTPS Cloudflare R2 custom-domain manifest URL. Do not bake
+`MONGODB_URI` into desktop builds — the API owns the database. The R2 `r2.dev`
+development URL and S3 API endpoint are not client update URLs.
 
 ```powershell
 .\scripts\build_windows.ps1

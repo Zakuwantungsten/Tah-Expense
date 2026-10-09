@@ -1,10 +1,12 @@
 # Production Docker deployment (Ubuntu)
 
 This option runs only the FastAPI API and its backup scheduler in containers.
-MongoDB Community and Tailscale remain host services and are not changed. Linux
-host networking is intentional: both containers reach host MongoDB at
-`127.0.0.1:27017`, while Uvicorn listens only on host loopback
-`127.0.0.1:8000` for Tailscale Serve.
+MongoDB Community remains a host service. Linux host networking is intentional:
+containers reach host MongoDB at `127.0.0.1:27017`, and Uvicorn listens only on
+host loopback `127.0.0.1:8000`. Public HTTPS is
+[Cloudflare Tunnel](CLOUDFLARE.md) to `https://api.meedexpe.com`. Tailscale may
+stay on the host for admin access; Tailscale Serve is not the production
+ingress path.
 
 The existing `deployment/v1` systemd deployment remains supported. Do not run
 its API/timers and this Compose deployment at the same time.
@@ -103,31 +105,24 @@ capabilities dropped, bounded PID/tmp/log usage, health checks, and
 `unless-stopped` restart policies. `tahmeed-api-backups` is the named volume for
 archives, manifests, and the local lock.
 
-## 5. Tailscale ACL, tag, and Serve
+## 5. Public HTTPS (Cloudflare Tunnel)
 
-Approve the ACL before enabling Serve. Adapt identities to your tailnet:
+Do **not** stop the API containers to add ingress. Follow
+[CLOUDFLARE.md](CLOUDFLARE.md):
 
-```json
-{
-  "tagOwners": {"tag:tahmeed-api": ["autogroup:admin"]},
-  "grants": [{
-    "src": ["group:tahmeed-users"],
-    "dst": ["tag:tahmeed-api"],
-    "ip": ["tcp:443"]
-  }]
-}
-```
+1. Cloudflare zone for `meedexpe.com`.
+2. Tunnel hostname `api.meedexpe.com` → `http://127.0.0.1:8000`.
+3. Host `cloudflared` systemd connector; leave Docker running.
+4. Verify from a non-Tailscale network:
+   `curl -fsS https://api.meedexpe.com/health/ready`.
+5. Only then cut Tailscale Serve (`sudo tailscale serve reset`). Keep the
+   Tailscale node if you still want admin SSH over the tailnet. Never enable
+   Funnel.
 
-Then tag the host, verify the tag in the admin console, and publish loopback:
+Optional temporary overlap: Tailscale Serve may remain up until step 4 passes
+so existing pilots are not interrupted.
 
-```bash
-sudo tailscale set --advertise-tags=tag:tahmeed-api
-sudo tailscale serve --bg --https=443 http://127.0.0.1:8000
-tailscale serve status
-curl --fail https://HOSTNAME.TAILNET.ts.net/health/ready
-```
-
-Never enable Funnel. Test an authorized and unauthorized identity.
+Firewall: deny public `8000` and `27017`; API and Mongo stay on loopback.
 
 ## 6. Configure and pilot the Windows client
 
@@ -135,19 +130,13 @@ On the trusted Windows build workstation, copy `.env.production.example` to
 `.env.production`. Set:
 
 ```dotenv
-API_BASE_URL=https://HOSTNAME.TAILNET.ts.net
-DB_NAME=tahmeed_expense
-MONGODB_URI=mongodb://TEMPORARY_APP_USER:PASSWORD@TAILSCALE_MONGO_IP:27017/tahmeed_expense?authSource=tahmeed_expense&directConnection=true
+API_BASE_URL=https://api.meedexpe.com
 UPDATE_MANIFEST_URL=https://updates.example.com/tahmeed/version.json
 ```
 
-Never put the server JWT secret, backup MongoDB credential, or S3 credentials in
-the desktop build. This first foundation release is deliberately hybrid:
-transactions, imports, reconciliation, and reports still use the existing
-desktop `MONGODB_URI`, while login, users, catalog, fleet, and backup status use
-the API. Keep the current restricted application MongoDB credential temporarily
-so all screens continue working. Remove it and close desktop access to port
-27017 only after those remaining domains are migrated to API endpoints.
+Do **not** bake `MONGODB_URI` or `DB_NAME` into the desktop installer — the app
+is API-only (Phase 11). Never put the server JWT secret, backup MongoDB
+credential, or S3 credentials in the desktop build.
 
 Build and test with a small named pilot group:
 
@@ -161,8 +150,8 @@ Use an R2 custom domain for `UPDATE_MANIFEST_URL`; see `releases/README.md` for
 key custody, ordered publishing, rollback, and the Authenticode/SmartScreen
 limitation.
 
-Confirm login, roles, representative reads/writes, Tailscale denial for a
-non-member, update behavior, and API logs. Expand only after a successful daily
+Confirm login, roles, representative reads/writes (no Tailscale required on
+user PCs), update behavior, and API logs. Expand only after a successful daily
 backup and restore verification.
 
 ## 7. Backup and restore smoke tests

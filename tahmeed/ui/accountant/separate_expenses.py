@@ -2200,7 +2200,7 @@ class TollPlazaWidget(QWidget):
             preview_headers=_TOLL_DETAIL_HEADERS,
             col_map=_TOLL_COL_MAP,
             save_fn=svc.save_imported_feed,
-            exist_fn=svc.get_existing_feed_keys,
+            exist_fn=lambda keys: svc.get_existing_feed_keys(keys, "toll_plaza"),
             auto_header_row=True,
             template_title=_TOLL_TEMPLATE_TITLE,
             template_headers=_TOLL_DETAIL_HEADERS,
@@ -3193,7 +3193,7 @@ class ParkingCongoWidget(QWidget):
             preview_headers=_PCONGO_DETAIL_HEADERS,
             col_map=_PCONGO_COL_MAP,
             save_fn=svc.save_imported_feed,
-            exist_fn=svc.get_existing_feed_keys,
+            exist_fn=lambda keys: svc.get_existing_feed_keys(keys, "parking_congo"),
             auto_header_row=True,
             template_title="",
             template_headers=_PCONGO_TEMPLATE_HEADERS,
@@ -10862,7 +10862,7 @@ class RahnTechWidget(QWidget):
             preview_headers=_RAHNTECH_HEADERS,
             col_map=_RAHNTECH_COL_MAP,
             save_fn=svc.save_imported_feed,
-            exist_fn=svc.get_existing_feed_keys,
+            exist_fn=lambda keys: svc.get_existing_feed_keys(keys, "rahntech"),
             parent=self,
         )
         dlg.imported.connect(self._on_imported)

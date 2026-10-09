@@ -14,8 +14,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import openpyxl
 from bson import ObjectId
 
-from tahmeed.db.connection import get_db
 from tahmeed.models.transaction import Transaction, pack_money
+from tahmeed.services.api_client import api_client
+from tahmeed.services.api_models import desktop_document, jsonable_document
 from tahmeed.services.description_mapping_service import (
     get_mappings_for_descriptions,
     normalize_description,
@@ -706,16 +707,6 @@ def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict
     }
 
 
-_MONTH_LABELS = (
-    "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-)
-
-
-def _month_label(dt: datetime) -> str:
-    return f"{_MONTH_LABELS[dt.month]} {str(dt.year)[-2:]}"
-
-
 def preview_rows_as_truck_dicts(
     preview: DailyImportPreview,
 ) -> List[dict]:
@@ -723,58 +714,8 @@ def preview_rows_as_truck_dicts(
     return [staged_row_payload(row, preview) for row in preview.rows]
 
 
-def _payload_to_verified_transaction(
-    payload: dict,
-    *,
-    verified_by: Optional[ObjectId] = None,
-    day_order: Optional[int] = None,
-) -> Transaction:
-    """Build a verified master transaction from a staged daily-import payload."""
-    dt = payload["date"]
-    if not isinstance(dt, datetime):
-        dt = datetime(dt.year, dt.month, dt.day)
-    item_name = (payload.get("category_name") or payload.get("item") or "").strip()
-    ref_float = (payload.get("ref_float") or "").strip()
-    primary = payload.get("import_primary_date")
-    return Transaction(
-        date=dt,
-        description=(payload.get("description") or "").strip(),
-        truck_number=(payload.get("truck_number") or "").strip().upper(),
-        amount=float(payload.get("amount") or 0),
-        currency=(payload.get("currency") or "TZS").strip().upper() or "TZS",
-        amount_usd=(
-            float(payload["amount_usd"])
-            if payload.get("amount_usd") is not None
-            else None
-        ),
-        category_id=payload.get("category_id"),
-        category_name=item_name or None,
-        category_confidence=1.0 if item_name else 0.0,
-        item=item_name,
-        lpo_do=(payload.get("lpo_do") or "").upper(),
-        do_number=(payload.get("do_number") or "").upper(),
-        memo=(payload.get("memo") or "").strip(),
-        receipt_status=payload.get("receipt_status") or "",
-        notes_flag=ref_float == "REFUND TO FLOAT",
-        ref_float=ref_float,
-        ownership=(payload.get("ownership") or "").upper(),
-        approver=(payload.get("approver") or "").upper(),
-        # Attribute the batch to the importing accountant so rows show in
-        # Table / Merged register like normal system-created entries.
-        cashier_id=verified_by,
-        verified=True,
-        verified_by=verified_by,
-        verified_at=datetime.utcnow(),
-        register_status="submitted",
-        day_order=day_order,
-        month=_month_label(dt),
-        year=dt.year,
-        created_at=datetime.utcnow(),
-        daily_import_id=payload.get("daily_import_id"),
-        daily_import_source=payload.get("daily_import_source"),
-        date_discrepancy=bool(payload.get("date_discrepancy")),
-        import_primary_date=primary,
-    )
+def _tx_from_api(document: dict) -> Transaction:
+    return Transaction.from_doc(desktop_document(document))
 
 
 async def commit_daily_to_master(
@@ -782,165 +723,36 @@ async def commit_daily_to_master(
     *,
     verified_by: Optional[ObjectId] = None,
 ) -> dict:
-    """Insert daily-import rows as verified Master Expenses.
+    """Insert daily-import rows as verified Master Expenses via API.
 
-    Rows without an item are skipped. Each inserted doc carries
-    ``import_row_key`` so a retry of the same upload cannot duplicate rows
-    (unique partial index on ``daily_import_id`` + ``import_row_key``).
+    ``verified_by`` is attributed server-side from the authenticated manager;
+    the argument is kept for call-site compatibility.
     """
-    from tahmeed.db.import_idempotency import (
-        daily_import_row_key,
-        ensure_import_indexes,
-        insert_many_idempotent,
+    del verified_by  # actor comes from API auth
+    payload = await api_client.request(
+        "POST",
+        "v1/imports/daily/commit",
+        json={"rows": [jsonable_document(row) for row in payloads]},
     )
-
-    db = get_db()
-    await ensure_import_indexes()
-    inserted = 0
-    duplicates = 0
-    skipped_no_item = 0
-    batch: List[dict] = []
-    upload_id = ""
-    source = ""
-    min_date: Optional[datetime] = None
-    max_date: Optional[datetime] = None
-    row_index = 0
-
-    for payload in payloads:
-        item_name = (payload.get("category_name") or payload.get("item") or "").strip()
-        if not item_name:
-            skipped_no_item += 1
-            continue
-        if not upload_id:
-            upload_id = str(payload.get("daily_import_id") or uuid.uuid4())
-        if not source:
-            source = str(payload.get("daily_import_source") or "")
-        # Keep batch tags consistent even if upstream mutated ids.
-        payload = dict(payload)
-        payload["daily_import_id"] = upload_id
-        if source:
-            payload["daily_import_source"] = source
-        tx = _payload_to_verified_transaction(
-            payload, verified_by=verified_by, day_order=row_index
-        )
-        row_index += 1
-        if isinstance(tx.date, datetime):
-            if min_date is None or tx.date < min_date:
-                min_date = tx.date
-            if max_date is None or tx.date > max_date:
-                max_date = tx.date
-        doc = tx.to_doc()
-        doc["import_row_key"] = daily_import_row_key(payload)
-        batch.append(doc)
-        if len(batch) >= 500:
-            n, d = await insert_many_idempotent(db.transactions, batch)
-            inserted += n
-            duplicates += d
-            batch.clear()
-
-    if batch:
-        n, d = await insert_many_idempotent(db.transactions, batch)
-        inserted += n
-        duplicates += d
-
-    result = {
-        "inserted": inserted,
-        "duplicates_skipped": duplicates,
-        "skipped_no_item": skipped_no_item,
-        "upload_id": upload_id,
-        "source": source,
-        "min_date": min_date,
-        "max_date": max_date,
-    }
-    try:
-        from tahmeed.services.audit_service import record_event
-
-        await record_event(
-            "import.daily_master",
-            actor_id=verified_by,
-            entity_type="import_batch",
-            upload_id=upload_id or None,
-            details=result,
-        )
-    except Exception:
-        pass
-    return result
+    return desktop_document(payload)
 
 
 async def cleanup_null_daily_import_ids() -> int:
-    """Strip null/empty daily_import_id tags left by older saves / bad uploads.
-
-    These used to appear in the Uploads browser as one undeleteable phantom group.
-    """
-    db = get_db()
-    result = await db.transactions.update_many(
-        {
-            "$or": [
-                {"daily_import_id": None},
-                {"daily_import_id": ""},
-                {"daily_import_id": {"$type": "null"}},
-            ]
-        },
-        {
-            "$unset": {
-                "daily_import_id": "",
-                "daily_import_source": "",
-                "import_primary_date": "",
-            }
-        },
+    """Strip null/empty daily_import_id tags left by older saves / bad uploads."""
+    payload = await api_client.request(
+        "POST", "v1/imports/daily/cleanup-null-ids"
     )
-    return int(result.modified_count or 0)
+    return int(payload.get("modified") or 0)
 
 
 async def list_daily_uploads(limit: int = 100) -> List[dict]:
-    db = get_db()
-    # Heal legacy null-tagged rows so they never group as a phantom upload.
-    await cleanup_null_daily_import_ids()
-    pipeline = [
-        # Only real string batch ids — never null / missing / empty.
-        {"$match": {"daily_import_id": {"$type": "string", "$ne": ""}}},
-        {
-            "$group": {
-                "_id": "$daily_import_id",
-                "source_filename": {"$first": "$daily_import_source"},
-                "count": {"$sum": 1},
-                "primary_date": {"$first": "$import_primary_date"},
-                "min_date": {"$min": "$date"},
-                "max_date": {"$max": "$date"},
-                "created_at": {"$min": "$created_at"},
-                "cashier_id": {"$first": "$cashier_id"},
-                "outlier_count": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$import_primary_date", None]},
-                                    {"$ne": [
-                                        {"$dateToString": {
-                                            "format": "%Y-%m-%d",
-                                            "date": "$date",
-                                        }},
-                                        {"$dateToString": {
-                                            "format": "%Y-%m-%d",
-                                            "date": "$import_primary_date",
-                                        }},
-                                    ]},
-                                ]
-                            },
-                            1,
-                            0,
-                        ]
-                    }
-                },
-                "duplicate_count": {
-                    "$sum": {"$cond": ["$possible_duplicate", 1, 0]}
-                },
-            }
-        },
-        {"$sort": {"created_at": -1}},
-        {"$limit": limit},
-    ]
-    return await db.transactions.aggregate(pipeline).to_list(length=limit)
+    payload = await api_client.request(
+        "GET",
+        "v1/imports/daily/uploads",
+        params={"limit": limit},
+    )
+    rows = payload if isinstance(payload, list) else payload.get("items") or []
+    return [desktop_document(row) for row in rows]
 
 
 async def get_daily_upload_records(
@@ -953,65 +765,23 @@ async def get_daily_upload_records(
     uid = str(upload_id or "").strip()
     if not uid:
         return []
-    db = get_db()
-    cursor = (
-        db.transactions.find({"daily_import_id": uid})
-        .sort([("date", 1), ("day_order", 1), ("created_at", 1)])
-        .skip(max(0, skip))
-        .limit(max(1, limit))
+    payload = await api_client.request(
+        "GET",
+        f"v1/imports/daily/uploads/{uid}/records",
+        params={"skip": max(0, skip), "limit": max(1, limit)},
     )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    rows = payload if isinstance(payload, list) else payload.get("items") or []
+    return [_tx_from_api(row) for row in rows]
 
 
 async def delete_daily_upload(upload_id: str) -> int:
     if not upload_id or not str(upload_id).strip():
         return 0
-    db = get_db()
-    result = await db.transactions.delete_many(
-        {"daily_import_id": str(upload_id).strip()}
+    payload = await api_client.request(
+        "DELETE",
+        f"v1/imports/daily/uploads/{str(upload_id).strip()}",
     )
-    return result.deleted_count
-
-
-def _build_issue_query(
-    *,
-    search: str = "",
-    truck: str = "",
-    cashier_id=None,
-    date_from=None,
-    date_to=None,
-    item="",
-    description="",
-) -> dict:
-    from tahmeed.services.accountant_service import _append_text_filters
-
-    issue_or = {"$or": [
-        {"possible_duplicate": True},
-        {"date_discrepancy": True},
-    ]}
-    and_clauses: list = [issue_or]
-    _append_text_filters(
-        and_clauses, search=search, item=item, description=description,
-    )
-
-    query: dict = {
-        "verified": {"$ne": True},
-        "rejected": {"$ne": True},
-        "$and": and_clauses,
-    }
-    if truck.strip():
-        query["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
-    if cashier_id:
-        query["cashier_id"] = cashier_id
-    if date_from or date_to:
-        df: dict = {}
-        if date_from:
-            df["$gte"] = date_from
-        if date_to:
-            df["$lte"] = date_to
-        query["date"] = df
-    return query
+    return int(payload.get("deleted") or 0)
 
 
 async def get_issue_transactions(
@@ -1026,24 +796,31 @@ async def get_issue_transactions(
     item="",
     description="",
 ) -> List[Transaction]:
-    db = get_db()
-    query = _build_issue_query(
-        search=search,
-        truck=truck,
-        cashier_id=cashier_id,
-        date_from=date_from,
-        date_to=date_to,
-        item=item,
-        description=description,
+    params: dict = {
+        "skip": skip,
+        "limit": limit,
+        "search": search,
+        "truck": truck,
+        "item": item,
+        "description": description,
+    }
+    if cashier_id is not None:
+        params["cashier_id"] = str(cashier_id)
+    if date_from is not None:
+        params["date_from"] = (
+            date_from.isoformat()
+            if hasattr(date_from, "isoformat")
+            else date_from
+        )
+    if date_to is not None:
+        params["date_to"] = (
+            date_to.isoformat() if hasattr(date_to, "isoformat") else date_to
+        )
+    payload = await api_client.request(
+        "GET", "v1/imports/daily/issues", params=params
     )
-    cursor = (
-        db.transactions.find(query)
-        .sort([("date", -1), ("created_at", -1)])
-        .skip(skip)
-        .limit(limit)
-    )
-    docs = await cursor.to_list(length=limit)
-    return [Transaction.from_doc(d) for d in docs]
+    rows = payload if isinstance(payload, list) else payload.get("items") or []
+    return [_tx_from_api(row) for row in rows]
 
 
 async def count_issue_transactions(
@@ -1056,23 +833,32 @@ async def count_issue_transactions(
     item="",
     description="",
 ) -> int:
-    db = get_db()
-    query = _build_issue_query(
-        search=search,
-        truck=truck,
-        cashier_id=cashier_id,
-        date_from=date_from,
-        date_to=date_to,
-        item=item,
-        description=description,
+    params: dict = {
+        "search": search,
+        "truck": truck,
+        "item": item,
+        "description": description,
+    }
+    if cashier_id is not None:
+        params["cashier_id"] = str(cashier_id)
+    if date_from is not None:
+        params["date_from"] = (
+            date_from.isoformat()
+            if hasattr(date_from, "isoformat")
+            else date_from
+        )
+    if date_to is not None:
+        params["date_to"] = (
+            date_to.isoformat() if hasattr(date_to, "isoformat") else date_to
+        )
+    payload = await api_client.request(
+        "GET", "v1/imports/daily/issues/count", params=params
     )
-    return await db.transactions.count_documents(query)
+    return int(payload.get("count") or 0)
 
 
 async def clear_issue_flags(tx_id: ObjectId) -> bool:
-    db = get_db()
-    result = await db.transactions.update_one(
-        {"_id": tx_id},
-        {"$set": {"possible_duplicate": False, "date_discrepancy": False}},
+    payload = await api_client.request(
+        "POST", f"v1/imports/daily/issues/{tx_id}/clear"
     )
-    return result.modified_count == 1
+    return bool(payload.get("cleared"))

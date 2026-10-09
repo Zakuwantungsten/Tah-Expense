@@ -1,20 +1,17 @@
-"""Per-transaction file attachments (receipts, scans) — two-phase disk + Mongo."""
+"""Per-transaction file attachments (receipts, scans) — API upload/download + local cache."""
 
 from __future__ import annotations
 
 import logging
 import os
-import shutil
 import time
-import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
 from bson import ObjectId
 
 from tahmeed.config import APP_NAME
-from tahmeed.db.connection import get_db
+from tahmeed.services.api_client import ApiError, api_client
 
 logger = logging.getLogger("tahmeed.attachments")
 
@@ -65,11 +62,51 @@ def purge_stale_staging(*, max_age_hours: float = 24.0) -> int:
 
 
 async def get_attachments(tx_id: ObjectId) -> List[dict]:
-    db = get_db()
-    doc = await db.transactions.find_one({"_id": tx_id}, {"attachments": 1})
-    if not doc:
-        return []
-    return list(doc.get("attachments") or [])
+    payload = await api_client.request(
+        "GET", f"v1/transactions/{tx_id}/attachments"
+    )
+    return list((payload or {}).get("items") or [])
+
+
+def _seed_cache(tx_id: ObjectId | str, meta: dict, content: bytes) -> None:
+    """Write uploaded bytes into the local open-cache so open works without re-download."""
+    dest = _cache_path(tx_id, meta)
+    if dest is None:
+        return
+    staging: Path | None = None
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        staging = dest.parent / f".{dest.name}.part"
+        staging.write_bytes(content)
+        os.replace(staging, dest)
+        staging = None
+    except OSError:
+        if staging is not None:
+            try:
+                staging.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _clear_cache(tx_id: ObjectId | str, attachment_id: str, meta: dict | None = None) -> None:
+    paths: list[Path] = []
+    if meta:
+        cached = _cache_path(tx_id, meta)
+        if cached is not None:
+            paths.append(cached)
+    folder = tx_dir(tx_id)
+    if folder.is_dir():
+        for path in folder.iterdir():
+            if path.is_file() and (
+                path.name.startswith(f"{attachment_id}_")
+                or path.name.startswith(f".{attachment_id}_")
+            ):
+                paths.append(path)
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 async def add_attachment(
@@ -78,7 +115,14 @@ async def add_attachment(
     *,
     actor_id: ObjectId | None = None,
 ) -> dict:
-    """Two-phase attach: stage file → Mongo $push → finalize with os.replace."""
+    """Upload a file to the API and seed the local open-cache.
+
+    ``actor_id`` is kept for call-site compatibility; the API records the
+    authenticated user as uploader.
+    """
+    import httpx
+
+    _ = actor_id  # server derives actor from the bearer token
     src = Path(source_path)
     if not src.is_file():
         raise FileNotFoundError(f"File not found: {src}")
@@ -90,70 +134,24 @@ async def add_attachment(
             "Allowed: PDF, images, Office docs, CSV, TXT."
         )
 
-    att_id = uuid.uuid4().hex
-    stored_name = f"{att_id}_{_safe_name(src.name)}"
-    stage_dir = staging_root()
-    stage_dir.mkdir(parents=True, exist_ok=True)
-    staging = stage_dir / f"{tx_id}_{att_id}.part"
-    dest_dir = tx_dir(tx_id)
-    dest = dest_dir / stored_name
-
+    content = src.read_bytes()
     try:
-        shutil.copy2(src, staging)
-    except OSError:
-        try:
-            staging.unlink(missing_ok=True)
-        except OSError:
-            pass
+        meta = await api_client.request(
+            "POST",
+            f"v1/transactions/{tx_id}/attachments",
+            files={"file": (src.name, content, "application/octet-stream")},
+            timeout=httpx.Timeout(120.0, connect=5.0),
+        )
+    except ApiError as exc:
+        if exc.status_code == 404:
+            raise ValueError("Transaction not found — attachment not saved.") from exc
+        if exc.status_code == 422:
+            raise ValueError(str(exc)) from exc
         raise
 
-    meta = {
-        "id": att_id,
-        "filename": src.name,
-        "stored_name": stored_name,
-        "size": staging.stat().st_size,
-        "uploaded_at": datetime.utcnow(),
-    }
-    if actor_id is not None:
-        meta["uploaded_by"] = actor_id
-
-    db = get_db()
-    try:
-        result = await db.transactions.update_one(
-            {"_id": tx_id},
-            {"$push": {"attachments": meta}},
-        )
-        if result.matched_count == 0:
-            raise ValueError("Transaction not found — attachment not saved.")
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        os.replace(staging, dest)
-    except Exception:
-        try:
-            staging.unlink(missing_ok=True)
-        except OSError:
-            pass
-        # If Mongo wrote meta but finalize failed, pull meta so disk/meta stay aligned.
-        try:
-            await db.transactions.update_one(
-                {"_id": tx_id},
-                {"$pull": {"attachments": {"id": att_id}}},
-            )
-        except Exception:
-            pass
-        raise
-
-    try:
-        from tahmeed.services.audit_service import record_event
-
-        await record_event(
-            "attachment.add",
-            actor_id=actor_id,
-            entity_type="attachment",
-            entity_ids=[tx_id],
-            details={"attachment_id": att_id, "filename": src.name},
-        )
-    except Exception:
-        pass
+    if not isinstance(meta, dict):
+        raise ValueError("Invalid attachment response from API.")
+    _seed_cache(tx_id, meta, content)
     return meta
 
 
@@ -163,67 +161,92 @@ async def remove_attachment(
     *,
     actor_id: ObjectId | None = None,
 ) -> bool:
-    db = get_db()
-    doc = await db.transactions.find_one({"_id": tx_id}, {"attachments": 1})
-    if not doc:
-        return False
-    attachments = list(doc.get("attachments") or [])
-    match = next((a for a in attachments if a.get("id") == attachment_id), None)
-    if not match:
+    """Delete an attachment via the API and clear any local cache copy."""
+    _ = actor_id
+    attachment_id = str(attachment_id or "").strip()
+    if not attachment_id:
         return False
 
-    stored = match.get("stored_name") or ""
-    path = tx_dir(tx_id) / stored if stored else None
-    staging = None
-    if path is not None and path.is_file():
-        stage_dir = staging_root()
-        stage_dir.mkdir(parents=True, exist_ok=True)
-        staging = stage_dir / f"{tx_id}_{attachment_id}.deleted"
-        try:
-            os.replace(path, staging)
-        except OSError:
-            staging = None
+    try:
+        await api_client.request(
+            "DELETE",
+            f"v1/transactions/{tx_id}/attachments/{attachment_id}",
+        )
+    except ApiError as exc:
+        if exc.status_code == 404:
+            _clear_cache(tx_id, attachment_id)
+            return False
+        raise
 
-    await db.transactions.update_one(
-        {"_id": tx_id},
-        {"$pull": {"attachments": {"id": attachment_id}}},
+    _clear_cache(tx_id, attachment_id)
+    return True
+
+
+def _cache_path(tx_id: ObjectId | str, meta: dict) -> Optional[Path]:
+    att_id = str(meta.get("id") or "").strip()
+    stored = str(meta.get("stored_name") or "").strip()
+    filename = str(meta.get("filename") or "file")
+    name = Path(stored).name if stored else None
+    if not name:
+        if not att_id:
+            return None
+        name = f"{att_id}_{_safe_name(filename)}"
+    return tx_dir(tx_id) / name
+
+
+def resolve_attachment_path(tx_id: ObjectId | str, meta: dict) -> Optional[Path]:
+    """Return a locally cached path if present (no network). Prefer ``ensure_attachment_local``."""
+    path = _cache_path(tx_id, meta)
+    if path is None:
+        return None
+    expected = meta.get("size")
+    if path.is_file() and (
+        expected is None or int(expected) == path.stat().st_size
+    ):
+        return path
+    return None
+
+
+async def ensure_attachment_local(
+    tx_id: ObjectId | str, meta: dict
+) -> Optional[Path]:
+    """Download attachment to a local cache (if needed) and return the path for open."""
+    cached = resolve_attachment_path(tx_id, meta)
+    if cached is not None:
+        return cached
+
+    att_id = str(meta.get("id") or "").strip()
+    dest = _cache_path(tx_id, meta)
+    if not att_id or dest is None:
+        return None
+
+    content = await api_client.request_bytes(
+        "GET", f"v1/transactions/{tx_id}/attachments/{att_id}/file"
     )
-
-    if staging is not None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = dest.parent / f".{dest.name}.part"
+    try:
+        staging.write_bytes(content)
+        os.replace(staging, dest)
+    except OSError:
         try:
             staging.unlink(missing_ok=True)
         except OSError:
             pass
-    elif path is not None:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    try:
-        from tahmeed.services.audit_service import record_event
-
-        await record_event(
-            "attachment.remove",
-            actor_id=actor_id,
-            entity_type="attachment",
-            entity_ids=[tx_id],
-            details={
-                "attachment_id": attachment_id,
-                "filename": match.get("filename"),
-            },
-        )
-    except Exception:
-        pass
-    return True
+        raise
+    return dest if dest.is_file() else None
 
 
-def resolve_attachment_path(tx_id: ObjectId | str, meta: dict) -> Optional[Path]:
-    stored = meta.get("stored_name") or ""
-    if not stored:
-        return None
-    path = tx_dir(tx_id) / stored
-    return path if path.is_file() else None
+def _count_stale_staging(*, max_age_hours: float = 24.0) -> int:
+    root = staging_root()
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - max(0.0, max_age_hours) * 3600.0
+    return sum(
+        1
+        for path in root.iterdir()
+        if path.is_file() and path.stat().st_mtime < cutoff
+    )
 
 
 async def cleanup_attachment_orphans(
@@ -231,74 +254,52 @@ async def cleanup_attachment_orphans(
     max_age_hours: float = 24.0,
     dry_run: bool = False,
 ) -> dict:
-    """Reconcile disk attachments with Mongo metadata; purge stale staging."""
-    staging_removed = purge_stale_staging(max_age_hours=max_age_hours) if not dry_run else 0
-    if dry_run:
-        staging_removed = 0
-        root = staging_root()
-        if root.is_dir():
-            cutoff = time.time() - max(0.0, max_age_hours) * 3600.0
-            staging_removed = sum(
-                1
-                for p in root.iterdir()
-                if p.is_file() and p.stat().st_mtime < cutoff
+    """Purge local staging, then ask the API to reconcile server attachment storage.
+
+    Server cleanup is manager-only; cashiers quietly skip that part after a 403.
+    """
+    local_staging = (
+        _count_stale_staging(max_age_hours=max_age_hours)
+        if dry_run
+        else purge_stale_staging(max_age_hours=max_age_hours)
+    )
+    result = {
+        "staging_removed": local_staging,
+        "orphan_files_removed": 0,
+        "empty_dirs_removed": 0,
+        "server_skipped": False,
+    }
+    try:
+        server = await api_client.request(
+            "POST",
+            "v1/transactions/attachments/cleanup-orphans",
+            params={
+                "max_age_hours": max_age_hours,
+                "dry_run": dry_run,
+            },
+        )
+        if isinstance(server, dict):
+            result["staging_removed"] = int(server.get("staging_removed") or 0) + local_staging
+            result["orphan_files_removed"] = int(server.get("orphan_files_removed") or 0)
+            result["empty_dirs_removed"] = int(server.get("empty_dirs_removed") or 0)
+    except ApiError as exc:
+        if exc.status_code in (401, 403):
+            result["server_skipped"] = True
+            logger.info(
+                "server attachment cleanup skipped (status=%s)",
+                exc.status_code,
             )
-
-    orphan_files = 0
-    empty_dirs = 0
-    root = attachments_root()
-    if not root.is_dir():
-        return {
-            "staging_removed": staging_removed,
-            "orphan_files_removed": 0,
-            "empty_dirs_removed": 0,
-        }
-
-    db = get_db()
-    for folder in list(root.iterdir()):
-        if not folder.is_dir() or folder.name.startswith("."):
-            continue
-        tx_key = folder.name
-        try:
-            tx_oid = ObjectId(tx_key)
-        except Exception:
-            continue
-        doc = await db.transactions.find_one({"_id": tx_oid}, {"attachments": 1})
-        known = {
-            str(a.get("stored_name") or "")
-            for a in (doc or {}).get("attachments") or []
-            if a.get("stored_name")
-        }
-        for path in list(folder.iterdir()):
-            if not path.is_file():
-                continue
-            if path.name in known:
-                continue
-            orphan_files += 1
-            if not dry_run:
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-        if not dry_run:
-            try:
-                if not any(folder.iterdir()):
-                    folder.rmdir()
-                    empty_dirs += 1
-            except OSError:
-                pass
-        elif not known and not any(folder.iterdir()):
-            empty_dirs += 1
+        else:
+            logger.warning("server attachment cleanup failed: %s", exc)
+            raise
 
     logger.info(
-        "attachment orphan cleanup: staging=%s orphans=%s empty_dirs=%s dry_run=%s",
-        staging_removed,
-        orphan_files,
-        empty_dirs,
+        "attachment orphan cleanup: staging=%s orphans=%s empty_dirs=%s "
+        "dry_run=%s server_skipped=%s",
+        result["staging_removed"],
+        result["orphan_files_removed"],
+        result["empty_dirs_removed"],
         dry_run,
+        result["server_skipped"],
     )
-    return {
-        "staging_removed": staging_removed,
-        "orphan_files_removed": orphan_files,
-        "empty_dirs_removed": empty_dirs,
-    }
+    return result

@@ -84,37 +84,40 @@ def test_query_empty_item_list_matches_no_rows() -> None:
 
 
 def test_get_and_set_diesel_cash_item_names(monkeypatch) -> None:
-    store: dict = {}
+    store: dict = {"items": ["Diesel Cash"]}
+    calls: list[tuple] = []
 
-    async def fake_get(key: str):
-        return store.get(key)
-
-    async def fake_set(key: str, value):
-        store[key] = value
+    async def request(method: str, path: str, *, json: dict | None = None, **_kw):
+        calls.append((method, path, json))
+        assert path == "v1/accountant/diesel-cash/items"
+        if method == "PUT":
+            store["items"] = list((json or {}).get("names") or [])
+            return {"items": store["items"]}
+        return {"items": store["items"]}
 
     monkeypatch.setattr(
-        "tahmeed.services.settings_service.get_setting", fake_get,
-    )
-    monkeypatch.setattr(
-        "tahmeed.services.settings_service.set_setting", fake_set,
+        "tahmeed.services.accountant_service.api_client.request", request,
     )
 
     saved = asyncio.run(set_diesel_cash_item_names(["Diesel", "Diesel Cash", "diesel"]))
     assert saved == ["Diesel", "Diesel Cash"]
-    assert store["diesel_cash_items"] == ["Diesel", "Diesel Cash"]
+    assert store["items"] == ["Diesel", "Diesel Cash"]
 
     loaded = asyncio.run(get_diesel_cash_item_names())
     assert loaded == ["Diesel", "Diesel Cash"]
 
     asyncio.run(set_diesel_cash_item_names([]))
     assert asyncio.run(get_diesel_cash_item_names()) == []
+    assert any(c[0] == "PUT" for c in calls)
 
 
 def test_unset_setting_defaults_to_diesel_cash(monkeypatch) -> None:
-    async def fake_get(key: str):
-        return None
+    async def request(method: str, path: str, **_kw):
+        assert method == "GET"
+        assert path == "v1/accountant/diesel-cash/items"
+        return {"items": None}
 
     monkeypatch.setattr(
-        "tahmeed.services.settings_service.get_setting", fake_get,
+        "tahmeed.services.accountant_service.api_client.request", request,
     )
     assert asyncio.run(get_diesel_cash_item_names()) == ["Diesel Cash"]

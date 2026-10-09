@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
 from typing import Any, Optional, Sequence
 
 from bson import ObjectId
+from bson.errors import InvalidId
 
 from tahmeed.config import APP_VERSION
-from tahmeed.db.connection import get_db
+from tahmeed.services.api_client import api_client
 
 logger = logging.getLogger("tahmeed.audit")
 
@@ -22,6 +22,17 @@ def _as_id_str(value: Any) -> Optional[str]:
         return str(value)
     text = str(value).strip()
     return text or None
+
+
+def _as_object_id(value: Any) -> Optional[ObjectId]:
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    try:
+        return ObjectId(str(value))
+    except (InvalidId, TypeError, ValueError):
+        return None
 
 
 async def record_event(
@@ -38,16 +49,14 @@ async def record_event(
     details: dict | None = None,
     request_id: str | None = None,
 ) -> Optional[ObjectId]:
-    """Insert one audit event. Never raises into callers."""
+    """Insert one audit event via the API. Never raises into callers."""
     try:
-        db = get_db()
         ids = []
         for raw in entity_ids or ():
             s = _as_id_str(raw)
             if s:
                 ids.append(s)
-        doc = {
-            "ts": datetime.utcnow(),
+        body = {
             "action": action,
             "actor_id": _as_id_str(actor_id),
             "actor_username": actor_username,
@@ -62,15 +71,19 @@ async def record_event(
             "app_version": APP_VERSION,
             "details": details or {},
         }
-        result = await db.operation_events.insert_one(doc)
+        # Drop null optionals so the API schema stays clean.
+        payload = {key: value for key, value in body.items() if value is not None}
+        response = await api_client.request("POST", "v1/audit/events", json=payload)
         logger.info(
             "audit %s outcome=%s actor=%s entities=%s",
             action,
             outcome,
-            doc["actor_id"],
+            body["actor_id"],
             ids[:5],
         )
-        return result.inserted_id
+        if isinstance(response, dict):
+            return _as_object_id(response.get("id"))
+        return None
     except Exception as exc:
         logger.warning("audit record failed for %s: %s", action, exc)
         return None

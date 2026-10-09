@@ -1,8 +1,11 @@
 # Tahmeed API Ubuntu operations (deployment assets v1)
 
 These assets deploy only `backend/`. They do not migrate, replace, or reconfigure
-MongoDB, and they bind the API to `127.0.0.1:8000`. Tailscale Serve is the only
-documented ingress path. Test on staging before the pilot.
+MongoDB, and they bind the API to `127.0.0.1:8000`. Production public HTTPS is
+Cloudflare Tunnel to `https://api.meedexpe.com` (see
+[../docker/CLOUDFLARE.md](../docker/CLOUDFLARE.md)). Tailscale may remain for
+admin access; Serve is optional temporary overlap only. Test on staging before
+the pilot.
 
 ## 1. Host preparation
 
@@ -69,13 +72,49 @@ The installer enforces hashes when that file exists and installs the project
 without re-resolving dependencies. It always records the actual resolution in
 `resolved-requirements.txt`; absence of the lock produces an explicit warning.
 
-## 2. Private HTTPS with Tailscale Serve
+## 2. Public HTTPS (Cloudflare Tunnel) and host firewall
 
-Do not enable Serve until the host tag and restrictive tailnet grant below are
-approved and active. Never use Funnel, which makes the service public. The API
-process must remain bound to `127.0.0.1`, not `0.0.0.0`.
+Primary ingress: host **cloudflared** → `http://127.0.0.1:8000` as
+`https://api.meedexpe.com`. Full cutover steps (overlap with Tailscale Serve,
+verify, then `tailscale serve reset`) are in
+[../docker/CLOUDFLARE.md](../docker/CLOUDFLARE.md).
 
-Example tailnet policy fragment (adapt identities and tags in the admin console):
+The API process must remain bound to `127.0.0.1`, not `0.0.0.0`. Do not stop the
+API to add the tunnel. Never enable Tailscale Funnel.
+
+After the tunnel is healthy:
+
+```bash
+curl -fsS https://api.meedexpe.com/health/live
+curl -fsS https://api.meedexpe.com/health/ready
+```
+
+For UFW, retain SSH access before enabling it:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow OpenSSH
+sudo ufw deny 8000/tcp
+sudo ufw deny 27017/tcp
+sudo ufw enable
+sudo ss -ltnp | grep -E ':(8000|27017)\s'  # must show 127.0.0.1 only
+```
+
+Cloudflare Tunnel does not require opening public TCP 443 on the host for the
+API. If host SSH is not required, remove the OpenSSH rule only after validating
+console access.
+
+### Optional: Tailscale for admin / temporary Serve overlap
+
+Tailscale on the host is fine for SSH or emergency access. During cutover you
+may keep Serve pointing at loopback until public health checks pass, then:
+
+```bash
+sudo tailscale serve reset
+```
+
+If you still use Serve briefly, tag/ACL example (adapt identities):
 
 ```json
 {
@@ -90,33 +129,12 @@ Example tailnet policy fragment (adapt identities and tags in the admin console)
 }
 ```
 
-Apply the `tag:tahmeed-api` tag to the host, verify it in the admin console,
-then publish only the loopback API:
-
 ```bash
 sudo tailscale set --advertise-tags=tag:tahmeed-api
-# Confirm the approved tag is attached in the admin console before continuing.
 sudo tailscale serve --bg --https=443 http://127.0.0.1:8000
-tailscale serve status
-curl --fail https://HOSTNAME.TAILNET-NAME.ts.net/health/ready
 ```
 
-On newer clients the equivalent shorthand may be `sudo tailscale serve --bg
-8000`. Use `tailscale serve --help`. Test with both an authorized and an
-unauthorized identity before pilot access. For UFW, retain SSH access before
-enabling it:
-
-```bash
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-sudo ufw allow OpenSSH
-sudo ufw deny 8000/tcp
-sudo ufw enable
-sudo ss -ltnp | grep ':8000'  # must show 127.0.0.1 only
-```
-
-Do not open public TCP 443 for Tailscale Serve. If host SSH is not required,
-remove the OpenSSH rule only after validating console access.
+End-user desktops must use `https://api.meedexpe.com` (no Tailscale required).
 
 ## 3. MongoDB least privilege
 

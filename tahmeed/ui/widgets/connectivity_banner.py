@@ -12,7 +12,7 @@ from tahmeed.signals import app_signals
 
 
 class ConnectivityBanner(QFrame):
-    """Amber/red strip; hidden when both API and Mongo probes succeed."""
+    """Amber/red strip; hidden when the API /health/ready probe succeeds."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
