@@ -26,6 +26,7 @@ from .schemas import (
 )
 from .security import utcnow
 from .serialization import json_safe, object_id
+from .mongo_async import aggregate_list
 
 imports = APIRouter(prefix="/imports", tags=["imports"])
 daily = APIRouter(prefix="/daily", tags=["imports-daily"])
@@ -157,9 +158,9 @@ async def list_daily_uploads(
             }
         },
     )
-    rows = await db.transactions.aggregate(
+    rows = await aggregate_list(db.transactions, 
         daily_uploads_pipeline(limit=limit)
-    ).to_list(length=limit)
+    , length=limit)
     return json_safe(rows)
 
 

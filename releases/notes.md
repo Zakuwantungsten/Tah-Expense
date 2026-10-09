@@ -1,3 +1,5 @@
+- 4.6.2: sharper 3D desktop icon + modern circular splash
+- 4.6.1: desktop talks only to https://api.meedexpe.com (no Tailscale, no desktop Mongo). Connectivity is API health only.
 - Fixed minor bugs
 - Implemented new supplier functionality
 - Phase 11: desktop is API-only (no Mongo URI in production builds; connectivity probes `/health/ready` only)

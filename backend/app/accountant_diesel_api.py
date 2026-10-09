@@ -19,6 +19,7 @@ from .accountant_diesel_ops import (
 from .dependencies import require_roles
 from .schemas import DieselCashItemsRequest
 from .serialization import json_safe
+from .mongo_async import aggregate_list
 
 diesel_cash = APIRouter(prefix="/diesel-cash", tags=["accountant"])
 
@@ -124,7 +125,7 @@ async def diesel_cash_month_summaries(
         },
         {"$sort": {"_id": 1}},
     ]
-    docs = await db.transactions.aggregate(pipeline).to_list(length=12)
+    docs = await aggregate_list(db.transactions, pipeline, length=12)
     summaries = []
     for doc in docs:
         month_idx = int(doc["_id"])
@@ -225,7 +226,7 @@ async def diesel_cash_totals(
         ),
         item_names=names,
     )
-    result = await db.transactions.aggregate(
+    result = await aggregate_list(db.transactions, 
         [
             {"$match": query},
             {
@@ -244,7 +245,7 @@ async def diesel_cash_totals(
                 }
             },
         ]
-    ).to_list(1)
+    , 1)
     if result:
         return {
             "tzs": float(result[0].get("tzs_total") or 0.0),

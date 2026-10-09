@@ -15,6 +15,7 @@ datas = [
     ("tahmeed/assets/update_public_keys.json", "tahmeed/assets"),
     ("tahmeed/assets/app.ico", "tahmeed/assets"),
     ("tahmeed/assets/app_icon.png", "tahmeed/assets"),
+    ("tahmeed/assets/splash_mark.png", "tahmeed/assets"),
     ("tahmeed/assets/logo_blue.png", "tahmeed/assets"),
 ]
 datas += collect_data_files("qtawesome")

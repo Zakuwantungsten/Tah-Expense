@@ -30,6 +30,7 @@ from .errors import ApiError
 from .schemas import CategoriesUsageTotalsRequest
 from .serialization import json_safe, object_id
 from .transaction_ops import normalize_multi_filter
+from .mongo_async import aggregate_list
 
 reports = APIRouter(prefix="/reports", tags=["accountant"])
 
@@ -144,9 +145,9 @@ def _empty_totals() -> dict[str, Any]:
 
 
 async def _aggregate_currency_totals(db: Any, query: dict[str, Any]) -> dict[str, Any]:
-    result = await db.transactions.aggregate(
+    result = await aggregate_list(db.transactions, 
         [{"$match": query}, {"$group": currency_totals_group()}]
-    ).to_list(1)
+    , 1)
     if not result:
         return _empty_totals()
     row = result[0]
@@ -167,7 +168,7 @@ async def categories_usage_totals(
     if not names:
         return {"totals": {}}
     lowered = [n.lower() for n in names]
-    result = await _database(request).transactions.aggregate(
+    result = await aggregate_list(_database(request).transactions, 
         [
             {
                 "$match": {
@@ -190,7 +191,7 @@ async def categories_usage_totals(
                 }
             },
         ]
-    ).to_list(length=None)
+    , length=None)
     out: dict[str, dict[str, Any]] = {}
     for row in result:
         key = (row.get("_id") or "").strip().lower()
@@ -228,7 +229,7 @@ async def supplier_payments_totals(
 
     year_start = datetime(year, 1, 1)
     year_end = datetime(year, 12, 31, 23, 59, 59)
-    result = await db.transactions.aggregate(
+    result = await aggregate_list(db.transactions, 
         [
             {
                 "$match": {
@@ -247,7 +248,7 @@ async def supplier_payments_totals(
             {"$match": {"_cat_l": {"$in": supplier_names}}},
             {"$group": currency_totals_group()},
         ]
-    ).to_list(1)
+    , 1)
     if not result:
         return _empty_totals()
     row = result[0]
@@ -365,7 +366,7 @@ async def category_opening_balance(
         column_filters=column_filters,
     )
     field, direction = category_report_primary_sort(sort_field, sort_asc)
-    result = await _database(request).transactions.aggregate(
+    result = await aggregate_list(_database(request).transactions, 
         [
             {"$match": query},
             {"$sort": {field: direction, "created_at": direction}},
@@ -399,7 +400,7 @@ async def category_opening_balance(
                 }
             },
         ]
-    ).to_list(1)
+    , 1)
     if not result:
         return {"tzs": 0.0, "usd": 0.0}
     row = result[0]
@@ -518,14 +519,14 @@ async def category_column_values(
             else {"$eq": [{"$toUpper": "$currency"}, "USD"]}
         )
         decimals = 0 if field == "tzs" else 2
-        docs = await db.transactions.aggregate(
+        docs = await aggregate_list(db.transactions, 
             [
                 {"$match": query},
                 {"$match": {"$expr": cur_match}},
                 {"$group": {"_id": "$amount"}},
                 {"$limit": 5000},
             ]
-        ).to_list(5000)
+        , 5000)
         return {
             "items": sorted(
                 {

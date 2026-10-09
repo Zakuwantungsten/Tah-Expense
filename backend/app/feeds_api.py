@@ -97,6 +97,7 @@ from .schemas import (
 )
 from .security import utcnow
 from .serialization import json_safe, object_id
+from .mongo_async import aggregate_list
 
 feeds = APIRouter(prefix="/feeds", tags=["feeds"])
 Manager = Annotated[dict[str, Any], Depends(require_roles("admin", "accountant"))]
@@ -680,7 +681,7 @@ async def feed_totals(
         query = insurance_query(
             spec.disc_value, month=month, status=status
         )
-        result = await coll.aggregate(insurance_totals_pipeline(query)).to_list(1)
+        result = await aggregate_list(coll, insurance_totals_pipeline(query), 1)
         return json_safe(result[0] if result else empty_insurance_totals())
 
     handler = _handler(spec)
@@ -698,13 +699,13 @@ async def feed_totals(
         called_out_only=called_out_only,
     )
     if handler.is_diesel:
-        result = await coll.aggregate(diesel_all_totals_pipeline(query)).to_list(1)
+        result = await aggregate_list(coll, diesel_all_totals_pipeline(query), 1)
         return json_safe(
             finalize_diesel_totals(
                 result[0] if result else None, feed_type=handler.feed_type
             )
         )
-    result = await coll.aggregate(handler.totals_pipeline(query)).to_list(1)
+    result = await aggregate_list(coll, handler.totals_pipeline(query), 1)
     row = result[0] if result else None
     if handler.finalize_totals:
         return json_safe(handler.finalize_totals(row))
@@ -745,7 +746,7 @@ async def feed_years(
     ]
     years.update(
         years_from_transaction_dates(
-            await coll.aggregate(pipeline).to_list(length=None)
+            await aggregate_list(coll, pipeline, length=None)
         )
     )
     if not handler.years_on_import_date:
@@ -818,9 +819,9 @@ async def parking_congo_deposit_totals(
 ) -> dict[str, Any]:
     del manager
     query = parking_congo_deposits_query(search, date_from, date_to)
-    result = await _database(request).imported_feeds.aggregate(
+    result = await aggregate_list(_database(request).imported_feeds, 
         parking_congo_totals_pipeline(query)
-    ).to_list(1)
+    , 1)
     return json_safe(result[0] if result else empty_parking_totals())
 
 
@@ -915,9 +916,11 @@ async def list_feed_uploads(
     spec = _feed(feed)
     _require_uploads(spec)
     handler = _handler(spec)
-    rows = await feed_collection(_database(request), spec).aggregate(
-        handler.uploads_pipeline()
-    ).to_list(length=None)
+    rows = await aggregate_list(
+        feed_collection(_database(request), spec),
+        handler.uploads_pipeline(),
+        length=None,
+    )
     return json_safe(rows)
 
 
@@ -985,9 +988,11 @@ async def upload_totals(
     _require_uploads(spec)
     handler = _handler(spec)
     query = handler.upload_query(upload_id, search)
-    result = await feed_collection(_database(request), spec).aggregate(
-        handler.totals_pipeline(query)
-    ).to_list(1)
+    result = await aggregate_list(
+        feed_collection(_database(request), spec),
+        handler.totals_pipeline(query),
+        1,
+    )
     row = result[0] if result else None
     if handler.finalize_totals:
         return json_safe(handler.finalize_totals(row))
@@ -1038,9 +1043,11 @@ async def list_file_labels(
             "file_labels_unsupported",
             f"Feed '{spec.slug}' does not expose file labels",
         )
-    docs = await feed_collection(_database(request), spec).aggregate(
-        diesel_file_labels_pipeline(spec.disc_value)
-    ).to_list(length=None)
+    docs = await aggregate_list(
+        feed_collection(_database(request), spec),
+        diesel_file_labels_pipeline(spec.disc_value),
+        length=None,
+    )
     labels = unique_diesel_file_labels(str(d.get("_id") or "") for d in docs)
     return {"items": labels}
 

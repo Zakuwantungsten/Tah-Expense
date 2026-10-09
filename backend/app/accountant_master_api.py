@@ -32,6 +32,7 @@ from .errors import ApiError
 from .schemas import BulkMasterUpdateRequest, MasterPatchRequest
 from .security import utcnow
 from .serialization import json_safe, object_id
+from .mongo_async import aggregate_list
 
 master = APIRouter(prefix="/master", tags=["accountant"])
 
@@ -273,7 +274,7 @@ async def master_totals(
             date_from, date_to, column_filters,
         )
     )
-    result = await _database(request).transactions.aggregate(
+    result = await aggregate_list(_database(request).transactions, 
         [
             {"$match": query},
             {
@@ -305,7 +306,7 @@ async def master_totals(
                 }
             },
         ]
-    ).to_list(1)
+    , 1)
     if result:
         return {
             "tzs": float(result[0].get("tzs_total") or 0),
@@ -341,7 +342,7 @@ async def master_month_totals(
             }
         },
     ]
-    docs = await _database(request).transactions.aggregate(pipeline).to_list(12)
+    docs = await aggregate_list(_database(request).transactions, pipeline, 12)
     months = {
         str(int(doc["_id"])): {
             "tzs": float(doc.get("tzs") or 0),
@@ -396,7 +397,7 @@ async def master_years(request: Request, _manager: Manager) -> dict:
         {"$group": {"_id": "$years"}},
         {"$sort": {"_id": -1}},
     ]
-    docs = await _database(request).transactions.aggregate(pipeline).to_list(50)
+    docs = await aggregate_list(_database(request).transactions, pipeline, 50)
     years = [int(d["_id"]) for d in docs if d.get("_id") is not None]
     if not years:
         y = date.today().year
@@ -523,14 +524,14 @@ async def master_column_values(
             else {"$eq": [{"$toUpper": "$currency"}, "USD"]}
         )
         decimals = 0 if field == "tzs" else 2
-        docs = await db.transactions.aggregate(
+        docs = await aggregate_list(db.transactions, 
             [
                 {"$match": query},
                 {"$match": {"$expr": cur_match}},
                 {"$group": {"_id": "$amount"}},
                 {"$limit": 5000},
             ]
-        ).to_list(5000)
+        , 5000)
         return {
             "items": sorted(
                 {

@@ -17,11 +17,31 @@ def _app_root() -> Path:
 
 
 def _load_env() -> None:
-    # Bundled .env (inside PyInstaller extract dir for one-file builds).
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        load_dotenv(Path(sys._MEIPASS) / ".env")
-        load_dotenv(Path(sys._MEIPASS) / ".env.build")
-    # .env beside the exe (lets IT update connection without a full rebuild).
+    # Bundled .env (PyInstaller onedir uses _MEIPASS → _internal; also try
+    # common onedir layouts so production never silently falls back to
+    # http://127.0.0.1:8000).
+    if getattr(sys, "frozen", False):
+        candidates: list[Path] = []
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass))
+        root = _app_root()
+        candidates.append(root / "_internal")
+        candidates.append(root)
+        seen: set[Path] = set()
+        for base in candidates:
+            try:
+                resolved = base.resolve()
+            except OSError:
+                resolved = base
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            load_dotenv(resolved / ".env")
+            load_dotenv(resolved / ".env.build")
+        # Sidecar next to the .exe always wins (IT override without rebuild).
+        load_dotenv(root / ".env", override=True)
+        return
     load_dotenv(_app_root() / ".env", override=True)
 
 

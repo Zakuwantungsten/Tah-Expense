@@ -28,6 +28,7 @@ from .accountant_overview_ops import (
 )
 from .dependencies import require_roles
 from .serialization import json_safe
+from .mongo_async import aggregate_list
 
 overview = APIRouter(prefix="/overview", tags=["accountant"])
 
@@ -65,7 +66,7 @@ async def _supplier_payments_totals(db: Any, year: int) -> dict[str, Any]:
         return {"count": 0, "tzs": 0.0, "usd": 0.0}
     year_start = datetime(year, 1, 1)
     year_end = datetime(year, 12, 31, 23, 59, 59)
-    result = await db.transactions.aggregate(
+    result = await aggregate_list(db.transactions, 
         [
             {
                 "$match": {
@@ -91,7 +92,7 @@ async def _supplier_payments_totals(db: Any, year: int) -> dict[str, Any]:
                 }
             },
         ]
-    ).to_list(1)
+    , 1)
     if not result:
         return {"count": 0, "tzs": 0.0, "usd": 0.0}
     row = result[0]
@@ -105,7 +106,7 @@ async def _supplier_payments_totals(db: Any, year: int) -> dict[str, Any]:
 async def _master_month_totals(db: Any, year: int) -> dict[int, dict[str, Any]]:
     start = datetime(year, 1, 1)
     end = datetime(year, 12, 31, 23, 59, 59)
-    docs = await db.transactions.aggregate(
+    docs = await aggregate_list(db.transactions, 
         [
             {
                 "$match": {
@@ -125,7 +126,7 @@ async def _master_month_totals(db: Any, year: int) -> dict[int, dict[str, Any]]:
                 }
             },
         ]
-    ).to_list(12)
+    , 12)
     return {
         int(doc["_id"]): {
             "tzs": float(doc.get("tzs") or 0.0),
@@ -153,7 +154,7 @@ async def _month_sum_map(
 async def _overview_zmw_feed_month_totals(db: Any, year: int) -> dict[int, float]:
     start, end = year_window(year)
     toll_docs, zambia_docs = await asyncio.gather(
-        db.imported_feeds.aggregate(
+        aggregate_list(db.imported_feeds, 
             [
                 {
                     "$match": {
@@ -168,8 +169,8 @@ async def _overview_zmw_feed_month_totals(db: Any, year: int) -> dict[int, float
                     }
                 },
             ]
-        ).to_list(length=None),
-        db.imported_feeds.aggregate(
+        , length=None),
+        aggregate_list(db.imported_feeds, 
             [
                 {
                     "$match": {
@@ -184,7 +185,7 @@ async def _overview_zmw_feed_month_totals(db: Any, year: int) -> dict[int, float
                     }
                 },
             ]
-        ).to_list(length=None),
+        , length=None),
     )
     toll = await _month_sum_map(toll_docs)
     zambia = await _month_sum_map(zambia_docs)
@@ -194,7 +195,7 @@ async def _overview_zmw_feed_month_totals(db: Any, year: int) -> dict[int, float
 async def _overview_usd_feed_month_totals(db: Any, year: int) -> dict[int, float]:
     start, end = year_window(year)
     congo_docs, kimvi_docs, parking_docs, afritrack_docs = await asyncio.gather(
-        db.separate_expenses.aggregate(
+        aggregate_list(db.separate_expenses, 
             [
                 {
                     "$match": {
@@ -222,8 +223,8 @@ async def _overview_usd_feed_month_totals(db: Any, year: int) -> dict[int, float
                     }
                 },
             ]
-        ).to_list(length=None),
-        db.separate_expenses.aggregate(
+        , length=None),
+        aggregate_list(db.separate_expenses, 
             [
                 {
                     "$match": {
@@ -251,8 +252,8 @@ async def _overview_usd_feed_month_totals(db: Any, year: int) -> dict[int, float
                     }
                 },
             ]
-        ).to_list(length=None),
-        db.imported_feeds.aggregate(
+        , length=None),
+        aggregate_list(db.imported_feeds, 
             [
                 {
                     "$match": {
@@ -267,8 +268,8 @@ async def _overview_usd_feed_month_totals(db: Any, year: int) -> dict[int, float
                     }
                 },
             ]
-        ).to_list(length=None),
-        db.imported_feeds.aggregate(
+        , length=None),
+        aggregate_list(db.imported_feeds, 
             [
                 {
                     "$match": {
@@ -283,7 +284,7 @@ async def _overview_usd_feed_month_totals(db: Any, year: int) -> dict[int, float
                     }
                 },
             ]
-        ).to_list(length=None),
+        , length=None),
     )
     congo = await _month_sum_map(congo_docs)
     kimvi = await _month_sum_map(kimvi_docs)
@@ -304,7 +305,7 @@ async def _compute_kpis(db: Any, year: int) -> dict[str, Any]:
         db.transactions.count_documents(
             {"verified": False, "rejected": {"$ne": True}}
         ),
-        db.transactions.aggregate(
+        aggregate_list(db.transactions, 
             [
                 {
                     "$match": {
@@ -322,8 +323,8 @@ async def _compute_kpis(db: Any, year: int) -> dict[str, Any]:
                     }
                 },
             ]
-        ).to_list(1),
-        db.transactions.aggregate(
+        , 1),
+        aggregate_list(db.transactions, 
             [
                 {"$match": {"date": {"$gte": month_start}}},
                 {
@@ -334,7 +335,7 @@ async def _compute_kpis(db: Any, year: int) -> dict[str, Any]:
                     }
                 },
             ]
-        ).to_list(1),
+        , 1),
     )
     ytd = ytd_res[0] if ytd_res else {
         "count": 0,
@@ -357,7 +358,7 @@ async def _compute_kpis(db: Any, year: int) -> dict[str, Any]:
 async def _compute_categories(db: Any, year: int, top_n: int) -> list[dict[str, Any]]:
     year_start = datetime(year, 1, 1)
     year_end = datetime(year, 12, 31, 23, 59, 59)
-    docs = await db.transactions.aggregate(
+    docs = await aggregate_list(db.transactions, 
         [
             {
                 "$match": {
@@ -379,7 +380,7 @@ async def _compute_categories(db: Any, year: int, top_n: int) -> list[dict[str, 
             },
             {"$sort": {"tzs": -1, "usd": -1, "zmw": -1}},
         ]
-    ).to_list(None)
+    , None)
     if not docs:
         return []
 
@@ -420,7 +421,7 @@ async def _compute_categories(db: Any, year: int, top_n: int) -> list[dict[str, 
 async def _compute_receipts(db: Any, year: int) -> dict[str, Any]:
     year_start = datetime(year, 1, 1)
     year_end = datetime(year, 12, 31, 23, 59, 59)
-    docs = await db.transactions.aggregate(
+    docs = await aggregate_list(db.transactions, 
         [
             {
                 "$match": {
@@ -430,7 +431,7 @@ async def _compute_receipts(db: Any, year: int) -> dict[str, Any]:
             },
             {"$group": {"_id": "$receipt_status", "count": {"$sum": 1}}},
         ]
-    ).to_list(None)
+    , None)
     received = pending = missing = 0
     for doc in docs:
         status = (doc.get("_id") or "pending").lower()
@@ -479,7 +480,7 @@ async def _compute_fuel_liters(db: Any, year: int) -> dict[str, Any]:
         db.transactions.find(
             diesel_match, projection={"date": 1, "description": 1}
         ).to_list(length=None),
-        db.imported_feeds.aggregate(station_pipeline).to_list(length=None),
+        aggregate_list(db.imported_feeds, station_pipeline, length=None),
     )
     accumulate_diesel_cash_fuel_liters(cash_docs, store)
     for doc in station_docs:

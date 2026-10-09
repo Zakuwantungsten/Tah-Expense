@@ -41,6 +41,7 @@ from .schemas import (
 )
 from .security import utcnow
 from .serialization import json_safe, object_id
+from .mongo_async import aggregate_list
 
 reconciliation = APIRouter(prefix="/reconciliation", tags=["reconciliation"])
 Manager = Annotated[dict[str, Any], Depends(require_roles("admin", "accountant"))]
@@ -170,12 +171,10 @@ async def row_totals(
 ) -> dict[str, Any]:
     table = _table(table)
     query = build_query(table, station)
-    rows = await (
-        _database(request)
-        .reconciliation_entries.aggregate(
-            [{"$match": query}, totals_group_stage()]
-        )
-        .to_list(1)
+    rows = await aggregate_list(
+        _database(request).reconciliation_entries,
+        [{"$match": query}, totals_group_stage()],
+        1,
     )
     return totals_from_aggregate(rows)
 
@@ -234,12 +233,10 @@ async def all_record_totals(
 ) -> dict[str, Any]:
     table = _table(table)
     query = all_records_query(table, station, search, year, month)
-    rows = await (
-        _database(request)
-        .reconciliation_entries.aggregate(
-            [{"$match": query}, totals_group_stage()]
-        )
-        .to_list(1)
+    rows = await aggregate_list(
+        _database(request).reconciliation_entries,
+        [{"$match": query}, totals_group_stage()],
+        1,
     )
     return totals_from_aggregate(rows)
 
@@ -258,7 +255,7 @@ async def available_years(
         years_t1_pipeline(table, station),
         years_import_pipeline(table, station),
     ):
-        for doc in await db.reconciliation_entries.aggregate(pipeline).to_list(
+        for doc in await aggregate_list(db.reconciliation_entries, pipeline, 
             length=None
         ):
             yr = doc.get("_id")
@@ -272,10 +269,10 @@ async def list_uploads(
     table: str, request: Request, _manager: Manager
 ) -> dict[str, Any]:
     table = _table(table)
-    docs = await (
-        _database(request)
-        .reconciliation_entries.aggregate(uploads_pipeline(table))
-        .to_list(length=None)
+    docs = await aggregate_list(
+        _database(request).reconciliation_entries,
+        uploads_pipeline(table),
+        length=None,
     )
     items = []
     for doc in docs:
@@ -293,12 +290,10 @@ async def upload_stations(
     table = _table(table)
     if not (upload_id or "").strip():
         return {"items": []}
-    docs = await (
-        _database(request)
-        .reconciliation_entries.aggregate(
-            upload_stations_pipeline(upload_id.strip(), table)
-        )
-        .to_list(length=None)
+    docs = await aggregate_list(
+        _database(request).reconciliation_entries,
+        upload_stations_pipeline(upload_id.strip(), table),
+        length=None,
     )
     docs.sort(key=upload_station_sort_key)
     items = []
@@ -360,12 +355,10 @@ async def upload_totals(
 ) -> dict[str, Any]:
     table = _table(table)
     query = upload_record_query(upload_id, table, station)
-    rows = await (
-        _database(request)
-        .reconciliation_entries.aggregate(
-            [{"$match": query}, totals_group_stage()]
-        )
-        .to_list(1)
+    rows = await aggregate_list(
+        _database(request).reconciliation_entries,
+        [{"$match": query}, totals_group_stage()],
+        1,
     )
     return totals_from_aggregate(rows)
 

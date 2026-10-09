@@ -1,9 +1,12 @@
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pymongo.errors import DuplicateKeyError
+
+_log = logging.getLogger("tahmeed.api")
 
 
 class ApiError(Exception):
@@ -44,7 +47,13 @@ def install_error_handlers(app: FastAPI) -> None:
         )
 
     @app.exception_handler(Exception)
-    async def unexpected_error(request: Request, _exc: Exception) -> JSONResponse:
+    async def unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        _log.exception(
+            "Unhandled API error on %s %s",
+            request.method,
+            request.url.path,
+            exc_info=exc,
+        )
         return JSONResponse(
             status_code=500,
             content=payload("internal_error", "An unexpected server error occurred", request),

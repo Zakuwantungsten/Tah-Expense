@@ -10,6 +10,23 @@ import httpx
 from tahmeed.config import API_BASE_URL
 
 
+def _ensure_ssl_certs() -> None:
+    """Point OpenSSL at certifi when frozen (common PyInstaller SSL failure)."""
+    try:
+        import os
+
+        import certifi
+
+        cacert = certifi.where()
+        os.environ.setdefault("SSL_CERT_FILE", cacert)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", cacert)
+    except Exception:
+        pass
+
+
+_ensure_ssl_certs()
+
+
 class ApiError(RuntimeError):
     """A normalized error returned by the Tahmeed API."""
 
@@ -57,11 +74,19 @@ class ApiClient:
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
+            verify: Any = True
+            try:
+                import certifi
+
+                verify = certifi.where()
+            except Exception:
+                verify = True
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=httpx.Timeout(15.0, connect=5.0),
                 transport=self._transport,
                 headers={"Accept": "application/json"},
+                verify=verify,
             )
         return self._client
 
@@ -149,10 +174,14 @@ class ApiClient:
         try:
             response = await self._http().request(method, path, headers=headers, **kwargs)
         except httpx.TimeoutException as exc:
-            raise ApiConnectionError("The API request timed out.", code="timeout") from exc
-        except httpx.RequestError as exc:
             raise ApiConnectionError(
-                "Unable to connect to the Tahmeed API.", code="connection_error"
+                f"The API request timed out ({self._base_url}).", code="timeout"
+            ) from exc
+        except httpx.RequestError as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            raise ApiConnectionError(
+                f"Unable to connect to the Tahmeed API ({self._base_url.rstrip('/')}). {detail}",
+                code="connection_error",
             ) from exc
 
         if auth and response.status_code == 401 and await self._refresh(rejected_token):
@@ -163,11 +192,13 @@ class ApiClient:
                 )
             except httpx.TimeoutException as exc:
                 raise ApiConnectionError(
-                    "The API request timed out.", code="timeout"
+                    f"The API request timed out ({self._base_url}).", code="timeout"
                 ) from exc
             except httpx.RequestError as exc:
+                detail = str(exc).strip() or type(exc).__name__
                 raise ApiConnectionError(
-                    "Unable to connect to the Tahmeed API.", code="connection_error"
+                    f"Unable to connect to the Tahmeed API ({self._base_url.rstrip('/')}). {detail}",
+                    code="connection_error",
                 ) from exc
 
         if response.status_code >= 400:

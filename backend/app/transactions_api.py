@@ -26,6 +26,7 @@ from .schemas import (
 from .security import utcnow
 from .serialization import json_safe, object_id
 from .attachments_api import attachments as attachments_router
+from .mongo_async import aggregate_list
 from .transaction_ops import (
     DRAFT_BASE_MATCH,
     REGISTER_DAY_EXPR,
@@ -264,12 +265,12 @@ async def overview_stats(request: Request, _actor: RegisterActor) -> dict:
             },
         ]
 
-    today_res = await db.transactions.aggregate(
+    today_res = await aggregate_list(db.transactions, 
         _money_group({"date": {"$gte": today_start, "$lte": today_end}})
-    ).to_list(1)
-    month_res = await db.transactions.aggregate(
+    , 1)
+    month_res = await aggregate_list(db.transactions, 
         _money_group({"date": {"$gte": month_start}})
-    ).to_list(1)
+    , 1)
     recent_docs = (
         await db.transactions.find({})
         .sort([("date", -1), ("created_at", -1)])
@@ -396,7 +397,7 @@ async def daily_summaries(
         {"$sort": {"_id.year": -1, "_id.month": -1, "_id.day": -1}},
         {"$limit": limit},
     ]
-    docs = await _database(request).transactions.aggregate(pipeline).to_list(length=limit)
+    docs = await aggregate_list(_database(request).transactions, pipeline, length=limit)
     items = []
     for doc in docs:
         group = doc["_id"]
@@ -498,7 +499,7 @@ async def available_months(request: Request, _actor: RegisterActor) -> dict:
         },
         {"$sort": {"_id.year": -1, "_id.month": -1}},
     ]
-    docs = await _database(request).transactions.aggregate(pipeline).to_list(length=None)
+    docs = await aggregate_list(_database(request).transactions, pipeline, length=None)
     items = [
         {"year": int(doc["_id"]["year"]), "month": int(doc["_id"]["month"])}
         for doc in docs
@@ -513,7 +514,7 @@ async def available_years(request: Request, _actor: RegisterActor) -> dict:
         {"$group": {"_id": {"$year": "$date"}}},
         {"$sort": {"_id": -1}},
     ]
-    docs = await _database(request).transactions.aggregate(pipeline).to_list(length=40)
+    docs = await aggregate_list(_database(request).transactions, pipeline, length=40)
     years = [int(doc["_id"]) for doc in docs if doc.get("_id") is not None]
     today_y = date.today().year
     for year in (today_y + 1, today_y, today_y - 1):
@@ -550,7 +551,7 @@ async def search_descriptions(
             {"$limit": limit},
         ]
     )
-    docs = await _database(request).transactions.aggregate(pipeline).to_list(length=limit)
+    docs = await aggregate_list(_database(request).transactions, pipeline, length=limit)
     items = [str(doc.get("_id") or "").strip() for doc in docs if doc.get("_id")]
     items = [name for name in items if name]
     return {"items": items, "total": len(items)}
@@ -792,7 +793,7 @@ async def draft_day_summaries(
         {"$sort": {"_id.year": -1, "_id.month": -1, "_id.day": -1}},
         {"$limit": limit},
     ]
-    docs = await _database(request).transactions.aggregate(pipeline).to_list(length=limit)
+    docs = await aggregate_list(_database(request).transactions, pipeline, length=limit)
     items = []
     for doc in docs:
         group = doc["_id"]
@@ -894,12 +895,12 @@ async def next_day_order(
     _actor: RegisterActor,
     target_date: date = Query(..., alias="date"),
 ) -> dict:
-    docs = await _database(request).transactions.aggregate(
+    docs = await aggregate_list(_database(request).transactions, 
         [
             {"$match": register_day_clause(target_date)},
             {"$group": {"_id": None, "mx": {"$max": "$day_order"}}},
         ]
-    ).to_list(1)
+    , 1)
     mx = docs[0].get("mx") if docs else None
     if mx is None:
         return {"next": 0}
