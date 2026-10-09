@@ -1,3 +1,4 @@
+- 4.6.3: ship icon/splash polish; pair with API deploy that fixes overview/feeds totals (PyMongo async aggregate)
 - 4.6.2: sharper 3D desktop icon + modern circular splash
 - 4.6.1: desktop talks only to https://api.meedexpe.com (no Tailscale, no desktop Mongo). Connectivity is API health only.
 - Fixed minor bugs
