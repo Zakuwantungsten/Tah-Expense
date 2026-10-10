@@ -41,6 +41,7 @@ class QbTxnToolbar(QFrame):
     attach_clicked = Signal()
     export_clicked = Signal(str)  # "xlsx" | "csv" | "pdf"
     import_clicked = Signal()
+    day_issues_clicked = Signal()
     today_clicked = Signal()
     edit_clicked = Signal()
     submit_clicked = Signal()
@@ -230,6 +231,14 @@ class QbTxnToolbar(QFrame):
             )
             self._btn_import.clicked.connect(self.import_clicked.emit)
             lay.addWidget(self._btn_import)
+
+            self._btn_day_issues = self._tool_btn(
+                "mdi.alert-decagram-outline",
+                "Day Issues",
+                "Map unmapped descriptions (Payee + Item)",
+            )
+            self._btn_day_issues.clicked.connect(self.day_issues_clicked.emit)
+            lay.addWidget(self._btn_day_issues)
 
             self._btn_today = self._tool_btn(
                 "mdi.calendar-today", "Today", "Jump to today"

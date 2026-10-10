@@ -487,24 +487,29 @@ async def search_descriptions(prefix: str, limit: int = 12) -> List[str]:
     return [str(name) for name in payload.get("items") or [] if str(name).strip()]
 
 
-async def resolve_item_name_for_description(description: str) -> Optional[str]:
-    """Item/category for a description: saved map first, then prior entries.
+async def resolve_mapping_fields_for_description(
+    description: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Item + payee for a description: saved map first, then prior item history.
 
-    Prefers verified history when no mapping exists. Returns None when neither
-    source has an item.
+    Returns ``(item_name, payee)``. Payee only comes from a saved description
+    map (history fallback fills item only). Either side may be None.
     """
     from tahmeed.services.description_mapping_service import (
         normalize_description,
-        resolve_category_for_description,
+        resolve_mapping_for_description,
     )
 
     key = normalize_description(description)
     if not key:
-        return None
+        return None, None
     try:
-        mapped = await resolve_category_for_description(description)
-        if mapped and (mapped[1] or "").strip():
-            return mapped[1].strip()
+        mapping = await resolve_mapping_for_description(description)
+        if mapping is not None:
+            item = (mapping.category_name or "").strip() or None
+            payee = (mapping.payee or "").strip() or None
+            if item or payee:
+                return item, payee
     except Exception:
         pass
 
@@ -513,8 +518,15 @@ async def resolve_item_name_for_description(description: str) -> Optional[str]:
         "v1/transactions/resolve-item",
         params={"description": key},
     )
-    item = payload.get("item")
-    return (str(item).strip() if item else None) or None
+    item = (str(payload.get("item") or "").strip() or None)
+    payee = (str(payload.get("payee") or "").strip() or None)
+    return item, payee
+
+
+async def resolve_item_name_for_description(description: str) -> Optional[str]:
+    """Item/category for a description (wrapper around mapping-fields resolve)."""
+    item, _payee = await resolve_mapping_fields_for_description(description)
+    return item
 
 
 async def get_rejected_transactions_for_cashier(

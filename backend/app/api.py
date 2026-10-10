@@ -36,6 +36,7 @@ from .schemas import (
     LoginRequest,
     MappingWrite,
     PatchDocument,
+    PayeeWrite,
     PeopleWrite,
     RefreshRequest,
     RuleWrite,
@@ -87,6 +88,7 @@ rules = APIRouter(prefix="/keyword-rules", tags=["keyword-rules"])
 mappings = APIRouter(prefix="/description-mappings", tags=["description-mappings"])
 fleet = APIRouter(tags=["fleet"])
 people = APIRouter(prefix="/people", tags=["people"])
+payees = APIRouter(prefix="/payees", tags=["payees"])
 backups = APIRouter(prefix="/backups", tags=["backups"])
 accountant = APIRouter(prefix="/accountant", tags=["accountant"])
 accountant.include_router(accountant_inbox_router)
@@ -111,6 +113,8 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "confidence_threshold": 75,
     "restrict_items": False,
     "defer_item_to_verify": False,
+    # When True, cashiers may Submit for Verify even if Day Issues remain.
+    "allow_submit_with_day_issues": False,
     "restrict_trucks": True,
     "duplicate_check_days": 5,
     "allowed_truck_labels": ["YARD", "GARAGE"],
@@ -972,9 +976,12 @@ async def list_collection(
     if not include_inactive:
         query["active"] = {"$ne": False}
     if search:
+        search_fields = ("name", "number", "pattern", "description")
+        if collection == "description_mappings":
+            search_fields = ("description", "payee", "category_name")
         query["$or"] = [
             {field: {"$regex": re.escape(search), "$options": "i"}}
-            for field in ("name", "number", "pattern", "description")
+            for field in search_fields
         ]
     db = database(request)
     total = await db[collection].count_documents(query)
@@ -1533,6 +1540,88 @@ async def delete_person(name: str, request: Request, manager: Manager) -> Respon
     return Response(status_code=204)
 
 
+async def list_payees(
+    request: Request,
+    search: str,
+    active: bool | None,
+    limit: int,
+    offset: int,
+) -> dict:
+    query: dict[str, Any] = {}
+    if search:
+        query["name"] = {"$regex": re.escape(search), "$options": "i"}
+    if active is not None:
+        query["active"] = active
+    collection = database(request)["payees"]
+    total = await collection.count_documents(query)
+    docs = (
+        await collection.find(query)
+        .sort([("name", 1), ("_id", 1)])
+        .skip(offset)
+        .limit(limit)
+        .to_list()
+    )
+    return {
+        "items": json_safe(docs),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@payees.get("")
+async def get_payees(
+    request: Request,
+    _user: Authenticated,
+    search: str = "",
+    active: bool | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    return await list_payees(request, search, active, limit, offset)
+
+
+@payees.put("/{name}")
+async def upsert_payee(name: str, body: PayeeWrite, request: Request, manager: Manager) -> dict:
+    normalized = " ".join(name.upper().split())
+    if normalized != body.name:
+        raise ApiError(422, "name_mismatch", "Path and body names must match")
+    db = database(request)
+    payload = body.model_dump()
+    doc = await db["payees"].find_one_and_update(
+        {"name": body.name},
+        {"$set": payload},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    await record_operation_event(
+        db,
+        action="payees.upsert",
+        actor=manager,
+        request=request,
+        entity_type="payee",
+        entity_ids=[body.name],
+        details={"active": body.active},
+    )
+    return json_safe(doc)
+
+
+@payees.delete("/{name}", status_code=204)
+async def delete_payee(name: str, request: Request, manager: Manager) -> Response:
+    normalized = " ".join(name.upper().split())
+    db = database(request)
+    await db["payees"].delete_one({"name": normalized})
+    await record_operation_event(
+        db,
+        action="payees.delete",
+        actor=manager,
+        request=request,
+        entity_type="payee",
+        entity_ids=[normalized],
+    )
+    return Response(status_code=204)
+
+
 @backups.get("")
 async def list_backup_jobs(
     request: Request,
@@ -1606,6 +1695,7 @@ for router in (
     mappings,
     fleet,
     people,
+    payees,
     backups,
     accountant,
     settings_api,

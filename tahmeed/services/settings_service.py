@@ -12,6 +12,8 @@ DEFAULTS = {
     # When True cashiers may save table rows with description only (no item).
     # The accountant assigns items on verify; mappings are remembered.
     "defer_item_to_verify": False,
+    # When True cashiers may Submit for Verify even if Day Issues remain.
+    "allow_submit_with_day_issues": False,
     # When True the cashier register's Truck No. column only accepts numbers that
     # exist in the accountant's fleet registries (trucks, trailers, motor vehicles).
     # Default On — always intended.

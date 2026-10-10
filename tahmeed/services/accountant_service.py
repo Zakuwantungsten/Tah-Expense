@@ -1663,10 +1663,14 @@ async def update_transaction_category(
     tx_id: ObjectId,
     category_name: str,
     category_id: Optional[ObjectId] = None,
+    *,
+    payee: Optional[str] = None,
 ) -> bool:
     body: dict = {"category_name": category_name}
     if category_id is not None:
         body["category_id"] = str(category_id)
+    if payee is not None:
+        body["payee"] = " ".join((payee or "").strip().upper().split())
     payload = await api_client.request(
         "PATCH",
         f"v1/accountant/transactions/{tx_id}/category",
@@ -1679,8 +1683,10 @@ async def bulk_update_transaction_category(
     tx_ids: List[ObjectId],
     category_name: str,
     category_id: Optional[ObjectId] = None,
+    *,
+    payee: Optional[str] = None,
 ) -> int:
-    """Assign the same item/category to many transactions in one round-trip."""
+    """Assign the same item/category (and optional payee) to many transactions."""
     if not tx_ids:
         return 0
     body: dict = {
@@ -1689,6 +1695,8 @@ async def bulk_update_transaction_category(
     }
     if category_id is not None:
         body["category_id"] = str(category_id)
+    if payee is not None:
+        body["payee"] = " ".join((payee or "").strip().upper().split())
     payload = await api_client.request(
         "POST",
         "v1/accountant/transactions/bulk-category",

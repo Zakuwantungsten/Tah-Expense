@@ -106,15 +106,50 @@ def test_description_inline_preview_and_tab_accept() -> None:
 
 @pytest.mark.asyncio
 async def test_resolve_item_prefers_saved_mapping(monkeypatch) -> None:
+    from tahmeed.models.description_mapping import DescriptionMapping
+    from bson import ObjectId
+
     async def mapped(description: str, cache=None):
-        return ("cat-id", "Parking")
+        return DescriptionMapping(
+            description_key="PARKING CONGO",
+            description="PARKING CONGO",
+            category_id=ObjectId(),
+            category_name="Parking",
+            payee="PARKING DAR",
+        )
 
     monkeypatch.setattr(
-        "tahmeed.services.description_mapping_service.resolve_category_for_description",
+        "tahmeed.services.description_mapping_service.resolve_mapping_for_description",
         mapped,
     )
     name = await cs.resolve_item_name_for_description("PARKING CONGO")
     assert name == "Parking"
+    item, payee = await cs.resolve_mapping_fields_for_description("PARKING CONGO")
+    assert item == "Parking"
+    assert payee == "PARKING DAR"
+
+
+@pytest.mark.asyncio
+async def test_resolve_mapping_fields_payee_only_map(monkeypatch) -> None:
+    from tahmeed.models.description_mapping import DescriptionMapping
+    from bson import ObjectId
+
+    async def mapped(description: str, cache=None):
+        return DescriptionMapping(
+            description_key="FEE",
+            description="FEE",
+            category_id=ObjectId(),
+            category_name="Facilitation",
+            payee="",
+        )
+
+    monkeypatch.setattr(
+        "tahmeed.services.description_mapping_service.resolve_mapping_for_description",
+        mapped,
+    )
+    item, payee = await cs.resolve_mapping_fields_for_description("FEE")
+    assert item == "Facilitation"
+    assert payee is None
 
 
 @pytest.mark.asyncio
@@ -123,35 +158,18 @@ async def test_resolve_item_falls_back_to_verified_history(monkeypatch) -> None:
         return None
 
     monkeypatch.setattr(
-        "tahmeed.services.description_mapping_service.resolve_category_for_description",
+        "tahmeed.services.description_mapping_service.resolve_mapping_for_description",
         none_mapped,
     )
 
-    class _Cursor:
-        def __init__(self, docs):
-            self._docs = docs
+    async def fake_request(method, path, params=None, **_kw):
+        assert method == "GET"
+        assert path == "v1/transactions/resolve-item"
+        return {"item": "Diesel CSH", "payee": None}
 
-        def sort(self, *_a, **_k):
-            return self
-
-        def limit(self, *_a, **_k):
-            return self
-
-        async def to_list(self, length=1):
-            return self._docs[:length]
-
-    class _Coll:
-        def __init__(self):
-            self.queries = []
-
-        def find(self, query, *_a, **_k):
-            self.queries.append(query)
-            if query.get("verified") is True:
-                return _Cursor([{"item": "Diesel CSH", "category_name": "Diesel CSH"}])
-            return _Cursor([])
-
-    coll = _Coll()
-    monkeypatch.setattr(cs, "get_db", lambda: SimpleNamespace(transactions=coll))
+    monkeypatch.setattr(cs.api_client, "request", fake_request)
     name = await cs.resolve_item_name_for_description("DIESEL")
     assert name == "Diesel CSH"
-    assert any(q.get("verified") is True for q in coll.queries)
+    item, payee = await cs.resolve_mapping_fields_for_description("DIESEL")
+    assert item == "Diesel CSH"
+    assert payee is None

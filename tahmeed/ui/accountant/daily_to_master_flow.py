@@ -7,21 +7,33 @@ from typing import Optional
 from bson import ObjectId
 from PySide6.QtWidgets import QFileDialog, QWidget
 
-from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.services.daily_import_service import (
     DailyImportCancelled,
-    apply_mapping_to_preview,
     commit_daily_to_master,
     preview_daily_import,
     preview_rows_as_truck_dicts,
 )
 from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
-from tahmeed.ui.dialog_theme import show_critical, show_info
+from tahmeed.ui.dialog_theme import show_critical, show_info, show_warning
 from tahmeed.ui.dialogs.daily_import_preview_dialog import DailyImportPreviewDialog
 from tahmeed.ui.dialogs.date_outlier_dialog import resolve_import_date_policy
-from tahmeed.ui.dialogs.description_mapping_flow import prompt_unmapped_descriptions
 from tahmeed.ui.dialogs.import_problem_rows_dialog import prompt_import_problems
 from tahmeed.ui.widgets.upload_busy import UploadBusy, UploadCancelled
+
+
+def _unmapped_block_message(unmapped: dict) -> str:
+    n = len(unmapped)
+    sample = sorted(unmapped.keys())[:8]
+    lines = "\n".join(f"  · {d}" for d in sample)
+    more = f"\n  · …and {n - len(sample):,} more" if n > len(sample) else ""
+    return (
+        f"{n:,} description(s) still need Payee + Item mapping before "
+        "this file can go to Master Expenses:\n\n"
+        f"{lines}{more}\n\n"
+        "Map them in Day Issues (for a register day) or Description Maps, "
+        "then import again.\n"
+        "Master import does not open one-by-one mapping dialogs."
+    )
 
 
 async def run_daily_to_master_flow(
@@ -29,9 +41,10 @@ async def run_daily_to_master_flow(
     *,
     verified_by: Optional[ObjectId] = None,
 ) -> Optional[dict]:
-    """Map → date policy → confirm → truck gate → insert verified. No dedupe.
+    """Date policy → confirm → truck gate → insert verified. No dedupe.
 
-    Returns the commit result dict, or None if cancelled / aborted.
+    Unmapped descriptions block the import (policy A). Returns the commit
+    result dict, or None if cancelled / aborted.
     """
     path, _ = QFileDialog.getOpenFileName(
         parent,
@@ -42,8 +55,6 @@ async def run_daily_to_master_flow(
     if not path:
         return None
 
-    categories = None
-    items_error = None
     try:
         with UploadBusy(
             parent,
@@ -64,14 +75,6 @@ async def run_daily_to_master_flow(
                     else ""
                 )
             )
-            if preview.rows and preview.unmapped:
-                busy.update("Loading items…")
-                try:
-                    categories = await busy.await_or_cancel(get_payment_target_categories())
-                except UploadCancelled:
-                    raise
-                except Exception as exc:
-                    items_error = exc
     except (UploadCancelled, DailyImportCancelled):
         return None
     except Exception as exc:
@@ -79,12 +82,6 @@ async def run_daily_to_master_flow(
             parent,
             "Import Rejected",
             f"Could not import this file:\n\n{exc}",
-        )
-        return None
-
-    if items_error is not None:
-        show_critical(
-            parent, "Import Error", f"Could not load items:\n{items_error}"
         )
         return None
 
@@ -102,25 +99,10 @@ async def run_daily_to_master_flow(
         )
         return None
 
-    # ── Description → item (required — no skip; going straight to Master) ─
+    # ── Description → Payee + Item required (no one-by-one dialog) ─────────
     if preview.unmapped:
-        if categories is None:
-            try:
-                categories = await get_payment_target_categories()
-            except Exception as exc:
-                show_critical(
-                    parent, "Import Error", f"Could not load items:\n{exc}"
-                )
-                return None
-        ok = await prompt_unmapped_descriptions(
-            preview,
-            categories or [],
-            parent,
-            allow_skip=False,
-            apply_mapping=apply_mapping_to_preview,
-        )
-        if not ok:
-            return None
+        show_warning(parent, "Map descriptions first", _unmapped_block_message(preview.unmapped))
+        return None
 
     # ── One reconciled date for the whole upload ──────────────────────────
     if not resolve_import_date_policy(preview, parent=parent):

@@ -102,8 +102,8 @@ async def test_apply_assignment_reuses_item_and_saves_each_description(monkeypat
     cat = Category(_id=ObjectId(), name="Parking")
     saved: list[tuple] = []
 
-    async def fake_save(description, category_id, category_name):
-        saved.append((description, category_id, category_name))
+    async def fake_save(description, category_id, category_name, payee=""):
+        saved.append((description, category_id, category_name, payee))
 
     monkeypatch.setattr(mas, "create_item_for_mapping", AsyncMock())
     monkeypatch.setattr(
@@ -112,14 +112,14 @@ async def test_apply_assignment_reuses_item_and_saves_each_description(monkeypat
     )
     chosen, failed = await mas.apply_assignment_to_descriptions(
         ["TRIANGLE", "PARKING KURASINI", " triangle "],
-        MappingAssignment(category=cat),
+        MappingAssignment(category=cat, payee="parking dar"),
         [cat],
     )
     assert chosen._id == cat._id
     assert failed == 0
     assert saved == [
-        ("TRIANGLE", cat._id, "Parking"),
-        ("PARKING KURASINI", cat._id, "Parking"),
+        ("TRIANGLE", cat._id, "Parking", "PARKING DAR"),
+        ("PARKING KURASINI", cat._id, "Parking", "PARKING DAR"),
     ]
     mas.create_item_for_mapping.assert_not_called()
 
@@ -132,10 +132,11 @@ async def test_apply_assignment_creates_item_once_then_maps_all(monkeypatch) -> 
     created = AsyncMock(return_value=new_cat)
     saved: list[str] = []
 
-    async def fake_save(description, category_id, category_name):
+    async def fake_save(description, category_id, category_name, payee=""):
         saved.append(description)
         assert category_id == new_cat._id
         assert category_name == "Council Fees"
+        assert payee == "SPARE PARTS"
 
     monkeypatch.setattr(mas, "create_item_for_mapping", created)
     monkeypatch.setattr(
@@ -149,6 +150,7 @@ async def test_apply_assignment_creates_item_once_then_maps_all(monkeypatch) -> 
             create_new=True,
             new_item_name="Council Fees",
             new_item_fields={"color": "#112233"},
+            payee="SPARE PARTS",
         ),
         catalog,
     )

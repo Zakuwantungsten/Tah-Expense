@@ -35,7 +35,7 @@ _T1 = "#111827"
 _T2 = "#6B7280"
 _TM = "#9CA3AF"
 
-_COL_DEFAULTS = [52, 280, 220]
+_COL_DEFAULTS = [52, 260, 180, 200]
 _SCROLL_CHUNK = 50
 
 
@@ -97,10 +97,10 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
 
 
 class _MappingEditorDialog(QDialog):
-    """Add, edit, or bulk re-assign description → item maps.
+    """Add, edit, or bulk re-assign description → Payee + Item maps.
 
     Pick an existing item, or open the same Add New Item dialog used on
-    the Items tab.
+    the Items tab. Payee is required (QuickBooks PAYEE catalog).
     """
 
     def __init__(
@@ -110,9 +110,15 @@ class _MappingEditorDialog(QDialog):
         *,
         mapping: Optional[DescriptionMapping] = None,
         mappings: Optional[List[DescriptionMapping]] = None,
+        payees: Optional[List[str]] = None,
     ) -> None:
         super().__init__(parent)
         self._categories = categories
+        self._payees = [
+            " ".join(str(p).strip().upper().split())
+            for p in (payees or [])
+            if str(p).strip()
+        ]
         entries = list(mappings or [])
         if mapping is not None and not entries:
             entries = [mapping]
@@ -130,12 +136,23 @@ class _MappingEditorDialog(QDialog):
         else:
             title = "Add Mapping"
         self.setWindowTitle(title)
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(520)
         self.setStyleSheet(
             f"QDialog {{ background: {_WHITE}; color: {_T1}; }}"
             f"QLabel {{ color: {_T1}; background: transparent; border: none; }}"
         )
         self._build(editing=editing, bulk=bulk)
+
+    def _combo_style(self) -> str:
+        return (
+            f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
+            f"background:{_WHITE};color:{_T1};font-size:12px;"
+            "font-family:'Segoe UI';padding:0 8px;}}"
+            f"QComboBox:focus{{border-color:{_BLUE};}}"
+        )
+
+    def _current_payee(self) -> str:
+        return " ".join(self._payee.currentText().upper().split())
 
     def _build(self, *, editing: bool, bulk: bool) -> None:
         vl = QVBoxLayout(self)
@@ -145,9 +162,9 @@ class _MappingEditorDialog(QDialog):
         if bulk:
             heading = f"Re-assign {len(self._entries):,} description maps"
         elif editing:
-            heading = "Edit description → item"
+            heading = "Edit description → Payee + Item"
         else:
-            heading = "Add description → item"
+            heading = "Add description → Payee + Item"
         vl.addWidget(_lbl(heading, size=15, weight=700))
 
         self._desc = QLineEdit()
@@ -169,7 +186,7 @@ class _MappingEditorDialog(QDialog):
             summary = _lbl(lines, size=12, color=_T2)
             summary.setWordWrap(True)
             vl.addWidget(_lbl(
-                "These descriptions will all point at the same item:",
+                "These descriptions will all get the same Payee + Item:",
                 size=12, color=_T2,
             ))
             vl.addWidget(summary)
@@ -184,17 +201,45 @@ class _MappingEditorDialog(QDialog):
                 )
             vl.addWidget(self._desc)
 
+        vl.addWidget(_lbl("Payee *", size=12, color=_T2))
+        self._payee = QComboBox()
+        self._payee.setEditable(True)
+        self._payee.setInsertPolicy(QComboBox.NoInsert)
+        self._payee.setFixedHeight(34)
+        self._payee.setStyleSheet(self._combo_style())
+        self._payee.addItems(self._payees)
+        payee_completer = QCompleter(self._payees, self)
+        payee_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        payee_completer.setFilterMode(Qt.MatchContains)
+        self._payee.setCompleter(payee_completer)
+        prefill_payee = ""
+        if self._mapping is not None and not bulk:
+            prefill_payee = (self._mapping.payee or "").strip().upper()
+        elif bulk:
+            shared = {
+                (e.payee or "").strip().upper()
+                for e in self._entries
+                if (e.payee or "").strip()
+            }
+            if len(shared) == 1:
+                prefill_payee = next(iter(shared))
+        if prefill_payee:
+            idx = self._payee.findText(prefill_payee)
+            if idx >= 0:
+                self._payee.setCurrentIndex(idx)
+            else:
+                self._payee.setEditText(prefill_payee)
+        else:
+            self._payee.setCurrentIndex(-1)
+            self._payee.setEditText("")
+        vl.addWidget(self._payee)
+
         vl.addWidget(_lbl("Item / Supplier *", size=12, color=_T2))
         self._combo = QComboBox()
         self._combo.setEditable(True)
         self._combo.setInsertPolicy(QComboBox.NoInsert)
         self._combo.setFixedHeight(34)
-        self._combo.setStyleSheet(
-            f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
-            f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI';padding:0 8px;}}"
-            f"QComboBox:focus{{border-color:{_BLUE};}}"
-        )
+        self._combo.setStyleSheet(self._combo_style())
         for cat in self._categories:
             self._combo.addItem(cat.name, cat._id)
         completer = QCompleter([c.name for c in self._categories], self)
@@ -247,7 +292,7 @@ class _MappingEditorDialog(QDialog):
         if self._mapping is None and not bulk:
             self._desc.setFocus()
         else:
-            self._combo.setFocus()
+            self._payee.setFocus()
 
     def _descriptions(self) -> List[str]:
         if self._entries:
@@ -262,12 +307,38 @@ class _MappingEditorDialog(QDialog):
             return self._desc.text().strip()
         return ""
 
+    def _require_payee(self) -> Optional[str]:
+        payee = self._current_payee()
+        if not payee:
+            show_warning(self, "Validation", "Payee is required.")
+            return None
+        if self._payees and payee not in set(self._payees):
+            tip = next((p for p in self._payees if payee in p or p in payee), "")
+            extra = f"\nDid you mean: {tip}?" if tip else ""
+            box = QMessageBox(self)
+            box.setWindowTitle("Payee not in list")
+            box.setIcon(QMessageBox.Question)
+            box.setText(
+                f"Payee {payee!r} was not found in the Payee list.{extra}\n\n"
+                "Save anyway?"
+            )
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.No)
+            from tahmeed.ui.dialog_theme import style_message_box
+            style_message_box(box)
+            if box.exec() != QMessageBox.Yes:
+                return None
+        return payee
+
     def _on_assign_new(self) -> None:
         if not self._entries:
             desc = self._desc.text().strip()
             if not desc:
                 show_warning(self, "Validation", "Description is required.")
                 return
+        payee = self._require_payee()
+        if payee is None:
+            return
         dlg = ItemDialog(parent=self, prefill_name=self._prefill_item_name())
         if dlg.exec() != QDialog.Accepted:
             return
@@ -290,6 +361,7 @@ class _MappingEditorDialog(QDialog):
             create_new=existing is None,
             new_item_name=name,
             new_item_fields=data,
+            payee=payee,
         )
         self.accept()
 
@@ -299,6 +371,9 @@ class _MappingEditorDialog(QDialog):
             if not desc:
                 show_warning(self, "Validation", "Description is required.")
                 return
+        payee = self._require_payee()
+        if payee is None:
+            return
         from tahmeed.ui.accountant.manage_suppliers import _SupplierDialog
 
         dlg = _SupplierDialog(parent=self)
@@ -323,6 +398,7 @@ class _MappingEditorDialog(QDialog):
             create_new=existing is None,
             new_item_name=name,
             new_item_fields=data,
+            payee=payee,
         )
         self.accept()
 
@@ -330,6 +406,9 @@ class _MappingEditorDialog(QDialog):
         descriptions = self._descriptions()
         if not descriptions:
             show_warning(self, "Validation", "Description is required.")
+            return
+        payee = self._require_payee()
+        if payee is None:
             return
         name = self._combo.currentText().strip()
         if not name:
@@ -360,6 +439,7 @@ class _MappingEditorDialog(QDialog):
             description=descriptions[0],
             category=category,
             create_new=False,
+            payee=payee,
         )
         self.accept()
 
@@ -373,6 +453,7 @@ class DescriptionMapsWidget(QWidget):
         self._total = 0
         self._loading = False
         self._categories: List[Category] = []
+        self._payees: List[str] = []
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(350)
@@ -415,7 +496,7 @@ class DescriptionMapsWidget(QWidget):
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search by description or item…")
+        self._search.setPlaceholderText("Search by description, payee, or item…")
         self._search.setFixedHeight(32)
         self._search.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
@@ -431,7 +512,7 @@ class DescriptionMapsWidget(QWidget):
         )
         self._reassign_btn.setEnabled(False)
         self._reassign_btn.setToolTip(
-            "Map the selected description(s) to an existing item or a new item"
+            "Map the selected description(s) to the same Payee + Item"
         )
         self._reassign_btn.clicked.connect(self._reassign_selected)
         toolbar.addWidget(self._reassign_btn)
@@ -445,7 +526,7 @@ class DescriptionMapsWidget(QWidget):
         toolbar.addWidget(self._delete_btn)
 
         clear_btn = _btn("Clear All", primary=False, height=32)
-        clear_btn.setToolTip("Delete every description → item mapping")
+        clear_btn.setToolTip("Delete every description → Payee + Item mapping")
         clear_btn.clicked.connect(self._confirm_clear_all)
         toolbar.addWidget(clear_btn)
 
@@ -462,8 +543,10 @@ class DescriptionMapsWidget(QWidget):
         table_vl.setContentsMargins(0, 0, 0, 0)
         table_vl.setSpacing(0)
 
-        self._table = QTableWidget(0, 3)
-        self._table.setHorizontalHeaderLabels(["#", "Description", "Item / Supplier"])
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(
+            ["#", "Description", "Payee", "Item / Supplier"]
+        )
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -542,6 +625,25 @@ class DescriptionMapsWidget(QWidget):
             return False
         return True
 
+    async def _ensure_payees(self, *, refresh: bool = False) -> bool:
+        if self._payees and not refresh:
+            return True
+        from tahmeed.services.payee_service import get_payee_names
+
+        try:
+            self._payees = await get_payee_names(active_only=True)
+        except Exception as exc:
+            show_critical(self, "Error", f"Could not load payees:\n{exc}")
+            return False
+        return True
+
+    async def _ensure_editor_data(self) -> bool:
+        cats_ok, payees_ok = await asyncio.gather(
+            self._ensure_categories(refresh=True),
+            self._ensure_payees(refresh=True),
+        )
+        return bool(cats_ok and payees_ok)
+
     async def _load_initial(self) -> None:
         if self._loading:
             return
@@ -611,7 +713,9 @@ class DescriptionMapsWidget(QWidget):
                 _cell(str(idx + 1), Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
             )
             self._table.setItem(idx, 1, _cell(row.description, bg=row_bg))
-            self._table.setItem(idx, 2, _cell(row.category_name, bg=row_bg))
+            payee = (row.payee or "").strip() or "—"
+            self._table.setItem(idx, 2, _cell(payee, bg=row_bg))
+            self._table.setItem(idx, 3, _cell(row.category_name, bg=row_bg))
             _finish_table_row(self._table, idx, row_bg)
 
     async def _load(self) -> None:
@@ -671,7 +775,7 @@ class DescriptionMapsWidget(QWidget):
             edit_act = None
         else:
             reassign_act = None
-            edit_act = menu.addAction("Edit Item…")
+            edit_act = menu.addAction("Edit Mapping…")
         try:
             act = reassign_act or edit_act
             if act is not None:
@@ -711,9 +815,11 @@ class DescriptionMapsWidget(QWidget):
         asyncio.ensure_future(self._do_reassign(entries))
 
     async def _do_add(self) -> None:
-        if not await self._ensure_categories(refresh=True):
+        if not await self._ensure_editor_data():
             return
-        dlg = _MappingEditorDialog(self._categories, parent=self)
+        dlg = _MappingEditorDialog(
+            self._categories, parent=self, payees=self._payees,
+        )
         if dlg.exec() != QDialog.Accepted:
             return
         if not dlg.result_assignment or not dlg.result_description:
@@ -724,10 +830,10 @@ class DescriptionMapsWidget(QWidget):
         await self._do_reassign([entry])
 
     async def _do_reassign(self, entries: List[DescriptionMapping]) -> None:
-        if not await self._ensure_categories(refresh=True):
+        if not await self._ensure_editor_data():
             return
         dlg = _MappingEditorDialog(
-            self._categories, parent=self, mappings=entries,
+            self._categories, parent=self, mappings=entries, payees=self._payees,
         )
         if dlg.exec() != QDialog.Accepted:
             return
@@ -736,11 +842,13 @@ class DescriptionMapsWidget(QWidget):
         descriptions = [e.description for e in entries]
         if len(entries) > 1:
             name = dlg.result_assignment.item_name
+            payee = dlg.result_assignment.payee_name
             box = QMessageBox(self)
             box.setWindowTitle("Re-assign Mappings")
             box.setIcon(QMessageBox.Question)
             box.setText(
-                f'Re-assign {len(entries):,} mapping(s) to "{name}"?'
+                f'Re-assign {len(entries):,} mapping(s) to '
+                f'Payee "{payee}" + Item "{name}"?'
             )
             box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
             box.setDefaultButton(QMessageBox.Yes)
@@ -780,10 +888,12 @@ class DescriptionMapsWidget(QWidget):
                 f"Updated {saved:,} mapping(s); {failed:,} failed.",
             )
         elif bulk:
+            payee = assignment.payee_name
             show_info(
                 self,
                 "Re-assigned",
-                f'Re-assigned {saved:,} mapping(s) to "{chosen.name}".',
+                f'Re-assigned {saved:,} mapping(s) to '
+                f'Payee "{payee}" + Item "{chosen.name}".',
             )
         await self._load()
 
@@ -791,8 +901,10 @@ class DescriptionMapsWidget(QWidget):
         box = QMessageBox(self)
         box.setWindowTitle("Delete Mapping")
         box.setIcon(QMessageBox.Question)
+        payee = (entry.payee or "").strip() or "—"
         box.setText(
             f'Delete mapping for "{entry.description}"?\n\n'
+            f"Payee: {payee}\n"
             f"Item: {entry.category_name}"
         )
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
@@ -841,8 +953,8 @@ class DescriptionMapsWidget(QWidget):
         box.setWindowTitle("Clear All Mappings")
         box.setIcon(QMessageBox.Warning)
         box.setText(
-            "Delete ALL description → item mappings?\n\n"
-            "Imports and Verify will ask you to map descriptions again.\n"
+            "Delete ALL description → Payee + Item mappings?\n\n"
+            "Day Issues and auto-fill will no longer use these maps.\n"
             "This cannot be undone."
         )
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)

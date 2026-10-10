@@ -28,6 +28,7 @@ UNIQUE_KEYS = (
     UniqueKey("trailers", ("number",)),
     UniqueKey("motor_vehicles", ("number",)),
     UniqueKey("people", ("name",)),
+    UniqueKey("payees", ("name",)),
     UniqueKey("system_settings", ("key",)),
 )
 

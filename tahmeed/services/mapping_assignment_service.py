@@ -26,6 +26,7 @@ class MappingAssignment:
     create_new: bool = False
     new_item_name: str = ""
     new_item_fields: Optional[dict] = None
+    payee: str = ""
 
     @property
     def item_name(self) -> str:
@@ -34,6 +35,10 @@ class MappingAssignment:
         if self.category is not None:
             return (self.category.name or "").strip()
         return ""
+
+    @property
+    def payee_name(self) -> str:
+        return " ".join((self.payee or "").strip().upper().split())
 
     def placeholder_category(self) -> Optional[Category]:
         """Category suitable for later dialogs in the same batch (id may be None)."""
@@ -152,13 +157,14 @@ async def apply_assignment_to_descriptions(
         raise ValueError("Please choose or create an item for these descriptions.")
     failed = 0
     seen: set[str] = set()
+    payee = assignment.payee_name
     for raw in descriptions:
         text = " ".join((raw or "").strip().split())
         if not text or text.lower() in seen:
             continue
         seen.add(text.lower())
         try:
-            await save_mapping(text, category._id, category.name)
+            await save_mapping(text, category._id, category.name, payee=payee)
         except Exception:
             failed += 1
     return category, failed

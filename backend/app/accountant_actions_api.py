@@ -87,6 +87,31 @@ async def _audit(
         pass
 
 
+def _tx_incomplete_item_or_payee(doc: dict[str, Any]) -> bool:
+    item = (doc.get("item") or doc.get("category_name") or "").strip()
+    payee = (doc.get("payee") or "").strip()
+    return not item or not payee
+
+
+async def _reject_if_missing_item_or_payee(
+    request: Request, ids: list[ObjectId]
+) -> None:
+    """Belt-and-suspenders: approve requires both Item and Payee."""
+    if not ids:
+        return
+    docs = await _database(request).transactions.find(
+        {"_id": {"$in": ids}},
+        {"item": 1, "category_name": 1, "payee": 1},
+    ).to_list(length=None)
+    bad = sum(1 for doc in docs if _tx_incomplete_item_or_payee(doc))
+    if bad:
+        raise ApiError(
+            400,
+            "missing_item_or_payee",
+            f"{bad} transaction(s) still need Item and/or Payee before approve.",
+        )
+
+
 @actions.post("/bulk-approve")
 async def bulk_approve(
     body: BulkIdsRequest, request: Request, manager: Manager
@@ -94,6 +119,7 @@ async def bulk_approve(
     ids = _parse_ids(body.ids)
     if not ids:
         return {"updated": 0}
+    await _reject_if_missing_item_or_payee(request, ids)
     actor_id = _actor_oid(manager)
     now = utcnow().replace(tzinfo=None)
     result = await _database(request).transactions.update_many(
@@ -157,6 +183,7 @@ async def bulk_re_approve(
     ids = _parse_ids(body.ids)
     if not ids:
         return {"updated": 0}
+    await _reject_if_missing_item_or_payee(request, ids)
     db = _database(request)
     docs = await db.transactions.find(
         {"_id": {"$in": ids}, "verified": False},
@@ -203,6 +230,8 @@ async def bulk_category(
     }
     if body.category_id:
         update["category_id"] = _valid_id(body.category_id)
+    if body.payee is not None:
+        update["payee"] = " ".join((body.payee or "").strip().upper().split())
     result = await _database(request).transactions.update_many(
         {"_id": {"$in": ids}},
         {"$set": update},
@@ -215,6 +244,7 @@ async def approve_transaction(
     tx_id: str, request: Request, manager: Manager
 ) -> dict:
     oid = _valid_id(tx_id)
+    await _reject_if_missing_item_or_payee(request, [oid])
     actor_id = _actor_oid(manager)
     now = utcnow().replace(tzinfo=None)
     result = await _database(request).transactions.update_one(
@@ -344,6 +374,7 @@ async def re_approve_transaction(
     tx_id: str, request: Request, manager: Manager
 ) -> dict:
     oid = _valid_id(tx_id)
+    await _reject_if_missing_item_or_payee(request, [oid])
     ok = await _re_approve_one(request, oid, _actor_oid(manager), manager)
     return {"ok": ok}
 
@@ -372,6 +403,8 @@ async def update_category(
     }
     if body.category_id:
         update["category_id"] = _valid_id(body.category_id)
+    if body.payee is not None:
+        update["payee"] = " ".join((body.payee or "").strip().upper().split())
     result = await _database(request).transactions.update_one(
         {"_id": oid}, {"$set": update}
     )

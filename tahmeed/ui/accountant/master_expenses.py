@@ -1648,13 +1648,10 @@ class MasterExpensesWidget(QWidget):
     async def _do_import_body(self) -> None:
         from pathlib import Path
 
-        from tahmeed.services.category_service import get_all_categories
         from tahmeed.services.master_import_service import (
-            apply_mapping_to_preview,
             commit_master_import,
             preview_master_import,
         )
-        from tahmeed.ui.dialogs.description_mapping_flow import prompt_unmapped_descriptions
 
         default_dir = str(Path(__file__).resolve().parents[3])
         path, _ = QFileDialog.getOpenFileName(
@@ -1668,16 +1665,6 @@ class MasterExpensesWidget(QWidget):
 
         self._loading_overlay.show_loading("Reading master Excel file…")
         try:
-            categories = await get_all_categories(is_supplier=False)
-        except Exception as exc:
-            self._loading_overlay.hide_loading()
-            QMessageBox.critical(self, "Import Error", f"Could not load items:\n{exc}")
-            return
-
-        if not categories:
-            categories = []
-
-        try:
             preview = await preview_master_import(path)
         except Exception as exc:
             self._loading_overlay.hide_loading()
@@ -1689,22 +1676,23 @@ class MasterExpensesWidget(QWidget):
             QMessageBox.information(self, "Import", "No expense rows found in the selected file.")
             return
 
+        # Master requires every description mapped first (no one-by-one dialog).
         if preview.unmapped:
             self._loading_overlay.hide_loading()
-            ok = await prompt_unmapped_descriptions(
-                preview,
-                categories,
+            n = len(preview.unmapped)
+            sample = sorted(preview.unmapped.keys())[:8]
+            lines = "\n".join(f"  · {d}" for d in sample)
+            more = f"\n  · …and {n - len(sample):,} more" if n > len(sample) else ""
+            QMessageBox.warning(
                 self,
-                allow_skip=False,
-                apply_mapping=apply_mapping_to_preview,
+                "Map descriptions first",
+                f"{n:,} description(s) still need Payee + Item mapping "
+                "before Master import:\n\n"
+                f"{lines}{more}\n\n"
+                "Map them in Description Maps (or Day Issues for a register day), "
+                "then import again.",
             )
-            if not ok:
-                QMessageBox.information(
-                    self,
-                    "Import Cancelled",
-                    "No records were imported.",
-                )
-                return
+            return
 
         self._loading_overlay.show_loading("Importing master expenses…")
         verified_by = self._user._id if self._user else None

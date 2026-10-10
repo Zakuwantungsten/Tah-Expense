@@ -19,10 +19,12 @@ from .import_ops import (
     daily_uploads_pipeline,
     null_daily_import_id_filter,
 )
+from .payee_import_ops import commit_payee_list
 from .schemas import (
     ChartOfAccountsImportRequest,
     DailyImportCommitRequest,
     MasterImportCommitRequest,
+    PayeeImportRequest,
 )
 from .security import utcnow
 from .serialization import json_safe, object_id
@@ -352,6 +354,35 @@ async def chart_of_accounts_import(
     await _audit(
         request,
         action="coa.replace",
+        actor=manager,
+        details=details,
+    )
+    return json_safe(details)
+
+
+@imports.post("/payees", status_code=status.HTTP_201_CREATED)
+async def payees_import(
+    body: PayeeImportRequest,
+    request: Request,
+    manager: Manager,
+) -> dict[str, Any]:
+    if not body.rows:
+        raise ApiError(422, "empty_rows", "No payees found in the Payee List payload.")
+    db = _database(request)
+    try:
+        result = await commit_payee_list(
+            db,
+            body.rows,
+            replace_existing=body.replace_existing,
+        )
+    except ValueError as exc:
+        raise ApiError(422, "empty_rows", str(exc)) from None
+    details = dict(result)
+    if body.source_filename:
+        details["source_filename"] = body.source_filename
+    await _audit(
+        request,
+        action="payees.import",
         actor=manager,
         details=details,
     )

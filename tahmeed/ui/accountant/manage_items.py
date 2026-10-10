@@ -1018,6 +1018,30 @@ class ManageItemsWidget(QWidget):
         self._defer_item_btn.toggled.connect(self._on_defer_item_toggled)
         hl.addWidget(self._defer_item_btn)
 
+        self._allow_issues_btn = QPushButton("  Submit with Day Issues: Off")
+        self._allow_issues_btn.setFixedHeight(32)
+        self._allow_issues_btn.setCheckable(True)
+        self._allow_issues_btn.setCursor(Qt.PointingHandCursor)
+        self._allow_issues_btn.setToolTip(
+            "When on, cashiers may Submit for Verify even if Day Issues remain.\n"
+            "When off (default), open Day Issues must be cleared first."
+        )
+        try:
+            self._allow_issues_btn.setIcon(qta.icon("mdi.alert-decagram-outline", color=_T2))
+            self._allow_issues_btn.setIconSize(QSize(15, 15))
+        except Exception:
+            pass
+        self._allow_issues_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T2};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            f"QPushButton:checked {{ background: {_GREEN_L}; color: {_GREEN};"
+            f" border-color: {_GREEN}; }}"
+            f"QPushButton:hover:!checked {{ background: {_BG}; }}"
+        )
+        self._allow_issues_btn.toggled.connect(self._on_allow_issues_toggled)
+        hl.addWidget(self._allow_issues_btn)
+
         self._export_restricted_btn = QPushButton("Export restricted")
         self._export_restricted_btn.setFixedHeight(32)
         self._export_restricted_btn.setCheckable(True)
@@ -1336,6 +1360,17 @@ class ManageItemsWidget(QWidget):
         )
         self._defer_item_btn.blockSignals(False)
 
+        try:
+            allow_issues = bool(await get_setting("allow_submit_with_day_issues"))
+        except Exception:
+            allow_issues = False
+        self._allow_issues_btn.blockSignals(True)
+        self._allow_issues_btn.setChecked(allow_issues)
+        self._allow_issues_btn.setText(
+            "  Submit with Day Issues: On" if allow_issues else "  Submit with Day Issues: Off"
+        )
+        self._allow_issues_btn.blockSignals(False)
+
     def _on_restrict_toggled(self, on: bool) -> None:
         self._restrict_btn.setText("  Restrict items: On" if on else "  Restrict items: Off")
         asyncio.ensure_future(self._save_restrict_setting(on))
@@ -1346,6 +1381,12 @@ class ManageItemsWidget(QWidget):
         )
         asyncio.ensure_future(self._save_defer_item_setting(on))
 
+    def _on_allow_issues_toggled(self, on: bool) -> None:
+        self._allow_issues_btn.setText(
+            "  Submit with Day Issues: On" if on else "  Submit with Day Issues: Off"
+        )
+        asyncio.ensure_future(self._save_allow_issues_setting(on))
+
     async def _save_restrict_setting(self, on: bool) -> None:
         try:
             await set_setting("restrict_items", on)
@@ -1355,6 +1396,12 @@ class ManageItemsWidget(QWidget):
     async def _save_defer_item_setting(self, on: bool) -> None:
         try:
             await set_setting("defer_item_to_verify", on)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
+
+    async def _save_allow_issues_setting(self, on: bool) -> None:
+        try:
+            await set_setting("allow_submit_with_day_issues", on)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
 

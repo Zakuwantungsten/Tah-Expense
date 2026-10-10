@@ -575,15 +575,19 @@ async def resolve_item_name(
 ) -> dict:
     key = (description or "").strip()
     if not key:
-        return {"item": None}
+        return {"item": None, "payee": None}
     db = _database(request)
     mapping = await db.description_mappings.find_one(
         {"description": {"$regex": f"^{re.escape(key)}$", "$options": "i"}}
     )
     if mapping:
         name = (mapping.get("category_name") or "").strip()
-        if name:
-            return {"item": name}
+        payee = (mapping.get("payee") or "").strip()
+        if name or payee:
+            return {
+                "item": name or None,
+                "payee": payee or None,
+            }
 
     desc_match = {"description": {"$regex": f"^{re.escape(key)}$", "$options": "i"}}
     has_item = {
@@ -592,7 +596,7 @@ async def resolve_item_name(
             {"category_name": {"$type": "string", "$ne": ""}},
         ]
     }
-    projection = {"item": 1, "category_name": 1}
+    projection = {"item": 1, "category_name": 1, "payee": 1}
 
     async def _first(extra: dict[str, Any]) -> dict[str, Any] | None:
         docs = (
@@ -607,8 +611,12 @@ async def resolve_item_name(
     if not doc:
         doc = await _first({})
     if not doc:
-        return {"item": None}
-    return {"item": (doc.get("item") or doc.get("category_name") or "").strip() or None}
+        return {"item": None, "payee": None}
+    return {
+        "item": (doc.get("item") or doc.get("category_name") or "").strip() or None,
+        # History may carry a payee, but mapping remains the source of truth.
+        "payee": (doc.get("payee") or "").strip() or None,
+    }
 
 
 def _parse_ids(raw_ids: list[str]) -> list[ObjectId]:

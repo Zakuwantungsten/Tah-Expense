@@ -43,6 +43,7 @@ from tahmeed.ui.cashier.transactions_table import TransactionBrowser
 from tahmeed.ui.cashier.cashier_category_view import CashierCategoryView
 from tahmeed.ui.cashier.rejected_view import RejectedView
 from tahmeed.ui.cashier.drafts_view import DraftsView, fetch_draft_badge_count
+from tahmeed.ui.cashier.day_issues import DayIssuesWidget
 
 _APP_BG = "#F4F6F8"
 _BORDER = "#E5E7EB"
@@ -624,6 +625,9 @@ class _TablePage(QWidget):
         self._qb_toolbar.attach_clicked.connect(register.toolbar_attach)
         self._qb_toolbar.export_clicked.connect(register.export_as)
         self._qb_toolbar.import_clicked.connect(register.import_from_file)
+        self._qb_toolbar.day_issues_clicked.connect(
+            lambda: register.day_issues_requested.emit(register.current_date())
+        )
         self._qb_toolbar.today_clicked.connect(
             lambda: register.navigate_to_date(date.today())
         )
@@ -763,11 +767,18 @@ class CashierDashboard(QWidget):
         self._drafts_view = DraftsView(user=self._user, show_all_cashiers=False)
         self._stack.addWidget(self._drafts_view)
 
-        # index 4 — Rejected entries
+        # index 4 — Day Issues
+        self._day_issues = DayIssuesWidget(user=self._user)
+        self._day_issues.open_register.connect(self._on_day_issues_open_register)
+        self._day_issues.issues_changed.connect(self._on_day_issues_badge)
+        self._day_issues.mappings_applied.connect(self._register.refresh)
+        self._stack.addWidget(self._day_issues)
+
+        # index 5 — Rejected entries
         self._rejected_view = RejectedView(user=self._user)
         self._stack.addWidget(self._rejected_view)
 
-        # index 5 — Browse (embedded)
+        # index 6 — Browse (embedded)
         self._browser = TransactionBrowser()
         self._browser.go_to_date.connect(self._on_go_to_date)
         self._browser.go_to_upload.connect(self._on_go_to_upload)
@@ -796,9 +807,13 @@ class CashierDashboard(QWidget):
         self._drafts_view.drafts_changed.connect(self._refresh_draft_badge)
         self._register.rows_saved.connect(lambda _: self._refresh_draft_badge())
         self._register.drafts_changed.connect(self._refresh_draft_badge)
+        self._register.day_issues_requested.connect(self._on_open_day_issues)
+        self._register.rows_saved.connect(lambda _: self._refresh_day_issues_badge())
+        self._register.drafts_changed.connect(self._refresh_day_issues_badge)
 
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._refresh_draft_badge())
+        schedule_coro(self._refresh_day_issues_badge())
 
 
     def _on_import(self) -> None:
@@ -851,11 +866,15 @@ class CashierDashboard(QWidget):
         elif key == "drafts":
             self._stack.setCurrentIndex(3)
             self._drafts_view.refresh()
-        elif key == "rejected":
+        elif key == "day_issues":
             self._stack.setCurrentIndex(4)
+            target = getattr(self._register, "_current_date", None) or date.today()
+            self._day_issues.set_date(target)
+        elif key == "rejected":
+            self._stack.setCurrentIndex(5)
             self._rejected_view.refresh()
         elif key == "browse":
-            self._stack.setCurrentIndex(5)
+            self._stack.setCurrentIndex(6)
             self._browser.refresh()
         elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
@@ -900,6 +919,29 @@ class CashierDashboard(QWidget):
         if hasattr(self._sidebar, "set_drafts_badge"):
             self._sidebar.set_drafts_badge(count)
 
+    def _on_day_issues_badge(self, count: int) -> None:
+        if hasattr(self._sidebar, "set_day_issues_badge"):
+            self._sidebar.set_day_issues_badge(count)
+
+    async def _refresh_day_issues_badge(self) -> None:
+        from tahmeed.services.day_issues_service import count_day_issues
+
+        target = getattr(self._register, "_current_date", None) or date.today()
+        try:
+            count = await count_day_issues(target)
+        except Exception:
+            count = 0
+        self._on_day_issues_badge(count)
+
+    def _on_open_day_issues(self, target=None) -> None:
+        self._on_nav("day_issues")
+        if target is not None:
+            self._day_issues.set_date(target)
+
+    def _on_day_issues_open_register(self, d: date) -> None:
+        self._on_nav("table")
+        self._register.navigate_to_date(d, merged=True)
+
     # ── Load categories ───────────────────────────────────────────────────────────
 
     async def _load_categories(self) -> None:
@@ -915,5 +957,10 @@ class CashierDashboard(QWidget):
             names = await get_people_names()
             self._register.update_people(names)
             self._form.update_people(names)
+        except Exception:
+            pass
+        try:
+            from tahmeed.services.payee_service import get_payee_names
+            self._register.update_payees(await get_payee_names())
         except Exception:
             pass

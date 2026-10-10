@@ -83,6 +83,8 @@ async def save_mapping(
     description: str,
     category_id: ObjectId,
     category_name: str,
+    *,
+    payee: str = "",
 ) -> DescriptionMapping:
     document = await api_client.request(
         "PUT",
@@ -91,6 +93,7 @@ async def save_mapping(
             "description": " ".join((description or "").strip().split()),
             "category_id": str(category_id),
             "category_name": category_name,
+            "payee": " ".join((payee or "").strip().upper().split()),
         },
     )
     return _mapping(document)
@@ -108,16 +111,25 @@ async def delete_all_mappings() -> int:
     return int(payload["deleted_count"])
 
 
-async def resolve_category_for_description(
+async def resolve_mapping_for_description(
     description: str,
     cache: Optional[Dict[str, DescriptionMapping]] = None,
-) -> Optional[Tuple[ObjectId, str]]:
+) -> Optional[DescriptionMapping]:
+    """Return the saved description map (item + payee), if any."""
     key = normalize_description(description)
     if not key:
         return None
     mapping = (cache or {}).get(key)
     if mapping is None:
         mapping = await get_mapping(description)
+    return mapping
+
+
+async def resolve_category_for_description(
+    description: str,
+    cache: Optional[Dict[str, DescriptionMapping]] = None,
+) -> Optional[Tuple[ObjectId, str]]:
+    mapping = await resolve_mapping_for_description(description, cache)
     if mapping is None:
         return None
     return mapping.category_id, mapping.category_name
@@ -126,3 +138,17 @@ async def resolve_category_for_description(
 def transaction_needs_item(item: str = "", category_name: Optional[str] = None) -> bool:
     """True when a transaction still needs an item/category assigned."""
     return not (item or "").strip() and not (category_name or "").strip()
+
+
+def transaction_needs_payee(payee: str = "") -> bool:
+    """True when a transaction still needs a payee assigned."""
+    return not (payee or "").strip()
+
+
+def transaction_needs_mapping(
+    item: str = "",
+    category_name: Optional[str] = None,
+    payee: str = "",
+) -> bool:
+    """True when Item and/or Payee are still missing (Verify / Day Issues gate)."""
+    return transaction_needs_item(item, category_name) or transaction_needs_payee(payee)

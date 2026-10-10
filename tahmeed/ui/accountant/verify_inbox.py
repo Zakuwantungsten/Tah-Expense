@@ -560,6 +560,11 @@ class _ActionPanel(QFrame):
         self._info_lbl = _lbl("", size=12, weight=600, color=_QB_HDR_FG)
         vl.addWidget(self._info_lbl)
 
+        self._mapping_warn = _lbl("", size=11, weight=600, color=_AMBER)
+        self._mapping_warn.setWordWrap(True)
+        self._mapping_warn.hide()
+        vl.addWidget(self._mapping_warn)
+
         # Controls row
         ctrl = QWidget()
         ctrl.setStyleSheet("background:transparent;")
@@ -570,7 +575,7 @@ class _ActionPanel(QFrame):
         # Category
         cat_w = QWidget(); cat_w.setStyleSheet("background:transparent;")
         cvl = QVBoxLayout(cat_w); cvl.setContentsMargins(0, 0, 0, 0); cvl.setSpacing(3)
-        cvl.addWidget(_lbl("CATEGORY", size=9, weight=600, color=_T2))
+        cvl.addWidget(_lbl("ITEM", size=9, weight=600, color=_T2))
         self._cat_combo = QComboBox()
         self._cat_combo.setFixedWidth(220)
         self._cat_combo.setStyleSheet(_input_ss())
@@ -669,39 +674,60 @@ class _ActionPanel(QFrame):
 
         return transaction_needs_item(tx.item, tx.category_name)
 
+    @staticmethod
+    def _needs_mapping(tx: Transaction) -> bool:
+        from tahmeed.services.description_mapping_service import transaction_needs_mapping
+
+        return transaction_needs_mapping(tx.item, tx.category_name, tx.payee or "")
+
     def _on_category_changed(self, _index: int) -> None:
         if self._cat_combo.signalsBlocked():
             return
         self._category_user_selected = True
 
+    def _refresh_mapping_warn(self, tx: Transaction) -> None:
+        missing: List[str] = []
+        if self._needs_item(tx):
+            missing.append("Item")
+        if not (tx.payee or "").strip():
+            missing.append("Payee")
+        if not missing or self._mode in ("rejected", "deleted"):
+            self._mapping_warn.hide()
+            self._mapping_warn.clear()
+            return
+        payee = (tx.payee or "").strip() or "—"
+        self._mapping_warn.setText(
+            f"Missing {' and '.join(missing)} — map in Day Issues / Description Maps "
+            f"before Approve. Payee now: {payee}"
+        )
+        self._mapping_warn.show()
+
     def load(self, tx: Transaction, cashier_name: str, categories: List[str]) -> None:
         self._tx = tx
         self._category_user_selected = False
-        currency = tx.currency or "TZS"
+        payee = (tx.payee or "").strip() or "—"
         self._info_lbl.setText(
             f"{tx.truck_number or '—'}  ·  {_fmt_date(tx.date)}  ·  "
             f"{tx.description or '—'}  ·  {_fmt_amount(tx)}"
+            f"  ·  Payee: {payee}"
             f"  ·  Cashier: {cashier_name or '—'}"
         )
+        self._refresh_mapping_warn(tx)
         self._cat_combo.blockSignals(True)
         self._cat_combo.clear()
         for cat in categories:
             self._cat_combo.addItem(cat)
-        if self._needs_item(tx) and categories:
-            self._cat_combo.insertItem(0, "— map on approve —")
-            self._cat_combo.setCurrentIndex(0)
-        elif tx.category_name:
-            idx = self._cat_combo.findText(tx.category_name)
+        current = (tx.category_name or tx.item or "").strip()
+        if current:
+            idx = self._cat_combo.findText(current)
             if idx >= 0:
                 self._cat_combo.setCurrentIndex(idx)
-                self._category_user_selected = True
             else:
-                self._cat_combo.insertItem(0, tx.category_name)
+                self._cat_combo.insertItem(0, current)
                 self._cat_combo.setCurrentIndex(0)
-                self._category_user_selected = True
-        elif categories:
-            self._cat_combo.setCurrentIndex(0)
             self._category_user_selected = True
+        else:
+            self._cat_combo.setCurrentIndex(-1)
         self._cat_combo.blockSignals(False)
         if self._mode == "deleted":
             requester = cashier_name or "—"
@@ -717,9 +743,7 @@ class _ActionPanel(QFrame):
         if not self._tx:
             return
         cat = self._cat_combo.currentText().strip()
-        if cat == "— map on approve —":
-            cat = ""
-        elif self._needs_item(self._tx) and not self._category_user_selected:
+        if not self._category_user_selected and self._needs_item(self._tx):
             cat = ""
         self.approved.emit(self._tx._id, cat)
 
@@ -1970,209 +1994,156 @@ class VerifyInboxWidget(QWidget):
         self._categories = [c.name for c in categories]
         return categories
 
-    async def _assign_item_and_remember(
+    async def _assign_item_only(
         self,
-        tx_id: ObjectId,
-        description: str,
+        tx: Transaction,
         category: Category,
     ) -> None:
+        """Update Item on the transaction. Description maps are owned by Day Issues."""
         from tahmeed.services.accountant_service import update_transaction_category
-        from tahmeed.services.description_mapping_service import save_mapping
 
-        await update_transaction_category(tx_id, category.name, category._id)
-        if description.strip():
-            await save_mapping(description, category._id, category.name)
+        if not tx._id:
+            return
+        payee = (tx.payee or "").strip() or None
+        await update_transaction_category(
+            tx._id, category.name, category._id, payee=payee,
+        )
+        tx.item = category.name
+        tx.category_name = category.name
+        tx.category_id = category._id
 
-    async def _resolve_items_for_transactions(self, txs: List[Transaction]) -> bool:
-        """Ensure each transaction has an item; prompt when mapping is unknown.
+    async def _ensure_item_and_payee(self, txs: List[Transaction]) -> bool:
+        """Apply saved maps quietly when both Item + Payee exist; else block.
 
-        All mapping dialogs run inside a single ``_await_ui`` callback (no asyncio
-        resume between prompts). Mappings and category updates are persisted in
-        bulk afterward.
+        No one-by-one dialogs — use Day Issues / Description Maps.
         """
         from tahmeed.services.description_mapping_service import (
             get_mappings_for_descriptions,
             normalize_description,
-            save_mapping,
             transaction_needs_item,
+            transaction_needs_mapping,
+            transaction_needs_payee,
         )
         from tahmeed.services.accountant_service import bulk_update_transaction_category
-        from tahmeed.services.mapping_assignment_service import (
-            MappingAssignment,
-            materialize_mapping_assignment,
-            remember_category,
-        )
-        from tahmeed.ui.dialogs.description_mapping_dialog import (
-            ACTION_ASSIGN,
-            DescriptionMappingDialog,
-        )
-        from tahmeed.ui.dialogs.description_mapping_flow import (
-            remember_created_from_assignment,
-        )
 
-        pending = [tx for tx in txs if transaction_needs_item(tx.item, tx.category_name)]
+        pending = [
+            tx for tx in txs
+            if tx._id and transaction_needs_mapping(tx.item, tx.category_name, tx.payee or "")
+        ]
         if not pending:
             return True
-
-        categories = await self._ensure_mapping_categories()
-        if categories is None:
-            return False
-        categories = list(categories)
 
         self._set_busy("Looking up saved description mappings…")
         descriptions = [tx.description for tx in pending if tx.description]
         mappings = await get_mappings_for_descriptions(descriptions)
 
         still_need: List[Transaction] = []
-        # Group known mappings by category for one bulk update each.
-        known_groups: Dict[Tuple[str, ObjectId], List[ObjectId]] = {}
+        # (category_name, category_id, payee) -> ids
+        patch_groups: Dict[Tuple[str, Optional[ObjectId], str], List[ObjectId]] = {}
+
         for tx in pending:
             if not tx._id:
                 continue
             key = normalize_description(tx.description or "")
-            mapping = mappings.get(key)
-            if mapping:
-                gk = (mapping.category_name, mapping.category_id)
-                known_groups.setdefault(gk, []).append(tx._id)
-            elif not (tx.description or "").strip():
-                self._clear_busy()
-                await self._await_ui(lambda: QMessageBox.warning(
-                    self,
-                    "Missing Item",
-                    "One or more selected entries have no item and no description.\n"
-                    "Assign a category manually before approving.",
-                ))
-                return False
-            else:
-                still_need.append(tx)
+            mapping = mappings.get(key) if key else None
 
-        if known_groups:
-            self._set_busy("Applying saved item mappings…")
+            need_item = transaction_needs_item(tx.item, tx.category_name)
+            need_payee = transaction_needs_payee(tx.payee or "")
+
+            map_item = (mapping.category_name or "").strip() if mapping else ""
+            map_payee = (mapping.payee or "").strip() if mapping else ""
+            map_cat_id = mapping.category_id if mapping else None
+
+            final_item = (tx.item or tx.category_name or "").strip()
+            final_payee = (tx.payee or "").strip()
+            final_cat_id = tx.category_id
+
+            if need_item:
+                if not map_item:
+                    still_need.append(tx)
+                    continue
+                final_item = map_item
+                final_cat_id = map_cat_id
+            if need_payee:
+                if not map_payee:
+                    still_need.append(tx)
+                    continue
+                final_payee = map_payee
+
+            if not final_item or not final_payee:
+                still_need.append(tx)
+                continue
+
+            gk = (final_item, final_cat_id, final_payee)
+            patch_groups.setdefault(gk, []).append(tx._id)
+            tx.item = final_item
+            tx.category_name = final_item
+            tx.category_id = final_cat_id
+            tx.payee = final_payee
+
+        if patch_groups:
+            self._set_busy("Applying saved Item + Payee mappings…")
             await asyncio.gather(*[
-                bulk_update_transaction_category(ids, name, cat_id)
-                for (name, cat_id), ids in known_groups.items()
+                bulk_update_transaction_category(
+                    ids, name, cat_id, payee=payee,
+                )
+                for (name, cat_id, payee), ids in patch_groups.items()
             ])
 
         if not still_need:
+            self._clear_busy()
             return True
 
-        groups: Dict[str, List[Transaction]] = {}
-        display: Dict[str, str] = {}
-        for tx in still_need:
-            key = normalize_description(tx.description or "")
-            groups.setdefault(key, []).append(tx)
-            display[key] = tx.description or key
-
-        # Show every mapping dialog in one Qt-tick callback. Returning to the
-        # asyncio task between dialogs (via repeated _await_ui) lets qasync /
-        # Py3.14 nest tasks during exec() and aborts the sequence mid-way —
-        # user sees ~3–5 prompts then the window vanishes until they approve again.
-        keys = list(groups.keys())
-        total_unique = len(keys)
-
-        def _prompt_all() -> Optional[Dict[str, MappingAssignment]]:
-            chosen: Dict[str, MappingAssignment] = {}
-            remaining = total_unique
-            cats = list(categories)
-            for key in keys:
-                dlg = DescriptionMappingDialog(
-                    description=display[key],
-                    row_count=len(groups[key]),
-                    categories=cats,
-                    remaining=remaining,
-                    parent=self,
-                    scope_label="in verify inbox",
-                    cancel_label="Cancel",
-                    total=total_unique,
-                )
-                if dlg.exec() != QDialog.Accepted:
-                    return None
-                assignment = dlg.assignment()
-                if assignment.action != ACTION_ASSIGN:
-                    return None
-                remember_created_from_assignment(cats, assignment)
-                chosen[key] = assignment
-                remaining -= 1
-            return chosen
-
-        # Hide busy UI so mapping dialogs are not covered / delayed behind it.
-        self._clear_busy()
-        assignments = await self._await_ui(_prompt_all)
-        if not assignments:
-            return False
-
-        # Persist item/sub-item creates first (sequential so names reuse),
-        # then mappings + category updates in parallel.
-        self._set_busy(
-            f"Saving {len(assignments):,} item mapping(s)…",
-            value=0,
-            maximum=max(1, len(assignments)),
+        unique = sorted({
+            normalize_description(tx.description or "") or "(no description)"
+            for tx in still_need
+        })
+        sample = unique[:8]
+        lines = "\n".join(f"  · {d}" for d in sample)
+        more = (
+            f"\n  · …and {len(unique) - len(sample):,} more"
+            if len(unique) > len(sample) else ""
         )
-        resolved: Dict[str, Category] = {}
-        try:
-            for key, assignment in assignments.items():
-                resolved[key] = await materialize_mapping_assignment(
-                    assignment, categories
-                )
-        except Exception as exc:
-            self._clear_busy()
-            await self._await_ui(lambda: QMessageBox.critical(
-                self,
-                "Could Not Save Item",
-                f"Could not create the item:\n{exc}",
-            ))
-            return False
-
-        persist = []
-        for key, cat in resolved.items():
-            remember_category(self._category_objects, cat)
-            persist.append(save_mapping(display[key], cat._id, cat.name))
-            ids = [tx._id for tx in groups[key] if tx._id]
-            if ids:
-                persist.append(
-                    bulk_update_transaction_category(ids, cat.name, cat._id)
-                )
-        if persist:
-            await asyncio.gather(*persist)
-
-        return True
+        n = len(still_need)
+        self._clear_busy()
+        await self._await_ui(lambda: QMessageBox.warning(
+            self,
+            "Item and Payee required",
+            f"{n:,} selected entr{'y' if n == 1 else 'ies'} still missing "
+            f"Item and/or Payee ({len(unique):,} unique description(s)):\n\n"
+            f"{lines}{more}\n\n"
+            "Map them in Day Issues or Description Maps, then approve again.\n"
+            "Approve is blocked until every selected row has both fields.",
+        ))
+        return False
 
     async def _prepare_transactions_for_approval(
         self,
         txs: List[Transaction],
         category_overrides: Optional[Dict[ObjectId, str]] = None,
     ) -> bool:
-        """Apply panel selections and description mappings before approval."""
+        """Apply panel item picks, then require Item + Payee before approve."""
         category_overrides = category_overrides or {}
-        manual: List[Transaction] = []
         for tx in txs:
             if not tx._id:
                 continue
             chosen = category_overrides.get(tx._id, "").strip()
-            if chosen:
-                current = (tx.category_name or tx.item or "").strip()
-                if chosen.lower() != current.lower():
-                    cat = self._category_by_name(chosen)
-                    if cat is None:
-                        chosen_name = chosen
-                        await self._await_ui(lambda: QMessageBox.warning(
-                            self,
-                            "Invalid Item",
-                            f'"{chosen_name}" is not a known item. Pick one from the category list.',
-                        ))
-                        return False
-                    if self._tx_needs_item(tx):
-                        await self._assign_item_and_remember(
-                            tx._id, tx.description or "", cat,
-                        )
-                    else:
-                        from tahmeed.services.accountant_service import update_transaction_category
-                        await update_transaction_category(tx._id, cat.name, cat._id)
-            elif self._tx_needs_item(tx):
-                manual.append(tx)
-        if manual:
-            return await self._resolve_items_for_transactions(manual)
-        return True
+            if not chosen:
+                continue
+            current = (tx.category_name or tx.item or "").strip()
+            if chosen.lower() == current.lower():
+                continue
+            cat = self._category_by_name(chosen)
+            if cat is None:
+                chosen_name = chosen
+                await self._await_ui(lambda: QMessageBox.warning(
+                    self,
+                    "Invalid Item",
+                    f'"{chosen_name}" is not a known item. Pick one from the item list.',
+                ))
+                return False
+            await self._assign_item_only(tx, cat)
+        return await self._ensure_item_and_payee(txs)
 
     # ── Async service calls ─────────────────────────────────────────────────────
 
@@ -2247,7 +2218,7 @@ class VerifyInboxWidget(QWidget):
         self._set_busy(f"Preparing {len(tx_ids):,} approval(s)…")
         try:
             txs = await get_transactions_by_ids(tx_ids)
-            self._set_busy("Checking items & description mappings…")
+            self._set_busy("Checking Item + Payee…")
             if not await self._prepare_transactions_for_approval(txs):
                 self._clear_busy()
                 return

@@ -364,6 +364,40 @@ class DraftsView(QWidget):
         asyncio.ensure_future(self._do_submit_day(self._selected_day))
 
     async def _do_submit_day(self, day: date) -> None:
+        from tahmeed.services.day_issues_service import collect_day_issues
+        from tahmeed.services.settings_service import get_setting
+
+        try:
+            snap = await collect_day_issues(day)
+        except Exception:
+            snap = None
+        if snap is not None and snap.total > 0:
+            allow = False
+            try:
+                allow = bool(await get_setting("allow_submit_with_day_issues"))
+            except Exception:
+                allow = False
+            label = day.strftime("%d %b %Y")
+            summary = (
+                f"{snap.total} Day Issue(s) on {label}:\n"
+                f"  · {snap.unmapped_count} unmapped\n"
+                f"  · {snap.bad_map_count} bad map\n\n"
+            )
+            if not allow:
+                QMessageBox.warning(
+                    self,
+                    "Day Issues block submit",
+                    summary + "Open Day Issues and map descriptions before submitting.",
+                )
+                return
+            if QMessageBox.question(
+                self,
+                "Submit with Day Issues?",
+                summary + "Submit anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
         try:
             n = await submit_day_for_verify(day)
             QMessageBox.information(

@@ -26,6 +26,7 @@ _LAZY_PAGE_KEYS = frozenset({
     "truck_overview",
     "verify",
     "drafts",
+    "day_issues",
     "master_expenses",
     "trash",
     "import_daily",
@@ -51,6 +52,7 @@ _LAZY_PAGE_KEYS = frozenset({
     "manage_suppliers",
     "manage_description_maps",
     "manage_people",
+    "manage_payees",
     "manage_users",
     "table",
     "browse",
@@ -70,6 +72,7 @@ class AccountantDashboard(QWidget):
         self._register = None  # DailyRegister, created with "table"
         self._pending_categories: list | None = None
         self._pending_people: list | None = None
+        self._pending_payees: list | None = None
         self._build()
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._load_categories())
@@ -214,6 +217,14 @@ class AccountantDashboard(QWidget):
             )
             return widget
 
+        if key == "day_issues":
+            from tahmeed.ui.cashier.day_issues import DayIssuesWidget
+            widget = DayIssuesWidget(user=self._user)
+            widget.open_register.connect(self._on_day_issues_open_register)
+            widget.issues_changed.connect(self._on_day_issues_badge)
+            widget.mappings_applied.connect(self._on_day_issues_mapped)
+            return widget
+
         if key == "master_expenses":
             from tahmeed.ui.accountant.master_expenses import MasterExpensesWidget
             return MasterExpensesWidget(user=self._user)
@@ -321,6 +332,10 @@ class AccountantDashboard(QWidget):
             from tahmeed.ui.accountant.manage_people import PeopleRegistryWidget
             return PeopleRegistryWidget()
 
+        if key == "manage_payees":
+            from tahmeed.ui.accountant.manage_payees import ManagePayeesWidget
+            return ManagePayeesWidget()
+
         if key == "manage_users":
             from tahmeed.ui.admin.users_tab import UsersTab
             return UsersTab()
@@ -335,11 +350,21 @@ class AccountantDashboard(QWidget):
             if self._pending_people is not None:
                 self._register.update_people(self._pending_people)
                 self._pending_people = None
+            if self._pending_payees is not None:
+                self._register.update_payees(self._pending_payees)
+                self._pending_payees = None
             self._register.rows_saved.connect(
                 lambda _: asyncio.ensure_future(self._refresh_drafts_badge())
             )
             self._register.drafts_changed.connect(
                 lambda: asyncio.ensure_future(self._refresh_drafts_badge())
+            )
+            self._register.day_issues_requested.connect(self._on_open_day_issues)
+            self._register.rows_saved.connect(
+                lambda _: asyncio.ensure_future(self._refresh_day_issues_badge())
+            )
+            self._register.drafts_changed.connect(
+                lambda: asyncio.ensure_future(self._refresh_day_issues_badge())
             )
             page = _TablePage(self._register)
             return page
@@ -463,6 +488,49 @@ class AccountantDashboard(QWidget):
             count = 0
         self._sidebar.set_drafts_badge(count)
 
+    def _on_day_issues_badge(self, count: int) -> None:
+        if hasattr(self._sidebar, "set_day_issues_badge"):
+            self._sidebar.set_day_issues_badge(count)
+
+    async def _refresh_day_issues_badge(self) -> None:
+        from datetime import date as _date
+        from tahmeed.services.day_issues_service import count_day_issues
+
+        target = _date.today()
+        if self._register is not None and getattr(self._register, "_current_date", None):
+            target = self._register._current_date
+        try:
+            count = await count_day_issues(target)
+        except Exception:
+            count = 0
+        self._on_day_issues_badge(count)
+
+    def _on_open_day_issues(self, target=None) -> None:
+        from tahmeed.ui.async_utils import in_running_task, schedule_call
+
+        self._sidebar.select("day_issues")
+
+        def _go() -> None:
+            widget = self._ensure_page("day_issues")
+            self._stack.setCurrentIndex(self._page_indices["day_issues"])
+            if target is not None and hasattr(widget, "set_date"):
+                widget.set_date(target)
+            elif hasattr(widget, "refresh"):
+                asyncio.ensure_future(widget.refresh())
+
+        if in_running_task() and "day_issues" not in self._pages:
+            schedule_call(_go)
+        else:
+            _go()
+
+    def _on_day_issues_open_register(self, d) -> None:
+        self._on_drafts_open_register(d)
+
+    def _on_day_issues_mapped(self) -> None:
+        if self._register is not None:
+            self._register.refresh()
+        asyncio.ensure_future(self._refresh_day_issues_badge())
+
     def _on_drafts_open_register(self, d) -> None:
         from tahmeed.ui.async_utils import in_running_task, schedule_call
 
@@ -544,6 +612,7 @@ class AccountantDashboard(QWidget):
             count = await get_verify_notification_count()
             self._sidebar.set_verify_badge(count)
             await self._refresh_drafts_badge()
+            await self._refresh_day_issues_badge()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -573,6 +642,16 @@ class AccountantDashboard(QWidget):
                         assert self._register is not None
                         self._register.reload_settings()
                         return
+                    if k == "day_issues":
+                        from datetime import date as _date
+                        target = _date.today()
+                        if self._register is not None and getattr(
+                            self._register, "_current_date", None
+                        ):
+                            target = self._register._current_date
+                        if hasattr(widget, "set_date"):
+                            widget.set_date(target)
+                            return
                     refresh = getattr(widget, "refresh", None)
                     if callable(refresh):
                         schedule_call(refresh)
@@ -657,6 +736,15 @@ class AccountantDashboard(QWidget):
                 self._register.update_people(people)
             else:
                 self._pending_people = people
+        except Exception:
+            pass
+        try:
+            from tahmeed.services.payee_service import get_payee_names
+            payees = await get_payee_names()
+            if self._register is not None:
+                self._register.update_payees(payees)
+            else:
+                self._pending_payees = payees
         except Exception:
             pass
 

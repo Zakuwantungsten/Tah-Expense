@@ -44,6 +44,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     ("CASHIER FLOW", [
         ("verify",          "Verify",            "mdi.inbox-arrow-down",             {"badge": True}),
         ("drafts",          "Drafts",            "mdi.file-document-edit-outline",   {"badge": True}),
+        ("day_issues",      "Day Issues",        "mdi.alert-decagram-outline",       {"badge": True}),
         ("table",           "Table",             "mdi.table-large",                  {}),
         ("browse",          "Browse",            "mdi.magnify",                      {}),
         ("master_expenses", "Master Expenses",   "mdi.table-multiple",               {}),
@@ -78,6 +79,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("manage_suppliers",  "Suppliers",         "mdi.truck-delivery-outline", {}),
         ("manage_description_maps", "Description Maps", "mdi.link-variant", {}),
         ("manage_people",     "People",           "mdi.account-outline", {}),
+        ("manage_payees",     "Payees",           "mdi.account-cash-outline", {}),
         ("manage_trucks",     "Trucks",           "mdi.truck",           {}),
         ("manage_trailers",   "Trailers",         "mdi.truck-trailer",   {}),
         ("manage_motor_vehicles", "Motorcycles & Cars", "mdi.car",        {}),
@@ -705,6 +707,10 @@ class SidebarWidget(QFrame):
     def set_drafts_badge(self, count: int) -> None:
         if "drafts" in self._items:
             self._items["drafts"].set_badge(count)
+
+    def set_day_issues_badge(self, count: int) -> None:
+        if "day_issues" in self._items:
+            self._items["day_issues"].set_badge(count)
 
     # ── Internal: top-level nav ────────────────────────────────────────────
 

@@ -785,6 +785,7 @@ class DailyRegister(QWidget):
     stats_updated     = Signal(int, float, float, float, object)  # n, tzs, usd, refund, date
     register_status_updated = Signal(int, int)  # draft_count, submitted_count on saved rows
     drafts_changed        = Signal()
+    day_issues_requested  = Signal(object)  # date | None — open Day Issues for this day
     undo_redo_changed     = Signal(bool, bool)  # can_undo, can_redo
     edit_state_changed = Signal(bool, int)         # (edit_mode_active, dirty_row_count)
     mode_changed      = Signal(bool)               # merged mode on/off
@@ -807,6 +808,7 @@ class DailyRegister(QWidget):
         self._fleet_kinds: dict = {}       # number → "truck" | "trailer" | "motor_vehicle"
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
         self._people_names: list = []      # Ownership / APR BY suggestions (unrestricted)
+        self._payee_names: list = []       # Payee catalog suggestions (unrestricted)
         self._cashier_names: dict = {}     # ObjectId -> display name
         self._merged_mode: bool = False    # Shared/Merged day (all cashiers)
         self._current_date: Optional[date] = date.today()
@@ -880,6 +882,7 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._load_locked_subitems())
         asyncio.ensure_future(self._load_fleet_numbers())
         asyncio.ensure_future(self._load_people_names())
+        asyncio.ensure_future(self._load_payee_names())
         asyncio.ensure_future(self._load_description_cache())
 
     # ------------------------------------------------------------------
@@ -990,6 +993,11 @@ class DailyRegister(QWidget):
         people_del = _ItemDelegate(lambda: list(self._people_names), self._table)
         self._table.setItemDelegateForColumn(COL_OWN, people_del)
         self._table.setItemDelegateForColumn(COL_APR, people_del)
+        # Payee — catalog suggestions from Manage → Payees (IIF); free text allowed.
+        self._table.setItemDelegateForColumn(
+            COL_PAYEE,
+            _ItemDelegate(lambda: list(self._payee_names), self._table),
+        )
 
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.model().dataChanged.connect(self._on_model_data_changed)
@@ -1304,6 +1312,8 @@ class DailyRegister(QWidget):
                     return
             d = self._current_date
             label = d.strftime("%d %b %Y")
+            if not await self._confirm_day_issues_for_submit(d):
+                return
             resp = QMessageBox.question(
                 self, "Submit for Verify",
                 f"Submit all draft entries for {label} to the Verify inbox?\n\n"
@@ -1328,6 +1338,52 @@ class DailyRegister(QWidget):
             if not self._save_in_flight:
                 self.save_busy_changed.emit(False)
 
+    async def _confirm_day_issues_for_submit(self, d: date) -> bool:
+        """Block submit when Day Issues remain, unless the accountant setting allows it."""
+        from tahmeed.services.day_issues_service import collect_day_issues
+        from tahmeed.services.settings_service import get_setting
+
+        try:
+            snap = await collect_day_issues(d)
+        except Exception:
+            return True
+        if snap.total <= 0:
+            return True
+        allow = False
+        try:
+            allow = bool(await get_setting("allow_submit_with_day_issues"))
+        except Exception:
+            allow = False
+        label = d.strftime("%d %b %Y")
+        summary = (
+            f"{snap.total} Day Issue(s) on {label}:\n"
+            f"  · {snap.unmapped_count} unmapped\n"
+            f"  · {snap.bad_map_count} bad map\n\n"
+        )
+        if not allow:
+            resp = QMessageBox.warning(
+                self,
+                "Day Issues block submit",
+                summary
+                + "Map descriptions on the Day Issues tab before submitting.\n\n"
+                "Open Day Issues now?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if resp == QMessageBox.Yes:
+                self.day_issues_requested.emit(d)
+            return False
+        resp = QMessageBox.question(
+            self,
+            "Submit with Day Issues?",
+            summary
+            + "Submit is allowed with issues (accountant setting).\n\n"
+            "Submit anyway?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return resp == QMessageBox.Yes
+
     def refresh(self) -> None:
         if self._current_date is None:
             self._populate([])
@@ -1344,6 +1400,7 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._load_locked_subitems())
         asyncio.ensure_future(self._load_fleet_numbers())
         asyncio.ensure_future(self._load_people_names())
+        asyncio.ensure_future(self._load_payee_names())
         asyncio.ensure_future(self._load_description_cache())
 
     def update_people(self, names: list) -> None:
@@ -1356,6 +1413,17 @@ class DailyRegister(QWidget):
             self.update_people(await get_people_names())
         except Exception:
             self._people_names = []
+
+    def update_payees(self, names: list) -> None:
+        """Refresh Payee column suggestion list (free text still allowed)."""
+        self._payee_names = [str(n).strip().upper() for n in (names or []) if str(n).strip()]
+
+    async def _load_payee_names(self) -> None:
+        try:
+            from tahmeed.services.payee_service import get_payee_names
+            self.update_payees(await get_payee_names())
+        except Exception:
+            self._payee_names = []
 
     def _populate(self, transactions: List[Transaction]) -> None:
         # A fresh load always returns the grid to read-only state.
@@ -4055,7 +4123,7 @@ class DailyRegister(QWidget):
         if self._bulk_mutating or not description.strip():
             return
         self._auto_fill_row = row
-        asyncio.ensure_future(self._auto_fill_item_from_mapping(row, description))
+        asyncio.ensure_future(self._auto_fill_from_mapping(row, description))
 
     def _load_staged_import_rows(self, payloads: list) -> None:
         if not payloads:
@@ -5159,32 +5227,57 @@ class DailyRegister(QWidget):
         except Exception:
             self._export_restrict_surfaces = set()
 
-    async def _auto_fill_item_from_mapping(self, row: int, description: str) -> None:
-        """Pre-fill Item from a saved description map or prior entries."""
+    async def _auto_fill_from_mapping(self, row: int, description: str) -> None:
+        """Pre-fill Item and Payee from a saved description map (blank cells only)."""
         try:
             if not description.strip():
                 return
             item_it = self._table.item(row, COL_ITEM)
-            if item_it and item_it.text().strip():
+            payee_it = self._table.item(row, COL_PAYEE)
+            need_item = not (item_it and item_it.text().strip())
+            need_payee = not (payee_it and payee_it.text().strip())
+            if not need_item and not need_payee:
                 return
-            from tahmeed.services.cashier_service import resolve_item_name_for_description
+
+            from tahmeed.services.cashier_service import (
+                resolve_mapping_fields_for_description,
+            )
 
             try:
-                cat_name = await resolve_item_name_for_description(description)
+                cat_name, payee = await resolve_mapping_fields_for_description(
+                    description
+                )
             except Exception:
                 return
-            if not cat_name:
+            if not cat_name and not payee:
                 return
+
             prev = self._table.blockSignals(True)
-            if item_it is None:
-                item_it = QTableWidgetItem(cat_name)
-                item_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                self._table.setItem(row, COL_ITEM, item_it)
-            else:
-                item_it.setText(cat_name)
+            filled_item = None
+            if need_item and cat_name:
+                if item_it is None:
+                    item_it = QTableWidgetItem(cat_name)
+                    item_it.setFlags(
+                        Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+                    )
+                    self._table.setItem(row, COL_ITEM, item_it)
+                else:
+                    item_it.setText(cat_name)
+                filled_item = item_it
+            if need_payee and payee:
+                payee_text = payee.strip().upper()
+                if payee_it is None:
+                    payee_it = QTableWidgetItem(payee_text)
+                    payee_it.setFlags(
+                        Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+                    )
+                    self._table.setItem(row, COL_PAYEE, payee_it)
+                else:
+                    payee_it.setText(payee_text)
             self._table.blockSignals(prev)
-            self._validate_item_cell(row, item_it)
-            self._update_truck_required_highlight(row)
+            if filled_item is not None:
+                self._validate_item_cell(row, filled_item)
+                self._update_truck_required_highlight(row)
         finally:
             if self._auto_fill_row == row:
                 self._auto_fill_row = None

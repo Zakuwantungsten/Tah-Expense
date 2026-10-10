@@ -91,6 +91,24 @@ class MappingWrite(StrictModel):
     description: str
     category_id: str
     category_name: str
+    payee: str = ""
+
+
+class PayeeWrite(StrictModel):
+    name: str = Field(min_length=1, max_length=200)
+    active: bool = True
+    ref_num: str = Field("", max_length=80)
+    currency: str = Field("TZS", max_length=12)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_payee_name(cls, value: str) -> str:
+        return " ".join(value.upper().split())
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        return " ".join((value or "TZS").upper().split()) or "TZS"
 
 
 class FleetWrite(StrictModel):
@@ -263,12 +281,14 @@ class BulkIdsRequest(StrictModel):
 class CategoryAssignRequest(StrictModel):
     category_name: str = Field(min_length=1, max_length=200)
     category_id: str | None = None
+    payee: str | None = None
 
 
 class BulkCategoryAssignRequest(StrictModel):
     ids: list[str] = Field(default_factory=list, max_length=500)
     category_name: str = Field(min_length=1, max_length=200)
     category_id: str | None = None
+    payee: str | None = None
 
 
 class MasterPatchRequest(StrictModel):
@@ -347,6 +367,12 @@ class MasterImportCommitRequest(StrictModel):
 
 
 class ChartOfAccountsImportRequest(StrictModel):
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
+    replace_existing: bool = True
+    source_filename: str = Field("", max_length=500)
+
+
+class PayeeImportRequest(StrictModel):
     rows: list[dict[str, Any]] = Field(default_factory=list, max_length=20000)
     replace_existing: bool = True
     source_filename: str = Field("", max_length=500)

@@ -135,6 +135,7 @@ class RejectedView(QWidget):
         self._fleet_numbers: set = set()
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
         self._people_names: list = []
+        self._payee_names: list = []
         self._restrict_items = False
         self._defer_item_to_verify = False
 
@@ -333,6 +334,10 @@ class RejectedView(QWidget):
         people_del = _ItemDelegate(lambda: list(self._people_names), t)
         t.setItemDelegateForColumn(COL_OWN, people_del)
         t.setItemDelegateForColumn(COL_APR, people_del)
+        t.setItemDelegateForColumn(
+            COL_PAYEE,
+            _ItemDelegate(lambda: list(self._payee_names), t),
+        )
 
         t.itemChanged.connect(self._on_item_changed)
         t.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -414,6 +419,14 @@ class RejectedView(QWidget):
             ]
         except Exception:
             self._people_names = []
+        try:
+            from tahmeed.services.payee_service import get_payee_names
+            payees = await get_payee_names()
+            self._payee_names = [
+                str(n).strip().upper() for n in (payees or []) if str(n).strip()
+            ]
+        except Exception:
+            self._payee_names = []
         try:
             labels = await get_setting("allowed_truck_labels")
             if labels:
