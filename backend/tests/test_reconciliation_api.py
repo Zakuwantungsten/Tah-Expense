@@ -272,14 +272,27 @@ def settings() -> Settings:
     )
 
 
+class FakeOperationEvents:
+    def __init__(self) -> None:
+        self.documents: list[dict] = []
+
+    async def insert_one(self, document: dict) -> SimpleNamespace:
+        stored = dict(document)
+        stored["_id"] = ObjectId()
+        self.documents.append(stored)
+        return SimpleNamespace(inserted_id=stored["_id"])
+
+
 def _app(
     entries: FakeEntries,
     stations: FakeStations | None = None,
+    events: FakeOperationEvents | None = None,
 ):
     database = SimpleNamespace(
         db=SimpleNamespace(
             reconciliation_entries=entries,
             recon_stations=stations or FakeStations(),
+            operation_events=events or FakeOperationEvents(),
         )
     )
     return create_app(settings=settings(), database=database)
@@ -527,7 +540,8 @@ def test_existing_keys_save_rows_and_patch() -> None:
 
 def test_stations_seed_ensure_and_add() -> None:
     stations = FakeStations()
-    app = _app(FakeEntries(), stations)
+    events = FakeOperationEvents()
+    app = _app(FakeEntries(), stations, events)
     app.dependency_overrides[current_user] = _manager
 
     with TestClient(app) as client:
@@ -565,3 +579,7 @@ def test_stations_seed_ensure_and_add() -> None:
         assert created2.status_code == 201
         assert created2.json()["slug"] == "tunduma"
         assert sum(1 for s in stations.documents if s["slug"] == "tunduma") == 1
+
+    actions = [e["action"] for e in events.documents]
+    assert "recon.stations_ensure" in actions
+    assert "recon.station_create" in actions

@@ -5,11 +5,13 @@ from PySide6.QtCore import Qt, Signal
 import qtawesome as qta
 
 from tahmeed.models.user import User
-from tahmeed.ui.accountant.backup import BackupWidget
+from tahmeed.ui.admin.audit_tab import AuditTab
+from tahmeed.ui.admin.backup_tab import BackupTab
 from tahmeed.ui.admin.users_tab import UsersTab
 from tahmeed.ui.admin.categories_tab import CategoriesTab
 from tahmeed.ui.admin.rules_tab import RulesTab
 from tahmeed.ui.admin.settings_tab import SettingsTab
+from tahmeed.ui.admin.security_tab import SecurityTab
 
 
 class AdminDashboard(QWidget):
@@ -47,12 +49,28 @@ class AdminDashboard(QWidget):
         tbl.addWidget(logout_btn)
         layout.addWidget(top_bar)
 
-        tabs = QTabWidget()
-        tabs.addTab(UsersTab(), "Users")
-        tabs.addTab(CategoriesTab(), "Categories")
-        tabs.addTab(RulesTab(), "Keyword Rules")
-        tabs.addTab(SettingsTab(), "Settings")
-        backup = BackupWidget(allow_restore=True)
+        self._tabs = QTabWidget()
+        self._users = UsersTab()
+        self._security = SecurityTab()
+        self._audit = AuditTab()
+        self._tabs.addTab(self._users, "Users")
+        self._tabs.addTab(CategoriesTab(), "Categories")
+        self._tabs.addTab(RulesTab(), "Keyword Rules")
+        self._tabs.addTab(SettingsTab(), "Settings")
+        self._tabs.addTab(self._security, "Security")
+        self._tabs.addTab(self._audit, "Audit Log")
+        backup = BackupTab()
         backup.logout_requested.connect(self.logout_requested)
-        tabs.addTab(backup, "Backups")
-        layout.addWidget(tabs)
+        self._tabs.addTab(backup, "Backups")
+        layout.addWidget(self._tabs)
+
+        self._users.view_sessions_requested.connect(self._goto_user_sessions)
+        self._users.view_audit_requested.connect(self._goto_user_audit)
+
+    def _goto_user_sessions(self, username: str) -> None:
+        self._tabs.setCurrentWidget(self._security)
+        self._security.focus_user(username)
+
+    def _goto_user_audit(self, username: str) -> None:
+        self._tabs.setCurrentWidget(self._audit)
+        self._audit.focus_actor(username)

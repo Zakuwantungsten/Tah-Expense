@@ -82,7 +82,6 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("manage_trailers",   "Trailers",         "mdi.truck-trailer",   {}),
         ("manage_motor_vehicles", "Motorcycles & Cars", "mdi.car",        {}),
         ("manage_users",      "Users",            "mdi.account-multiple-outline", {}),
-        ("backup",            "Backups",          "mdi.database-export-outline", {}),
     ]),
 ]
 

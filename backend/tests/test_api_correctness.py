@@ -159,7 +159,7 @@ async def test_bootstrap_is_atomic_and_failed_insert_releases_lock() -> None:
         await bootstrap(
             UserCreate(
                 username="first",
-                password="long-enough-password",
+                password="Long-enough-pass1",
                 role="admin",
                 full_name="First Admin",
             ),
@@ -172,7 +172,7 @@ async def test_bootstrap_is_atomic_and_failed_insert_releases_lock() -> None:
         bootstrap(
             UserCreate(
                 username="first",
-                password="long-enough-password",
+                password="Long-enough-pass1",
                 role="admin",
                 full_name="First Admin",
             ),
@@ -181,7 +181,7 @@ async def test_bootstrap_is_atomic_and_failed_insert_releases_lock() -> None:
         bootstrap(
             UserCreate(
                 username="second",
-                password="long-enough-password",
+                password="Long-enough-pass1",
                 role="admin",
                 full_name="Second Admin",
             ),
@@ -230,7 +230,7 @@ async def test_accountant_can_manage_non_admin_users_only() -> None:
     cashier = await create_user(
         UserCreate(
             username="cashier",
-            password="long-enough-password",
+            password="Long-enough-pass1",
             role="cashier",
             full_name="Cashier User",
         ),
@@ -243,7 +243,7 @@ async def test_accountant_can_manage_non_admin_users_only() -> None:
         await create_user(
             UserCreate(
                 username="another-admin",
-                password="long-enough-password",
+                password="Long-enough-pass1",
                 role="admin",
                 full_name="Another Admin",
             ),

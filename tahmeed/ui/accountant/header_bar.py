@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QSize, Signal, QPoint
 from PySide6.QtGui import QColor, QMouseEvent
 
+from tahmeed.config import APP_NAME
 from tahmeed.models.user import User
 
 _NAVY  = "#1B2B4B"
@@ -129,7 +130,7 @@ class HeaderBar(QFrame):
         hl.addSpacing(10)
 
         # ── App name ──
-        app_name = QLabel("Tahmeed Expense")
+        app_name = QLabel(APP_NAME)
         app_name.setStyleSheet(
             f"color: {text_col}; font-size: 14px; font-weight: 600;"
             " letter-spacing: 0.4px; font-family:'Segoe UI'; background: transparent;"

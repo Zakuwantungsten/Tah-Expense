@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 
+from tahmeed.config import APP_NAME
 from tahmeed.services.auth import authenticate, any_user_exists, create_user
 from tahmeed.services.api_client import ApiError
 from tahmeed.ui.branding import is_dark_theme, load_brand_logo
@@ -72,7 +73,7 @@ class LoginWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Tahmeed Expenses")
+        self.setWindowTitle(APP_NAME)
         self.setFixedSize(460, 520)
         self._build_ui()
 
@@ -116,7 +117,7 @@ class LoginWindow(QWidget):
         layout.addWidget(logo)
         layout.addSpacing(8)
 
-        title = QLabel(_title_html("Tahmeed Expenses", 20))
+        title = QLabel(_title_html(APP_NAME, 20))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
@@ -177,7 +178,7 @@ class LoginWindow(QWidget):
         layout.addWidget(logo)
         layout.addSpacing(4)
 
-        title = QLabel(_title_html("Tahmeed Expenses", 16))
+        title = QLabel(_title_html(APP_NAME, 16))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 

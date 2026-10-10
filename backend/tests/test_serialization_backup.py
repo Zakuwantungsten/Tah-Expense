@@ -22,28 +22,34 @@ def test_json_safe_handles_nested_bson_and_datetime() -> None:
     assert result["nested"] == ["2026-01-01T00:00:00Z"]
 
 
-def test_retention_keeps_union_of_time_buckets() -> None:
+def test_retention_keeps_newest_count() -> None:
     jobs = [
         {"_id": index, "created_at": datetime(2026, month, 1, tzinfo=timezone.utc)}
         for index, month in enumerate(range(6, 0, -1))
     ]
-    kept = retention_set(jobs, daily=1, weekly=1, monthly=3)
-    assert {0, 1, 2}.issubset(kept)
+    kept = retention_set(jobs, keep_count=3)
+    assert kept == {0, 1, 2}
     assert 5 not in kept
 
 
-def test_backup_plan_defaults() -> None:
+def test_backup_plan_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Ignore developer .env overrides for this assertion.
+    monkeypatch.setenv("BACKUP_KEEP_COUNT", "30")
+    monkeypatch.setenv("BACKUP_SCHEDULE_MODE", "hourly")
+    monkeypatch.setenv("BACKUP_LOCAL_KEEP_GENERATIONS", "30")
+    monkeypatch.setenv("BACKUP_SCHEDULE_CATCHUP_MINUTES", "90")
     settings = Settings(
         mongodb_uri="mongodb://localhost:27017",
         jwt_secret="a-test-secret-that-is-definitely-32-characters",
+        backup_keep_count=30,
+        backup_schedule_mode="hourly",
+        backup_local_keep_generations=30,
+        backup_schedule_catchup_minutes=90,
     )
-    assert (
-        settings.backup_keep_daily,
-        settings.backup_keep_weekly,
-        settings.backup_keep_monthly,
-    ) == (7, 4, 6)
+    assert settings.backup_keep_count == 30
+    assert settings.backup_schedule_mode == "hourly"
     assert settings.backup_consistency_mode == "standalone"
-    assert settings.backup_local_keep_generations == 3
+    assert settings.backup_local_keep_generations == 30
 
 
 def test_free_space_check_rejects_low_disk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -373,25 +379,37 @@ async def test_remote_prune_deletes_archive_and_manifest_versions(
         "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
         "status": "uploaded",
     }
-    jobs = UploadBackupJobs([job])
+    older = {
+        "_id": "old",
+        "object_key": "prefix/old.archive.gz",
+        "manifest_key": "prefix/old.archive.gz.manifest.json",
+        "archive_version_id": "old-archive-version",
+        "manifest_version_id": "old-manifest-version",
+        "created_at": datetime(2025, 1, 1, tzinfo=timezone.utc),
+        "status": "uploaded",
+    }
+    # Newest-first order as returned by Mongo sort.
+    jobs = UploadBackupJobs([job, older])
     client = FakeS3()
     monkeypatch.setattr(backup, "s3_client", lambda _: client)
     settings = Settings(
         mongodb_uri="mongodb://localhost:27017",
         jwt_secret="a-test-secret-that-is-definitely-32-characters",
         backup_s3_bucket="bucket",
-        backup_keep_daily=0,
-        backup_keep_weekly=0,
-        backup_keep_monthly=0,
+        backup_keep_count=1,
     )
 
     assert await backup.prune(settings, SimpleNamespace(backup_jobs=jobs)) == 1
     assert client.deletions == [
-        {"Bucket": "bucket", "Key": "prefix/archive.gz", "VersionId": "archive-version"},
         {
             "Bucket": "bucket",
-            "Key": "prefix/archive.gz.manifest.json",
-            "VersionId": "manifest-version",
+            "Key": "prefix/old.archive.gz",
+            "VersionId": "old-archive-version",
+        },
+        {
+            "Bucket": "bucket",
+            "Key": "prefix/old.archive.gz.manifest.json",
+            "VersionId": "old-manifest-version",
         },
     ]
     assert jobs.updates[-1][1]["$set"]["status"] == "pruned"

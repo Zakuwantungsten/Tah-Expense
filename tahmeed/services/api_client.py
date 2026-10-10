@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from tahmeed.config import API_BASE_URL
+from tahmeed.services.device_id import primary_mac_address
 
 
 def _ensure_ssl_certs() -> None:
@@ -118,7 +119,9 @@ class ApiClient:
                 return False
             try:
                 response = await self._http().post(
-                    "v1/auth/refresh", json={"refresh_token": token}
+                    "v1/auth/refresh",
+                    json={"refresh_token": token},
+                    headers={"X-Device-Mac": primary_mac_address()},
                 )
                 if response.status_code >= 400:
                     self.clear_tokens()
@@ -165,6 +168,7 @@ class ApiClient:
     ) -> httpx.Response:
         rejected_token = self._access_token
         headers = dict(kwargs.pop("headers", {}))
+        headers.setdefault("X-Device-Mac", primary_mac_address())
         if auth:
             if not rejected_token:
                 raise ApiAuthenticationError(

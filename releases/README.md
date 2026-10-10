@@ -1,7 +1,7 @@
 # Signed Windows desktop releases
 
 The only distributable artifact is the per-user Inno installer
-`installer_output/TahmeedExpenseSetup-X.Y.Z.exe`. Do not publish a ZIP. The
+`installer_output/meedexpeSetup-X.Y.Z.exe`. Do not publish a ZIP. The
 desktop version has one source: `tahmeed/version.py`.
 
 ## One-time signing setup

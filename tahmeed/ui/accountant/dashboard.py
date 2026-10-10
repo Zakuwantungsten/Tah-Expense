@@ -52,7 +52,6 @@ _LAZY_PAGE_KEYS = frozenset({
     "manage_description_maps",
     "manage_people",
     "manage_users",
-    "backup",
     "table",
     "browse",
 })
@@ -325,12 +324,6 @@ class AccountantDashboard(QWidget):
         if key == "manage_users":
             from tahmeed.ui.admin.users_tab import UsersTab
             return UsersTab()
-
-        if key == "backup":
-            from tahmeed.ui.accountant.backup import BackupWidget
-            widget = BackupWidget(allow_restore=True)
-            widget.logout_requested.connect(self.logout_requested)
-            return widget
 
         if key == "table":
             from tahmeed.ui.cashier.excel_grid import DailyRegister

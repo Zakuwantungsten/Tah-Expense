@@ -1,4 +1,4 @@
-"""Desktop structured logging to %%LOCALAPPDATA%%\\Tahmeed Expense\\logs."""
+"""Desktop structured logging to %%LOCALAPPDATA%%\\meedexpe\\logs."""
 
 from __future__ import annotations
 

@@ -258,7 +258,7 @@ async def create_local_backup(
     *,
     schedule_id: str | None = None,
 ) -> Path:
-    if cadence not in {"daily", "weekly", "monthly"}:
+    if cadence not in {"hourly", "daily", "weekly", "monthly"}:
         raise ValueError(f"Unsupported backup cadence: {cadence}")
     settings.backup_directory.mkdir(parents=True, exist_ok=True)
     ensure_free_space(settings.backup_directory, settings.backup_min_free_bytes)
@@ -508,24 +508,22 @@ async def upload_pending(settings: Settings, db: Any) -> int:
                     }
                 },
             )
-    await prune_local(settings, db)
+    await prune_local(settings, db, keep_count=await resolve_keep_count(settings, db))
     return uploaded
 
 
-async def prune_local(settings: Settings, db: Any) -> int:
-    """Keep the newest configured number of uploaded archives per cadence."""
+async def prune_local(settings: Settings, db: Any, *, keep_count: int | None = None) -> int:
+    """Keep the newest configured number of local archives (global count)."""
+    limit = keep_count if keep_count is not None else settings.backup_local_keep_generations
     jobs = await db.backup_jobs.find(
         {
             "status": {"$in": ["uploaded", "pruned"]},
             "local_available": {"$ne": False},
         }
     ).sort("created_at", -1).to_list()
-    kept: dict[str, int] = {}
     removed = 0
-    for job in jobs:
-        cadence = job.get("cadence", "unspecified")
-        kept[cadence] = kept.get(cadence, 0) + 1
-        if kept[cadence] <= settings.backup_local_keep_generations:
+    for index, job in enumerate(jobs):
+        if index < limit:
             continue
         archive = Path(job["local_path"])
         local_manifest = Path(job.get("manifest_path") or manifest_path(archive))
@@ -545,30 +543,32 @@ async def prune_local(settings: Settings, db: Any) -> int:
     return removed
 
 
-def retention_set(jobs: list[dict], daily: int, weekly: int, monthly: int) -> set:
-    keep: set = set()
-    buckets = (
-        (daily, lambda dt: dt.date().isoformat()),
-        (weekly, lambda dt: f"{dt.isocalendar().year}-W{dt.isocalendar().week:02d}"),
-        (monthly, lambda dt: f"{dt.year}-{dt.month:02d}"),
-    )
-    for limit, bucket in buckets:
-        seen: set[str] = set()
-        for job in jobs:
-            key = bucket(job["created_at"])
-            if key not in seen and len(seen) < limit:
-                keep.add(job["_id"])
-                seen.add(key)
-    return keep
+def retention_set(jobs: list[dict], keep_count: int) -> set:
+    """Keep the newest ``keep_count`` jobs (jobs must already be newest-first)."""
+    return {job["_id"] for job in jobs[: max(0, keep_count)]}
+
+
+async def resolve_keep_count(settings: Settings, db: Any) -> int:
+    try:
+        doc = await db.system_settings.find_one({"key": "backup_keep_count"})
+    except Exception:
+        return settings.backup_keep_count
+    if doc is not None and "value" in doc:
+        try:
+            value = int(doc["value"])
+            if 1 <= value <= 365:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return settings.backup_keep_count
 
 
 async def prune(settings: Settings, db: Any) -> int:
     if not settings.backup_s3_bucket:
         return 0
+    keep_count = await resolve_keep_count(settings, db)
     jobs = await db.backup_jobs.find({"status": "uploaded"}).sort("created_at", -1).to_list()
-    keep = retention_set(
-        jobs, settings.backup_keep_daily, settings.backup_keep_weekly, settings.backup_keep_monthly
-    )
+    keep = retention_set(jobs, keep_count)
     obsolete = [job for job in jobs if job["_id"] not in keep]
     if not obsolete:
         return 0
@@ -798,9 +798,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--cadence",
-        choices=("daily", "weekly", "monthly"),
-        default="daily",
-        help="Retention cadence metadata for a newly created archive.",
+        choices=("hourly", "daily", "weekly", "monthly"),
+        default="hourly",
+        help="Cadence metadata for a newly created archive.",
     )
     args = parser.parse_args()
     asyncio.run(execute(args.command, args.cadence))

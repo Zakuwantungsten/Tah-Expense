@@ -8,6 +8,7 @@ from app.cli.scheduler import (
     claim_slot,
     daily_slot,
     due_slots,
+    hourly_slot,
     interval_slot,
     weekly_slot,
 )
@@ -52,43 +53,62 @@ def test_due_slots_use_utc_boundaries() -> None:
     assert daily_slot(now, "02:00").due_at == datetime(2026, 7, 18, 2, tzinfo=UTC)
     assert weekly_slot(now, 6, "03:00").due_at == datetime(2026, 7, 12, 3, tzinfo=UTC)
     assert interval_slot(now, 30).due_at == datetime(2026, 7, 19, 1, 30, tzinfo=UTC)
+    assert hourly_slot(now).due_at == datetime(2026, 7, 19, 1, 0, tzinfo=UTC)
 
 
 def test_slot_key_is_stable_for_same_due_time() -> None:
     due = datetime(2026, 7, 19, 2, tzinfo=UTC)
 
     assert ScheduleSlot("backup-daily", due, "daily").key == "backup-daily:20260719T0200Z"
+    assert ScheduleSlot("backup-hourly", due, "hourly").key == "backup-hourly:20260719T0200Z"
 
 
-def test_weekly_day_replaces_daily_and_old_slots_are_not_caught_up() -> None:
+def test_hourly_mode_dumps_within_catchup_window() -> None:
     settings = Settings(
         mongodb_uri="mongodb://localhost:27017",
         jwt_secret="a-test-secret-that-is-definitely-32-characters",
-        backup_schedule_catchup_minutes=360,
+        backup_schedule_mode="hourly",
+        backup_schedule_catchup_minutes=30,
     )
-    sunday_before_weekly = due_slots(
-        settings, datetime(2026, 7, 19, 2, 30, tzinfo=UTC)
-    )
-    assert [slot.task for slot in sunday_before_weekly] == ["upload-retry-prune"]
-
-    sunday_after_weekly = due_slots(
-        settings, datetime(2026, 7, 19, 3, 5, tzinfo=UTC)
-    )
-    assert [slot.task for slot in sunday_after_weekly] == [
-        "backup-weekly",
+    just_after_hour = due_slots(settings, datetime(2026, 7, 20, 2, 5, tzinfo=UTC))
+    assert [slot.task for slot in just_after_hour] == [
+        "backup-hourly",
         "upload-retry-prune",
     ]
 
-    monday_after_daily = due_slots(
-        settings, datetime(2026, 7, 20, 2, 5, tzinfo=UTC)
+    # Current hour slot is already older than the catchup window.
+    too_late = due_slots(settings, datetime(2026, 7, 20, 2, 45, tzinfo=UTC))
+    assert [slot.task for slot in too_late] == ["upload-retry-prune"]
+
+
+def test_daily_mode_uses_configured_time() -> None:
+    settings = Settings(
+        mongodb_uri="mongodb://localhost:27017",
+        jwt_secret="a-test-secret-that-is-definitely-32-characters",
+        backup_schedule_mode="daily",
+        backup_daily_time_utc="00:00",
+        backup_schedule_catchup_minutes=90,
     )
-    assert [slot.task for slot in monday_after_daily] == [
+    after_midnight = due_slots(
+        settings,
+        datetime(2026, 7, 20, 0, 10, tzinfo=UTC),
+        schedule_mode="daily",
+        daily_time_utc="00:00",
+    )
+    assert [slot.task for slot in after_midnight] == [
         "backup-daily",
         "upload-retry-prune",
     ]
 
-    monday_too_late = due_slots(settings, datetime(2026, 7, 20, 15, 0, tzinfo=UTC))
-    assert [slot.task for slot in monday_too_late] == ["upload-retry-prune"]
+
+def test_disabled_mode_only_runs_maintenance() -> None:
+    settings = Settings(
+        mongodb_uri="mongodb://localhost:27017",
+        jwt_secret="a-test-secret-that-is-definitely-32-characters",
+        backup_schedule_mode="disabled",
+    )
+    slots = due_slots(settings, datetime(2026, 7, 20, 2, 5, tzinfo=UTC))
+    assert [slot.task for slot in slots] == ["upload-retry-prune"]
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ from .accountant_diesel_ops import (
     diesel_cash_verified_match,
     normalize_diesel_cash_item_names,
 )
+from .audit_ops import record_operation_event
 from .dependencies import require_roles
 from .schemas import DieselCashItemsRequest
 from .serialization import json_safe
@@ -78,7 +79,7 @@ async def get_diesel_cash_items(request: Request, _manager: Manager) -> dict:
 async def put_diesel_cash_items(
     request: Request,
     body: DieselCashItemsRequest,
-    _manager: Manager,
+    manager: Manager,
 ) -> dict:
     cleaned = normalize_diesel_cash_item_names(list(body.names or []))
     db = _database(request)
@@ -86,6 +87,14 @@ async def put_diesel_cash_items(
         {"key": DIESEL_CASH_ITEMS_SETTING},
         {"$set": {"key": DIESEL_CASH_ITEMS_SETTING, "value": cleaned}},
         upsert=True,
+    )
+    await record_operation_event(
+        db,
+        action="diesel.items_update",
+        actor=manager,
+        request=request,
+        entity_type="diesel_cash_items",
+        details={"count": len(cleaned)},
     )
     return {"items": cleaned}
 

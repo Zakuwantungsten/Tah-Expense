@@ -94,4 +94,4 @@ UPDATE_MANIFEST_URL: str = os.getenv("UPDATE_MANIFEST_URL", "")
 
 _assert_local_dev_targets(mongodb_uri=MONGODB_URI, api_base_url=API_BASE_URL)
 
-APP_NAME = "Tahmeed Expense"
+APP_NAME = "meedexpe"

@@ -1,8 +1,8 @@
-; Inno Setup script for Tahmeed Expense
+; Inno Setup script for meedexpe
 ; Compiled only by scripts\build_windows.ps1, which supplies MyAppVersion from
 ; tahmeed\version.py (the authoritative desktop version source).
 ;
-; Produces:  installer_output\TahmeedExpenseSetup-<version>.exe
+; Produces:  installer_output\meedexpeSetup-<version>.exe
 ; That single .exe is what you give users. They double-click it, Next-Next-Finish,
 ; and get a Start Menu + Desktop shortcut. The Ubuntu MongoDB connection is already
 ; baked into the app, so it connects automatically on first launch.
@@ -10,9 +10,9 @@
 #ifndef MyAppVersion
   #error MyAppVersion must be supplied by scripts\build_windows.ps1
 #endif
-#define MyAppName "Tahmeed Expense"
-#define MyAppPublisher "Tahmeed"
-#define MyAppExeName "Tahmeed Expense.exe"
+#define MyAppName "meedexpe"
+#define MyAppPublisher "meedexpe"
+#define MyAppExeName "meedexpe.exe"
 
 [Setup]
 AppId={{A3F1C2D4-5E6F-4A7B-8C9D-0E1F2A3B4C5D}
@@ -24,7 +24,7 @@ DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=installer_output
-OutputBaseFilename=TahmeedExpenseSetup-{#MyAppVersion}
+OutputBaseFilename=meedexpeSetup-{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -44,7 +44,7 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 
 [Files]
 ; Everything PyInstaller produced in the build folder.
-Source: "dist\Tahmeed Expense\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\meedexpe\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"

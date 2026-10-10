@@ -16,6 +16,6 @@ def test_release_assets_use_authoritative_version_and_shared_mutex() -> None:
     installer = (ROOT / "installer.iss").read_text("utf-8")
     build_script = (ROOT / "scripts" / "build_windows.ps1").read_text("utf-8")
     assert "AppVersion={#MyAppVersion}" in installer
-    assert "TahmeedExpenseSetup-{#MyAppVersion}" in installer
+    assert "meedexpeSetup-{#MyAppVersion}" in installer
     assert "AppMutex=TahmeedExpense.A3F1C2D4-5E6F-4A7B-8C9D-0E1F2A3B4C5D" in installer
     assert 'Get-Content "tahmeed\\version.py" -Raw' in build_script

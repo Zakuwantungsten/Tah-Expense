@@ -10,6 +10,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from pymongo import UpdateOne
 
+from .audit_ops import record_operation_event
 from .dependencies import Authenticated, require_roles
 from .errors import ApiError
 from .schemas import (
@@ -132,8 +133,17 @@ async def create_transaction(
     body: TransactionCreate, request: Request, actor: RegisterActor
 ) -> dict:
     doc = _create_document(body, actor)
-    result = await _database(request).transactions.insert_one(doc)
+    db = _database(request)
+    result = await db.transactions.insert_one(doc)
     doc["_id"] = result.inserted_id
+    await record_operation_event(
+        db,
+        action="txn.create",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(doc["_id"])],
+    )
     return json_safe(doc)
 
 
@@ -666,7 +676,8 @@ async def discard_transactions(
     if not ids:
         return {"updated": 0}
     scope = _actor_cashier_id(actor, body.cashier_id)
-    result = await _database(request).transactions.update_many(
+    db = _database(request)
+    result = await db.transactions.update_many(
         {
             "_id": {"$in": ids},
             "cashier_id": scope,
@@ -674,6 +685,15 @@ async def discard_transactions(
             "discarded": {"$ne": True},
         },
         {"$set": {"discarded": True}},
+    )
+    await record_operation_event(
+        db,
+        action="txn.discard",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(oid) for oid in ids],
+        details={"updated": int(result.modified_count)},
     )
     return {"updated": int(result.modified_count)}
 
@@ -686,13 +706,23 @@ async def restore_discarded_transactions(
     if not ids:
         return {"updated": 0}
     scope = _actor_cashier_id(actor, body.cashier_id)
-    result = await _database(request).transactions.update_many(
+    db = _database(request)
+    result = await db.transactions.update_many(
         {
             "_id": {"$in": ids},
             "cashier_id": scope,
             "discarded": True,
         },
         {"$set": {"discarded": False}},
+    )
+    await record_operation_event(
+        db,
+        action="txn.restore_discarded",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(oid) for oid in ids],
+        details={"updated": int(result.modified_count)},
     )
     return {"updated": int(result.modified_count)}
 
@@ -705,12 +735,22 @@ async def delete_discarded_transactions(
     if not ids:
         return {"deleted": 0}
     scope = _actor_cashier_id(actor, body.cashier_id)
-    result = await _database(request).transactions.delete_many(
+    db = _database(request)
+    result = await db.transactions.delete_many(
         {
             "_id": {"$in": ids},
             "cashier_id": scope,
             "discarded": True,
         }
+    )
+    await record_operation_event(
+        db,
+        action="txn.delete_discarded",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(oid) for oid in ids],
+        details={"deleted": int(result.deleted_count)},
     )
     return {"deleted": int(result.deleted_count)}
 
@@ -747,6 +787,15 @@ async def resubmit_rejected_transactions(
         )
         if result.modified_count:
             updated += 1
+    await record_operation_event(
+        db,
+        action="txn.resubmit",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=list(body.updates_by_id.keys())[:100],
+        details={"updated": updated},
+    )
     return {"updated": updated}
 
 
@@ -847,15 +896,26 @@ async def discard_draft_transactions(
     }
     if not body.allow_any_cashier:
         query["cashier_id"] = _actor_cashier_id(actor, body.cashier_id)
-    result = await _database(request).transactions.delete_many(query)
+    db = _database(request)
+    result = await db.transactions.delete_many(query)
+    await record_operation_event(
+        db,
+        action="txn.draft_discard",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(oid) for oid in ids],
+        details={"deleted": int(result.deleted_count)},
+    )
     return {"deleted": int(result.deleted_count)}
 
 
 @transactions.post("/submit-day")
 async def submit_day_for_verify(
-    body: SubmitDayRequest, request: Request, _actor: RegisterActor
+    body: SubmitDayRequest, request: Request, actor: RegisterActor
 ) -> dict:
-    result = await _database(request).transactions.update_many(
+    db = _database(request)
+    result = await db.transactions.update_many(
         {
             "$and": [
                 register_day_clause(body.date),
@@ -872,12 +932,21 @@ async def submit_day_for_verify(
         },
         {"$set": {"register_status": "submitted"}},
     )
+    await record_operation_event(
+        db,
+        action="txn.submit_day",
+        actor=actor,
+        request=request,
+        entity_type="register_day",
+        entity_ids=[str(body.date)],
+        details={"updated": int(result.modified_count)},
+    )
     return {"updated": int(result.modified_count)}
 
 
 @transactions.post("/day-order", status_code=status.HTTP_204_NO_CONTENT)
 async def recount_day_order(
-    body: DayOrderRequest, request: Request, _actor: RegisterActor
+    body: DayOrderRequest, request: Request, actor: RegisterActor
 ) -> Response:
     if not body.ordered_ids:
         return Response(status_code=204)
@@ -885,7 +954,17 @@ async def recount_day_order(
         UpdateOne({"_id": _valid_id(raw)}, {"$set": {"day_order": index}})
         for index, raw in enumerate(body.ordered_ids)
     ]
-    await _database(request).transactions.bulk_write(ops, ordered=False)
+    db = _database(request)
+    await db.transactions.bulk_write(ops, ordered=False)
+    await record_operation_event(
+        db,
+        action="txn.day_order",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=list(body.ordered_ids)[:100],
+        details={"count": len(body.ordered_ids)},
+    )
     return Response(status_code=204)
 
 
@@ -956,28 +1035,46 @@ async def get_transaction(
 
 @transactions.patch("/{tx_id}")
 async def patch_transaction(
-    tx_id: str, body: TransactionPatch, request: Request, _actor: RegisterActor
+    tx_id: str, body: TransactionPatch, request: Request, actor: RegisterActor
 ) -> dict:
     oid = _valid_id(tx_id)
     values = _coerce_write_fields(dict(body.values))
     if not values:
         raise ApiError(422, "empty_patch", "No fields to update")
-    result = await _database(request).transactions.update_one(
-        {"_id": oid}, {"$set": values}
-    )
+    db = _database(request)
+    result = await db.transactions.update_one({"_id": oid}, {"$set": values})
     if result.matched_count == 0:
         raise ApiError(404, "not_found", "Transaction not found")
-    doc = await _database(request).transactions.find_one({"_id": oid})
+    doc = await db.transactions.find_one({"_id": oid})
+    await record_operation_event(
+        db,
+        action="txn.update",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(oid)],
+        details={"fields": sorted(values.keys())[:40]},
+    )
     return json_safe(doc)
 
 
 @transactions.delete("/{tx_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_transaction(
-    tx_id: str, request: Request, _actor: RegisterActor
+    tx_id: str, request: Request, actor: RegisterActor
 ) -> Response:
-    result = await _database(request).transactions.delete_one({"_id": _valid_id(tx_id)})
+    oid = _valid_id(tx_id)
+    db = _database(request)
+    result = await db.transactions.delete_one({"_id": oid})
     if result.deleted_count == 0:
         raise ApiError(404, "not_found", "Transaction not found")
+    await record_operation_event(
+        db,
+        action="txn.delete",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(oid)],
+    )
     return Response(status_code=204)
 
 
@@ -997,6 +1094,15 @@ async def request_or_delete_transaction(
     is_pending_edit = bool(doc.get("original_transaction_id")) and not doc.get("verified")
     if is_pending_edit or not doc.get("verified"):
         await db.transactions.delete_one({"_id": oid})
+        await record_operation_event(
+            db,
+            action="txn.delete",
+            actor=actor,
+            request=request,
+            entity_type="transaction",
+            entity_ids=[str(oid)],
+            details={"via": "request_delete", "pending_or_unverified": True},
+        )
         return {"result": "deleted"}
 
     cashier_id = None
@@ -1013,6 +1119,14 @@ async def request_or_delete_transaction(
                 or doc.get("cashier_id"),
             }
         },
+    )
+    await record_operation_event(
+        db,
+        action="txn.request_delete",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(oid)],
     )
     return {"result": "deletion_requested"}
 
@@ -1061,6 +1175,15 @@ async def insert_pending_edit(
         patch.update(meta)
         await db.transactions.update_one({"_id": existing["_id"]}, {"$set": patch})
         doc = await db.transactions.find_one({"_id": existing["_id"]})
+        await record_operation_event(
+            db,
+            action="txn.pending_edit",
+            actor=actor,
+            request=request,
+            entity_type="transaction",
+            entity_ids=[str(existing["_id"]), str(original_id)],
+            details={"mode": "update"},
+        )
         return json_safe(doc)
 
     pending = dict(original_doc)
@@ -1070,4 +1193,13 @@ async def insert_pending_edit(
     pending["created_at"] = now
     result = await db.transactions.insert_one(pending)
     pending["_id"] = result.inserted_id
+    await record_operation_event(
+        db,
+        action="txn.pending_edit",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(pending["_id"]), str(original_id)],
+        details={"mode": "insert"},
+    )
     return json_safe(pending)

@@ -47,8 +47,16 @@ async def current_user(
     )
     if not session:
         raise ApiError(401, "session_revoked", "Session is no longer active")
-    user = await database.users.find_one({"_id": user_id, "active": True})
-    if not user:
+    user = await database.users.find_one({"_id": user_id})
+    if not user or user.get("deleted_at"):
+        raise ApiError(401, "user_deleted", "User account is unavailable")
+    if user.get("banned"):
+        reason = (user.get("ban_reason") or "").strip()
+        message = "User account is banned"
+        if reason:
+            message = f"User account is banned: {reason}"
+        raise ApiError(401, "user_banned", message)
+    if not user.get("active", True):
         raise ApiError(401, "user_inactive", "User is inactive or unavailable")
     request.state.session = session
     return user

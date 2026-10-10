@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QMenu, QMenuBar, QToolButton, QWidget,
 )
 
+from tahmeed.config import APP_NAME
+
 _BG = "#F0F0F0"
 _BORDER = "#D0D0D0"
 _TEXT = "#1B2B4B"
@@ -201,8 +203,6 @@ class AccountantMenuBar(QMenuBar):
 
     def _file_menu(self) -> None:
         m = self.addMenu("&File")
-        self._add(m, "&Backups…", lambda: self._nav("backup"))
-        m.addSeparator()
         self._add(m, "Change &Password…", lambda: self._change_password_cb and self._change_password_cb())
         self._add(m, "&Log Out", lambda: self._logout_cb and self._logout_cb())
         m.addSeparator()
@@ -260,7 +260,6 @@ class AccountantMenuBar(QMenuBar):
         self._add(m, "&Motorcycles & Cars…", lambda: self._nav("manage_motor_vehicles"))
         m.addSeparator()
         self._add(m, "&Users…", lambda: self._nav("manage_users"))
-        self._add(m, "&Backups…", lambda: self._nav("backup"))
 
     def _suppliers_menu(self) -> None:
         m = self.addMenu("&Suppliers")
@@ -338,7 +337,6 @@ class AccountantMenuBar(QMenuBar):
 
     def _company_menu(self) -> None:
         m = self.addMenu("&Company")
-        self._add(m, "&Backups…", lambda: self._nav("backup"))
         self._add(m, "&Users", lambda: self._nav("manage_users"))
 
     def _expenses_menu(self) -> None:
@@ -394,4 +392,4 @@ class AccountantMenuBar(QMenuBar):
 
     def _help_menu(self) -> None:
         m = self.addMenu("&Help")
-        self._add(m, "&About Tahmeed Expense…", lambda: self._about_cb and self._about_cb())
+        self._add(m, f"&About {APP_NAME}…", lambda: self._about_cb and self._about_cb())

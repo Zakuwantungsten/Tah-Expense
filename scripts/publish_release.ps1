@@ -23,7 +23,7 @@ if ($VersionSource -notmatch '(?m)^APP_VERSION\s*=\s*"(?<version>(0|[1-9]\d*)\.(
 }
 $Version = $Matches.version
 if (-not $MinimumSupportedVersion) { $MinimumSupportedVersion = $Version }
-$Installer = Join-Path $Root "installer_output\TahmeedExpenseSetup-$Version.exe"
+$Installer = Join-Path $Root "installer_output\meedexpeSetup-$Version.exe"
 if (-not (Test-Path $Installer)) {
     throw "Expected installer not found. Run .\scripts\build_windows.ps1 first: $Installer"
 }

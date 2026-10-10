@@ -19,12 +19,13 @@ class RefreshRequest(StrictModel):
 
 class ChangePasswordRequest(StrictModel):
     current_password: str
-    new_password: str = Field(min_length=10, max_length=1024)
+    # Complexity is enforced against live security_* settings in the route.
+    new_password: str = Field(min_length=1, max_length=1024)
 
 
 class UserCreate(StrictModel):
     username: str = Field(min_length=1, max_length=100)
-    password: str = Field(min_length=10, max_length=1024)
+    password: str = Field(min_length=1, max_length=1024)
     role: Literal["admin", "cashier", "accountant"]
     full_name: str = Field(min_length=1, max_length=200)
     active: bool = True
@@ -34,7 +35,15 @@ class UserUpdate(StrictModel):
     full_name: str | None = Field(None, min_length=1, max_length=200)
     role: Literal["admin", "cashier", "accountant"] | None = None
     active: bool | None = None
-    password: str | None = Field(None, min_length=10, max_length=1024)
+    password: str | None = Field(None, min_length=1, max_length=1024)
+
+
+class UserBanRequest(StrictModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class UserResetPasswordRequest(StrictModel):
+    password: str = Field(min_length=1, max_length=1024)
 
 
 class CategoryWrite(StrictModel):

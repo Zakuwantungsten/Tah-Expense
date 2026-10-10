@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from tahmeed.config import APP_VERSION
+from tahmeed.config import APP_NAME, APP_VERSION
 from tahmeed.services.update_service import (
     DownloadCancelled,
     UpdateInfo,
@@ -80,7 +80,7 @@ class UpdateDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
 
-        title = QLabel("A new version of Tahmeed Expense is available.")
+        title = QLabel(f"A new version of {APP_NAME} is available.")
         title.setWordWrap(True)
         title.setStyleSheet("font-size: 15px; font-weight: 600;")
         layout.addWidget(title)

@@ -482,11 +482,12 @@ def clear_staged_update() -> None:
             installer.unlink()
         except OSError:
             pass
-    for leftover in root.glob("TahmeedExpenseSetup-*.exe"):
-        try:
-            leftover.unlink()
-        except OSError:
-            pass
+    for pattern in ("meedexpeSetup-*.exe", "TahmeedExpenseSetup-*.exe"):
+        for leftover in root.glob(pattern):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
 
 
 def cleanup_applied_update() -> None:

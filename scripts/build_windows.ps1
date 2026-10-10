@@ -59,7 +59,7 @@ try {
     & $Iscc "/DMyAppVersion=$Version" "installer.iss"
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed." }
 
-    $Installer = Join-Path $Root "installer_output\TahmeedExpenseSetup-$Version.exe"
+    $Installer = Join-Path $Root "installer_output\meedexpeSetup-$Version.exe"
     if (-not (Test-Path $Installer)) {
         throw "Expected installer was not produced: $Installer"
     }

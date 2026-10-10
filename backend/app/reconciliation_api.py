@@ -7,6 +7,7 @@ from typing import Annotated, Any
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request, status
 
+from .audit_ops import record_operation_event
 from .dependencies import require_roles
 from .errors import ApiError
 from .reconciliation_ops import (
@@ -368,17 +369,28 @@ async def upload_totals(
     status_code=status.HTTP_200_OK,
 )
 async def delete_upload(
-    table: str, upload_id: str, request: Request, _manager: Manager
+    table: str, upload_id: str, request: Request, manager: Manager
 ) -> dict[str, Any]:
     table = _table(table)
     if not (upload_id or "").strip():
         raise ApiError(422, "invalid_upload_id", "Upload id is required")
-    result = await _database(request).reconciliation_entries.delete_many(
+    db = _database(request)
+    uid = upload_id.strip()
+    result = await db.reconciliation_entries.delete_many(
         {
             "entity": ENTITY,
             "table": table,
-            "upload_id": upload_id.strip(),
+            "upload_id": uid,
         }
+    )
+    await record_operation_event(
+        db,
+        action="recon.upload_delete",
+        actor=manager,
+        request=request,
+        entity_type="reconciliation_upload",
+        entity_ids=[uid],
+        details={"table": table, "deleted": int(result.deleted_count)},
     )
     return {"deleted": int(result.deleted_count)}
 
@@ -442,6 +454,15 @@ async def save_rows(
     db = _database(request)
     result = await db.reconciliation_entries.insert_many(docs, ordered=False)
     await _ensure_stations(db, table, [d.get("station") or "" for d in docs])
+    await record_operation_event(
+        db,
+        action="recon.rows_save",
+        actor=manager,
+        request=request,
+        entity_type="reconciliation",
+        entity_ids=[str(i) for i in result.inserted_ids[:50]],
+        details={"table": table, "inserted": len(result.inserted_ids)},
+    )
     return {"inserted": len(result.inserted_ids)}
 
 
@@ -451,7 +472,7 @@ async def patch_row_status(
     row_id: str,
     body: ReconRowStatusPatch,
     request: Request,
-    _manager: Manager,
+    manager: Manager,
 ) -> dict[str, Any]:
     table = _table(table)
     oid = _valid_id(row_id)
@@ -464,12 +485,22 @@ async def patch_row_status(
         update["dispute_note"] = body.dispute_note
     if not update:
         raise ApiError(422, "empty_patch", "No status fields provided")
-    result = await _database(request).reconciliation_entries.update_one(
+    db = _database(request)
+    result = await db.reconciliation_entries.update_one(
         {"_id": oid, "entity": ENTITY, "table": table},
         {"$set": update},
     )
     if result.matched_count == 0:
         raise ApiError(404, "not_found", "Reconciliation row not found")
+    await record_operation_event(
+        db,
+        action="recon.row_status",
+        actor=manager,
+        request=request,
+        entity_type="reconciliation_row",
+        entity_ids=[str(oid)],
+        details={"table": table, "fields": sorted(update.keys())},
+    )
     return {"updated": bool(result.modified_count)}
 
 
@@ -496,10 +527,21 @@ async def ensure_stations(
     table: str,
     body: ReconStationsEnsureRequest,
     request: Request,
-    _manager: Manager,
+    manager: Manager,
 ) -> dict[str, Any]:
     table = _table(table)
-    await _ensure_stations(_database(request), table, list(body.slugs or []))
+    db = _database(request)
+    slugs = list(body.slugs or [])
+    await _ensure_stations(db, table, slugs)
+    await record_operation_event(
+        db,
+        action="recon.stations_ensure",
+        actor=manager,
+        request=request,
+        entity_type="recon_station",
+        entity_ids=slugs[:50],
+        details={"table": table, "count": len(slugs)},
+    )
     return {"ok": True}
 
 
@@ -508,13 +550,23 @@ async def create_station(
     table: str,
     body: ReconStationCreateRequest,
     request: Request,
-    _manager: Manager,
+    manager: Manager,
 ) -> dict[str, Any]:
     table = _table(table)
+    db = _database(request)
     doc = await _add_station(
-        _database(request),
+        db,
         table,
         body.name,
         border_post=body.border_post,
+    )
+    await record_operation_event(
+        db,
+        action="recon.station_create",
+        actor=manager,
+        request=request,
+        entity_type="recon_station",
+        entity_ids=[str(doc.get("_id") or doc.get("slug") or "")],
+        details={"table": table, "name": body.name},
     )
     return json_safe(doc)

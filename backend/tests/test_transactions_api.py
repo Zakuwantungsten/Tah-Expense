@@ -222,11 +222,27 @@ class FakeMappings:
         return None
 
 
-def _app(collection: FakeTransactions, mappings: list[dict] | None = None):
+class FakeOperationEvents:
+    def __init__(self) -> None:
+        self.documents: list[dict] = []
+
+    async def insert_one(self, document: dict) -> SimpleNamespace:
+        stored = dict(document)
+        stored["_id"] = ObjectId()
+        self.documents.append(stored)
+        return SimpleNamespace(inserted_id=stored["_id"])
+
+
+def _app(
+    collection: FakeTransactions,
+    mappings: list[dict] | None = None,
+    events: FakeOperationEvents | None = None,
+):
     database = SimpleNamespace(
         db=SimpleNamespace(
             transactions=collection,
             description_mappings=FakeMappings(mappings),
+            operation_events=events or FakeOperationEvents(),
         )
     )
     return create_app(settings=settings(), database=database)
@@ -242,7 +258,8 @@ def _cashier(user_id: ObjectId | None = None) -> dict:
 
 def test_create_transaction() -> None:
     collection = FakeTransactions()
-    app = _app(collection)
+    events = FakeOperationEvents()
+    app = _app(collection, events=events)
     user = _cashier()
     app.dependency_overrides[current_user] = lambda: user
 
@@ -264,6 +281,7 @@ def test_create_transaction() -> None:
     assert body["cashier_id"] == str(user["_id"])
     assert body["register_status"] == "draft"
     assert len(collection.documents) == 1
+    assert any(e["action"] == "txn.create" for e in events.documents)
 
 
 def test_get_and_patch_and_delete_transaction() -> None:
@@ -282,7 +300,8 @@ def test_get_and_patch_and_delete_transaction() -> None:
             }
         ]
     )
-    app = _app(collection)
+    events = FakeOperationEvents()
+    app = _app(collection, events=events)
     app.dependency_overrides[current_user] = lambda: user
 
     with TestClient(app) as client:
@@ -301,6 +320,10 @@ def test_get_and_patch_and_delete_transaction() -> None:
         deleted = client.delete(f"/v1/transactions/{tx_id}")
         assert deleted.status_code == 204
         assert collection.documents == []
+
+    actions = [e["action"] for e in events.documents]
+    assert "txn.update" in actions
+    assert "txn.delete" in actions
 
 
 def test_list_by_ids() -> None:

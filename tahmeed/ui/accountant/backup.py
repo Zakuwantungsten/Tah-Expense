@@ -1,4 +1,4 @@
-"""Backend backup job history, with admin/accountant restore."""
+"""Backend backup job history and restore (admin Backups tab)."""
 
 from __future__ import annotations
 

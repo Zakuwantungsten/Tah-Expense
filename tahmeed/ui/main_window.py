@@ -4,6 +4,7 @@ from PySide6.QtWidgets import QMainWindow, QStatusBar, QLabel, QWidget
 from PySide6.QtCore import Qt, Signal, QPoint, QRect, QEvent
 from PySide6.QtGui import QCloseEvent
 
+from tahmeed.config import APP_NAME
 from tahmeed.models.user import User
 from tahmeed.ui.admin.dashboard import AdminDashboard
 from tahmeed.ui.cashier.dashboard import CashierDashboard
@@ -25,7 +26,7 @@ class MainWindow(QMainWindow):
         self._resize_origin = QPoint()
         self._geo_origin = QRect()
         self._resize_filters_ready = False
-        self.setWindowTitle(f"Tahmeed Expense — {user.full_name}")
+        self.setWindowTitle(f"{APP_NAME} — {user.full_name}")
         self.setMinimumSize(1100, 700)
         if user.role == "accountant":
             self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)

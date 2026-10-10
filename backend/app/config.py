@@ -48,18 +48,21 @@ class Settings(BaseSettings):
     backup_min_free_bytes: int = Field(5 * 1024 * 1024 * 1024, ge=0)
     backup_upload_stale_minutes: int = Field(60, ge=5)
     backup_consistency_mode: str = "standalone"
-    backup_local_keep_generations: int = Field(3, ge=1)
+    backup_local_keep_generations: int = Field(30, ge=1)
     backup_lease_minutes: int = Field(90, ge=35)
+    # Legacy bucket retention (unused by prune; kept for env compatibility).
     backup_keep_daily: int = Field(7, ge=0)
     backup_keep_weekly: int = Field(4, ge=0)
     backup_keep_monthly: int = Field(6, ge=0)
-    backup_daily_time_utc: str = "02:00"
+    backup_keep_count: int = Field(30, ge=1, le=365)
+    backup_schedule_mode: str = "hourly"
+    backup_daily_time_utc: str = "00:00"
     backup_weekly_day_utc: int = Field(6, ge=0, le=6)
     backup_weekly_time_utc: str = "03:00"
     backup_maintenance_interval_minutes: int = Field(30, ge=5)
     backup_scheduler_poll_seconds: int = Field(60, ge=10, le=3600)
     backup_schedule_stale_minutes: int = Field(120, ge=35)
-    backup_schedule_catchup_minutes: int = Field(360, ge=0, le=1440)
+    backup_schedule_catchup_minutes: int = Field(90, ge=0, le=1440)
 
     @field_validator("mongodb_uri")
     @classmethod
@@ -103,6 +106,14 @@ class Settings(BaseSettings):
         if not 0 <= hour <= 23 or not 0 <= minute <= 59:
             raise ValueError("must be HH:MM in UTC")
         return f"{hour:02d}:{minute:02d}"
+
+    @field_validator("backup_schedule_mode")
+    @classmethod
+    def validate_backup_schedule_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"hourly", "daily", "disabled"}:
+            raise ValueError("must be hourly, daily, or disabled")
+        return normalized
 
 
 @lru_cache

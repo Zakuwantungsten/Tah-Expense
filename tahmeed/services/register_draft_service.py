@@ -1,6 +1,6 @@
 """Local Daily Register draft outbox — crash / power-loss recovery.
 
-Drafts live under ``%LOCALAPPDATA%\\Tahmeed Expense\\register_drafts\\`` and are
+Drafts live under ``%LOCALAPPDATA%\\meedexpe\\register_drafts\\`` and are
 keyed by ``(user_id, register_date, merged)``. They store raw cell text so
 incomplete rows survive without Mongo validation.
 """

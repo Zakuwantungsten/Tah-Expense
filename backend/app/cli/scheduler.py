@@ -51,7 +51,14 @@ def daily_slot(now: datetime, value: str) -> ScheduleSlot:
     return ScheduleSlot("backup-daily", due, "daily")
 
 
+def hourly_slot(now: datetime) -> ScheduleSlot:
+    now = now.astimezone(UTC)
+    due = now.replace(minute=0, second=0, microsecond=0)
+    return ScheduleSlot("backup-hourly", due, "hourly")
+
+
 def weekly_slot(now: datetime, weekday: int, value: str) -> ScheduleSlot:
+    """Legacy helper retained for tests and manual tooling."""
     now = now.astimezone(UTC)
     hour, minute = _parse_time(value)
     due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -68,17 +75,47 @@ def interval_slot(now: datetime, minutes: int) -> ScheduleSlot:
     return ScheduleSlot("upload-retry-prune", datetime.fromtimestamp(timestamp, UTC))
 
 
-def due_slots(settings: Settings, now: datetime) -> tuple[ScheduleSlot, ...]:
-    """Return due work without starting two full dumps on the weekly backup day."""
+async def load_schedule_overrides(db: Any, settings: Settings) -> tuple[str, str]:
+    mode = settings.backup_schedule_mode
+    daily_time = settings.backup_daily_time_utc
+    try:
+        docs = await db.system_settings.find(
+            {"key": {"$in": ["backup_schedule_mode", "backup_daily_time_utc"]}}
+        ).to_list(length=None)
+    except Exception:
+        return mode, daily_time
+    for doc in docs or []:
+        key = doc.get("key")
+        value = doc.get("value")
+        if key == "backup_schedule_mode" and value in {"hourly", "daily", "disabled"}:
+            mode = str(value)
+        if key == "backup_daily_time_utc" and isinstance(value, str) and ":" in value:
+            daily_time = value
+    return mode, daily_time
+
+
+def due_slots(
+    settings: Settings,
+    now: datetime,
+    *,
+    schedule_mode: str | None = None,
+    daily_time_utc: str | None = None,
+) -> tuple[ScheduleSlot, ...]:
+    """Return due dump + maintenance work for the configured schedule mode."""
     now = now.astimezone(UTC)
-    backup_slot = (
-        weekly_slot(now, settings.backup_weekly_day_utc, settings.backup_weekly_time_utc)
-        if now.weekday() == settings.backup_weekly_day_utc
-        else daily_slot(now, settings.backup_daily_time_utc)
-    )
+    mode = (schedule_mode or settings.backup_schedule_mode or "hourly").strip().lower()
+    daily_time = daily_time_utc or settings.backup_daily_time_utc
     maximum_age = timedelta(minutes=settings.backup_schedule_catchup_minutes)
     slots: list[ScheduleSlot] = []
-    if timedelta(0) <= now - backup_slot.due_at <= maximum_age:
+
+    backup_slot: ScheduleSlot | None = None
+    if mode == "hourly":
+        backup_slot = hourly_slot(now)
+    elif mode == "daily":
+        backup_slot = daily_slot(now, daily_time)
+    # mode == "disabled" → no dump slot
+
+    if backup_slot is not None and timedelta(0) <= now - backup_slot.due_at <= maximum_age:
         slots.append(backup_slot)
     slots.append(interval_slot(now, settings.backup_maintenance_interval_minutes))
     return tuple(slots)
@@ -169,7 +206,10 @@ async def execute_slot(settings: Settings, db: Any, slot: ScheduleSlot) -> None:
 async def scheduler_iteration(settings: Settings, db: Any, now: datetime) -> int:
     owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
     claimed = 0
-    for slot in due_slots(settings, now):
+    mode, daily_time = await load_schedule_overrides(db, settings)
+    for slot in due_slots(
+        settings, now, schedule_mode=mode, daily_time_utc=daily_time
+    ):
         if not await claim_slot(
             db.backup_schedules,
             slot,

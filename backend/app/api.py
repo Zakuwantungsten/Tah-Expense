@@ -4,7 +4,7 @@ import hmac
 import re
 import secrets
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Annotated, Any
 
 from bson import ObjectId
@@ -12,8 +12,21 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from .dependencies import Authenticated, Cashier, Manager, require_roles
+from .audit_ops import parse_audit_filters, record_operation_event
+from .dependencies import Admin, Authenticated, Cashier, Manager, require_roles
 from .errors import ApiError
+from .security_policy import (
+    DEVICE_MAC_HEADER,
+    SECURITY_SETTING_DEFAULTS,
+    assert_not_locked,
+    clear_login_failures,
+    client_ip,
+    enforce_password_policy,
+    is_admin_only_setting,
+    normalize_mac,
+    record_login_failure,
+)
+from .sessions_api import sessions as sessions_router
 from .schemas import (
     AuditEventWrite,
     BackupRestoreRequest,
@@ -28,7 +41,9 @@ from .schemas import (
     RuleWrite,
     SettingWrite,
     SubtableWrite,
+    UserBanRequest,
     UserCreate,
+    UserResetPasswordRequest,
     UserUpdate,
 )
 from .security import (
@@ -108,6 +123,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
         "truck_overview",
         "diesel_cash",
     ],
+    **SECURITY_SETTING_DEFAULTS,
 }
 
 _SETTING_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -121,7 +137,10 @@ def validate_setting_key(key: str) -> str:
 
 async def merged_settings(db: Any) -> dict[str, Any]:
     result = dict(SETTINGS_DEFAULTS)
-    docs = await db.system_settings.find({}).to_list(length=None)
+    try:
+        docs = await db.system_settings.find({}).to_list(length=None)
+    except Exception:
+        return result
     result.update({doc["key"]: doc["value"] for doc in docs if "key" in doc})
     return result
 
@@ -164,6 +183,39 @@ async def issue_session(request: Request, user: dict) -> dict:
     settings = request.app.state.settings
     db = database(request)
     now = utcnow()
+    policy = await merged_settings(db)
+
+    idle_days = int(policy.get("security_idle_session_days") or 0)
+    if idle_days > 0:
+        await db.auth_sessions.update_many(
+            {
+                "user_id": user["_id"],
+                "revoked_at": None,
+                "last_used_at": {"$lt": now - timedelta(days=idle_days)},
+            },
+            {"$set": {"revoked_at": now}},
+        )
+
+    max_sessions = int(policy.get("security_max_sessions_per_user") or 0)
+    if max_sessions > 0:
+        active = (
+            await db.auth_sessions.find(
+                {
+                    "user_id": user["_id"],
+                    "revoked_at": None,
+                    "expires_at": {"$gt": now},
+                }
+            )
+            .sort("created_at", 1)
+            .to_list()
+        )
+        overflow = len(active) - (max_sessions - 1)
+        if overflow > 0:
+            for stale in active[:overflow]:
+                await db.auth_sessions.update_one(
+                    {"_id": stale["_id"]}, {"$set": {"revoked_at": now}}
+                )
+
     session_id = ObjectId()
     secret = new_refresh_secret()
     expires = now + timedelta(days=settings.refresh_token_days)
@@ -177,7 +229,9 @@ async def issue_session(request: Request, user: dict) -> dict:
             "expires_at": expires,
             "revoked_at": None,
             "user_agent": request.headers.get("user-agent", "")[:500],
-            "ip": request.client.host if request.client else None,
+            "ip": getattr(request.state, "client_ip", None)
+            or client_ip(request),
+            "device_mac": normalize_mac(request.headers.get(DEVICE_MAC_HEADER)),
         }
     )
     access, access_expires = create_access_token(
@@ -195,10 +249,61 @@ async def issue_session(request: Request, user: dict) -> dict:
 @auth.post("/login")
 async def login(body: LoginRequest, request: Request) -> dict:
     db = database(request)
-    user = await db.users.find_one({"username": body.username, "active": True})
-    if not user or not verify_password(body.password, user.get("password_hash", "")):
+    settings_map = await merged_settings(db)
+    ip = getattr(request.state, "client_ip", None) or client_ip(request)
+    await assert_not_locked(db, body.username, ip, settings_map)
+    user = await db.users.find_one({"username": body.username})
+    if (
+        not user
+        or user.get("deleted_at")
+        or not verify_password(body.password, user.get("password_hash", ""))
+    ):
+        await record_login_failure(db, body.username, ip, settings_map)
+        await record_operation_event(
+            db,
+            action="auth.login",
+            outcome="fail",
+            actor_username=body.username,
+            error="invalid_credentials",
+            request=request,
+            details={"reason": "invalid_credentials"},
+        )
         raise ApiError(401, "invalid_credentials", "Invalid username or password")
+    if user.get("banned"):
+        reason = (user.get("ban_reason") or "").strip()
+        message = "Your account is banned"
+        if reason:
+            message = f"Your account is banned: {reason}"
+        await record_operation_event(
+            db,
+            action="auth.login",
+            outcome="fail",
+            actor=user,
+            error="user_banned",
+            request=request,
+            details={"reason": "user_banned"},
+        )
+        raise ApiError(403, "user_banned", message)
+    if not user.get("active", True):
+        await record_operation_event(
+            db,
+            action="auth.login",
+            outcome="fail",
+            actor=user,
+            error="user_inactive",
+            request=request,
+            details={"reason": "user_inactive"},
+        )
+        raise ApiError(401, "user_inactive", "Your account is inactive")
+    await clear_login_failures(db, body.username, ip)
     await db.users.update_one({"_id": user["_id"]}, {"$set": {"last_login": utcnow()}})
+    await record_operation_event(
+        db,
+        action="auth.login",
+        outcome="ok",
+        actor=user,
+        request=request,
+    )
     return json_safe(await issue_session(request, user))
 
 
@@ -212,6 +317,7 @@ async def bootstrap(body: UserCreate, request: Request) -> dict:
     if body.role != "admin":
         raise ApiError(422, "admin_required", "The first user must be an admin")
     db = database(request)
+    enforce_password_policy(body.password, await merged_settings(db))
     lock_key = "bootstrap"
     owner = await acquire_operation_lock(db, lock_key)
     if owner is None:
@@ -222,9 +328,27 @@ async def bootstrap(body: UserCreate, request: Request) -> dict:
         if await db.users.count_documents({}) > 0:
             raise ApiError(409, "already_initialized", "The application is already initialized")
         doc = body.model_dump(exclude={"password"})
-        doc.update(password_hash=hash_password(body.password), created_at=utcnow(), last_login=None)
+        doc.update(
+            password_hash=hash_password(body.password),
+            created_at=utcnow(),
+            last_login=None,
+            banned=False,
+            ban_reason="",
+            banned_at=None,
+            banned_by=None,
+            deleted_at=None,
+        )
         result = await db.users.insert_one(doc)
         doc["_id"] = result.inserted_id
+        await record_operation_event(
+            db,
+            action="auth.bootstrap",
+            outcome="ok",
+            actor=doc,
+            entity_type="user",
+            entity_ids=[str(doc["_id"])],
+            request=request,
+        )
         return {
             "user": public_user(doc),
             "tokens": json_safe(await issue_session(request, doc)),
@@ -251,6 +375,16 @@ async def refresh(body: RefreshRequest, request: Request) -> dict:
         session.get("refresh_hash", ""), hash_refresh_secret(old_secret)
     ):
         await db.auth_sessions.update_one({"_id": session_id}, {"$set": {"revoked_at": now}})
+        await record_operation_event(
+            db,
+            action="auth.refresh_reuse",
+            outcome="fail",
+            actor_id=str(session.get("user_id") or ""),
+            error="refresh_reuse_detected",
+            request=request,
+            entity_type="session",
+            entity_ids=[str(session_id)],
+        )
         raise ApiError(401, "refresh_reuse_detected", "Refresh token reuse revoked the session")
     user = await db.users.find_one({"_id": session["user_id"], "active": True})
     if not user:
@@ -281,9 +415,19 @@ async def refresh(body: RefreshRequest, request: Request) -> dict:
 
 
 @auth.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(request: Request, _user: Authenticated) -> Response:
-    await database(request).auth_sessions.update_one(
+async def logout(request: Request, user: Authenticated) -> Response:
+    db = database(request)
+    await db.auth_sessions.update_one(
         {"_id": request.state.session["_id"]}, {"$set": {"revoked_at": utcnow()}}
+    )
+    await record_operation_event(
+        db,
+        action="auth.logout",
+        outcome="ok",
+        actor=user,
+        request=request,
+        entity_type="session",
+        entity_ids=[str(request.state.session["_id"])],
     )
     return Response(status_code=204)
 
@@ -311,12 +455,22 @@ async def change_password(
         raise ApiError(400, "incorrect_password", "Current password is incorrect")
     now = utcnow()
     db = database(request)
+    enforce_password_policy(body.new_password, await merged_settings(db))
     await db.users.update_one(
         {"_id": user["_id"]}, {"$set": {"password_hash": hash_password(body.new_password)}}
     )
     await db.auth_sessions.update_many(
         {"user_id": user["_id"], "_id": {"$ne": request.state.session["_id"]}},
         {"$set": {"revoked_at": now}},
+    )
+    await record_operation_event(
+        db,
+        action="auth.change_password",
+        outcome="ok",
+        actor=user,
+        request=request,
+        entity_type="user",
+        entity_ids=[str(user["_id"])],
     )
     return Response(status_code=204)
 
@@ -352,18 +506,76 @@ async def get_setting(key: str, request: Request, _user: Authenticated) -> dict[
 
 @settings_api.put("/{key}")
 async def put_setting(
-    key: str, body: SettingWrite, request: Request, _user: Authenticated
+    key: str, body: SettingWrite, request: Request, user: Authenticated
 ) -> dict[str, Any]:
     # Matches desktop: cashiers may update labels / force restrict_trucks; managers
-    # update the rest. All authenticated roles may write known UI settings.
+    # update the rest. security_* and backup_* settings require admin.
     key = validate_setting_key(key)
+    if is_admin_only_setting(key) and user.get("role") != "admin":
+        raise ApiError(403, "forbidden", "Only an administrator can change this setting")
+    if key not in SETTINGS_DEFAULTS:
+        raise ApiError(404, "setting_not_found", f"Unknown setting '{key}'")
     db = database(request)
+    value = body.value
+    if key == "backup_schedule_mode" and value not in {"hourly", "daily", "disabled"}:
+        raise ApiError(422, "invalid_setting_value", "backup_schedule_mode must be hourly, daily, or disabled")
+    if key == "backup_keep_count":
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise ApiError(422, "invalid_setting_value", "backup_keep_count must be an integer") from None
+        if value < 1 or value > 365:
+            raise ApiError(422, "invalid_setting_value", "backup_keep_count must be between 1 and 365")
+    if key == "backup_daily_time_utc":
+        text = str(value).strip()
+        parts = text.split(":")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            raise ApiError(422, "invalid_setting_value", "backup_daily_time_utc must be HH:MM")
+        hour, minute = (int(part) for part in parts)
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ApiError(422, "invalid_setting_value", "backup_daily_time_utc must be HH:MM")
+        value = f"{hour:02d}:{minute:02d}"
     await db.system_settings.update_one(
         {"key": key},
-        {"$set": {"key": key, "value": body.value}},
+        {"$set": {"key": key, "value": value}},
         upsert=True,
     )
-    return json_safe({"key": key, "value": body.value})
+    await record_operation_event(
+        db,
+        action="settings.update",
+        outcome="ok",
+        actor=user,
+        request=request,
+        entity_type="setting",
+        entity_ids=[key],
+        details={"key": key},
+    )
+    return json_safe({"key": key, "value": value})
+
+
+@audit_api.get("/events")
+async def list_audit_events(
+    request: Request,
+    _admin: Admin,
+    limit: int = Query(100, ge=1, le=500),
+    action: str | None = Query(None, max_length=200),
+    actor: str | None = Query(None, max_length=100),
+    outcome: str | None = Query(None, max_length=40),
+    since: datetime | None = Query(None),
+    until: datetime | None = Query(None),
+) -> list[dict]:
+    """Admin-only newest-first audit trail viewer."""
+    query = parse_audit_filters(
+        action=action, actor=actor, outcome=outcome, since=since, until=until
+    )
+    docs = (
+        await database(request)
+        .operation_events.find(query)
+        .sort("ts", -1)
+        .limit(limit)
+        .to_list()
+    )
+    return json_safe(docs)
 
 
 @audit_api.post("/events", status_code=201)
@@ -395,8 +607,20 @@ async def create_audit_event(
 
 
 @users.get("")
-async def list_users(request: Request, _manager: Manager) -> list[dict]:
-    docs = await database(request).users.find({}, {"password_hash": 0}).sort("full_name", 1).to_list()
+async def list_users(
+    request: Request,
+    manager: Manager,
+    include_deleted: bool = Query(False),
+) -> list[dict]:
+    query: dict[str, Any] = {}
+    if not include_deleted or manager.get("role") != "admin":
+        query["deleted_at"] = None
+    docs = (
+        await database(request)
+        .users.find(query, {"password_hash": 0})
+        .sort("full_name", 1)
+        .to_list()
+    )
     return json_safe(docs)
 
 
@@ -404,11 +628,74 @@ async def list_users(request: Request, _manager: Manager) -> list[dict]:
 async def create_user(body: UserCreate, request: Request, manager: Manager) -> dict:
     if body.role == "admin" and manager.get("role") != "admin":
         raise ApiError(403, "forbidden", "Only an administrator can create administrators")
+    db = database(request)
+    enforce_password_policy(body.password, await merged_settings(db))
     doc = body.model_dump(exclude={"password"})
-    doc.update(password_hash=hash_password(body.password), created_at=utcnow(), last_login=None)
-    result = await database(request).users.insert_one(doc)
+    doc.update(
+        password_hash=hash_password(body.password),
+        created_at=utcnow(),
+        last_login=None,
+        banned=False,
+        ban_reason="",
+        banned_at=None,
+        banned_by=None,
+        deleted_at=None,
+    )
+    result = await db.users.insert_one(doc)
     doc["_id"] = result.inserted_id
+    await record_operation_event(
+        db,
+        action="user.create",
+        outcome="ok",
+        actor=manager,
+        request=request,
+        entity_type="user",
+        entity_ids=[str(doc["_id"])],
+        details={"username": doc.get("username"), "role": doc.get("role")},
+    )
     return public_user(doc)
+
+
+async def _require_manageable_user(
+    db: Any, oid: ObjectId, actor: dict, *, allow_self: bool = False
+) -> dict:
+    current = await db.users.find_one({"_id": oid})
+    if not current or current.get("deleted_at"):
+        raise ApiError(404, "not_found", "User not found")
+    if not allow_self and actor.get("_id") == oid:
+        raise ApiError(400, "cannot_target_self", "You cannot perform this action on yourself")
+    if current.get("role") == "admin" and actor.get("role") != "admin":
+        raise ApiError(403, "forbidden", "Only an administrator can manage administrators")
+    return current
+
+
+async def _assert_not_last_active_admin(db: Any, user: dict) -> None:
+    if user.get("role") != "admin" or not user.get("active", True):
+        return
+    if user.get("banned") or user.get("deleted_at"):
+        return
+    active_admins = await db.users.count_documents(
+        {
+            "role": "admin",
+            "active": True,
+            "banned": {"$ne": True},
+            "deleted_at": None,
+        }
+    )
+    if active_admins <= 1:
+        raise ApiError(
+            409,
+            "last_admin_required",
+            "The final active administrator cannot be banned, deactivated, or deleted",
+        )
+
+
+async def _revoke_user_sessions(db: Any, user_id: ObjectId) -> int:
+    result = await db.auth_sessions.update_many(
+        {"user_id": user_id, "revoked_at": None},
+        {"$set": {"revoked_at": utcnow()}},
+    )
+    return int(result.modified_count)
 
 
 @users.patch("/{user_id}")
@@ -416,6 +703,7 @@ async def update_user(user_id: str, body: UserUpdate, request: Request, manager:
     values = body.model_dump(exclude_none=True)
     password = values.pop("password", None)
     if password:
+        enforce_password_policy(password, await merged_settings(database(request)))
         values["password_hash"] = hash_password(password)
     oid = valid_id(user_id)
     db = database(request)
@@ -426,25 +714,22 @@ async def update_user(user_id: str, body: UserUpdate, request: Request, manager:
             raise ApiError(409, "user_update_in_progress", "Another user update is in progress")
     try:
         current = await db.users.find_one({"_id": oid})
-        if not current:
+        if not current or current.get("deleted_at"):
             raise ApiError(404, "not_found", "User not found")
         if manager.get("role") != "admin" and (
             current.get("role") == "admin" or values.get("role") == "admin"
         ):
             raise ApiError(403, "forbidden", "Only an administrator can modify administrators")
+        if values.get("active") is True:
+            values.update(banned=False, ban_reason="", banned_at=None, banned_by=None)
         removes_active_admin = (
             current.get("role") == "admin"
             and current.get("active", True)
+            and not current.get("banned")
             and (values.get("role", "admin") != "admin" or values.get("active", True) is False)
         )
         if removes_active_admin:
-            active_admins = await db.users.count_documents({"role": "admin", "active": True})
-            if active_admins <= 1:
-                raise ApiError(
-                    409,
-                    "last_admin_required",
-                    "The final active administrator cannot be demoted or deactivated",
-                )
+            await _assert_not_last_active_admin(db, current)
         doc = await db.users.find_one_and_update(
             {"_id": oid}, {"$set": values}, return_document=ReturnDocument.AFTER
         )
@@ -454,10 +739,188 @@ async def update_user(user_id: str, body: UserUpdate, request: Request, manager:
     if not doc:
         raise ApiError(404, "not_found", "User not found")
     if password or values.get("active") is False:
-        await database(request).auth_sessions.update_many(
-            {"user_id": oid, "revoked_at": None}, {"$set": {"revoked_at": utcnow()}}
-        )
+        await _revoke_user_sessions(db, oid)
+    changed = {key: values[key] for key in values if key != "password_hash"}
+    if password:
+        changed["password_reset"] = True
+    action = "user.update"
+    if list(changed.keys()) == ["active"] or set(changed.keys()) <= {
+        "active",
+        "banned",
+        "ban_reason",
+        "banned_at",
+        "banned_by",
+    }:
+        if values.get("active") is True:
+            action = "user.activate"
+        elif values.get("active") is False:
+            action = "user.deactivate"
+    await record_operation_event(
+        db,
+        action=action,
+        outcome="ok",
+        actor=manager,
+        request=request,
+        entity_type="user",
+        entity_ids=[str(oid)],
+        details={"username": doc.get("username"), "changed": changed},
+    )
     return public_user(doc)
+
+
+@users.post("/{user_id}/ban", status_code=status.HTTP_204_NO_CONTENT)
+async def ban_user(
+    user_id: str, body: UserBanRequest, request: Request, admin: Admin
+) -> Response:
+    oid = valid_id(user_id)
+    db = database(request)
+    current = await _require_manageable_user(db, oid, admin)
+    await _assert_not_last_active_admin(db, current)
+    now = utcnow()
+    await db.users.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "active": False,
+                "banned": True,
+                "banned_at": now,
+                "banned_by": admin.get("_id"),
+                "ban_reason": body.reason.strip(),
+            }
+        },
+    )
+    revoked = await _revoke_user_sessions(db, oid)
+    await record_operation_event(
+        db,
+        action="user.ban",
+        outcome="ok",
+        actor=admin,
+        request=request,
+        entity_type="user",
+        entity_ids=[str(oid)],
+        details={
+            "username": current.get("username"),
+            "reason": body.reason.strip(),
+            "revoked_sessions": revoked,
+        },
+    )
+    return Response(status_code=204)
+
+
+@users.post("/{user_id}/unban", status_code=status.HTTP_204_NO_CONTENT)
+async def unban_user(user_id: str, request: Request, admin: Admin) -> Response:
+    oid = valid_id(user_id)
+    db = database(request)
+    current = await _require_manageable_user(db, oid, admin, allow_self=True)
+    await db.users.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "banned": False,
+                "ban_reason": "",
+                "banned_at": None,
+                "banned_by": None,
+                # Leave inactive until an explicit activate.
+                "active": False,
+            }
+        },
+    )
+    await record_operation_event(
+        db,
+        action="user.unban",
+        outcome="ok",
+        actor=admin,
+        request=request,
+        entity_type="user",
+        entity_ids=[str(oid)],
+        details={"username": current.get("username")},
+    )
+    return Response(status_code=204)
+
+
+@users.post("/{user_id}/force-logout", status_code=status.HTTP_204_NO_CONTENT)
+async def force_logout_user(user_id: str, request: Request, admin: Admin) -> Response:
+    oid = valid_id(user_id)
+    db = database(request)
+    current = await _require_manageable_user(db, oid, admin, allow_self=True)
+    query: dict[str, Any] = {"user_id": oid, "revoked_at": None}
+    current_sid = request.state.session.get("_id") if hasattr(request.state, "session") else None
+    if current_sid and admin.get("_id") == oid:
+        query["_id"] = {"$ne": current_sid}
+    result = await db.auth_sessions.update_many(query, {"$set": {"revoked_at": utcnow()}})
+    await record_operation_event(
+        db,
+        action="user.force_logout",
+        outcome="ok",
+        actor=admin,
+        request=request,
+        entity_type="user",
+        entity_ids=[str(oid)],
+        details={
+            "username": current.get("username"),
+            "revoked_count": int(result.modified_count),
+        },
+    )
+    return Response(status_code=204)
+
+
+@users.post("/{user_id}/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+async def reset_user_password(
+    user_id: str, body: UserResetPasswordRequest, request: Request, admin: Admin
+) -> Response:
+    oid = valid_id(user_id)
+    db = database(request)
+    current = await _require_manageable_user(db, oid, admin, allow_self=True)
+    enforce_password_policy(body.password, await merged_settings(db))
+    await db.users.update_one(
+        {"_id": oid}, {"$set": {"password_hash": hash_password(body.password)}}
+    )
+    revoked = await _revoke_user_sessions(db, oid)
+    await record_operation_event(
+        db,
+        action="user.reset_password",
+        outcome="ok",
+        actor=admin,
+        request=request,
+        entity_type="user",
+        entity_ids=[str(oid)],
+        details={"username": current.get("username"), "revoked_sessions": revoked},
+    )
+    return Response(status_code=204)
+
+
+@users.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_user(user_id: str, request: Request, admin: Admin) -> Response:
+    oid = valid_id(user_id)
+    db = database(request)
+    current = await _require_manageable_user(db, oid, admin)
+    await _assert_not_last_active_admin(db, current)
+    now = utcnow()
+    await db.users.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "deleted_at": now,
+                "active": False,
+                "banned": True,
+                "banned_at": now,
+                "banned_by": admin.get("_id"),
+                "ban_reason": current.get("ban_reason") or "Account deleted",
+            }
+        },
+    )
+    revoked = await _revoke_user_sessions(db, oid)
+    await record_operation_event(
+        db,
+        action="user.delete",
+        outcome="ok",
+        actor=admin,
+        request=request,
+        entity_type="user",
+        entity_ids=[str(oid)],
+        details={"username": current.get("username"), "revoked_sessions": revoked},
+    )
+    return Response(status_code=204)
 
 
 def valid_id(value: str) -> ObjectId:
@@ -555,62 +1018,123 @@ async def list_categories(
     return await list_collection(request, "categories", exact=exact, **page)
 
 
-@categories.post("", status_code=201)
-async def create_category(body: CategoryWrite, request: Request, _manager: Manager) -> dict:
-    return await insert_category(body, request)
-
-
-async def insert_category(body: CategoryWrite, request: Request) -> dict:
+async def insert_category(
+    body: CategoryWrite, request: Request, *, actor: dict | None = None
+) -> dict:
     doc = body.model_dump()
-    result = await database(request).categories.insert_one(doc)
+    db = database(request)
+    result = await db.categories.insert_one(doc)
     doc["_id"] = result.inserted_id
+    if actor is not None:
+        await record_operation_event(
+            db,
+            action="category.create",
+            actor=actor,
+            request=request,
+            entity_type="category",
+            entity_ids=[str(doc["_id"])],
+            details={"name": doc.get("name")},
+        )
     return json_safe(doc)
+
+
+@categories.post("", status_code=201)
+async def create_category(body: CategoryWrite, request: Request, manager: Manager) -> dict:
+    return await insert_category(body, request, actor=manager)
 
 
 @categories.post("/cashier-create", status_code=201)
 async def cashier_create_category(
-    body: CategoryWrite, request: Request, _cashier: Cashier
+    body: CategoryWrite, request: Request, cashier: Cashier
 ) -> dict:
     """Allow cashier/accountant unknown-item creation from the daily register."""
-    return await insert_category(body, request)
+    return await insert_category(body, request, actor=cashier)
 
 
 @categories.patch("/{item_id}")
-async def patch_category(item_id: str, body: PatchDocument, request: Request, _manager: Manager) -> dict:
+async def patch_category(item_id: str, body: PatchDocument, request: Request, manager: Manager) -> dict:
     values = allowed_patch("categories", body.values)
-    doc = await database(request).categories.find_one_and_update(
+    db = database(request)
+    doc = await db.categories.find_one_and_update(
         {"_id": valid_id(item_id)}, {"$set": values}, return_document=ReturnDocument.AFTER
     )
     if not doc:
         raise ApiError(404, "not_found", "Category not found")
+    await record_operation_event(
+        db,
+        action="category.patch",
+        actor=manager,
+        request=request,
+        entity_type="category",
+        entity_ids=[item_id],
+        details={"fields": sorted(values.keys())[:40]},
+    )
     return json_safe(doc)
 
 
 @categories.delete("/{item_id}", status_code=204)
-async def delete_category(item_id: str, request: Request, _manager: Manager) -> Response:
-    result = await database(request).categories.delete_one({"_id": valid_id(item_id)})
+async def delete_category(item_id: str, request: Request, manager: Manager) -> Response:
+    db = database(request)
+    result = await db.categories.delete_one({"_id": valid_id(item_id)})
     if not result.deleted_count:
         raise ApiError(404, "not_found", "Category not found")
+    await record_operation_event(
+        db,
+        action="category.delete",
+        actor=manager,
+        request=request,
+        entity_type="category",
+        entity_ids=[item_id],
+    )
     return Response(status_code=204)
 
 
-async def create_named(request: Request, collection: str, body: Any) -> dict:
+_COLLECTION_AUDIT = {
+    "category_subtables": "subtable",
+    "keyword_rules": "rule",
+    "description_mappings": "mapping",
+}
+
+
+async def create_named(
+    request: Request, collection: str, body: Any, *, actor: dict | None = None
+) -> dict:
     doc = body.model_dump()
+    db = database(request)
     if collection in {"category_subtables", "description_mappings"}:
         doc["created_at"] = utcnow()
     if collection == "description_mappings":
         doc["description_key"] = " ".join(doc["description"].upper().split())
-        doc = await database(request)[collection].find_one_and_update(
+        doc = await db[collection].find_one_and_update(
             {"description_key": doc["description_key"]},
             {"$set": doc},
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
+        if actor is not None:
+            await record_operation_event(
+                db,
+                action="mapping.upsert",
+                actor=actor,
+                request=request,
+                entity_type="mapping",
+                entity_ids=[str(doc.get("_id") or "")],
+            )
         return json_safe(doc)
     if "category_id" in doc:
         doc["category_id"] = valid_id(doc["category_id"])
-    result = await database(request)[collection].insert_one(doc)
+    result = await db[collection].insert_one(doc)
     doc["_id"] = result.inserted_id
+    if actor is not None:
+        entity = _COLLECTION_AUDIT.get(collection, collection)
+        await record_operation_event(
+            db,
+            action=f"{entity}.create",
+            actor=actor,
+            request=request,
+            entity_type=entity,
+            entity_ids=[str(doc["_id"])],
+        )
     return json_safe(doc)
 
 
@@ -626,16 +1150,16 @@ async def list_subtables(
 
 
 @subtables.post("", status_code=201)
-async def create_subtable(body: SubtableWrite, request: Request, _manager: Manager) -> dict:
-    return await create_named(request, "category_subtables", body)
+async def create_subtable(body: SubtableWrite, request: Request, manager: Manager) -> dict:
+    return await create_named(request, "category_subtables", body, actor=manager)
 
 
 @subtables.post("/cashier-create", status_code=201)
 async def cashier_create_subtable(
-    body: SubtableWrite, request: Request, _cashier: Cashier
+    body: SubtableWrite, request: Request, cashier: Cashier
 ) -> dict:
     """Allow cashier/accountant sub-item creation from import mapping."""
-    return await create_named(request, "category_subtables", body)
+    return await create_named(request, "category_subtables", body, actor=cashier)
 
 
 @rules.get("")
@@ -644,8 +1168,8 @@ async def list_rules(request: Request, _user: Authenticated, page: Annotated[dic
 
 
 @rules.post("", status_code=201)
-async def create_rule(body: RuleWrite, request: Request, _manager: Manager) -> dict:
-    return await create_named(request, "keyword_rules", body)
+async def create_rule(body: RuleWrite, request: Request, manager: Manager) -> dict:
+    return await create_named(request, "keyword_rules", body, actor=manager)
 
 
 @mappings.get("")
@@ -663,61 +1187,115 @@ async def list_mappings(
 
 
 @mappings.put("", status_code=200)
-async def put_mapping(body: MappingWrite, request: Request, _user: Authenticated) -> dict:
+async def put_mapping(body: MappingWrite, request: Request, user: Authenticated) -> dict:
     """Cashiers save maps during daily import; accountants/admins manage them too."""
-    return await create_named(request, "description_mappings", body)
+    return await create_named(request, "description_mappings", body, actor=user)
 
 
-async def patch_named(collection: str, item_id: str, body: PatchDocument, request: Request) -> dict:
+async def patch_named(
+    collection: str,
+    item_id: str,
+    body: PatchDocument,
+    request: Request,
+    *,
+    actor: dict | None = None,
+) -> dict:
     values = allowed_patch(collection, body.values)
     if "category_id" in values:
         values["category_id"] = valid_id(str(values["category_id"]))
-    doc = await database(request)[collection].find_one_and_update(
+    db = database(request)
+    doc = await db[collection].find_one_and_update(
         {"_id": valid_id(item_id)}, {"$set": values}, return_document=ReturnDocument.AFTER
     )
     if not doc:
         raise ApiError(404, "not_found", "Resource not found")
+    if actor is not None:
+        entity = _COLLECTION_AUDIT.get(collection, collection)
+        await record_operation_event(
+            db,
+            action=f"{entity}.patch",
+            actor=actor,
+            request=request,
+            entity_type=entity,
+            entity_ids=[item_id],
+            details={"fields": sorted(values.keys())[:40]},
+        )
     return json_safe(doc)
 
 
 @subtables.patch("/{item_id}")
-async def patch_subtable(item_id: str, body: PatchDocument, request: Request, _manager: Manager) -> dict:
-    return await patch_named("category_subtables", item_id, body, request)
+async def patch_subtable(item_id: str, body: PatchDocument, request: Request, manager: Manager) -> dict:
+    return await patch_named("category_subtables", item_id, body, request, actor=manager)
 
 
 @rules.patch("/{item_id}")
-async def patch_rule(item_id: str, body: PatchDocument, request: Request, _manager: Manager) -> dict:
-    return await patch_named("keyword_rules", item_id, body, request)
+async def patch_rule(item_id: str, body: PatchDocument, request: Request, manager: Manager) -> dict:
+    return await patch_named("keyword_rules", item_id, body, request, actor=manager)
 
 
-async def delete_named(collection: str, item_id: str, request: Request) -> Response:
-    result = await database(request)[collection].delete_one({"_id": valid_id(item_id)})
+async def delete_named(
+    collection: str,
+    item_id: str,
+    request: Request,
+    *,
+    actor: dict | None = None,
+) -> Response:
+    db = database(request)
+    result = await db[collection].delete_one({"_id": valid_id(item_id)})
     if not result.deleted_count:
         raise ApiError(404, "not_found", "Resource not found")
+    if actor is not None:
+        entity = _COLLECTION_AUDIT.get(collection, collection)
+        await record_operation_event(
+            db,
+            action=f"{entity}.delete",
+            actor=actor,
+            request=request,
+            entity_type=entity,
+            entity_ids=[item_id],
+        )
     return Response(status_code=204)
 
 
 @subtables.delete("/{item_id}", status_code=204)
-async def delete_subtable(item_id: str, request: Request, _manager: Manager) -> Response:
-    return await delete_named("category_subtables", item_id, request)
+async def delete_subtable(item_id: str, request: Request, manager: Manager) -> Response:
+    return await delete_named("category_subtables", item_id, request, actor=manager)
 
 
 @rules.delete("/{item_id}", status_code=204)
-async def delete_rule(item_id: str, request: Request, _manager: Manager) -> Response:
-    return await delete_named("keyword_rules", item_id, request)
+async def delete_rule(item_id: str, request: Request, manager: Manager) -> Response:
+    return await delete_named("keyword_rules", item_id, request, actor=manager)
 
 
 @mappings.delete("")
-async def delete_mappings(request: Request, _manager: Manager) -> dict:
-    result = await database(request).description_mappings.delete_many({})
+async def delete_mappings(request: Request, manager: Manager) -> dict:
+    db = database(request)
+    result = await db.description_mappings.delete_many({})
+    await record_operation_event(
+        db,
+        action="mapping.delete_all",
+        actor=manager,
+        request=request,
+        entity_type="mapping",
+        details={"deleted_count": int(result.deleted_count)},
+    )
     return {"deleted_count": result.deleted_count}
 
 
 @mappings.delete("/{item_id}", status_code=204)
-async def delete_mapping(item_id: str, request: Request, _manager: Manager) -> Response:
-    result = await database(request).description_mappings.delete_one({"_id": valid_id(item_id)})
+async def delete_mapping(item_id: str, request: Request, manager: Manager) -> Response:
+    db = database(request)
+    result = await db.description_mappings.delete_one({"_id": valid_id(item_id)})
     if not result.deleted_count:
         raise ApiError(404, "not_found", "Mapping not found")
+    await record_operation_event(
+        db,
+        action="mapping.delete",
+        actor=manager,
+        request=request,
+        entity_type="mapping",
+        entity_ids=[item_id],
+    )
     return Response(status_code=204)
 
 
@@ -751,15 +1329,53 @@ async def list_fleet(
     }
 
 
-async def put_fleet(kind: str, body: FleetWrite, request: Request) -> dict:
-    return json_safe(
-        await database(request)[kind].find_one_and_update(
-            {"number": body.number},
-            {"$set": body.model_dump()},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
+_FLEET_ENTITY = {
+    "trucks": "truck",
+    "trailers": "trailer",
+    "motor_vehicles": "motor_vehicle",
+}
+
+
+async def put_fleet(
+    kind: str, body: FleetWrite, request: Request, *, actor: dict | None = None
+) -> dict:
+    db = database(request)
+    doc = await db[kind].find_one_and_update(
+        {"number": body.number},
+        {"$set": body.model_dump()},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
     )
+    if actor is not None:
+        await record_operation_event(
+            db,
+            action="fleet.upsert",
+            actor=actor,
+            request=request,
+            entity_type=_FLEET_ENTITY.get(kind, kind),
+            entity_ids=[body.number],
+            details={"kind": kind, "active": body.active},
+        )
+    return json_safe(doc)
+
+
+async def delete_fleet(
+    kind: str, number: str, request: Request, *, actor: dict | None = None
+) -> Response:
+    normalized = " ".join(number.upper().split())
+    db = database(request)
+    await db[kind].delete_one({"number": normalized})
+    if actor is not None:
+        await record_operation_event(
+            db,
+            action="fleet.delete",
+            actor=actor,
+            request=request,
+            entity_type=_FLEET_ENTITY.get(kind, kind),
+            entity_ids=[normalized],
+            details={"kind": kind},
+        )
+    return Response(status_code=204)
 
 
 @fleet.get("/trucks")
@@ -775,16 +1391,15 @@ async def get_trucks(
 
 
 @fleet.put("/trucks/{number}")
-async def upsert_truck(number: str, body: FleetWrite, request: Request, _manager: Manager) -> dict:
+async def upsert_truck(number: str, body: FleetWrite, request: Request, manager: Manager) -> dict:
     if number.upper().strip() != body.number:
         raise ApiError(422, "number_mismatch", "Path and body numbers must match")
-    return await put_fleet("trucks", body, request)
+    return await put_fleet("trucks", body, request, actor=manager)
 
 
 @fleet.delete("/trucks/{number}", status_code=204)
-async def delete_truck(number: str, request: Request, _manager: Manager) -> Response:
-    await database(request).trucks.delete_one({"number": " ".join(number.upper().split())})
-    return Response(status_code=204)
+async def delete_truck(number: str, request: Request, manager: Manager) -> Response:
+    return await delete_fleet("trucks", number, request, actor=manager)
 
 
 @fleet.get("/trailers")
@@ -800,16 +1415,15 @@ async def get_trailers(
 
 
 @fleet.put("/trailers/{number}")
-async def upsert_trailer(number: str, body: FleetWrite, request: Request, _manager: Manager) -> dict:
+async def upsert_trailer(number: str, body: FleetWrite, request: Request, manager: Manager) -> dict:
     if number.upper().strip() != body.number:
         raise ApiError(422, "number_mismatch", "Path and body numbers must match")
-    return await put_fleet("trailers", body, request)
+    return await put_fleet("trailers", body, request, actor=manager)
 
 
 @fleet.delete("/trailers/{number}", status_code=204)
-async def delete_trailer(number: str, request: Request, _manager: Manager) -> Response:
-    await database(request).trailers.delete_one({"number": " ".join(number.upper().split())})
-    return Response(status_code=204)
+async def delete_trailer(number: str, request: Request, manager: Manager) -> Response:
+    return await delete_fleet("trailers", number, request, actor=manager)
 
 
 @fleet.get("/motor_vehicles")
@@ -825,18 +1439,17 @@ async def get_motor_vehicles(
 
 
 @fleet.put("/motor_vehicles/{number}")
-async def upsert_motor_vehicle(number: str, body: FleetWrite, request: Request, _manager: Manager) -> dict:
+async def upsert_motor_vehicle(
+    number: str, body: FleetWrite, request: Request, manager: Manager
+) -> dict:
     if number.upper().strip() != body.number:
         raise ApiError(422, "number_mismatch", "Path and body numbers must match")
-    return await put_fleet("motor_vehicles", body, request)
+    return await put_fleet("motor_vehicles", body, request, actor=manager)
 
 
 @fleet.delete("/motor_vehicles/{number}", status_code=204)
-async def delete_motor_vehicle(number: str, request: Request, _manager: Manager) -> Response:
-    await database(request).motor_vehicles.delete_one(
-        {"number": " ".join(number.upper().split())}
-    )
-    return Response(status_code=204)
+async def delete_motor_vehicle(number: str, request: Request, manager: Manager) -> Response:
+    return await delete_fleet("motor_vehicles", number, request, actor=manager)
 
 
 async def list_people(
@@ -881,30 +1494,49 @@ async def get_people(
 
 
 @people.put("/{name}")
-async def upsert_person(name: str, body: PeopleWrite, request: Request, _manager: Manager) -> dict:
+async def upsert_person(name: str, body: PeopleWrite, request: Request, manager: Manager) -> dict:
     normalized = " ".join(name.upper().split())
     if normalized != body.name:
         raise ApiError(422, "name_mismatch", "Path and body names must match")
-    return json_safe(
-        await database(request)["people"].find_one_and_update(
-            {"name": body.name},
-            {"$set": body.model_dump()},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
+    db = database(request)
+    doc = await db["people"].find_one_and_update(
+        {"name": body.name},
+        {"$set": body.model_dump()},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
     )
+    await record_operation_event(
+        db,
+        action="people.upsert",
+        actor=manager,
+        request=request,
+        entity_type="person",
+        entity_ids=[body.name],
+        details={"active": body.active},
+    )
+    return json_safe(doc)
 
 
 @people.delete("/{name}", status_code=204)
-async def delete_person(name: str, request: Request, _manager: Manager) -> Response:
-    await database(request)["people"].delete_one({"name": " ".join(name.upper().split())})
+async def delete_person(name: str, request: Request, manager: Manager) -> Response:
+    normalized = " ".join(name.upper().split())
+    db = database(request)
+    await db["people"].delete_one({"name": normalized})
+    await record_operation_event(
+        db,
+        action="people.delete",
+        actor=manager,
+        request=request,
+        entity_type="person",
+        entity_ids=[normalized],
+    )
     return Response(status_code=204)
 
 
 @backups.get("")
 async def list_backup_jobs(
     request: Request,
-    _manager: Annotated[dict, Depends(require_roles("admin", "accountant"))],
+    _admin: Admin,
     limit: int = Query(100, ge=1, le=500),
 ) -> list[dict]:
     docs = await database(request).backup_jobs.find().sort("created_at", -1).limit(limit).to_list()
@@ -915,9 +1547,9 @@ async def list_backup_jobs(
 async def restore_backup_job(
     body: BackupRestoreRequest,
     request: Request,
-    manager: Manager,
+    admin: Admin,
 ) -> dict:
-    """Replace the live database with a verified uploaded backup (admin/accountant)."""
+    """Replace the live database with a verified uploaded backup (admin only)."""
     from .cli.backup import exclusive_lock, distributed_lease, restore_database
 
     settings = request.app.state.settings
@@ -930,7 +1562,7 @@ async def restore_backup_job(
                     db,
                     filename=body.filename,
                     confirm_filename=body.confirm_filename,
-                    actor=manager,
+                    actor=admin,
                 )
     except RuntimeError as exc:
         message = str(exc)
@@ -949,6 +1581,19 @@ async def restore_backup_job(
             code = "backup_busy"
             status_code = 409
         raise ApiError(status_code, code, message) from exc
+    await record_operation_event(
+        db,
+        action="backup.restore",
+        actor=admin,
+        request=request,
+        entity_type="backup",
+        entity_ids=[body.filename],
+        details={
+            "filename": body.filename,
+            "status": result.get("status"),
+            "archive_sha256": result.get("archive_sha256"),
+        },
+    )
     return json_safe(result)
 
 
@@ -965,6 +1610,7 @@ for router in (
     accountant,
     settings_api,
     audit_api,
+    sessions_router,
     transactions_router,
     reconciliation_router,
     imports_router,
