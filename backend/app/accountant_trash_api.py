@@ -160,7 +160,16 @@ async def bulk_restore_from_trash(
         return {"updated": 0}
     result = await _database(request).transactions.update_many(
         {"_id": {"$in": ids}, "trashed": True},
-        {"$set": {"trashed": False, "trashed_at": None, "trashed_by": None}},
+        {
+            "$set": {
+                "trashed": False,
+                "trashed_at": None,
+                "trashed_by": None,
+                "restore_requested": False,
+                "restore_requested_at": None,
+                "restore_requested_by": None,
+            }
+        },
     )
     return {"updated": int(result.modified_count)}
 
@@ -192,7 +201,16 @@ async def restore_from_trash(tx_id: str, request: Request, _manager: Manager) ->
     oid = _valid_id(tx_id)
     result = await _database(request).transactions.update_one(
         {"_id": oid, "trashed": True},
-        {"$set": {"trashed": False, "trashed_at": None, "trashed_by": None}},
+        {
+            "$set": {
+                "trashed": False,
+                "trashed_at": None,
+                "trashed_by": None,
+                "restore_requested": False,
+                "restore_requested_at": None,
+                "restore_requested_by": None,
+            }
+        },
     )
     return {"ok": result.modified_count == 1}
 

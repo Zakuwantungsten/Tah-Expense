@@ -171,6 +171,65 @@ async def request_or_delete_transaction(
     return "not_found"
 
 
+async def get_cashier_trash(
+    search: str = "",
+    limit: int = 100,
+    skip: int = 0,
+) -> List[Transaction]:
+    params: dict = {"limit": limit, "skip": skip}
+    if search.strip():
+        params["search"] = search.strip()
+    payload = await api_client.request(
+        "GET", "v1/transactions/trash", params=params
+    )
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
+
+
+async def count_cashier_trash() -> int:
+    payload = await api_client.request("GET", "v1/transactions/trash/count")
+    return int(payload.get("count") or 0)
+
+
+async def request_restore_from_trash(
+    tx_id: ObjectId,
+    cashier_id: Optional[ObjectId] = None,
+) -> str:
+    """Ask accountant to restore a trashed row.
+
+    Returns ``restore_requested``, ``already_requested``, or ``not_found``.
+    """
+    body: dict = {}
+    if cashier_id is not None:
+        body["cashier_id"] = str(cashier_id)
+    payload = await api_client.request(
+        "POST",
+        f"v1/transactions/{tx_id}/request-restore",
+        json=body,
+    )
+    result = str(payload.get("result") or "not_found")
+    if result in {"restore_requested", "already_requested", "not_found"}:
+        return result
+    return "not_found"
+
+
+async def bulk_request_restore_from_trash(tx_ids: List[ObjectId]) -> int:
+    if not tx_ids:
+        return 0
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/trash/bulk-request-restore",
+        json={"ids": [str(oid) for oid in tx_ids]},
+    )
+    return int(payload.get("updated") or 0)
+
+
+async def cancel_restore_request(tx_id: ObjectId) -> bool:
+    payload = await api_client.request(
+        "POST", f"v1/transactions/{tx_id}/cancel-restore"
+    )
+    return bool(payload.get("ok"))
+
+
 async def search_transactions(
     date_from: date = None,
     date_to: date = None,
@@ -201,12 +260,220 @@ async def get_overview_stats() -> dict:
         "receipt_received": 0,
         "receipt_pending": 0,
         "receipt_missing": 0,
+        "verified": 0,
         "unverified": 0,
     }
+
+    def _bucket(raw) -> dict:
+        row = dict(_empty)
+        src = raw or {}
+        for key in _empty:
+            if key == "tzs_total":
+                row[key] = float(src.get(key) or 0.0)
+            else:
+                row[key] = int(src.get(key) or 0)
+        return row
+
     return {
-        "today": payload.get("today") or _empty,
-        "month": payload.get("month") or _empty,
+        "today": _bucket(payload.get("today")),
+        "month": _bucket(payload.get("month")),
         "recent": recent,
+    }
+
+
+_OVERVIEW_PERIODS = ("month", "3m", "year")
+_CURRENCY_KEYS = {"TZS": "tzs", "USD": "usd", "ZMW": "zmw"}
+
+
+def _parse_overview_day(raw) -> date | None:
+    if isinstance(raw, date) and not isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, datetime):
+        return raw.date()
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _overview_period_spec(period: str, year: int, today: date | None = None) -> dict:
+    """Labels / bucket keys for cashier Overview payee trend periods."""
+    import calendar
+    from datetime import timedelta
+
+    today = today or date.today()
+    period = period if period in _OVERVIEW_PERIODS else "year"
+    as_of = today if year == today.year else (
+        date(year, 12, 31) if year < today.year else date(year, 1, 1)
+    )
+
+    if period == "month":
+        start = date(as_of.year, as_of.month, 1)
+        keys = [date(as_of.year, as_of.month, day) for day in range(1, as_of.day + 1)]
+        labels = [str(day) for day in range(1, as_of.day + 1)]
+        subtitle = (
+            f"Spend by day, {calendar.month_name[as_of.month]} {as_of.year}"
+        )
+        grain = "day"
+        end = as_of
+    elif period == "3m":
+        start_month = as_of.month - 2
+        start_year = as_of.year
+        while start_month < 1:
+            start_month += 12
+            start_year -= 1
+        start = date(start_year, start_month, 1)
+        fy_start = date(year, 1, 1)
+        if start < fy_start:
+            start = fy_start
+        end = as_of
+        grain = "week"
+        keys = []
+        labels = []
+        cursor = start - timedelta(days=start.weekday())
+        while cursor <= end:
+            keys.append(cursor)
+            label_day = start if cursor < start else cursor
+            labels.append(f"{label_day.day} {calendar.month_abbr[label_day.month]}")
+            cursor += timedelta(days=7)
+        if start.month == as_of.month and start.year == as_of.year:
+            subtitle = (
+                f"Spend by week, {calendar.month_name[as_of.month]} {as_of.year}"
+            )
+        elif start.year == as_of.year:
+            subtitle = (
+                f"Spend by week, {calendar.month_abbr[start.month]} to "
+                f"{calendar.month_abbr[as_of.month]} {as_of.year}"
+            )
+        else:
+            subtitle = (
+                f"Spend by week, {calendar.month_abbr[start.month]} {start.year} "
+                f"to {calendar.month_abbr[as_of.month]} {as_of.year}"
+            )
+    else:
+        grain = "month"
+        start = date(year, 1, 1)
+        end_month = as_of.month if as_of.year == year else 12
+        end = date(year, end_month, calendar.monthrange(year, end_month)[1])
+        if as_of.year == year:
+            end = min(end, as_of)
+        keys = [date(year, month, 1) for month in range(1, end_month + 1)]
+        labels = [calendar.month_abbr[month] for month in range(1, end_month + 1)]
+        if end_month == 1:
+            subtitle = f"Spend by month, Jan {year}"
+        elif end_month == 12:
+            subtitle = f"Spend by month, {year}"
+        else:
+            subtitle = (
+                f"Spend by month, Jan to {calendar.month_abbr[end_month]} {year}"
+            )
+
+    return {
+        "period": period,
+        "grain": grain,
+        "start": start,
+        "end": end,
+        "keys": keys,
+        "labels": labels,
+        "subtitle": subtitle,
+    }
+
+
+def _bucket_day(day: date, grain: str) -> date:
+    if grain == "month":
+        return date(day.year, day.month, 1)
+    if grain == "week":
+        from datetime import timedelta
+        return day - timedelta(days=day.weekday())
+    return day
+
+
+def bucket_payee_spend(
+    payee_series: list[dict],
+    period: str,
+    year: int,
+    currency: str = "TZS",
+    today: date | None = None,
+) -> dict:
+    """Roll top-payee daily money into Overview line-chart buckets."""
+    spec = _overview_period_spec(period, year, today)
+    cur_key = _CURRENCY_KEYS.get((currency or "TZS").upper(), "tzs")
+    index = {key: i for i, key in enumerate(spec["keys"])}
+    series = []
+    for item in payee_series or []:
+        values = [0.0] * len(spec["keys"])
+        daily = item.get("daily") or {}
+        for raw_day, money in daily.items():
+            day = _parse_overview_day(raw_day)
+            if day is None or day < spec["start"] or day > spec["end"]:
+                continue
+            slot = index.get(_bucket_day(day, spec["grain"]))
+            if slot is None:
+                continue
+            if isinstance(money, dict):
+                values[slot] += float(money.get(cur_key) or 0.0)
+            else:
+                values[slot] += float(money or 0.0)
+        series.append(
+            {
+                "key": item.get("key") or item.get("label") or "payee",
+                "label": item.get("label") or item.get("key") or "Payee",
+                "values": values,
+            }
+        )
+    return {
+        "period": spec["period"],
+        "labels": spec["labels"],
+        "subtitle": spec["subtitle"],
+        "series": series,
+    }
+
+
+async def get_overview_charts(year: int | None = None) -> dict:
+    """Item breakdown + top-payee daily series for cashier Overview charts."""
+    params: dict = {}
+    if year is not None:
+        params["year"] = int(year)
+    payload = await api_client.request(
+        "GET", "v1/transactions/overview-charts", params=params or None
+    )
+    items = []
+    for row in payload.get("items") or []:
+        items.append(
+            {
+                "name": row.get("name") or "Uncategorised",
+                "tzs": float(row.get("tzs") or 0.0),
+                "usd": float(row.get("usd") or 0.0),
+                "zmw": float(row.get("zmw") or 0.0),
+            }
+        )
+    payees = []
+    for row in (payload.get("payees") or {}).get("series") or []:
+        daily_raw = row.get("daily") or {}
+        daily: dict = {}
+        for day_key, money in daily_raw.items():
+            if isinstance(money, dict):
+                daily[str(day_key)] = {
+                    "tzs": float(money.get("tzs") or 0.0),
+                    "usd": float(money.get("usd") or 0.0),
+                    "zmw": float(money.get("zmw") or 0.0),
+                }
+        payees.append(
+            {
+                "key": row.get("key") or row.get("label") or "payee",
+                "label": row.get("label") or row.get("key") or "Payee",
+                "daily": daily,
+            }
+        )
+    return {
+        "year": int(payload.get("year") or year or date.today().year),
+        "items": items,
+        "payees": payees,
     }
 
 

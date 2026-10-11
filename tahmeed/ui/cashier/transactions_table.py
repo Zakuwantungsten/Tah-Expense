@@ -35,6 +35,7 @@ from tahmeed.services.cashier_service import (
 )
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
+from tahmeed.ui.widgets.combo_styles import with_combo_popup
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 
@@ -51,18 +52,18 @@ QPushButton:pressed { background: #e5e7eb; }
 
 _PRIMARY_BTN = """
 QPushButton {
-    background: #E85D04; border: 1px solid #F48C06; border-radius: 5px;
+    background: #0077C5; border: 1px solid #0077C5; border-radius: 5px;
     padding: 5px 18px; color: #ffffff; font-size: 12px; font-weight: 600;
 }
-QPushButton:hover   { background: #F48C06; }
-QPushButton:pressed { background: #DC2F02; }
-QPushButton:disabled { background: #fdba74; border-color: #fdba74; }
+QPushButton:hover   { background: #0369A1; border-color: #0369A1; }
+QPushButton:pressed { background: #075985; border-color: #075985; }
+QPushButton:disabled { background: #93C5FD; border-color: #93C5FD; }
 """
 
 _TABLE_SS = """
 QTableWidget {
     background: #ffffff; gridline-color: #e5e7eb; border: none;
-    selection-background-color: #fff3e8; selection-color: #111827;
+    selection-background-color: #E8F4FD; selection-color: #111827;
 }
 QHeaderView::section {
     background: #f1f5f9; color: #334155; font-weight: 600; font-size: 11px;
@@ -73,10 +74,11 @@ QTableWidget::item { padding: 2px 8px; color: #111827; }
 QTableWidget::item:alternate { background: #f8fafc; }
 """
 
-_FIELD_SS = (
+_FIELD_SS = with_combo_popup(
     "QLineEdit, QDateEdit, QComboBox {"
     "  border: 1px solid #d1d5db; border-radius: 4px;"
     "  padding: 0 8px; font-size: 12px; color: #111827;"
+    "  background: #FFFFFF;"
     "}"
     "QLineEdit:focus, QDateEdit:focus, QComboBox:focus { border-color: #0077C5; }"
 )
@@ -152,9 +154,10 @@ class TransactionBrowser(QWidget):
     go_to_date = Signal(object, str)
     go_to_upload = Signal(str, object)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, can_manage_uploads: bool = True):
         super().__init__(parent)
         self.setStyleSheet("QWidget { background: #ffffff; }")
+        self._can_manage_uploads = bool(can_manage_uploads)
         self._results_simple: List[dict] = []
         self._results_advanced: List[Transaction] = []
         self._results_uploads: list = []
@@ -740,11 +743,10 @@ class TransactionBrowser(QWidget):
                 self._results_simple = await get_daily_summaries(**params, limit=400)
                 if gen != self._find_generation:
                     return
-                from tahmeed.services.accountant_service import get_cashier_names
                 ids = []
                 for s in self._results_simple:
                     ids.extend(s.get("cashier_ids") or [])
-                self._user_names = await get_cashier_names(ids) if ids else {}
+                self._user_names = await self._resolve_cashier_names(ids)
                 if gen != self._find_generation:
                     return
                 self._populate_simple(self._results_simple)
@@ -755,14 +757,13 @@ class TransactionBrowser(QWidget):
                 )
                 if gen != self._find_generation:
                     return
-                from tahmeed.services.accountant_service import get_cashier_names
                 ids = []
                 for tx in self._results_advanced:
                     if tx.cashier_id:
                         ids.append(tx.cashier_id)
                     if tx.last_edited_by:
                         ids.append(tx.last_edited_by)
-                self._user_names = await get_cashier_names(ids) if ids else {}
+                self._user_names = await self._resolve_cashier_names(ids)
                 if gen != self._find_generation:
                     return
                 self._populate_advanced(self._results_advanced)
@@ -784,16 +785,24 @@ class TransactionBrowser(QWidget):
                 for btn in self._find_btns:
                     btn.setEnabled(True)
 
+    async def _resolve_cashier_names(self, cashier_ids: list) -> dict:
+        if not cashier_ids:
+            return {}
+        try:
+            from tahmeed.services.accountant_service import get_cashier_names
+            return await get_cashier_names(cashier_ids)
+        except Exception:
+            return {}
+
     async def _load_uploads(self) -> None:
         from tahmeed.services.daily_import_service import list_daily_uploads
-        from tahmeed.services.accountant_service import get_cashier_names
 
         uploads = await list_daily_uploads(limit=200)
         # Defense: never show groups without a real batch id.
         uploads = [u for u in uploads if u.get("_id")]
         self._results_uploads = uploads
         cashier_ids = [u.get("cashier_id") for u in uploads if u.get("cashier_id")]
-        names = await get_cashier_names(cashier_ids) if cashier_ids else {}
+        names = await self._resolve_cashier_names(cashier_ids)
         self._populate_uploads(uploads, names)
 
     def _populate_uploads(self, uploads: list, names: dict) -> None:
@@ -841,24 +850,26 @@ class TransactionBrowser(QWidget):
             open_btn = QPushButton("Open")
             open_btn.setCursor(Qt.PointingHandCursor)
             open_btn.setStyleSheet(
-                "QPushButton{background:#fff;color:#1d4ed8;border:1px solid #bfdbfe;"
+                "QPushButton{background:#fff;color:#0077C5;border:1px solid #BFDBFE;"
                 "border-radius:4px;padding:2px 10px;font-size:11px;font-weight:600;}"
-                "QPushButton:hover{background:#eff6ff;}"
+                "QPushButton:hover{background:#E8F4FD;}"
             )
             open_btn.clicked.connect(lambda _c=False, r=i: self._open_upload_at(r))
             hl.addWidget(open_btn)
 
-            btn = QPushButton("Delete")
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(
-                "QPushButton{background:#fff;color:#b91c1c;border:1px solid #fecaca;"
-                "border-radius:4px;padding:2px 10px;font-size:11px;font-weight:600;}"
-                "QPushButton:hover{background:#fef2f2;}"
-            )
-            btn.clicked.connect(
-                lambda _c=False, uid=upload_id, fn=fname, n=count: self._confirm_delete_upload(uid, fn, n)
-            )
-            hl.addWidget(btn)
+            if self._can_manage_uploads:
+                btn = QPushButton("Delete")
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setStyleSheet(
+                    "QPushButton{background:#fff;color:#b91c1c;border:1px solid #fecaca;"
+                    "border-radius:4px;padding:2px 10px;font-size:11px;font-weight:600;}"
+                    "QPushButton:hover{background:#fef2f2;}"
+                )
+                btn.clicked.connect(
+                    lambda _c=False, uid=upload_id, fn=fname, n=count:
+                    self._confirm_delete_upload(uid, fn, n)
+                )
+                hl.addWidget(btn)
             t.setCellWidget(i, _U_COL_ACT, acts)
 
         self._count_label.setText(f"Uploads: {len(uploads)}")

@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tahmeed.config import APP_NAME, APP_VERSION
+from tahmeed.config import APP_NAME, APP_VERSION, COMPANY_NAME
 from tahmeed.models.user import User
 
 _NAVY = "#1B2B4B"
@@ -37,9 +37,12 @@ class AccountantTitleBar(QFrame):
         self,
         user: User,
         parent: Optional[QWidget] = None,
+        *,
+        edition: str = "Accountant Edition",
     ) -> None:
         super().__init__(parent)
         self._user = user
+        self._edition = edition
         self._drag_pos: Optional[QPoint] = None
         self._window_offset = QPoint()
         self._build()
@@ -90,7 +93,7 @@ class AccountantTitleBar(QFrame):
         name = (self._user.full_name or self._user.username or "").strip()
         who = f" ({name})" if name else ""
         return (
-            f"TAHMEED TRANSPORTERS — {APP_NAME}: Accountant Edition "
+            f"{COMPANY_NAME} — {APP_NAME}: {self._edition} "
             f"{APP_VERSION}{who}"
         )
 

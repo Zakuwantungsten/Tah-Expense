@@ -408,9 +408,16 @@ def build_issue_query(
     return query
 
 
-def daily_uploads_pipeline(*, limit: int = 100) -> list[dict[str, Any]]:
+def daily_uploads_pipeline(
+    *,
+    limit: int = 100,
+    cashier_id: Any | None = None,
+) -> list[dict[str, Any]]:
+    match: dict[str, Any] = {"daily_import_id": {"$type": "string", "$ne": ""}}
+    if cashier_id is not None:
+        match["cashier_id"] = cashier_id
     return [
-        {"$match": {"daily_import_id": {"$type": "string", "$ne": ""}}},
+        {"$match": match},
         {
             "$group": {
                 "_id": "$daily_import_id",

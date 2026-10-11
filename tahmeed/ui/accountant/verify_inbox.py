@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 from bson import ObjectId
@@ -53,7 +53,11 @@ _ROW_H     = 28
 
 _SCROLL_CHUNK      = 50
 _SELECT_ALL_CHUNK  = 500
-_DATE_OPTS         = ["All Dates", "Today", "Last 7 Days", "Last 30 Days", "This Month"]
+
+# Date-filter tokens stored on the combo's itemData.
+_DATE_ALL        = "all"
+_DATE_TODAY      = "today"
+_DATE_YESTERDAY  = "yesterday"
 
 _RECEIPT_DISPLAY: Dict[str, str] = {
     "pending":  "Pending",
@@ -84,17 +88,41 @@ _NCOLS     = 12
 _COL_WIDTHS = [32, 44, 80, 95, 90, 200, 90, 115, 90, 130, 80, 80]
 
 
-def _resolve_date_filter(label: str) -> Tuple[Optional[datetime], Optional[datetime]]:
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    if label == "Today":
-        return today, today.replace(hour=23, minute=59, second=59)
-    if label == "Last 7 Days":
-        return today - timedelta(days=7), today.replace(hour=23, minute=59, second=59)
-    if label == "Last 30 Days":
-        return today - timedelta(days=30), today.replace(hour=23, minute=59, second=59)
-    if label == "This Month":
-        return today.replace(day=1), today.replace(hour=23, minute=59, second=59)
-    return None, None
+def _day_bounds(day: date) -> Tuple[datetime, datetime]:
+    start = datetime(day.year, day.month, day.day)
+    end = start.replace(hour=23, minute=59, second=59)
+    return start, end
+
+
+def _resolve_date_filter(
+    token: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """Map a date-combo token to inclusive ``date`` field bounds.
+
+    Tokens:
+      - ``all`` / empty → no filter (merge all days)
+      - ``today`` / ``yesterday`` → calendar shortcuts (UTC date)
+      - ``YYYY-MM-DD`` → one expense/register day
+    """
+    key = (token or _DATE_ALL).strip().lower()
+    if not key or key == _DATE_ALL:
+        return None, None
+    clock = now or datetime.utcnow()
+    today = clock.date() if isinstance(clock, datetime) else date.today()
+    if key == _DATE_TODAY:
+        return _day_bounds(today)
+    if key == _DATE_YESTERDAY:
+        return _day_bounds(today - timedelta(days=1))
+    try:
+        return _day_bounds(date.fromisoformat(key[:10]))
+    except ValueError:
+        return None, None
+
+
+def _format_day_label(day: date) -> str:
+    return day.strftime("%d %b %Y")
 
 
 # ── Primitive helpers ──────────────────────────────────────────────────────────
@@ -140,7 +168,8 @@ def _btn(text: str, icon: str = "", primary: bool = True,
 
 
 def _input_ss() -> str:
-    return (
+    from tahmeed.ui.widgets.combo_styles import with_combo_popup
+    return with_combo_popup(
         f"QLineEdit,QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
         f"background:{_WHITE};color:{_T1};font-size:12px;"
         "font-family:'Segoe UI';padding:0 8px;"
@@ -335,11 +364,10 @@ class _FilterBar(QFrame):
         hl.addWidget(self._cashier_cb)
 
         self._date_cb = QComboBox()
-        for opt in _DATE_OPTS:
-            self._date_cb.addItem(opt)
-        self._date_cb.setFixedWidth(110)
+        self._date_cb.setFixedWidth(140)
         self._date_cb.setStyleSheet(_input_ss())
-        self._date_cb.currentTextChanged.connect(self.filter_changed)
+        self._date_cb.currentIndexChanged.connect(self.filter_changed)
+        self._rebuild_date_options([])
         hl.addWidget(self._date_cb)
 
         clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
@@ -437,6 +465,41 @@ class _FilterBar(QFrame):
         self._cashier_cb.setCurrentIndex(max(0, idx))
         self._cashier_cb.blockSignals(False)
 
+    def populate_available_dates(self, days: List[date]) -> None:
+        """Refresh day picker: All / Today / Yesterday + distinct queue days."""
+        self._rebuild_date_options(days)
+
+    def _rebuild_date_options(self, days: List[date]) -> None:
+        cur = self._date_cb.currentData()
+        if cur is None:
+            cur = _DATE_ALL
+        self._date_cb.blockSignals(True)
+        self._date_cb.clear()
+        self._date_cb.addItem("All Dates", _DATE_ALL)
+        self._date_cb.addItem("Today", _DATE_TODAY)
+        self._date_cb.addItem("Yesterday", _DATE_YESTERDAY)
+
+        today = datetime.utcnow().date()
+        yesterday = today - timedelta(days=1)
+        extras = [d for d in days if d not in (today, yesterday)]
+        if extras:
+            self._date_cb.insertSeparator(self._date_cb.count())
+            for day in extras:
+                self._date_cb.addItem(_format_day_label(day), day.isoformat())
+
+        idx = self._date_cb.findData(cur)
+        # Keep a previously picked calendar day even if it left the queue list.
+        if idx < 0 and isinstance(cur, str) and len(cur) == 10 and cur[4] == "-":
+            try:
+                day = date.fromisoformat(cur)
+            except ValueError:
+                day = None
+            if day is not None:
+                self._date_cb.addItem(_format_day_label(day), day.isoformat())
+                idx = self._date_cb.findData(cur)
+        self._date_cb.setCurrentIndex(max(0, idx))
+        self._date_cb.blockSignals(False)
+
     def set_bulk_enabled(self, enabled: bool) -> None:
         self._approve_btn.setEnabled(enabled)
         self._reject_btn.setEnabled(enabled)
@@ -451,16 +514,33 @@ class _FilterBar(QFrame):
             self._confirm_delete_btn.setVisible(visible)
             self._restore_btn.setVisible(visible)
             return
+        if self._bulk_mode == "restore":
+            self._approve_btn.setVisible(visible)
+            self._reject_btn.setVisible(visible)
+            self._confirm_delete_btn.setVisible(False)
+            self._restore_btn.setVisible(False)
+            return
         self._approve_btn.setVisible(visible)
         self._reject_btn.setVisible(visible)
         self._confirm_delete_btn.setVisible(False)
         self._restore_btn.setVisible(False)
 
     def set_bulk_mode(self, mode: str) -> None:
-        """Switch bulk actions for tab: new/edited/issues vs rejected vs deleted."""
+        """Switch bulk actions for tab: new/edited/issues vs rejected vs deleted/restore."""
         self._bulk_mode = mode
         is_deleted = mode == "deleted"
+        is_restore = mode == "restore"
         is_rejected = mode == "rejected"
+        if is_restore:
+            self._approve_btn.setText("Approve Restore")
+            self._reject_btn.setText("Keep in Trash")
+            self._approve_btn.setVisible(True)
+            self._reject_btn.setVisible(True)
+            self._confirm_delete_btn.setVisible(False)
+            self._restore_btn.setVisible(False)
+            return
+        self._approve_btn.setText("Approve Selected")
+        self._reject_btn.setText("Reject Selected")
         self._approve_btn.setVisible(not is_deleted and not is_rejected)
         self._reject_btn.setVisible(not is_deleted and not is_rejected)
         self._confirm_delete_btn.setVisible(is_deleted)
@@ -483,7 +563,14 @@ class _FilterBar(QFrame):
         return self._cashier_cb.currentData()
 
     def date_filter(self) -> Tuple[Optional[datetime], Optional[datetime]]:
-        return _resolve_date_filter(self._date_cb.currentText())
+        token = self._date_cb.currentData()
+        if token is None:
+            token = _DATE_ALL
+        return _resolve_date_filter(str(token))
+
+    def date_token(self) -> str:
+        token = self._date_cb.currentData()
+        return str(token) if token is not None else _DATE_ALL
 
     def clear_filters(self) -> None:
         """Reset search, multi-combos, truck, cashier, and date to defaults."""
@@ -537,6 +624,8 @@ class _ActionPanel(QFrame):
     returned  = Signal(object)       # tx._id — return rejected entry to inbox
     deletion_confirmed = Signal(object)  # tx._id
     deletion_restored = Signal(object)   # tx._id
+    restore_confirmed = Signal(object)   # tx._id — approve cashier restore
+    restore_rejected = Signal(object)    # tx._id — keep in trash
     dismissed = Signal()
 
     def __init__(self, parent=None) -> None:
@@ -646,19 +735,34 @@ class _ActionPanel(QFrame):
         vl.addWidget(ctrl)
 
     def set_mode(self, mode: str) -> None:
-        """Switch panel between 'new', 'edited', 'rejected', and 'deleted' modes."""
+        """Switch panel between 'new', 'edited', 'rejected', 'deleted', 'restore'."""
         self._mode = mode
         is_rejected = mode == "rejected"
         is_deleted = mode == "deleted"
-        self._save_btn.setVisible(not is_rejected and not is_deleted)
-        self._approve_btn.setVisible(not is_rejected and not is_deleted)
-        self._reject_btn.setVisible(not is_rejected and not is_deleted)
+        is_restore = mode == "restore"
+        locked = is_deleted or is_restore
+        self._save_btn.setVisible(not is_rejected and not locked)
+        if is_restore:
+            self._approve_btn.setText("Approve Restore")
+            self._reject_btn.setText("Keep in Trash")
+            self._approve_btn.setVisible(True)
+            self._reject_btn.setVisible(True)
+        else:
+            self._approve_btn.setText("Approve")
+            self._reject_btn.setText("Reject")
+            self._approve_btn.setVisible(not is_rejected and not is_deleted)
+            self._reject_btn.setVisible(not is_rejected and not is_deleted)
         self._return_btn.setVisible(is_rejected)
         self._confirm_delete_btn.setVisible(is_deleted)
         self._restore_btn.setVisible(is_deleted)
-        self._cat_combo.setEnabled(not is_deleted)
-        self._notes.setEnabled(not is_deleted)
-        if is_deleted:
+        self._cat_combo.setEnabled(not locked)
+        self._notes.setEnabled(not locked)
+        if is_restore:
+            self._notes_lbl.setText("RESTORE REQUEST")
+            self._notes.setPlaceholderText(
+                "Cashier asked to restore this trashed expense to Master."
+            )
+        elif is_deleted:
             self._notes_lbl.setText("DELETION REQUEST")
             self._notes.setPlaceholderText("Cashier requested permanent removal of this approved entry.")
         elif is_rejected:
@@ -691,7 +795,7 @@ class _ActionPanel(QFrame):
             missing.append("Item")
         if not (tx.payee or "").strip():
             missing.append("Payee")
-        if not missing or self._mode in ("rejected", "deleted"):
+        if not missing or self._mode in ("rejected", "deleted", "restore"):
             self._mapping_warn.hide()
             self._mapping_warn.clear()
             return
@@ -729,7 +833,17 @@ class _ActionPanel(QFrame):
         else:
             self._cat_combo.setCurrentIndex(-1)
         self._cat_combo.blockSignals(False)
-        if self._mode == "deleted":
+        if self._mode == "restore":
+            requester = cashier_name or "—"
+            when = (
+                _fmt_date(tx.restore_requested_at)
+                if tx.restore_requested_at else "—"
+            )
+            self._notes.setPlainText(
+                f"Restore requested by {requester} on {when}.\n"
+                "Approve Restore returns it to Master; Keep in Trash leaves it deleted."
+            )
+        elif self._mode == "deleted":
             requester = cashier_name or "—"
             when = _fmt_date(tx.deletion_requested_at) if tx.deletion_requested_at else "—"
             self._notes.setPlainText(
@@ -742,6 +856,9 @@ class _ActionPanel(QFrame):
     def _on_approve(self) -> None:
         if not self._tx:
             return
+        if self._mode == "restore":
+            self.restore_confirmed.emit(self._tx._id)
+            return
         cat = self._cat_combo.currentText().strip()
         if not self._category_user_selected and self._needs_item(self._tx):
             cat = ""
@@ -749,6 +866,9 @@ class _ActionPanel(QFrame):
 
     def _on_reject(self) -> None:
         if not self._tx:
+            return
+        if self._mode == "restore":
+            self.restore_rejected.emit(self._tx._id)
             return
         note = self._notes.toPlainText().strip()
         if not note:
@@ -790,9 +910,9 @@ class _ActionPanel(QFrame):
 # ── Sub-tab bar (New | Edited | Rejected) ────────────────────────────────────
 
 class _SubTabBar(QFrame):
-    """Segmented New | Edited | Rejected | Issues | Deleted switcher with live count badges."""
+    """New | Edited | Rejected | Issues | Deleted | Restore switcher with badges."""
 
-    tab_changed = Signal(int)   # 0 = New, 1 = Edited, 2 = Rejected, 3 = Issues, 4 = Deleted
+    tab_changed = Signal(int)   # 0 New … 4 Deleted, 5 Restore
 
     _TAB_SS = (
         "QPushButton{background:transparent;border:none;"
@@ -825,7 +945,7 @@ class _SubTabBar(QFrame):
             f"QFrame{{background:{_WHITE};border-bottom:1px solid {_BORDER};}}"
         )
         self._current = 0
-        self._labels = ["New", "Edited", "Rejected", "Issues", "Deleted"]
+        self._labels = ["New", "Edited", "Rejected", "Issues", "Deleted", "Restore"]
 
         hl = QHBoxLayout(self)
         hl.setContentsMargins(20, 0, 20, 0)
@@ -839,7 +959,7 @@ class _SubTabBar(QFrame):
             btn.setFixedHeight(42)
             if i == 2 or i == 4:
                 ss = self._REJECTED_SS
-            elif i == 3:
+            elif i == 3 or i == 5:
                 ss = self._ISSUES_SS
             else:
                 ss = self._TAB_SS
@@ -868,12 +988,14 @@ class _SubTabBar(QFrame):
         rejected_count: int = 0,
         issues_count: int = 0,
         deleted_count: int = 0,
+        restore_count: int = 0,
     ) -> None:
         self._buttons[0].setText(f"New ({new_count})")
         self._buttons[1].setText(f"Edited ({edited_count})")
         self._buttons[2].setText(f"Rejected ({rejected_count})")
         self._buttons[3].setText(f"Issues ({issues_count})")
         self._buttons[4].setText(f"Deleted ({deleted_count})")
+        self._buttons[5].setText(f"Restore ({restore_count})")
 
 
 # ── Main widget ────────────────────────────────────────────────────────────────
@@ -1005,6 +1127,8 @@ class VerifyInboxWidget(QWidget):
         self._panel.returned.connect(self._on_returned)
         self._panel.deletion_confirmed.connect(self._on_deletion_confirmed)
         self._panel.deletion_restored.connect(self._on_deletion_restored)
+        self._panel.restore_confirmed.connect(self._on_restore_confirmed)
+        self._panel.restore_rejected.connect(self._on_restore_rejected)
         self._panel.dismissed.connect(self._panel.hide)
         cl.addWidget(self._panel)
 
@@ -1148,6 +1272,8 @@ class VerifyInboxWidget(QWidget):
             if hide_panel:
                 self._panel.hide()
             if reload:
+                # Refresh day picker so emptied days drop out of the list.
+                self._filters_tab = -1
                 self._reset_and_load()
             if error:
                 QMessageBox.critical(self, error_title, error)
@@ -1181,6 +1307,8 @@ class VerifyInboxWidget(QWidget):
             mode = "edited"
         elif idx == 4:
             mode = "deleted"
+        elif idx == 5:
+            mode = "restore"
         else:
             mode = "new"
         self._panel.set_mode(mode)
@@ -1200,6 +1328,8 @@ class VerifyInboxWidget(QWidget):
                 item.setText("ISSUE")
             elif tab == 4:
                 item.setText("REQUESTED")
+            elif tab == 5:
+                item.setText("RESTORE")
             else:
                 item.setText("APP BY")
 
@@ -1223,6 +1353,11 @@ class VerifyInboxWidget(QWidget):
             descs = await get_rejected_descriptions(items=items or None)
         elif self._current_tab == 4:
             descs = await get_deletion_requested_descriptions(items=items or None)
+        elif self._current_tab == 5:
+            from tahmeed.services.accountant_service import (
+                get_restore_requested_descriptions,
+            )
+            descs = await get_restore_requested_descriptions(items=items or None)
         else:
             descs = await get_unverified_descriptions(items=items or None)
         self._filter_bar.populate_descriptions(descs, emit=False)
@@ -1239,6 +1374,11 @@ class VerifyInboxWidget(QWidget):
             items = await get_rejected_items(descriptions=descs or None)
         elif self._current_tab == 4:
             items = await get_deletion_requested_items(descriptions=descs or None)
+        elif self._current_tab == 5:
+            from tahmeed.services.accountant_service import (
+                get_restore_requested_items,
+            )
+            items = await get_restore_requested_items(descriptions=descs or None)
         else:
             items = await get_unverified_items(descriptions=descs or None)
         self._filter_bar.populate_items(items, emit=False)
@@ -1413,6 +1553,27 @@ class VerifyInboxWidget(QWidget):
 
     # ── Data load ───────────────────────────────────────────────────────────────
 
+    async def _fetch_available_dates(self, tab: int) -> List[date]:
+        """Distinct expense days for the active Verify sub-tab."""
+        from tahmeed.services.accountant_service import (
+            get_unverified_available_dates,
+            get_rejected_available_dates,
+            get_deletion_requested_available_dates,
+            get_restore_requested_available_dates,
+        )
+        if tab == 1:
+            return await get_unverified_available_dates(edited=True)
+        if tab == 2:
+            return await get_rejected_available_dates()
+        if tab == 3:
+            from tahmeed.services.daily_import_service import get_issue_available_dates
+            return await get_issue_available_dates()
+        if tab == 4:
+            return await get_deletion_requested_available_dates()
+        if tab == 5:
+            return await get_restore_requested_available_dates()
+        return await get_unverified_available_dates(edited=False)
+
     async def _load_filter_options(self, tab: int) -> Dict:
         from tahmeed.services.accountant_service import (
             get_unverified_trucks, get_unverified_cashier_ids,
@@ -1435,28 +1596,53 @@ class VerifyInboxWidget(QWidget):
             return await get_payment_target_categories()
 
         if tab == 2:
-            cats, trucks, cashier_ids, items, descs = await asyncio.gather(
+            cats, trucks, cashier_ids, items, descs, days = await asyncio.gather(
                 _cats(),
                 get_rejected_trucks(),
                 get_rejected_cashier_ids(),
                 get_rejected_items(descriptions=selected_descs or None),
                 get_rejected_descriptions(items=selected_items or None),
+                self._fetch_available_dates(tab),
             )
         elif tab == 4:
-            cats, trucks, cashier_ids, items, descs = await asyncio.gather(
+            cats, trucks, cashier_ids, items, descs, days = await asyncio.gather(
                 _cats(),
                 get_deletion_requested_trucks(),
                 get_deletion_requested_cashier_ids(),
                 get_deletion_requested_items(descriptions=selected_descs or None),
                 get_deletion_requested_descriptions(items=selected_items or None),
+                self._fetch_available_dates(tab),
             )
-        else:
-            cats, trucks, cashier_ids, items, descs = await asyncio.gather(
+        elif tab == 5:
+            from tahmeed.services.accountant_service import (
+                get_restore_requested_trucks, get_restore_requested_cashier_ids,
+                get_restore_requested_items, get_restore_requested_descriptions,
+            )
+            cats, trucks, cashier_ids, items, descs, days = await asyncio.gather(
+                _cats(),
+                get_restore_requested_trucks(),
+                get_restore_requested_cashier_ids(),
+                get_restore_requested_items(descriptions=selected_descs or None),
+                get_restore_requested_descriptions(items=selected_items or None),
+                self._fetch_available_dates(tab),
+            )
+        elif tab == 3:
+            cats, trucks, cashier_ids, items, descs, days = await asyncio.gather(
                 _cats(),
                 get_unverified_trucks(),
                 get_unverified_cashier_ids(),
                 get_unverified_items(descriptions=selected_descs or None),
                 get_unverified_descriptions(items=selected_items or None),
+                self._fetch_available_dates(tab),
+            )
+        else:
+            cats, trucks, cashier_ids, items, descs, days = await asyncio.gather(
+                _cats(),
+                get_unverified_trucks(),
+                get_unverified_cashier_ids(),
+                get_unverified_items(descriptions=selected_descs or None),
+                get_unverified_descriptions(items=selected_items or None),
+                self._fetch_available_dates(tab),
             )
         self._categories = [c.name for c in cats]
         self._category_objects = cats
@@ -1464,6 +1650,7 @@ class VerifyInboxWidget(QWidget):
         self._filter_bar.populate_trucks(trucks)
         self._filter_bar.populate_items(items)
         self._filter_bar.populate_descriptions(descs)
+        self._filter_bar.populate_available_dates(days)
         clist = sorted(
             [(cname_map.get(ci, "Unknown cashier"), ci) for ci in cashier_ids],
             key=lambda x: x[0],
@@ -1496,38 +1683,46 @@ class VerifyInboxWidget(QWidget):
             return await get_deletion_requested_filtered(
                 **kw, limit=limit, skip=skip,
             )
+        if tab == 5:
+            from tahmeed.services.accountant_service import (
+                get_restore_requested_filtered,
+            )
+            return await get_restore_requested_filtered(
+                **kw, limit=limit, skip=skip,
+            )
         return await get_unverified_filtered(
             **kw, limit=limit, skip=skip, edited=False,
         )
 
-    async def _fetch_counts(self, kw: dict) -> Tuple[int, int, int, int, int, int]:
+    async def _fetch_counts(self, kw: dict) -> Tuple[int, int, int, int, int, int, int]:
         from tahmeed.services.accountant_service import (
             count_unverified_filtered, count_edited_transactions,
             count_rejected_transactions, count_deletion_requested_filtered,
-            get_pending_count,
+            count_restore_requested_filtered, get_pending_count,
         )
         from tahmeed.services.daily_import_service import count_issue_transactions
 
         (
             new_count, edited_count, rejected_count, issues_count,
-            deleted_count, pending,
+            deleted_count, restore_count, pending,
         ) = await asyncio.gather(
             count_unverified_filtered(**kw, edited=False),
             count_edited_transactions(**kw),
             count_rejected_transactions(**kw),
             count_issue_transactions(**kw),
             count_deletion_requested_filtered(**kw),
+            count_restore_requested_filtered(**kw),
             get_pending_count(),
         )
         return (
             new_count, edited_count, rejected_count,
-            issues_count, deleted_count, pending,
+            issues_count, deleted_count, restore_count, pending,
         )
 
     async def _load_initial(self, generation: int) -> None:
         self._loading = True
-        tab_labels = ("New", "Edited", "Rejected", "Issues", "Deleted")
-        label = tab_labels[self._current_tab] if 0 <= self._current_tab < 5 else "Verify"
+        tab_labels = ("New", "Edited", "Rejected", "Issues", "Deleted", "Restore")
+        label = tab_labels[self._current_tab] if 0 <= self._current_tab < 6 else "Verify"
         self._loading_overlay.show_loading(f"Loading {label}…")
         self._update_status()
         try:
@@ -1557,7 +1752,7 @@ class VerifyInboxWidget(QWidget):
 
             (
                 new_count, edited_count, rejected_count,
-                issues_count, deleted_count, pending,
+                issues_count, deleted_count, restore_count, pending,
             ) = counts
             if tab == 2:
                 total = rejected_count
@@ -1567,6 +1762,8 @@ class VerifyInboxWidget(QWidget):
                 total = issues_count
             elif tab == 4:
                 total = deleted_count
+            elif tab == 5:
+                total = restore_count
             else:
                 total = new_count
 
@@ -1577,6 +1774,9 @@ class VerifyInboxWidget(QWidget):
             page_ids |= {
                 tx.deletion_requested_by for tx in txs if tx.deletion_requested_by
             }
+            page_ids |= {
+                tx.restore_requested_by for tx in txs if tx.restore_requested_by
+            }
             if page_ids:
                 page_names = await get_cashier_names(list(page_ids))
                 cname_map.update(page_names)
@@ -1584,7 +1784,8 @@ class VerifyInboxWidget(QWidget):
             self._cashier_names = cname_map
             self._total = total
             self._subtabs.set_counts(
-                new_count, edited_count, rejected_count, issues_count, deleted_count,
+                new_count, edited_count, rejected_count,
+                issues_count, deleted_count, restore_count,
             )
             self._fill_table(txs, cname_map, 0, append=False)
             self._loaded = len(txs)
@@ -1637,6 +1838,9 @@ class VerifyInboxWidget(QWidget):
             page_ids |= {
                 tx.deletion_requested_by for tx in txs if tx.deletion_requested_by
             }
+            page_ids |= {
+                tx.restore_requested_by for tx in txs if tx.restore_requested_by
+            }
             cname_map = dict(self._cashier_names)
             if page_ids:
                 page_names = await get_cashier_names(list(page_ids))
@@ -1677,6 +1881,7 @@ class VerifyInboxWidget(QWidget):
                     "No rejected entries." if tab == 2 else
                     "No issue entries (duplicates or mixed dates)." if tab == 3 else
                     "No deletion requests." if tab == 4 else
+                    "No restore requests." if tab == 5 else
                     "No edited transactions match the current filters." if tab == 1 else
                     "No pending transactions match the current filters."
                 )
@@ -1806,6 +2011,20 @@ class VerifyInboxWidget(QWidget):
                     )
                 t.setItem(r, _COL_APP, req_item)
                 row_bg = "#FEF2F2"
+            elif tab == 5:
+                rel = _fmt_relative(tx.restore_requested_at)
+                req_item = _cell(rel or "—", color=_AMBER)
+                requester = (
+                    cnames.get(tx.restore_requested_by, "")
+                    if tx.restore_requested_by else ""
+                )
+                if tx.restore_requested_at:
+                    req_item.setToolTip(
+                        f"Restore requested by {requester or '—'} on "
+                        f"{_fmt_date(tx.restore_requested_at)}"
+                    )
+                t.setItem(r, _COL_APP, req_item)
+                row_bg = "#FFFBEB"
             else:
                 # New tab — same white/slate zebra as Master / Separate Expenses.
                 t.setItem(r, _COL_APP, _cell(tx.approver or "—", color=_T2))
@@ -1865,6 +2084,22 @@ class VerifyInboxWidget(QWidget):
     def _on_deletion_restored(self, tx_id: ObjectId) -> None:
         asyncio.ensure_future(self._do_restore_deletion(tx_id))
 
+    def _on_restore_confirmed(self, tx_id: ObjectId) -> None:
+        if QMessageBox.question(
+            self, "Approve Restore",
+            "Return this expense from Trash to Master Expenses and the day table?",
+            QMessageBox.Yes | QMessageBox.No,
+        ) == QMessageBox.Yes:
+            asyncio.ensure_future(self._do_confirm_restore(tx_id))
+
+    def _on_restore_rejected(self, tx_id: ObjectId) -> None:
+        if QMessageBox.question(
+            self, "Keep in Trash",
+            "Deny this restore request? The expense will stay in Trash.",
+            QMessageBox.Yes | QMessageBox.No,
+        ) == QMessageBox.Yes:
+            asyncio.ensure_future(self._do_reject_restore(tx_id))
+
     def _selected_tx_ids(self) -> List[ObjectId]:
         checked = [
             r for r in range(self._table.rowCount())
@@ -1889,6 +2124,16 @@ class VerifyInboxWidget(QWidget):
         if not tx_rows:
             return
 
+        if self._current_tab == 5:
+            tx_ids = [tx._id for _, tx in tx_rows if tx._id]
+            if QMessageBox.question(
+                self, "Approve Restore",
+                f"Return {len(tx_ids)} expense(s) from Trash to Master?",
+                QMessageBox.Yes | QMessageBox.No,
+            ) == QMessageBox.Yes:
+                asyncio.ensure_future(self._do_bulk_confirm_restores(tx_ids))
+            return
+
         if self._current_tab == 1:
             msg = f"Re-approve {len(tx_rows)} edited transaction(s)?"
             title = "Re-approve Edited"
@@ -1904,6 +2149,14 @@ class VerifyInboxWidget(QWidget):
     def _on_bulk_reject(self) -> None:
         tx_ids = self._selected_tx_ids()
         if not tx_ids:
+            return
+        if self._current_tab == 5:
+            if QMessageBox.question(
+                self, "Keep in Trash",
+                f"Deny restore for {len(tx_ids)} expense(s)? They stay in Trash.",
+                QMessageBox.Yes | QMessageBox.No,
+            ) == QMessageBox.Yes:
+                asyncio.ensure_future(self._do_bulk_reject_restores(tx_ids))
             return
         reason, ok = QInputDialog.getMultiLineText(
             self,
@@ -2295,6 +2548,66 @@ class VerifyInboxWidget(QWidget):
             )
         except Exception as exc:
             self._finish_mutation(error=f"Bulk delete failed: {exc}")
+
+    async def _do_confirm_restore(self, tx_id: ObjectId) -> None:
+        from tahmeed.services.accountant_service import confirm_restore, get_pending_count
+        try:
+            ok = await confirm_restore(tx_id)
+            if not ok:
+                self._finish_mutation(
+                    warning="Could not approve restore — it may have already been updated.",
+                )
+                return
+            count = await get_pending_count()
+            self.badge_updated.emit(count)
+            self._finish_mutation(hide_panel=True, reload=True)
+        except Exception as exc:
+            self._finish_mutation(error=f"Failed to approve restore: {exc}")
+
+    async def _do_reject_restore(self, tx_id: ObjectId) -> None:
+        from tahmeed.services.accountant_service import reject_restore, get_pending_count
+        try:
+            ok = await reject_restore(tx_id)
+            if not ok:
+                self._finish_mutation(
+                    warning="Could not deny restore — it may have already been updated.",
+                )
+                return
+            count = await get_pending_count()
+            self.badge_updated.emit(count)
+            self._finish_mutation(hide_panel=True, reload=True)
+        except Exception as exc:
+            self._finish_mutation(error=f"Failed to deny restore: {exc}")
+
+    async def _do_bulk_confirm_restores(self, tx_ids: List[ObjectId]) -> None:
+        from tahmeed.services.accountant_service import (
+            bulk_confirm_restores, get_pending_count,
+        )
+        try:
+            n = await bulk_confirm_restores(tx_ids)
+            count = await get_pending_count()
+            self.badge_updated.emit(count)
+            self._finish_mutation(
+                info=f"Restored {n} expense(s) to Master.",
+                reload=True,
+            )
+        except Exception as exc:
+            self._finish_mutation(error=f"Bulk restore approve failed: {exc}")
+
+    async def _do_bulk_reject_restores(self, tx_ids: List[ObjectId]) -> None:
+        from tahmeed.services.accountant_service import (
+            bulk_reject_restores, get_pending_count,
+        )
+        try:
+            n = await bulk_reject_restores(tx_ids)
+            count = await get_pending_count()
+            self.badge_updated.emit(count)
+            self._finish_mutation(
+                info=f"Kept {n} expense(s) in Trash.",
+                reload=True,
+            )
+        except Exception as exc:
+            self._finish_mutation(error=f"Bulk restore deny failed: {exc}")
 
     async def _do_bulk_restore_deletions(self, tx_ids: List[ObjectId]) -> None:
         from tahmeed.services.accountant_service import (

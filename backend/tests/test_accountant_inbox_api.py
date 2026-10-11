@@ -219,6 +219,61 @@ def test_inbox_edited_and_badge_counts() -> None:
     assert new_only.json()["total"] == 1
 
 
+def test_inbox_meta_dates_buckets_by_day() -> None:
+    docs = [
+        _submitted(date=datetime(2026, 6, 1, 0, 0), description="Day1a"),
+        _submitted(date=datetime(2026, 6, 1, 12, 0), description="Day1b"),
+        _submitted(
+            date=datetime(2026, 6, 3, 0, 0),
+            edited_after_verification=True,
+            description="Edited day",
+        ),
+        _submitted(date=datetime(2026, 5, 20, 0, 0), description="Older"),
+        _submitted(
+            register_status="draft",
+            date=datetime(2026, 6, 4, 0, 0),
+            description="Draft excluded",
+        ),
+    ]
+    app = _app(FakeTransactions(docs))
+    app.dependency_overrides[current_user] = _manager
+
+    with TestClient(app) as client:
+        all_days = client.get("/v1/accountant/inbox/meta/dates")
+        new_days = client.get(
+            "/v1/accountant/inbox/meta/dates", params={"edited": "false"}
+        )
+        edited_days = client.get(
+            "/v1/accountant/inbox/meta/dates", params={"edited": "true"}
+        )
+        filtered = client.get(
+            "/v1/accountant/inbox",
+            params={
+                "edited": "false",
+                "date_from": "2026-06-01T00:00:00",
+                "date_to": "2026-06-01T23:59:59",
+            },
+        )
+
+    assert all_days.status_code == 200
+    assert [row["date"] for row in all_days.json()["items"]] == [
+        "2026-06-03",
+        "2026-06-01",
+        "2026-05-20",
+    ]
+    assert [row["date"] for row in new_days.json()["items"]] == [
+        "2026-06-01",
+        "2026-05-20",
+    ]
+    assert [row["date"] for row in edited_days.json()["items"]] == ["2026-06-03"]
+    assert filtered.status_code == 200
+    assert filtered.json()["total"] == 2
+    assert {item["description"] for item in filtered.json()["items"]} == {
+        "Day1a",
+        "Day1b",
+    }
+
+
 def test_inbox_meta_and_cashier_names() -> None:
     c1 = ObjectId()
     c2 = ObjectId()
@@ -274,3 +329,27 @@ def test_inbox_requires_manager_role() -> None:
         response = client.get("/v1/accountant/inbox")
 
     assert response.status_code == 403
+
+
+def test_cashier_can_resolve_cashier_names() -> None:
+    c1 = ObjectId()
+    users = FakeUsers(
+        [{"_id": c1, "full_name": "Alice Cashier", "username": "alice"}]
+    )
+    app = _app(FakeTransactions(), users)
+    app.dependency_overrides[current_user] = lambda: {
+        "_id": c1,
+        "username": "alice",
+        "role": "cashier",
+    }
+
+    with TestClient(app) as client:
+        names = client.get(
+            "/v1/accountant/cashier-names",
+            params={"ids": str(c1)},
+        )
+        inbox = client.get("/v1/accountant/inbox")
+
+    assert names.status_code == 200
+    assert names.json()["names"][str(c1)] == "Alice Cashier"
+    assert inbox.status_code == 403

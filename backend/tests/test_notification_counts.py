@@ -10,15 +10,23 @@ from app.main import create_app
 
 
 class FakeTransactions:
-    def __init__(self, count: int = 0, deletion_count: int = 0) -> None:
+    def __init__(
+        self,
+        count: int = 0,
+        deletion_count: int = 0,
+        restore_count: int = 0,
+    ) -> None:
         self.count = count
         self.deletion_count = deletion_count
+        self.restore_count = restore_count
         self.queries: list[dict] = []
 
     async def count_documents(self, query: dict) -> int:
         self.queries.append(query)
         if query.get("deletion_requested") is True:
             return self.deletion_count
+        if query.get("restore_requested") is True:
+            return self.restore_count
         return self.count
 
 
@@ -72,7 +80,8 @@ def test_notification_counts_uses_pending_inbox_predicate(role: str) -> None:
                 {"register_status": {"$exists": False}},
             ],
         },
-        {"deletion_requested": True},
+        {"deletion_requested": True, "trashed": {"$ne": True}},
+        {"trashed": True, "restore_requested": True},
     ]
 
 def test_notification_counts_rejects_cashier() -> None:

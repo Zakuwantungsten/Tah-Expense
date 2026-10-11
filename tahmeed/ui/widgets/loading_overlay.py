@@ -1,13 +1,13 @@
-"""Semi-transparent loading overlay with a single horizontal progress bar."""
+"""Semi-transparent loading overlay with branded horse fade pulse + context text."""
 
 from __future__ import annotations
 
 from typing import Optional
 
 from PySide6.QtCore import Qt, QEvent, QObject
-from PySide6.QtWidgets import (
-    QApplication, QFrame, QLabel, QProgressBar, QVBoxLayout, QWidget,
-)
+from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
+
+from tahmeed.ui.widgets.brand_loader import BrandLoaderPanel
 
 
 class LoadingOverlay(QFrame):
@@ -18,7 +18,7 @@ class LoadingOverlay(QFrame):
         self.setObjectName("loadingOverlay")
         self.setStyleSheet(
             "QFrame#loadingOverlay {"
-            "  background: rgba(244, 246, 248, 0.88);"
+            "  background: rgba(255, 255, 255, 0.55);"
             "  border: none;"
             "}"
         )
@@ -26,30 +26,10 @@ class LoadingOverlay(QFrame):
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        self._message = QLabel(message)
-        self._message.setAlignment(Qt.AlignCenter)
-        self._message.setStyleSheet(
-            "color: #6B7280; font-size: 13px; font-weight: 600;"
-            " font-family:'Segoe UI'; background: transparent;"
-        )
-        layout.addWidget(self._message, alignment=Qt.AlignCenter)
-
-        self._bar = QProgressBar()
-        self._bar.setFixedWidth(220)
-        self._bar.setFixedHeight(10)
-        self._bar.setTextVisible(False)
-        self._bar.setRange(0, 0)  # indeterminate by default
-        self._bar.setStyleSheet(
-            "QProgressBar {"
-            "  background: #E5E7EB; border: none; border-radius: 5px;"
-            "}"
-            "QProgressBar::chunk {"
-            "  background: #0077C5; border-radius: 5px;"
-            "}"
-        )
-        layout.addWidget(self._bar, alignment=Qt.AlignCenter)
+        self._panel = BrandLoaderPanel(self, message, mark_width=160, show_progress=True)
+        layout.addWidget(self._panel, alignment=Qt.AlignCenter)
 
         parent.installEventFilter(self)
 
@@ -71,22 +51,16 @@ class LoadingOverlay(QFrame):
         maximum: Optional[int] = None,
     ) -> None:
         if message:
-            self._message.setText(message)
-        if maximum is not None and maximum > 0:
-            self._bar.setRange(0, maximum)
-            self._bar.setValue(max(0, min(maximum, value or 0)))
-        elif value is not None and self._bar.maximum() > 0:
-            self._bar.setValue(max(0, min(self._bar.maximum(), value)))
-        elif maximum is not None:
-            # Explicit maximum<=0 → indeterminate.
-            self._bar.setRange(0, 0)
-        # message-only: keep current bar mode (fresh overlay starts indeterminate)
+            self._panel.set_message(message)
+        self._panel.set_progress(value=value, maximum=maximum)
         self._sync_geometry()
         self.show()
         self.raise_()
+        self._panel.start()
         from tahmeed.ui.async_utils import safe_process_events
         safe_process_events()
 
     def hide_loading(self) -> None:
-        self._bar.setRange(0, 0)
+        self._panel.reset_progress()
+        self._panel.stop()
         self.hide()

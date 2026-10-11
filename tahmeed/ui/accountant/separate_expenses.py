@@ -157,7 +157,8 @@ def _btn(text: str, icon: str = "", primary: bool = True,
 
 
 def _input_ss() -> str:
-    return (
+    from tahmeed.ui.widgets.combo_styles import with_combo_popup
+    return with_combo_popup(
         f"QLineEdit,QComboBox,QDateEdit{{border:1px solid {_BORDER};border-radius:5px;"
         f"background:{_WHITE};color:{_T1};font-size:12px;"
         f"font-family:'Segoe UI';padding:0 8px;"
@@ -353,6 +354,22 @@ def _write_feed_xlsx(
     wb.save(path)
 
 
+
+def _show_widget_loading(widget: QWidget, message: str) -> None:
+    """Show branded overlay on any separate-expense tab/browse widget."""
+    overlay = getattr(widget, "_loading_overlay", None)
+    if not isinstance(overlay, LoadingOverlay):
+        overlay = LoadingOverlay(widget, message)
+        widget._loading_overlay = overlay  # type: ignore[attr-defined]
+    overlay.show_loading(message)
+
+
+def _hide_widget_loading(widget: QWidget) -> None:
+    overlay = getattr(widget, "_loading_overlay", None)
+    if isinstance(overlay, LoadingOverlay):
+        overlay.hide_loading()
+
+
 class _FeedExportMixin:
     """Filtered / All Excel export for Separate Expenses feed tables."""
 
@@ -360,6 +377,15 @@ class _FeedExportMixin:
     _export_filename = "export"
     _export_headers: List[str] = []
     _export_row_fn: Callable[[dict], list] = staticmethod(lambda rec: list(rec.values()))
+
+
+    def _begin_feed_loading(self, message: str | None = None) -> None:
+        title = getattr(self, "_export_title", None) or "records"
+        msg = message or f"Loading {title}…"
+        _show_widget_loading(self, msg)  # type: ignore[arg-type]
+
+    def _end_feed_loading(self) -> None:
+        _hide_widget_loading(self)  # type: ignore[arg-type]
 
     def _on_export_filtered(self) -> None:
         if getattr(self, "_export_in_flight", False):
@@ -1653,30 +1679,34 @@ class _TollAllEntries(_FeedExportMixin, QWidget):
         if self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
-        from tahmeed.services import accountant_service as svc
-        month = self._effective_month()
         try:
-            totals, recs, total = await asyncio.gather(
-                svc.get_toll_plaza_all_totals(self._search, self._year, month, **self._date_kw()),
-                svc.get_toll_plaza_all_records(
-                    self._search, self._year, month,
-                    limit=_TOLL_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
-                ),
-                svc.count_toll_plaza_all_records(self._search, self._year, month, **self._date_kw()),
-            )
-        except Exception:
-            self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
+            from tahmeed.services import accountant_service as svc
+            month = self._effective_month()
+            try:
+                totals, recs, total = await asyncio.gather(
+                    svc.get_toll_plaza_all_totals(self._search, self._year, month, **self._date_kw()),
+                    svc.get_toll_plaza_all_records(
+                        self._search, self._year, month,
+                        limit=_TOLL_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
+                    ),
+                    svc.count_toll_plaza_all_records(self._search, self._year, month, **self._date_kw()),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
 
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("zmw",   float(totals.get("total_zmw", 0)), "ZMW ")
-        self._totals.set_total("count", int(totals.get("count", 0)), "")
-        self._loading = False
-        self._update_status()
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("zmw",   float(totals.get("total_zmw", 0)), "ZMW ")
+            self._totals.set_total("count", int(totals.get("count", 0)), "")
+            self._update_status()
+
+        finally:
+            self._loading = False
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         if self._loading or self._loaded >= self._total:
@@ -1825,9 +1855,14 @@ class _TollUploadBrowse(QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
-        uploads = await svc.get_toll_plaza_uploads()
-        self._uploads = uploads
-        self._fill(uploads)
+        _show_widget_loading(self, "Loading toll plaza uploads…")
+        try:
+            uploads = await svc.get_toll_plaza_uploads()
+            self._uploads = uploads
+            self._fill(uploads)
+
+        finally:
+            _hide_widget_loading(self)
 
     def _fill(self, uploads: List[dict]) -> None:
         t = self._table
@@ -2021,25 +2056,29 @@ class _TollUploadDetail(_FeedExportMixin, QWidget):
         if not self._upload_id or self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
         try:
-            recs, total = await asyncio.gather(
-                svc.get_toll_plaza_upload_records(
-                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
-                    **sort_kw(self._sort_state),
-                ),
-                svc.count_toll_plaza_upload_records(self._upload_id, self._search),
-            )
-        except Exception:
+            try:
+                recs, total = await asyncio.gather(
+                    svc.get_toll_plaza_upload_records(
+                        self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                        **sort_kw(self._sort_state),
+                    ),
+                    svc.count_toll_plaza_upload_records(self._upload_id, self._search),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("count", total, "")
+            self._update_status()
+
+        finally:
             self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("count", total, "")
-        self._loading = False
-        self._update_status()
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -2465,30 +2504,34 @@ class _ParkingCongoAllEntries(_FeedExportMixin, QWidget):
         if self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
-        from tahmeed.services import accountant_service as svc
-        month = self._effective_month()
         try:
-            totals, recs, total = await asyncio.gather(
-                svc.get_parking_congo_all_totals(self._search, self._year, month, **self._date_kw()),
-                svc.get_parking_congo_all_records(
-                    self._search, self._year, month,
-                    limit=_PCONGO_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
-                ),
-                svc.count_parking_congo_all_records(self._search, self._year, month, **self._date_kw()),
-            )
-        except Exception:
-            self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
+            from tahmeed.services import accountant_service as svc
+            month = self._effective_month()
+            try:
+                totals, recs, total = await asyncio.gather(
+                    svc.get_parking_congo_all_totals(self._search, self._year, month, **self._date_kw()),
+                    svc.get_parking_congo_all_records(
+                        self._search, self._year, month,
+                        limit=_PCONGO_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
+                    ),
+                    svc.count_parking_congo_all_records(self._search, self._year, month, **self._date_kw()),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
 
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("amount", float(totals.get("amount", 0)), "")
-        self._totals.set_total("count",  int(totals.get("count", 0)), "")
-        self._loading = False
-        self._update_status()
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("amount", float(totals.get("amount", 0)), "")
+            self._totals.set_total("count",  int(totals.get("count", 0)), "")
+            self._update_status()
+
+        finally:
+            self._loading = False
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         if self._loading or self._loaded >= self._total:
@@ -2618,9 +2661,14 @@ class _ParkingCongoUploadBrowse(QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
-        uploads = await svc.get_parking_congo_uploads()
-        self._uploads = uploads
-        self._fill(uploads)
+        _show_widget_loading(self, "Loading parking Congo uploads…")
+        try:
+            uploads = await svc.get_parking_congo_uploads()
+            self._uploads = uploads
+            self._fill(uploads)
+
+        finally:
+            _hide_widget_loading(self)
 
     def _fill(self, uploads: List[dict]) -> None:
         t = self._table
@@ -2781,18 +2829,23 @@ class _ParkingCongoUploadDetail(_FeedExportMixin, QWidget):
         from tahmeed.services import accountant_service as svc
         if not self._upload_id:
             return
-        skip = (self._page - 1) * self._page_size
-        recs, total = await asyncio.gather(
-            svc.get_parking_congo_upload_records(
-                self._upload_id, self._search, self._page_size, skip,
-                **sort_kw(self._sort_state),
-            ),
-            svc.count_parking_congo_upload_records(self._upload_id, self._search),
-        )
-        self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
-        self._totals.set_total("count", total, "")
+        self._begin_feed_loading("Loading upload records…")
+        try:
+            skip = (self._page - 1) * self._page_size
+            recs, total = await asyncio.gather(
+                svc.get_parking_congo_upload_records(
+                    self._upload_id, self._search, self._page_size, skip,
+                    **sort_kw(self._sort_state),
+                ),
+                svc.count_parking_congo_upload_records(self._upload_id, self._search),
+            )
+            self._total = total
+            self._fill_table(recs)
+            self._pager.set_total(total, self._page_size, self._page)
+            self._totals.set_total("count", total, "")
+
+        finally:
+            self._end_feed_loading()
 
     def _fill_table(self, recs: List[dict]) -> None:
         t = self._table
@@ -2930,28 +2983,32 @@ class _ParkingCongoDeposited(_FeedExportMixin, QWidget):
         if self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
-        from tahmeed.services import accountant_service as svc
         try:
-            totals, recs, total = await asyncio.gather(
-                svc.get_parking_congo_deposit_totals(self._search, **self._date_kw()),
-                svc.get_parking_congo_deposits(
-                    self._search, limit=_PCONGO_SCROLL_CHUNK, skip=0, **self._date_kw(),
-                ),
-                svc.count_parking_congo_deposits(self._search, **self._date_kw()),
-            )
-        except Exception:
-            self._loading = False
-            self._status_lbl.setText("Failed to load deposits.")
-            return
+            from tahmeed.services import accountant_service as svc
+            try:
+                totals, recs, total = await asyncio.gather(
+                    svc.get_parking_congo_deposit_totals(self._search, **self._date_kw()),
+                    svc.get_parking_congo_deposits(
+                        self._search, limit=_PCONGO_SCROLL_CHUNK, skip=0, **self._date_kw(),
+                    ),
+                    svc.count_parking_congo_deposits(self._search, **self._date_kw()),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load deposits.")
+                return
 
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("amount", float(totals.get("amount", 0)), "")
-        self._totals.set_total("count",  int(totals.get("count", 0)), "")
-        self._loading = False
-        self._update_status()
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("amount", float(totals.get("amount", 0)), "")
+            self._totals.set_total("count",  int(totals.get("count", 0)), "")
+            self._update_status()
+
+        finally:
+            self._loading = False
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         if self._loading or self._loaded >= self._total:
@@ -3548,41 +3605,45 @@ class _CongoEntriesBase(_FeedExportMixin, QWidget):
         if self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
-        from tahmeed.services import accountant_service as svc
-        month = self._effective_month()
         try:
-            totals, recs, total = await asyncio.gather(
-                svc.get_congo_all_totals(
-                    self._search, self._year, month,
-                    **self._amount_filter_kw(), **self._date_kw(),
-                ),
-                svc.get_congo_all_records(
-                    self._search, self._year, month,
-                    **self._amount_filter_kw(),
-                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
-                ),
-                svc.count_congo_all_records(
-                    self._search, self._year, month,
-                    **self._amount_filter_kw(), **self._date_kw(),
-                ),
-            )
-        except Exception:
-            self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
+            from tahmeed.services import accountant_service as svc
+            month = self._effective_month()
+            try:
+                totals, recs, total = await asyncio.gather(
+                    svc.get_congo_all_totals(
+                        self._search, self._year, month,
+                        **self._amount_filter_kw(), **self._date_kw(),
+                    ),
+                    svc.get_congo_all_records(
+                        self._search, self._year, month,
+                        **self._amount_filter_kw(),
+                        limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
+                    ),
+                    svc.count_congo_all_records(
+                        self._search, self._year, month,
+                        **self._amount_filter_kw(), **self._date_kw(),
+                    ),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
 
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        _set_congo_summary(
-            self._in_lbl, self._out_lbl, self._bal_lbl,
-            float(totals.get("money_in", 0)),
-            float(totals.get("money_out", 0)),
-        )
-        self._totals.set_total("count", int(totals.get("count", 0)), "")
-        self._loading = False
-        self._update_status()
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            _set_congo_summary(
+                self._in_lbl, self._out_lbl, self._bal_lbl,
+                float(totals.get("money_in", 0)),
+                float(totals.get("money_out", 0)),
+            )
+            self._totals.set_total("count", int(totals.get("count", 0)), "")
+            self._update_status()
+
+        finally:
+            self._loading = False
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         if self._loading or self._loaded >= self._total:
@@ -3932,9 +3993,14 @@ class _CongoExpUploadBrowse(QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
-        uploads = await svc.get_congo_uploads()
-        self._uploads = uploads
-        self._fill(uploads)
+        _show_widget_loading(self, "Loading Congo expense uploads…")
+        try:
+            uploads = await svc.get_congo_uploads()
+            self._uploads = uploads
+            self._fill(uploads)
+
+        finally:
+            _hide_widget_loading(self)
 
     def _fill(self, uploads: List[dict]) -> None:
         t = self._table
@@ -4139,25 +4205,29 @@ class _CongoExpUploadDetail(_FeedExportMixin, QWidget):
         if not self._upload_id or self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
         try:
-            recs, total = await asyncio.gather(
-                svc.get_congo_upload_records(
-                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
-                    **sort_kw(self._sort_state),
-                ),
-                svc.count_congo_upload_records(self._upload_id, self._search),
-            )
-        except Exception:
+            try:
+                recs, total = await asyncio.gather(
+                    svc.get_congo_upload_records(
+                        self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                        **sort_kw(self._sort_state),
+                    ),
+                    svc.count_congo_upload_records(self._upload_id, self._search),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("count", total, "")
+            self._update_status()
+
+        finally:
             self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("count", total, "")
-        self._loading = False
-        self._update_status()
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -5267,41 +5337,45 @@ class _KimviEntriesBase(_FeedExportMixin, QWidget):
         if self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
-        from tahmeed.services import accountant_service as svc
-        month = self._effective_month()
         try:
-            totals, recs, total = await asyncio.gather(
-                svc.get_kimvi_all_totals(
-                    self._search, self._year, month,
-                    **self._amount_filter_kw(), **self._date_kw(),
-                ),
-                svc.get_kimvi_all_records(
-                    self._search, self._year, month,
-                    **self._amount_filter_kw(),
-                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
-                ),
-                svc.count_kimvi_all_records(
-                    self._search, self._year, month,
-                    **self._amount_filter_kw(), **self._date_kw(),
-                ),
-            )
-        except Exception:
-            self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
+            from tahmeed.services import accountant_service as svc
+            month = self._effective_month()
+            try:
+                totals, recs, total = await asyncio.gather(
+                    svc.get_kimvi_all_totals(
+                        self._search, self._year, month,
+                        **self._amount_filter_kw(), **self._date_kw(),
+                    ),
+                    svc.get_kimvi_all_records(
+                        self._search, self._year, month,
+                        **self._amount_filter_kw(),
+                        limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
+                    ),
+                    svc.count_kimvi_all_records(
+                        self._search, self._year, month,
+                        **self._amount_filter_kw(), **self._date_kw(),
+                    ),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
 
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        _set_congo_summary(
-            self._in_lbl, self._out_lbl, self._bal_lbl,
-            float(totals.get("money_in", 0)),
-            float(totals.get("money_out", 0)),
-        )
-        self._totals.set_total("count", int(totals.get("count", 0)), "")
-        self._loading = False
-        self._update_status()
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            _set_congo_summary(
+                self._in_lbl, self._out_lbl, self._bal_lbl,
+                float(totals.get("money_in", 0)),
+                float(totals.get("money_out", 0)),
+            )
+            self._totals.set_total("count", int(totals.get("count", 0)), "")
+            self._update_status()
+
+        finally:
+            self._loading = False
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         if self._loading or self._loaded >= self._total:
@@ -5455,9 +5529,14 @@ class _KimviUploadBrowse(QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
-        uploads = await svc.get_kimvi_uploads()
-        self._uploads = uploads
-        self._fill(uploads)
+        _show_widget_loading(self, "Loading Ahmed Kimvi uploads…")
+        try:
+            uploads = await svc.get_kimvi_uploads()
+            self._uploads = uploads
+            self._fill(uploads)
+
+        finally:
+            _hide_widget_loading(self)
 
     def _fill(self, uploads: List[dict]) -> None:
         t = self._table
@@ -5663,25 +5742,29 @@ class _KimviUploadDetail(_FeedExportMixin, QWidget):
         if not self._upload_id or self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
         try:
-            recs, total = await asyncio.gather(
-                svc.get_kimvi_upload_records(
-                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
-                    **sort_kw(self._sort_state),
-                ),
-                svc.count_kimvi_upload_records(self._upload_id, self._search),
-            )
-        except Exception:
+            try:
+                recs, total = await asyncio.gather(
+                    svc.get_kimvi_upload_records(
+                        self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                        **sort_kw(self._sort_state),
+                    ),
+                    svc.count_kimvi_upload_records(self._upload_id, self._search),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("count", total, "")
+            self._update_status()
+
+        finally:
             self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("count", total, "")
-        self._loading = False
-        self._update_status()
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -6264,41 +6347,45 @@ class _ZambiaParkingEntriesBase(_FeedExportMixin, QWidget):
         if self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
-        from tahmeed.services import accountant_service as svc
-        month = self._effective_month()
         try:
-            totals, recs, total = await asyncio.gather(
-                svc.get_zambia_parking_all_totals(
-                    self._search, self._year, month,
-                    credit_only=self._credit_only, **self._date_kw(),
-                ),
-                svc.get_zambia_parking_all_records(
-                    self._search, self._year, month,
-                    credit_only=self._credit_only,
-                    limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
-                ),
-                svc.count_zambia_parking_all_records(
-                    self._search, self._year, month,
-                    credit_only=self._credit_only, **self._date_kw(),
-                ),
-            )
-        except Exception:
-            self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
+            from tahmeed.services import accountant_service as svc
+            month = self._effective_month()
+            try:
+                totals, recs, total = await asyncio.gather(
+                    svc.get_zambia_parking_all_totals(
+                        self._search, self._year, month,
+                        credit_only=self._credit_only, **self._date_kw(),
+                    ),
+                    svc.get_zambia_parking_all_records(
+                        self._search, self._year, month,
+                        credit_only=self._credit_only,
+                        limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
+                    ),
+                    svc.count_zambia_parking_all_records(
+                        self._search, self._year, month,
+                        credit_only=self._credit_only, **self._date_kw(),
+                    ),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
 
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        _set_zambia_summary(
-            self._in_lbl, self._out_lbl, self._bal_lbl,
-            float(totals.get("total_credit", 0)),
-            float(totals.get("total_debit", 0)),
-        )
-        self._totals.set_total("count", int(totals.get("count", 0)), "")
-        self._loading = False
-        self._update_status()
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            _set_zambia_summary(
+                self._in_lbl, self._out_lbl, self._bal_lbl,
+                float(totals.get("total_credit", 0)),
+                float(totals.get("total_debit", 0)),
+            )
+            self._totals.set_total("count", int(totals.get("count", 0)), "")
+            self._update_status()
+
+        finally:
+            self._loading = False
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         if self._loading or self._loaded >= self._total:
@@ -6706,9 +6793,14 @@ class _ZambiaParkingUploadBrowse(QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
-        uploads = await svc.get_zambia_parking_uploads()
-        self._uploads = uploads
-        self._fill(uploads)
+        _show_widget_loading(self, "Loading Zambia parking uploads…")
+        try:
+            uploads = await svc.get_zambia_parking_uploads()
+            self._uploads = uploads
+            self._fill(uploads)
+
+        finally:
+            _hide_widget_loading(self)
 
     def _fill(self, uploads: List[dict]) -> None:
         t = self._table
@@ -6911,24 +7003,28 @@ class _ZambiaParkingUploadDetail(_FeedExportMixin, QWidget):
         if not self._upload_id or self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
         try:
-            recs, total = await asyncio.gather(
-                svc.get_zambia_parking_upload_records(
-                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
-                    **sort_kw(self._sort_state),
-                ),
-                svc.count_zambia_parking_upload_records(self._upload_id, self._search),
-            )
-        except Exception:
+            try:
+                recs, total = await asyncio.gather(
+                    svc.get_zambia_parking_upload_records(
+                        self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                        **sort_kw(self._sort_state),
+                    ),
+                    svc.count_zambia_parking_upload_records(self._upload_id, self._search),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._update_status()
+
+        finally:
             self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._loading = False
-        self._update_status()
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -8425,29 +8521,32 @@ class _AfritrackAllEntries(_FeedExportMixin, QWidget):
         if self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
-        from tahmeed.services import accountant_service as svc
-        month = self._effective_month()
         try:
-            totals, recs, total = await asyncio.gather(
-                svc.get_afritrack_all_totals(self._search, self._year, month, **self._date_kw()),
-                svc.get_afritrack_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state)),
-                svc.count_afritrack_all_records(self._search, self._year, month, **self._date_kw()),
-            )
-        except Exception:
-            self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
+            from tahmeed.services import accountant_service as svc
+            month = self._effective_month()
+            try:
+                totals, recs, total = await asyncio.gather(
+                    svc.get_afritrack_all_totals(self._search, self._year, month, **self._date_kw()),
+                    svc.get_afritrack_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state)),
+                    svc.count_afritrack_all_records(self._search, self._year, month, **self._date_kw()),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
 
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("t", float(totals.get("total_tahmeed", 0) or 0), "USD ")
-        self._totals.set_total("i", float(totals.get("total_invoice", 0) or 0), "USD ")
-        self._totals.set_total("v", float(totals.get("total_variance", 0) or 0), "USD ")
-        self._totals.set_total("c", int(totals.get("count", 0) or 0), "")
-        self._loading = False
-        self._update_status()
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("t", float(totals.get("total_tahmeed", 0) or 0), "USD ")
+            self._totals.set_total("i", float(totals.get("total_invoice", 0) or 0), "USD ")
+            self._totals.set_total("v", float(totals.get("total_variance", 0) or 0), "USD ")
+            self._totals.set_total("c", int(totals.get("count", 0) or 0), "")
+            self._update_status()
+        finally:
+            self._loading = False
+            self._end_feed_loading()
         self._maybe_fill_viewport()
 
     async def _load_more(self) -> None:
@@ -8638,12 +8737,17 @@ class _AfritrackUploadBrowse(QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
+        _show_widget_loading(self, "Loading Afritrack uploads…")
         try:
-            uploads = await svc.get_afritrack_uploads()
-        except Exception:
-            uploads = []
-        self._uploads = uploads
-        self._fill(uploads)
+            try:
+                uploads = await svc.get_afritrack_uploads()
+            except Exception:
+                uploads = []
+            self._uploads = uploads
+            self._fill(uploads)
+
+        finally:
+            _hide_widget_loading(self)
 
     def _fill(self, uploads: List[dict]) -> None:
         t = self._table
@@ -8828,26 +8932,29 @@ class _AfritrackUploadDetail(_FeedExportMixin, QWidget):
         if not self._upload_id or self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
         try:
-            recs, total, totals = await asyncio.gather(
-                svc.get_afritrack_upload_records(
-                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
-                    **sort_kw(self._sort_state),
-                ),
-                svc.count_afritrack_upload_records(self._upload_id, self._search),
-                svc.get_afritrack_upload_totals(self._upload_id, ""),
-            )
-        except Exception:
+            try:
+                recs, total, totals = await asyncio.gather(
+                    svc.get_afritrack_upload_records(
+                        self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                        **sort_kw(self._sort_state),
+                    ),
+                    svc.count_afritrack_upload_records(self._upload_id, self._search),
+                    svc.get_afritrack_upload_totals(self._upload_id, ""),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._refresh_footer(totals)
+            self._update_status()
+        finally:
             self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._refresh_footer(totals)
-        self._loading = False
-        self._update_status()
+            self._end_feed_loading()
         self._maybe_fill_viewport()
 
     async def _load_more(self) -> None:
@@ -9768,25 +9875,30 @@ class ComesaWidget(_FeedExportMixin, QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
-        skip = (self._page - 1) * self._page_size
-        recs, total, totals = await asyncio.gather(
-            svc.get_insurance_feed(
-                "comesa", self._search, self._month, "",
-                self._page_size, skip, **sort_kw(self._sort_state),
-            ),
-            svc.count_insurance_feed("comesa", self._search, self._month),
-            svc.get_insurance_totals("comesa", self._month),
-        )
-        self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
+        self._begin_feed_loading("Loading COMESA records…")
+        try:
+            skip = (self._page - 1) * self._page_size
+            recs, total, totals = await asyncio.gather(
+                svc.get_insurance_feed(
+                    "comesa", self._search, self._month, "",
+                    self._page_size, skip, **sort_kw(self._sort_state),
+                ),
+                svc.count_insurance_feed("comesa", self._search, self._month),
+                svc.get_insurance_totals("comesa", self._month),
+            )
+            self._total = total
+            self._fill_table(recs)
+            self._pager.set_total(total, self._page_size, self._page)
 
-        prem = totals.get("premium", 0.0)
-        self._totals_bar.set_value("premium", prem)
-        self._totals_bar.set_text("records", f"{total:,}")
-        self._summary_lbl.setText(
-            f"{total:,} records  ·  Total Premium: TSh {prem:,.0f}"
-        )
+            prem = totals.get("premium", 0.0)
+            self._totals_bar.set_value("premium", prem)
+            self._totals_bar.set_text("records", f"{total:,}")
+            self._summary_lbl.setText(
+                f"{total:,} records  ·  Total Premium: TSh {prem:,.0f}"
+            )
+
+        finally:
+            self._end_feed_loading()
 
     def _fill_table(self, recs: List[dict]) -> None:
         t   = self._table
@@ -10019,34 +10131,39 @@ class ThirdPartyWidget(_FeedExportMixin, QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
-        skip = (self._page - 1) * self._page_size
-        recs, total, totals = await asyncio.gather(
-            svc.get_insurance_feed(
-                "third_party", self._search, self._month, self._status,
-                self._page_size, skip, **sort_kw(self._sort_state),
-            ),
-            svc.count_insurance_feed(
-                "third_party", self._search, self._month, self._status
-            ),
-            svc.get_insurance_totals(
-                "third_party", self._month, self._status
-            ),
-        )
-        self._total = total
-        self._fill_table(recs)
-        self._pager.set_total(total, self._page_size, self._page)
+        self._begin_feed_loading("Loading third-party records…")
+        try:
+            skip = (self._page - 1) * self._page_size
+            recs, total, totals = await asyncio.gather(
+                svc.get_insurance_feed(
+                    "third_party", self._search, self._month, self._status,
+                    self._page_size, skip, **sort_kw(self._sort_state),
+                ),
+                svc.count_insurance_feed(
+                    "third_party", self._search, self._month, self._status
+                ),
+                svc.get_insurance_totals(
+                    "third_party", self._month, self._status
+                ),
+            )
+            self._total = total
+            self._fill_table(recs)
+            self._pager.set_total(total, self._page_size, self._page)
 
-        prem = totals.get("premium", 0.0)
-        vat  = totals.get("vat",     0.0)
-        tot  = totals.get("total_premium", 0.0)
-        self._totals_bar.set_value("premium", prem)
-        self._totals_bar.set_value("vat",     vat)
-        self._totals_bar.set_value("total",   tot)
-        self._totals_bar.set_text("records",  f"{total:,}")
-        self._summary_lbl.setText(
-            f"{total:,} records  ·  Premium: TSh {prem:,.0f}"
-            f"  ·  Total inc. VAT: TSh {tot:,.0f}"
-        )
+            prem = totals.get("premium", 0.0)
+            vat  = totals.get("vat",     0.0)
+            tot  = totals.get("total_premium", 0.0)
+            self._totals_bar.set_value("premium", prem)
+            self._totals_bar.set_value("vat",     vat)
+            self._totals_bar.set_value("total",   tot)
+            self._totals_bar.set_text("records",  f"{total:,}")
+            self._summary_lbl.setText(
+                f"{total:,} records  ·  Premium: TSh {prem:,.0f}"
+                f"  ·  Total inc. VAT: TSh {tot:,.0f}"
+            )
+
+        finally:
+            self._end_feed_loading()
 
     def _fill_table(self, recs: List[dict]) -> None:
         t   = self._table
@@ -10375,25 +10492,29 @@ class _RahnTechAllEntries(_FeedExportMixin, QWidget):
         if self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
-        from tahmeed.services import accountant_service as svc
-        month = self._effective_month()
         try:
-            totals, recs, total = await asyncio.gather(
-                svc.get_rahntech_all_totals(self._search, self._year, month, **self._date_kw()),
-                svc.get_rahntech_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state)),
-                svc.count_rahntech_all_records(self._search, self._year, month, **self._date_kw()),
-            )
-        except Exception:
+            from tahmeed.services import accountant_service as svc
+            month = self._effective_month()
+            try:
+                totals, recs, total = await asyncio.gather(
+                    svc.get_rahntech_all_totals(self._search, self._year, month, **self._date_kw()),
+                    svc.get_rahntech_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state)),
+                    svc.count_rahntech_all_records(self._search, self._year, month, **self._date_kw()),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("count", int(totals.get("count", 0)), "")
+            self._update_status()
+
+        finally:
             self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("count", int(totals.get("count", 0)), "")
-        self._loading = False
-        self._update_status()
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         if self._loading or self._loaded >= self._total:
@@ -10518,9 +10639,14 @@ class _RahnTechUploadBrowse(QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
-        uploads = await svc.get_rahntech_uploads()
-        self._uploads = uploads
-        self._fill(uploads)
+        _show_widget_loading(self, "Loading RahnTech uploads…")
+        try:
+            uploads = await svc.get_rahntech_uploads()
+            self._uploads = uploads
+            self._fill(uploads)
+
+        finally:
+            _hide_widget_loading(self)
 
     def _fill(self, uploads: List[dict]) -> None:
         t = self._table
@@ -10692,25 +10818,29 @@ class _RahnTechUploadDetail(_FeedExportMixin, QWidget):
         if not self._upload_id or self._loading:
             return
         self._loading = True
+        self._begin_feed_loading()
         self._update_status()
         try:
-            recs, total = await asyncio.gather(
-                svc.get_rahntech_upload_records(
-                    self._upload_id, self._search, _SCROLL_CHUNK, 0,
-                    **sort_kw(self._sort_state),
-                ),
-                svc.count_rahntech_upload_records(self._upload_id, self._search),
-            )
-        except Exception:
+            try:
+                recs, total = await asyncio.gather(
+                    svc.get_rahntech_upload_records(
+                        self._upload_id, self._search, _SCROLL_CHUNK, 0,
+                        **sort_kw(self._sort_state),
+                    ),
+                    svc.count_rahntech_upload_records(self._upload_id, self._search),
+                )
+            except Exception:
+                self._status_lbl.setText("Failed to load records.")
+                return
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("count", total, "")
+            self._update_status()
+
+        finally:
             self._loading = False
-            self._status_lbl.setText("Failed to load records.")
-            return
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("count", total, "")
-        self._loading = False
-        self._update_status()
+            self._end_feed_loading()
 
     async def _load_more(self) -> None:
         from tahmeed.services import accountant_service as svc

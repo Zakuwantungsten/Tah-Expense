@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import qtawesome as qta
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -25,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tahmeed.services.api_client import api_client
 from tahmeed.services.device_id import primary_mac_address
 from tahmeed.services.session_service import (
     SessionInfo,
@@ -34,6 +33,7 @@ from tahmeed.services.session_service import (
     revoke_user_sessions,
 )
 from tahmeed.services.settings_service import get_all_settings, set_setting
+from tahmeed.ui.async_utils import schedule_call, schedule_coro
 
 
 def _lines_to_list(text: str) -> list[str]:
@@ -44,6 +44,28 @@ def _list_to_lines(values) -> str:
     if not values:
         return ""
     return "\n".join(str(item) for item in values)
+
+
+def _normalize_mac(value: str) -> str:
+    return value.strip().upper().replace("-", ":")
+
+
+def _ensure_listed(edit: QTextEdit, value: str, *, as_mac: bool = False) -> None:
+    """Append *value* to *edit* if it is not already present."""
+    text = (value or "").strip()
+    if not text:
+        return
+    existing = _lines_to_list(edit.toPlainText())
+    if as_mac:
+        needle = _normalize_mac(text)
+        if any(_normalize_mac(item) == needle for item in existing):
+            return
+        existing.append(needle)
+    else:
+        if any(item == text for item in existing):
+            return
+        existing.append(text)
+    edit.setPlainText(_list_to_lines(existing))
 
 
 def _fmt_dt(value) -> str:
@@ -57,9 +79,12 @@ class SecurityTab(QWidget):
         super().__init__(parent)
         self._sessions: list[SessionInfo] = []
         self._sessions_busy = False
+        self._hydrating = False
+        self._this_ip = ""
+        self._this_mac = primary_mac_address()
         self._build_ui()
-        asyncio.ensure_future(self._load())
-        asyncio.ensure_future(self._load_sessions())
+        schedule_coro(self._load())
+        schedule_coro(self._load_sessions())
 
     def _build_ui(self) -> None:
         shell = QVBoxLayout(self)
@@ -82,18 +107,29 @@ class SecurityTab(QWidget):
         outer.addWidget(title)
 
         note = QLabel(
-            "IP allowlisting uses Cloudflare’s client IP. MAC allowlisting uses the "
-            "desktop-reported adapter address (soft control — spoofable). Register "
-            "office IPs and MACs before enabling either toggle."
+            "Allowlists stay off by default. Turning IP or MAC enforcement on "
+            "automatically adds this PC’s current address to that list so you "
+            "are not locked out. IP uses the address the API sees (Cloudflare "
+            "client IP in production). MAC uses this adapter address "
+            "(soft control — spoofable)."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color:#6B7280; font:12px 'Segoe UI';")
         outer.addWidget(note)
 
-        self._this_mac = QLabel(f"This PC’s MAC: {primary_mac_address()}")
-        self._this_mac.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self._this_mac.setStyleSheet("color:#111827; font:600 12px 'Consolas','Segoe UI';")
-        outer.addWidget(self._this_mac)
+        self._this_mac_lbl = QLabel(f"This PC’s MAC: {self._this_mac}")
+        self._this_mac_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._this_mac_lbl.setStyleSheet(
+            "color:#111827; font:600 12px 'Consolas','Segoe UI';"
+        )
+        outer.addWidget(self._this_mac_lbl)
+
+        self._this_ip_lbl = QLabel("This session’s IP: —")
+        self._this_ip_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._this_ip_lbl.setStyleSheet(
+            "color:#111827; font:600 12px 'Consolas','Segoe UI';"
+        )
+        outer.addWidget(self._this_ip_lbl)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
@@ -101,6 +137,7 @@ class SecurityTab(QWidget):
         form.setVerticalSpacing(12)
 
         self._ip_enabled = QCheckBox("Enforce IP allowlist")
+        self._ip_enabled.toggled.connect(self._on_ip_toggled)
         form.addRow("IP allowlist:", self._ip_enabled)
         self._ips = QTextEdit()
         self._ips.setPlaceholderText("One IP or CIDR per line\n203.0.113.10\n198.51.100.0/24")
@@ -108,6 +145,7 @@ class SecurityTab(QWidget):
         form.addRow("Allowed IPs:", self._ips)
 
         self._mac_enabled = QCheckBox("Enforce MAC allowlist")
+        self._mac_enabled.toggled.connect(self._on_mac_toggled)
         form.addRow("MAC allowlist:", self._mac_enabled)
         self._macs = QTextEdit()
         self._macs.setPlaceholderText("One MAC per line\nAA:BB:CC:DD:EE:FF")
@@ -241,8 +279,11 @@ class SecurityTab(QWidget):
         outer.addWidget(self._sessions_box)
 
     async def _load(self) -> None:
+        self._hydrating = True
         try:
+            await self._refresh_this_ip()
             settings = await get_all_settings()
+            # Allowlists default off; only check if the server already has them on.
             self._ip_enabled.setChecked(bool(settings.get("security_ip_allowlist_enabled")))
             self._ips.setPlainText(_list_to_lines(settings.get("security_allowed_ips") or []))
             self._mac_enabled.setChecked(bool(settings.get("security_mac_allowlist_enabled")))
@@ -261,13 +302,65 @@ class SecurityTab(QWidget):
             self._show_sessions.setChecked(show)
             self._sessions_box.setVisible(show)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to load security settings:\n{exc}")
+            self._alert("Error", f"Failed to load security settings:\n{exc}")
+        finally:
+            self._hydrating = False
+
+    async def _refresh_this_ip(self) -> None:
+        """Read the IP the API recorded for this login session."""
+        try:
+            payload = await api_client.request("GET", "v1/auth/me")
+            session = payload.get("session") if isinstance(payload, dict) else None
+            ip = ""
+            if isinstance(session, dict):
+                ip = str(session.get("ip") or "").strip()
+            self._this_ip = ip
+            self._this_ip_lbl.setText(
+                f"This session’s IP: {ip}" if ip else "This session’s IP: —"
+            )
+        except Exception:
+            self._this_ip = ""
+            self._this_ip_lbl.setText("This session’s IP: —")
+
+    def _on_ip_toggled(self, checked: bool) -> None:
+        if self._hydrating or not checked:
+            return
+        if not self._this_ip:
+            schedule_coro(self._seed_ip_after_refresh())
+            return
+        _ensure_listed(self._ips, self._this_ip)
+
+    async def _seed_ip_after_refresh(self) -> None:
+        await self._refresh_this_ip()
+        if self._ip_enabled.isChecked() and self._this_ip:
+            _ensure_listed(self._ips, self._this_ip)
+
+    def _on_mac_toggled(self, checked: bool) -> None:
+        if self._hydrating or not checked:
+            return
+        _ensure_listed(self._macs, self._this_mac, as_mac=True)
+
+    def _alert(self, title: str, message: str) -> None:
+        """Show a modal error after this asyncio task has yielded.
+
+        A QMessageBox pumps Qt events. On Python 3.14 that re-enters other
+        admin-tab loads and raises ``Cannot enter into task``.
+        """
+        schedule_call(lambda t=title, m=message: QMessageBox.critical(self, t, m))
 
     def _on_save(self) -> None:
-        asyncio.ensure_future(self._do_save())
+        schedule_coro(self._do_save())
 
     async def _do_save(self) -> None:
         try:
+            # Last-chance seed so Save with enforcement on cannot lock this PC out.
+            if self._ip_enabled.isChecked():
+                if not self._this_ip:
+                    await self._refresh_this_ip()
+                _ensure_listed(self._ips, self._this_ip)
+            if self._mac_enabled.isChecked():
+                _ensure_listed(self._macs, self._this_mac, as_mac=True)
+
             await set_setting("security_ip_allowlist_enabled", self._ip_enabled.isChecked())
             await set_setting("security_allowed_ips", _lines_to_list(self._ips.toPlainText()))
             await set_setting("security_mac_allowlist_enabled", self._mac_enabled.isChecked())
@@ -288,7 +381,7 @@ class SecurityTab(QWidget):
             self._sessions_box.setVisible(self._show_sessions.isChecked())
             self._status.setText("Saved.")
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to save security settings:\n{exc}")
+            self._alert("Error", f"Failed to save security settings:\n{exc}")
 
     def focus_user(self, username: str) -> None:
         """Deep-link from Users: show sessions panel filtered to this username."""
@@ -299,7 +392,7 @@ class SecurityTab(QWidget):
 
     def refresh_sessions(self) -> None:
         if not self._sessions_busy:
-            asyncio.ensure_future(self._load_sessions())
+            schedule_coro(self._load_sessions())
 
     async def _load_sessions(self) -> None:
         self._sessions_busy = True
@@ -307,7 +400,7 @@ class SecurityTab(QWidget):
             self._sessions = await list_sessions(active_only=True, limit=200)
             self._render_sessions()
         except Exception as exc:
-            QMessageBox.critical(self, "Sessions Error", str(exc))
+            self._alert("Sessions Error", str(exc))
         finally:
             self._sessions_busy = False
 
@@ -367,14 +460,14 @@ class SecurityTab(QWidget):
             != QMessageBox.Yes
         ):
             return
-        asyncio.ensure_future(self._do_revoke_one(session.id))
+        schedule_coro(self._do_revoke_one(session.id))
 
     async def _do_revoke_one(self, session_id: str) -> None:
         try:
             await revoke_session(session_id)
             await self._load_sessions()
         except Exception as exc:
-            QMessageBox.critical(self, "Error", str(exc))
+            self._alert("Error", str(exc))
 
     def _selected_session(self) -> SessionInfo | None:
         rows = self._sess_table.selectionModel().selectedRows()
@@ -400,14 +493,14 @@ class SecurityTab(QWidget):
             != QMessageBox.Yes
         ):
             return
-        asyncio.ensure_future(self._do_revoke_user(session.user_id))
+        schedule_coro(self._do_revoke_user(session.user_id))
 
     async def _do_revoke_user(self, user_id: str) -> None:
         try:
             await revoke_user_sessions(user_id)
             await self._load_sessions()
         except Exception as exc:
-            QMessageBox.critical(self, "Error", str(exc))
+            self._alert("Error", str(exc))
 
     def _on_revoke_all(self) -> None:
         if (
@@ -421,11 +514,11 @@ class SecurityTab(QWidget):
             != QMessageBox.Yes
         ):
             return
-        asyncio.ensure_future(self._do_revoke_all())
+        schedule_coro(self._do_revoke_all())
 
     async def _do_revoke_all(self) -> None:
         try:
             await revoke_all_sessions()
             await self._load_sessions()
         except Exception as exc:
-            QMessageBox.critical(self, "Error", str(exc))
+            self._alert("Error", str(exc))

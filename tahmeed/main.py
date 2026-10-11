@@ -89,31 +89,58 @@ def _launch_verified_installer(installer: Path) -> bool:
 
 
 def _set_app_icon(app: QApplication) -> None:
-    from PySide6.QtGui import QIcon
+    """Set the app/window icon with sizes Windows taskbar can use without blur."""
+    from PySide6.QtCore import QSize, Qt
+    from PySide6.QtGui import QIcon, QPixmap
 
-    candidates = []
+    # Prefer multi-size .ico; also inject explicit small pixmaps from the PNG
+    # so Qt/Windows do not downscale a single 256px bitmap for the taskbar.
+    ico_candidates: list[Path] = []
+    png_candidates: list[Path] = []
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         meipass = Path(sys._MEIPASS)
-        candidates.extend(
+        ico_candidates.extend(
             [
                 meipass / "tahmeed" / "assets" / "app.ico",
+            ]
+        )
+        png_candidates.extend(
+            [
                 meipass / "tahmeed" / "assets" / "app_icon.png",
             ]
         )
     root = Path(__file__).resolve().parent
-    candidates.extend(
+    ico_candidates.append(root / "assets" / "app.ico")
+    png_candidates.extend(
         [
-            root / "assets" / "app.ico",
             root / "assets" / "app_icon.png",
             root.parent / "logo.png",
         ]
     )
-    for path in candidates:
+
+    icon = QIcon()
+    for path in ico_candidates:
         if path.is_file():
-            icon = QIcon(str(path))
-            if not icon.isNull():
-                app.setWindowIcon(icon)
-                return
+            loaded = QIcon(str(path))
+            if not loaded.isNull():
+                icon = loaded
+                break
+
+    png_path = next((p for p in png_candidates if p.is_file()), None)
+    if png_path is not None:
+        master = QPixmap(str(png_path))
+        if not master.isNull():
+            for edge in (16, 24, 32, 48, 64, 128, 256):
+                scaled = master.scaled(
+                    QSize(edge, edge),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+                if not scaled.isNull():
+                    icon.addPixmap(scaled)
+
+    if not icon.isNull():
+        app.setWindowIcon(icon)
 
 
 def main() -> None:

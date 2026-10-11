@@ -9,10 +9,13 @@ from PySide6.QtCore import Qt, Signal, QEvent
 from PySide6.QtGui import QColor, QFontMetrics, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import QComboBox
 
+from tahmeed.ui.widgets.combo_styles import with_combo_popup
+
 
 # Force light readable colors — parent/app themes often paint editable
 # combos and their popup lists black-on-black.
-_COMBO_SS = """
+_COMBO_SS = with_combo_popup(
+    """
 QComboBox {
     border: 1px solid #E5E7EB;
     border-radius: 5px;
@@ -24,23 +27,8 @@ QComboBox {
 }
 QComboBox:focus { border-color: #0077C5; }
 QComboBox::drop-down { border: none; width: 20px; }
-QComboBox QAbstractItemView {
-    border: 1px solid #E5E7EB;
-    background: #FFFFFF;
-    color: #111827;
-    selection-background-color: #E8F4FD;
-    selection-color: #111827;
-    outline: none;
-    padding: 2px;
-}
-QComboBox QLineEdit {
-    background: #FFFFFF;
-    color: #111827;
-    border: none;
-    selection-background-color: #DBEAFE;
-    selection-color: #111827;
-}
 """
+)
 
 _FG = QColor("#111827")
 _BG = QColor("#FFFFFF")

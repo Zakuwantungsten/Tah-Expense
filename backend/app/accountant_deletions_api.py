@@ -15,6 +15,7 @@ from .accountant_ops import (
     build_deletion_query,
     deletion_descriptions_query,
     deletion_items_query,
+    format_available_dates,
 )
 from .dependencies import require_roles
 from .errors import ApiError
@@ -183,6 +184,12 @@ async def count_deletions(
 async def deletions_badge_count(request: Request, _manager: Manager) -> dict:
     total = await _database(request).transactions.count_documents(DELETION_BASE_MATCH)
     return {"count": int(total)}
+
+
+@deletions.get("/deletions/meta/dates")
+async def deletion_dates(request: Request, _manager: Manager) -> dict:
+    vals = await _database(request).transactions.distinct("date", DELETION_BASE_MATCH)
+    return {"items": format_available_dates(vals)}
 
 
 @deletions.get("/deletions/meta/trucks")

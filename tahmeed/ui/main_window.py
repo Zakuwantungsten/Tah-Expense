@@ -28,7 +28,7 @@ class MainWindow(QMainWindow):
         self._resize_filters_ready = False
         self.setWindowTitle(f"{APP_NAME} — {user.full_name}")
         self.setMinimumSize(1100, 700)
-        if user.role == "accountant":
+        if user.role in {"accountant", "cashier"}:
             self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
             self.setMouseTracking(True)
             self.setStyleSheet(
@@ -53,15 +53,25 @@ class MainWindow(QMainWindow):
             dash.logout_requested.connect(self.logout_requested)
         self.setCentralWidget(dash)
 
-        # Accountant chrome has its own status strip; avoid a second bar.
-        if self.user.role != "accountant":
+        # Accountant/cashier chrome has its own status strip; avoid a second bar.
+        # Admin puts user context in the page header / sidebar.
+        if self.user.role not in {"accountant", "cashier", "admin"}:
             bar = QStatusBar()
             bar.showMessage(f"  {self.user.full_name}  ·  {self.user.role.title()}")
             self.setStatusBar(bar)
+        elif self.user.role == "admin":
+            self.setStyleSheet(
+                "QMainWindow{background:#F8FAFC;}"
+                "QStatusBar{background:#FFFFFF;color:#6B7280;"
+                "border-top:1px solid #E5E7EB;}"
+            )
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if self.user.role == "accountant" and not self._resize_filters_ready:
+        if (
+            self.user.role in {"accountant", "cashier"}
+            and not self._resize_filters_ready
+        ):
             self._resize_filters_ready = True
             self._install_edge_filters(self.centralWidget())
 
@@ -75,9 +85,10 @@ class MainWindow(QMainWindow):
             w = getattr(dash, name, None)
             if w is not None:
                 targets.append(w)
-        status = dash.findChild(QWidget, "accountantStatusBar")
-        if status is not None:
-            targets.append(status)
+        for status_name in ("accountantStatusBar", "cashierStatusBar"):
+            status = dash.findChild(QWidget, status_name)
+            if status is not None:
+                targets.append(status)
         for w in targets:
             w.setMouseTracking(True)
             w.installEventFilter(self)
@@ -124,10 +135,10 @@ class MainWindow(QMainWindow):
         finally:
             self._close_pending = False
 
-    # ── Frameless edge resize (accountant only) ─────────────────────────────
+    # ── Frameless edge resize (accountant / cashier) ────────────────────────
 
     def eventFilter(self, obj, event):
-        if self.user.role != "accountant" or self.isMaximized():
+        if self.user.role not in {"accountant", "cashier"} or self.isMaximized():
             return super().eventFilter(obj, event)
 
         et = event.type()
@@ -172,7 +183,7 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _hit_edges(self, pos: QPoint) -> Qt.Edges:
-        if self.user.role != "accountant" or self.isMaximized():
+        if self.user.role not in {"accountant", "cashier"} or self.isMaximized():
             return Qt.Edges()
         edges = Qt.Edges()
         r = self.rect()

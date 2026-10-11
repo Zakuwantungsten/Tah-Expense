@@ -1,22 +1,16 @@
 """
-CashierDashboard — Sidebar-based navigation (matches Accountant visual style).
+CashierDashboard — Accountant-style chrome + sidebar navigation.
 
 Layout:
+  ┌─ Title bar (TAHMEED COACH — Cashier Edition) ──────────────────────────────┐
+  ├─ Menu bar (File / Edit / View / Cashier / Reports / Window / Help) ────────┤
+  ├─ Connectivity banner ──────────────────────────────────────────────────────┤
   ┌─ Sidebar (220px, navy #1B2B4B, collapsible) ─┬─ Content Area ──────────────┐
-  │  [T] Tahmeed / Expense Manager               │  [Stacked pages]            │
-  │  ─────────────────────────────               │                             │
-  │  Overview  ·  Browse                         │                             │
-  │  ─────────────────────────────               │                             │
-  │  ENTRY                                       │                             │
-  │    Table  ·  Form                            │                             │
-  │  CATEGORIES   (13 items)                     │                             │
-  │  SEPARATE EXPENSES  (11 items)               │                             │
-  │  FUEL CONSUMPTION   (5 items)                │                             │
-  │  ─────────────────────────────               │                             │
-  │  [user avatar + name/role]                   │                             │
+  │  Overview  ·  Browse                         │  [Stacked pages]            │
+  │  ENTRY / INBOX / ITEMS                       │                             │
   │  [Collapse]                                  │                             │
   └──────────────────────────────────────────────┴─────────────────────────────┘
-  ── Status bar (24px) ─────────────────────────────────────────────────────────
+  ── Status bar (Cashier Mode) ─────────────────────────────────────────────────
 """
 
 import asyncio
@@ -30,11 +24,13 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QDate
 
+from tahmeed.config import APP_NAME, APP_VERSION, COMPANY_NAME
 from tahmeed.models.user import User
 from tahmeed.services.category_service import get_payment_target_categories
-from tahmeed.ui.accountant.header_bar import HeaderBar
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
+from tahmeed.ui.accountant.title_bar import AccountantTitleBar
 from tahmeed.ui.dialogs.change_password_dialog import ChangePasswordDialog
+from tahmeed.ui.cashier.menu_bar import CashierMenuBar
 from tahmeed.ui.cashier.sidebar import CashierSidebarWidget
 from tahmeed.ui.cashier.excel_grid import DailyRegister
 from tahmeed.ui.cashier.entry_form import EntryForm
@@ -44,6 +40,7 @@ from tahmeed.ui.cashier.cashier_category_view import CashierCategoryView
 from tahmeed.ui.cashier.rejected_view import RejectedView
 from tahmeed.ui.cashier.drafts_view import DraftsView, fetch_draft_badge_count
 from tahmeed.ui.cashier.day_issues import DayIssuesWidget
+from tahmeed.ui.cashier.trash import CashierTrashWidget
 
 _APP_BG = "#F4F6F8"
 _BORDER = "#E5E7EB"
@@ -706,20 +703,34 @@ class CashierDashboard(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Build sidebar first so its toggle fn can be passed to the header bar.
         self._sidebar = CashierSidebarWidget(user=self._user)
         self._sidebar.nav_selected.connect(self._on_nav)
 
-        # ── Header bar ────────────────────────────────────────────────────────
-        self._header = HeaderBar(
+        # ── QuickBooks-style chrome (matches Accountant Edition) ─────────────
+        self._title_bar = AccountantTitleBar(
             user=self._user,
-            sidebar_toggle_fn=self._sidebar.toggle_collapsed,
-            dark=True,
-            show_search=False,
+            edition="Cashier Edition",
         )
-        self._header.logout_requested.connect(self.logout_requested)
-        self._header.change_password_requested.connect(self._on_change_password)
-        root.addWidget(self._header)
+        self._title_bar.minimize_requested.connect(self._on_minimize)
+        self._title_bar.maximize_requested.connect(self._on_maximize)
+        self._title_bar.close_requested.connect(self._on_exit)
+        root.addWidget(self._title_bar)
+
+        self._menu_bar = CashierMenuBar(
+            user_display_name=self._user.full_name or self._user.username,
+        )
+        self._menu_bar.bind(
+            navigate=self._menu_navigate,
+            toggle_sidebar=self._toggle_sidebar,
+            refresh=self._refresh_current,
+            change_password=self._on_change_password,
+            logout=self.logout_requested.emit,
+            exit_app=self._on_exit,
+            about=self._on_about,
+            find=self._on_find,
+        )
+        self._sidebar.items_changed.connect(self._menu_bar.set_item_entries)
+        root.addWidget(self._menu_bar)
 
         from tahmeed.ui.widgets.connectivity_banner import ConnectivityBanner
         from tahmeed.ui.widgets.live_status_bar import LiveStatusBar
@@ -779,10 +790,14 @@ class CashierDashboard(QWidget):
         self._stack.addWidget(self._rejected_view)
 
         # index 6 — Browse (embedded)
-        self._browser = TransactionBrowser()
+        self._browser = TransactionBrowser(can_manage_uploads=False)
         self._browser.go_to_date.connect(self._on_go_to_date)
         self._browser.go_to_upload.connect(self._on_go_to_upload)
         self._stack.addWidget(self._browser)
+
+        # index 7 — Trash (confirmed deletions; restore via accountant)
+        self._trash_view = CashierTrashWidget(user=self._user)
+        self._stack.addWidget(self._trash_view)
 
         self._stack.setCurrentIndex(0)
         body_hl.addWidget(self._stack, 1)
@@ -792,17 +807,12 @@ class CashierDashboard(QWidget):
             LiveStatusBar(
                 object_name="cashierStatusBar",
                 mode_label="Cashier Mode",
-                dark=True,
+                dark=False,
             )
         )
 
         # ── Signal wiring ──────────────────────────────────────────────────────
         self._form.transaction_saved.connect(lambda _: self._register.refresh())
-        self._overview.go_to_register.connect(lambda: self._on_nav("table"))
-        self._overview.go_to_form.connect(lambda: self._on_nav("form"))
-        self._overview.go_to_browse.connect(lambda: self._on_nav("browse"))
-        self._overview.export_data.connect(lambda: self._on_nav("browse"))
-        self._overview.import_data.connect(self._on_import)
         self._drafts_view.open_register_date.connect(self._on_drafts_open_register)
         self._drafts_view.drafts_changed.connect(self._refresh_draft_badge)
         self._register.rows_saved.connect(lambda _: self._refresh_draft_badge())
@@ -823,6 +833,69 @@ class CashierDashboard(QWidget):
     async def prepare_to_leave(self) -> bool:
         """Prompt to save/discard unsaved table entries before logout or exit."""
         return await self._register.confirm_leave()
+
+    # ── Chrome helpers ──────────────────────────────────────────────────────────
+
+    def _toggle_sidebar(self) -> None:
+        self._sidebar.toggle_collapsed()
+
+    def _host_window(self):
+        return self.window()
+
+    def _on_minimize(self) -> None:
+        win = self._host_window()
+        if win is not None:
+            win.showMinimized()
+
+    def _on_maximize(self) -> None:
+        win = self._host_window()
+        if win is None:
+            return
+        if win.isMaximized():
+            win.showNormal()
+            self._title_bar.set_maximized(False)
+        else:
+            win.showMaximized()
+            self._title_bar.set_maximized(True)
+
+    def _on_exit(self) -> None:
+        win = self._host_window()
+        if win is not None:
+            win.close()
+
+    def _menu_navigate(self, key: str) -> None:
+        self._on_nav(key)
+
+    def _refresh_current(self) -> None:
+        widget = self._stack.currentWidget()
+        refresh = getattr(widget, "refresh", None)
+        if callable(refresh):
+            refresh()
+
+    def sync_chrome_maximized(self, maximized: bool) -> None:
+        """Keep title-bar restore/maximize icon in sync with the host window."""
+        self._title_bar.set_maximized(maximized)
+
+    def _on_about(self) -> None:
+        QMessageBox.about(
+            self,
+            f"About {APP_NAME}",
+            (
+                f"<b>{APP_NAME}</b><br>"
+                f"Cashier Edition<br><br>"
+                f"Version {APP_VERSION}<br>"
+                f"{COMPANY_NAME}"
+            ),
+        )
+
+    def _on_find(self) -> None:
+        QMessageBox.information(
+            self,
+            "Find",
+            "Global search across trucks, descriptions, and amounts "
+            "will be available in a future update.\n\n"
+            "Use Browse or the page filters for now.",
+        )
 
     # ── Profile menu ────────────────────────────────────────────────────────────
 
@@ -876,6 +949,9 @@ class CashierDashboard(QWidget):
         elif key == "browse":
             self._stack.setCurrentIndex(6)
             self._browser.refresh()
+        elif key == "trash":
+            self._stack.setCurrentIndex(7)
+            self._trash_view.refresh()
         elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
 

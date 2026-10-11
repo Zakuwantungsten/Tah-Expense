@@ -52,3 +52,12 @@ async def restore_backup(filename: str) -> dict[str, Any]:
         json={"filename": filename, "confirm_filename": filename},
         timeout=httpx.Timeout(1800.0, connect=30.0),
     )
+
+
+async def run_backup_now() -> dict[str, Any]:
+    """Ask the API to dump (and upload) a backup immediately."""
+    return await api_client.request(
+        "POST",
+        "v1/backups/run",
+        timeout=httpx.Timeout(1800.0, connect=30.0),
+    )

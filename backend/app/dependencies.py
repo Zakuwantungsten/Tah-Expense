@@ -63,8 +63,11 @@ async def current_user(
 
 
 def require_roles(*roles: str) -> Callable:
+    allowed = {str(role).strip().lower() for role in roles}
+
     async def dependency(user: Annotated[dict, Depends(current_user)]) -> dict:
-        if user.get("role") not in roles:
+        role = str(user.get("role") or "").strip().lower()
+        if role not in allowed:
             raise ApiError(403, "forbidden", "Your role cannot perform this action")
         return user
 

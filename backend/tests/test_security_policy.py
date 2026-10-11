@@ -278,7 +278,9 @@ def test_backups_require_admin(monkeypatch: pytest.MonkeyPatch) -> None:
     }
     with TestClient(app) as client:
         denied = client.get("/v1/backups")
+        denied_run = client.post("/v1/backups/run")
     assert denied.status_code == 403
+    assert denied_run.status_code == 403
 
     app.dependency_overrides[current_user] = lambda: {
         "_id": ObjectId(),

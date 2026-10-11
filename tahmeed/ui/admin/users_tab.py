@@ -26,6 +26,11 @@ from PySide6.QtWidgets import (
 
 from tahmeed.models.user import User
 from tahmeed.services.auth import create_user
+from tahmeed.services.password_policy import (
+    password_placeholder,
+    password_policy_errors,
+)
+from tahmeed.services.settings_service import DEFAULTS, get_all_settings
 from tahmeed.services.user_service import (
     ban_user,
     delete_user,
@@ -46,9 +51,16 @@ def _editable_roles(user: Optional[User]) -> list[str]:
 
 
 class _UserDialog(QDialog):
-    def __init__(self, user: Optional[User] = None, parent=None):
+    def __init__(
+        self,
+        user: Optional[User] = None,
+        parent=None,
+        *,
+        password_policy: Optional[dict] = None,
+    ):
         super().__init__(parent)
         self._user = user
+        self._password_policy = dict(password_policy or DEFAULTS)
         self.result_data: dict = {}
         self.setWindowTitle("Edit User" if user else "Add User")
         self.setFixedWidth(360)
@@ -80,7 +92,10 @@ class _UserDialog(QDialog):
         self._password.setFixedHeight(32)
         self._password.setEchoMode(QLineEdit.Password)
         self._password.setPlaceholderText(
-            "Leave blank to keep current" if self._user else "Min 10 characters"
+            password_placeholder(
+                editing=bool(self._user),
+                settings=self._password_policy,
+            )
         )
         form.addRow("Password:", self._password)
 
@@ -124,9 +139,11 @@ class _UserDialog(QDialog):
         if not self._user and not password:
             self._error.setText("Password is required for new users.")
             return
-        if password and len(password) < 10:
-            self._error.setText("Password must be at least 10 characters.")
-            return
+        if password:
+            errors = password_policy_errors(password, self._password_policy)
+            if errors:
+                self._error.setText(errors[0])
+                return
 
         self.result_data = {
             "full_name": full_name,
@@ -138,8 +155,15 @@ class _UserDialog(QDialog):
 
 
 class _ResetPasswordDialog(QDialog):
-    def __init__(self, user: User, parent=None):
+    def __init__(
+        self,
+        user: User,
+        parent=None,
+        *,
+        password_policy: Optional[dict] = None,
+    ):
         super().__init__(parent)
+        self._password_policy = dict(password_policy or DEFAULTS)
         self.result_password = ""
         self.setWindowTitle(f"Reset password — {user.username}")
         self.setFixedWidth(360)
@@ -147,7 +171,8 @@ class _ResetPasswordDialog(QDialog):
         form = QFormLayout()
         self._password = QLineEdit()
         self._password.setEchoMode(QLineEdit.Password)
-        self._password.setPlaceholderText("New password (min 10 characters)")
+        min_hint = password_placeholder(settings=self._password_policy).lower()
+        self._password.setPlaceholderText(f"New password ({min_hint})")
         form.addRow("New password:", self._password)
         self._confirm = QLineEdit()
         self._confirm.setEchoMode(QLineEdit.Password)
@@ -169,8 +194,9 @@ class _ResetPasswordDialog(QDialog):
 
     def _validate(self) -> None:
         password = self._password.text()
-        if len(password) < 10:
-            self._error.setText("Password must be at least 10 characters.")
+        errors = password_policy_errors(password, self._password_policy)
+        if errors:
+            self._error.setText(errors[0])
             return
         if password != self._confirm.text():
             self._error.setText("Passwords do not match.")
@@ -300,9 +326,18 @@ class UsersTab(QWidget):
         return w
 
     def _on_add(self) -> None:
-        dlg = _UserDialog(parent=self)
+        asyncio.ensure_future(self._open_add())
+
+    async def _password_policy(self) -> dict:
+        try:
+            return await get_all_settings()
+        except Exception:
+            return dict(DEFAULTS)
+
+    async def _open_add(self) -> None:
+        dlg = _UserDialog(parent=self, password_policy=await self._password_policy())
         if dlg.exec() == QDialog.Accepted:
-            asyncio.ensure_future(self._do_add(dlg.result_data))
+            await self._do_add(dlg.result_data)
 
     async def _do_add(self, data: dict) -> None:
         try:
@@ -314,9 +349,14 @@ class UsersTab(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to create user:\n{exc}")
 
     def _on_edit(self, user: User) -> None:
-        dlg = _UserDialog(user=user, parent=self)
+        asyncio.ensure_future(self._open_edit(user))
+
+    async def _open_edit(self, user: User) -> None:
+        dlg = _UserDialog(
+            user=user, parent=self, password_policy=await self._password_policy()
+        )
         if dlg.exec() == QDialog.Accepted:
-            asyncio.ensure_future(self._do_edit(user._id, dlg.result_data))
+            await self._do_edit(user._id, dlg.result_data)
 
     async def _do_edit(self, user_id: ObjectId, data: dict) -> None:
         try:
@@ -328,9 +368,14 @@ class UsersTab(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to update user:\n{exc}")
 
     def _on_reset_password(self, user: User) -> None:
-        dlg = _ResetPasswordDialog(user, parent=self)
+        asyncio.ensure_future(self._open_reset_password(user))
+
+    async def _open_reset_password(self, user: User) -> None:
+        dlg = _ResetPasswordDialog(
+            user, parent=self, password_policy=await self._password_policy()
+        )
         if dlg.exec() == QDialog.Accepted:
-            asyncio.ensure_future(self._do_reset_password(user._id, dlg.result_password))
+            await self._do_reset_password(user._id, dlg.result_password)
 
     async def _do_reset_password(self, user_id: ObjectId, password: str) -> None:
         try:

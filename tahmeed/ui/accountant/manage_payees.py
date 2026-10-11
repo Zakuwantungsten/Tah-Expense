@@ -236,13 +236,14 @@ class ManagePayeesWidget(QWidget):
         self._filter_cb = QComboBox()
         self._filter_cb.addItems(["All", "Active only", "Inactive only"])
         self._filter_cb.setFixedHeight(32)
-        self._filter_cb.setStyleSheet(
+        from tahmeed.ui.widgets.combo_styles import with_combo_popup
+        self._filter_cb.setStyleSheet(with_combo_popup(
             f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
             "font-family:'Segoe UI';padding:0 8px;min-width:120px;}}"
             f"QComboBox:focus{{border-color:{_BLUE};}}"
             "QComboBox::drop-down{border:none;width:20px;}"
-        )
+        ))
         self._filter_cb.currentIndexChanged.connect(self._on_filter_changed)
         toolbar.addWidget(self._filter_cb)
         root.addLayout(toolbar)

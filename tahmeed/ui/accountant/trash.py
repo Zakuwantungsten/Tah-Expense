@@ -172,11 +172,11 @@ class TrashWidget(QWidget):
         self._table.setShowGrid(False)
         self._table.setStyleSheet(
             f"QTableWidget{{background:{_WHITE};border:1px solid {_BORDER};"
-            "border-radius:6px;gridline-color:transparent;"
+            f"border-radius:6px;gridline-color:transparent;color:{_T1};"
             "font-family:'Segoe UI',sans-serif;font-size:12px;}}"
             f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};border:none;"
             f"border-bottom:1px solid {_BORDER};padding:6px 8px;font-weight:600;}}"
-            "QTableWidget::item{padding:4px 8px;}"
+            f"QTableWidget::item{{padding:4px 8px;color:{_T1};}}"
             f"QTableWidget::item:selected{{background:#DBEAFE;color:{_T1};}}"
         )
         hdr = self._table.horizontalHeader()
@@ -285,6 +285,7 @@ class TrashWidget(QWidget):
                     continue
                 item = QTableWidgetItem(text)
                 item.setBackground(tint)
+                item.setForeground(QBrush(QColor(_T1)))
                 if c == 5:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(r, c, item)

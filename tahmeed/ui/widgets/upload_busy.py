@@ -1,4 +1,4 @@
-"""Modal progress dialog for file upload / Excel parse work."""
+"""Modal branded busy dialog for file upload / Excel parse work."""
 
 from __future__ import annotations
 
@@ -7,8 +7,16 @@ import threading
 from collections.abc import Coroutine
 from typing import Any, Optional, TypeVar
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QProgressDialog, QWidget
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QDialog,
+    QHBoxLayout,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from tahmeed.ui.widgets.brand_loader import BrandLoaderPanel
 
 _T = TypeVar("_T")
 
@@ -17,8 +25,102 @@ class UploadCancelled(Exception):
     """User cancelled an UploadBusy operation."""
 
 
+class _BusyDialog(QDialog):
+    """Lightweight stand-in for QProgressDialog with branded visuals."""
+
+    canceled = Signal()
+
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        message: str,
+        *,
+        title: str,
+        cancellable: bool,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.WindowModal)
+        self.setMinimumWidth(360)
+        self.setStyleSheet(
+            "QDialog { background: #FFFFFF; color: #111827; }"
+            "QPushButton {"
+            "  background: #FFFFFF; color: #111827; border: 1px solid #D1D5DB;"
+            "  border-radius: 5px; padding: 6px 16px; min-width: 72px;"
+            "  min-height: 28px; font-size: 13px;"
+            "}"
+            "QPushButton:hover { background: #F3F4F6; }"
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 8, 12, 12)
+        root.setSpacing(8)
+
+        self._panel = BrandLoaderPanel(self, message, mark_width=160, show_progress=True)
+        root.addWidget(self._panel)
+
+        self._cancel_btn: Optional[QPushButton] = None
+        if cancellable:
+            row = QHBoxLayout()
+            row.addStretch(1)
+            self._cancel_btn = QPushButton("Cancel", self)
+            self._cancel_btn.clicked.connect(self.canceled.emit)
+            row.addWidget(self._cancel_btn)
+            root.addLayout(row)
+
+        self._was_canceled = False
+        self._maximum = 0
+        self._value = 0
+
+    def labelText(self) -> str:
+        return self._panel.display_text()
+
+    def setLabelText(self, text: str) -> None:
+        self._panel.set_message(text)
+
+    def setMaximum(self, maximum: int) -> None:
+        self._maximum = max(0, int(maximum))
+        self._panel.set_progress(value=self._value, maximum=self._maximum)
+
+    def maximum(self) -> int:
+        return self._maximum
+
+    def setValue(self, value: int) -> None:
+        self._value = max(0, int(value))
+        if self._maximum > 0:
+            self._panel.set_progress(value=self._value, maximum=self._maximum)
+
+    def wasCanceled(self) -> bool:
+        return self._was_canceled
+
+    def setCancelButton(self, button: Optional[QPushButton]) -> None:
+        if button is None and self._cancel_btn is not None:
+            self._cancel_btn.hide()
+            self._cancel_btn.setEnabled(False)
+
+    def setCancelButtonText(self, text: str) -> None:
+        if self._cancel_btn is not None:
+            self._cancel_btn.setText(text)
+
+    def mark_canceled(self) -> None:
+        self._was_canceled = True
+
+    def reset(self) -> None:
+        self._value = 0
+        self._maximum = 0
+        self._panel.reset_progress()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._panel.start()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        self._panel.stop()
+        super().hideEvent(event)
+
+
 class UploadBusy:
-    """Show a progress dialog while an upload is processed.
+    """Show a branded progress dialog while an upload is processed.
 
     Use as a context manager around parse / staging work so the user always
     sees that the system is busy before any preview or result appears.
@@ -39,40 +141,20 @@ class UploadBusy:
         self._cancellable = cancellable
         self._cancel_event = threading.Event()
         self._closing = False
-        cancel_text = "Cancel" if cancellable else None
-        self._dlg = QProgressDialog(message, cancel_text, 0, 0, parent)
-        self._dlg.setWindowTitle(title)
-        self._dlg.setWindowModality(Qt.WindowModal)
-        self._dlg.setMinimumDuration(0)
-        if not cancellable:
-            self._dlg.setCancelButton(None)
-        else:
-            self._dlg.setCancelButtonText("Cancel")
-            self._dlg.canceled.connect(self._on_canceled)
-        self._dlg.setMinimumWidth(360)
-        self._dlg.setAutoClose(False)
-        self._dlg.setAutoReset(False)
-        # Explicit light contrast — Windows dark mode otherwise paints white text.
-        self._dlg.setStyleSheet(
-            "QProgressDialog { background: #FFFFFF; color: #111827; }"
-            "QProgressDialog QLabel { color: #111827; background: transparent; }"
-            "QProgressDialog QPushButton {"
-            "  background: #FFFFFF; color: #111827; border: 1px solid #D1D5DB;"
-            "  border-radius: 5px; padding: 6px 16px; min-width: 72px;"
-            "  min-height: 28px; font-size: 13px;"
-            "}"
-            "QProgressDialog QPushButton:hover { background: #F3F4F6; }"
-            "QProgressBar {"
-            "  background: #E5E7EB; border: none; border-radius: 4px;"
-            "  text-align: center; color: #111827; min-height: 12px;"
-            "}"
-            "QProgressBar::chunk { background: #0077C5; border-radius: 4px; }"
+        self._dlg = _BusyDialog(
+            parent,
+            message,
+            title=title,
+            cancellable=cancellable,
         )
+        if cancellable:
+            self._dlg.canceled.connect(self._on_canceled)
 
     def _on_canceled(self) -> None:
         if self._closing:
             return
         self._cancel_event.set()
+        self._dlg.mark_canceled()
         self._dlg.setLabelText("Cancelling…")
         self._dlg.setCancelButton(None)
 

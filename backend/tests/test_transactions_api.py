@@ -21,6 +21,15 @@ def _matches(doc: dict, query: dict) -> bool:
             continue
         actual = doc.get(key)
         if isinstance(expected, dict):
+            if "$type" in expected:
+                want = expected["$type"]
+                if want == "string" and not isinstance(actual, str):
+                    return False
+                if want == "null" and actual is not None:
+                    return False
+                if "$ne" in expected and actual == expected["$ne"]:
+                    return False
+                continue
             if "$ne" in expected and actual == expected["$ne"]:
                 return False
             if "$exists" in expected:
@@ -112,9 +121,24 @@ class FakeTransactions:
                             "_id": None,
                             "count": len(docs),
                             "tzs_total": sum(float(d.get("amount") or 0) for d in docs),
-                            "receipt_received": 0,
-                            "receipt_pending": 0,
-                            "receipt_missing": 0,
+                            "receipt_received": sum(
+                                1
+                                for d in docs
+                                if d.get("receipt_status") == "received"
+                            ),
+                            "receipt_pending": sum(
+                                1
+                                for d in docs
+                                if d.get("receipt_status") == "pending"
+                            ),
+                            "receipt_missing": sum(
+                                1
+                                for d in docs
+                                if d.get("receipt_status") == "missing"
+                            ),
+                            "verified": sum(
+                                1 for d in docs if d.get("verified") is True
+                            ),
                             "unverified": sum(
                                 1 for d in docs if d.get("verified") is False
                             ),
@@ -159,6 +183,35 @@ class FakeTransactions:
                         reverse=True,
                     )
                     docs = [{"_id": year} for year in years]
+                elif group.get("_id") == "$daily_import_id":
+                    buckets: dict[str, dict] = {}
+                    for d in docs:
+                        key = str(d.get("daily_import_id") or "")
+                        if not key:
+                            continue
+                        bucket = buckets.setdefault(
+                            key,
+                            {
+                                "_id": key,
+                                "source_filename": d.get("daily_import_source"),
+                                "count": 0,
+                                "primary_date": d.get("import_primary_date"),
+                                "min_date": d.get("date"),
+                                "max_date": d.get("date"),
+                                "created_at": d.get("created_at"),
+                                "cashier_id": d.get("cashier_id"),
+                                "outlier_count": 0,
+                                "duplicate_count": 0,
+                            },
+                        )
+                        bucket["count"] += 1
+                        if d.get("possible_duplicate"):
+                            bucket["duplicate_count"] += 1
+                    docs = list(buckets.values())
+            elif "$sort" in stage:
+                continue
+            elif "$limit" in stage:
+                docs = docs[: int(stage["$limit"])]
         return FakeCursor(docs)
 
     async def update_one(self, query: dict, update: dict) -> SimpleNamespace:
@@ -172,7 +225,11 @@ class FakeTransactions:
         count = 0
         for doc in self.documents:
             if _matches(doc, query):
-                doc.update(update.get("$set") or {})
+                if "$unset" in update:
+                    for key in update["$unset"]:
+                        doc.pop(key, None)
+                if "$set" in update:
+                    doc.update(update["$set"])
                 count += 1
         return SimpleNamespace(matched_count=count, modified_count=count)
 
@@ -596,6 +653,98 @@ def test_search_and_browse_and_meta() -> None:
     assert "today" in overview.json() and "recent" in overview.json()
     assert resolve.json()["item"] == "Stationery"
     assert prefix.status_code == 200
+
+
+def test_cashier_daily_uploads_endpoint() -> None:
+    user = _cashier()
+    other = ObjectId()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": ObjectId(),
+                "cashier_id": user["_id"],
+                "daily_import_id": "mine",
+                "daily_import_source": "mine.xlsx",
+                "date": datetime(2026, 3, 1),
+                "created_at": datetime(2026, 3, 2),
+            },
+            {
+                "_id": ObjectId(),
+                "cashier_id": other,
+                "daily_import_id": "theirs",
+                "daily_import_source": "theirs.xlsx",
+                "date": datetime(2026, 3, 1),
+                "created_at": datetime(2026, 3, 2),
+            },
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        resp = client.get("/v1/transactions/daily-uploads?limit=50")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["_id"] == "mine"
+
+
+def test_overview_charts() -> None:
+    user = _cashier()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": ObjectId(),
+                "cashier_id": user["_id"],
+                "date": datetime(2026, 3, 12, 9, 0, 0),
+                "amount": 40_000,
+                "currency": "TZS",
+                "item": "DIESEL",
+                "payee": "INFINITY",
+                "trashed": False,
+                "discarded": False,
+            },
+            {
+                "_id": ObjectId(),
+                "cashier_id": user["_id"],
+                "date": datetime(2026, 4, 2, 9, 0, 0),
+                "amount": 10_000,
+                "currency": "TZS",
+                "category_name": "MILEAGE",
+                "payee": "LAKE ZAMBIA",
+                "trashed": False,
+                "discarded": False,
+            },
+            {
+                "_id": ObjectId(),
+                "cashier_id": ObjectId(),
+                "date": datetime(2026, 4, 2, 9, 0, 0),
+                "amount": 99_000,
+                "currency": "TZS",
+                "item": "OTHER CASHIER",
+                "payee": "SOMEONE",
+                "trashed": False,
+                "discarded": False,
+            },
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        resp = client.get("/v1/transactions/overview-charts?year=2026")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["year"] == 2026
+    names = [row["name"] for row in body["items"]]
+    assert "DIESEL" in names
+    assert "MILEAGE" in names
+    assert "OTHER CASHIER" not in names
+    payee_labels = [row["label"] for row in body["payees"]["series"]]
+    assert payee_labels[0] == "INFINITY"
+    assert "SOMEONE" not in payee_labels
 
 
 def test_rejected_discarded_and_drafts() -> None:

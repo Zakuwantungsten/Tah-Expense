@@ -165,7 +165,8 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400, color: str = _T1) ->
 
 
 def _input_ss() -> str:
-    return (
+    from tahmeed.ui.widgets.combo_styles import with_combo_popup
+    return with_combo_popup(
         f"QLineEdit, QComboBox, QDateEdit {{"
         f"  border: 1px solid {_BORDER}; border-radius: 5px;"
         f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"

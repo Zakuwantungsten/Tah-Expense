@@ -484,7 +484,7 @@ async def get_cashier_names(cashier_ids: List[ObjectId]) -> Dict[ObjectId, str]:
 
 
 async def get_pending_count() -> int:
-    """Sidebar / inbox badge: submitted unverified + deletion requests."""
+    """Sidebar / inbox badge: unverified + deletion + restore requests."""
     payload = await api_client.request("GET", "v1/accountant/counts/pending")
     return int(payload.get("count") or 0)
 
@@ -1315,6 +1315,139 @@ async def bulk_restore_deletions(tx_ids: List[ObjectId]) -> int:
     return int(payload.get("updated") or 0)
 
 
+# ── Restore-request queries (accountant "Restore" sub-tab) ────────────────────
+
+async def get_restore_requested_filtered(
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 25,
+    skip: int = 0,
+    item="",
+    description="",
+) -> List[Transaction]:
+    """Trashed rows the cashier asked to bring back."""
+    params = _inbox_params(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        item=item,
+        description=description,
+        limit=limit,
+        skip=skip,
+    )
+    payload = await api_client.request(
+        "GET", "v1/accountant/restores", params=params
+    )
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
+
+
+async def count_restore_requested_filtered(
+    search: str = "",
+    truck: str = "",
+    cashier_id: Optional[ObjectId] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    item="",
+    description="",
+) -> int:
+    params = _inbox_params(
+        search=search,
+        truck=truck,
+        cashier_id=cashier_id,
+        date_from=date_from,
+        date_to=date_to,
+        item=item,
+        description=description,
+    )
+    payload = await api_client.request(
+        "GET", "v1/accountant/restores/count", params=params
+    )
+    return int(payload.get("count") or 0)
+
+
+async def get_restore_requested_trucks() -> List[str]:
+    payload = await api_client.request(
+        "GET", "v1/accountant/restores/meta/trucks"
+    )
+    return list(payload.get("items") or [])
+
+
+async def get_restore_requested_cashier_ids() -> List[ObjectId]:
+    payload = await api_client.request(
+        "GET", "v1/accountant/restores/meta/cashiers"
+    )
+    return _oids_from_api_items(payload.get("items") or [])
+
+
+async def get_restore_requested_items(
+    descriptions: Optional[List[str]] = None,
+) -> List[str]:
+    params: dict = {}
+    csv = _csv_param(descriptions or [])
+    if csv:
+        params["descriptions"] = csv
+    payload = await api_client.request(
+        "GET", "v1/accountant/restores/meta/items", params=params
+    )
+    return list(payload.get("items") or [])
+
+
+async def get_restore_requested_descriptions(
+    items: Optional[List[str]] = None,
+) -> List[str]:
+    params: dict = {}
+    csv = _csv_param(items or [])
+    if csv:
+        params["items"] = csv
+    payload = await api_client.request(
+        "GET", "v1/accountant/restores/meta/descriptions", params=params
+    )
+    return list(payload.get("items") or [])
+
+
+async def confirm_restore(tx_id: ObjectId) -> bool:
+    """Approve cashier restore — return row to Master / register."""
+    payload = await api_client.request(
+        "POST", f"v1/accountant/restores/{tx_id}/confirm"
+    )
+    return bool(payload.get("ok"))
+
+
+async def reject_restore(tx_id: ObjectId) -> bool:
+    """Deny cashier restore — keep row in Trash."""
+    payload = await api_client.request(
+        "POST", f"v1/accountant/restores/{tx_id}/reject"
+    )
+    return bool(payload.get("ok"))
+
+
+async def bulk_confirm_restores(tx_ids: List[ObjectId]) -> int:
+    if not tx_ids:
+        return 0
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/restores/bulk-confirm",
+        json={"ids": [str(oid) for oid in tx_ids]},
+    )
+    return int(payload.get("updated") or 0)
+
+
+async def bulk_reject_restores(tx_ids: List[ObjectId]) -> int:
+    if not tx_ids:
+        return 0
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/restores/bulk-reject",
+        json={"ids": [str(oid) for oid in tx_ids]},
+    )
+    return int(payload.get("updated") or 0)
+
+
 # ── Trash (soft-deleted confirmed removals) ───────────────────────────────────
 
 async def get_trashed_transactions(
@@ -1530,6 +1663,51 @@ async def bulk_re_approve_transactions(
         json={"ids": [str(oid) for oid in tx_ids]},
     )
     return int(payload.get("updated") or 0)
+
+
+def _dates_from_meta_payload(payload: dict) -> List[date]:
+    """Parse ``{items: [{date: YYYY-MM-DD}, ...]}`` from verify meta endpoints."""
+    out: List[date] = []
+    for row in payload.get("items") or []:
+        raw = row.get("date") if isinstance(row, dict) else row
+        text = str(raw or "").strip()[:10]
+        if not text:
+            continue
+        try:
+            out.append(date.fromisoformat(text))
+        except ValueError:
+            continue
+    return out
+
+
+async def get_unverified_available_dates(
+    *, edited: Optional[bool] = False,
+) -> List[date]:
+    """Expense days present in New (edited=False) or Edited (edited=True) queues."""
+    params: dict = {}
+    if edited is True:
+        params["edited"] = "true"
+    elif edited is False:
+        params["edited"] = "false"
+    payload = await api_client.request(
+        "GET", "v1/accountant/inbox/meta/dates", params=params
+    )
+    return _dates_from_meta_payload(payload)
+
+
+async def get_rejected_available_dates() -> List[date]:
+    payload = await api_client.request("GET", "v1/accountant/rejected/meta/dates")
+    return _dates_from_meta_payload(payload)
+
+
+async def get_deletion_requested_available_dates() -> List[date]:
+    payload = await api_client.request("GET", "v1/accountant/deletions/meta/dates")
+    return _dates_from_meta_payload(payload)
+
+
+async def get_restore_requested_available_dates() -> List[date]:
+    payload = await api_client.request("GET", "v1/accountant/restores/meta/dates")
+    return _dates_from_meta_payload(payload)
 
 
 async def get_unverified_trucks() -> List[str]:

@@ -102,7 +102,7 @@ def test_export_truck_overview_pdf_writes_landscape_with_all_columns(tmp_path: P
 
         text = "\n".join(p.get_text("text") for p in doc).replace("\xa0", " ")
         upper = text.upper()
-        assert "TAHMEED TRANSPORTERS" in text
+        assert "TAHMEED COACH" in text
         assert "FLEET EXPENSE REPORT" in upper
         assert "TRUCK OVERVIEW" in upper
         assert "CONFIDENTIAL" in text

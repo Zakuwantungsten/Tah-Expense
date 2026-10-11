@@ -350,6 +350,47 @@ def test_daily_uploads_records_delete_cleanup() -> None:
     assert all(d.get("daily_import_id") != "up-a" for d in txs.documents)
 
 
+def test_cashier_can_list_own_daily_uploads() -> None:
+    cashier_id = ObjectId()
+    other_id = ObjectId()
+    txs = FakeCollection(
+        [
+            {
+                "_id": ObjectId(),
+                "daily_import_id": "mine",
+                "daily_import_source": "mine.xlsx",
+                "cashier_id": cashier_id,
+                "date": datetime(2026, 3, 1),
+                "created_at": datetime(2026, 3, 2),
+            },
+            {
+                "_id": ObjectId(),
+                "daily_import_id": "theirs",
+                "daily_import_source": "theirs.xlsx",
+                "cashier_id": other_id,
+                "date": datetime(2026, 3, 1),
+                "created_at": datetime(2026, 3, 2),
+            },
+        ]
+    )
+    app = _app(txs)
+    app.dependency_overrides[current_user] = lambda: {
+        "_id": cashier_id,
+        "username": "cash1",
+        "role": "cashier",
+    }
+
+    with TestClient(app) as client:
+        uploads = client.get("/v1/imports/daily/uploads")
+        forbidden = client.delete("/v1/imports/daily/uploads/mine")
+
+    assert uploads.status_code == 200
+    body = uploads.json()
+    assert len(body) == 1
+    assert body[0]["_id"] == "mine"
+    assert forbidden.status_code == 403
+
+
 def test_daily_issues_list_count_clear() -> None:
     tx_id = ObjectId()
     txs = FakeCollection(

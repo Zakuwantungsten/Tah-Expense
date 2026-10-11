@@ -14,6 +14,7 @@ from .accountant_ops import (
     apply_cascade_filters,
     build_inbox_query,
     edited_count_query,
+    format_available_dates,
     inbox_base_query,
     pending_inbox_count_query,
 )
@@ -24,6 +25,9 @@ from .serialization import json_safe, object_id
 inbox = APIRouter(tags=["accountant"])
 
 Manager = Annotated[dict[str, Any], Depends(require_roles("admin", "accountant"))]
+RegisterActor = Annotated[
+    dict[str, Any], Depends(require_roles("admin", "cashier", "accountant"))
+]
 
 
 def _database(request: Request) -> Any:
@@ -199,14 +203,35 @@ async def count_edited_inbox(
 async def pending_count(request: Request, _manager: Manager) -> dict:
     db = _database(request)
     inbox_n = await db.transactions.count_documents(pending_inbox_count_query())
-    deletions = await db.transactions.count_documents({"deletion_requested": True})
-    return {"count": int(inbox_n) + int(deletions)}
+    deletions = await db.transactions.count_documents(
+        {"deletion_requested": True, "trashed": {"$ne": True}}
+    )
+    restores = await db.transactions.count_documents(
+        {"trashed": True, "restore_requested": True}
+    )
+    return {"count": int(inbox_n) + int(deletions) + int(restores)}
 
 
 @inbox.get("/counts/edited")
 async def edited_badge_count(request: Request, _manager: Manager) -> dict:
     total = await _database(request).transactions.count_documents(edited_count_query())
     return {"count": int(total)}
+
+
+@inbox.get("/inbox/meta/dates")
+async def inbox_dates(
+    request: Request,
+    _manager: Manager,
+    edited: bool | None = None,
+) -> dict:
+    """Distinct expense days present in the New/Edited verify queues."""
+    query = dict(inbox_base_query(rejected=False))
+    if edited is True:
+        query["edited_after_verification"] = True
+    elif edited is False:
+        query["edited_after_verification"] = {"$ne": True}
+    vals = await _database(request).transactions.distinct("date", query)
+    return {"items": format_available_dates(vals)}
 
 
 @inbox.get("/inbox/meta/trucks")
@@ -262,9 +287,10 @@ async def inbox_cashier_ids(request: Request, _manager: Manager) -> dict:
 @inbox.get("/cashier-names")
 async def cashier_names(
     request: Request,
-    _manager: Manager,
+    _actor: RegisterActor,
     ids: str = Query("", description="Comma-separated user ObjectIds"),
 ) -> dict:
+    del _actor  # auth gate only — cashiers need names for Browse/Uploads columns
     raw_ids = [part.strip() for part in ids.split(",") if part.strip()]
     if not raw_ids:
         return {"names": {}}

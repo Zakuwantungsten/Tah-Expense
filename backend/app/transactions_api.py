@@ -14,6 +14,7 @@ from .audit_ops import record_operation_event
 from .dependencies import Authenticated, require_roles
 from .errors import ApiError
 from .schemas import (
+    BulkIdsRequest,
     DayOrderRequest,
     DuplicateCheckRequest,
     PendingEditRequest,
@@ -27,6 +28,8 @@ from .schemas import (
 from .security import utcnow
 from .serialization import json_safe, object_id
 from .attachments_api import attachments as attachments_router
+from .cashier_overview_ops import compute_overview_charts
+from .import_ops import daily_uploads_pipeline, null_daily_import_id_filter
 from .mongo_async import aggregate_list
 from .transaction_ops import (
     DRAFT_BASE_MATCH,
@@ -50,6 +53,7 @@ _OBJECT_ID_FIELDS = {
     "last_edited_by",
     "deletion_requested_by",
     "trashed_by",
+    "restore_requested_by",
     "original_transaction_id",
 }
 _DATETIME_FIELDS = {
@@ -59,6 +63,7 @@ _DATETIME_FIELDS = {
     "last_edited_at",
     "deletion_requested_at",
     "trashed_at",
+    "restore_requested_at",
     "created_at",
     "import_primary_date",
 }
@@ -123,6 +128,7 @@ def _create_document(body: TransactionCreate, actor: dict[str, Any]) -> dict[str
     doc.setdefault("discarded", False)
     doc.setdefault("deletion_requested", False)
     doc.setdefault("trashed", False)
+    doc.setdefault("restore_requested", False)
     doc.setdefault("register_status", "draft")
     doc.setdefault("attachments", [])
     return doc
@@ -238,16 +244,22 @@ async def search_transactions(
 
 
 @transactions.get("/overview-stats")
-async def overview_stats(request: Request, _actor: RegisterActor) -> dict:
+async def overview_stats(
+    request: Request,
+    actor: RegisterActor,
+    cashier_id: str | None = None,
+) -> dict:
     db = _database(request)
     today = date.today()
     today_start = datetime(today.year, today.month, today.day)
     today_end = datetime(today.year, today.month, today.day, 23, 59, 59)
     month_start = datetime(today.year, today.month, 1)
+    scope = _actor_cashier_id(actor, cashier_id)
 
     def _money_group(match: dict[str, Any]) -> list[dict[str, Any]]:
+        scoped = {**match, "cashier_id": scope, "trashed": {"$ne": True}}
         return [
-            {"$match": match},
+            {"$match": scoped},
             {
                 "$group": {
                     "_id": None,
@@ -268,6 +280,9 @@ async def overview_stats(request: Request, _actor: RegisterActor) -> dict:
                             "$cond": [{"$eq": ["$receipt_status", "missing"]}, 1, 0]
                         }
                     },
+                    "verified": {
+                        "$sum": {"$cond": [{"$eq": ["$verified", True]}, 1, 0]}
+                    },
                     "unverified": {
                         "$sum": {"$cond": [{"$eq": ["$verified", False]}, 1, 0]}
                     },
@@ -282,7 +297,9 @@ async def overview_stats(request: Request, _actor: RegisterActor) -> dict:
         _money_group({"date": {"$gte": month_start}})
     , 1)
     recent_docs = (
-        await db.transactions.find({})
+        await db.transactions.find(
+            {"cashier_id": scope, "trashed": {"$ne": True}}
+        )
         .sort([("date", -1), ("created_at", -1)])
         .limit(8)
         .to_list(8)
@@ -293,6 +310,7 @@ async def overview_stats(request: Request, _actor: RegisterActor) -> dict:
         "receipt_received": 0,
         "receipt_pending": 0,
         "receipt_missing": 0,
+        "verified": 0,
         "unverified": 0,
     }
 
@@ -308,6 +326,92 @@ async def overview_stats(request: Request, _actor: RegisterActor) -> dict:
             "recent": recent_docs,
         }
     )
+
+
+@transactions.get("/overview-charts")
+async def overview_charts(
+    request: Request,
+    actor: RegisterActor,
+    year: int | None = None,
+    top_items: int = Query(4, ge=1, le=12),
+    top_payees: int = Query(5, ge=1, le=12),
+    cashier_id: str | None = None,
+) -> dict:
+    """Item spend donut + top-payee daily series for cashier Overview."""
+    fy = int(year or date.today().year)
+    year_start = datetime(fy, 1, 1)
+    year_end = datetime(fy, 12, 31, 23, 59, 59)
+    scope = _actor_cashier_id(actor, cashier_id)
+    match: dict[str, Any] = {
+        "cashier_id": scope,
+        "date": {"$gte": year_start, "$lte": year_end},
+        "trashed": {"$ne": True},
+        "discarded": {"$ne": True},
+    }
+    docs = (
+        await _database(request)
+        .transactions.find(
+            match,
+            {
+                "date": 1,
+                "amount": 1,
+                "currency": 1,
+                "item": 1,
+                "category_name": 1,
+                "payee": 1,
+                "trashed": 1,
+                "discarded": 1,
+            },
+        )
+        .to_list(length=50_000)
+    )
+    return json_safe(
+        compute_overview_charts(
+            docs,
+            year=fy,
+            top_items=top_items,
+            top_payees=top_payees,
+        )
+    )
+
+
+@transactions.get("/daily-uploads")
+async def cashier_daily_uploads(
+    request: Request,
+    actor: RegisterActor,
+    limit: int = Query(100, ge=1, le=500),
+    cashier_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Excel upload batches for Browse → Uploads.
+
+    Cashiers only see their own batches; admin/accountant see all (optional filter).
+    """
+    if cashier_id:
+        scope: ObjectId | None = _valid_id(cashier_id)
+    elif str(actor.get("role") or "").lower() == "cashier":
+        scope = _actor_cashier_id(actor, None)
+    else:
+        scope = None
+    db = _database(request)
+    heal_filter: dict[str, Any] = null_daily_import_id_filter()
+    if scope is not None:
+        heal_filter = {"$and": [heal_filter, {"cashier_id": scope}]}
+    await db.transactions.update_many(
+        heal_filter,
+        {
+            "$unset": {
+                "daily_import_id": "",
+                "daily_import_source": "",
+                "import_primary_date": "",
+            }
+        },
+    )
+    rows = await aggregate_list(
+        db.transactions,
+        daily_uploads_pipeline(limit=limit, cashier_id=scope),
+        length=limit,
+    )
+    return json_safe(rows)
 
 
 @transactions.get("/by-category")
@@ -1031,6 +1135,87 @@ async def check_for_duplicates(
     return {"items": json_safe(docs), "total": len(docs)}
 
 
+@transactions.get("/trash")
+async def list_cashier_trash(
+    request: Request,
+    actor: RegisterActor,
+    search: str = "",
+    limit: int = Query(100, ge=1, le=500),
+    skip: int = Query(0, ge=0),
+) -> dict:
+    """Soft-deleted rows owned by the cashier (after accountant confirmed delete)."""
+    db = _database(request)
+    query: dict[str, Any] = {
+        "trashed": True,
+        "cashier_id": actor.get("_id"),
+    }
+    if search.strip():
+        esc = re.escape(search.strip())
+        query["$or"] = [
+            {"description": {"$regex": esc, "$options": "i"}},
+            {"item": {"$regex": esc, "$options": "i"}},
+            {"truck_number": {"$regex": esc, "$options": "i"}},
+            {"category_name": {"$regex": esc, "$options": "i"}},
+        ]
+    docs = (
+        await db.transactions.find(query)
+        .sort([("trashed_at", -1), ("date", -1)])
+        .skip(skip)
+        .limit(limit)
+        .to_list(length=limit)
+    )
+    total = await db.transactions.count_documents(query)
+    return {"items": json_safe(docs), "total": int(total)}
+
+
+@transactions.get("/trash/count")
+async def count_cashier_trash(request: Request, actor: RegisterActor) -> dict:
+    total = await _database(request).transactions.count_documents(
+        {"trashed": True, "cashier_id": actor.get("_id")}
+    )
+    return {"count": int(total)}
+
+
+@transactions.post("/trash/bulk-request-restore")
+async def bulk_request_restore_from_trash(
+    body: BulkIdsRequest,
+    request: Request,
+    actor: RegisterActor,
+) -> dict:
+    ids = [_valid_id(str(raw).strip()) for raw in body.ids if str(raw).strip()]
+    if not ids:
+        return {"updated": 0}
+    cashier_id = actor.get("_id")
+    now = utcnow().replace(tzinfo=None)
+    result = await _database(request).transactions.update_many(
+        {
+            "_id": {"$in": ids},
+            "trashed": True,
+            "cashier_id": cashier_id,
+            "restore_requested": {"$ne": True},
+        },
+        {
+            "$set": {
+                "restore_requested": True,
+                "restore_requested_at": now,
+                "restore_requested_by": cashier_id,
+            }
+        },
+    )
+    n = int(result.modified_count)
+    if n:
+        await record_operation_event(
+            _database(request),
+            action="txn.request_restore_bulk",
+            actor=actor,
+            request=request,
+            entity_type="transaction",
+            entity_ids=[str(oid) for oid in ids],
+            details={"count": n},
+        )
+    return {"updated": n}
+
+
 @transactions.get("/{tx_id}")
 async def get_transaction(
     tx_id: str, request: Request, _user: Authenticated
@@ -1137,6 +1322,83 @@ async def request_or_delete_transaction(
         entity_ids=[str(oid)],
     )
     return {"result": "deletion_requested"}
+
+
+@transactions.post("/{tx_id}/request-restore")
+async def request_restore_from_trash(
+    tx_id: str,
+    request: Request,
+    actor: RegisterActor,
+    body: RequestDeleteBody | None = None,
+) -> dict:
+    """Cashier asks accountant to restore a trashed expense."""
+    oid = _valid_id(tx_id)
+    db = _database(request)
+    cashier_id = actor.get("_id")
+    if body and body.cashier_id:
+        cashier_id = _valid_id(body.cashier_id)
+    doc = await db.transactions.find_one(
+        {"_id": oid, "trashed": True, "cashier_id": cashier_id}
+    )
+    if not doc:
+        return {"result": "not_found"}
+    if doc.get("restore_requested"):
+        return {"result": "already_requested"}
+    await db.transactions.update_one(
+        {"_id": oid, "trashed": True, "cashier_id": cashier_id},
+        {
+            "$set": {
+                "restore_requested": True,
+                "restore_requested_at": utcnow().replace(tzinfo=None),
+                "restore_requested_by": cashier_id,
+            }
+        },
+    )
+    await record_operation_event(
+        db,
+        action="txn.request_restore",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(oid)],
+    )
+    return {"result": "restore_requested"}
+
+
+@transactions.post("/{tx_id}/cancel-restore")
+async def cancel_restore_request(
+    tx_id: str,
+    request: Request,
+    actor: RegisterActor,
+) -> dict:
+    """Cashier withdraws a pending restore request (row stays in trash)."""
+    oid = _valid_id(tx_id)
+    result = await _database(request).transactions.update_one(
+        {
+            "_id": oid,
+            "trashed": True,
+            "cashier_id": actor.get("_id"),
+            "restore_requested": True,
+        },
+        {
+            "$set": {
+                "restore_requested": False,
+                "restore_requested_at": None,
+                "restore_requested_by": None,
+            }
+        },
+    )
+    ok = result.modified_count == 1
+    if ok:
+        await record_operation_event(
+            _database(request),
+            action="txn.cancel_restore",
+            actor=actor,
+            request=request,
+            entity_type="transaction",
+            entity_ids=[str(oid)],
+        )
+    return {"ok": ok}
 
 
 @transactions.post("/{tx_id}/pending-edit", status_code=201)

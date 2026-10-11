@@ -15,6 +15,35 @@ UNVERIFIED_INBOX_SORT = [("date", -1), ("day_order", 1), ("created_at", 1)]
 EDITED_INBOX_SORT = [("last_edited_at", -1), ("date", -1)]
 
 
+def to_day_key(value: Any) -> str | None:
+    """Normalize a stored date/datetime to ``YYYY-MM-DD`` (UTC-naive calendar day)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    if not text:
+        return None
+    # Accept ISO timestamps / date-only strings.
+    try:
+        if "T" in text or " " in text:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+        return date.fromisoformat(text[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+def format_available_dates(raw_values: Sequence[Any]) -> list[dict[str, str]]:
+    """Unique expense days from distinct() values, newest first."""
+    days = sorted(
+        {key for key in (to_day_key(v) for v in raw_values) if key},
+        reverse=True,
+    )
+    return [{"date": day} for day in days]
+
+
 def inbox_base_query(*, rejected: bool = False) -> dict[str, Any]:
     if rejected:
         return {"rejected": True, "discarded": {"$ne": True}}
@@ -149,8 +178,8 @@ def build_inbox_query(
             df["$gte"] = date_from
         if date_to is not None:
             df["$lte"] = date_to
-        date_field = "last_edited_at" if edited is True else "date"
-        query[date_field] = df
+        # Day picker filters by expense/register date on every queue.
+        query["date"] = df
     return query
 
 
@@ -260,7 +289,7 @@ def build_deletion_query(
             df["$gte"] = date_from
         if date_to is not None:
             df["$lte"] = date_to
-        query["deletion_requested_at"] = df
+        query["date"] = df
     return query
 
 
@@ -290,6 +319,71 @@ def deletion_descriptions_query(items: Sequence[str] | None = None) -> dict[str,
 
 TRASH_SORT = [("trashed_at", -1), ("date", -1)]
 VERIFIED_SORT = [("date", -1), ("created_at", -1)]
+
+RESTORE_BASE_MATCH: dict[str, Any] = {
+    "trashed": True,
+    "restore_requested": True,
+}
+
+RESTORE_SORT = [("restore_requested_at", -1), ("date", -1)]
+
+
+def build_restore_query(
+    *,
+    search: str = "",
+    truck: str = "",
+    cashier_id: ObjectId | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    item: str | Sequence[str] | None = "",
+    description: str | Sequence[str] | None = "",
+) -> dict[str, Any]:
+    """Pending cashier restore requests awaiting accountant approval."""
+    query: dict[str, Any] = dict(RESTORE_BASE_MATCH)
+    and_clauses: list[dict[str, Any]] = []
+    append_text_filters(
+        and_clauses, search=search, item=item, description=description
+    )
+    if and_clauses:
+        query["$and"] = and_clauses
+    if truck.strip():
+        query["truck_number"] = {
+            "$regex": re.escape(truck.strip()),
+            "$options": "i",
+        }
+    if cashier_id is not None:
+        query["cashier_id"] = cashier_id
+    if date_from or date_to:
+        df: dict[str, Any] = {}
+        if date_from is not None:
+            df["$gte"] = date_from
+        if date_to is not None:
+            df["$lte"] = date_to
+        query["date"] = df
+    return query
+
+
+def restore_items_query(descriptions: Sequence[str] | None = None) -> dict[str, Any]:
+    base: dict[str, Any] = dict(RESTORE_BASE_MATCH)
+    descs = normalize_multi_filter(list(descriptions or []))
+    if descs:
+        base["$or"] = [
+            {"description": {"$regex": re.escape(d), "$options": "i"}} for d in descs
+        ]
+    return base
+
+
+def restore_descriptions_query(items: Sequence[str] | None = None) -> dict[str, Any]:
+    base: dict[str, Any] = dict(RESTORE_BASE_MATCH)
+    item_list = normalize_multi_filter(list(items or []))
+    if item_list:
+        ors: list[dict[str, Any]] = []
+        for it in item_list:
+            esc = re.escape(it)
+            ors.append({"item": {"$regex": f"^{esc}$", "$options": "i"}})
+            ors.append({"category_name": {"$regex": f"^{esc}$", "$options": "i"}})
+        base["$or"] = ors
+    return base
 
 
 def build_trash_query(

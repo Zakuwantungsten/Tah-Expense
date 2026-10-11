@@ -30,42 +30,49 @@ class BackupWidget(QWidget):
 
     logout_requested = Signal()
 
-    def __init__(self, parent=None, *, allow_restore: bool = False) -> None:
+    def __init__(
+        self,
+        parent=None,
+        *,
+        allow_restore: bool = False,
+        show_chrome: bool = True,
+        show_actions: bool = True,
+    ) -> None:
         super().__init__(parent)
         self._allow_restore = allow_restore
+        self._show_chrome = show_chrome
+        self._show_actions = show_actions
         self._jobs: list[BackupJob] = []
         self._busy = False
         self._build()
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 20)
+        root.setContentsMargins(24 if self._show_chrome else 0, 12 if self._show_chrome else 0, 24 if self._show_chrome else 0, 20)
         root.setSpacing(12)
 
-        title = QLabel("Database Backup Status")
-        title.setStyleSheet("color:#1F2937; font:700 22px 'Segoe UI';")
-        root.addWidget(title)
+        if self._show_chrome:
+            title = QLabel("Database Backup Status")
+            title.setStyleSheet("color:#1F2937; font:700 22px 'Segoe UI';")
+            root.addWidget(title)
 
-        description = QLabel(
-            "Backups are created and stored by the server. This page shows "
-            "their current status and recent history."
-            + (
-                " You can restore an Uploaded backup into the live database."
-                if self._allow_restore
-                else ""
+            description = QLabel(
+                "Backups are created and stored by the server. This page shows "
+                "their current status and recent history."
+                + (
+                    " You can restore an Uploaded backup into the live database."
+                    if self._allow_restore
+                    else ""
+                )
             )
-        )
-        description.setWordWrap(True)
-        description.setStyleSheet("color:#6B7280; font:13px 'Segoe UI';")
-        root.addWidget(description)
+            description.setWordWrap(True)
+            description.setStyleSheet("color:#6B7280; font:13px 'Segoe UI';")
+            root.addWidget(description)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
         self._refresh_button = QPushButton("Refresh")
         self._refresh_button.setIcon(qta.icon("mdi.refresh", color="#374151"))
         self._refresh_button.setFixedWidth(110)
         self._refresh_button.clicked.connect(self.refresh)
-        actions.addWidget(self._refresh_button)
 
         self._restore_button = QPushButton("Restore selected…")
         self._restore_button.setIcon(qta.icon("mdi.database-refresh", color="#FFFFFF"))
@@ -78,9 +85,14 @@ class BackupWidget(QWidget):
             "QPushButton:hover:!disabled{background:#991B1B;}"
         )
         self._restore_button.clicked.connect(self._confirm_restore)
-        actions.addWidget(self._restore_button)
-        actions.addStretch()
-        root.addLayout(actions)
+
+        if self._show_actions:
+            actions = QHBoxLayout()
+            actions.setSpacing(8)
+            actions.addWidget(self._refresh_button)
+            actions.addWidget(self._restore_button)
+            actions.addStretch()
+            root.addLayout(actions)
 
         self._table = QTableWidget()
         self._table.setColumnCount(5)
@@ -106,6 +118,14 @@ class BackupWidget(QWidget):
         self._empty.setStyleSheet("color:#9CA3AF; font:13px 'Segoe UI';")
         root.addWidget(self._empty)
         self._overlay = LoadingOverlay(self)
+
+    @property
+    def refresh_button(self) -> QPushButton:
+        return self._refresh_button
+
+    @property
+    def restore_button(self) -> QPushButton:
+        return self._restore_button
 
     def refresh(self) -> None:
         if not self._busy:

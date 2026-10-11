@@ -25,6 +25,7 @@ from tahmeed.ui.accountant.date_filters import (
 )
 from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.combo_styles import with_combo_popup
 from tahmeed.ui.widgets.excel_column_filter import (
     ExcelFilterHeaderView, SORT_ASC, cascade_column_values,
 )
@@ -113,7 +114,7 @@ _TABLE_SS = (
     f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ width: 0; height: 0; }}"
 )
 
-_INPUT_SS = (
+_INPUT_SS = with_combo_popup(
     f"QComboBox, QDateEdit {{"
     f"  border: 1px solid {_BORDER}; border-radius: 5px;"
     f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"

@@ -1,6 +1,6 @@
 """Fleet Expense Report PDF for Truck Overview.
 
-Matches the Tahmeed Transporters report layout in A4 landscape so every
+Matches the Tahmeed Coach report layout in A4 landscape so every
 on-screen column fits: logo header, KPI cards, spend-by-source bars,
 transaction detail, signatures, confidential footer.
 """
@@ -355,7 +355,7 @@ def _header(page: fitz.Page, logo_path: Optional[Path]) -> float:
             keep_proportion=True,
         )
 
-    company = "TAHMEED TRANSPORTERS"
+    company = "TAHMEED COACH"
     company_size = 11.0
     company_w = _text_len(company, company_size, bold=True)
     _draw_text(

@@ -1,6 +1,6 @@
 """Daily Register PDF for the cashier table view.
 
-Matches the Tahmeed Transporters report style used by Truck Overview
+Matches the Tahmeed Coach report style used by Truck Overview
 (logo header, orange accent, KPI cards, dark table header, signatures,
 confidential footer) in A4 landscape so all register columns fit.
 """
@@ -272,7 +272,7 @@ def _header(page: fitz.Page, logo_path: Optional[Path]) -> float:
             keep_proportion=True,
         )
 
-    company = "TAHMEED TRANSPORTERS"
+    company = "TAHMEED COACH"
     company_size = 11.0
     company_w = _text_len(company, company_size, bold=True)
     _draw_text(

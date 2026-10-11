@@ -268,6 +268,9 @@ class MasterLedgerTable(QFrame):
         self._tbl.customContextMenuRequested.connect(self._show_context_menu)
         self._tbl.itemChanged.connect(self._on_item_changed)
         self._tbl._grid_owner = self
+        sm = self._tbl.selectionModel()
+        sm.selectionChanged.connect(lambda *_: self._tbl.viewport().update())
+        sm.currentChanged.connect(lambda *_: self._tbl.viewport().update())
 
         self._install_delegates()
 

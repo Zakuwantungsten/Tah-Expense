@@ -510,7 +510,8 @@ def _btn(text: str, icon: str = "", primary: bool = True,
 
 
 def _input_ss() -> str:
-    return (
+    from tahmeed.ui.widgets.combo_styles import with_combo_popup
+    return with_combo_popup(
         f"QLineEdit,QComboBox,QDateEdit{{border:1px solid {_BORDER};border-radius:5px;"
         f"background:{_WHITE};color:{_T1};font-size:12px;"
         f"font-family:'Segoe UI';padding:0 8px;"

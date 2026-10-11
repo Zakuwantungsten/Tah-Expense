@@ -140,7 +140,8 @@ def _lbl(text: str = "", size: int = 13, weight: int = 400, color: str = _T1) ->
 
 
 def _input_ss() -> str:
-    return (
+    from tahmeed.ui.widgets.combo_styles import with_combo_popup
+    return with_combo_popup(
         f"QLineEdit, QComboBox, QDateEdit {{"
         f" border: 1px solid {_BORDER}; border-radius: 5px;"
         f" background: {_WHITE}; color: {_T1}; font-size: 12px;"
@@ -149,10 +150,6 @@ def _input_ss() -> str:
         f"QLineEdit:focus, QComboBox:focus, QDateEdit:focus {{ border-color: {_BLUE}; }}"
         "QComboBox::drop-down { border: none; width: 20px; }"
         "QDateEdit::drop-down { border: none; width: 20px; }"
-        "QComboBox QAbstractItemView {"
-        f"  border: 1px solid {_BORDER}; background: {_WHITE}; selection-background-color: {_BLUE_L};"
-        "  outline: none; padding: 2px;"
-        "}"
     )
 
 

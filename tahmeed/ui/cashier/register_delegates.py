@@ -455,8 +455,8 @@ class _DateDelegate(_ExcelCellDelegate):
         else:
             self._paint_text(painter, option, index)
 
-        # Calendar icon — only when cell has data or is selected
-        if value or is_sel:
+        # Calendar icon — only on the active Date cell itself
+        if self._is_current(index):
             sp_icon = QApplication.style().standardIcon(QStyle.SP_FileDialogDetailedView)
             pix = sp_icon.pixmap(QSize(14, 14))
             ix = option.rect.right() - 18

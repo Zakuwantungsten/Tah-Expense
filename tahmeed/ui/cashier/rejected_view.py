@@ -342,6 +342,9 @@ class RejectedView(QWidget):
         t.itemChanged.connect(self._on_item_changed)
         t.setContextMenuPolicy(Qt.CustomContextMenu)
         t.customContextMenuRequested.connect(self._show_context_menu)
+        sm = t.selectionModel()
+        sm.selectionChanged.connect(lambda *_: t.viewport().update())
+        sm.currentChanged.connect(lambda *_: t.viewport().update())
 
         t._grid_owner = self  # used by cell delegates for Tab/Enter navigation
         self._key_filter = _TableKeyFilter(self._table_key_press)

@@ -36,7 +36,7 @@ def test_title_bar_shows_company_and_version(qapp):
     bar = AccountantTitleBar(_user())
     label = bar.findChild(QLabel, "accountantTitleText")
     assert label is not None
-    assert "TAHMEED TRANSPORTERS" in label.text()
+    assert "TAHMEED COACH" in label.text()
     assert "Accountant Edition" in label.text()
     assert "Hamdu" in label.text()
 

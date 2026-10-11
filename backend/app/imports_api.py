@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from .dependencies import require_roles
 from .errors import ApiError
 from .coa_import_ops import commit_chart_of_accounts
+from .accountant_ops import format_available_dates
 from .import_ops import (
     build_issue_query,
     commit_daily_to_master,
@@ -34,6 +35,9 @@ imports = APIRouter(prefix="/imports", tags=["imports"])
 daily = APIRouter(prefix="/daily", tags=["imports-daily"])
 master = APIRouter(prefix="/master", tags=["imports-master"])
 Manager = Annotated[dict[str, Any], Depends(require_roles("admin", "accountant"))]
+RegisterActor = Annotated[
+    dict[str, Any], Depends(require_roles("admin", "cashier", "accountant"))
+]
 
 
 def _database(request: Request) -> Any:
@@ -48,6 +52,24 @@ def _actor_oid(user: dict[str, Any]) -> ObjectId | None:
         return object_id(str(raw)) if raw is not None else None
     except ValueError:
         return None
+
+
+def _uploads_cashier_scope(
+    actor: dict[str, Any],
+    cashier_id: str | None = None,
+) -> ObjectId | None:
+    """Cashiers only see their own uploads; managers may filter or see all."""
+    if cashier_id:
+        try:
+            return object_id(cashier_id)
+        except ValueError as exc:
+            raise ApiError(422, "invalid_id", "cashier_id is invalid") from exc
+    if str(actor.get("role") or "").lower() == "cashier":
+        oid = _actor_oid(actor)
+        if oid is None:
+            raise ApiError(422, "cashier_required", "cashier_id is required")
+        return oid
+    return None
 
 
 def _valid_id(value: str) -> ObjectId:
@@ -144,14 +166,19 @@ async def cleanup_null_daily_import_ids(
 @daily.get("/uploads")
 async def list_daily_uploads(
     request: Request,
-    manager: Manager,
+    actor: RegisterActor,
     limit: int = Query(100, ge=1, le=500),
+    cashier_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    del manager
     db = _database(request)
+    scope = _uploads_cashier_scope(actor, cashier_id)
     # Heal legacy null-tagged rows so they never group as a phantom upload.
+    # Managers heal globally; cashiers only touch their own rows.
+    heal_filter = null_daily_import_id_filter()
+    if scope is not None:
+        heal_filter = {"$and": [heal_filter, {"cashier_id": scope}]}
     await db.transactions.update_many(
-        null_daily_import_id_filter(),
+        heal_filter,
         {
             "$unset": {
                 "daily_import_id": "",
@@ -160,9 +187,11 @@ async def list_daily_uploads(
             }
         },
     )
-    rows = await aggregate_list(db.transactions, 
-        daily_uploads_pipeline(limit=limit)
-    , length=limit)
+    rows = await aggregate_list(
+        db.transactions,
+        daily_uploads_pipeline(limit=limit, cashier_id=scope),
+        length=limit,
+    )
     return json_safe(rows)
 
 
@@ -170,17 +199,21 @@ async def list_daily_uploads(
 async def get_daily_upload_records(
     upload_id: str,
     request: Request,
-    manager: Manager,
+    actor: RegisterActor,
     skip: int = Query(0, ge=0),
     limit: int = Query(10000, ge=1, le=20000),
+    cashier_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    del manager
     uid = (upload_id or "").strip()
     if not uid:
         return []
+    scope = _uploads_cashier_scope(actor, cashier_id)
+    query: dict[str, Any] = {"daily_import_id": uid}
+    if scope is not None:
+        query["cashier_id"] = scope
     db = _database(request)
     cursor = (
-        db.transactions.find({"daily_import_id": uid})
+        db.transactions.find(query)
         .sort([("date", 1), ("day_order", 1), ("created_at", 1)])
         .skip(skip)
         .limit(limit)
@@ -279,6 +312,16 @@ async def count_issue_transactions(
     )
     count = await _database(request).transactions.count_documents(query)
     return {"count": int(count)}
+
+
+@daily.get("/issues/meta/dates")
+async def issue_dates(request: Request, manager: Manager) -> dict[str, Any]:
+    del manager
+    # Base issues queue only — omit list filters so the day picker shows all
+    # days that still have flagged rows.
+    query = build_issue_query()
+    vals = await _database(request).transactions.distinct("date", query)
+    return {"items": format_available_dates(vals)}
 
 
 @daily.post("/issues/{tx_id}/clear")

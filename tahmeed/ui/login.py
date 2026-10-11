@@ -9,6 +9,10 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from tahmeed.config import APP_NAME
 from tahmeed.services.auth import authenticate, any_user_exists, create_user
 from tahmeed.services.api_client import ApiError
+from tahmeed.services.password_policy import (
+    password_placeholder,
+    password_policy_errors,
+)
 from tahmeed.ui.branding import is_dark_theme, load_brand_logo
 
 # App brand blues (match accountant / cashier UI)
@@ -202,7 +206,9 @@ class LoginWindow(QWidget):
         layout.addWidget(self._setup_username)
 
         self._setup_password = QLineEdit()
-        self._setup_password.setPlaceholderText("Password (min 10 chars)")
+        self._setup_password.setPlaceholderText(
+            f"Password ({password_placeholder().lower()})"
+        )
         self._setup_password.setEchoMode(QLineEdit.Password)
         self._setup_password.setFixedHeight(36)
         self._setup_password.setStyleSheet(_FIELD_STYLE)
@@ -332,8 +338,9 @@ class LoginWindow(QWidget):
             self._setup_error.setText("Passwords do not match.")
             self._setup_btn.setEnabled(True)
             return
-        if len(password) < 10:
-            self._setup_error.setText("Password must be at least 10 characters.")
+        policy_errors = password_policy_errors(password)
+        if policy_errors:
+            self._setup_error.setText(policy_errors[0])
             self._setup_btn.setEnabled(True)
             return
 

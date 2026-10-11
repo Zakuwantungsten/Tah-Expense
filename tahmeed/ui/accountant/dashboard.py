@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 
-from tahmeed.config import APP_NAME, APP_VERSION
+from tahmeed.config import APP_NAME, APP_VERSION, COMPANY_NAME
 from tahmeed.models.user import User
 from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.ui.dialogs.change_password_dialog import ChangePasswordDialog
@@ -436,7 +436,7 @@ class AccountantDashboard(QWidget):
                 f"<b>{APP_NAME}</b><br>"
                 f"Accountant Edition<br><br>"
                 f"Version {APP_VERSION}<br>"
-                f"TAHMEED TRANSPORTERS"
+                f"{COMPANY_NAME}"
             ),
         )
 

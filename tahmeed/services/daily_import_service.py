@@ -746,9 +746,14 @@ async def cleanup_null_daily_import_ids() -> int:
 
 
 async def list_daily_uploads(limit: int = 100) -> List[dict]:
+    """List Excel daily-import batches.
+
+    Cashiers use ``/v1/transactions/daily-uploads`` (register actor). Managers
+    may still hit the imports route; this client path is shared by Browse.
+    """
     payload = await api_client.request(
         "GET",
-        "v1/imports/daily/uploads",
+        "v1/transactions/daily-uploads",
         params={"limit": limit},
     )
     rows = payload if isinstance(payload, list) else payload.get("items") or []
@@ -855,6 +860,22 @@ async def count_issue_transactions(
         "GET", "v1/imports/daily/issues/count", params=params
     )
     return int(payload.get("count") or 0)
+
+
+async def get_issue_available_dates() -> List[date]:
+    """Expense days that still have duplicate / date-discrepancy flags."""
+    payload = await api_client.request("GET", "v1/imports/daily/issues/meta/dates")
+    out: List[date] = []
+    for row in payload.get("items") or []:
+        raw = row.get("date") if isinstance(row, dict) else row
+        text = str(raw or "").strip()[:10]
+        if not text:
+            continue
+        try:
+            out.append(date.fromisoformat(text))
+        except ValueError:
+            continue
+    return out
 
 
 async def clear_issue_flags(tx_id: ObjectId) -> bool:

@@ -12,6 +12,7 @@ from .accountant_ops import (
     REJECTED_SORT,
     apply_cascade_filters,
     build_rejected_query,
+    format_available_dates,
     inbox_base_query,
 )
 from .dependencies import require_roles
@@ -130,6 +131,14 @@ async def rejected_badge_count(request: Request, _manager: Manager) -> dict:
         inbox_base_query(rejected=True)
     )
     return {"count": int(total)}
+
+
+@rejected.get("/rejected/meta/dates")
+async def rejected_dates(request: Request, _manager: Manager) -> dict:
+    vals = await _database(request).transactions.distinct(
+        "date", inbox_base_query(rejected=True)
+    )
+    return {"items": format_available_dates(vals)}
 
 
 @rejected.get("/rejected/meta/trucks")

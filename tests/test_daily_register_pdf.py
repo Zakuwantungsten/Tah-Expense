@@ -68,7 +68,7 @@ def test_export_daily_register_pdf_writes_landscape_with_all_columns(tmp_path: P
 
         text = page.get_text("text").replace("\xa0", " ")
         upper = text.upper()
-        assert "TAHMEED TRANSPORTERS" in text
+        assert "TAHMEED COACH" in text
         assert "DAILY REGISTER" in upper
         assert "CONFIDENTIAL" in text
         assert "S/N" in upper or "S/N" in text

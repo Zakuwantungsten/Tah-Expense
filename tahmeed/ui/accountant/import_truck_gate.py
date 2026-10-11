@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QProgressDialog, QWidget
+from PySide6.QtWidgets import QWidget
 
 from tahmeed.services.import_truck_check import (
     apply_truck_resolutions,
@@ -16,8 +15,9 @@ from tahmeed.services.import_truck_check import (
 )
 from tahmeed.services.truck_format import DEFAULT_PLACE_LABELS, merge_allowed_labels
 from tahmeed.ui.async_utils import pause_background_polls, safe_process_events
-from tahmeed.ui.dialog_theme import show_critical, show_warning, style_progress_dialog
+from tahmeed.ui.dialog_theme import show_critical, show_warning
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog
+from tahmeed.ui.widgets.upload_busy import UploadBusy
 
 
 @dataclass
@@ -106,32 +106,27 @@ async def _run_import_truck_gate_inner(
         stored = []
     labels = merge_allowed_labels(DEFAULT_PLACE_LABELS, stored or [])
 
-    progress = QProgressDialog(
-        "Checking truck numbers against fleet…", None, 0, 0, parent
-    )
-    progress.setWindowTitle("Checking trucks")
-    progress.setWindowModality(Qt.WindowModal)
-    progress.setMinimumDuration(0)
-    progress.setCancelButton(None)
-    progress.setMaximum(max(1, len(rows)))
-    progress.setValue(0)
-    style_progress_dialog(progress)
-    progress.show()
-    safe_process_events()
-
-    def _on_progress(done: int, total: int) -> None:
-        progress.setMaximum(max(1, total))
-        progress.setValue(done)
-        progress.setLabelText(
-            f"Checking trucks… {done:,} / {total:,}"
+    with UploadBusy(
+        parent,
+        "Checking truck numbers against fleet…",
+        title="Checking trucks",
+    ) as busy:
+        busy.update(
+            "Checking truck numbers against fleet…",
+            value=0,
+            maximum=max(1, len(rows)),
         )
-        safe_process_events()
 
-    scan = scan_import_trucks(
-        rows, field, fleet, allowed_labels=labels, progress=_on_progress
-    )
-    progress.setValue(progress.maximum())
-    progress.close()
+        def _on_progress(done: int, total: int) -> None:
+            busy.update(
+                f"Checking trucks… {done:,} / {total:,}",
+                value=done,
+                maximum=max(1, total),
+            )
+
+        scan = scan_import_trucks(
+            rows, field, fleet, allowed_labels=labels, progress=_on_progress
+        )
     safe_process_events()
 
     if not scan.issues:

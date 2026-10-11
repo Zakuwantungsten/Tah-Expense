@@ -67,6 +67,7 @@ from .accountant_ops import pending_inbox_count_query
 from .accountant_overview_api import overview as accountant_overview_router
 from .accountant_rejected_api import rejected as accountant_rejected_router
 from .accountant_reports_api import reports as accountant_reports_router
+from .accountant_restores_api import restores as accountant_restores_router
 from .accountant_trash_api import trash as accountant_trash_router
 from .accountant_fuel_overview_api import (
     fuel_overview as accountant_fuel_overview_router,
@@ -95,6 +96,7 @@ accountant.include_router(accountant_inbox_router)
 accountant.include_router(accountant_actions_router)
 accountant.include_router(accountant_rejected_router)
 accountant.include_router(accountant_deletions_router)
+accountant.include_router(accountant_restores_router)
 accountant.include_router(accountant_trash_router)
 accountant.include_router(accountant_master_router)
 accountant.include_router(accountant_reports_router)
@@ -487,8 +489,13 @@ async def accountant_notification_counts(
     """Badge total — same formula as ``GET /v1/accountant/counts/pending``."""
     db = database(request)
     pending = await db.transactions.count_documents(pending_inbox_count_query())
-    deletions = await db.transactions.count_documents({"deletion_requested": True})
-    return {"verify": int(pending) + int(deletions)}
+    deletions = await db.transactions.count_documents(
+        {"deletion_requested": True, "trashed": {"$ne": True}}
+    )
+    restores = await db.transactions.count_documents(
+        {"trashed": True, "restore_requested": True}
+    )
+    return {"verify": int(pending) + int(deletions) + int(restores)}
 
 
 @settings_api.get("")
@@ -1630,6 +1637,64 @@ async def list_backup_jobs(
 ) -> list[dict]:
     docs = await database(request).backup_jobs.find().sort("created_at", -1).limit(limit).to_list()
     return json_safe(docs)
+
+
+@backups.post("/run")
+async def run_backup_now(
+    request: Request,
+    admin: Admin,
+) -> dict:
+    """Create an immediate database dump (admin only), then upload/prune if configured."""
+    from .cli.backup import (
+        create_local_backup,
+        distributed_lease,
+        exclusive_lock,
+        prune,
+        upload_pending,
+    )
+
+    settings = request.app.state.settings
+    db = database(request)
+    try:
+        with exclusive_lock(settings.backup_lock_file):
+            async with distributed_lease(settings, db):
+                archive = await create_local_backup(settings, db, "manual")
+                uploaded = await upload_pending(settings, db)
+                pruned = await prune(settings, db)
+    except RuntimeError as exc:
+        message = str(exc)
+        code = "backup_failed"
+        status_code = 409
+        if "lock" in message.lower() or "lease" in message.lower():
+            code = "backup_busy"
+        raise ApiError(status_code, code, message) from exc
+    except ValueError as exc:
+        raise ApiError(422, "invalid_backup", str(exc)) from exc
+
+    job = await db.backup_jobs.find_one({"filename": archive.name})
+    await record_operation_event(
+        db,
+        action="backup.run_manual",
+        actor=admin,
+        request=request,
+        entity_type="backup",
+        entity_ids=[archive.name],
+        details={
+            "filename": archive.name,
+            "uploaded": uploaded,
+            "pruned": pruned,
+            "status": (job or {}).get("status"),
+        },
+    )
+    return json_safe(
+        {
+            "filename": archive.name,
+            "status": (job or {}).get("status", "pending_upload"),
+            "size": (job or {}).get("size", 0),
+            "uploaded": uploaded,
+            "pruned": pruned,
+        }
+    )
 
 
 @backups.post("/restore")

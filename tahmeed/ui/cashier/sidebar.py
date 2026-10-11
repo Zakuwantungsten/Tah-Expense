@@ -46,6 +46,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("drafts",     "Drafts",     "mdi.file-document-edit-outline", {"badge": True}),
         ("day_issues", "Day Issues", "mdi.alert-decagram-outline",     {"badge": True}),
         ("rejected",   "Rejected",   "mdi.alert-circle-outline",       {}),
+        ("trash",      "Trash",      "mdi.delete-outline",             {}),
     ]),
     ("ITEMS", []),
 ]
@@ -374,6 +375,8 @@ class CashierSidebarWidget(QFrame):
 
     nav_selected = Signal(str)
     subtable_selected = Signal(str, str, str, str)
+    # Emitted after dynamic ITEMS rows rebuild: list of (key, sidebar_label).
+    items_changed = Signal(object)
 
     def __init__(self, user: User, parent=None):
         super().__init__(parent)
@@ -705,9 +708,11 @@ class CashierSidebarWidget(QFrame):
             hint.setVisible(not self._collapsed)
             self._items_empty_hint = hint
             self._items_host_vl.addWidget(hint)
+            self.items_changed.emit([])
             return
 
         self._items_empty_hint = None
+        entries: list[tuple[str, str]] = []
 
         for cat in cats:
             key = _ik(cat.name)
@@ -718,11 +723,13 @@ class CashierSidebarWidget(QFrame):
             self._item_defs[key] = (cat.name, icon, label)
             self._item_keys.add(key)
             self._add_item_row(key, label, icon)
+            entries.append((key, label))
 
         if self._collapsed:
             for key in self._item_keys:
                 self._items[key].set_collapsed(True)
 
+        self.items_changed.emit(entries)
         asyncio.ensure_future(self._load_item_chevrons())
 
     def _add_item_row(self, key: str, label: str, icon_name: str) -> None:

@@ -258,7 +258,7 @@ async def create_local_backup(
     *,
     schedule_id: str | None = None,
 ) -> Path:
-    if cadence not in {"hourly", "daily", "weekly", "monthly"}:
+    if cadence not in {"hourly", "daily", "weekly", "monthly", "manual"}:
         raise ValueError(f"Unsupported backup cadence: {cadence}")
     settings.backup_directory.mkdir(parents=True, exist_ok=True)
     ensure_free_space(settings.backup_directory, settings.backup_min_free_bytes)
@@ -798,7 +798,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--cadence",
-        choices=("hourly", "daily", "weekly", "monthly"),
+        choices=("hourly", "daily", "weekly", "monthly", "manual"),
         default="hourly",
         help="Cadence metadata for a newly created archive.",
     )

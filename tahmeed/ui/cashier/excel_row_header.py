@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QHeaderView, QTableWidget, QTableWidgetItem, QWidg
 from tahmeed.ui.cashier.register_delegates import COL_DESC
 
 ROW_HEADER_WIDTH = 40
-DEFAULT_ROW_HEIGHT = 20   # 15 pt @ 96 DPI
+DEFAULT_ROW_HEIGHT = 24   # slightly taller than Excel 15pt for readability
 MIN_ROW_HEIGHT = 15
 _ROW_HEADER_RESIZE_HIT = 5
 

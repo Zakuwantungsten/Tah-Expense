@@ -36,6 +36,7 @@ from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, Tr
 from tahmeed.ui.dialogs.attachment_dialog import AttachmentDialog
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.cashier.excel_row_header import ExcelRowHeaderView, ROW_HEADER_QSS, sync_row_header_labels
+from tahmeed.ui.widgets.combo_styles import with_combo_popup
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,7 +48,8 @@ _CARD = "background:#ffffff; border:1px solid #e5e7eb; border-radius:8px;"
 _LBL  = "color:#374151; font-size:12px; font-weight:500; margin-bottom:2px;"
 
 # Single consistent height for EVERY input field in the form
-_INPUT = """
+_INPUT = with_combo_popup(
+    """
 QLineEdit, QDateEdit, QComboBox, QDoubleSpinBox {
     border: 1px solid #d1d5db;
     border-radius: 6px;
@@ -65,6 +67,7 @@ QComboBox::drop-down  { border: none; width: 24px; }
 QComboBox::down-arrow { width: 10px; height: 10px; }
 QDateEdit::drop-down  { border: none; width: 24px; }
 """
+)
 
 _BTN_SECONDARY = """
 QPushButton {
