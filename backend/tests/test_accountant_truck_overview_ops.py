@@ -1,11 +1,13 @@
 """Phase 9.1 — truck overview pure helpers."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.accountant_truck_overview_ops import (
     DIESEL_STATION_SOURCE_GROUPS,
     TRUCK_OVERVIEW_SOURCES,
+    as_date_value,
     diesel_overview_query,
+    filter_fuel_overview_rows,
     filter_truck_overview_rows,
     imported_feed_overview_query,
     master_rows_from_docs,
@@ -131,3 +133,63 @@ def test_row_builders() -> None:
     )
     assert toll[0]["currency"] == "ZMW"
     assert "toll_plaza" in TRUCK_OVERVIEW_SOURCES
+
+
+def test_as_date_value_strips_timezone() -> None:
+    aware = datetime(2026, 3, 10, 12, 0, tzinfo=timezone.utc)
+    assert as_date_value(aware) == datetime(2026, 3, 10, 12, 0)
+    assert as_date_value(aware).tzinfo is None
+
+
+def test_filter_tolerates_tz_aware_mongo_dates() -> None:
+    """Mongo is opened with tz_aware=True; filter bounds are naive."""
+    rows = master_rows_from_docs(
+        [
+            {
+                "date": datetime(2026, 3, 10, tzinfo=timezone.utc),
+                "truck_number": "T1",
+                "category_name": "Parts",
+                "item": "Bolt",
+                "description": "repair",
+                "currency": "TZS",
+                "amount": 100.0,
+            },
+            {
+                "date": datetime(2026, 6, 1, tzinfo=timezone.utc),
+                "truck_number": "T1",
+                "category_name": "Diesel Cash",
+                "item": "Diesel Cash",
+                "description": "20 ltrs",
+                "currency": "TZS",
+                "amount": 50.0,
+            },
+        ],
+        ["Diesel Cash"],
+    )
+    assert all(row["date"].tzinfo is None for row in rows)
+
+    truck_filtered = filter_truck_overview_rows(
+        rows,
+        source="all",
+        date_from=datetime(2026, 1, 1),
+        date_to=datetime(2026, 12, 31, 23, 59, 59),
+    )
+    assert len(truck_filtered) == 2
+
+    # Filter must also tolerate rows that still carry tz-aware dates.
+    fuel_filtered = filter_fuel_overview_rows(
+        [
+            {
+                "source_group": "diesel_cash",
+                "source": "Diesel Cash",
+                "date": datetime(2026, 3, 10, tzinfo=timezone.utc),
+                "currency": "TZS",
+                "amount": 50.0,
+                "liters": 20.0,
+            }
+        ],
+        source="all",
+        date_from=datetime(2026, 1, 1),
+        date_to=datetime(2026, 12, 31, 23, 59, 59),
+    )
+    assert len(fuel_filtered) == 1

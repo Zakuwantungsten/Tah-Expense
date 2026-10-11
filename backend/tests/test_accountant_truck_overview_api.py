@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from bson import ObjectId
@@ -11,6 +11,12 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.dependencies import current_user
 from app.main import create_app
+
+
+def _as_naive(value):
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.replace(tzinfo=None)
+    return value
 
 
 def _matches(doc: dict, query: dict) -> bool:
@@ -41,17 +47,17 @@ def _matches(doc: dict, query: dict) -> bool:
             if "$gte" in expected or "$lte" in expected or "$lt" in expected:
                 if actual is None:
                     return False
-                if "$gte" in expected and actual < expected["$gte"]:
+                left = _as_naive(actual)
+                if "$gte" in expected and left < _as_naive(expected["$gte"]):
                     return False
-                if "$lte" in expected and actual > expected["$lte"]:
+                if "$lte" in expected and left > _as_naive(expected["$lte"]):
                     return False
-                if "$lt" in expected and actual >= expected["$lt"]:
+                if "$lt" in expected and left >= _as_naive(expected["$lt"]):
                     return False
             continue
         if actual != expected:
             return False
     return True
-
 
 class FakeCursor:
     def __init__(self, documents: list[dict]) -> None:
@@ -213,3 +219,43 @@ def test_truck_overview_empty_truck() -> None:
     # FastAPI min_length=1 after strip? Query doesn't strip; spaces pass.
     # Our handler returns [] for blank strip.
     assert r.status_code in (200, 422)
+
+
+def test_truck_overview_accepts_tz_aware_dates_with_range() -> None:
+    app = _app(
+        transactions=[
+            {
+                "_id": ObjectId(),
+                "verified": True,
+                "truck_number": "T103 DVL",
+                "category_name": "Parts",
+                "item": "Bolt",
+                "description": "repair",
+                "currency": "TZS",
+                "amount": 100.0,
+                "date": datetime(2026, 3, 10, tzinfo=timezone.utc),
+            }
+        ],
+    )
+    app.dependency_overrides[current_user] = _manager
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/accountant/truck-overview/records",
+            params={
+                "truck": "T103 DVL",
+                "date_from": "2026-01-01T00:00:00Z",
+                "date_to": "2026-12-31T23:59:59Z",
+            },
+        )
+        summary = client.get(
+            "/v1/accountant/truck-overview/summary",
+            params={
+                "truck": "T103 DVL",
+                "date_from": "2026-01-01T00:00:00Z",
+                "date_to": "2026-12-31T23:59:59Z",
+            },
+        )
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    assert summary.status_code == 200
+    assert summary.json()["record_count"] == 1

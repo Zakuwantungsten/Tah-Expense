@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from bson import ObjectId
@@ -12,6 +12,12 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.dependencies import current_user
 from app.main import create_app
+
+
+def _as_naive(value):
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.replace(tzinfo=None)
+    return value
 
 
 def _matches(doc: dict, query: dict) -> bool:
@@ -42,9 +48,10 @@ def _matches(doc: dict, query: dict) -> bool:
             if "$gte" in expected or "$lte" in expected:
                 if actual is None:
                     return False
-                if "$gte" in expected and actual < expected["$gte"]:
+                left = _as_naive(actual)
+                if "$gte" in expected and left < _as_naive(expected["$gte"]):
                     return False
-                if "$lte" in expected and actual > expected["$lte"]:
+                if "$lte" in expected and left > _as_naive(expected["$lte"]):
                     return False
             continue
         if actual != expected:
@@ -165,3 +172,55 @@ def test_fuel_overview_records_summary_filters() -> None:
     assert cache.status_code == 200
     assert "Infinity Diesel" in cache.json()["filters"]["source"]
     assert "Diesel Cash" in cache.json()["filters"]["source"]
+
+
+def test_fuel_overview_accepts_tz_aware_dates_with_range() -> None:
+    app = _app(
+        transactions=[
+            {
+                "_id": ObjectId(),
+                "verified": True,
+                "truck_number": "T103 DVL",
+                "category_name": "Diesel Cash",
+                "item": "Diesel Cash",
+                "description": "100 ltrs station",
+                "currency": "TZS",
+                "amount": 500.0,
+                "date": datetime(2026, 4, 1, tzinfo=timezone.utc),
+            }
+        ],
+        feeds=[
+            {
+                "_id": ObjectId(),
+                "feed_type": "diesel_infinity",
+                "truck_no": "T103 DVL",
+                "ltrs": 20,
+                "price_per_ltr": 3,
+                "destinations": "DAR",
+                "transaction_date": datetime(2026, 4, 2, tzinfo=timezone.utc),
+                "upload_label": "Apr batch",
+            }
+        ],
+    )
+    app.dependency_overrides[current_user] = _manager
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/accountant/fuel-overview/records",
+            params={
+                "truck": "T103 DVL",
+                "date_from": "2026-01-01T00:00:00Z",
+                "date_to": "2026-12-31T23:59:59Z",
+            },
+        )
+        summary = client.get(
+            "/v1/accountant/fuel-overview/summary",
+            params={
+                "truck": "T103 DVL",
+                "date_from": "2026-01-01T00:00:00Z",
+                "date_to": "2026-12-31T23:59:59Z",
+            },
+        )
+    assert response.status_code == 200
+    assert len(response.json()) == 2
+    assert summary.status_code == 200
+    assert summary.json()["record_count"] == 2

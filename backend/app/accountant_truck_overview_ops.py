@@ -135,9 +135,18 @@ def safe_float_value(value: Any) -> float:
         return 0.0
 
 
+def as_naive_datetime(value: datetime | None) -> datetime | None:
+    """Strip tzinfo so Mongo tz-aware dates compare safely with filter bounds."""
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.replace(tzinfo=None)
+    return value
+
+
 def as_date_value(value: Any) -> datetime:
     if isinstance(value, datetime):
-        return value
+        return as_naive_datetime(value) or datetime.min
     if value in (None, "", "None"):
         return datetime.min
     for fmt in (
@@ -156,17 +165,27 @@ def as_date_value(value: Any) -> datetime:
     return datetime.min
 
 
+def row_sort_date(row: dict[str, Any]) -> datetime:
+    value = row.get("date")
+    if isinstance(value, datetime):
+        return as_naive_datetime(value) or datetime.min
+    return datetime.min
+
+
 def truck_row_in_date_range(
     row: dict[str, Any],
     date_from: datetime | None = None,
     date_to: datetime | None = None,
 ) -> bool:
-    row_date = row.get("date")
-    if not isinstance(row_date, datetime) or row_date == datetime.min:
+    raw = row.get("date")
+    row_date = as_naive_datetime(raw) if isinstance(raw, datetime) else None
+    if row_date is None or row_date == datetime.min:
         return date_from is None and date_to is None
-    if date_from is not None and row_date < date_from:
+    bound_from = as_naive_datetime(date_from)
+    bound_to = as_naive_datetime(date_to)
+    if bound_from is not None and row_date < bound_from:
         return False
-    if date_to is not None and row_date > date_to:
+    if bound_to is not None and row_date > bound_to:
         return False
     return True
 
@@ -262,7 +281,7 @@ def filter_truck_overview_rows(
         and truck_row_in_date_range(row, date_from, date_to)
         and truck_row_matches_currency(row, currency)
     ]
-    filtered.sort(key=lambda row: (row.get("date") or datetime.min))
+    filtered.sort(key=row_sort_date)
     return filtered
 
 
@@ -674,7 +693,7 @@ def filter_fuel_overview_rows(
         and truck_row_matches_currency(row, currency)
     ]
     if sort_rows:
-        filtered.sort(key=lambda row: (row.get("date") or datetime.min))
+        filtered.sort(key=row_sort_date)
     return filtered
 
 
@@ -781,7 +800,7 @@ def apply_overview_column_filters(
 
 def overview_sort_key(row: dict[str, Any], field: str) -> Any:
     if field == "date":
-        return row.get("date") or datetime.min
+        return row_sort_date(row)
     if field in ("liters", "rate"):
         val = row.get(field)
         if val in (None, ""):
