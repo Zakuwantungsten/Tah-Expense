@@ -8,6 +8,7 @@ import qtawesome as qta
 from PySide6.QtCore import QPoint, QSize, Qt, Signal
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -43,8 +44,7 @@ class AccountantTitleBar(QFrame):
         super().__init__(parent)
         self._user = user
         self._edition = edition
-        self._drag_pos: Optional[QPoint] = None
-        self._window_offset = QPoint()
+        self._press_global: Optional[QPoint] = None
         self._build()
 
     def _build(self) -> None:
@@ -119,7 +119,6 @@ class AccountantTitleBar(QFrame):
             "}"
             f"QToolButton:hover {{ background: {hover}; }}"
         )
-        # Swap icon color on hover via property is awkward; keep muted + red bg for close.
         btn.clicked.connect(slot)
         btn.setProperty("closeBtn", close)
         btn.setProperty("iconHover", icon_hover)
@@ -131,28 +130,45 @@ class AccountantTitleBar(QFrame):
         self._max_btn.setIcon(qta.icon(icon, color=_MUTED))
         self._max_btn.setToolTip(tip)
 
+    def _begin_system_move(self) -> bool:
+        """Hand the drag to the OS (Aero Snap, drag-to-maximize, etc.)."""
+        win = self.window()
+        if win is None:
+            return False
+        handle = win.windowHandle()
+        if handle is None:
+            return False
+        return bool(handle.startSystemMove())
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
-            win = self.window()
-            if win is not None and not win.isMaximized():
-                self._drag_pos = event.globalPosition().toPoint()
-                self._window_offset = (
-                    self._drag_pos - win.frameGeometry().topLeft()
-                )
+            # Delay startSystemMove until the cursor moves so double-click
+            # maximize still works. On Windows, MainWindow.nativeEvent often
+            # returns HTCAPTION and owns the drag instead.
+            self._press_global = event.globalPosition().toPoint()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
-            win = self.window()
-            if win is not None and not win.isMaximized():
-                win.move(event.globalPosition().toPoint() - self._window_offset)
+        if (
+            self._press_global is not None
+            and event.buttons() & Qt.LeftButton
+        ):
+            app = QApplication.instance()
+            threshold = app.startDragDistance() if app is not None else 10
+            delta = event.globalPosition().toPoint() - self._press_global
+            if delta.manhattanLength() >= threshold:
+                self._press_global = None
+                if self._begin_system_move():
+                    event.accept()
+                    return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        self._drag_pos = None
+        self._press_global = None
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
+            self._press_global = None
             self.maximize_requested.emit()
         super().mouseDoubleClickEvent(event)

@@ -80,3 +80,60 @@ def test_menu_navigate_callback(qapp):
 
 def test_menu_bar_is_qmenubar(qapp):
     assert isinstance(AccountantMenuBar(), QMenuBar)
+
+
+def test_edges_to_ht_corners_and_sides():
+    from PySide6.QtCore import Qt
+
+    from tahmeed.ui.main_window import edges_to_ht
+
+    assert edges_to_ht(Qt.Edges(0)) == 0
+    assert edges_to_ht(Qt.LeftEdge) == 10
+    assert edges_to_ht(Qt.RightEdge) == 11
+    assert edges_to_ht(Qt.TopEdge) == 12
+    assert edges_to_ht(Qt.BottomEdge) == 15
+    assert edges_to_ht(Qt.LeftEdge | Qt.TopEdge) == 13
+    assert edges_to_ht(Qt.RightEdge | Qt.BottomEdge) == 17
+
+
+def test_title_bar_starts_system_move_helper(qapp, monkeypatch):
+    """Drag threshold path calls QWindow.startSystemMove when available."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    bar = AccountantTitleBar(_user())
+    calls: list[bool] = []
+
+    class _Handle:
+        def startSystemMove(self):
+            calls.append(True)
+            return True
+
+    class _Win:
+        def windowHandle(self):
+            return _Handle()
+
+        def isMaximized(self):
+            return False
+
+    monkeypatch.setattr(bar, "window", lambda: _Win())
+
+    press = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        QPointF(20, 10),
+        QPointF(120, 80),
+        Qt.LeftButton,
+        Qt.LeftButton,
+        Qt.NoModifier,
+    )
+    bar.mousePressEvent(press)
+    move = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(40, 10),
+        QPointF(140, 80),
+        Qt.LeftButton,
+        Qt.LeftButton,
+        Qt.NoModifier,
+    )
+    bar.mouseMoveEvent(move)
+    assert calls == [True]
