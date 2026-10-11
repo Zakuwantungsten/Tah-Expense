@@ -639,11 +639,76 @@ async def test_apply_mapping_keeps_assignment_when_save_fails(monkeypatch) -> No
     )
     from tahmeed.services.daily_import_service import apply_mapping_to_preview
 
-    await apply_mapping_to_preview(preview, "DIESEL", cat_id, "Fuel")
+    await apply_mapping_to_preview(
+        preview, "DIESEL", cat_id, "Fuel", payee="shell station"
+    )
     assert row.category_id == cat_id
     assert row.category_name == "Fuel"
+    assert row.payee == "SHELL STATION"
     assert row.skipped_item is False
     assert "DIESEL" not in preview.unmapped
+
+
+def test_apply_mappings_fills_item_and_payee() -> None:
+    from types import SimpleNamespace
+
+    from tahmeed.services.daily_import_service import _apply_mappings_to_rows
+
+    cat_id = ObjectId()
+    row = DailyImportRow(
+        serial=1,
+        date=datetime(2026, 7, 21),
+        description="latra fee",
+        truck_number="",
+        lpo_do="",
+        do_number="",
+        memo="",
+        notes="",
+        amount=100.0,
+        currency="TZS",
+        receipt_status="pending",
+        ownership="",
+        approver="",
+    )
+    mappings = {
+        "LATRA FEE": SimpleNamespace(
+            category_id=cat_id,
+            category_name="Parking",
+            payee="city council",
+        )
+    }
+    unmapped = _apply_mappings_to_rows([row], mappings)
+    assert unmapped == {}
+    assert row.category_id == cat_id
+    assert row.category_name == "Parking"
+    assert row.payee == "CITY COUNCIL"
+
+    preview = DailyImportPreview(
+        source_filename="x.xlsx",
+        source_path="x.xlsx",
+        rows=[row],
+        primary_date=date(2026, 7, 21),
+    )
+    payload = staged_row_payload(row, preview)
+    assert payload["item"] == "Parking"
+    assert payload["payee"] == "CITY COUNCIL"
+
+
+def test_verified_doc_from_daily_payload_keeps_payee() -> None:
+    from backend.app.import_ops import verified_doc_from_daily_payload
+
+    doc = verified_doc_from_daily_payload(
+        {
+            "date": "2026-03-01",
+            "description": "LATRA FEE",
+            "amount": 100,
+            "category_name": "Parking",
+            "payee": "city council",
+        },
+        verified_by=ObjectId(),
+        day_order=1,
+    )
+    assert doc["payee"] == "CITY COUNCIL"
 
 
 def test_master_query_filters_by_excel_date() -> None:

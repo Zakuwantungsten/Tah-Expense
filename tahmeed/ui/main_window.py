@@ -18,6 +18,7 @@ from tahmeed.models.user import User
 from tahmeed.ui.admin.dashboard import AdminDashboard
 from tahmeed.ui.cashier.dashboard import CashierDashboard
 from tahmeed.ui.accountant.dashboard import AccountantDashboard
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 # Wider than a typical 1px border so edge-drag resize is easy to grab.
 _EDGE = 12
@@ -84,6 +85,7 @@ class MainWindow(QMainWindow):
         self.user = user
         self._force_close = False
         self._close_pending = False
+        self._close_overlay: Optional[LoadingOverlay] = None
         self._resize_filters_ready = False
         self._thick_frame_applied = False
         # True while we applied a Size*Cursor on this shell. Content widgets
@@ -196,6 +198,12 @@ class MainWindow(QMainWindow):
             return await dash.prepare_to_leave()
         return True
 
+    def _ensure_close_overlay(self) -> LoadingOverlay:
+        host = self.centralWidget() or self
+        if self._close_overlay is None or self._close_overlay.parentWidget() is not host:
+            self._close_overlay = LoadingOverlay(host, "Closing…")
+        return self._close_overlay
+
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._force_close:
             event.accept()
@@ -203,14 +211,20 @@ class MainWindow(QMainWindow):
         # Defer close until unsaved work is handled (async).
         event.ignore()
         if self._close_pending:
+            # Extra X clicks while preparing: keep the closing UI visible.
+            if self._close_overlay is not None:
+                self._close_overlay.show_loading("Still closing…")
             return
         self._close_pending = True
         asyncio.ensure_future(self._close_after_prepare())
 
     async def _close_after_prepare(self) -> None:
+        overlay = self._ensure_close_overlay()
+        overlay.show_loading("Checking for unsaved work…")
         try:
             if not await self.prepare_to_leave():
                 return
+            overlay.show_loading("Closing…")
             self._force_close = True
             self.close()
             # Window X / Alt+F4: leave the process. Logout sets _force_close and
@@ -219,6 +233,8 @@ class MainWindow(QMainWindow):
             if app is not None:
                 app.quit()
         finally:
+            if self._close_overlay is not None:
+                self._close_overlay.hide_loading()
             self._close_pending = False
 
     # ── Frameless: native hit-test (Windows) + Qt resize fallback ───────────
@@ -279,6 +295,10 @@ class MainWindow(QMainWindow):
         hit_bounds = self.rect().adjusted(-_EDGE, -_EDGE, _EDGE, _EDGE)
         if not hit_bounds.contains(local):
             return _HTCLIENT
+        # Window buttons sit inside the top/right resize strip — prefer client
+        # hits so minimize / maximize / close fire on the first click.
+        if self.rect().contains(local) and self._over_title_bar_controls(local):
+            return _HTCLIENT
         edges = self._hit_edges(local)
         ht = edges_to_ht(edges)
         if ht:
@@ -332,7 +352,11 @@ class MainWindow(QMainWindow):
             return
         if global_pos is None:
             global_pos = QCursor.pos()
-        edges = self._hit_edges(self.mapFromGlobal(global_pos))
+        local = self.mapFromGlobal(global_pos)
+        if self._over_title_bar_controls(local):
+            self._clear_edge_cursor()
+            return
+        edges = self._hit_edges(local)
         if not edges:
             self._clear_edge_cursor()
             return
@@ -368,14 +392,16 @@ class MainWindow(QMainWindow):
             and hasattr(event, "globalPosition")
         ):
             pos = self.mapFromGlobal(event.globalPosition().toPoint())
-            edges = self._hit_edges(pos)
-            if edges:
-                handle = self.windowHandle()
-                if handle is not None and handle.startSystemResize(edges):
-                    # OS resize grab finished (or was cancelled); re-sync so
-                    # a Size*Cursor does not remain stuck afterward.
-                    self._sync_edge_cursor(event.globalPosition().toPoint())
-                    return True
+            # Do not steal presses meant for min / max / close.
+            if not self._over_title_bar_controls(pos):
+                edges = self._hit_edges(pos)
+                if edges:
+                    handle = self.windowHandle()
+                    if handle is not None and handle.startSystemResize(edges):
+                        # OS resize grab finished (or was cancelled); re-sync so
+                        # a Size*Cursor does not remain stuck afterward.
+                        self._sync_edge_cursor(event.globalPosition().toPoint())
+                        return True
         elif et == QEvent.Type.MouseMove and hasattr(event, "globalPosition"):
             if in_shell or self._edge_cursor_active:
                 self._sync_edge_cursor(event.globalPosition().toPoint())

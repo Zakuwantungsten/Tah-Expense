@@ -147,7 +147,7 @@ def verified_doc_from_daily_payload(
         "ref_float": ref_float,
         "ownership": (payload.get("ownership") or "").upper(),
         "approver": (payload.get("approver") or "").upper(),
-        "payee": "",
+        "payee": " ".join((payload.get("payee") or "").strip().upper().split()),
         "cheque": "",
         "reported_date": None,
         # Attribute the batch to the importing accountant so rows show in

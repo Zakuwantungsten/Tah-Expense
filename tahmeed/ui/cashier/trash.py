@@ -56,7 +56,7 @@ def _btn(text: str, icon: str = "", *, primary=False) -> QPushButton:
         btn.setStyleSheet(
             f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:4px;"
             "font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;"
-            "padding:0 14px;}}"
+            "padding:0 14px;}"
             "QPushButton:hover{background:#005EA3;}"
             "QPushButton:disabled{background:#93C5FD;}"
         )
@@ -64,7 +64,7 @@ def _btn(text: str, icon: str = "", *, primary=False) -> QPushButton:
         btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{_T1};border:1px solid {_BORDER};"
             "border-radius:4px;font-size:12px;font-weight:500;"
-            "font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+            "font-family:'Segoe UI',sans-serif;padding:0 14px;}"
             f"QPushButton:hover{{background:{_BG};}}"
             "QPushButton:disabled{color:#D1D5DB;}"
         )
@@ -167,7 +167,7 @@ class CashierTrashWidget(QWidget):
         self._table.setStyleSheet(
             f"QTableWidget{{background:{_WHITE};border:1px solid {_BORDER};"
             f"border-radius:6px;gridline-color:transparent;color:{_T1};"
-            "font-family:'Segoe UI',sans-serif;font-size:12px;}}"
+            "font-family:'Segoe UI',sans-serif;font-size:12px;}"
             f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};border:none;"
             f"border-bottom:1px solid {_BORDER};padding:6px 8px;font-weight:600;}}"
             f"QTableWidget::item{{padding:4px 8px;color:{_T1};}}"

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from tahmeed.ui.accountant.separate_expenses import (
     _finish_table_row, _stripe_bg, _table_style, _ROW_H,
 )
+from tahmeed.ui.async_utils import pause_background_polls, schedule_call, schedule_coro
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
@@ -136,7 +137,7 @@ class _AddPayeeDialog(QDialog):
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:13px;"
             "font-family:'Segoe UI';padding:0 8px;"
-            "min-height:34px;max-height:34px;}}"
+            "min-height:34px;max-height:34px;}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
         self._inp.returnPressed.connect(self._accept)
@@ -227,7 +228,7 @@ class ManagePayeesWidget(QWidget):
         self._search.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI';padding:0 8px;}}"
+            "font-family:'Segoe UI';padding:0 8px;}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
         self._search.textChanged.connect(self._on_search_changed)
@@ -240,7 +241,7 @@ class ManagePayeesWidget(QWidget):
         self._filter_cb.setStyleSheet(with_combo_popup(
             f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI';padding:0 8px;min-width:120px;}}"
+            "font-family:'Segoe UI';padding:0 8px;min-width:120px;}"
             f"QComboBox:focus{{border-color:{_BLUE};}}"
             "QComboBox::drop-down{border:none;width:20px;}"
         ))
@@ -305,7 +306,7 @@ class ManagePayeesWidget(QWidget):
         root.addWidget(self._footer)
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._load())
+        schedule_coro(self._load())
 
     def _active_filter(self) -> str:
         idx = self._filter_cb.currentIndex()
@@ -320,22 +321,22 @@ class ManagePayeesWidget(QWidget):
 
     def _on_search_commit(self) -> None:
         self._page = 0
-        asyncio.ensure_future(self._load())
+        schedule_coro(self._load())
 
     def _on_filter_changed(self) -> None:
         self._page = 0
-        asyncio.ensure_future(self._load())
+        schedule_coro(self._load())
 
     def _on_prev_page(self) -> None:
         if self._page > 0:
             self._page -= 1
-            asyncio.ensure_future(self._load())
+            schedule_coro(self._load())
 
     def _on_next_page(self) -> None:
         max_pg = max(0, (self._total - 1) // _PAGE_SIZE) if self._total else 0
         if self._page < max_pg:
             self._page += 1
-            asyncio.ensure_future(self._load())
+            schedule_coro(self._load())
 
     def _update_pager(self) -> None:
         total = self._total
@@ -385,7 +386,12 @@ class ManagePayeesWidget(QWidget):
             self._populate_table()
             self._update_pager()
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Could not load payees:\n{exc}")
+            # Defer modal so badge polls cannot wake into this task (Py 3.14).
+            schedule_call(
+                lambda e=exc: QMessageBox.critical(
+                    self, "Error", f"Could not load payees:\n{e}",
+                )
+            )
         finally:
             self._loading = False
             self._loading_overlay.hide_loading()
@@ -443,7 +449,7 @@ class ManagePayeesWidget(QWidget):
 
         chosen = menu.exec(self._table.viewport().mapToGlobal(pos))
         if chosen == toggle_act:
-            asyncio.ensure_future(self._toggle_active(name, not active))
+            schedule_coro(self._toggle_active(name, not active))
         elif chosen == delete_act:
             self._confirm_delete(name)
 
@@ -453,7 +459,9 @@ class ManagePayeesWidget(QWidget):
         try:
             await set_payee_active(name, active)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", str(exc))
+            schedule_call(
+                lambda e=exc: QMessageBox.critical(self, "Error", str(e))
+            )
             return
         await self._load()
 
@@ -463,7 +471,7 @@ class ManagePayeesWidget(QWidget):
             f'Delete "{name}" permanently?\nThis cannot be undone.',
         ) != QMessageBox.Yes:
             return
-        asyncio.ensure_future(self._do_delete(name))
+        schedule_coro(self._do_delete(name))
 
     async def _do_delete(self, name: str) -> None:
         from tahmeed.services.payee_service import remove_payee
@@ -471,14 +479,16 @@ class ManagePayeesWidget(QWidget):
         try:
             await remove_payee(name)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", str(exc))
+            schedule_call(
+                lambda e=exc: QMessageBox.critical(self, "Error", str(e))
+            )
             return
         await self._load()
 
     def _add_payee(self) -> None:
         dlg = _AddPayeeDialog(parent=self)
         if dlg.exec() == QDialog.Accepted and dlg.result_name:
-            asyncio.ensure_future(self._do_add(dlg.result_name))
+            schedule_coro(self._do_add(dlg.result_name))
 
     async def _do_add(self, name: str) -> None:
         from tahmeed.services.payee_service import add_payee
@@ -486,7 +496,9 @@ class ManagePayeesWidget(QWidget):
         try:
             await add_payee(name)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", str(exc))
+            schedule_call(
+                lambda e=exc: QMessageBox.critical(self, "Error", str(e))
+            )
             return
         await self._load()
 
@@ -513,33 +525,48 @@ class ManagePayeesWidget(QWidget):
         if choice == QMessageBox.Cancel:
             return
         replace = choice == QMessageBox.Yes
-        asyncio.ensure_future(self._do_import_iif(path, replace_existing=replace))
+        schedule_coro(self._do_import_iif(path, replace_existing=replace))
 
     async def _do_import_iif(self, path: str, *, replace_existing: bool) -> None:
+        """Import payees while badge polls are paused (avoids Py 3.14 task clash)."""
         from tahmeed.services.payee_service import import_payee_list
 
-        self._loading_overlay.show_loading("Importing payees…")
-        try:
-            result = await import_payee_list(path, replace_existing=replace_existing)
-        except Exception as exc:
-            QMessageBox.critical(self, "Import Error", f"Could not import payees:\n{exc}")
-            return
-        finally:
-            self._loading_overlay.hide_loading()
+        with pause_background_polls(self):
+            self._loading_overlay.show_loading("Importing payees…")
+            try:
+                result = await import_payee_list(
+                    path, replace_existing=replace_existing,
+                )
+            except Exception as exc:
+                schedule_call(
+                    lambda e=exc: QMessageBox.critical(
+                        self,
+                        "Import Error",
+                        f"Could not import payees:\n{e}",
+                    )
+                )
+                return
+            finally:
+                self._loading_overlay.hide_loading()
 
-        imported = int(result.get("imported") or 0)
-        updated = int(result.get("updated") or 0)
-        removed = int(result.get("removed") or 0)
-        if replace_existing:
-            msg = (
-                f"Imported {imported:,} payee(s) from the IIF file.\n"
-                f"Removed {removed:,} previous payee(s)."
+            imported = int(result.get("imported") or 0)
+            updated = int(result.get("updated") or 0)
+            removed = int(result.get("removed") or 0)
+            if replace_existing:
+                msg = (
+                    f"Imported {imported:,} payee(s) from the IIF file.\n"
+                    f"Removed {removed:,} previous payee(s)."
+                )
+            else:
+                msg = (
+                    f"Added {imported:,} new payee(s).\n"
+                    f"Updated {updated:,} existing payee(s)."
+                )
+            # Show after this task yields — never block with a modal mid-task.
+            schedule_call(
+                lambda m=msg: QMessageBox.information(
+                    self, "Payees Imported", m,
+                )
             )
-        else:
-            msg = (
-                f"Added {imported:,} new payee(s).\n"
-                f"Updated {updated:,} existing payee(s)."
-            )
-        QMessageBox.information(self, "Payees Imported", msg)
-        self._page = 0
-        await self._load()
+            self._page = 0
+            await self._load()

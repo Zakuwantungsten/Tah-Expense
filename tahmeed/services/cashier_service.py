@@ -972,6 +972,38 @@ async def get_draft_day_summaries(
     return result
 
 
+async def get_open_day_summaries(
+    cashier_id=None,
+    *,
+    all_cashiers: bool = False,
+    limit: int = 120,
+) -> List[dict]:
+    """Calendar days with open (unverified) register rows — Day Issues All days."""
+    params: dict = {
+        "all_cashiers": "true" if all_cashiers else "false",
+        "limit": limit,
+    }
+    if not all_cashiers and cashier_id is not None:
+        params["cashier_id"] = str(cashier_id)
+    payload = await api_client.request(
+        "GET", "v1/transactions/open-day-summaries", params=params
+    )
+    result = []
+    for row in payload.get("items") or []:
+        item = dict(row)
+        item["date"] = _parse_summary_date(item.get("date"))
+        cashier_ids = []
+        for cid in item.get("cashier_ids") or []:
+            if cid is None:
+                continue
+            cashier_ids.append(
+                ObjectId(str(cid)) if ObjectId.is_valid(str(cid)) else cid
+            )
+        item["cashier_ids"] = cashier_ids
+        result.append(item)
+    return result
+
+
 async def get_draft_transactions(
     register_date: date,
     cashier_id=None,

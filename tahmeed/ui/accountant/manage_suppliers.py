@@ -86,7 +86,7 @@ def _input_ss() -> str:
         f"  border: 1px solid {_BORDER}; border-radius: 5px;"
         f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
         "  font-family:'Segoe UI'; padding: 4px 8px;"
-        "  min-height: 32px; max-height: 32px; }}"
+        "  min-height: 32px; max-height: 32px; }"
         f"QLineEdit:focus {{ border-color: {_BLUE}; }}"
     )
 
@@ -181,7 +181,7 @@ class _SupplierDialog(QDialog):
         cancel.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }}"
+            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         cancel.clicked.connect(self.reject)
@@ -193,7 +193,7 @@ class _SupplierDialog(QDialog):
         save.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
-            " font-family:'Segoe UI'; padding: 0 18px; }}"
+            " font-family:'Segoe UI'; padding: 0 18px; }"
             "QPushButton:hover { background: #005EA3; }"
         )
         save.clicked.connect(self._accept)
@@ -326,7 +326,7 @@ class ManageSuppliersWidget(QWidget):
         add_btn.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
-            " font-family:'Segoe UI'; padding: 0 16px; }}"
+            " font-family:'Segoe UI'; padding: 0 16px; }"
             "QPushButton:hover { background: #005EA3; }"
         )
         add_btn.clicked.connect(self._on_add)
@@ -357,7 +357,7 @@ class ManageSuppliersWidget(QWidget):
         inactive_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:checked {{ background: {_BG}; color: {_T1};"
             f" border-color: {_BLUE}; }}"
         )
@@ -433,7 +433,7 @@ class ManageSuppliersWidget(QWidget):
         back_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         back_btn.clicked.connect(self._close_report)

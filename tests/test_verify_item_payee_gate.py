@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -61,15 +61,20 @@ async def test_ensure_blocks_when_item_set_but_payee_empty(monkeypatch) -> None:
     widget._set_busy = lambda *a, **k: None
     widget._clear_busy = lambda: None
 
+    opened: list = []
+
     async def fake_await_ui(fn):
         warnings.append("warned")
-        return None  # skip real QMessageBox (needs initialized QWidget)
+        # Simulate choosing "Open Day Issues"
+        return True
 
     widget._await_ui = fake_await_ui
+    widget.open_day_issues = type("Sig", (), {"emit": lambda self, d: opened.append(d)})()
 
     ok = await VerifyInboxWidget._ensure_item_and_payee(widget, [tx])
     assert ok is False
     assert warnings == ["warned"]
+    assert opened and opened[0] == datetime(2026, 1, 1).date()
 
 
 @pytest.mark.asyncio
@@ -152,13 +157,24 @@ async def test_ensure_mixed_batch_fails_without_partial_approve(monkeypatch) -> 
     widget = VerifyInboxWidget.__new__(VerifyInboxWidget)
     widget._set_busy = lambda *a, **k: None
     widget._clear_busy = lambda: None
-    widget._await_ui = AsyncMock(return_value=None)
+    widget._await_ui = AsyncMock(return_value=False)  # Close without opening
+    widget.open_day_issues = type("Sig", (), {"emit": lambda self, d: None})()
 
     ok = await VerifyInboxWidget._ensure_item_and_payee(widget, [good, bad])
     assert ok is False
     # Good row may be patched, but ensure still fails the batch.
     assert any(c[1] == "Parking" for c in bulk_calls)
     widget._await_ui.assert_awaited()
+
+
+def test_preferred_day_issues_date_prefers_import_primary() -> None:
+    from tahmeed.ui.accountant.verify_inbox import _preferred_day_issues_date
+
+    tx = _tx(
+        date=datetime(2026, 1, 5),
+        import_primary_date=datetime(2026, 1, 10),
+    )
+    assert _preferred_day_issues_date([tx]) == date(2026, 1, 10)
 
 
 def test_action_panel_has_no_map_on_approve_placeholder() -> None:

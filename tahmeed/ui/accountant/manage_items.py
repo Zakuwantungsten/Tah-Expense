@@ -123,7 +123,7 @@ def _input_ss() -> str:
         f"QLineEdit, QTextEdit {{"
         f"  border: 1px solid {_BORDER}; border-radius: 5px;"
         f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
-        "  font-family:'Segoe UI'; padding: 4px 8px; }}"
+        "  font-family:'Segoe UI'; padding: 4px 8px; }"
         f"QLineEdit {{ min-height: 32px; max-height: 32px; }}"
         f"QLineEdit:focus, QTextEdit:focus {{ border-color: {_BLUE}; }}"
     )
@@ -148,7 +148,7 @@ def _icon_btn(icon_name: str, tooltip: str, color: str = _T2,
     btn.setToolTip(tooltip)
     btn.setStyleSheet(
         f"QPushButton {{ background: {_WHITE}; border: 1px solid {_BORDER};"
-        " border-radius: 4px; }}"
+        " border-radius: 4px; }"
         f"QPushButton:hover {{ background: {hover_bg}; border-color: {color}; }}"
     )
     try:
@@ -262,7 +262,7 @@ class _SubItemDialog(QDialog):
         cancel.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }}"
+            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         cancel.clicked.connect(self.reject)
@@ -276,7 +276,7 @@ class _SubItemDialog(QDialog):
         save.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
-            " font-family:'Segoe UI'; padding: 0 18px; }}"
+            " font-family:'Segoe UI'; padding: 0 18px; }"
             "QPushButton:hover { background: #005EA3; }"
         )
         save.clicked.connect(self._validate)
@@ -376,7 +376,7 @@ class _SubItemsPanel(QWidget):
         self._add_btn.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 12px; font-weight: 600;"
-            " font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-family:'Segoe UI'; padding: 0 12px; }"
             "QPushButton:hover { background: #005EA3; }"
         )
         self._add_btn.clicked.connect(self._on_add)
@@ -658,7 +658,7 @@ class _ExportScopesDialog(QDialog):
         save.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600; padding: 0 16px;"
-            " min-height: 34px; }}"
+            " min-height: 34px; }"
         )
         save.clicked.connect(self._save)
         btn_row.addWidget(save)
@@ -795,7 +795,7 @@ class ManageItemsWidget(QWidget):
         back_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         back_btn.clicked.connect(self._close_item_report)
@@ -912,7 +912,7 @@ class ManageItemsWidget(QWidget):
         add_btn.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
-            " font-family:'Segoe UI'; padding: 0 16px; }}"
+            " font-family:'Segoe UI'; padding: 0 16px; }"
             "QPushButton:hover { background: #005EA3; }"
         )
         add_btn.clicked.connect(self._on_add)
@@ -929,7 +929,7 @@ class ManageItemsWidget(QWidget):
         import_coa_btn.setStyleSheet(
             f"QPushButton {{ background: {_NAVY}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
-            " font-family:'Segoe UI'; padding: 0 16px; }}"
+            " font-family:'Segoe UI'; padding: 0 16px; }"
             "QPushButton:hover { background: #253A5C; }"
         )
         import_coa_btn.clicked.connect(self._on_import_coa)
@@ -962,7 +962,7 @@ class ManageItemsWidget(QWidget):
             f"QLineEdit {{ border: 1px solid {_BORDER}; border-radius: 5px;"
             f" background: {_WHITE}; color: {_T1}; font-size: 12px;"
             " font-family:'Segoe UI'; padding: 0 8px;"
-            " min-height: 32px; max-height: 32px; }}"
+            " min-height: 32px; max-height: 32px; }"
             f"QLineEdit:focus {{ border-color: {_BLUE}; }}"
         )
         self._search.textChanged.connect(self._on_search_changed)
@@ -986,7 +986,7 @@ class ManageItemsWidget(QWidget):
         self._restrict_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:checked {{ background: {_GREEN_L}; color: {_GREEN};"
             f" border-color: {_GREEN}; }}"
             f"QPushButton:hover:!checked {{ background: {_BG}; }}"
@@ -1010,7 +1010,7 @@ class ManageItemsWidget(QWidget):
         self._defer_item_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:checked {{ background: {_GREEN_L}; color: {_GREEN};"
             f" border-color: {_GREEN}; }}"
             f"QPushButton:hover:!checked {{ background: {_BG}; }}"
@@ -1034,7 +1034,7 @@ class ManageItemsWidget(QWidget):
         self._allow_issues_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:checked {{ background: {_GREEN_L}; color: {_GREEN};"
             f" border-color: {_GREEN}; }}"
             f"QPushButton:hover:!checked {{ background: {_BG}; }}"
@@ -1052,7 +1052,7 @@ class ManageItemsWidget(QWidget):
         self._export_restricted_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:checked {{ background: {_AMBER_L}; color: {_AMBER};"
             f" border-color: {_AMBER}; }}"
             f"QPushButton:hover:!checked {{ background: {_BG}; }}"
@@ -1069,7 +1069,7 @@ class ManageItemsWidget(QWidget):
         scopes_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         scopes_btn.clicked.connect(self._on_export_scopes)
@@ -1082,7 +1082,7 @@ class ManageItemsWidget(QWidget):
         self._inactive_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:checked {{ background: {_NAVY}; color: #FFF; border-color: {_NAVY}; }}"
             f"QPushButton:hover:!checked {{ background: {_BG}; }}"
         )
@@ -1790,7 +1790,7 @@ class ManageItemsWidget(QWidget):
         menu = QMenu(self)
         menu.setStyleSheet(
             f"QMenu {{ background: {_WHITE}; border: 1px solid {_BORDER};"
-            " padding: 4px; border-radius: 6px; }}"
+            " padding: 4px; border-radius: 6px; }"
             f"QMenu::item {{ padding: 6px 20px; border-radius: 4px;"
             f" color: {_T1}; font-size: 12px; font-family:'Segoe UI'; }}"
             f"QMenu::item:selected {{ background: {_BLUE_L}; }}"

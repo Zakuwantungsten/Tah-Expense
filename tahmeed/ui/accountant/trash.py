@@ -56,7 +56,7 @@ def _btn(text: str, icon: str = "", *, primary=False, danger=False) -> QPushButt
         btn.setStyleSheet(
             f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:4px;"
             "font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;"
-            "padding:0 14px;}}"
+            "padding:0 14px;}"
             "QPushButton:hover{background:#005EA3;}"
             "QPushButton:disabled{background:#93C5FD;}"
         )
@@ -64,7 +64,7 @@ def _btn(text: str, icon: str = "", *, primary=False, danger=False) -> QPushButt
         btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{_RED};border:1px solid #FECACA;"
             "border-radius:4px;font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+            "font-family:'Segoe UI',sans-serif;padding:0 14px;}"
             f"QPushButton:hover{{background:{_RED_L};}}"
             "QPushButton:disabled{color:#FCA5A5;border-color:#FEE2E2;}"
         )
@@ -72,7 +72,7 @@ def _btn(text: str, icon: str = "", *, primary=False, danger=False) -> QPushButt
         btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{_T1};border:1px solid {_BORDER};"
             "border-radius:4px;font-size:12px;font-weight:500;"
-            "font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+            "font-family:'Segoe UI',sans-serif;padding:0 14px;}"
             f"QPushButton:hover{{background:{_BG};}}"
             "QPushButton:disabled{color:#D1D5DB;}"
         )
@@ -101,10 +101,12 @@ class TrashWidget(QWidget):
         self._transactions: List[Transaction] = []
         self._busy = False
         self._build()
-        asyncio.ensure_future(self._reload())
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._reload())
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._reload())
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._reload())
 
     def _build(self) -> None:
         self.setStyleSheet(f"background:{_BG};")
@@ -152,7 +154,7 @@ class TrashWidget(QWidget):
         self._search.setFixedHeight(30)
         self._search.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:4px;padding:0 8px;"
-            "font-size:12px;font-family:'Segoe UI',sans-serif;}}"
+            "font-size:12px;font-family:'Segoe UI',sans-serif;}"
         )
         self._search.returnPressed.connect(self.refresh)
         tools_hl.addWidget(self._search, 1)
@@ -173,7 +175,7 @@ class TrashWidget(QWidget):
         self._table.setStyleSheet(
             f"QTableWidget{{background:{_WHITE};border:1px solid {_BORDER};"
             f"border-radius:6px;gridline-color:transparent;color:{_T1};"
-            "font-family:'Segoe UI',sans-serif;font-size:12px;}}"
+            "font-family:'Segoe UI',sans-serif;font-size:12px;}"
             f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};border:none;"
             f"border-bottom:1px solid {_BORDER};padding:6px 8px;font-weight:600;}}"
             f"QTableWidget::item{{padding:4px 8px;color:{_T1};}}"

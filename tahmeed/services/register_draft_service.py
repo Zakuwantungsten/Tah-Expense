@@ -130,6 +130,60 @@ def draft_is_empty(payload: dict | None) -> bool:
     return not payload.get("dirty_saved") and not payload.get("new_rows")
 
 
+def apply_mapping_to_draft_payload(
+    draft: dict,
+    description_keys: set[str],
+    *,
+    payee: str,
+    item_name: str,
+    category_id: ObjectId | str | None = None,
+    desc_col: int = 3,
+    item_col: int = 2,
+    payee_col: int = 12,
+    normalize_description=None,
+) -> int:
+    """Stamp Payee + Item onto matching draft new/dirty rows. Mutates *draft*."""
+    if not draft or not description_keys:
+        return 0
+    if normalize_description is None:
+        from tahmeed.services.description_mapping_service import (
+            normalize_description as _norm,
+        )
+        normalize_description = _norm
+
+    updated = 0
+    new_rows = list(draft.get("new_rows") or [])
+    for entry in new_rows:
+        cells = cells_from_json(entry.get("cells"))
+        key = normalize_description((cells.get(desc_col) or "").strip())
+        if not key or key not in description_keys:
+            continue
+        cells[item_col] = item_name
+        cells[payee_col] = payee
+        entry["cells"] = cells_for_json(cells)
+        meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+        if category_id is not None:
+            meta["category_id"] = category_id
+        entry["pending_meta"] = serialize_pending_meta(meta)
+        updated += 1
+
+    dirty = list(draft.get("dirty_saved") or [])
+    for entry in dirty:
+        cells = cells_from_json(entry.get("cells"))
+        key = normalize_description((cells.get(desc_col) or "").strip())
+        if not key or key not in description_keys:
+            continue
+        cells[item_col] = item_name
+        cells[payee_col] = payee
+        entry["cells"] = cells_for_json(cells)
+        updated += 1
+
+    if updated:
+        draft["new_rows"] = new_rows
+        draft["dirty_saved"] = dirty
+    return updated
+
+
 def save_register_draft(payload: dict) -> Path:
     """Write or replace the draft file. Empty drafts delete the file."""
     user_id = payload["user_id"]

@@ -28,6 +28,14 @@ _BLUE       = "#0077C5"
 _WHITE      = "#F9FAFB"
 _MUTED      = "#94A3B8"
 _RED        = "#DC2626"
+# Unscoped ``background:`` on nav rows leaks into Qt tooltips; keep labels readable.
+_TOOLTIP_SS = (
+    "QToolTip {"
+    f" background-color: {_WHITE}; color: {_NAVY};"
+    " border: 1px solid #CBD5E1; border-radius: 4px;"
+    " padding: 6px 10px; font-size: 12px;"
+    "}"
+)
 
 EXPANDED_W  = 220
 COLLAPSED_W = 64
@@ -291,21 +299,21 @@ class _NavItem(QWidget):
 
     def _paint(self, hover: bool) -> None:
         if self._active:
-            self.setStyleSheet(f"background: {_ACTIVE_BG};")
+            self.setStyleSheet(f"background: {_ACTIVE_BG};{_TOOLTIP_SS}")
             self._indicator.setStyleSheet(f"background: {_BLUE};")
             self._text_lbl.setStyleSheet(
                 f"color: {_WHITE}; font-size: 13px; font-weight: 600;"
                 " font-family:'Segoe UI'; background: transparent;"
             )
         elif hover:
-            self.setStyleSheet(f"background: {_ACTIVE_BG};")
+            self.setStyleSheet(f"background: {_ACTIVE_BG};{_TOOLTIP_SS}")
             self._indicator.setStyleSheet("background: transparent;")
             self._text_lbl.setStyleSheet(
                 f"color: {_WHITE}; font-size: 13px;"
                 " font-family:'Segoe UI'; background: transparent;"
             )
         else:
-            self.setStyleSheet("background: transparent;")
+            self.setStyleSheet(f"background: transparent;{_TOOLTIP_SS}")
             self._indicator.setStyleSheet("background: transparent;")
             self._text_lbl.setStyleSheet(
                 f"color: {_MUTED}; font-size: 13px;"
@@ -424,25 +432,25 @@ class _SubNavItem(QWidget):
 
     def _paint(self, hover: bool) -> None:
         if self.is_add:
-            self.setStyleSheet(f"background: {_SUB_BG};")
+            self.setStyleSheet(f"background: {_SUB_BG};{_TOOLTIP_SS}")
             self._indicator.setStyleSheet("background: transparent;")
             return
         if self._active:
-            self.setStyleSheet(f"background: {_ACTIVE_BG};")
+            self.setStyleSheet(f"background: {_ACTIVE_BG};{_TOOLTIP_SS}")
             self._indicator.setStyleSheet(f"background: {_BLUE};")
             self._text_lbl.setStyleSheet(
                 f"color: {_WHITE}; font-size: 12px; font-weight: 600;"
                 " font-family:'Segoe UI'; background: transparent;"
             )
         elif hover:
-            self.setStyleSheet(f"background: {_ACTIVE_BG};")
+            self.setStyleSheet(f"background: {_ACTIVE_BG};{_TOOLTIP_SS}")
             self._indicator.setStyleSheet("background: transparent;")
             self._text_lbl.setStyleSheet(
                 f"color: {_WHITE}; font-size: 12px;"
                 " font-family:'Segoe UI'; background: transparent;"
             )
         else:
-            self.setStyleSheet(f"background: {_SUB_BG};")
+            self.setStyleSheet(f"background: {_SUB_BG};{_TOOLTIP_SS}")
             self._indicator.setStyleSheet("background: transparent;")
             self._text_lbl.setStyleSheet(
                 f"color: {_MUTED}; font-size: 12px;"

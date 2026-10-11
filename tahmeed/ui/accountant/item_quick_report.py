@@ -119,7 +119,7 @@ _INPUT_SS = with_combo_popup(
     f"  border: 1px solid {_BORDER}; border-radius: 5px;"
     f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
     "  font-family:'Segoe UI'; padding: 0 8px;"
-    "  min-height: 30px; max-height: 30px; }}"
+    "  min-height: 30px; max-height: 30px; }"
     f"QComboBox:focus, QDateEdit:focus {{ border-color: #0077C5; }}"
     f"QComboBox::drop-down {{ border: none; width: 22px; }}"
 )
@@ -383,7 +383,7 @@ class ItemQuickReportView(QWidget):
         clear_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:hover {{ background: {_WHITE}; color: {_T1}; }}"
         )
         clear_btn.clicked.connect(self._clear_filters)

@@ -206,6 +206,7 @@ class AccountantDashboard(QWidget):
             from tahmeed.ui.accountant.verify_inbox import VerifyInboxWidget
             widget = VerifyInboxWidget(user=self._user)
             widget.badge_updated.connect(self._on_badge_updated)
+            widget.open_day_issues.connect(self._on_open_day_issues)
             return widget
 
         if key == "drafts":
@@ -219,7 +220,11 @@ class AccountantDashboard(QWidget):
 
         if key == "day_issues":
             from tahmeed.ui.cashier.day_issues import DayIssuesWidget
-            widget = DayIssuesWidget(user=self._user)
+            widget = DayIssuesWidget(
+                user=self._user,
+                row_source=self._day_issues_row_source,
+                apply_live=self._day_issues_apply_live,
+            )
             widget.open_register.connect(self._on_day_issues_open_register)
             widget.issues_changed.connect(self._on_day_issues_badge)
             widget.mappings_applied.connect(self._on_day_issues_mapped)
@@ -366,6 +371,9 @@ class AccountantDashboard(QWidget):
             self._register.drafts_changed.connect(
                 lambda: asyncio.ensure_future(self._refresh_day_issues_badge())
             )
+            self._register.day_issues_source_changed.connect(
+                self._on_day_issues_source_changed
+            )
             page = _TablePage(self._register)
             return page
 
@@ -492,6 +500,18 @@ class AccountantDashboard(QWidget):
         if hasattr(self._sidebar, "set_day_issues_badge"):
             self._sidebar.set_day_issues_badge(count)
 
+    def _day_issues_row_source(self, target):
+        if self._register is None:
+            return None, None
+        return self._register.day_issues_row_source(target)
+
+    def _day_issues_apply_live(self, target, descriptions, **kwargs) -> int:
+        if self._register is None:
+            return 0
+        return self._register.apply_description_mapping_to_open_rows(
+            target, descriptions, **kwargs
+        )
+
     async def _refresh_day_issues_badge(self) -> None:
         from datetime import date as _date
         from tahmeed.services.day_issues_service import count_day_issues
@@ -500,13 +520,28 @@ class AccountantDashboard(QWidget):
         if self._register is not None and getattr(self._register, "_current_date", None):
             target = self._register._current_date
         try:
-            count = await count_day_issues(target)
+            replace_txs, extra_txs = self._day_issues_row_source(target)
+            # Accountant badge: all cashiers (cashier_id=None).
+            count = await count_day_issues(
+                target,
+                transactions=replace_txs,
+                extra_transactions=extra_txs,
+                cashier_id=None,
+            )
         except Exception:
             count = 0
         self._on_day_issues_badge(count)
 
+    def _on_day_issues_source_changed(self) -> None:
+        from tahmeed.ui.async_utils import schedule_coro
+
+        schedule_coro(self._refresh_day_issues_badge())
+        widget = self._pages.get("day_issues")
+        if widget is not None and self._stack.currentWidget() is widget:
+            schedule_coro(widget.refresh())
+
     def _on_open_day_issues(self, target=None) -> None:
-        from tahmeed.ui.async_utils import in_running_task, schedule_call
+        from tahmeed.ui.async_utils import in_running_task, schedule_call, schedule_coro
 
         self._sidebar.select("day_issues")
 
@@ -516,7 +551,7 @@ class AccountantDashboard(QWidget):
             if target is not None and hasattr(widget, "set_date"):
                 widget.set_date(target)
             elif hasattr(widget, "refresh"):
-                asyncio.ensure_future(widget.refresh())
+                schedule_coro(widget.refresh())
 
         if in_running_task() and "day_issues" not in self._pages:
             schedule_call(_go)
@@ -527,9 +562,9 @@ class AccountantDashboard(QWidget):
         self._on_drafts_open_register(d)
 
     def _on_day_issues_mapped(self) -> None:
-        if self._register is not None:
-            self._register.refresh()
-        asyncio.ensure_future(self._refresh_day_issues_badge())
+        # Table already stamped in-place (including unsaved); do not full-refresh.
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._refresh_day_issues_badge())
 
     def _on_drafts_open_register(self, d) -> None:
         from tahmeed.ui.async_utils import in_running_task, schedule_call

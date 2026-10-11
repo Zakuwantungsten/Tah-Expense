@@ -166,7 +166,7 @@ class DailyImportPreviewDialog(QDialog):
         cancel.setCursor(Qt.PointingHandCursor)
         cancel.setStyleSheet(
             f"QPushButton{{background:#fff;color:{_T1};border:1px solid {_BORDER};"
-            "border-radius:6px;padding:8px 16px;font-weight:600;}}"
+            "border-radius:6px;padding:8px 16px;font-weight:600;}"
             "QPushButton:hover{background:#f9fafb;}"
         )
         cancel.clicked.connect(self.reject)
@@ -175,7 +175,7 @@ class DailyImportPreviewDialog(QDialog):
         confirm.setDefault(True)
         confirm.setStyleSheet(
             f"QPushButton{{background:{_BLUE};color:#fff;border:none;"
-            "border-radius:6px;padding:8px 16px;font-weight:600;}}"
+            "border-radius:6px;padding:8px 16px;font-weight:600;}"
             "QPushButton:hover{background:#0066a8;}"
         )
         confirm.clicked.connect(self.accept)

@@ -151,7 +151,7 @@ class ImportProblemRowsDialog(QDialog):
             skip_btn.setStyleSheet(
                 f"QPushButton {{ background: {_WHITE}; color: {_AMBER};"
                 f" border: 1px solid {_BORDER}; border-radius: 4px;"
-                " font-size: 12px; padding: 0 10px; min-height: 26px; }}"
+                " font-size: 12px; padding: 0 10px; min-height: 26px; }"
             )
             skip_btn.clicked.connect(lambda _=False, idx=i: self._toggle_skip(idx))
             table.setCellWidget(i, 6, skip_btn)
@@ -171,7 +171,7 @@ class ImportProblemRowsDialog(QDialog):
         cancel.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 13px; padding: 0 16px; min-height: 34px; }}"
+            " font-size: 13px; padding: 0 16px; min-height: 34px; }"
         )
         cancel.clicked.connect(self.reject)
         btn_row.addWidget(cancel)
@@ -182,7 +182,7 @@ class ImportProblemRowsDialog(QDialog):
         skip_all.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 13px; padding: 0 16px; min-height: 34px; }}"
+            " font-size: 13px; padding: 0 16px; min-height: 34px; }"
         )
         skip_all.clicked.connect(self._skip_all)
         btn_row.addWidget(skip_all)
@@ -192,7 +192,7 @@ class ImportProblemRowsDialog(QDialog):
         ok.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
-            " padding: 0 16px; min-height: 34px; }}"
+            " padding: 0 16px; min-height: 34px; }"
             "QPushButton:hover { background: #005EA3; }"
         )
         ok.clicked.connect(self._on_apply)
@@ -210,7 +210,7 @@ class ImportProblemRowsDialog(QDialog):
                 f"QPushButton {{ background: {_WHITE}; color: "
                 f"{'#059669' if skipped else _AMBER};"
                 f" border: 1px solid {_BORDER}; border-radius: 4px;"
-                " font-size: 12px; padding: 0 10px; min-height: 26px; }}"
+                " font-size: 12px; padding: 0 10px; min-height: 26px; }"
             )
         self._status.setText("")
 

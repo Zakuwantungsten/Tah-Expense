@@ -69,6 +69,9 @@ def test_bulk_reassign_existing_item() -> None:
     dlg = _MappingEditorDialog(cats, mappings=entries, payees=_PAYEES)
     assert dlg.windowTitle() == "Re-assign 3 Mappings"
     assert dlg._desc.isHidden()
+    # Shared Item + Payee across selection are prefilled for many→one edit.
+    assert dlg._combo.currentText() == "Parking"
+    assert dlg._payee.currentText() == "PARKING DAR"
     buttons = [b.text().replace("&", "") for b in dlg.findChildren(QPushButton)]
     assert "Re-assign" in buttons
     assert any("New Item" in text for text in buttons)
@@ -81,6 +84,21 @@ def test_bulk_reassign_existing_item() -> None:
     assert dlg.result_assignment.category is not None
     assert dlg.result_assignment.category.name == "Parking"
     assert dlg.result_assignment.payee == "TRIANGLE"
+
+
+def test_bulk_reassign_mixed_items_leaves_item_blank() -> None:
+    _app()
+    cats = [
+        Category(_id=ObjectId(), name="Parking"),
+        Category(_id=ObjectId(), name="Fuel"),
+    ]
+    entries = [
+        _mapping("TRIANGLE", item="Parking", payee="PARKING DAR"),
+        _mapping("LATRA", item="Fuel", payee="PARKING DAR"),
+    ]
+    dlg = _MappingEditorDialog(cats, mappings=entries, payees=_PAYEES)
+    assert dlg._combo.currentText() == ""
+    assert dlg._payee.currentText() == "PARKING DAR"
 
 
 def test_accept_requires_payee(monkeypatch) -> None:
@@ -184,7 +202,14 @@ def test_toolbar_sits_on_search_row() -> None:
         widget._table.horizontalHeaderItem(i).text()
         for i in range(widget._table.columnCount())
     ]
-    assert headers == ["#", "Description", "Payee", "Item / Supplier"]
+    assert headers == ["#", "Description", "Item / Supplier", "Payee"]
+    widget._rows = [
+        _mapping("PARKING KURASINI 7TH OCTB", item="Parking", payee="PARKING DAR"),
+    ]
+    widget._rebuild_table()
+    assert widget._table.item(0, 1).text() == "PARKING KURASINI 7TH OCTB"
+    assert widget._table.item(0, 2).text() == "Parking"
+    assert widget._table.item(0, 3).text() == "PARKING DAR"
     widget._update_status()
     assert "Showing" in widget._footer.text()
 

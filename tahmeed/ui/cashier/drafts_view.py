@@ -62,14 +62,14 @@ def _tool_btn(text: str, *, primary: bool = False, gold: bool = False, danger: b
     if primary:
         style = (
             f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:4px;"
-            "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
+            "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}"
             "QPushButton:hover{background:#005EA3;}"
             "QPushButton:disabled{background:#93C5FD;}"
         )
     elif gold:
         style = (
             f"QPushButton{{background:{_GOLD};color:#FFF;border:none;border-radius:4px;"
-            "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
+            "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}"
             "QPushButton:hover{background:#9A784C;}"
             "QPushButton:disabled{background:#D6C4A8;}"
         )
@@ -222,7 +222,8 @@ class DraftsView(QWidget):
         self.setStyleSheet(f"background:{_BG};")
 
     def refresh(self) -> None:
-        asyncio.ensure_future(self._load_days())
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._load_days())
 
     async def _load_days(self) -> None:
         try:

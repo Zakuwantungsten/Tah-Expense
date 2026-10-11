@@ -40,7 +40,7 @@ def _input_ss() -> str:
         f"QLineEdit, QTextEdit {{"
         f"  border: 1px solid {_BORDER}; border-radius: 5px;"
         f"  background: {_WHITE}; color: {_T1}; font-size: 12px;"
-        "  font-family:'Segoe UI'; padding: 4px 8px; }}"
+        "  font-family:'Segoe UI'; padding: 4px 8px; }"
         f"QLineEdit {{ min-height: 32px; max-height: 32px; }}"
         f"QLineEdit:focus, QTextEdit:focus {{ border-color: {_BLUE}; }}"
     )
@@ -130,7 +130,7 @@ class _IconPickerDialog(QDialog):
             btn.setChecked(name == current)
             btn.setStyleSheet(
                 f"QToolButton {{ background: {_WHITE}; border: 1px solid {_BORDER};"
-                " border-radius: 6px; }}"
+                " border-radius: 6px; }"
                 f"QToolButton:hover {{ background: {_BG}; border-color: {_BLUE}; }}"
                 f"QToolButton:checked {{ background: #EFF6FF; border: 2px solid {_BLUE}; }}"
             )
@@ -149,7 +149,7 @@ class _IconPickerDialog(QDialog):
         cancel.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }}"
+            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         cancel.clicked.connect(self.reject)
@@ -314,7 +314,7 @@ class ItemDialog(QDialog):
         self._choose_icon_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }}"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
             f"QPushButton:disabled {{ color: {_TM}; }}"
         )
@@ -370,7 +370,7 @@ class ItemDialog(QDialog):
         cancel.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
-            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }}"
+            " font-size: 13px; font-family:'Segoe UI'; padding: 0 18px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         cancel.clicked.connect(self.reject)
@@ -384,7 +384,7 @@ class ItemDialog(QDialog):
         save.setStyleSheet(
             f"QPushButton {{ background: {_BLUE}; color: #FFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
-            " font-family:'Segoe UI'; padding: 0 18px; }}"
+            " font-family:'Segoe UI'; padding: 0 18px; }"
             "QPushButton:hover { background: #005EA3; }"
         )
         save.clicked.connect(self._validate)
@@ -438,7 +438,7 @@ class ItemDialog(QDialog):
             pass
         self._icon_btn.setStyleSheet(
             f"QPushButton {{ background: {_WHITE}; border: 1px solid {_BORDER};"
-            " border-radius: 6px; }}"
+            " border-radius: 6px; }"
             f"QPushButton:hover {{ border-color: {_BLUE}; }}"
             f"QPushButton:disabled {{ background: {_BG}; }}"
         )

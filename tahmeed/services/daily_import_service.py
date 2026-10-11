@@ -59,6 +59,7 @@ class DailyImportRow:
     approver: str
     category_id: Optional[ObjectId] = None
     category_name: Optional[str] = None
+    payee: str = ""  # from description mapping when present
     skipped_item: bool = False  # user chose Skip — leave without item
     amount_usd: Optional[float] = None
 
@@ -481,6 +482,10 @@ def parse_daily_expenses_excel(
     )
 
 
+def _mapping_payee(mapping) -> str:
+    return " ".join((getattr(mapping, "payee", None) or "").strip().upper().split())
+
+
 def _apply_mappings_to_rows(
     rows: List[DailyImportRow],
     mappings: dict,
@@ -492,6 +497,7 @@ def _apply_mappings_to_rows(
         if mapping:
             row.category_id = mapping.category_id
             row.category_name = mapping.category_name
+            row.payee = _mapping_payee(mapping)
         else:
             unmapped[key] = unmapped.get(key, 0) + 1
     return unmapped
@@ -549,6 +555,7 @@ async def absorb_import_problems(preview: DailyImportPreview) -> None:
         if mapping:
             row.category_id = mapping.category_id
             row.category_name = mapping.category_name
+            row.payee = _mapping_payee(mapping)
             preview.unmapped.pop(key, None)
         else:
             preview.unmapped[key] = preview.unmapped.get(key, 0) + 1
@@ -595,22 +602,26 @@ async def apply_mapping_to_preview(
     description_key: str,
     category_id: ObjectId,
     category_name: str,
+    *,
+    payee: str = "",
 ) -> None:
-    """Assign an item to matching preview rows, then remember the map if allowed.
+    """Assign item/payee to matching preview rows, then remember the map if allowed.
 
     The assignment always applies to this import. Persisting can fail for
     network/role issues; the current batch must still continue.
     """
+    payee_text = " ".join((payee or "").strip().upper().split())
     display = description_key
     for row in preview.rows:
         if normalize_description(row.description) == description_key:
             display = row.description
             row.category_id = category_id
             row.category_name = category_name
+            row.payee = payee_text
             row.skipped_item = False
     preview.unmapped.pop(description_key, None)
     try:
-        await save_mapping(display, category_id, category_name)
+        await save_mapping(display, category_id, category_name, payee=payee_text)
     except Exception:
         pass
 
@@ -621,6 +632,7 @@ def skip_description_in_preview(preview: DailyImportPreview, description_key: st
             row.skipped_item = True
             row.category_id = None
             row.category_name = None
+            row.payee = ""
     preview.unmapped.pop(description_key, None)
 
 
@@ -695,6 +707,7 @@ def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict
         "receipt_status": row.receipt_status,
         "ownership": row.ownership,
         "approver": row.approver,
+        "payee": row.payee or "",
         "category_id": row.category_id,
         "category_name": row.category_name,
         "lpo_do": row.lpo_do,

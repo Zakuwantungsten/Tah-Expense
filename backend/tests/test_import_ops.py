@@ -59,6 +59,7 @@ def test_verified_doc_from_daily_payload() -> None:
             "amount": 500,
             "currency": "tzs",
             "category_name": "DIESEL",
+            "payee": "shell station",
             "ref_float": "REFUND TO FLOAT",
             "daily_import_id": "upload-1",
             "daily_import_source": "daily.xlsx",
@@ -73,6 +74,7 @@ def test_verified_doc_from_daily_payload() -> None:
     assert doc["verified_by"] == verified_by
     assert doc["cashier_id"] == verified_by
     assert doc["item"] == "DIESEL"
+    assert doc["payee"] == "SHELL STATION"
     assert doc["notes_flag"] is True
     assert doc["day_order"] == 3
     assert doc["register_status"] == "submitted"

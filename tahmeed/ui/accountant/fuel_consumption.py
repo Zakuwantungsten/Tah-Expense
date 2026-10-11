@@ -532,7 +532,7 @@ def _hsep() -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:11px;font-family:'Segoe UI';}}"
+        "border:none;font-size:11px;font-family:'Segoe UI';}"
         f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
@@ -753,7 +753,7 @@ class _TotalsBar(QFrame):
         self.setFixedHeight(38)
         self.setStyleSheet(
             f"QFrame{{background:{_HDR_BG};border-top:1px solid {_BORDER};"
-            "border-bottom-left-radius:6px;border-bottom-right-radius:6px;}}"
+            "border-bottom-left-radius:6px;border-bottom-right-radius:6px;}"
         )
         hl = QHBoxLayout(self)
         hl.setContentsMargins(16, 0, 16, 0)

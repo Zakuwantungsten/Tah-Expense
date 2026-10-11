@@ -101,7 +101,7 @@ class DuplicateReviewDialog(QDialog):
             btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(
                 f"QPushButton{{background:transparent;color:{_BLUE};border:1px solid {_BORDER};"
-                "border-radius:4px;padding:4px 12px;font-size:11px;font-family:'Segoe UI';}}"
+                "border-radius:4px;padding:4px 12px;font-size:11px;font-family:'Segoe UI';}"
                 f"QPushButton:hover{{background:{_BG};}}"
             )
         self._select_all.clicked.connect(self._check_all)
@@ -129,7 +129,7 @@ class DuplicateReviewDialog(QDialog):
         self._table.setAlternatingRowColors(True)
         self._table.setStyleSheet(
             f"QTableWidget{{border:1px solid {_BORDER};gridline-color:{_BORDER};"
-            "font-family:'Segoe UI';font-size:12px;}}"
+            "font-family:'Segoe UI';font-size:12px;}"
             "QHeaderView::section{background:#F9FAFB;padding:6px;border:none;"
             f"border-bottom:1px solid {_BORDER};font-weight:600;color:{_T2};}}"
         )
@@ -182,12 +182,12 @@ class DuplicateReviewDialog(QDialog):
         cancel_btn = buttons.addButton("Cancel save", QDialogButtonBox.RejectRole)
         save_btn.setStyleSheet(
             f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:4px;"
-            "padding:8px 16px;font-weight:600;font-family:'Segoe UI';}}"
+            "padding:8px 16px;font-weight:600;font-family:'Segoe UI';}"
             "QPushButton:hover{background:#005EA3;}"
         )
         skip_btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{_T1};border:1px solid {_BORDER};"
-            "border-radius:4px;padding:8px 16px;font-family:'Segoe UI';}}"
+            "border-radius:4px;padding:8px 16px;font-family:'Segoe UI';}"
             f"QPushButton:hover{{background:{_BG};}}"
         )
         cancel_btn.setStyleSheet(

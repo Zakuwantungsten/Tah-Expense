@@ -33,6 +33,7 @@ from .import_ops import daily_uploads_pipeline, null_daily_import_id_filter
 from .mongo_async import aggregate_list
 from .transaction_ops import (
     DRAFT_BASE_MATCH,
+    OPEN_REGISTER_MATCH,
     REGISTER_DAY_EXPR,
     browse_match,
     filter_pending_edit_clones,
@@ -966,6 +967,52 @@ async def draft_day_summaries(
                 "date": date(group["year"], group["month"], group["day"]).isoformat(),
                 "entries_count": int(doc.get("entries_count") or 0),
                 "total_tzs": float(doc.get("total_tzs") or 0.0),
+                "cashier_ids": cashier_ids,
+            }
+        )
+    return json_safe({"items": items, "total": len(items)})
+
+
+@transactions.get("/open-day-summaries")
+async def open_day_summaries(
+    request: Request,
+    actor: RegisterActor,
+    cashier_id: str | None = None,
+    all_cashiers: bool = False,
+    limit: int = Query(120, ge=1, le=500),
+) -> dict:
+    """Calendar days with open (unverified) register rows — Day Issues All days."""
+    match: dict[str, Any] = dict(OPEN_REGISTER_MATCH)
+    if not all_cashiers:
+        match["cashier_id"] = _actor_cashier_id(actor, cashier_id)
+    pipeline = [
+        {"$match": match},
+        {"$addFields": {"register_day": REGISTER_DAY_EXPR}},
+        {
+            "$group": {
+                "_id": {
+                    "year": {"$year": "$register_day"},
+                    "month": {"$month": "$register_day"},
+                    "day": {"$dayOfMonth": "$register_day"},
+                },
+                "entries_count": {"$sum": 1},
+                "cashier_ids": {"$addToSet": "$cashier_id"},
+            }
+        },
+        {"$sort": {"_id.year": -1, "_id.month": -1, "_id.day": -1}},
+        {"$limit": limit},
+    ]
+    docs = await aggregate_list(_database(request).transactions, pipeline, length=limit)
+    items = []
+    for doc in docs:
+        group = doc["_id"]
+        cashier_ids = [
+            cid for cid in (doc.get("cashier_ids") or []) if cid is not None
+        ]
+        items.append(
+            {
+                "date": date(group["year"], group["month"], group["day"]).isoformat(),
+                "entries_count": int(doc.get("entries_count") or 0),
                 "cashier_ids": cashier_ids,
             }
         )

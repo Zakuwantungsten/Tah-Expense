@@ -7,12 +7,49 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import List, Optional, Sequence
 
+from bson import ObjectId
+
 from tahmeed.services.cashier_service import get_transactions_by_date
 from tahmeed.services.description_mapping_service import (
     get_mappings_for_descriptions,
     normalize_description,
 )
 from tahmeed.services.payee_service import get_payee_names
+
+
+def merge_transactions_for_day_issues(
+    saved: Sequence,
+    extras: Sequence,
+) -> list:
+    """Overlay *extras* onto *saved*.
+
+    - Extra rows with ``_id`` replace the matching saved row (live cell edits).
+    - Extra rows without ``_id`` are appended (unsaved / staged / draft rows).
+    """
+    by_id: dict[str, object] = {}
+    ephemeral: list = []
+    for tx in extras:
+        tid = getattr(tx, "_id", None)
+        if tid is None:
+            ephemeral.append(tx)
+        else:
+            by_id[str(tid)] = tx
+
+    out: list = []
+    seen: set[str] = set()
+    for tx in saved:
+        tid = getattr(tx, "_id", None)
+        key = str(tid) if tid is not None else ""
+        if key and key in by_id:
+            out.append(by_id[key])
+            seen.add(key)
+        else:
+            out.append(tx)
+    for key, tx in by_id.items():
+        if key not in seen:
+            out.append(tx)
+    out.extend(ephemeral)
+    return out
 
 
 @dataclass(frozen=True)
@@ -32,6 +69,10 @@ class DayIssue:
 class DayIssuesSnapshot:
     target_date: date
     issues: List[DayIssue] = field(default_factory=list)
+    scope: str = "day"  # "day" | "all"
+    # description_key -> register days that contributed (All days scope).
+    issue_dates: dict = field(default_factory=dict)
+    days_scanned: List[date] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -44,6 +85,57 @@ class DayIssuesSnapshot:
     @property
     def bad_map_count(self) -> int:
         return sum(1 for issue in self.issues if issue.kind == "Bad map")
+
+
+def merge_day_issue_snapshots(
+    snaps: Sequence[DayIssuesSnapshot],
+    *,
+    anchor_date: date,
+) -> DayIssuesSnapshot:
+    """Merge per-day snapshots into one All-days view (by description key)."""
+    by_key: dict[str, DayIssue] = {}
+    dates_by_key: dict[str, set[date]] = {}
+    days_scanned: list[date] = []
+
+    for snap in snaps:
+        days_scanned.append(snap.target_date)
+        for issue in snap.issues:
+            key = issue.description_key
+            dates_by_key.setdefault(key, set()).add(snap.target_date)
+            existing = by_key.get(key)
+            if existing is None:
+                by_key[key] = issue
+                continue
+            # Prefer Bad map over Unmapped when either day has a bad map.
+            kind = existing.kind
+            if issue.kind == "Bad map" or existing.kind == "Bad map":
+                kind = "Bad map"
+            payee = issue.payee or existing.payee
+            item = issue.item or existing.item
+            detail = issue.detail if issue.kind == "Bad map" else existing.detail
+            if existing.kind == "Bad map" and issue.kind != "Bad map":
+                detail = existing.detail
+            by_key[key] = DayIssue(
+                kind=kind,
+                description=existing.description or issue.description,
+                description_key=key,
+                count=existing.count + issue.count,
+                payee=payee,
+                item=item,
+                detail=detail or existing.detail,
+            )
+
+    issues = sorted(
+        by_key.values(),
+        key=lambda i: (-i.count, i.description_key),
+    )
+    return DayIssuesSnapshot(
+        target_date=anchor_date,
+        issues=issues,
+        scope="all",
+        issue_dates={k: sorted(v) for k, v in dates_by_key.items()},
+        days_scanned=sorted(set(days_scanned)),
+    )
 
 
 def _row_description(tx) -> str:
@@ -70,17 +162,53 @@ def _is_open_row(tx) -> bool:
     return True
 
 
+def _cashier_id_matches(tx, cashier_id: Optional[ObjectId]) -> bool:
+    """When *cashier_id* is set, keep only that cashier's rows."""
+    if cashier_id is None:
+        return True
+    cid = getattr(tx, "cashier_id", None)
+    if cid is None:
+        return False
+    return str(cid) == str(cashier_id)
+
+
+def filter_rows_for_cashier_scope(
+    rows: Sequence,
+    cashier_id: Optional[ObjectId],
+) -> list:
+    if cashier_id is None:
+        return list(rows)
+    return [tx for tx in rows if _cashier_id_matches(tx, cashier_id)]
+
+
 async def collect_day_issues(
     target: date,
     *,
     transactions: Optional[Sequence] = None,
+    extra_transactions: Optional[Sequence] = None,
     payee_names: Optional[Sequence[str]] = None,
+    cashier_id: Optional[ObjectId] = None,
 ) -> DayIssuesSnapshot:
-    """Build Day Issues for *target* from open (unverified) register rows."""
+    """Build Day Issues for *target* from open (unverified) register rows.
+
+    Pass ``transactions`` to fully replace the DB load (e.g. live Table snapshot
+    for the open register day). Pass ``extra_transactions`` to overlay dirty
+    saved rows and append unsaved / draft rows onto the DB result.
+
+    When ``cashier_id`` is set (cashier UI), only that cashier's rows count.
+    Accountant UI passes ``cashier_id=None`` to include everyone.
+    """
     if transactions is not None:
         rows = list(transactions)
+    elif cashier_id is not None:
+        rows = await get_transactions_by_date(
+            target, merged=False, cashier_id=cashier_id
+        )
     else:
         rows = await get_transactions_by_date(target, merged=True)
+    if extra_transactions:
+        rows = merge_transactions_for_day_issues(rows, extra_transactions)
+    rows = filter_rows_for_cashier_scope(rows, cashier_id)
     open_rows = [tx for tx in rows if _is_open_row(tx)]
 
     desc_counts: Counter[str] = Counter()
@@ -172,9 +300,72 @@ async def collect_day_issues(
     return DayIssuesSnapshot(target_date=target, issues=issues)
 
 
-async def count_day_issues(target: date) -> int:
-    snap = await collect_day_issues(target)
+async def count_day_issues(
+    target: date,
+    *,
+    transactions: Optional[Sequence] = None,
+    extra_transactions: Optional[Sequence] = None,
+    cashier_id: Optional[ObjectId] = None,
+) -> int:
+    snap = await collect_day_issues(
+        target,
+        transactions=transactions,
+        extra_transactions=extra_transactions,
+        cashier_id=cashier_id,
+    )
     return snap.total
+
+
+async def collect_day_issues_all_days(
+    *,
+    cashier_id: Optional[ObjectId] = None,
+    anchor_date: Optional[date] = None,
+    live_target: Optional[date] = None,
+    live_transactions: Optional[Sequence] = None,
+    live_extras: Optional[Sequence] = None,
+    limit_days: int = 120,
+) -> DayIssuesSnapshot:
+    """Build Day Issues across open register days (incomplete rows only)."""
+    from tahmeed.services.cashier_service import get_open_day_summaries
+
+    anchor = anchor_date or date.today()
+    all_cashiers = cashier_id is None
+    try:
+        summaries = await get_open_day_summaries(
+            cashier_id,
+            all_cashiers=all_cashiers,
+            limit=limit_days,
+        )
+    except Exception:
+        summaries = []
+
+    days: list[date] = []
+    for row in summaries:
+        d = row.get("date")
+        if isinstance(d, date):
+            days.append(d)
+    if live_target is not None and live_target not in days:
+        days.append(live_target)
+    if not days and live_transactions is None and live_extras is None:
+        return DayIssuesSnapshot(
+            target_date=anchor, issues=[], scope="all", days_scanned=[]
+        )
+
+    snaps: list[DayIssuesSnapshot] = []
+    for d in sorted(set(days)):
+        kwargs: dict = {"cashier_id": cashier_id}
+        if live_target is not None and d == live_target:
+            if live_transactions is not None:
+                kwargs["transactions"] = live_transactions
+            if live_extras is not None:
+                kwargs["extra_transactions"] = live_extras
+        snaps.append(await collect_day_issues(d, **kwargs))
+
+    if not snaps:
+        return DayIssuesSnapshot(
+            target_date=anchor, issues=[], scope="all", days_scanned=[]
+        )
+    return merge_day_issue_snapshots(snaps, anchor_date=anchor)
 
 
 def as_of_label(target: date) -> str:

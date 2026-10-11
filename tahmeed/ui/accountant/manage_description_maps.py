@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QColor, QFont, QBrush
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QCompleter, QDialog, QFrame,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
+    QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -35,8 +35,10 @@ _T1 = "#111827"
 _T2 = "#6B7280"
 _TM = "#9CA3AF"
 
-_COL_DEFAULTS = [52, 260, 180, 200]
+# # | Description | Item | Payee — Description stretches; Item/Payee stay visible.
+_COL_DEFAULTS = [52, 280, 200, 200]
 _SCROLL_CHUNK = 50
+_COL_NUM, _COL_DESC, _COL_ITEM, _COL_PAYEE = 0, 1, 2, 3
 
 
 def _lbl(text: str = "", size: int = 13, weight: int = 400,
@@ -147,7 +149,7 @@ class _MappingEditorDialog(QDialog):
         return (
             f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI';padding:0 8px;}}"
+            "font-family:'Segoe UI';padding:0 8px;}"
             f"QComboBox:focus{{border-color:{_BLUE};}}"
         )
 
@@ -173,7 +175,7 @@ class _MappingEditorDialog(QDialog):
         self._desc.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:13px;"
-            "font-family:'Segoe UI';padding:0 8px;}}"
+            "font-family:'Segoe UI';padding:0 8px;}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
             f"QLineEdit:disabled{{background:{_BG};color:{_T2};}}"
         )
@@ -246,14 +248,26 @@ class _MappingEditorDialog(QDialog):
         completer.setCaseSensitivity(Qt.CaseInsensitive)
         completer.setFilterMode(Qt.MatchContains)
         self._combo.setCompleter(completer)
+        prefill_item = ""
         if self._mapping is not None and not bulk:
-            idx = self._combo.findText(self._mapping.category_name)
+            prefill_item = (self._mapping.category_name or "").strip()
+        elif bulk:
+            shared_items = {
+                (e.category_name or "").strip()
+                for e in self._entries
+                if (e.category_name or "").strip()
+            }
+            if len(shared_items) == 1:
+                prefill_item = next(iter(shared_items))
+        if prefill_item:
+            idx = self._combo.findText(prefill_item)
             if idx >= 0:
                 self._combo.setCurrentIndex(idx)
             else:
-                self._combo.setEditText(self._mapping.category_name)
+                self._combo.setEditText(prefill_item)
         else:
             self._combo.setCurrentIndex(-1)
+            self._combo.setEditText("")
         vl.addWidget(self._combo)
 
         btn_row = QHBoxLayout()
@@ -501,7 +515,7 @@ class DescriptionMapsWidget(QWidget):
         self._search.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI';padding:0 8px;}}"
+            "font-family:'Segoe UI';padding:0 8px;}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
         self._search.textChanged.connect(self._on_search_changed)
@@ -512,7 +526,8 @@ class DescriptionMapsWidget(QWidget):
         )
         self._reassign_btn.setEnabled(False)
         self._reassign_btn.setToolTip(
-            "Map the selected description(s) to the same Payee + Item"
+            "Edit Item + Payee for one mapping, or map many descriptions "
+            "to the same Item + Payee"
         )
         self._reassign_btn.clicked.connect(self._reassign_selected)
         toolbar.addWidget(self._reassign_btn)
@@ -545,7 +560,7 @@ class DescriptionMapsWidget(QWidget):
 
         self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(
-            ["#", "Description", "Payee", "Item / Supplier"]
+            ["#", "Description", "Item / Supplier", "Payee"]
         )
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -562,12 +577,16 @@ class DescriptionMapsWidget(QWidget):
 
         hdr_view = self._table.horizontalHeader()
         hdr_view.setSectionsMovable(False)
-        hdr_view.setStretchLastSection(True)
+        hdr_view.setStretchLastSection(False)
+        hdr_view.setMinimumSectionSize(48)
         for i, width in enumerate(_COL_DEFAULTS):
             self._table.setColumnWidth(i, width)
-            hdr_view.setSectionResizeMode(i, QHeaderView.Interactive)
+        # Stretch description; keep Item + Payee readable (not scrolled away).
         bind_column_width_persistence(
-            self._table, "description_maps", _COL_DEFAULTS,
+            self._table,
+            "description_maps_desc_item_payee",
+            _COL_DEFAULTS,
+            stretch_columns=(_COL_DESC,),
         )
         table_vl.addWidget(self._table)
         root.addWidget(self._table_host, 1)
@@ -708,14 +727,21 @@ class DescriptionMapsWidget(QWidget):
             idx = start_index + i
             self._table.insertRow(idx)
             row_bg = _stripe_bg(idx)
+            item_name = (row.category_name or "").strip() or "—"
+            payee = (row.payee or "").strip() or "—"
             self._table.setItem(
-                idx, 0,
+                idx, _COL_NUM,
                 _cell(str(idx + 1), Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
             )
-            self._table.setItem(idx, 1, _cell(row.description, bg=row_bg))
-            payee = (row.payee or "").strip() or "—"
-            self._table.setItem(idx, 2, _cell(payee, bg=row_bg))
-            self._table.setItem(idx, 3, _cell(row.category_name, bg=row_bg))
+            desc_cell = _cell(row.description, bg=row_bg)
+            desc_cell.setToolTip(
+                f"Description: {row.description}\n"
+                f"Item: {item_name}\n"
+                f"Payee: {payee}"
+            )
+            self._table.setItem(idx, _COL_DESC, desc_cell)
+            self._table.setItem(idx, _COL_ITEM, _cell(item_name, bg=row_bg))
+            self._table.setItem(idx, _COL_PAYEE, _cell(payee, bg=row_bg))
             _finish_table_row(self._table, idx, row_bg)
 
     async def _load(self) -> None:
@@ -728,7 +754,9 @@ class DescriptionMapsWidget(QWidget):
         self._reassign_btn.setEnabled(n > 0)
         if n <= 1:
             self._delete_btn.setText("  Delete Selected")
-            self._reassign_btn.setText("  Re-assign Selected")
+            self._reassign_btn.setText(
+                "  Edit Selected" if n == 1 else "  Re-assign Selected"
+            )
         else:
             self._delete_btn.setText(f"  Delete Selected ({n})")
             self._reassign_btn.setText(f"  Re-assign Selected ({n})")
@@ -771,11 +799,13 @@ class DescriptionMapsWidget(QWidget):
         menu = QMenu(self)
         selected = self._selected_entries()
         if len(selected) > 1:
-            reassign_act = menu.addAction(f"Re-assign Selected ({len(selected)})…")
+            reassign_act = menu.addAction(
+                f"Re-assign Selected ({len(selected)}) to same Item + Payee…"
+            )
             edit_act = None
         else:
             reassign_act = None
-            edit_act = menu.addAction("Edit Mapping…")
+            edit_act = menu.addAction("Edit Item + Payee…")
         try:
             act = reassign_act or edit_act
             if act is not None:

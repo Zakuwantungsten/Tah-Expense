@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from datetime import date, datetime, timedelta
-from typing import Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 from bson import ObjectId
 import qtawesome as qta
@@ -67,7 +68,7 @@ _RECEIPT_DISPLAY: Dict[str, str] = {
 
 # Table columns
 _HEADERS = [
-    "", "S/N", "DATE", "CASHIER", "ITEM", "DESCRIPTION",
+    "", "S/N", "DATE", "CASHIER", "ITEM", "PAYEE", "DESCRIPTION",
     "TRUCK", "AMOUNT", "MEO", "NOTES", "RECEIPT", "APP BY",
 ]
 _COL_CHK   = 0
@@ -75,17 +76,18 @@ _COL_SN    = 1
 _COL_DATE  = 2
 _COL_CASH  = 3
 _COL_ITEM  = 4
-_COL_DESC  = 5
-_COL_TRUCK = 6
-_COL_AMT   = 7
-_COL_MEO   = 8
-_COL_NOTES = 9
-_COL_RCPT  = 10
-_COL_APP   = 11
-_NCOLS     = 12
+_COL_PAYEE = 5
+_COL_DESC  = 6
+_COL_TRUCK = 7
+_COL_AMT   = 8
+_COL_MEO   = 9
+_COL_NOTES = 10
+_COL_RCPT  = 11
+_COL_APP   = 12
+_NCOLS     = 13
 
 # Fixed widths per column (Description gets a real default so it stays resizable)
-_COL_WIDTHS = [32, 44, 80, 95, 90, 200, 90, 115, 90, 130, 80, 80]
+_COL_WIDTHS = [32, 44, 80, 95, 90, 120, 200, 90, 115, 90, 130, 80, 80]
 
 
 def _day_bounds(day: date) -> Tuple[datetime, datetime]:
@@ -125,6 +127,34 @@ def _format_day_label(day: date) -> str:
     return day.strftime("%d %b %Y")
 
 
+def _tx_register_day(tx: Transaction) -> Optional[date]:
+    """Register / reconciled day for Day Issues (prefer import primary date)."""
+    primary = getattr(tx, "import_primary_date", None)
+    if isinstance(primary, datetime):
+        return primary.date()
+    if isinstance(primary, date):
+        return primary
+    raw = getattr(tx, "date", None)
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    return None
+
+
+def _preferred_day_issues_date(txs: Sequence[Transaction]) -> Optional[date]:
+    """Most common register day among *txs* (ties → earliest)."""
+    counts: Counter[date] = Counter()
+    for tx in txs:
+        day = _tx_register_day(tx)
+        if day is not None:
+            counts[day] += 1
+    if not counts:
+        return None
+    top = max(counts.values())
+    return sorted(d for d, n in counts.items() if n == top)[0]
+
+
 # ── Primitive helpers ──────────────────────────────────────────────────────────
 
 def _lbl(text: str = "", size: int = 13, weight: int = 400,
@@ -150,12 +180,12 @@ def _btn(text: str, icon: str = "", primary: bool = True,
             pass
     if danger:
         ss = (f"QPushButton{{background:{_RED};color:#FFF;border:none;border-radius:5px;"
-              "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
+              "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}"
               "QPushButton:hover{background:#B91C1C;}"
               "QPushButton:disabled{background:#FCA5A5;}")
     elif primary:
         ss = (f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:5px;"
-              "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
+              "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}"
               "QPushButton:hover{background:#005EA3;}"
               "QPushButton:disabled{background:#93C5FD;}")
     else:
@@ -173,7 +203,7 @@ def _input_ss() -> str:
         f"QLineEdit,QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
         f"background:{_WHITE};color:{_T1};font-size:12px;"
         "font-family:'Segoe UI';padding:0 8px;"
-        "min-height:32px;max-height:32px;}}"
+        "min-height:32px;max-height:32px;}"
         f"QLineEdit:focus,QComboBox:focus{{border-color:{_BLUE};}}"
         "QComboBox::drop-down{border:none;width:20px;}"
     )
@@ -190,7 +220,7 @@ def _hsep() -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:11px;font-family:'Segoe UI';}}"
+        "border:none;font-size:11px;font-family:'Segoe UI';}"
         f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
@@ -685,7 +715,7 @@ class _ActionPanel(QFrame):
         self._notes.setStyleSheet(
             f"QTextEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI';padding:5px;}}"
+            "font-family:'Segoe UI';padding:5px;}"
             f"QTextEdit:focus{{border-color:{_BLUE};}}"
         )
         nvl.addWidget(self._notes)
@@ -801,8 +831,8 @@ class _ActionPanel(QFrame):
             return
         payee = (tx.payee or "").strip() or "—"
         self._mapping_warn.setText(
-            f"Missing {' and '.join(missing)} — map in Day Issues / Description Maps "
-            f"before Approve. Payee now: {payee}"
+            f"Missing {' and '.join(missing)} — Approve opens Day Issues to map "
+            f"first. Payee now: {payee}"
         )
         self._mapping_warn.show()
 
@@ -1002,6 +1032,8 @@ class _SubTabBar(QFrame):
 
 class VerifyInboxWidget(QWidget):
     badge_updated = Signal(int)
+    # date | None — open Day Issues (Phase 4: map before approve)
+    open_day_issues = Signal(object)
 
     def __init__(self, user: User, parent=None) -> None:
         super().__init__(parent)
@@ -1157,7 +1189,7 @@ class VerifyInboxWidget(QWidget):
         # Interactive + persisted widths (shared across New / Edited / Rejected / Issues).
         bind_column_width_persistence(
             t,
-            "verify_inbox",
+            "verify_inbox_v2",
             _COL_WIDTHS,
         )
         t.itemClicked.connect(self._on_item_clicked)
@@ -1922,6 +1954,12 @@ class VerifyInboxWidget(QWidget):
 
             t.setItem(r, _COL_ITEM, _cell(tx.item or tx.category_name or "—"))
 
+            t.setItem(
+                r,
+                _COL_PAYEE,
+                _cell((tx.payee or "").strip() or "—", color=_T2),
+            )
+
             desc_item = _cell(tx.description or "—")
             if tx.possible_duplicate:
                 desc_item.setBackground(QColor("#FEE2E2"))
@@ -2358,17 +2396,44 @@ class VerifyInboxWidget(QWidget):
             if len(unique) > len(sample) else ""
         )
         n = len(still_need)
+        target = _preferred_day_issues_date(still_need)
         self._clear_busy()
-        await self._await_ui(lambda: QMessageBox.warning(
-            self,
-            "Item and Payee required",
-            f"{n:,} selected entr{'y' if n == 1 else 'ies'} still missing "
-            f"Item and/or Payee ({len(unique):,} unique description(s)):\n\n"
-            f"{lines}{more}\n\n"
-            "Map them in Day Issues or Description Maps, then approve again.\n"
-            "Approve is blocked until every selected row has both fields.",
-        ))
+        open_issues = await self._await_ui(
+            lambda: self._ask_open_day_issues(
+                n=n,
+                unique_count=len(unique),
+                lines=lines,
+                more=more,
+            )
+        )
+        if open_issues:
+            self.open_day_issues.emit(target)
         return False
+
+    def _ask_open_day_issues(
+        self,
+        *,
+        n: int,
+        unique_count: int,
+        lines: str,
+        more: str,
+    ) -> bool:
+        """Warn that approve is blocked; offer navigation to Day Issues."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Item and Payee required")
+        box.setText(
+            f"{n:,} selected entr{'y' if n == 1 else 'ies'} still missing "
+            f"Item and/or Payee ({unique_count:,} unique description(s)):\n\n"
+            f"{lines}{more}\n\n"
+            "Approve is blocked until every selected row has both fields.\n"
+            "Open Day Issues to map them, then approve again."
+        )
+        open_btn = box.addButton("Open Day Issues", QMessageBox.AcceptRole)
+        box.addButton("Close", QMessageBox.RejectRole)
+        box.setDefaultButton(open_btn)
+        box.exec()
+        return box.clickedButton() is open_btn
 
     async def _prepare_transactions_for_approval(
         self,

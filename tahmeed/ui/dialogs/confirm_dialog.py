@@ -54,12 +54,12 @@ def _is_destructive(title: str, text: str, accept_label: str) -> bool:
 
 
 class _WarningBadge(QWidget):
-    """44px circle with a 24px warning triangle."""
+    """32px circle with a ~18px warning triangle (matches QMessageBox icon scale)."""
 
     def __init__(self, *, dark: bool, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._dark = dark
-        self.setFixedSize(44, 44)
+        self.setFixedSize(32, 32)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         del event
@@ -69,11 +69,11 @@ class _WarningBadge(QWidget):
         tri = QColor("#FCE100" if self._dark else "#9D5D00")
         p.setPen(Qt.NoPen)
         p.setBrush(circle)
-        p.drawEllipse(0, 0, 44, 44)
+        p.drawEllipse(0, 0, 32, 32)
 
-        # ~24px triangle centered in the 44px circle
-        cx, cy = 22.0, 23.0
-        half_w, height = 12.0, 21.0
+        # ~18px triangle centered in the 32px circle
+        cx, cy = 16.0, 16.5
+        half_w, height = 8.5, 15.0
         top = QPointF(cx, cy - height / 2)
         bl = QPointF(cx - half_w, cy + height / 2)
         br = QPointF(cx + half_w, cy + height / 2)
@@ -86,7 +86,7 @@ class _WarningBadge(QWidget):
             mark = QColor("#2B2B2B")
         else:
             p.setBrush(Qt.NoBrush)
-            pen = QPen(tri, 2.0)
+            pen = QPen(tri, 1.6)
             pen.setJoinStyle(Qt.RoundJoin)
             pen.setCapStyle(Qt.RoundCap)
             p.setPen(pen)
@@ -96,8 +96,8 @@ class _WarningBadge(QWidget):
         # Exclamation mark
         p.setPen(Qt.NoPen)
         p.setBrush(mark)
-        p.drawRoundedRect(QRectF(cx - 1.2, cy - 6.5, 2.4, 8.5), 1.0, 1.0)
-        p.drawEllipse(QPointF(cx, cy + 5.5), 1.6, 1.6)
+        p.drawRoundedRect(QRectF(cx - 0.9, cy - 4.5, 1.8, 6.0), 0.8, 0.8)
+        p.drawEllipse(QPointF(cx, cy + 4.0), 1.2, 1.2)
         p.end()
 
 
@@ -227,18 +227,19 @@ class ConfirmDialog(QDialog):
         c = self._colors()
         outer = QVBoxLayout(self)
         # Room for drop shadow around the card
-        outer.setContentsMargins(24, 20, 24, 28)
+        outer.setContentsMargins(16, 12, 16, 18)
         outer.setSpacing(0)
 
         card = QWidget(self)
         card.setObjectName("confirmCard")
-        card.setFixedWidth(440)
+        # Compact width — closer to standard QMessageBox (Import Complete).
+        card.setFixedWidth(380)
         card.setStyleSheet(
             f"""
             QWidget#confirmCard {{
                 background: {c['card']};
                 border: 1px solid {c['border']};
-                border-radius: 8px;
+                border-radius: 6px;
                 font-family: {_FONT};
             }}
             QLabel {{
@@ -248,9 +249,9 @@ class ConfirmDialog(QDialog):
             """
         )
         shadow = QGraphicsDropShadowEffect(card)
-        shadow.setBlurRadius(40)
-        shadow.setOffset(0, 16)
-        shadow.setColor(QColor(0, 0, 0, 71))  # ~28% black
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 10)
+        shadow.setColor(QColor(0, 0, 0, 56))
         card.setGraphicsEffect(shadow)
 
         card_layout = QVBoxLayout(card)
@@ -259,17 +260,17 @@ class ConfirmDialog(QDialog):
 
         # ── Title bar ─────────────────────────────────────────────────────
         title_bar = QWidget(card)
-        title_bar.setFixedHeight(40)
+        title_bar.setFixedHeight(32)
         title_bar.setStyleSheet("background: transparent;")
         title_row = QHBoxLayout(title_bar)
-        title_row.setContentsMargins(12, 0, 0, 0)
-        title_row.setSpacing(8)
+        title_row.setContentsMargins(10, 0, 0, 0)
+        title_row.setSpacing(6)
 
         icon_lbl = QLabel(title_bar)
-        icon_lbl.setFixedSize(16, 16)
+        icon_lbl.setFixedSize(14, 14)
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
-            icon_lbl.setPixmap(app.windowIcon().pixmap(16, 16))
+            icon_lbl.setPixmap(app.windowIcon().pixmap(14, 14))
         title_row.addWidget(icon_lbl, 0, Qt.AlignVCenter)
 
         title_lbl = QLabel(title, title_bar)
@@ -280,7 +281,7 @@ class ConfirmDialog(QDialog):
         title_row.addStretch(1)
 
         close_btn = QPushButton("✕", title_bar)
-        close_btn.setFixedSize(46, 40)
+        close_btn.setFixedSize(36, 32)
         close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.setFlat(True)
         close_btn.setStyleSheet(
@@ -288,9 +289,9 @@ class ConfirmDialog(QDialog):
             QPushButton {{
                 background: transparent;
                 border: none;
-                border-top-right-radius: 8px;
+                border-top-right-radius: 6px;
                 color: {c['title']};
-                font-size: 12px;
+                font-size: 11px;
                 font-family: {_FONT};
             }}
             QPushButton:hover {{
@@ -306,19 +307,20 @@ class ConfirmDialog(QDialog):
         body_wrap = QWidget(card)
         body_wrap.setStyleSheet("background: transparent;")
         body_row = QHBoxLayout(body_wrap)
-        body_row.setContentsMargins(28, 12, 28, 28)
-        body_row.setSpacing(16)
+        body_row.setContentsMargins(16, 6, 16, 14)
+        body_row.setSpacing(12)
 
         body_row.addWidget(_WarningBadge(dark=self._dark, parent=body_wrap), 0, Qt.AlignTop)
 
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(8)
+        text_col.setSpacing(4)
 
+        # Match QMessageBox / Import Complete text scale (13px).
         heading_lbl = QLabel(heading, body_wrap)
         heading_lbl.setWordWrap(True)
         heading_lbl.setStyleSheet(
-            f"color: {c['heading']}; font-size: 18px; font-weight: 600; "
+            f"color: {c['heading']}; font-size: 13px; font-weight: 600; "
             f"font-family: {_FONT};"
         )
         text_col.addWidget(heading_lbl)
@@ -327,7 +329,7 @@ class ConfirmDialog(QDialog):
             body_lbl = QLabel(body, body_wrap)
             body_lbl.setWordWrap(True)
             body_lbl.setStyleSheet(
-                f"color: {c['body']}; font-size: 14px; font-family: {_FONT};"
+                f"color: {c['body']}; font-size: 13px; font-family: {_FONT};"
             )
             text_col.addWidget(body_lbl)
 
@@ -335,7 +337,7 @@ class ConfirmDialog(QDialog):
             note_lbl = QLabel(note, body_wrap)
             note_lbl.setWordWrap(True)
             note_lbl.setStyleSheet(
-                f"color: {c['note']}; font-size: 13px; font-family: {_FONT};"
+                f"color: {c['note']}; font-size: 12px; font-family: {_FONT};"
             )
             text_col.addWidget(note_lbl)
 
@@ -350,20 +352,20 @@ class ConfirmDialog(QDialog):
             QWidget {{
                 background: {c['footer']};
                 border-top: 1px solid {c['footer_border']};
-                border-bottom-left-radius: 8px;
-                border-bottom-right-radius: 8px;
+                border-bottom-left-radius: 6px;
+                border-bottom-right-radius: 6px;
             }}
             """
         )
         footer_row = QHBoxLayout(footer)
-        footer_row.setContentsMargins(20, 16, 20, 16)
-        footer_row.setSpacing(8)
+        footer_row.setContentsMargins(12, 10, 12, 10)
+        footer_row.setSpacing(6)
         footer_row.addStretch(1)
 
         cancel_btn = QPushButton(cancel_label, footer)
         cancel_btn.setCursor(Qt.PointingHandCursor)
-        cancel_btn.setFixedHeight(36)
-        cancel_btn.setMinimumWidth(96)
+        cancel_btn.setFixedHeight(28)
+        cancel_btn.setMinimumWidth(72)
         cancel_btn.setFocusPolicy(Qt.StrongFocus)
         cancel_btn.setStyleSheet(
             f"""
@@ -371,9 +373,9 @@ class ConfirmDialog(QDialog):
                 background: {c['cancel_bg']};
                 color: {c['cancel_fg']};
                 border: 1px solid {c['cancel_border']};
-                border-radius: 4px;
+                border-radius: 5px;
                 padding: 0 16px;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 600;
                 font-family: {_FONT};
             }}
@@ -390,17 +392,17 @@ class ConfirmDialog(QDialog):
         accept_bg = c["accept"] if destructive else c["accept_primary"]
         accept_btn = QPushButton(accept_label, footer)
         accept_btn.setCursor(Qt.PointingHandCursor)
-        accept_btn.setFixedHeight(36)
-        accept_btn.setMinimumWidth(112)
+        accept_btn.setFixedHeight(28)
+        accept_btn.setMinimumWidth(72)
         accept_btn.setStyleSheet(
             f"""
             QPushButton {{
                 background: {accept_bg};
                 color: #FFFFFF;
                 border: 1px solid {accept_bg};
-                border-radius: 4px;
+                border-radius: 5px;
                 padding: 0 16px;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 600;
                 font-family: {_FONT};
             }}

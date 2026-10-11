@@ -167,8 +167,8 @@ class _QBDocHeader(QFrame):
         self._merged_badge.setFixedHeight(22)
         self._merged_badge.setStyleSheet(
             f"QLabel{{background:transparent;color:{_GOLD};border:1.5px solid {_GOLD};"
-            "border-radius:11px;padding:0 10px;font-size:10px;font-weight:700;"
-            "letter-spacing:0.6px;font-family:'Segoe UI',sans-serif;}}"
+            f"border-radius:11px;padding:0 10px;font-size:10px;font-weight:700;"
+            f"letter-spacing:0.6px;font-family:'Segoe UI',sans-serif;}}"
         )
         self._merged_badge.hide()
         title_row.addWidget(self._merged_badge, 0, Qt.AlignVCenter)
@@ -779,10 +779,17 @@ class CashierDashboard(QWidget):
         self._stack.addWidget(self._drafts_view)
 
         # index 4 — Day Issues
-        self._day_issues = DayIssuesWidget(user=self._user)
+        self._day_issues = DayIssuesWidget(
+            user=self._user,
+            row_source=self._register.day_issues_row_source,
+            apply_live=self._register.apply_description_mapping_to_open_rows,
+        )
         self._day_issues.open_register.connect(self._on_day_issues_open_register)
         self._day_issues.issues_changed.connect(self._on_day_issues_badge)
-        self._day_issues.mappings_applied.connect(self._register.refresh)
+        # Live apply already stamps the Table; avoid full refresh (would wipe unsaved).
+        self._day_issues.mappings_applied.connect(
+            lambda: asyncio.ensure_future(self._refresh_day_issues_badge())
+        )
         self._stack.addWidget(self._day_issues)
 
         # index 5 — Rejected entries
@@ -820,6 +827,7 @@ class CashierDashboard(QWidget):
         self._register.day_issues_requested.connect(self._on_open_day_issues)
         self._register.rows_saved.connect(lambda _: self._refresh_day_issues_badge())
         self._register.drafts_changed.connect(self._refresh_day_issues_badge)
+        self._register.day_issues_source_changed.connect(self._on_day_issues_source_changed)
 
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._refresh_draft_badge())
@@ -1004,10 +1012,21 @@ class CashierDashboard(QWidget):
 
         target = getattr(self._register, "_current_date", None) or date.today()
         try:
-            count = await count_day_issues(target)
+            replace_txs, extra_txs = self._register.day_issues_row_source(target)
+            count = await count_day_issues(
+                target,
+                transactions=replace_txs,
+                extra_transactions=extra_txs,
+                cashier_id=self._user._id,
+            )
         except Exception:
             count = 0
         self._on_day_issues_badge(count)
+
+    def _on_day_issues_source_changed(self) -> None:
+        asyncio.ensure_future(self._refresh_day_issues_badge())
+        if self._stack.currentIndex() == 4:
+            asyncio.ensure_future(self._day_issues.refresh())
 
     def _on_open_day_issues(self, target=None) -> None:
         self._on_nav("day_issues")

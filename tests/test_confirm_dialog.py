@@ -67,7 +67,7 @@ def test_confirm_dialog_clear_table_labels(qapp, monkeypatch):
     assert dlg._cancel_btn.isDefault()
     card = _find_card(dlg)
     assert card is not None
-    assert card.width() == 440
+    assert card.width() == 380
     assert "#C42B1C" in dlg._accept_btn.styleSheet()
     dlg.close()
 

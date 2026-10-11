@@ -137,7 +137,7 @@ class _AddPersonDialog(QDialog):
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:13px;"
             "font-family:'Segoe UI';padding:0 8px;"
-            "min-height:34px;max-height:34px;}}"
+            "min-height:34px;max-height:34px;}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
         self._inp.returnPressed.connect(self._accept)
@@ -219,7 +219,7 @@ class PeopleRegistryWidget(QWidget):
         self._search.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI';padding:0 8px;}}"
+            "font-family:'Segoe UI';padding:0 8px;}"
             f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
         self._search.textChanged.connect(self._on_search_changed)
@@ -232,7 +232,7 @@ class PeopleRegistryWidget(QWidget):
         self._filter_cb.setStyleSheet(with_combo_popup(
             f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            "font-family:'Segoe UI';padding:0 8px;min-width:120px;}}"
+            "font-family:'Segoe UI';padding:0 8px;min-width:120px;}"
             f"QComboBox:focus{{border-color:{_BLUE};}}"
             "QComboBox::drop-down{border:none;width:20px;}"
         ))

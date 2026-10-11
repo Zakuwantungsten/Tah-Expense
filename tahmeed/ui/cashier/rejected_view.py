@@ -80,7 +80,7 @@ def _tool_btn(text: str, *, primary=False, danger=False) -> QPushButton:
         btn.setStyleSheet(
             f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:4px;"
             "font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;"
-            "padding:0 14px;}}"
+            "padding:0 14px;}"
             "QPushButton:hover{background:#005EA3;}"
             "QPushButton:disabled{background:#93C5FD;}"
         )
@@ -88,7 +88,7 @@ def _tool_btn(text: str, *, primary=False, danger=False) -> QPushButton:
         btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{_RED};border:1px solid #FECACA;"
             "border-radius:4px;font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+            "font-family:'Segoe UI',sans-serif;padding:0 14px;}"
             f"QPushButton:hover{{background:{_RED_L};}}"
             "QPushButton:disabled{color:#FCA5A5;border-color:#FEE2E2;}"
         )
@@ -96,7 +96,7 @@ def _tool_btn(text: str, *, primary=False, danger=False) -> QPushButton:
         btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{_T1};border:1px solid {_BORDER};"
             "border-radius:4px;font-size:12px;font-weight:500;"
-            "font-family:'Segoe UI',sans-serif;padding:0 14px;}}"
+            "font-family:'Segoe UI',sans-serif;padding:0 14px;}"
             f"QPushButton:hover{{background:{_BG};}}"
             "QPushButton:disabled{color:#D1D5DB;}"
         )
@@ -283,7 +283,7 @@ class RejectedView(QWidget):
         t.setStyleSheet(
             f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
             "border:none;font-family:Calibri;font-size:11pt;"
-            "selection-background-color:#cde0f5;selection-color:#1B2B4B;}}"
+            "selection-background-color:#cde0f5;selection-color:#1B2B4B;}"
             f"QTableWidget::item{{padding:2px 3px;color:{_T1};}}"
             f"QHeaderView::section:horizontal{{background:{_HDR_BG};color:{_HDR_FG};"
             "font-size:11px;font-weight:700;font-family:'Segoe UI',sans-serif;"
@@ -366,14 +366,14 @@ class RejectedView(QWidget):
                     f"QPushButton{{background:transparent;color:{_RED};border:none;"
                     f"border-bottom:2px solid {_RED};border-radius:0;"
                     "font-size:12px;font-weight:700;font-family:'Segoe UI',sans-serif;"
-                    "padding:6px 12px;}}"
+                    "padding:6px 12px;}"
                 )
             else:
                 btn.setStyleSheet(
                     f"QPushButton{{background:transparent;color:{_T2};border:none;"
                     "border-bottom:2px solid transparent;border-radius:0;"
                     "font-size:12px;font-weight:500;font-family:'Segoe UI',sans-serif;"
-                    "padding:6px 12px;}}"
+                    "padding:6px 12px;}"
                     f"QPushButton:hover{{color:{_T1};}}"
                 )
 

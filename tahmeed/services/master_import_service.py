@@ -42,6 +42,7 @@ class MasterImportRow:
     approver: str
     category_id: Optional[ObjectId] = None
     category_name: Optional[str] = None
+    payee: str = ""
     amount_usd: Optional[float] = None
 
 
@@ -150,6 +151,7 @@ async def preview_master_import(path: str | Path) -> MasterImportPreview:
         if mapping:
             row.category_id = mapping.category_id
             row.category_name = mapping.category_name
+            row.payee = " ".join((mapping.payee or "").strip().upper().split())
         else:
             unmapped[key] = unmapped.get(key, 0) + 1
 
@@ -166,18 +168,22 @@ async def apply_mapping_to_preview(
     description_key: str,
     category_id: ObjectId,
     category_name: str,
+    *,
+    payee: str = "",
 ) -> None:
-    """Assign an item to all preview rows sharing this description key."""
+    """Assign item/payee to all preview rows sharing this description key."""
+    payee_text = " ".join((payee or "").strip().upper().split())
     display = description_key
     for row in preview.rows:
         if normalize_description(row.description) == description_key:
             display = row.description
             break
-    await save_mapping(display, category_id, category_name)
+    await save_mapping(display, category_id, category_name, payee=payee_text)
     for row in preview.rows:
         if normalize_description(row.description) == description_key:
             row.category_id = category_id
             row.category_name = category_name
+            row.payee = payee_text
     preview.unmapped.pop(description_key, None)
 
 
@@ -199,6 +205,7 @@ def _row_commit_payload(row: MasterImportRow) -> dict:
             "receipt_raw": row.receipt_raw,
             "ownership": row.ownership,
             "approver": row.approver,
+            "payee": row.payee or "",
             "category_id": row.category_id,
             "category_name": row.category_name,
         }

@@ -100,7 +100,7 @@ def _seg_style(position: str) -> str:
         r = "border-radius:0;"
     return (
         f"QPushButton{{background:#ffffff;border:1px solid #d1d5db;{r}"
-        " padding:4px 14px;font-size:11px;font-weight:600;color:#6b7280;}}"
+        " padding:4px 14px;font-size:11px;font-weight:600;color:#6b7280;}"
         "QPushButton:checked{background:#0077C5;border-color:#0077C5;color:#ffffff;}"
         "QPushButton:hover:!checked{background:#f9fafb;}"
     )

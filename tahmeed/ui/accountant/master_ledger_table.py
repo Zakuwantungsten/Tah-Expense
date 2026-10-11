@@ -700,11 +700,38 @@ class MasterLedgerTable(QFrame):
             self._validate_truck_cell(row, item)
         self._mark_dirty(row)
 
+    def _active_item_editor(self):
+        """Return the open cell editor widget, or None if not editing."""
+        table = self._tbl
+        if table.state() != QAbstractItemView.EditingState:
+            return None
+        idx = table.currentIndex()
+        if idx.isValid():
+            persistent = table.indexWidget(idx)
+            if persistent is not None:
+                return persistent
+        viewport = table.viewport()
+        w = QApplication.focusWidget()
+        while w is not None:
+            parent = w.parentWidget()
+            if parent is viewport:
+                return w
+            if w is table or not table.isAncestorOf(w):
+                break
+            w = parent
+        return None
+
     def _commit_open_editor(self) -> None:
-        w = self._tbl.indexWidget(self._tbl.currentIndex())
-        if w is not None:
-            self._tbl.commitData(w)
-            self._tbl.closeEditor(w, QAbstractItemDelegate.NoHint)
+        table = self._tbl
+        editor = self._active_item_editor()
+        if editor is not None:
+            table.commitData(editor)
+            table.closeEditor(editor, QAbstractItemDelegate.SubmitModelCache)
+        elif table.state() == QAbstractItemView.EditingState:
+            fw = QApplication.focusWidget()
+            if fw is not None and table.isAncestorOf(fw):
+                fw.clearFocus()
+            table.setFocus(Qt.OtherFocusReason)
 
     def _table_key_press(self, event: QKeyEvent) -> None:
         mod = event.modifiers()

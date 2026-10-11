@@ -153,7 +153,7 @@ class DescriptionMappingDialog(QDialog):
         self._combo.setStyleSheet(
             f"QComboBox {{ border: 1px solid {_BORDER}; border-radius: 5px;"
             f" background: {_WHITE}; color: {_T1}; font-size: 12px;"
-            " padding: 0 8px; min-height: 34px; max-height: 34px; }}"
+            " padding: 0 8px; min-height: 34px; max-height: 34px; }"
             f"QComboBox:focus {{ border-color: {_BLUE}; }}"
         )
         for cat in self._categories:
@@ -178,7 +178,7 @@ class DescriptionMappingDialog(QDialog):
             f"QPushButton {{ background: {_WHITE}; color: {_T2};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
             " font-size: 13px; padding: 0 16px;"
-            " min-height: 34px; max-height: 34px; }}"
+            " min-height: 34px; max-height: 34px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         cancel_btn.clicked.connect(self.reject)
@@ -194,7 +194,7 @@ class DescriptionMappingDialog(QDialog):
                 f"QPushButton {{ background: {_WHITE}; color: {_T1};"
                 f" border: 1px solid {_BORDER}; border-radius: 5px;"
                 " font-size: 13px; padding: 0 14px;"
-                " min-height: 34px; max-height: 34px; }}"
+                " min-height: 34px; max-height: 34px; }"
                 f"QPushButton:hover {{ background: {_BG}; }}"
             )
             skip_btn.clicked.connect(self._on_skip)
@@ -211,7 +211,7 @@ class DescriptionMappingDialog(QDialog):
                 f"QPushButton {{ background: {_WHITE}; color: {_T1};"
                 f" border: 1px solid {_BORDER}; border-radius: 5px;"
                 " font-size: 13px; padding: 0 14px;"
-                " min-height: 34px; max-height: 34px; }}"
+                " min-height: 34px; max-height: 34px; }"
                 f"QPushButton:hover {{ background: {_BG}; }}"
             )
             skip_all_btn.clicked.connect(self._on_skip_all)
@@ -232,7 +232,7 @@ class DescriptionMappingDialog(QDialog):
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
             " font-size: 13px; padding: 0 14px;"
-            " min-height: 34px; max-height: 34px; }}"
+            " min-height: 34px; max-height: 34px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         new_item_btn.clicked.connect(self._on_assign_new)
@@ -250,7 +250,7 @@ class DescriptionMappingDialog(QDialog):
             f"QPushButton {{ background: {_WHITE}; color: {_T1};"
             f" border: 1px solid {_BORDER}; border-radius: 5px;"
             " font-size: 13px; padding: 0 14px;"
-            " min-height: 34px; max-height: 34px; }}"
+            " min-height: 34px; max-height: 34px; }"
             f"QPushButton:hover {{ background: {_BG}; }}"
         )
         new_supplier_btn.clicked.connect(self._on_assign_new_supplier)
@@ -265,7 +265,7 @@ class DescriptionMappingDialog(QDialog):
             f"QPushButton {{ background: {_BLUE}; color: #FFFFFF; border: none;"
             " border-radius: 5px; font-size: 13px; font-weight: 600;"
             " padding: 0 16px;"
-            " min-height: 34px; max-height: 34px; }}"
+            " min-height: 34px; max-height: 34px; }"
             "QPushButton:hover { background: #005EA3; }"
         )
         assign_btn.clicked.connect(self._on_assign)

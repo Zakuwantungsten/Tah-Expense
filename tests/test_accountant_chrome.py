@@ -144,6 +144,36 @@ def test_frameless_nchit_edges_are_resizable(qapp, monkeypatch):
     win.close()
 
 
+def test_frameless_nchit_prefers_title_bar_controls_over_edge(qapp, monkeypatch):
+    """Min/max/close hits stay HTCLIENT even inside the top-right resize strip."""
+    from PySide6.QtCore import QPoint, QRect
+
+    from tahmeed.ui.main_window import MainWindow, _HTCLIENT, _HTTOPRIGHT
+
+    user = User(
+        username="cashier1",
+        password_hash="x",
+        role="cashier",
+        full_name="Cashier",
+    )
+    monkeypatch.setattr(MainWindow, "_build_ui", lambda self: None)
+    win = MainWindow(user)
+    win.setGeometry(100, 100, 1200, 800)
+
+    monkeypatch.setattr(win, "mapFromGlobal", lambda g: QPoint(g.x() - 100, g.y() - 100))
+    monkeypatch.setattr(win, "rect", lambda: QRect(0, 0, 1200, 800))
+    monkeypatch.setattr(win, "isMaximized", lambda: False)
+
+    # Top-right corner is normally HTTOPRIGHT…
+    assert win.nchit_test(QPoint(100 + 1195, 100 + 4)) == _HTTOPRIGHT
+    # …but not when the cursor is over a window-control button.
+    monkeypatch.setattr(win, "_over_title_bar_controls", lambda _local: True)
+    assert win.nchit_test(QPoint(100 + 1195, 100 + 4)) == _HTCLIENT
+
+    win._force_close = True
+    win.close()
+
+
 def test_title_bar_starts_system_move_helper(qapp, monkeypatch):
     """Drag threshold path calls QWindow.startSystemMove when available."""
     from PySide6.QtCore import QEvent, QPointF, Qt

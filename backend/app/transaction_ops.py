@@ -18,6 +18,15 @@ DRAFT_BASE_MATCH: dict[str, Any] = {
     "trashed": {"$ne": True},
 }
 
+# Open register rows for Day Issues (draft + submitted, not yet verified).
+OPEN_REGISTER_MATCH: dict[str, Any] = {
+    "verified": {"$ne": True},
+    "rejected": {"$ne": True},
+    "discarded": {"$ne": True},
+    "deletion_requested": {"$ne": True},
+    "trashed": {"$ne": True},
+}
+
 
 def day_bounds(target: date) -> tuple[datetime, datetime]:
     start = datetime.combine(target, time.min)

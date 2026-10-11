@@ -786,6 +786,8 @@ class DailyRegister(QWidget):
     register_status_updated = Signal(int, int)  # draft_count, submitted_count on saved rows
     drafts_changed        = Signal()
     day_issues_requested  = Signal(object)  # date | None — open Day Issues for this day
+    # Item / Payee / Description / import staging changed — refresh Day Issues.
+    day_issues_source_changed = Signal()
     undo_redo_changed     = Signal(bool, bool)  # can_undo, can_redo
     edit_state_changed = Signal(bool, int)         # (edit_mode_active, dirty_row_count)
     mode_changed      = Signal(bool)               # merged mode on/off
@@ -2317,6 +2319,8 @@ class DailyRegister(QWidget):
                 self._update_truck_required_highlight(row)
             if col == COL_TZS or col == COL_USD:
                 self._update_footer()
+            if col in (COL_ITEM, COL_PAYEE, COL_DESC):
+                self._notify_day_issues_source_changed()
             return
 
         # Uppercase all free-text cells
@@ -2366,6 +2370,8 @@ class DailyRegister(QWidget):
             self._update_footer()
 
         self._schedule_draft_autosave()
+        if col in (COL_ITEM, COL_PAYEE, COL_DESC):
+            self._notify_day_issues_source_changed()
 
     def _on_model_data_changed(self, top_left, bottom_right, roles=()) -> None:
         # Kept for receipt/other UserRole updates if added later.
@@ -4099,6 +4105,7 @@ class DailyRegister(QWidget):
                 "Review the Table, make any edits, then click Save.\n"
                 "Saved entries go to the accountant Verify inbox.",
             )
+            self.day_issues_source_changed.emit()
         finally:
             self._suppress_truck_dialog = False
         QTimer.singleShot(0, self._flush_truck_correction)
@@ -4160,6 +4167,14 @@ class DailyRegister(QWidget):
                 if item_name:
                     self._table.setItem(
                         target, COL_ITEM, QTableWidgetItem(_upper_text(COL_ITEM, item_name))
+                    )
+
+                payee_name = data.get("payee") or ""
+                if payee_name:
+                    self._table.setItem(
+                        target,
+                        COL_PAYEE,
+                        QTableWidgetItem(_upper_text(COL_PAYEE, payee_name)),
                     )
 
                 desc = data.get("description") or ""
@@ -4673,6 +4688,284 @@ class DailyRegister(QWidget):
                 return True
         return False
 
+    def _notify_day_issues_source_changed(self) -> None:
+        if self._bulk_mutating:
+            return
+        self.day_issues_source_changed.emit()
+
+    def snapshot_transactions_for_day_issues(self) -> list:
+        """Live Table rows (saved + unsaved) using current Item / Payee / Desc cells.
+
+        Used as the authoritative Day Issues source when this register date is open.
+        """
+        from dataclasses import replace
+        from datetime import datetime as _dt
+
+        from tahmeed.models.transaction import Transaction
+
+        if self._current_date is None:
+            return []
+        base_dt = _dt(
+            self._current_date.year,
+            self._current_date.month,
+            self._current_date.day,
+        )
+        out: list = []
+        for row in range(self._table.rowCount()):
+            if row >= self._saved_count and not self._row_has_data(row):
+                continue
+            desc = self._cell_text(row, COL_DESC).strip()
+            item = self._cell_text(row, COL_ITEM).strip()
+            payee = self._cell_text(row, COL_PAYEE).strip()
+            if row < self._saved_count:
+                base = self._saved_txs.get(row)
+                if base is None:
+                    continue
+                out.append(
+                    replace(
+                        base,
+                        description=desc or (base.description or ""),
+                        item=item,
+                        category_name=item or (base.category_name or ""),
+                        payee=payee,
+                    )
+                )
+                continue
+            if not desc:
+                continue
+            out.append(
+                Transaction(
+                    date=base_dt,
+                    description=desc,
+                    truck_number=self._cell_text(row, COL_TRUCK).strip(),
+                    amount=0.0,
+                    item=item,
+                    category_name=item,
+                    payee=payee,
+                    cashier_id=getattr(self._user, "_id", None),
+                    verified=False,
+                )
+            )
+        return out
+
+    def local_draft_transactions_for_day_issues(self, target: date) -> list:
+        """Unsaved draft rows for *target* when the Table is not open on that date."""
+        from datetime import datetime as _dt
+
+        from tahmeed.models.transaction import Transaction
+
+        draft = load_register_draft(
+            self._user._id, target, merged=self._merged_mode
+        )
+        if draft is None or draft_is_empty(draft):
+            return []
+        base_dt = _dt(target.year, target.month, target.day)
+        out: list = []
+        for entry in draft.get("new_rows") or []:
+            cells = cells_from_json(entry.get("cells"))
+            desc = (cells.get(COL_DESC) or "").strip()
+            if not desc:
+                continue
+            item = (cells.get(COL_ITEM) or "").strip()
+            payee = (cells.get(COL_PAYEE) or "").strip()
+            out.append(
+                Transaction(
+                    date=base_dt,
+                    description=desc,
+                    truck_number=(cells.get(COL_TRUCK) or "").strip(),
+                    amount=0.0,
+                    item=item,
+                    category_name=item,
+                    payee=payee,
+                    cashier_id=getattr(self._user, "_id", None),
+                    verified=False,
+                )
+            )
+        return out
+
+    def day_issues_row_source(self, target: date) -> tuple:
+        """Return ``(replace_transactions, extra_transactions)`` for Day Issues.
+
+        When the Table is open on *target*, the live snapshot fully replaces the
+        DB load. Otherwise local draft new-rows are passed as extras.
+        """
+        if self._current_date == target:
+            return self.snapshot_transactions_for_day_issues(), None
+        extras = self.local_draft_transactions_for_day_issues(target)
+        return None, extras or None
+
+    def apply_description_mapping_to_open_rows(
+        self,
+        target: date,
+        descriptions,
+        *,
+        payee: str,
+        item_name: str,
+        category_id=None,
+        cashier_id=None,
+    ) -> int:
+        """Stamp Payee + Item onto matching live / draft rows for *target*.
+
+        Updates unsaved Table rows in place (no Save required). Also updates
+        saved-row cells on the open register so the UI matches the DB patch.
+        When the Table is on another date, patches the local draft file.
+        """
+        from tahmeed.services.description_mapping_service import normalize_description
+
+        keys = {
+            normalize_description(d)
+            for d in (descriptions or [])
+            if normalize_description(d)
+        }
+        if not keys:
+            return 0
+        payee_text = " ".join((payee or "").strip().upper().split())
+        item_text = (item_name or "").strip()
+
+        if self._current_date == target:
+            return self._apply_mapping_to_live_grid(
+                keys,
+                payee=payee_text,
+                item_name=item_text,
+                category_id=category_id,
+                cashier_id=cashier_id,
+            )
+        return self._apply_mapping_to_local_draft(
+            target,
+            keys,
+            payee=payee_text,
+            item_name=item_text,
+            category_id=category_id,
+        )
+
+    def _apply_mapping_to_live_grid(
+        self,
+        keys: set,
+        *,
+        payee: str,
+        item_name: str,
+        category_id=None,
+        cashier_id=None,
+    ) -> int:
+        from dataclasses import replace
+
+        from tahmeed.services.description_mapping_service import normalize_description
+
+        updated = 0
+        self._commit_open_editor()
+        prev_bulk = self._bulk_mutating
+        self._bulk_mutating = True
+        prev = self._table.blockSignals(True)
+        try:
+            for row in range(self._table.rowCount()):
+                if row >= self._saved_count and not self._row_has_data(row):
+                    continue
+                desc = self._cell_text(row, COL_DESC).strip()
+                key = normalize_description(desc)
+                if not key or key not in keys:
+                    continue
+                if row < self._saved_count:
+                    tx = self._saved_txs.get(row)
+                    if tx is None:
+                        continue
+                    if getattr(tx, "verified", False) or getattr(tx, "trashed", False):
+                        continue
+                    if getattr(tx, "discarded", False):
+                        continue
+                    if cashier_id is not None:
+                        cid = getattr(tx, "cashier_id", None)
+                        if cid is None or str(cid) != str(cashier_id):
+                            continue
+                    self._write_mapping_cells(
+                        row, item_name=item_name, payee=payee, saved=True
+                    )
+                    self._saved_txs[row] = replace(
+                        tx,
+                        item=item_name,
+                        category_name=item_name,
+                        category_id=category_id if category_id is not None else tx.category_id,
+                        payee=payee,
+                    )
+                    updated += 1
+                    continue
+
+                if cashier_id is not None:
+                    # Unsaved rows belong to the signed-in user.
+                    if str(getattr(self._user, "_id", "") or "") != str(cashier_id):
+                        continue
+                self._write_mapping_cells(
+                    row, item_name=item_name, payee=payee, saved=False
+                )
+                meta = dict(self._pending_row_meta.get(row) or {})
+                if category_id is not None:
+                    meta["category_id"] = category_id
+                self._pending_row_meta[row] = meta
+                updated += 1
+        finally:
+            self._table.blockSignals(prev)
+            self._bulk_mutating = prev_bulk
+        if updated:
+            self._schedule_draft_autosave()
+            self.day_issues_source_changed.emit()
+        return updated
+
+    def _write_mapping_cells(
+        self, row: int, *, item_name: str, payee: str, saved: bool
+    ) -> None:
+        if saved and not self._edit_mode:
+            flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+            bg: Optional[QBrush] = QBrush(SAVED_BG)
+        elif saved and self._edit_mode:
+            flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+            bg = QBrush(EDIT_BG)
+        else:
+            flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+            bg = None
+
+        for col, text in ((COL_ITEM, item_name), (COL_PAYEE, payee)):
+            it = self._table.item(row, col)
+            if it is None:
+                it = QTableWidgetItem(text)
+                self._table.setItem(row, col, it)
+            else:
+                it.setText(text)
+            it.setFlags(flags)
+            if bg is not None:
+                it.setBackground(bg)
+
+    def _apply_mapping_to_local_draft(
+        self,
+        target: date,
+        keys: set,
+        *,
+        payee: str,
+        item_name: str,
+        category_id=None,
+    ) -> int:
+        from tahmeed.services.register_draft_service import apply_mapping_to_draft_payload
+
+        draft = load_register_draft(
+            self._user._id, target, merged=self._merged_mode
+        )
+        if draft is None or draft_is_empty(draft):
+            return 0
+        updated = apply_mapping_to_draft_payload(
+            draft,
+            keys,
+            payee=payee,
+            item_name=item_name,
+            category_id=category_id,
+            desc_col=COL_DESC,
+            item_col=COL_ITEM,
+            payee_col=COL_PAYEE,
+        )
+        if updated:
+            try:
+                save_register_draft(draft)
+            except Exception:
+                return 0
+        return updated
+
     # ------------------------------------------------------------------
     # Local draft autosave (crash / power-loss recovery)
     # ------------------------------------------------------------------
@@ -4868,13 +5161,40 @@ class DailyRegister(QWidget):
             return "discard"
         return "cancel"
 
+    def _active_item_editor(self):
+        """Return the open cell editor widget, or None if not editing."""
+        table = self._table
+        if table.state() != QAbstractItemView.EditingState:
+            return None
+        idx = table.currentIndex()
+        if idx.isValid():
+            persistent = table.indexWidget(idx)
+            if persistent is not None:
+                return persistent
+        viewport = table.viewport()
+        w = QApplication.focusWidget()
+        while w is not None:
+            parent = w.parentWidget()
+            if parent is viewport:
+                return w
+            if w is table or not table.isAncestorOf(w):
+                break
+            w = parent
+        return None
+
     def _commit_open_editor(self) -> None:
         """Flush the active cell editor into the model before save/leave checks."""
-        row, col = self._table.currentRow(), self._table.currentColumn()
-        w = QApplication.focusWidget()
-        if w is not None and self._table.isAncestorOf(w):
-            self._table.commitData(w)
-            self._table.closeEditor(w, QAbstractItemDelegate.NoHint)
+        table = self._table
+        editor = self._active_item_editor()
+        if editor is not None:
+            table.commitData(editor)
+            table.closeEditor(editor, QAbstractItemDelegate.SubmitModelCache)
+        elif table.state() == QAbstractItemView.EditingState:
+            # Last resort: focus-out commits without naming the wrong widget.
+            fw = QApplication.focusWidget()
+            if fw is not None and table.isAncestorOf(fw):
+                fw.clearFocus()
+            table.setFocus(Qt.OtherFocusReason)
         self._begin_closing_row_edit()
         self._flush_pending_row_edits()
 
@@ -5283,6 +5603,8 @@ class DailyRegister(QWidget):
             if filled_item is not None:
                 self._validate_item_cell(row, filled_item)
                 self._update_truck_required_highlight(row)
+            if (need_item and cat_name) or (need_payee and payee):
+                self._notify_day_issues_source_changed()
         finally:
             if self._auto_fill_row == row:
                 self._auto_fill_row = None
