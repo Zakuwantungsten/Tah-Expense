@@ -175,6 +175,25 @@ def _patch_message_box_statics() -> None:
         buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
         defaultButton: QMessageBox.StandardButton = QMessageBox.StandardButton.NoButton,
     ) -> int:
+        yes = QMessageBox.StandardButton.Yes
+        no = QMessageBox.StandardButton.No
+        cancel = QMessageBox.StandardButton.Cancel
+        discard = QMessageBox.StandardButton.Discard
+        confirm_set = (
+            (bool(buttons & yes) and bool(buttons & (no | cancel)))
+            or (bool(buttons & discard) and bool(buttons & cancel))
+        )
+        if confirm_set:
+            from tahmeed.ui.dialogs.confirm_dialog import ask_standard_question
+
+            return ask_standard_question(
+                parent,
+                title,
+                text,
+                buttons,
+                defaultButton,
+                destructive=True,
+            )
         box = QMessageBox(QMessageBox.Icon.Warning, title, text, buttons, parent)
         if defaultButton != QMessageBox.StandardButton.NoButton:
             box.setDefaultButton(defaultButton)
@@ -201,10 +220,11 @@ def _patch_message_box_statics() -> None:
         ),
         defaultButton: QMessageBox.StandardButton = QMessageBox.StandardButton.NoButton,
     ) -> int:
-        box = QMessageBox(QMessageBox.Icon.Question, title, text, buttons, parent)
-        if defaultButton != QMessageBox.StandardButton.NoButton:
-            box.setDefaultButton(defaultButton)
-        return _style_dialog_surface(box).exec()
+        from tahmeed.ui.dialogs.confirm_dialog import ask_standard_question
+
+        return ask_standard_question(
+            parent, title, text, buttons, defaultButton
+        )
 
     QMessageBox.information = staticmethod(_information)  # type: ignore[method-assign]
     QMessageBox.warning = staticmethod(_warning)  # type: ignore[method-assign]
@@ -271,15 +291,18 @@ def show_question(
     *,
     default_no: bool = True,
 ) -> int:
-    """Contrast-safe Yes/No question; returns the clicked standard button."""
-    return show_message(
+    """Fluent Yes/No confirm; returns the clicked standard button."""
+    from tahmeed.ui.dialogs.confirm_dialog import ask_standard_question
+
+    return ask_standard_question(
         parent,
         title,
         text,
-        icon=QMessageBox.Icon.Question,
-        buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        default_button=(
-            QMessageBox.StandardButton.No if default_no else QMessageBox.StandardButton.Yes
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        (
+            QMessageBox.StandardButton.No
+            if default_no
+            else QMessageBox.StandardButton.Yes
         ),
     )
 

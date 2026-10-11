@@ -4455,14 +4455,19 @@ class DailyRegister(QWidget):
                 "There is no unsaved data to clear.",
             )
             return
-        if QMessageBox.question(
+        from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
+
+        if not ask_confirm(
             self,
-            "Clear Table",
-            "Clear all unsaved rows and typed data?\n\n"
-            "Saved entries on this register will not be removed.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        ) != QMessageBox.Yes:
+            title="Clear Table",
+            heading="Clear this table?",
+            body="All unsaved rows and typed data will be removed.",
+            note="Saved entries on this register will not be affected.",
+            accept_label="Clear table",
+            cancel_label="Cancel",
+            destructive=True,
+            default_cancel=True,
+        ):
             return
         self._commit_open_editor()
         self._clear_unsaved_with_undo()

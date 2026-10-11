@@ -32,7 +32,7 @@ def register(qapp, monkeypatch):
     from tahmeed.ui.cashier.excel_grid import DailyRegister
     from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_ITEM, COL_TZS
     from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QTableWidgetItem, QMessageBox
+    from PySide6.QtWidgets import QTableWidgetItem
 
     user = MagicMock()
     user._id = "cashier-1"
@@ -51,8 +51,8 @@ def register(qapp, monkeypatch):
     reg._COL_TZS = COL_TZS
 
     monkeypatch.setattr(
-        "tahmeed.ui.cashier.excel_grid.QMessageBox.question",
-        lambda *_a, **_k: QMessageBox.Yes,
+        "tahmeed.ui.dialogs.confirm_dialog.ask_confirm",
+        lambda *_a, **_k: True,
     )
     return reg
 
