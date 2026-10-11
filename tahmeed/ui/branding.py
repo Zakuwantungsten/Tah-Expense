@@ -99,7 +99,7 @@ def load_brand_logo(
 
     ``for_dark_bg``:
       - ``True``  — light (near-white) TAHMEED text for dark panels
-      - ``False`` — dark (near-black) TAHMEED text for light panels (e.g. splash)
+      - ``False`` — dark (near-black) TAHMEED text for light panels
       - ``None``  — follow the OS / app palette via ``is_dark_theme()``
     """
     dark_bg = is_dark_theme() if for_dark_bg is None else for_dark_bg

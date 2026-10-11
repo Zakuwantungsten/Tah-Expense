@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QApplication,
 )
 from PySide6.QtCore import Qt, Signal, QPoint, QEvent, QRect
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QCursor
 
 from tahmeed.config import APP_NAME
 from tahmeed.models.user import User
@@ -19,7 +19,8 @@ from tahmeed.ui.admin.dashboard import AdminDashboard
 from tahmeed.ui.cashier.dashboard import CashierDashboard
 from tahmeed.ui.accountant.dashboard import AccountantDashboard
 
-_EDGE = 8
+# Wider than a typical 1px border so edge-drag resize is easy to grab.
+_EDGE = 12
 
 # Win32 WM_NCHITTEST result codes (frameless Aero Snap / edge resize).
 _HTCLIENT = 1
@@ -33,6 +34,10 @@ _HTBOTTOM = 15
 _HTBOTTOMLEFT = 16
 _HTBOTTOMRIGHT = 17
 _WM_NCHITTEST = 0x0084
+_GWL_STYLE = -16
+_WS_THICKFRAME = 0x00040000
+_WS_MAXIMIZEBOX = 0x00010000
+_WS_MINIMIZEBOX = 0x00020000
 
 
 def edges_to_ht(edges: Qt.Edges) -> int:
@@ -62,6 +67,15 @@ def edges_to_ht(edges: Qt.Edges) -> int:
     return 0
 
 
+def _lparam_screen_point(lparam: int) -> QPoint:
+    """Decode WM_NCHITTEST lParam into a signed screen QPoint."""
+    from ctypes import c_short
+
+    x = c_short(lparam & 0xFFFF).value
+    y = c_short((lparam >> 16) & 0xFFFF).value
+    return QPoint(x, y)
+
+
 class MainWindow(QMainWindow):
     logout_requested = Signal()
 
@@ -71,6 +85,10 @@ class MainWindow(QMainWindow):
         self._force_close = False
         self._close_pending = False
         self._resize_filters_ready = False
+        self._thick_frame_applied = False
+        # True while we applied a Size*Cursor on this shell. Content widgets
+        # inherit that cursor, so it must be cleared on leave / interior moves.
+        self._edge_cursor_active = False
         self.setWindowTitle(f"{APP_NAME} — {user.full_name}")
         self.setMinimumSize(1100, 700)
         if user.role in {"accountant", "cashier"}:
@@ -115,20 +133,40 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        if self.user.role in {"accountant", "cashier"}:
+            self._ensure_win32_thick_frame()
+            if not self._resize_filters_ready:
+                self._resize_filters_ready = True
+                self._install_edge_filters(self.centralWidget())
+
+    def _ensure_win32_thick_frame(self) -> None:
+        """Keep WS_THICKFRAME so Windows still offers snap + edge resize."""
         if (
-            self.user.role in {"accountant", "cashier"}
-            and not self._resize_filters_ready
+            self._thick_frame_applied
+            or sys.platform != "win32"
+            or not self._frameless()
         ):
-            self._resize_filters_ready = True
-            self._install_edge_filters(self.centralWidget())
+            return
+        try:
+            import ctypes
+
+            hwnd = int(self.winId())
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, _GWL_STYLE)
+            new_style = style | _WS_THICKFRAME | _WS_MAXIMIZEBOX | _WS_MINIMIZEBOX
+            if new_style != style:
+                ctypes.windll.user32.SetWindowLongW(hwnd, _GWL_STYLE, new_style)
+            self._thick_frame_applied = True
+        except Exception:
+            # Resize still works via WM_NCHITTEST / startSystemResize below.
+            pass
 
     def _install_edge_filters(self, root: QWidget | None) -> None:
         if root is None:
             return
-        # Chrome widgets only — content grids keep their own mouse handling.
-        # Full-window edge hits on Windows come from nativeEvent (WM_NCHITTEST).
+        # Chrome widgets + the shell itself. Content grids keep their own
+        # mouse handling; full-window edges also use nativeEvent (WM_NCHITTEST).
         dash = root
-        targets = [dash]
+        targets = [self, dash]
         for name in ("_title_bar", "_menu_bar", "_sidebar"):
             w = getattr(dash, name, None)
             if w is not None:
@@ -144,6 +182,8 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMaximized():
+                self._clear_edge_cursor()
             dash = self.centralWidget()
             sync = getattr(dash, "sync_chrome_maximized", None)
             if callable(sync):
@@ -191,13 +231,14 @@ class MainWindow(QMainWindow):
             return Qt.Edges()
         edges = Qt.Edges()
         r = self.rect()
+        # Cursor can land 1px outside the client rect on DPI / frameless frames.
         if pos.x() <= _EDGE:
             edges |= Qt.LeftEdge
-        if pos.x() >= r.width() - _EDGE:
+        if pos.x() >= r.width() - _EDGE - 1:
             edges |= Qt.RightEdge
         if pos.y() <= _EDGE:
             edges |= Qt.TopEdge
-        if pos.y() >= r.height() - _EDGE:
+        if pos.y() >= r.height() - _EDGE - 1:
             edges |= Qt.BottomEdge
         return edges
 
@@ -234,13 +275,15 @@ class MainWindow(QMainWindow):
     def nchit_test(self, global_pos: QPoint) -> int:
         """Win32 HT* code for a global cursor position (also used in tests)."""
         local = self.mapFromGlobal(global_pos)
-        if not self.rect().contains(local):
+        # Inflate slightly — outer pixels often map just outside rect().
+        hit_bounds = self.rect().adjusted(-_EDGE, -_EDGE, _EDGE, _EDGE)
+        if not hit_bounds.contains(local):
             return _HTCLIENT
         edges = self._hit_edges(local)
         ht = edges_to_ht(edges)
         if ht:
             return ht
-        if self._over_title_bar_caption(local):
+        if self.rect().contains(local) and self._over_title_bar_caption(local):
             return _HTCAPTION
         return _HTCLIENT
 
@@ -251,42 +294,111 @@ class MainWindow(QMainWindow):
             and eventType in (b"windows_generic_MSG", "windows_generic_MSG")
         ):
             try:
-                from ctypes import c_short
                 from ctypes.wintypes import MSG
 
                 addr = int(message)
                 msg = MSG.from_address(addr)
                 if msg.message == _WM_NCHITTEST:
-                    x = c_short(msg.lParam & 0xFFFF).value
-                    y = c_short((msg.lParam >> 16) & 0xFFFF).value
-                    return True, self.nchit_test(QPoint(x, y))
+                    return True, self.nchit_test(_lparam_screen_point(int(msg.lParam)))
             except Exception:
                 pass
         return super().nativeEvent(eventType, message)
 
+    def _shell_owns_object(self, obj) -> bool:
+        if obj is self:
+            return True
+        if isinstance(obj, QWidget):
+            try:
+                return obj.window() is self
+            except RuntimeError:
+                return False
+        return False
+
+    def _clear_edge_cursor(self) -> None:
+        """Drop a shell Size*Cursor so content no longer inherits it."""
+        if not self._edge_cursor_active:
+            return
+        self._edge_cursor_active = False
+        self.unsetCursor()
+        app = QApplication.instance()
+        if app is not None:
+            # Remove the temporary app-wide filter installed while active.
+            app.removeEventFilter(self)
+
+    def _sync_edge_cursor(self, global_pos: QPoint | None = None) -> None:
+        """Set or clear the edge resize cursor from a screen position."""
+        if not self._frameless() or self.isMaximized() or not self.isVisible():
+            self._clear_edge_cursor()
+            return
+        if global_pos is None:
+            global_pos = QCursor.pos()
+        edges = self._hit_edges(self.mapFromGlobal(global_pos))
+        if not edges:
+            self._clear_edge_cursor()
+            return
+        self.setCursor(self._cursor_for_edges(edges))
+        if not self._edge_cursor_active:
+            self._edge_cursor_active = True
+            # While the shell cursor is active it is inherited by every child
+            # that has no cursor of its own (tables, pages, …). Catch moves on
+            # those widgets too so we clear as soon as the pointer leaves the
+            # resize strip — chrome-only filters never see those moves.
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+
     def eventFilter(self, obj, event):
-        # Non-Windows / when native hit-test is unavailable: startSystemResize
-        # from chrome widgets near the frame edge.
-        if not self._frameless() or self.isMaximized() or sys.platform == "win32":
+        # Edge cursor + startSystemResize fallback (all platforms, including
+        # Windows when WM_NCHITTEST does not fire for a given press).
+        if not self._frameless():
             return super().eventFilter(obj, event)
 
+        if self.isMaximized():
+            self._clear_edge_cursor()
+            return super().eventFilter(obj, event)
+
+        et = event.type()
+        in_shell = self._shell_owns_object(obj)
+
         if (
-            event.type() == QEvent.Type.MouseButtonPress
+            et == QEvent.Type.MouseButtonPress
+            and in_shell
+            and hasattr(event, "button")
             and event.button() == Qt.LeftButton
+            and hasattr(event, "globalPosition")
         ):
             pos = self.mapFromGlobal(event.globalPosition().toPoint())
             edges = self._hit_edges(pos)
             if edges:
                 handle = self.windowHandle()
                 if handle is not None and handle.startSystemResize(edges):
+                    # OS resize grab finished (or was cancelled); re-sync so
+                    # a Size*Cursor does not remain stuck afterward.
+                    self._sync_edge_cursor(event.globalPosition().toPoint())
                     return True
-        elif event.type() == QEvent.Type.MouseMove:
-            pos = self.mapFromGlobal(event.globalPosition().toPoint())
-            edges = self._hit_edges(pos)
-            if edges:
-                self.setCursor(self._cursor_for_edges(edges))
-            else:
-                self.unsetCursor()
+        elif et == QEvent.Type.MouseMove and hasattr(event, "globalPosition"):
+            if in_shell or self._edge_cursor_active:
+                self._sync_edge_cursor(event.globalPosition().toPoint())
+        elif et in (
+            QEvent.Type.Leave,
+            QEvent.Type.HoverLeave,
+            QEvent.Type.MouseButtonRelease,
+        ):
+            if in_shell or self._edge_cursor_active:
+                if et == QEvent.Type.MouseButtonRelease and hasattr(
+                    event, "globalPosition"
+                ):
+                    self._sync_edge_cursor(event.globalPosition().toPoint())
+                else:
+                    self._sync_edge_cursor()
+        elif et in (
+            QEvent.Type.WindowDeactivate,
+            QEvent.Type.Hide,
+        ):
+            # Only the shell itself — an app-wide filter also sees child
+            # Hide/FocusOut noise and must not drop a still-valid edge cursor.
+            if obj is self:
+                self._clear_edge_cursor()
         return super().eventFilter(obj, event)
 
     def _cursor_for_edges(self, edges: Qt.Edges) -> Qt.CursorShape:
