@@ -389,12 +389,18 @@ async def get_verified_transactions(
 async def get_transactions_by_ids(tx_ids: List[ObjectId]) -> List[Transaction]:
     if not tx_ids:
         return []
-    payload = await api_client.request(
-        "GET",
-        "v1/transactions",
-        params={"ids": ",".join(str(oid) for oid in tx_ids)},
-    )
-    return [_tx_from_api(doc) for doc in payload.get("items") or []]
+    # Chunk so the ids query string stays within typical URL length limits.
+    _CHUNK = 150
+    out: List[Transaction] = []
+    for i in range(0, len(tx_ids), _CHUNK):
+        chunk = tx_ids[i : i + _CHUNK]
+        payload = await api_client.request(
+            "GET",
+            "v1/transactions",
+            params={"ids": ",".join(str(oid) for oid in chunk)},
+        )
+        out.extend(_tx_from_api(doc) for doc in payload.get("items") or [])
+    return out
 
 
 async def approve_transaction(tx_id: ObjectId, accountant_id: ObjectId) -> bool:

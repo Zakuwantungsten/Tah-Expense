@@ -37,13 +37,15 @@ from PySide6.QtWidgets import (
     QAbstractItemDelegate, QStyledItemDelegate, QStyleOptionViewItem, QMenu, QFileDialog,
     QMessageBox, QAbstractItemView, QHeaderView, QDateEdit, QLineEdit,
     QStyle, QComboBox, QDialog, QFrame, QListWidget, QListWidgetItem, QPushButton,
+    QTableWidgetSelectionRange,
 )
 from PySide6.QtCore import (
     Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer, QEventLoop,
     QItemSelection, QItemSelectionModel, QSettings,
 )
 from PySide6.QtGui import (
-    QAction, QKeyEvent, QColor, QBrush, QFont, QPen, QPainter, QMouseEvent, QCursor,
+    QAction, QKeyEvent, QColor, QBrush, QFont, QFontMetrics, QPen, QPainter,
+    QMouseEvent, QCursor,
 )
 
 from tahmeed.models.category import Category
@@ -77,6 +79,7 @@ from tahmeed.services.register_draft_service import (
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_completion
+from tahmeed.ui.widgets.excel_column_filter import chevron_hit_contains
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
 from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
 from tahmeed.services.duplicate_review import DuplicateReviewItem, format_amount_label
@@ -100,6 +103,7 @@ from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
     _parse_optional_amount_text, _ReceiptDelegate,
     _ItemDelegate, _CurrencyLineEdit, _TZSDelegate,
     _RCPT_COLORS, _RCPT_LABEL, _RECEIPT_OPTS, _RCPT_OPT_KEY, _RCPT_NORM, _VALID_RCPT,
+    _CELL_H_INSET,
 )
 
 from tahmeed.ui.cashier.excel_cursors import excel_hover_cursor, excel_drag_cursor
@@ -116,6 +120,8 @@ _TABLE_FONT_PT_MAX = 18
 _TABLE_FONT_SETTINGS_ORG = "Tahmeed"
 _TABLE_FONT_SETTINGS_APP = "tahmeed-expense"
 _TABLE_FONT_SETTINGS_KEY = "daily_register/table_font_pt"
+# Soft cap so a single long wrapped cell cannot balloon the grid.
+_WRAP_ROW_HEIGHT_MAX = 240
 
 
 def _load_table_font_pt() -> int:
@@ -195,7 +201,8 @@ class _ExcelTableViewport(QWidget):
         table = self._table
         if table._fill_dragging and (event.buttons() & Qt.LeftButton):
             table._update_fill_drag_end(table._viewport_pos(event))
-            table.setCursor(table._drag_cursor)
+            # Viewport only — never table.setCursor (that leaks onto the header).
+            table.viewport().setCursor(table._drag_cursor)
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -236,7 +243,7 @@ class _ExcelTableWidget(QTableWidget):
         self._drag_cursor = excel_drag_cursor()
 
     def leaveEvent(self, event) -> None:
-        self.unsetCursor()
+        self.viewport().unsetCursor()
         self._cursor_zone = "arrow"
         super().leaveEvent(event)
 
@@ -347,7 +354,7 @@ class _ExcelTableWidget(QTableWidget):
         self._fill_anchor = bounds
         self._fill_end = (r1, c1)
         self._cursor_zone = "drag"
-        self.setCursor(self._drag_cursor)
+        self.viewport().setCursor(self._drag_cursor)
         self.viewport().grabMouse()
         self._refresh_fill_drag_visual()
         return True
@@ -497,12 +504,14 @@ class _ExcelTableWidget(QTableWidget):
             return
         old_zone = self._cursor_zone
         self._cursor_zone = zone
+        # Apply Excel plus/fill cursors on the viewport only so the header
+        # keeps Qt's arrow / SizeHorCursor for column resize.
         if zone == "hover":
-            self.setCursor(self._hover_cursor)
+            self.viewport().setCursor(self._hover_cursor)
         elif zone in ("fill", "drag"):
-            self.setCursor(self._drag_cursor)
+            self.viewport().setCursor(self._drag_cursor)
         else:
-            self.unsetCursor()
+            self.viewport().unsetCursor()
         if old_zone == "fill" or zone == "fill":
             self.viewport().update()
 
@@ -573,7 +582,7 @@ class _ExcelTableWidget(QTableWidget):
         pos = self._viewport_pos(event)
         if self._fill_dragging and (event.buttons() & Qt.LeftButton):
             self._update_fill_drag_end(pos)
-            self.setCursor(self._drag_cursor)
+            self.viewport().setCursor(self._drag_cursor)
             event.accept()
             return
 
@@ -716,16 +725,28 @@ class _ColumnFilterPopup(QFrame):
         self.close()
 
 
+# Columns the user must not hide (row identity + system-managed Cashier).
+_COLUMN_HIDE_LOCKED = {COL_SNO, COL_CASHIER}
+# Right-edge pixels that count as the Excel "hidden columns" gap affordance.
+_HIDE_GAP_HIT_PX = 8
+
+
 class _FilterHeaderView(QHeaderView):
-    """Horizontal header ▾ filters — options only from table rows, with chaining."""
+    """Horizontal header ▾ filters + Excel-style column hide / unhide."""
 
     filter_changed = Signal(int, set)   # (col_index, accepted_values); empty = cleared
+    hide_columns_requested = Signal(object)    # list[int]
+    unhide_columns_requested = Signal(object)  # list[int]
 
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
         self._active: dict = {}   # col -> set of accepted values
         self._value_provider = None  # optional callable(col) -> set[str]
         self._popup = None
+        self._sel_anchor: int | None = None
+        self.setSectionsClickable(True)
+        self.setHighlightSections(True)
+        self.setContextMenuPolicy(Qt.DefaultContextMenu)
 
     def set_value_provider(self, provider) -> None:
         self._value_provider = provider
@@ -739,33 +760,161 @@ class _FilterHeaderView(QHeaderView):
         self._active = {c: set(v) for c, v in (filters or {}).items() if v}
         self.viewport().update()
 
+    def _table(self):
+        return self.parent()
+
+    def _is_section_hidden(self, col: int) -> bool:
+        if col < 0 or col >= self.count():
+            return True
+        return self.isSectionHidden(col)
+
+    def _next_visible_col(self, col: int) -> int | None:
+        for c in range(col + 1, self.count()):
+            if not self._is_section_hidden(c):
+                return c
+        return None
+
+    def _prev_visible_col(self, col: int) -> int | None:
+        for c in range(col - 1, -1, -1):
+            if not self._is_section_hidden(c):
+                return c
+        return None
+
+    def _hidden_between(self, left: int, right: int) -> list[int]:
+        lo, hi = (left, right) if left <= right else (right, left)
+        return [
+            c for c in range(lo + 1, hi)
+            if self._is_section_hidden(c) and c not in _COLUMN_HIDE_LOCKED
+        ]
+
+    def _gap_hidden_cols_at(self, col: int, pos_x: int) -> list[int]:
+        """Hidden columns under the Excel-style thick gap near a section edge."""
+        if col < 0 or self._is_section_hidden(col):
+            return []
+        col_x = self.sectionViewportPosition(col)
+        col_w = self.sectionSize(col)
+        # Near right edge → hidden between this and next visible
+        if pos_x >= col_x + col_w - _HIDE_GAP_HIT_PX:
+            nxt = self._next_visible_col(col)
+            if nxt is not None:
+                return self._hidden_between(col, nxt)
+        # Near left edge → hidden between previous visible and this
+        if pos_x <= col_x + _HIDE_GAP_HIT_PX:
+            prev = self._prev_visible_col(col)
+            if prev is not None:
+                return self._hidden_between(prev, col)
+        return []
+
+    def _selected_columns(self) -> list[int]:
+        table = self._table()
+        if table is None:
+            return []
+        cols = sorted({i.column() for i in table.selectedIndexes()})
+        return cols
+
+    def _select_column_range(self, anchor: int, col: int) -> None:
+        table = self._table()
+        if table is None or table.rowCount() <= 0:
+            return
+        lo, hi = (anchor, col) if anchor <= col else (col, anchor)
+        table.clearSelection()
+        # ContiguousSelection: select a rectangle covering the column range.
+        table.setRangeSelected(
+            QTableWidgetSelectionRange(0, lo, table.rowCount() - 1, hi),
+            True,
+        )
+        table.setCurrentCell(table.currentRow() if table.currentRow() >= 0 else 0, col)
+
     def paintSection(self, painter, rect, logical_index):
         super().paintSection(painter, rect, logical_index)
-        if logical_index not in _FILTER_COLS or rect.width() < 28:
-            return
-        painter.save()
-        is_active = bool(self._active.get(logical_index))
-        painter.setPen(QColor("#EA580C") if is_active else QColor("#94A3B8"))
-        f = painter.font()
-        f.setPointSize(7)
-        painter.setFont(f)
-        painter.drawText(
-            QRect(rect.right() - 15, rect.top(), 13, rect.height()),
-            Qt.AlignVCenter | Qt.AlignHCenter,
-            "▾",
-        )
-        painter.restore()
+        if logical_index in _FILTER_COLS and rect.width() >= 28:
+            painter.save()
+            is_active = bool(self._active.get(logical_index))
+            painter.setPen(QColor("#EA580C") if is_active else QColor("#94A3B8"))
+            f = painter.font()
+            f.setPointSize(7)
+            painter.setFont(f)
+            painter.drawText(
+                QRect(rect.right() - 16, rect.top(), 14, rect.height()),
+                Qt.AlignVCenter | Qt.AlignHCenter,
+                "▾",
+            )
+            painter.restore()
+
+        # Excel-style thicker divider when columns are hidden after this section.
+        nxt = self._next_visible_col(logical_index)
+        if nxt is not None and nxt > logical_index + 1:
+            painter.save()
+            pen = QPen(QColor("#475569"), 3)
+            pen.setCapStyle(Qt.FlatCap)
+            painter.setPen(pen)
+            x = rect.right() - 1
+            painter.drawLine(x, rect.top() + 2, x, rect.bottom() - 2)
+            painter.restore()
 
     def mousePressEvent(self, event):
         col = self.logicalIndexAt(event.pos())
-        if col in _FILTER_COLS:
-            x      = event.pos().x()
-            col_x  = self.sectionViewportPosition(col)
-            col_w  = self.sectionSize(col)
-            if x >= col_x + col_w - 20:
-                self._open_menu(col, event.globalPosition().toPoint())
-                return
+        if event.button() == Qt.LeftButton and col >= 0:
+            if col in _FILTER_COLS:
+                col_x = self.sectionViewportPosition(col)
+                col_w = self.sectionSize(col)
+                if chevron_hit_contains(col_x, col_w, event.pos().x()):
+                    self._open_menu(col, event.globalPosition().toPoint())
+                    return
+            # Header click selects column(s) for bulk hide (Excel-style).
+            mods = event.modifiers()
+            if mods & Qt.ShiftModifier and self._sel_anchor is not None:
+                self._select_column_range(self._sel_anchor, col)
+            else:
+                table = self._table()
+                if table is not None:
+                    table.selectColumn(col)
+                self._sel_anchor = col
+            return
         super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        col = self.logicalIndexAt(event.pos())
+        gap_hidden = self._gap_hidden_cols_at(col, event.pos().x()) if col >= 0 else []
+        selected = self._selected_columns()
+        if col >= 0 and col not in selected:
+            # Right-click outside current selection → target this column only.
+            selected = [col]
+            table = self._table()
+            if table is not None:
+                table.selectColumn(col)
+            self._sel_anchor = col
+
+        hide_targets = [c for c in selected if c not in _COLUMN_HIDE_LOCKED]
+        # Unhide: gap under cursor, or any user-hidden cols spanned by selection.
+        span_hidden: list[int] = []
+        if len(selected) >= 2:
+            span_hidden = self._hidden_between(min(selected), max(selected))
+        unhide_targets = list(dict.fromkeys(gap_hidden + span_hidden))
+
+        menu = QMenu(self)
+        if len(hide_targets) > 1:
+            act_hide = menu.addAction(f"Hide Columns ({len(hide_targets)})")
+        else:
+            act_hide = menu.addAction("Hide Column")
+        act_hide.setEnabled(bool(hide_targets))
+
+        if unhide_targets:
+            act_unhide = menu.addAction(
+                f"Unhide Columns ({len(unhide_targets)})"
+                if len(unhide_targets) > 1
+                else "Unhide Column"
+            )
+        else:
+            act_unhide = menu.addAction("Unhide")
+            act_unhide.setEnabled(False)
+
+        chosen = menu.exec(event.globalPos())
+        if chosen is act_hide and hide_targets:
+            self.hide_columns_requested.emit(hide_targets)
+        elif chosen is act_unhide and unhide_targets:
+            self.unhide_columns_requested.emit(unhide_targets)
+        event.accept()
 
     def _open_menu(self, col: int, global_pos) -> None:
         if not callable(self._value_provider):
@@ -823,12 +972,18 @@ class DailyRegister(QWidget):
     active_cheque_changed = Signal(str, bool)  # cheque, editable
     # Table text zoom (Larger / Smaller toolbar) — (can_larger, can_smaller)
     font_size_changed = Signal(bool, bool)
+    # Wrap Text toolbar — True when any column is wrapping
+    wrap_state_changed = Signal(bool)
+    # Soft-trash / deletion-request changed — refresh Cashier Trash badge
+    trash_changed = Signal()
 
     def __init__(self, user: User, categories: List[Category], parent=None):
         super().__init__(parent)
         self._user        = user
         self._categories  = categories
         self._table_font_pt = _load_table_font_pt()
+        self._wrapped_cols: set = set()  # columns with Wrap Text on
+        self._user_hidden_cols: set = set()  # Excel Hide Column (not Cashier)
         self._cat_by_name: dict = {c.name.lower(): c for c in categories}
         self._locked_subitems: dict = {}   # item name (lower) -> [sub-item names]
         self._restrict_items: bool = False
@@ -895,6 +1050,11 @@ class DailyRegister(QWidget):
         self._draft_timer.setSingleShot(True)
         self._draft_timer.setInterval(1_500)
         self._draft_timer.timeout.connect(self._flush_local_draft)
+        # Debounce row-height recompute while wrapping + column resize.
+        self._wrap_height_timer = QTimer(self)
+        self._wrap_height_timer.setSingleShot(True)
+        self._wrap_height_timer.setInterval(50)
+        self._wrap_height_timer.timeout.connect(self._refresh_wrapped_row_heights)
         # Debounce DB writes for day-level Cheque (saved rows only).
         self._cheque_persist_timer = QTimer(self)
         self._cheque_persist_timer.setSingleShot(True)
@@ -931,6 +1091,8 @@ class DailyRegister(QWidget):
         _fhv = _FilterHeaderView(self._table)
         _fhv.set_value_provider(self._filter_menu_values)
         _fhv.filter_changed.connect(self._on_col_filter_changed)
+        _fhv.hide_columns_requested.connect(self._hide_columns)
+        _fhv.unhide_columns_requested.connect(self._unhide_columns)
         self._table.setHorizontalHeader(_fhv)
         self._table.setHorizontalHeaderLabels(HEADERS)
         sno_hdr = self._table.horizontalHeaderItem(COL_SNO)
@@ -945,11 +1107,12 @@ class DailyRegister(QWidget):
             hh.setSectionResizeMode(col, QHeaderView.Interactive)
         hh.setSectionResizeMode(COL_SNO,  QHeaderView.Fixed)
         hh.setSectionResizeMode(COL_DESC, QHeaderView.Stretch)
+        hh.sectionResized.connect(lambda *_: self._schedule_wrap_height_refresh())
 
         for col, width in _COL_PREFERRED.items():
             self._table.setColumnWidth(col, width)
         QTimer.singleShot(0, self._fit_table_columns)
-        self._table.setColumnHidden(COL_CASHIER, True)
+        self._apply_column_visibility(show_cashier=False)
 
         self._table.setSelectionMode(QAbstractItemView.ContiguousSelection)
         self._table.setVerticalHeader(ExcelRowHeaderView(self._table, owner=self))
@@ -1215,7 +1378,7 @@ class DailyRegister(QWidget):
             self._pending_row_meta.clear()
             self._populate(txs)
             show_cashier = self._merged_mode or bool(upload_id)
-            self._table.setColumnHidden(COL_CASHIER, not show_cashier)
+            self._apply_column_visibility(show_cashier=show_cashier)
             if not self._skip_draft_restore:
                 restored = self._restore_local_draft()
                 if restored:
@@ -2301,6 +2464,8 @@ class DailyRegister(QWidget):
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         row = item.row()
         col = item.column()
+        if col in self._wrapped_cols:
+            self._schedule_wrap_height_refresh()
 
         # Saved rows: only mutable while in edit mode. Track them as dirty and
         # uppercase free-text, but skip the new-row activation / expansion logic.
@@ -3952,8 +4117,8 @@ class DailyRegister(QWidget):
             if verified_n:
                 msg = (
                     f'Request deletion of approved expense:\n"{desc}"?\n\n'
-                    "It will leave Master Expenses immediately and appear in the "
-                    "accountant's Verify → Deleted tab. Confirming moves it to Trash."
+                    "It leaves Master Expenses and goes to the accountant's "
+                    "Verify → Deleted tab. After they confirm, it moves to Trash."
                 )
             elif pending_n:
                 msg = (
@@ -3962,26 +4127,35 @@ class DailyRegister(QWidget):
                 )
             elif submitted_n:
                 msg = (
-                    f'Delete submitted transaction:\n"{desc}"?\n\n'
-                    "It will be removed from the Verify inbox."
+                    f'Move submitted expense to Trash:\n"{desc}"?\n\n'
+                    "It leaves the Verify inbox and appears in your Trash "
+                    "(you can restore or delete it there)."
                 )
             else:
-                msg = f'Delete saved transaction:\n"{desc}"?'
+                msg = (
+                    f'Move draft expense to Trash:\n"{desc}"?\n\n'
+                    "It will appear in your Trash so you can restore or "
+                    "delete it permanently."
+                )
         else:
             parts = [f"Delete {n_rows} selected saved row(s)?"]
             if verified_n:
                 parts.append(
-                    f"{verified_n} approved row(s) will go to Verify → Deleted "
-                    "(confirm moves them to Trash)."
+                    f"{verified_n} approved row(s) → Verify → Deleted "
+                    "(accountant confirms → Trash)."
                 )
             if pending_n:
                 parts.append(
                     f"{pending_n} pending edit(s) will be removed "
                     "(originals stay on Master)."
                 )
-            if submitted_n or draft_n:
+            if draft_n:
                 parts.append(
-                    f"{submitted_n + draft_n} unverified row(s) will be deleted."
+                    f"{draft_n} draft row(s) → your Trash (restore / purge)."
+                )
+            if submitted_n:
+                parts.append(
+                    f"{submitted_n} submitted row(s) leave Verify → your Trash."
                 )
             msg = "\n\n".join(parts)
 
@@ -3994,7 +4168,8 @@ class DailyRegister(QWidget):
             == QMessageBox.Yes
         ):
             tx_ids = [self._saved_ids[r] for r in rows if r in self._saved_ids]
-            asyncio.ensure_future(self._do_delete_saved_many(tx_ids))
+            from tahmeed.ui.async_utils import schedule_coro
+            schedule_coro(self._do_delete_saved_many(tx_ids))
 
     async def _do_delete_saved(self, tx_id) -> None:
         await self._do_delete_saved_many([tx_id])
@@ -4005,6 +4180,7 @@ class DailyRegister(QWidget):
         try:
             cashier_id = getattr(self._user, "_id", None)
             requested = 0
+            trashed = 0
             deleted = 0
             missing = 0
             for tx_id in tx_ids:
@@ -4013,22 +4189,39 @@ class DailyRegister(QWidget):
                     missing += 1
                 elif result == "deletion_requested":
                     requested += 1
+                elif result in ("trashed", "already_trashed"):
+                    trashed += 1
                 elif result == "deleted":
                     deleted += 1
-            if missing and not (requested or deleted):
+            if missing and not (requested or trashed or deleted):
                 QMessageBox.warning(
                     self, "Not Found",
                     "Those entries were already removed.",
                 )
-            elif requested:
-                QMessageBox.information(
-                    self, "Deletion Requested",
-                    (
+            elif requested or trashed or deleted:
+                parts = []
+                if trashed:
+                    parts.append(
+                        f"{trashed} expense(s) moved to your Trash.\n"
+                        "Open Trash to restore or delete them permanently."
+                    )
+                if requested:
+                    parts.append(
                         f"{requested} approved expense(s) sent to Verify → Deleted.\n"
-                        "An accountant must confirm (moves to Trash) or restore."
-                        + (f"\n{deleted} other row(s) were removed." if deleted else "")
-                    ),
+                        "An accountant must confirm (then Trash) or restore to Master."
+                    )
+                if deleted:
+                    parts.append(f"{deleted} pending-edit clone(s) removed.")
+                title = (
+                    "Moved to Trash"
+                    if trashed and not requested
+                    else "Deletion Requested"
+                    if requested
+                    else "Deleted"
                 )
+                QMessageBox.information(self, title, "\n\n".join(parts))
+            if trashed or requested or deleted:
+                self.trash_changed.emit()
             await self._load_date(self._current_date)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to delete:\n{exc}")
@@ -4137,7 +4330,7 @@ class DailyRegister(QWidget):
         self._truck_allow_anyway.clear()
         self._pending_truck_issues.clear()
         self._populate(txs)
-        self._table.setColumnHidden(COL_CASHIER, not show_cashier)
+        self._apply_column_visibility(show_cashier=show_cashier)
 
     def _kick_auto_fill_item(self, row: int, description: str) -> None:
         if self._bulk_mutating or not description.strip():
@@ -4452,8 +4645,11 @@ class DailyRegister(QWidget):
             vh.set_font_pt(pt)
         row_h = self._row_height_for_font(pt)
         vh.setDefaultSectionSize(row_h)
-        for row in range(self._table.rowCount()):
-            self._table.setRowHeight(row, row_h)
+        if self._wrapped_cols:
+            self._refresh_wrapped_row_heights()
+        else:
+            for row in range(self._table.rowCount()):
+                self._table.setRowHeight(row, row_h)
 
         if persist:
             _save_table_font_pt(pt)
@@ -4471,6 +4667,96 @@ class DailyRegister(QWidget):
             return
         self._table_font_pt -= 1
         self._apply_table_font_size()
+
+    def _apply_column_visibility(self, *, show_cashier: bool | None = None) -> None:
+        """Apply Cashier visibility + user Hide Column state."""
+        if show_cashier is None:
+            show_cashier = bool(self._merged_mode or self._load_upload_id)
+        for col in range(self._table.columnCount()):
+            if col == COL_CASHIER:
+                self._table.setColumnHidden(col, not show_cashier)
+            elif col in self._user_hidden_cols:
+                self._table.setColumnHidden(col, True)
+            else:
+                self._table.setColumnHidden(col, False)
+        hdr = self._table.horizontalHeader()
+        if hdr is not None:
+            hdr.viewport().update()
+
+    def _hide_columns(self, cols) -> None:
+        """Excel Hide Column(s) — keeps S/NO and Cashier locked."""
+        show_cashier = not self._table.isColumnHidden(COL_CASHIER)
+        for col in cols or []:
+            col = int(col)
+            if col in _COLUMN_HIDE_LOCKED:
+                continue
+            if col < 0 or col >= self._table.columnCount():
+                continue
+            self._user_hidden_cols.add(col)
+        self._apply_column_visibility(show_cashier=show_cashier)
+
+    def _unhide_columns(self, cols) -> None:
+        """Excel Unhide — restore columns hidden via Hide Column."""
+        show_cashier = not self._table.isColumnHidden(COL_CASHIER)
+        for col in cols or []:
+            self._user_hidden_cols.discard(int(col))
+        self._apply_column_visibility(show_cashier=show_cashier)
+
+    def _wrap_target_columns(self) -> set:
+        """Columns touched by the current selection, or all columns if none."""
+        cols = {i.column() for i in self._table.selectedIndexes()}
+        if cols:
+            return cols
+        return set(range(self._table.columnCount()))
+
+    def wrap_is_active(self) -> bool:
+        return bool(self._wrapped_cols)
+
+    def _schedule_wrap_height_refresh(self) -> None:
+        if not self._wrapped_cols:
+            return
+        self._wrap_height_timer.start()
+
+    def _refresh_wrapped_row_heights(self) -> None:
+        """Grow/shrink rows so wrapped columns show their full text."""
+        base = self._row_height_for_font(self._table_font_pt)
+        vh = self._table.verticalHeader()
+        vh.setDefaultSectionSize(base)
+        if not self._wrapped_cols:
+            for row in range(self._table.rowCount()):
+                self._table.setRowHeight(row, base)
+            return
+
+        fm = QFontMetrics(self._table.font())
+        pad = 4
+        for row in range(self._table.rowCount()):
+            h = base
+            for col in self._wrapped_cols:
+                w = self._table.columnWidth(col) - (2 * _CELL_H_INSET)
+                if w < 16:
+                    continue
+                item = self._table.item(row, col)
+                text = item.text() if item is not None else ""
+                if not text:
+                    continue
+                br = fm.boundingRect(
+                    QRect(0, 0, w, _WRAP_ROW_HEIGHT_MAX * 4),
+                    int(Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap),
+                    text,
+                )
+                h = max(h, br.height() + pad)
+            self._table.setRowHeight(row, min(h, _WRAP_ROW_HEIGHT_MAX))
+
+    def toolbar_toggle_wrap(self) -> None:
+        """Toggle Wrap Text for selected columns (or all if nothing selected)."""
+        cols = self._wrap_target_columns()
+        if cols and cols.issubset(self._wrapped_cols):
+            self._wrapped_cols -= cols
+        else:
+            self._wrapped_cols |= cols
+        self._refresh_wrapped_row_heights()
+        self._table.viewport().update()
+        self.wrap_state_changed.emit(self.wrap_is_active())
 
     def _data_rows(self) -> List[int]:
         """Saved + non-empty editable rows (for Find navigation)."""
@@ -4560,8 +4846,8 @@ class DailyRegister(QWidget):
         self._pending_truck_issues.clear()
         self._header_cheque = ""
         self._current_date = None
-        self._table.setColumnHidden(COL_CASHIER, True)
         self._populate([])
+        self._apply_column_visibility(show_cashier=False)
         self._hide_register_loading()
         if self._table.rowCount() > 0:
             self._table.setCurrentCell(0, COL_DESC)

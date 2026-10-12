@@ -516,18 +516,38 @@ def test_day_order_and_next() -> None:
     assert by_id[a] == 1
 
 
-def test_request_delete_hard_and_soft() -> None:
+def test_request_delete_soft_trash_unverified_and_request_verified() -> None:
     user = _cashier()
     draft = ObjectId()
+    submitted = ObjectId()
     verified = ObjectId()
+    pending_clone = ObjectId()
+    original = ObjectId()
     collection = FakeTransactions(
         [
-            {"_id": draft, "verified": False, "cashier_id": user["_id"]},
+            {
+                "_id": draft,
+                "verified": False,
+                "register_status": "draft",
+                "cashier_id": user["_id"],
+            },
+            {
+                "_id": submitted,
+                "verified": False,
+                "register_status": "submitted",
+                "cashier_id": user["_id"],
+            },
             {
                 "_id": verified,
                 "verified": True,
                 "cashier_id": user["_id"],
                 "deletion_requested": False,
+            },
+            {
+                "_id": pending_clone,
+                "verified": False,
+                "original_transaction_id": original,
+                "cashier_id": user["_id"],
             },
         ]
     )
@@ -535,13 +555,27 @@ def test_request_delete_hard_and_soft() -> None:
     app.dependency_overrides[current_user] = lambda: user
 
     with TestClient(app) as client:
-        hard = client.post(f"/v1/transactions/{draft}/request-delete", json={})
+        draft_resp = client.post(f"/v1/transactions/{draft}/request-delete", json={})
+        submitted_resp = client.post(
+            f"/v1/transactions/{submitted}/request-delete", json={}
+        )
         soft = client.post(f"/v1/transactions/{verified}/request-delete", json={})
+        clone = client.post(
+            f"/v1/transactions/{pending_clone}/request-delete", json={}
+        )
 
-    assert hard.json() == {"result": "deleted"}
+    assert draft_resp.json() == {"result": "trashed"}
+    assert submitted_resp.json() == {"result": "trashed"}
     assert soft.json() == {"result": "deletion_requested"}
-    assert len(collection.documents) == 1
-    assert collection.documents[0]["deletion_requested"] is True
+    assert clone.json() == {"result": "deleted"}
+
+    by_id = {doc["_id"]: doc for doc in collection.documents}
+    assert pending_clone not in by_id
+    assert by_id[draft]["trashed"] is True
+    assert by_id[draft]["verified"] is False
+    assert by_id[submitted]["trashed"] is True
+    assert by_id[verified]["deletion_requested"] is True
+    assert by_id[verified].get("trashed") is not True
 
 
 def test_pending_edit_creates_clone() -> None:

@@ -1,3 +1,4 @@
+- 4.6.7: Branded loading horse while Overview and other data tabs fetch (Cashier + Accountant overviews, Drafts, Rejected, Trash, Form, Reconciliation, Fuel, Diesel Cash, Skipped Trucks, Manage Users)
 - 4.6.6: Larger table entry text (10pt) across Separate Expenses, Master Expenses, Browse, Items, Payees, Description Maps, Trash, and Day Issues (Daily Register unchanged)
 - 4.6.5: Daily Register Larger/Smaller text zoom (cashier + accountant); Day Issues SHOW filter readable again; denser Excel-style column filters across tables; draft day discard/deletion; Day Issues selection polish; open-day summaries API support
 - 4.6.4: frameless window resize + Aero Snap (drag to top); cashier trash restore requests; payee management + item/payee required before verify; stronger password policy; admin/cashier chrome polish

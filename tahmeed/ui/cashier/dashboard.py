@@ -638,15 +638,18 @@ class _TablePage(QWidget):
         self._qb_toolbar.submit_clicked.connect(register.submit_for_verify)
         self._qb_toolbar.font_larger_clicked.connect(register.toolbar_font_larger)
         self._qb_toolbar.font_smaller_clicked.connect(register.toolbar_font_smaller)
+        self._qb_toolbar.wrap_clicked.connect(register.toolbar_toggle_wrap)
         register.font_size_changed.connect(
             lambda larger, smaller: self._qb_toolbar.set_font_size_controls_enabled(
                 can_larger=larger, can_smaller=smaller
             )
         )
+        register.wrap_state_changed.connect(self._qb_toolbar.set_wrap_active)
         self._qb_toolbar.set_font_size_controls_enabled(
             can_larger=register.can_increase_font(),
             can_smaller=register.can_decrease_font(),
         )
+        self._qb_toolbar.set_wrap_active(register.wrap_is_active())
         register.attachment_count_changed.connect(self._qb_toolbar.set_attachment_count)
         register.edit_state_changed.connect(self._qb_toolbar.set_edit_state)
         register.save_busy_changed.connect(self._qb_toolbar.set_mutation_busy)
@@ -804,8 +807,12 @@ class CashierDashboard(QWidget):
         self._day_issues.open_register.connect(self._on_day_issues_open_register)
         self._day_issues.issues_changed.connect(self._on_day_issues_badge)
         # Live apply already stamps the Table; avoid full refresh (would wipe unsaved).
+        # schedule_coro: mapping runs under an asyncio Task + QMessageBox nested loop
+        # (Python 3.14 / qasync forbids ensure_future while that Task is current).
+        from tahmeed.ui.async_utils import schedule_coro as _sched_di
+
         self._day_issues.mappings_applied.connect(
-            lambda: asyncio.ensure_future(self._refresh_day_issues_badge())
+            lambda: _sched_di(self._refresh_day_issues_badge())
         )
         self._stack.addWidget(self._day_issues)
 
@@ -819,8 +826,9 @@ class CashierDashboard(QWidget):
         self._browser.go_to_upload.connect(self._on_go_to_upload)
         self._stack.addWidget(self._browser)
 
-        # index 7 — Trash (confirmed deletions; restore via accountant)
+        # index 7 — Trash (own soft-trash + accountant-confirmed)
         self._trash_view = CashierTrashWidget(user=self._user)
+        self._trash_view.count_changed.connect(self._on_trash_badge)
         self._stack.addWidget(self._trash_view)
 
         self._stack.setCurrentIndex(0)
@@ -837,18 +845,30 @@ class CashierDashboard(QWidget):
 
         # ── Signal wiring ──────────────────────────────────────────────────────
         self._form.transaction_saved.connect(lambda _: self._register.refresh())
+        self._form.trash_changed.connect(self._on_register_trash_changed)
         self._drafts_view.open_register_date.connect(self._on_drafts_open_register)
         self._drafts_view.drafts_changed.connect(self._refresh_draft_badge)
-        self._register.rows_saved.connect(lambda _: self._refresh_draft_badge())
-        self._register.drafts_changed.connect(self._refresh_draft_badge)
-        self._register.day_issues_requested.connect(self._on_open_day_issues)
-        self._register.rows_saved.connect(lambda _: self._refresh_day_issues_badge())
-        self._register.drafts_changed.connect(self._refresh_day_issues_badge)
-        self._register.day_issues_source_changed.connect(self._on_day_issues_source_changed)
-
         from tahmeed.ui.async_utils import schedule_coro
+
+        self._register.rows_saved.connect(
+            lambda _: schedule_coro(self._refresh_draft_badge())
+        )
+        self._register.drafts_changed.connect(
+            lambda: schedule_coro(self._refresh_draft_badge())
+        )
+        self._register.day_issues_requested.connect(self._on_open_day_issues)
+        self._register.rows_saved.connect(
+            lambda _: schedule_coro(self._refresh_day_issues_badge())
+        )
+        self._register.drafts_changed.connect(
+            lambda: schedule_coro(self._refresh_day_issues_badge())
+        )
+        self._register.day_issues_source_changed.connect(self._on_day_issues_source_changed)
+        self._register.trash_changed.connect(self._on_register_trash_changed)
+
         schedule_coro(self._refresh_draft_badge())
         schedule_coro(self._refresh_day_issues_badge())
+        schedule_coro(self._refresh_trash_badge())
 
 
     def _on_import(self) -> None:
@@ -1024,6 +1044,27 @@ class CashierDashboard(QWidget):
         if hasattr(self._sidebar, "set_day_issues_badge"):
             self._sidebar.set_day_issues_badge(count)
 
+    def _on_trash_badge(self, count: int) -> None:
+        if hasattr(self._sidebar, "set_trash_badge"):
+            self._sidebar.set_trash_badge(count)
+
+    async def _refresh_trash_badge(self) -> None:
+        from tahmeed.services.cashier_service import count_cashier_trash
+
+        try:
+            count = await count_cashier_trash()
+        except Exception:
+            count = 0
+        self._on_trash_badge(count)
+
+    def _on_register_trash_changed(self) -> None:
+        from tahmeed.ui.async_utils import schedule_coro
+
+        schedule_coro(self._refresh_trash_badge())
+        # Refresh trash page if it's currently visible (stack index 7).
+        if self._stack.currentIndex() == 7:
+            self._trash_view.refresh()
+
     async def _refresh_day_issues_badge(self) -> None:
         from tahmeed.services.day_issues_service import count_day_issues
 
@@ -1041,9 +1082,11 @@ class CashierDashboard(QWidget):
         self._on_day_issues_badge(count)
 
     def _on_day_issues_source_changed(self) -> None:
-        asyncio.ensure_future(self._refresh_day_issues_badge())
+        from tahmeed.ui.async_utils import schedule_coro
+
+        schedule_coro(self._refresh_day_issues_badge())
         if self._stack.currentIndex() == 4:
-            asyncio.ensure_future(self._day_issues.refresh())
+            schedule_coro(self._day_issues.refresh())
 
     def _on_open_day_issues(self, target=None) -> None:
         self._on_nav("day_issues")

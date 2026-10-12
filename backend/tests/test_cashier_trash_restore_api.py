@@ -165,6 +165,7 @@ def test_cashier_trash_list_and_request_restore() -> None:
             {
                 "_id": mine,
                 "trashed": True,
+                "verified": True,
                 "cashier_id": cashier,
                 "description": "My deleted toll",
                 "truck_number": "T100",
@@ -175,6 +176,7 @@ def test_cashier_trash_list_and_request_restore() -> None:
             {
                 "_id": theirs,
                 "trashed": True,
+                "verified": True,
                 "cashier_id": other,
                 "description": "Other cashier",
                 "truck_number": "T200",
@@ -275,6 +277,7 @@ def test_cashier_cancel_restore_request() -> None:
             {
                 "_id": tx_id,
                 "trashed": True,
+                "verified": True,
                 "cashier_id": cashier,
                 "restore_requested": True,
                 "restore_requested_at": datetime(2026, 6, 1),
@@ -292,3 +295,93 @@ def test_cashier_cancel_restore_request() -> None:
         res = client.post(f"/v1/transactions/{tx_id}/cancel-restore")
         assert res.json()["ok"] is True
         assert collection.documents[0]["restore_requested"] is False
+
+
+def test_cashier_restore_and_purge_own_unverified_trash() -> None:
+    cashier = ObjectId()
+    other = ObjectId()
+    draft = ObjectId()
+    submitted = ObjectId()
+    verified_trash = ObjectId()
+    other_draft = ObjectId()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": draft,
+                "trashed": True,
+                "verified": False,
+                "register_status": "draft",
+                "cashier_id": cashier,
+                "description": "Draft gone",
+            },
+            {
+                "_id": submitted,
+                "trashed": True,
+                "verified": False,
+                "register_status": "submitted",
+                "cashier_id": cashier,
+                "description": "Submitted gone",
+            },
+            {
+                "_id": verified_trash,
+                "trashed": True,
+                "verified": True,
+                "cashier_id": cashier,
+                "description": "Needs accountant",
+            },
+            {
+                "_id": other_draft,
+                "trashed": True,
+                "verified": False,
+                "cashier_id": other,
+                "description": "Not mine",
+            },
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: {
+        "_id": cashier,
+        "username": "cash1",
+        "role": "cashier",
+    }
+    with TestClient(app) as client:
+        restored = client.post(
+            "/v1/transactions/trash/bulk-restore-own",
+            json={"ids": [str(draft), str(verified_trash), str(other_draft)]},
+        )
+        assert restored.status_code == 200
+        assert restored.json()["updated"] == 1
+        by_id = {d["_id"]: d for d in collection.documents}
+        assert by_id[draft]["trashed"] is False
+        assert by_id[verified_trash]["trashed"] is True
+        assert by_id[other_draft]["trashed"] is True
+
+        purged = client.post(
+            "/v1/transactions/trash/bulk-purge-own",
+            json={
+                "ids": [
+                    str(submitted),
+                    str(verified_trash),
+                    str(other_draft),
+                ]
+            },
+        )
+        assert purged.status_code == 200
+        assert purged.json()["deleted"] == 1
+        remaining = {d["_id"] for d in collection.documents}
+        assert submitted not in remaining
+        assert verified_trash in remaining
+        assert other_draft in remaining
+
+        # Request restore still requires verified trash
+        bad = client.post(
+            "/v1/transactions/trash/bulk-request-restore",
+            json={"ids": [str(draft)]},
+        )
+        assert bad.json()["updated"] == 0
+        good = client.post(
+            "/v1/transactions/trash/bulk-request-restore",
+            json={"ids": [str(verified_trash)]},
+        )
+        assert good.json()["updated"] == 1
+        assert by_id[verified_trash]["restore_requested"] is True

@@ -46,10 +46,16 @@ def format_available_dates(raw_values: Sequence[Any]) -> list[dict[str, str]]:
 
 def inbox_base_query(*, rejected: bool = False) -> dict[str, Any]:
     if rejected:
-        return {"rejected": True, "discarded": {"$ne": True}}
+        return {
+            "rejected": True,
+            "discarded": {"$ne": True},
+            "trashed": {"$ne": True},
+        }
     return {
         "verified": False,
         "rejected": {"$ne": True},
+        "trashed": {"$ne": True},
+        "deletion_requested": {"$ne": True},
         "$or": [
             {"register_status": "submitted"},
             {"register_status": {"$exists": False}},

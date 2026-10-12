@@ -263,6 +263,14 @@ class _ExcelCellDelegate(QStyledItemDelegate):
         opt.backgroundBrush = QBrush(Qt.NoBrush)
         return opt
 
+    def _column_wraps(self, index) -> bool:
+        table = self.parent()
+        if table is None:
+            return False
+        owner = getattr(table, "_grid_owner", None)
+        wrapped = getattr(owner, "_wrapped_cols", None) if owner is not None else None
+        return bool(wrapped) and index.column() in wrapped
+
     def _paint_text(self, painter: QPainter, option, index) -> None:
         """Draw cell text only — never paints background (selection stays visible)."""
         text = option.text if option.text is not None else ""
@@ -283,7 +291,17 @@ class _ExcelCellDelegate(QStyledItemDelegate):
         else:
             align = int(align)
         inset = _CELL_H_INSET
-        painter.drawText(option.rect.adjusted(inset, 0, -inset, 0), align, text)
+        rect = option.rect.adjusted(inset, 0, -inset, 0)
+        if self._column_wraps(index):
+            h_align = align & int(
+                Qt.AlignLeft | Qt.AlignRight | Qt.AlignHCenter | Qt.AlignJustify
+            )
+            if not h_align:
+                h_align = int(Qt.AlignLeft)
+            flags = h_align | int(Qt.AlignTop) | int(Qt.TextWordWrap)
+            painter.drawText(rect.adjusted(0, 1, 0, -1), flags, text)
+        else:
+            painter.drawText(rect, align, text)
 
     def _paint_fill_extension_preview(
         self, painter: QPainter, option, index, table,

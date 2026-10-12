@@ -282,12 +282,12 @@ class RejectRequest(StrictModel):
 
 
 class BulkRejectRequest(StrictModel):
-    ids: list[str] = Field(default_factory=list, max_length=500)
+    ids: list[str] = Field(default_factory=list, max_length=100000)
     reason: str = Field("", max_length=2000)
 
 
 class BulkIdsRequest(StrictModel):
-    ids: list[str] = Field(default_factory=list, max_length=500)
+    ids: list[str] = Field(default_factory=list, max_length=100000)
 
 
 class CategoryAssignRequest(StrictModel):

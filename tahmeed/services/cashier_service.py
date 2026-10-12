@@ -150,11 +150,13 @@ async def request_or_delete_transaction(
     tx_id: ObjectId,
     cashier_id: Optional[ObjectId] = None,
 ) -> str:
-    """Delete or request deletion of a register row.
+    """Delete, soft-trash, or request deletion of a register row.
 
     Returns one of:
-      - ``"deleted"`` — hard-deleted (unverified, or pending-edit clone)
-      - ``"deletion_requested"`` — approved row flagged for accountant confirm
+      - ``"trashed"`` — soft-trashed (draft / submitted unverified)
+      - ``"already_trashed"`` — already in trash
+      - ``"deleted"`` — hard-deleted (pending-edit clone only)
+      - ``"deletion_requested"`` — verified row flagged for accountant confirm
       - ``"not_found"`` — no matching document
     """
     body: dict = {}
@@ -166,7 +168,13 @@ async def request_or_delete_transaction(
         json=body,
     )
     result = str(payload.get("result") or "not_found")
-    if result in {"deleted", "deletion_requested", "not_found"}:
+    if result in {
+        "trashed",
+        "already_trashed",
+        "deleted",
+        "deletion_requested",
+        "not_found",
+    }:
         return result
     return "not_found"
 
@@ -213,6 +221,7 @@ async def request_restore_from_trash(
 
 
 async def bulk_request_restore_from_trash(tx_ids: List[ObjectId]) -> int:
+    """Ask accountant to restore verified-path trash rows."""
     if not tx_ids:
         return 0
     payload = await api_client.request(
@@ -221,6 +230,30 @@ async def bulk_request_restore_from_trash(tx_ids: List[ObjectId]) -> int:
         json={"ids": [str(oid) for oid in tx_ids]},
     )
     return int(payload.get("updated") or 0)
+
+
+async def bulk_restore_own_trash(tx_ids: List[ObjectId]) -> int:
+    """Immediately restore own draft/submitted soft-trashed rows."""
+    if not tx_ids:
+        return 0
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/trash/bulk-restore-own",
+        json={"ids": [str(oid) for oid in tx_ids]},
+    )
+    return int(payload.get("updated") or 0)
+
+
+async def bulk_purge_own_trash(tx_ids: List[ObjectId]) -> int:
+    """Permanently delete own draft/submitted soft-trashed rows."""
+    if not tx_ids:
+        return 0
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/trash/bulk-purge-own",
+        json={"ids": [str(oid) for oid in tx_ids]},
+    )
+    return int(payload.get("deleted") or 0)
 
 
 async def cancel_restore_request(tx_id: ObjectId) -> bool:

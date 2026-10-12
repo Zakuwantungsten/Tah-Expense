@@ -54,13 +54,32 @@ def test_fat_hover_on_cell_thin_at_fill_corner(register):
     rect = table.visualRect(table.model().index(0, register._COL_DESC))
     table._update_hover_cursor(rect.center())
     assert table._cursor_zone == "hover"
-    assert table.cursor().pixmap() is not None
+    # Plus cursor lives on viewport only so the header can show SizeHorCursor.
+    assert table.viewport().cursor().pixmap() is not None
+    assert table.cursor().pixmap() is None or table.cursor().pixmap().isNull()
 
     handle = table._fill_handle_hit_rect()
     assert handle is not None
     table._update_hover_cursor(handle.center())
     assert table._cursor_zone == "fill"
-    assert table.cursor().pixmap() is not None
+    assert table.viewport().cursor().pixmap() is not None
+
+
+def test_hover_plus_does_not_stick_on_header(register):
+    """Excel plus must not inherit onto the header (resize cursor conflict)."""
+    table = register._table
+    register._put(0, register._COL_DESC, "Diesel")
+    table.setCurrentCell(0, register._COL_DESC)
+
+    rect = table.visualRect(table.model().index(0, register._COL_DESC))
+    table._update_hover_cursor(rect.center())
+    assert table._cursor_zone == "hover"
+    assert table.viewport().cursor().pixmap() is not None
+
+    hdr = table.horizontalHeader()
+    # Sibling of viewport — must not carry the custom plus pixmap.
+    assert hdr.cursor().pixmap() is None or hdr.cursor().pixmap().isNull()
+    assert table.cursor().pixmap() is None or table.cursor().pixmap().isNull()
 
 
 def test_fill_handle_shows_over_active_selection(register):

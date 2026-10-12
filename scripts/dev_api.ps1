@@ -5,7 +5,7 @@ $Backend = Join-Path $Root "backend"
 Set-Location $Backend
 
 if (-not (Test-Path ".env")) {
-    throw "Missing backend\.env — copy backend\.env.example and use 127.0.0.1 + tahmeed_expense_dev."
+    throw "Missing backend\.env - copy backend\.env.example and use 127.0.0.1 + tahmeed_expense_dev."
 }
 
 $EnvText = Get-Content ".env" -Raw
@@ -16,5 +16,10 @@ if ($EnvText -notmatch '(?m)^MONGODB_URI=mongodb://127\.0\.0\.1') {
     throw "backend\.env MONGODB_URI must use mongodb://127.0.0.1 for local development."
 }
 
+$Python = Join-Path $Backend ".venv\Scripts\python.exe"
+if (-not (Test-Path $Python)) {
+    throw "Missing backend\.venv - create it with: python -m venv .venv && .\.venv\Scripts\pip install -e `".[dev]`""
+}
+
 Write-Host "Starting API on http://127.0.0.1:8000 (DB from backend\.env)..."
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+& $Python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload

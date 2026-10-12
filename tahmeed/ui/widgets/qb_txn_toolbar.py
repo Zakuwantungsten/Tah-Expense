@@ -53,7 +53,7 @@ class QbTxnToolbar(QFrame):
 
     Core: Undo, Redo, Find, New, Save, Delete, Copy, Print, Attach File.
     With ``register_actions=True`` (cashier/accountant Table): also Larger,
-    Smaller (right after Redo), Export, Import, Today, Edit, Submit day.
+    Smaller, Wrap (right after Redo), Export, Import, Today, Edit, Submit day.
     """
 
     find_prev = Signal()
@@ -75,6 +75,7 @@ class QbTxnToolbar(QFrame):
     clear_table_clicked = Signal()
     font_larger_clicked = Signal()
     font_smaller_clicked = Signal()
+    wrap_clicked = Signal()
 
     def __init__(
         self,
@@ -107,6 +108,10 @@ class QbTxnToolbar(QFrame):
             }}
             QToolButton:pressed:!disabled {{
                 background: #DCE3EC;
+            }}
+            QToolButton:checked {{
+                background: #DBEAFE;
+                border-color: #93C5FD;
             }}
             QToolButton:disabled {{
                 color: {_MUTED};
@@ -143,6 +148,7 @@ class QbTxnToolbar(QFrame):
         self._btn_redo: Optional[QToolButton] = None
         self._btn_font_larger: Optional[QToolButton] = None
         self._btn_font_smaller: Optional[QToolButton] = None
+        self._btn_wrap: Optional[QToolButton] = None
         if register_actions:
             self._btn_undo = self._tool_btn(
                 "mdi.undo", "Undo", "Undo last change (Ctrl+Z)"
@@ -157,7 +163,7 @@ class QbTxnToolbar(QFrame):
             lay.addWidget(self._btn_undo)
             lay.addWidget(self._btn_redo)
 
-            # Immediately after Redo: table text size
+            # Immediately after Redo: table text size, then Wrap Text
             self._btn_font_larger = self._icon_tool_btn(
                 _font_size_icon(larger=True),
                 "Larger",
@@ -168,10 +174,19 @@ class QbTxnToolbar(QFrame):
                 "Smaller",
                 "Decrease table text size",
             )
+            self._btn_wrap = self._tool_btn(
+                "mdi.format-text-wrapping-wrap",
+                "Wrap",
+                "Wrap text in selected columns (or all if none selected)",
+            )
+            self._btn_wrap.setCheckable(True)
             self._btn_font_larger.clicked.connect(self.font_larger_clicked.emit)
             self._btn_font_smaller.clicked.connect(self.font_smaller_clicked.emit)
+            # clicked(bool) on checkable buttons — ignore the checked arg.
+            self._btn_wrap.clicked.connect(lambda *_: self.wrap_clicked.emit())
             lay.addWidget(self._btn_font_larger)
             lay.addWidget(self._btn_font_smaller)
+            lay.addWidget(self._btn_wrap)
             lay.addWidget(self._sep())
 
         self._btn_find_prev = self._icon_btn(
@@ -449,6 +464,11 @@ class QbTxnToolbar(QFrame):
             self._btn_font_larger.setEnabled(can_larger)
         if self._btn_font_smaller is not None:
             self._btn_font_smaller.setEnabled(can_smaller)
+
+    def set_wrap_active(self, active: bool) -> None:
+        """Mirror register Wrap Text state on the toolbar button."""
+        if self._btn_wrap is not None:
+            self._btn_wrap.setChecked(bool(active))
 
     def set_actions_enabled(
         self,

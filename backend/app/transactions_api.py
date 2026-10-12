@@ -164,8 +164,6 @@ async def list_transactions_by_ids(
     raw_ids = [part.strip() for part in ids.split(",") if part.strip()]
     if not raw_ids:
         return {"items": [], "total": 0}
-    if len(raw_ids) > 200:
-        raise ApiError(422, "too_many_ids", "At most 200 ids are allowed")
     oids = [_valid_id(value) for value in raw_ids]
     docs = await _database(request).transactions.find({"_id": {"$in": oids}}).to_list(
         length=len(oids)
@@ -1217,7 +1215,7 @@ async def list_cashier_trash(
     limit: int = Query(100, ge=1, le=500),
     skip: int = Query(0, ge=0),
 ) -> dict:
-    """Soft-deleted rows owned by the cashier (after accountant confirmed delete)."""
+    """Soft-deleted rows owned by the cashier (own soft-trash + accountant-confirmed)."""
     db = _database(request)
     query: dict[str, Any] = {
         "trashed": True,
@@ -1250,13 +1248,18 @@ async def count_cashier_trash(request: Request, actor: RegisterActor) -> dict:
     return {"count": int(total)}
 
 
+def _cashier_trash_ids(body: BulkIdsRequest) -> list:
+    return [_valid_id(str(raw).strip()) for raw in body.ids if str(raw).strip()]
+
+
 @transactions.post("/trash/bulk-request-restore")
 async def bulk_request_restore_from_trash(
     body: BulkIdsRequest,
     request: Request,
     actor: RegisterActor,
 ) -> dict:
-    ids = [_valid_id(str(raw).strip()) for raw in body.ids if str(raw).strip()]
+    """Request accountant restore — verified-path trash only."""
+    ids = _cashier_trash_ids(body)
     if not ids:
         return {"updated": 0}
     cashier_id = actor.get("_id")
@@ -1265,6 +1268,7 @@ async def bulk_request_restore_from_trash(
         {
             "_id": {"$in": ids},
             "trashed": True,
+            "verified": True,
             "cashier_id": cashier_id,
             "restore_requested": {"$ne": True},
         },
@@ -1288,6 +1292,83 @@ async def bulk_request_restore_from_trash(
             details={"count": n},
         )
     return {"updated": n}
+
+
+@transactions.post("/trash/bulk-restore-own")
+async def bulk_restore_own_unverified_trash(
+    body: BulkIdsRequest,
+    request: Request,
+    actor: RegisterActor,
+) -> dict:
+    """Cashier immediately restores own draft/submitted soft-trashed rows."""
+    ids = _cashier_trash_ids(body)
+    if not ids:
+        return {"updated": 0}
+    cashier_id = actor.get("_id")
+    result = await _database(request).transactions.update_many(
+        {
+            "_id": {"$in": ids},
+            "trashed": True,
+            "verified": {"$ne": True},
+            "cashier_id": cashier_id,
+        },
+        {
+            "$set": {
+                "trashed": False,
+                "trashed_at": None,
+                "trashed_by": None,
+                "restore_requested": False,
+                "restore_requested_at": None,
+                "restore_requested_by": None,
+            }
+        },
+    )
+    n = int(result.modified_count)
+    if n:
+        await record_operation_event(
+            _database(request),
+            action="txn.restore_own_trash_bulk",
+            actor=actor,
+            request=request,
+            entity_type="transaction",
+            entity_ids=[str(oid) for oid in ids],
+            details={"count": n},
+        )
+    return {"updated": n}
+
+
+@transactions.post("/trash/bulk-purge-own")
+async def bulk_purge_own_unverified_trash(
+    body: BulkIdsRequest,
+    request: Request,
+    actor: RegisterActor,
+) -> dict:
+    """Cashier permanently deletes own draft/submitted soft-trashed rows."""
+    ids = _cashier_trash_ids(body)
+    if not ids:
+        return {"deleted": 0}
+    cashier_id = actor.get("_id")
+    db = _database(request)
+    result = await db.transactions.delete_many(
+        {
+            "_id": {"$in": ids},
+            "trashed": True,
+            "verified": {"$ne": True},
+            "cashier_id": cashier_id,
+        }
+    )
+    n = int(result.deleted_count)
+    if n:
+        await record_operation_event(
+            db,
+            action="txn.purge_own_trash_bulk",
+            actor=actor,
+            request=request,
+            entity_type="transaction",
+            entity_ids=[str(oid) for oid in ids],
+            details={"count": n},
+        )
+    return {"deleted": n}
 
 
 @transactions.get("/{tx_id}")
@@ -1358,8 +1439,9 @@ async def request_or_delete_transaction(
     if not doc:
         return {"result": "not_found"}
 
+    # Pending-edit clones are disposable — hard-delete the clone only.
     is_pending_edit = bool(doc.get("original_transaction_id")) and not doc.get("verified")
-    if is_pending_edit or not doc.get("verified"):
+    if is_pending_edit:
         await db.transactions.delete_one({"_id": oid})
         await record_operation_event(
             db,
@@ -1368,22 +1450,58 @@ async def request_or_delete_transaction(
             request=request,
             entity_type="transaction",
             entity_ids=[str(oid)],
-            details={"via": "request_delete", "pending_or_unverified": True},
+            details={"via": "request_delete", "pending_edit_clone": True},
         )
         return {"result": "deleted"}
 
-    cashier_id = None
+    actor_id = actor.get("_id") or doc.get("cashier_id")
     if body and body.cashier_id:
-        cashier_id = _valid_id(body.cashier_id)
+        actor_id = _valid_id(body.cashier_id) or actor_id
+    now = utcnow().replace(tzinfo=None)
+
+    # Draft / submitted but unverified → Cashier Trash (soft), no accountant gate.
+    if not doc.get("verified"):
+        if doc.get("trashed"):
+            return {"result": "already_trashed"}
+        await db.transactions.update_one(
+            {"_id": oid},
+            {
+                "$set": {
+                    "trashed": True,
+                    "trashed_at": now,
+                    "trashed_by": actor_id,
+                    "deletion_requested": False,
+                    "deletion_requested_at": None,
+                    "deletion_requested_by": None,
+                    "restore_requested": False,
+                    "restore_requested_at": None,
+                    "restore_requested_by": None,
+                }
+            },
+        )
+        await record_operation_event(
+            db,
+            action="txn.trash",
+            actor=actor,
+            request=request,
+            entity_type="transaction",
+            entity_ids=[str(oid)],
+            details={
+                "via": "request_delete",
+                "unverified": True,
+                "register_status": doc.get("register_status") or "draft",
+            },
+        )
+        return {"result": "trashed"}
+
+    # Verified → accountant must confirm (Verify → Deleted), then Trash.
     await db.transactions.update_one(
         {"_id": oid},
         {
             "$set": {
                 "deletion_requested": True,
-                "deletion_requested_at": utcnow().replace(tzinfo=None),
-                "deletion_requested_by": cashier_id
-                or actor.get("_id")
-                or doc.get("cashier_id"),
+                "deletion_requested_at": now,
+                "deletion_requested_by": actor_id,
             }
         },
     )
@@ -1412,14 +1530,24 @@ async def request_restore_from_trash(
     if body and body.cashier_id:
         cashier_id = _valid_id(body.cashier_id)
     doc = await db.transactions.find_one(
-        {"_id": oid, "trashed": True, "cashier_id": cashier_id}
+        {
+            "_id": oid,
+            "trashed": True,
+            "verified": True,
+            "cashier_id": cashier_id,
+        }
     )
     if not doc:
         return {"result": "not_found"}
     if doc.get("restore_requested"):
         return {"result": "already_requested"}
     await db.transactions.update_one(
-        {"_id": oid, "trashed": True, "cashier_id": cashier_id},
+        {
+            "_id": oid,
+            "trashed": True,
+            "verified": True,
+            "cashier_id": cashier_id,
+        },
         {
             "$set": {
                 "restore_requested": True,

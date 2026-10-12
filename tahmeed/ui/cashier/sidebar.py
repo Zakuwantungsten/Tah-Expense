@@ -54,7 +54,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("drafts",     "Drafts",     "mdi.file-document-edit-outline", {"badge": True}),
         ("day_issues", "Day Issues", "mdi.alert-decagram-outline",     {"badge": True}),
         ("rejected",   "Rejected",   "mdi.alert-circle-outline",       {}),
-        ("trash",      "Trash",      "mdi.delete-outline",             {}),
+        ("trash",      "Trash",      "mdi.delete-outline",             {"badge": True}),
     ]),
     ("ITEMS", []),
 ]
@@ -590,6 +590,10 @@ class CashierSidebarWidget(QFrame):
     def set_day_issues_badge(self, count: int) -> None:
         if "day_issues" in self._items:
             self._items["day_issues"].set_badge(count)
+
+    def set_trash_badge(self, count: int) -> None:
+        if "trash" in self._items:
+            self._items["trash"].set_badge(count)
 
     # ── Internal: top-level nav ────────────────────────────────────────────────
 

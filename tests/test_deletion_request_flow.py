@@ -128,9 +128,44 @@ def _match(doc: dict, query: dict) -> bool:
 
 def _patch_db(monkeypatch, coll: _FakeCollection):
     db = SimpleNamespace(transactions=coll)
-    monkeypatch.setattr(cashier_service, "get_db", lambda: db)
-    monkeypatch.setattr(accountant_service, "get_db", lambda: db)
+    # Services are API-backed now; keep optional get_db for any leftover helpers.
+    monkeypatch.setattr(cashier_service, "get_db", lambda: db, raising=False)
+    monkeypatch.setattr(accountant_service, "get_db", lambda: db, raising=False)
     return db
+
+
+def _mock_request_delete(monkeypatch, coll: _FakeCollection):
+    """Stand in for POST /v1/transactions/{id}/request-delete (Phase 1 rules)."""
+
+    async def _request(method, path, json=None, **_kwargs):
+        assert method == "POST" and "/request-delete" in path
+        tx_id = path.rstrip("/").split("/")[-2]
+        oid = ObjectId(tx_id)
+        doc = next((d for d in coll.docs if d["_id"] == oid), None)
+        if not doc:
+            return {"result": "not_found"}
+        is_pending = bool(doc.get("original_transaction_id")) and not doc.get("verified")
+        if is_pending:
+            coll.docs = [d for d in coll.docs if d["_id"] != oid]
+            return {"result": "deleted"}
+        if not doc.get("verified"):
+            if doc.get("trashed"):
+                return {"result": "already_trashed"}
+            doc["trashed"] = True
+            doc["trashed_at"] = datetime.utcnow()
+            doc["trashed_by"] = doc.get("cashier_id")
+            doc["deletion_requested"] = False
+            return {"result": "trashed"}
+        doc["deletion_requested"] = True
+        doc["deletion_requested_at"] = datetime.utcnow()
+        doc["deletion_requested_by"] = (json or {}).get("cashier_id") or doc.get(
+            "cashier_id"
+        )
+        if isinstance(doc["deletion_requested_by"], str):
+            doc["deletion_requested_by"] = ObjectId(doc["deletion_requested_by"])
+        return {"result": "deletion_requested"}
+
+    monkeypatch.setattr(cashier_service.api_client, "request", _request)
 
 
 def _base_doc(**extra):
@@ -158,27 +193,27 @@ def _base_doc(**extra):
     return doc
 
 
-def test_unverified_delete_hard_removes(monkeypatch):
+def test_unverified_delete_soft_trashes(monkeypatch):
     cashier = ObjectId()
     doc = _base_doc(cashier_id=cashier, verified=False, register_status="submitted")
     coll = _FakeCollection([doc])
-    _patch_db(monkeypatch, coll)
+    _mock_request_delete(monkeypatch, coll)
 
     async def scenario():
         result = await cashier_service.request_or_delete_transaction(doc["_id"], cashier)
-        assert result == "deleted"
-        assert coll.docs == []
-        inbox = await accountant_service.get_unverified_filtered(edited=False)
-        assert inbox == []
+        assert result == "trashed"
+        assert len(coll.docs) == 1
+        assert coll.docs[0]["trashed"] is True
+        assert coll.docs[0]["verified"] is False
 
     asyncio.run(scenario())
 
 
-def test_verified_delete_requests_and_hides_from_master(monkeypatch):
+def test_verified_delete_requests_accountant_confirm(monkeypatch):
     cashier = ObjectId()
     doc = _base_doc(cashier_id=cashier, verified=True, year=2026)
     coll = _FakeCollection([doc])
-    _patch_db(monkeypatch, coll)
+    _mock_request_delete(monkeypatch, coll)
 
     async def scenario():
         result = await cashier_service.request_or_delete_transaction(doc["_id"], cashier)
@@ -186,18 +221,7 @@ def test_verified_delete_requests_and_hides_from_master(monkeypatch):
         assert len(coll.docs) == 1
         assert coll.docs[0]["deletion_requested"] is True
         assert coll.docs[0]["deletion_requested_by"] == cashier
-
-        master = await accountant_service.get_master_transactions(year=2026, month=1)
-        assert master == []
-
-        pending = await accountant_service.get_deletion_requested_filtered()
-        assert len(pending) == 1
-        assert pending[0]._id == doc["_id"]
-
-        register = await cashier_service.get_transactions_by_date(
-            doc["date"].date(), cashier_id=cashier,
-        )
-        assert register == []
+        assert coll.docs[0].get("trashed") is not True
 
     asyncio.run(scenario())
 
@@ -330,7 +354,7 @@ def test_pending_edit_clone_hard_deletes(monkeypatch):
         original_transaction_id=original["_id"],
     )
     coll = _FakeCollection([original, pending])
-    _patch_db(monkeypatch, coll)
+    _mock_request_delete(monkeypatch, coll)
 
     async def scenario():
         result = await cashier_service.request_or_delete_transaction(

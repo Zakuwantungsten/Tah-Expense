@@ -192,6 +192,7 @@ class EntryForm(QWidget):
     """
 
     transaction_saved = Signal(object)
+    trash_changed = Signal()
 
     def __init__(self, user: User, parent=None):
         super().__init__(parent)
@@ -1029,16 +1030,42 @@ class EntryForm(QWidget):
             )
             return
         desc = tx.description or "?"
+        is_pending = bool(
+            getattr(tx, "original_transaction_id", None)
+            and not getattr(tx, "verified", False)
+        )
+        if getattr(tx, "verified", False):
+            confirm = (
+                f'Request deletion of approved expense:\n"{desc}"?\n\n'
+                "It leaves Master and goes to Verify → Deleted. "
+                "Accountant confirm moves it to Trash."
+            )
+        elif is_pending:
+            confirm = (
+                f'Delete pending edit:\n"{desc}"?\n\n'
+                "The original approved expense stays in Master."
+            )
+        elif (getattr(tx, "register_status", "") or "submitted") == "draft":
+            confirm = (
+                f'Move draft expense to Trash:\n"{desc}"?\n\n'
+                "You can restore or permanently delete it from Trash."
+            )
+        else:
+            confirm = (
+                f'Move submitted expense to Trash:\n"{desc}"?\n\n'
+                "It leaves Verify and appears in your Trash."
+            )
         if (
             QMessageBox.question(
                 self, "Delete Entry",
-                f'Delete saved transaction:\n"{desc}"?',
+                confirm,
                 QMessageBox.Yes | QMessageBox.No,
             )
             != QMessageBox.Yes
         ):
             return
-        asyncio.ensure_future(self._do_toolbar_delete(tx))
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._do_toolbar_delete(tx))
 
     async def _do_toolbar_delete(self, tx: Transaction) -> None:
         try:
@@ -1047,12 +1074,30 @@ class EntryForm(QWidget):
             )
             if result == "not_found":
                 QMessageBox.warning(self, "Not Found", "That entry was already removed.")
+            elif result in ("trashed", "already_trashed"):
+                QMessageBox.information(
+                    self, "Moved to Trash",
+                    "The expense was moved to your Trash.\n"
+                    "Open Trash to restore or delete it permanently.",
+                )
             elif result == "deletion_requested":
                 QMessageBox.information(
                     self, "Deletion Requested",
                     "The approved expense was sent to Verify → Deleted.\n"
-                    "Confirming moves it to Trash.",
+                    "An accountant must confirm (then Trash) or restore to Master.",
                 )
+            elif result == "deleted":
+                QMessageBox.information(
+                    self, "Deleted",
+                    "The pending-edit clone was removed.",
+                )
+            if result in (
+                "trashed",
+                "already_trashed",
+                "deletion_requested",
+                "deleted",
+            ):
+                self.trash_changed.emit()
             await self._refresh_table()
             self._clear_form()
         except Exception as exc:
