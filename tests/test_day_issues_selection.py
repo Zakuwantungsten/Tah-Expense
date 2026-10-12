@@ -49,8 +49,33 @@ def test_filter_day_issues_search_and_value() -> None:
     keys = {normalize_description("DIESEL"), normalize_description("TOLLS")}
     filtered = filter_day_issues(issues, value_filter=keys)
     assert {i.description for i in filtered} == {"DIESEL", "TOLLS"}
-    both = filter_day_issues(issues, search="d", value_filter=keys)
+    both = filter_day_issues(issues, search="die", value_filter=keys)
     assert [i.description for i in both] == ["DIESEL"]
+
+
+def test_filter_day_issues_search_matches_payee_item_and_kind() -> None:
+    issues = [
+        _issue("LATRA FEE", kind="Unmapped"),
+        DayIssue(
+            description_key=normalize_description("XTRA FEE"),
+            description="XTRA FEE",
+            kind="Bad map",
+            count=1,
+            payee="SPARE PARTS",
+            item="Council Fees",
+            detail="payee not in list",
+        ),
+        _issue("TOLLS"),
+    ]
+    assert [i.description for i in filter_day_issues(issues, search="spare")] == [
+        "XTRA FEE"
+    ]
+    assert [i.description for i in filter_day_issues(issues, search="council")] == [
+        "XTRA FEE"
+    ]
+    assert [i.description for i in filter_day_issues(issues, search="bad map")] == [
+        "XTRA FEE"
+    ]
 
 
 def test_resolve_value_filter_selection_show_all() -> None:

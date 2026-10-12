@@ -99,8 +99,17 @@ def filter_day_issues(
     for issue in issues:
         if value_filter is not None and issue.description_key not in value_filter:
             continue
-        if needle and needle not in (issue.description or "").lower():
-            continue
+        if needle:
+            haystack = " ".join(
+                [
+                    issue.description or "",
+                    issue.payee or "",
+                    issue.item or "",
+                    issue.kind or "",
+                ]
+            ).lower()
+            if needle not in haystack:
+                continue
         out.append(issue)
     return out
 
@@ -752,60 +761,67 @@ class DayIssuesWidget(QWidget):
         hint.setWordWrap(True)
         root.addWidget(hint)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        self._map_btn = _btn("Map Selected", primary=True)
-        self._map_btn.clicked.connect(self._map_selected)
-        actions.addWidget(self._map_btn)
-        self._map_all_btn = _btn("Map All Unmapped…", primary=False)
-        self._map_all_btn.clicked.connect(self._map_all_unmapped)
-        actions.addWidget(self._map_all_btn)
-        self._save_filled_btn = _btn("Save Filled Mappings", primary=True)
-        self._save_filled_btn.clicked.connect(self._schedule_save_filled)
-        self._save_filled_btn.setEnabled(False)
-        actions.addWidget(self._save_filled_btn)
-        check_hl = _btn("Check Highlighted", primary=False)
-        check_hl.clicked.connect(self._check_highlighted)
-        actions.addWidget(check_hl)
-        clear_chk = _btn("Clear Checks", primary=False)
-        clear_chk.clicked.connect(self._clear_checks)
-        actions.addWidget(clear_chk)
-        actions.addStretch()
-        self._status = _lbl("", size=12, color=_T2)
-        actions.addWidget(self._status)
-        root.addLayout(actions)
+        # One toolbar row: search first, then actions, status at the end.
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
 
-        search_row = QHBoxLayout()
-        search_row.setSpacing(8)
-        search_row.addWidget(_lbl("SEARCH", size=12, color=_T2))
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Filter descriptions…")
+        self._search.setPlaceholderText("Search description, payee, item, or type…")
         self._search.setFixedHeight(32)
+        self._search.setMinimumWidth(200)
         self._search.setClearButtonEnabled(True)
         self._search.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
-            f"background:{_WHITE};color:{_T1};font-size:12px;"
-            f"font-family:'Segoe UI';padding:0 8px;}}"
-            f"QLineEdit:focus{{border-color:{_BLUE};}}"
+            f"background:#F9FAFB;color:{_T1};font-size:12px;"
+            "font-family:'Segoe UI';padding:0 10px;}"
+            f"QLineEdit:focus{{border-color:{_BLUE};background:{_WHITE};}}"
         )
         self._search.textChanged.connect(self._on_search_changed)
-        search_row.addWidget(self._search, 1)
+        tools.addWidget(self._search, 1)
+
+        self._search_clear_btn = _btn("Search", primary=False)
+        self._search_clear_btn.setFixedWidth(72)
+        self._search_clear_btn.setToolTip("Clear the search filter")
+        self._search_clear_btn.clicked.connect(self._on_search_clear_clicked)
+        tools.addWidget(self._search_clear_btn)
+
         self._filter_btn = _btn("Filter VALUE…", primary=False)
         self._filter_btn.clicked.connect(self._open_value_filter)
-        search_row.addWidget(self._filter_btn)
+        tools.addWidget(self._filter_btn)
         self._value_chip = QLabel("")
         self._value_chip.setStyleSheet(
             f"background:{_BLUE_L};color:{_BLUE};font-size:11px;font-weight:700;"
             "border-radius:10px;padding:2px 10px;font-family:'Segoe UI';"
         )
         self._value_chip.setVisible(False)
-        search_row.addWidget(self._value_chip)
+        tools.addWidget(self._value_chip)
         self._clear_filter_btn = _btn("Clear VALUE Filter", primary=False)
         self._clear_filter_btn.clicked.connect(self._clear_value_filter)
         self._clear_filter_btn.setEnabled(False)
         self._clear_filter_btn.setVisible(False)
-        search_row.addWidget(self._clear_filter_btn)
-        root.addLayout(search_row)
+        tools.addWidget(self._clear_filter_btn)
+
+        self._map_btn = _btn("Map Selected", primary=True)
+        self._map_btn.clicked.connect(self._map_selected)
+        tools.addWidget(self._map_btn)
+        self._map_all_btn = _btn("Map All Unmapped…", primary=False)
+        self._map_all_btn.clicked.connect(self._map_all_unmapped)
+        tools.addWidget(self._map_all_btn)
+        self._save_filled_btn = _btn("Save Filled Mappings", primary=True)
+        self._save_filled_btn.clicked.connect(self._schedule_save_filled)
+        self._save_filled_btn.setEnabled(False)
+        tools.addWidget(self._save_filled_btn)
+        check_hl = _btn("Check Highlighted", primary=False)
+        check_hl.clicked.connect(self._check_highlighted)
+        tools.addWidget(check_hl)
+        clear_chk = _btn("Clear Checks", primary=False)
+        clear_chk.clicked.connect(self._clear_checks)
+        tools.addWidget(clear_chk)
+
+        tools.addStretch(1)
+        self._status = _lbl("", size=12, color=_T2)
+        tools.addWidget(self._status)
+        root.addLayout(tools)
 
         self._table_host = QFrame()
         self._table_host.setStyleSheet("QFrame{background:transparent;border:none;}")
@@ -987,7 +1003,29 @@ class DayIssuesWidget(QWidget):
 
     def _on_search_changed(self, text: str) -> None:
         self._search_text = text or ""
+        has_text = bool((text or "").strip())
+        self._search_clear_btn.setText("Clear" if has_text else "Search")
+        self._search_clear_btn.setStyleSheet(
+            (
+                f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:5px;"
+                "font-size:12px;font-weight:600;font-family:'Segoe UI';padding:0 14px;}}"
+                f"QPushButton:hover{{background:#005EA3;}}"
+            )
+            if has_text else
+            (
+                f"QPushButton{{background:{_WHITE};color:{_T1};border:1px solid {_BORDER};"
+                "border-radius:5px;font-size:12px;font-family:'Segoe UI';padding:0 14px;}}"
+                f"QPushButton:hover{{background:{_BG};}}"
+            )
+        )
         self._apply_filters()
+
+    def _on_search_clear_clicked(self) -> None:
+        if self._search.text():
+            self._search.clear()
+            self._search.setFocus()
+        else:
+            self._search.setFocus()
 
     def _sync_value_filter_chrome(self) -> None:
         active = self._value_filter is not None

@@ -92,7 +92,7 @@ _PAGE_SIZES = [25, 50, 100]
 # Daily Register Table (excel_grid) does not use these tokens.
 _ROW_H      = 24
 _HDR_H      = 22
-_CELL_FONT_PX = 10  # CSS px via QFont.setPixelSize — not point size
+_CELL_FONT_PT = 10  # point size via QFont.setPointSize
 _ROW_EVEN   = "#FFFFFF"
 _ROW_ODD    = "#F1F5F9"   # slate-100 — manual stripe (readable on all row types)
 _CREDIT_ROW_BG = "#E6F4EC"  # soft mint for money-in / credit rows
@@ -195,7 +195,7 @@ def _card(widget: QWidget) -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        f"border:none;font-size:{_CELL_FONT_PX}px;font-family:'Segoe UI';}}"
+        f"border:none;font-size:{_CELL_FONT_PT}pt;font-family:'Segoe UI';}}"
         f"QTableWidget::item{{padding:1px 6px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
@@ -208,9 +208,9 @@ def _table_style() -> str:
 
 
 def _table_cell_font(*, bold: bool = False, italic: bool = False) -> QFont:
-    """Uniform cell font in CSS pixels (matches ``_table_style``)."""
+    """Uniform cell font in points (matches ``_table_style``)."""
     f = QFont("Segoe UI")
-    f.setPixelSize(_CELL_FONT_PX)
+    f.setPointSize(_CELL_FONT_PT)
     f.setBold(bold)
     f.setItalic(italic)
     return f
@@ -563,7 +563,7 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
     if mono:
         f = QFont("Cascadia Code")
         f.setStyleHint(QFont.Monospace)
-        f.setPixelSize(_CELL_FONT_PX)
+        f.setPointSize(_CELL_FONT_PT)
         item.setFont(f)
     else:
         item.setFont(_table_cell_font())

@@ -31,8 +31,9 @@ class DescriptionMapping:
 
     @classmethod
     def from_doc(cls, doc: dict) -> "DescriptionMapping":
+        raw_id = doc.get("_id") or doc.get("id")
         return cls(
-            _id=doc.get("_id"),
+            _id=raw_id,
             description_key=doc["description_key"],
             description=doc.get("description", doc["description_key"]),
             category_id=doc["category_id"],

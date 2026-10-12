@@ -6,8 +6,8 @@ import asyncio
 from typing import List, Optional
 
 import qtawesome as qta
-from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QColor, QBrush
+from PySide6.QtCore import Qt, QSize, QTimer, QObject, QEvent
+from PySide6.QtGui import QColor, QBrush, QKeyEvent
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QCompleter, QDialog, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
@@ -17,8 +17,9 @@ from PySide6.QtWidgets import (
 from tahmeed.models.category import Category
 from tahmeed.models.description_mapping import DescriptionMapping
 from tahmeed.services.mapping_assignment_service import MappingAssignment
+from tahmeed.ui.accountant.master_ledger_table import _TABLE_SS as _MASTER_TABLE_SS
 from tahmeed.ui.accountant.separate_expenses import (
-    _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
+    _finish_table_row, _make_table, _stripe_bg, _table_cell_font,
 )
 from tahmeed.ui.dialog_theme import show_critical, show_info, show_warning
 from tahmeed.ui.dialogs.item_dialog import ItemDialog
@@ -39,6 +40,17 @@ _TM = "#9CA3AF"
 _COL_DEFAULTS = [52, 280, 200, 200]
 _SCROLL_CHUNK = 50
 _COL_NUM, _COL_DESC, _COL_ITEM, _COL_PAYEE = 0, 1, 2, 3
+
+
+class _TableKeyFilter(QObject):
+    def __init__(self, handler) -> None:
+        super().__init__()
+        self._handler = handler
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.KeyPress and self._handler(event):
+            return True
+        return super().eventFilter(obj, event)
 
 
 def _lbl(text: str = "", size: int = 13, weight: int = 400,
@@ -472,6 +484,8 @@ class DescriptionMapsWidget(QWidget):
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(350)
         self._search_debounce.timeout.connect(self._on_search_commit)
+        self._select_all_loading = False
+        self._deleting = False
         self._build()
 
     def _build(self) -> None:
@@ -503,14 +517,14 @@ class DescriptionMapsWidget(QWidget):
         hdr.addStretch()
 
         hint = _lbl(
-            "Select rows to re-assign or delete · right-click for more",
+            "Select rows to re-assign or delete · Select All loads every match",
             size=11, color=_TM,
         )
         hdr.addWidget(hint)
 
-        add_btn = _btn("+ Add Mapping", primary=True, height=32)
-        add_btn.clicked.connect(self._add_mapping)
-        hdr.addWidget(add_btn)
+        self._add_btn = _btn("+ Add Mapping", primary=True, height=32)
+        self._add_btn.clicked.connect(self._add_mapping)
+        hdr.addWidget(self._add_btn)
         root.addLayout(hdr)
 
         # Toolbar — search + bulk actions (Maps-specific; Payees uses filter combo).
@@ -548,10 +562,17 @@ class DescriptionMapsWidget(QWidget):
         self._delete_btn.clicked.connect(self._delete_selected)
         toolbar.addWidget(self._delete_btn)
 
-        clear_btn = _btn("Clear All", primary=False, height=32)
-        clear_btn.setToolTip("Delete every description → Payee + Item mapping")
-        clear_btn.clicked.connect(self._confirm_clear_all)
-        toolbar.addWidget(clear_btn)
+        self._select_all_btn = _btn("Select All", primary=False, height=32)
+        self._select_all_btn.setToolTip(
+            "Load every mapping that matches the current search, then select all rows"
+        )
+        self._select_all_btn.clicked.connect(self._on_select_all_clicked)
+        toolbar.addWidget(self._select_all_btn)
+
+        self._clear_btn = _btn("Clear All", primary=False, height=32)
+        self._clear_btn.setToolTip("Delete every description → Payee + Item mapping")
+        self._clear_btn.clicked.connect(self._confirm_clear_all)
+        toolbar.addWidget(self._clear_btn)
         root.addLayout(toolbar)
 
         self._table_host = QFrame()
@@ -562,18 +583,10 @@ class DescriptionMapsWidget(QWidget):
         table_vl.setContentsMargins(0, 0, 0, 0)
         table_vl.setSpacing(0)
 
-        self._table = QTableWidget(0, 4)
-        self._table.setHorizontalHeaderLabels(
-            ["#", "Description", "Item", "Payee"]
-        )
-        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table = _make_table(["#", "Description", "Item", "Payee"])
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self._table.setAlternatingRowColors(False)
         self._table.setShowGrid(True)
-        self._table.verticalHeader().setVisible(False)
-        self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
-        self._table.setStyleSheet(_table_style())
+        self._table.setStyleSheet(_MASTER_TABLE_SS)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._context_menu)
         self._table.doubleClicked.connect(self._on_double_click)
@@ -596,6 +609,9 @@ class DescriptionMapsWidget(QWidget):
             "description_maps_desc_item_payee",
             _COL_DEFAULTS,
             stretch_columns=(_COL_DESC,),
+        )
+        self._table.installEventFilter(
+            _TableKeyFilter(self._table_key_press),
         )
         table_vl.addWidget(self._table)
         root.addWidget(self._table_host, 1)
@@ -686,11 +702,12 @@ class DescriptionMapsWidget(QWidget):
         )
         return bool(cats_ok and payees_ok)
 
-    async def _load_initial(self) -> None:
+    async def _load_initial(self, *, quiet: bool = False) -> None:
         if self._loading:
             return
         self._loading = True
-        self._loading_overlay.show_loading("Loading mappings…")
+        if not quiet:
+            self._loading_overlay.show_loading("Loading mappings…")
         self._update_status()
         try:
             from tahmeed.services.description_mapping_service import (
@@ -709,9 +726,26 @@ class DescriptionMapsWidget(QWidget):
             show_critical(self, "Error", f"Could not load mappings:\n{exc}")
         finally:
             self._loading = False
-            self._loading_overlay.hide_loading()
+            if not quiet:
+                self._loading_overlay.hide_loading()
             self._update_status()
             self._fill_if_needed()
+
+    def _set_mutating_locked(self, locked: bool) -> None:
+        self._table.setEnabled(not locked)
+        self._search.setEnabled(not locked)
+        self._add_btn.setEnabled(not locked)
+        self._clear_btn.setEnabled(not locked)
+        self._select_all_btn.setEnabled(not locked)
+        if locked:
+            self._delete_btn.setEnabled(False)
+            self._reassign_btn.setEnabled(False)
+        else:
+            self._on_selection_changed()
+
+    def _show_busy(self, message: str) -> None:
+        self._loading_overlay.show_loading(message)
+        self._footer.setText(message)
 
     async def _load_more(self) -> None:
         if self._loading or len(self._rows) >= self._total:
@@ -767,8 +801,59 @@ class DescriptionMapsWidget(QWidget):
             self._table.setItem(idx, _COL_PAYEE, _cell(payee, bg=row_bg))
             _finish_table_row(self._table, idx, row_bg)
 
-    async def _load(self) -> None:
-        await self._load_initial()
+    async def _load(self, *, quiet: bool = False) -> None:
+        await self._load_initial(quiet=quiet)
+
+    def _table_key_press(self, event: QKeyEvent) -> bool:
+        if event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_A:
+            asyncio.ensure_future(self._select_all_matching())
+            return True
+        return False
+
+    def _on_select_all_clicked(self) -> None:
+        asyncio.ensure_future(self._select_all_matching())
+
+    async def _ensure_all_loaded(self) -> None:
+        from tahmeed.services.description_mapping_service import list_mappings
+
+        search = self._search.text().strip()
+        while len(self._rows) < self._total:
+            rows = await list_mappings(
+                search=search,
+                limit=_SCROLL_CHUNK,
+                skip=len(self._rows),
+            )
+            if not rows:
+                break
+            start = len(self._rows)
+            self._rows.extend(rows)
+            self._append_rows(rows, start)
+            self._update_status()
+
+    async def _select_all_matching(self) -> None:
+        if self._select_all_loading or self._loading:
+            return
+        if self._total <= 0 and self._table.rowCount() == 0:
+            return
+        self._select_all_loading = True
+        self._loading_overlay.show_loading("Loading all mappings…")
+        try:
+            await self._ensure_all_loaded()
+            self._table.selectAll()
+            self._on_selection_changed()
+        except Exception as exc:
+            show_critical(self, "Error", f"Could not select all mappings:\n{exc}")
+        finally:
+            self._select_all_loading = False
+            self._loading_overlay.hide_loading()
+            self._update_status()
+
+    def _all_matching_selected(self, entries: List[DescriptionMapping]) -> bool:
+        return (
+            self._total > 0
+            and len(entries) == self._total
+            and len(self._rows) == self._total
+        )
 
     def _on_selection_changed(self) -> None:
         selected = self._selected_entries()
@@ -792,6 +877,8 @@ class DescriptionMapsWidget(QWidget):
         ]
 
     def _delete_selected(self) -> None:
+        if self._deleting:
+            return
         entries = self._selected_entries()
         if not entries:
             show_info(self, "Delete", "Select one or more mappings to delete.")
@@ -969,39 +1056,95 @@ class DescriptionMapsWidget(QWidget):
         asyncio.ensure_future(self._do_delete(entry))
 
     async def _do_delete(self, entry: DescriptionMapping) -> None:
+        if self._deleting:
+            return
         if not entry._id:
             show_warning(self, "Delete", "This mapping has no id and cannot be deleted.")
             return
         from tahmeed.services.description_mapping_service import delete_mapping
 
+        self._deleting = True
+        self._set_mutating_locked(True)
+        label = (entry.description or "mapping").strip()
+        self._show_busy(f'Deleting "{label}"…')
+        deleted = 0
         try:
             await delete_mapping(entry._id)
+            deleted = 1
+            self._show_busy("Updating table…")
+            await self._load(quiet=True)
         except Exception as exc:
             show_critical(self, "Error", f"Could not delete mapping:\n{exc}")
-            return
-        await self._load()
+        else:
+            if deleted:
+                show_info(self, "Deleted", "Mapping deleted.")
+        finally:
+            self._deleting = False
+            self._set_mutating_locked(False)
+            self._loading_overlay.hide_loading()
 
     async def _do_delete_many(self, entries: List[DescriptionMapping]) -> None:
-        from tahmeed.services.description_mapping_service import delete_mapping
+        if self._deleting:
+            return
+        from tahmeed.services.description_mapping_service import (
+            delete_all_mappings,
+            delete_mappings_bulk,
+        )
 
-        failed = 0
-        for entry in entries:
-            if not entry._id:
-                failed += 1
-                continue
-            try:
-                await delete_mapping(entry._id)
-            except Exception:
-                failed += 1
-        if failed:
-            show_warning(
+        search = self._search.text().strip()
+        n = len(entries)
+        self._deleting = True
+        self._set_mutating_locked(True)
+        self._show_busy(
+            f"Deleting {n:,} mapping(s)… This can take a minute. Please wait."
+        )
+        deleted = 0
+        try:
+            if self._all_matching_selected(entries):
+                deleted = await delete_all_mappings(search=search)
+            else:
+                ids = [entry._id for entry in entries if entry._id]
+                missing = len(entries) - len(ids)
+                if not ids:
+                    show_warning(
+                        self,
+                        "Delete",
+                        "None of the selected mappings could be deleted (missing ids).",
+                    )
+                    return
+                deleted = await delete_mappings_bulk(ids)
+                if missing:
+                    show_warning(
+                        self,
+                        "Delete",
+                        f"Deleted {deleted:,} mapping(s); "
+                        f"{missing:,} selection(s) had no id and were skipped.",
+                    )
+                elif deleted < len(ids):
+                    show_warning(
+                        self,
+                        "Delete",
+                        f"Deleted {deleted:,} of {len(ids):,} selected mapping(s).",
+                    )
+            self._show_busy("Updating table…")
+            await self._load(quiet=True)
+            if deleted:
+                show_info(self, "Deleted", f"Deleted {deleted:,} mapping(s).")
+        except Exception as exc:
+            show_critical(
                 self,
-                "Delete",
-                f"Deleted {len(entries) - failed:,} mapping(s); {failed:,} failed.",
+                "Error",
+                f"Could not delete mappings:\n{exc}\n\n"
+                "If the list still shows old rows, wait a moment and refresh.",
             )
-        await self._load()
+        finally:
+            self._deleting = False
+            self._set_mutating_locked(False)
+            self._loading_overlay.hide_loading()
 
     def _confirm_clear_all(self) -> None:
+        if self._deleting:
+            return
         box = QMessageBox(self)
         box.setWindowTitle("Clear All Mappings")
         box.setIcon(QMessageBox.Warning)
@@ -1019,12 +1162,30 @@ class DescriptionMapsWidget(QWidget):
         asyncio.ensure_future(self._do_clear_all())
 
     async def _do_clear_all(self) -> None:
+        if self._deleting:
+            return
         from tahmeed.services.description_mapping_service import delete_all_mappings
 
+        self._deleting = True
+        self._set_mutating_locked(True)
+        self._show_busy(
+            f"Clearing all {self._total:,} mapping(s)… "
+            "This can take a minute. Please wait."
+        )
+        count = 0
         try:
-            count = await delete_all_mappings()
+            count = await delete_all_mappings(search="")
+            self._show_busy("Updating table…")
+            await self._load(quiet=True)
+            show_info(self, "Cleared", f"Deleted {count:,} mapping(s).")
         except Exception as exc:
-            show_critical(self, "Error", f"Could not clear mappings:\n{exc}")
-            return
-        show_info(self, "Cleared", f"Deleted {count:,} mapping(s).")
-        await self._load()
+            show_critical(
+                self,
+                "Error",
+                f"Could not clear mappings:\n{exc}\n\n"
+                "If mappings still appear, wait a moment and refresh.",
+            )
+        finally:
+            self._deleting = False
+            self._set_mutating_locked(False)
+            self._loading_overlay.hide_loading()

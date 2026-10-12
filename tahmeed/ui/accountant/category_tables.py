@@ -81,7 +81,7 @@ _HDR_BG     = "#F1F5F9"
 _SCROLL_CHUNK = 50
 _ROW_H        = 24
 _HDR_H        = 22
-_CELL_FONT_PX = 10
+_CELL_FONT_PT = 10
 
 # (label, pixel width, right-aligned?, mono?)
 _COLS = [
@@ -134,7 +134,7 @@ _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE};"
     f"  gridline-color: {_BORDER};"
-    f"  font-size: {_CELL_FONT_PX}px; font-family:'Segoe UI';"
+    f"  font-size: {_CELL_FONT_PT}pt; font-family:'Segoe UI';"
     f"  color: {_T1}; border: none;"
     f"}}"
     f"QTableWidget::item {{ padding: 1px 6px; border: none; }}"
@@ -218,7 +218,7 @@ def _set_cell(table: QTableWidget, row: int, col: int, text: str,
     if mono:
         f = QFont("Cascadia Code")
         f.setStyleHint(QFont.Monospace)
-        f.setPixelSize(_CELL_FONT_PX)
+        f.setPointSize(_CELL_FONT_PT)
         item.setFont(f)
     table.setItem(row, col, item)
 

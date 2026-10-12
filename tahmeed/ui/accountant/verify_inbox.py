@@ -410,12 +410,12 @@ class _FilterBar(QFrame):
 
         hl.addStretch()
 
-        self._approve_btn = _btn("Approve Selected", "mdi.check-all")
+        self._approve_btn = _btn("Approve", "mdi.check-all")
         self._approve_btn.setEnabled(False)
         self._approve_btn.clicked.connect(self.approve_selected)
         hl.addWidget(self._approve_btn)
 
-        self._reject_btn = _btn("Reject Selected", "mdi.close-circle-multiple-outline",
+        self._reject_btn = _btn("Reject", "mdi.close-circle-multiple-outline",
                                 danger=True)
         self._reject_btn.setEnabled(False)
         self._reject_btn.clicked.connect(self.reject_selected)
@@ -573,8 +573,8 @@ class _FilterBar(QFrame):
             self._confirm_delete_btn.setVisible(False)
             self._restore_btn.setVisible(False)
             return
-        self._approve_btn.setText("Approve Selected")
-        self._reject_btn.setText("Reject Selected")
+        self._approve_btn.setText("Approve")
+        self._reject_btn.setText("Reject")
         self._approve_btn.setVisible(not is_deleted and not is_rejected)
         self._reject_btn.setVisible(not is_deleted and not is_rejected)
         self._confirm_delete_btn.setVisible(is_deleted)

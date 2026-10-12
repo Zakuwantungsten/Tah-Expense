@@ -94,6 +94,10 @@ class MappingWrite(StrictModel):
     payee: str = ""
 
 
+class MappingBulkDelete(StrictModel):
+    ids: list[str] = Field(min_length=1, max_length=10000)
+
+
 class PayeeWrite(StrictModel):
     name: str = Field(min_length=1, max_length=200)
     active: bool = True

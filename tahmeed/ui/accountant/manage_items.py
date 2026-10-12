@@ -70,13 +70,13 @@ _BLUE_L  = "#E8F4FD"   # row selection highlight (matches SM Burhani Bonds)
 _STRIPE  = "#F1F5F9"   # subtle slate zebra stripe (matches SM Burhani Bonds)
 _ROW_H   = 24
 _HDR_H   = 22
-_CELL_FONT_PX = 10
+_CELL_FONT_PT = 10
 _PAGE_SIZE = 100
 
 _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE}; gridline-color: {_BORDER};"
-    f"  font-size: {_CELL_FONT_PX}px; font-family:'Segoe UI';"
+    f"  font-size: {_CELL_FONT_PT}pt; font-family:'Segoe UI';"
     f"  color: {_T1}; border: none;"
     f"}}"
     f"QTableWidget::item {{ padding: 1px 6px; border: none; }}"
@@ -95,9 +95,9 @@ _TABLE_SS = (
 
 
 def _item_table_font(*, bold: bool = False, italic: bool = False) -> QFont:
-    """Uniform cell font in CSS pixels (matches ``_TABLE_SS``)."""
+    """Uniform cell font in points (matches ``_TABLE_SS``)."""
     f = QFont("Segoe UI")
-    f.setPixelSize(_CELL_FONT_PX)
+    f.setPointSize(_CELL_FONT_PT)
     f.setBold(bold)
     f.setItalic(italic)
     return f

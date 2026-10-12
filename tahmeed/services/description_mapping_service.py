@@ -2,11 +2,14 @@
 
 from typing import Dict, List, Optional, Tuple
 
+import httpx
 from bson import ObjectId
 
 from tahmeed.models.description_mapping import DescriptionMapping
 from tahmeed.services.api_client import api_client
 from tahmeed.services.api_models import desktop_document, get_all_pages
+
+_BULK_MUTATION_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 
 
 def normalize_description(description: str) -> str:
@@ -106,8 +109,33 @@ async def delete_mapping(mapping_id: ObjectId | str) -> None:
     )
 
 
-async def delete_all_mappings() -> int:
-    payload = await api_client.request("DELETE", "v1/description-mappings")
+async def delete_all_mappings(*, search: str = "") -> int:
+    params: dict[str, str] = {}
+    text = (search or "").strip()
+    if text:
+        params["search"] = text
+    kwargs: dict = {}
+    if params:
+        kwargs["params"] = params
+    payload = await api_client.request(
+        "DELETE",
+        "v1/description-mappings",
+        timeout=_BULK_MUTATION_TIMEOUT,
+        **kwargs,
+    )
+    return int(payload["deleted_count"])
+
+
+async def delete_mappings_bulk(mapping_ids: List[ObjectId | str]) -> int:
+    ids = [str(item_id) for item_id in mapping_ids if item_id]
+    if not ids:
+        return 0
+    payload = await api_client.request(
+        "POST",
+        "v1/description-mappings/bulk-delete",
+        json={"ids": ids},
+        timeout=_BULK_MUTATION_TIMEOUT,
+    )
     return int(payload["deleted_count"])
 
 

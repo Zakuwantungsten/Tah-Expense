@@ -19,8 +19,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from tahmeed.ui.accountant.master_ledger_table import _TABLE_SS as _MASTER_TABLE_SS
 from tahmeed.ui.accountant.separate_expenses import (
-    _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
+    _finish_table_row, _make_table, _stripe_bg, _table_cell_font,
 )
 from tahmeed.ui.async_utils import pause_background_polls, schedule_call, schedule_coro
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
@@ -97,7 +98,7 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
 def _status_chip(active: bool) -> QLabel:
     lbl = QLabel("Active" if active else "Inactive")
     lbl.setAlignment(Qt.AlignCenter)
-    lbl.setFixedHeight(22)
+    lbl.setFixedHeight(18)
     lbl.setMinimumWidth(60)
     if active:
         lbl.setStyleSheet(
@@ -255,14 +256,9 @@ class ManagePayeesWidget(QWidget):
         table_vl.setContentsMargins(0, 0, 0, 0)
         table_vl.setSpacing(0)
 
-        self._table = QTableWidget(0, 4)
-        self._table.setHorizontalHeaderLabels(["#", "Name", "Currency", "Status"])
-        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setAlternatingRowColors(False)
-        self._table.verticalHeader().setVisible(False)
-        self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
-        self._table.setStyleSheet(_table_style())
+        self._table = _make_table(["#", "Name", "Currency", "Status"])
+        self._table.setStyleSheet(_MASTER_TABLE_SS)
+        self._table.setShowGrid(True)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._context_menu)
 
@@ -419,7 +415,7 @@ class ManagePayeesWidget(QWidget):
             chip_container = QWidget()
             chip_container.setStyleSheet(f"background: {row_bg};")
             cl = QHBoxLayout(chip_container)
-            cl.setContentsMargins(6, 2, 6, 2)
+            cl.setContentsMargins(6, 1, 6, 1)
             cl.addWidget(chip)
             cl.addStretch()
             self._table.setCellWidget(i, 3, chip_container)

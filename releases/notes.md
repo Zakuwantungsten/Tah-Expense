@@ -1,3 +1,4 @@
+- 4.6.5: Daily Register Larger/Smaller text zoom (cashier + accountant); Day Issues SHOW filter readable again; denser Excel-style column filters across tables; draft day discard/deletion; Day Issues selection polish; open-day summaries API support
 - 4.6.4: frameless window resize + Aero Snap (drag to top); cashier trash restore requests; payee management + item/payee required before verify; stronger password policy; admin/cashier chrome polish
 - 4.6.3: ship icon/splash polish; pair with API deploy that fixes overview/feeds totals (PyMongo async aggregate)
 - 4.6.2: sharper 3D desktop icon + modern circular splash

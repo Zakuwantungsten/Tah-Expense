@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from tahmeed.ui.accountant.separate_expenses import (
-    _CELL_FONT_PX, _finish_table_row, _stripe_bg, _table_style, _ROW_H,
+    _CELL_FONT_PT, _finish_table_row, _stripe_bg, _table_style, _ROW_H,
 )
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
@@ -104,7 +104,7 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
     if mono:
         f = QFont("Cascadia Code")
         f.setStyleHint(QFont.Monospace)
-        f.setPixelSize(_CELL_FONT_PX)
+        f.setPointSize(_CELL_FONT_PT)
         item.setFont(f)
     if bg:
         item.setBackground(QBrush(QColor(bg)))

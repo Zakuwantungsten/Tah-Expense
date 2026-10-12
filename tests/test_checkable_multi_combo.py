@@ -1,5 +1,7 @@
 """Popup sizing for long fuel-station file names in CheckableMultiCombo."""
 
+from time import monotonic
+
 from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import QApplication
 
@@ -46,4 +48,36 @@ def test_file_name_options_keep_full_tooltip() -> None:
     assert item is not None
     assert item.text() == name
     assert item.toolTip() == name
+    assert _app is not None
+
+
+def test_hide_popup_ignored_immediately_after_show() -> None:
+    """Opening click must not dismiss the list (press-show / release-hide race)."""
+    _app = QApplication.instance() or QApplication([])
+    combo = CheckableMultiCombo("All Items", noun_plural="items")
+    combo.set_options(["Fuel", "Parking"], emit=False)
+    combo.showPopup()
+    assert combo._popup_open
+    combo.hidePopup()  # same-tick dismiss attempt
+    assert combo._popup_open
+    combo._block_hide_until = monotonic() - 1
+    combo.hidePopup()
+    assert not combo._popup_open
+    assert _app is not None
+
+
+def test_set_options_deferred_while_popup_open() -> None:
+    _app = QApplication.instance() or QApplication([])
+    combo = CheckableMultiCombo("All Items", noun_plural="items")
+    combo.set_options(["A", "B"], emit=False)
+    combo.showPopup()
+    combo.set_options(["C", "D"], emit=False)
+    # Still showing original rows; rebuild waits until hide is allowed.
+    assert combo.model().item(1).text() == "A"
+    assert combo._pending_options is not None
+    combo._block_hide_until = monotonic() - 1
+    combo.hidePopup()
+    assert combo.model().item(1).text() == "C"
+    assert combo.model().item(2).text() == "D"
+    assert combo._pending_options is None
     assert _app is not None

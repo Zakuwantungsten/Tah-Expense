@@ -34,6 +34,10 @@ from tahmeed.services.cashier_service import (
     get_available_years, get_browse_items, get_browse_descriptions,
 )
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
+from tahmeed.ui.accountant.separate_expenses import (
+    _CELL_FONT_PT, _ROW_H, _finish_table_row, _stripe_bg, _table_cell_font,
+    _table_style,
+)
 from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
 from tahmeed.ui.widgets.combo_styles import with_combo_popup
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
@@ -60,20 +64,8 @@ QPushButton:pressed { background: #075985; border-color: #075985; }
 QPushButton:disabled { background: #93C5FD; border-color: #93C5FD; }
 """
 
-_TABLE_SS = """
-QTableWidget {
-    background: #ffffff; gridline-color: #e5e7eb; border: none;
-    font-size: 10px; font-family: 'Segoe UI';
-    selection-background-color: #E8F4FD; selection-color: #111827;
-}
-QHeaderView::section {
-    background: #f1f5f9; color: #334155; font-weight: 600; font-size: 9px;
-    padding: 0 6px; border: none; min-height: 22px;
-    border-right: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1;
-}
-QTableWidget::item { padding: 1px 6px; color: #111827; }
-QTableWidget::item:alternate { background: #f8fafc; }
-"""
+# Same compact density as Separate Expenses (10px cells / 24px rows).
+_TABLE_SS = _table_style()
 
 _FIELD_SS = with_combo_popup(
     "QLineEdit, QDateEdit, QComboBox {"
@@ -407,7 +399,7 @@ class TransactionBrowser(QWidget):
             "Issues", "Imported", "",
         ])
         t.setStyleSheet(_TABLE_SS)
-        t.setAlternatingRowColors(True)
+        t.setAlternatingRowColors(False)
         hh = t.horizontalHeader()
         for i in range(7):
             hh.setSectionResizeMode(i, QHeaderView.Interactive)
@@ -422,7 +414,7 @@ class TransactionBrowser(QWidget):
         t.verticalHeader().setVisible(False)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        t.verticalHeader().setDefaultSectionSize(24)
+        t.verticalHeader().setDefaultSectionSize(_ROW_H)
         t.itemSelectionChanged.connect(self._on_selection_changed)
         t.doubleClicked.connect(self._on_open_upload)
         return t
@@ -435,7 +427,7 @@ class TransactionBrowser(QWidget):
              "Refund to Float", "Total Amount"]
         )
         t.setStyleSheet(_TABLE_SS)
-        t.setAlternatingRowColors(True)
+        t.setAlternatingRowColors(False)
         hh = t.horizontalHeader()
         for i in range(6):
             hh.setSectionResizeMode(i, QHeaderView.Interactive)
@@ -450,7 +442,7 @@ class TransactionBrowser(QWidget):
         t.verticalHeader().setVisible(False)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        t.verticalHeader().setDefaultSectionSize(24)
+        t.verticalHeader().setDefaultSectionSize(_ROW_H)
         t.doubleClicked.connect(self._on_go_to)
         t.itemSelectionChanged.connect(self._on_selection_changed)
         return t
@@ -464,7 +456,8 @@ class TransactionBrowser(QWidget):
             "Cashier", "Edited by",
         ])
         t.setStyleSheet(_TABLE_SS)
-        t.setAlternatingRowColors(True)
+        # Manual Master Expenses zebra (white / slate) — not Qt AlternateBase.
+        t.setAlternatingRowColors(False)
         hh = t.horizontalHeader()
         for i in range(12):
             hh.setSectionResizeMode(i, QHeaderView.Interactive)
@@ -485,7 +478,7 @@ class TransactionBrowser(QWidget):
         t.verticalHeader().setVisible(False)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        t.verticalHeader().setDefaultSectionSize(24)
+        t.verticalHeader().setDefaultSectionSize(_ROW_H)
         t.doubleClicked.connect(self._on_go_to)
         t.itemSelectionChanged.connect(self._on_selection_changed)
         return t
@@ -812,22 +805,26 @@ class TransactionBrowser(QWidget):
         t = self._uploads_table
         t.setRowCount(len(uploads))
         for i, u in enumerate(uploads):
+            row_bg = _stripe_bg(i)
             upload_id = str(u.get("_id") or "")
             fname = u.get("source_filename") or "—"
-            t.setItem(i, _U_COL_FILE, _ro(fname))
+            t.setItem(i, _U_COL_FILE, _ro(fname, bg=row_bg))
 
             primary = u.get("primary_date") or u.get("min_date")
             if hasattr(primary, "strftime"):
                 date_str = primary.strftime("%d/%m/%Y")
             else:
                 date_str = "—"
-            t.setItem(i, _U_COL_DATE, _ro(date_str))
+            t.setItem(i, _U_COL_DATE, _ro(date_str, bg=row_bg))
 
             count = int(u.get("count") or 0)
-            t.setItem(i, _U_COL_COUNT, _ro(str(count), Qt.AlignCenter))
+            t.setItem(i, _U_COL_COUNT, _ro(str(count), Qt.AlignCenter, bg=row_bg))
 
             cid = u.get("cashier_id")
-            t.setItem(i, _U_COL_CASHIER, _ro(names.get(cid, "—") if cid else "—"))
+            t.setItem(
+                i, _U_COL_CASHIER,
+                _ro(names.get(cid, "—") if cid else "—", bg=row_bg),
+            )
 
             outliers = int(u.get("outlier_count") or 0)
             dupes = int(u.get("duplicate_count") or 0)
@@ -836,23 +833,27 @@ class TransactionBrowser(QWidget):
                 issue_bits.append(f"{outliers} date")
             if dupes:
                 issue_bits.append(f"{dupes} dup")
-            t.setItem(i, _U_COL_ISSUES, _ro(", ".join(issue_bits) if issue_bits else "—"))
+            t.setItem(
+                i, _U_COL_ISSUES,
+                _ro(", ".join(issue_bits) if issue_bits else "—", bg=row_bg),
+            )
 
             created = u.get("created_at")
             when = created.strftime("%d/%m/%Y %H:%M") if hasattr(created, "strftime") else "—"
-            t.setItem(i, _U_COL_WHEN, _ro(when))
+            t.setItem(i, _U_COL_WHEN, _ro(when, bg=row_bg))
 
             acts = QWidget()
-            acts.setStyleSheet("background:transparent;")
+            acts.setStyleSheet(f"background:{row_bg};")
             hl = QHBoxLayout(acts)
-            hl.setContentsMargins(4, 2, 4, 2)
+            hl.setContentsMargins(2, 0, 2, 0)
             hl.setSpacing(4)
 
             open_btn = QPushButton("Open")
             open_btn.setCursor(Qt.PointingHandCursor)
+            open_btn.setFixedHeight(_ROW_H - 4)
             open_btn.setStyleSheet(
                 "QPushButton{background:#fff;color:#0077C5;border:1px solid #BFDBFE;"
-                "border-radius:4px;padding:2px 10px;font-size:11px;font-weight:600;}"
+                f"border-radius:3px;padding:0 8px;font-size:{_CELL_FONT_PT}pt;font-weight:600;}}"
                 "QPushButton:hover{background:#E8F4FD;}"
             )
             open_btn.clicked.connect(lambda _c=False, r=i: self._open_upload_at(r))
@@ -861,9 +862,10 @@ class TransactionBrowser(QWidget):
             if self._can_manage_uploads:
                 btn = QPushButton("Delete")
                 btn.setCursor(Qt.PointingHandCursor)
+                btn.setFixedHeight(_ROW_H - 4)
                 btn.setStyleSheet(
                     "QPushButton{background:#fff;color:#b91c1c;border:1px solid #fecaca;"
-                    "border-radius:4px;padding:2px 10px;font-size:11px;font-weight:600;}"
+                    f"border-radius:3px;padding:0 8px;font-size:{_CELL_FONT_PT}pt;font-weight:600;}}"
                     "QPushButton:hover{background:#fef2f2;}"
                 )
                 btn.clicked.connect(
@@ -872,6 +874,7 @@ class TransactionBrowser(QWidget):
                 )
                 hl.addWidget(btn)
             t.setCellWidget(i, _U_COL_ACT, acts)
+            _finish_table_row(t, i, row_bg)
 
         self._count_label.setText(f"Uploads: {len(uploads)}")
         self._goto_btn.setEnabled(False)
@@ -940,30 +943,45 @@ class TransactionBrowser(QWidget):
         t.setRowCount(len(rows))
         names = getattr(self, "_user_names", {}) or {}
         for i, s in enumerate(rows):
+            row_bg = _stripe_bg(i)
             d = s["date"]
-            t.setItem(i, _S_COL_DATE, _ro(d.strftime("%a, %d %b %Y")))
+            t.setItem(i, _S_COL_DATE, _ro(d.strftime("%a, %d %b %Y"), bg=row_bg))
 
-            txn = _ro(f"TXN-{d.strftime('%Y%m%d')}")
-            txn.setFont(QFont("Consolas", 10))
+            txn = _ro(f"TXN-{d.strftime('%Y%m%d')}", bg=row_bg)
+            txn_font = QFont("Consolas")
+            txn_font.setPointSize(_CELL_FONT_PT)
+            txn.setFont(txn_font)
             txn.setForeground(QColor("#0077C5"))
             t.setItem(i, _S_COL_TXN_ID, txn)
 
-            t.setItem(i, _S_COL_ENTRIES, _ro(str(s["entries_count"]), Qt.AlignCenter))
+            t.setItem(
+                i, _S_COL_ENTRIES,
+                _ro(str(s["entries_count"]), Qt.AlignCenter, bg=row_bg),
+            )
 
-            status_it = _ro(self._simple_status_text(s, names))
+            status_it = _ro(self._simple_status_text(s, names), bg=row_bg)
             t.setItem(i, _S_COL_STATUS, status_it)
 
             refund = s["total_refund"]
-            ref_it = _ro(f"TZS {refund:,.0f}" if refund else "—", Qt.AlignRight | Qt.AlignVCenter)
+            ref_it = _ro(
+                f"TZS {refund:,.0f}" if refund else "—",
+                Qt.AlignRight | Qt.AlignVCenter,
+                bg=row_bg,
+            )
             if refund:
                 ref_it.setForeground(QColor("#EA580C"))
             t.setItem(i, _S_COL_REFUND, ref_it)
 
             total = s["total_tzs"]
-            tot_it = _ro(f"TZS {total:,.0f}" if total else "—", Qt.AlignRight | Qt.AlignVCenter)
+            tot_it = _ro(
+                f"TZS {total:,.0f}" if total else "—",
+                Qt.AlignRight | Qt.AlignVCenter,
+                bg=row_bg,
+            )
             if total and total < 0:
                 tot_it.setForeground(QColor("#dc2626"))
             t.setItem(i, _S_COL_TOTAL, tot_it)
+            _finish_table_row(t, i, row_bg)
 
         n = len(rows)
         self._count_label.setText(f"Days shown: {n}")
@@ -1018,23 +1036,28 @@ class TransactionBrowser(QWidget):
         names = getattr(self, "_user_names", {}) or {}
 
         for i, tx in enumerate(txs):
+            row_bg = _stripe_bg(i)
             d = tx.date
             date_str = d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
-            t.setItem(i, _A_COL_DATE, _ro(date_str))
-            t.setItem(i, _A_COL_ITEM, _ro(tx.item or tx.category_name or ""))
-            t.setItem(i, _A_COL_DESC, _ro(tx.description or ""))
-            t.setItem(i, _A_COL_TRUCK, _ro(tx.truck_number or ""))
-            t.setItem(i, _A_COL_MEMO, _ro(tx.memo or ""))
+            t.setItem(i, _A_COL_DATE, _ro(date_str, bg=row_bg))
+            t.setItem(i, _A_COL_ITEM, _ro(tx.item or tx.category_name or "", bg=row_bg))
+            t.setItem(i, _A_COL_DESC, _ro(tx.description or "", bg=row_bg))
+            t.setItem(i, _A_COL_TRUCK, _ro(tx.truck_number or "", bg=row_bg))
+            t.setItem(i, _A_COL_MEMO, _ro(tx.memo or "", bg=row_bg))
 
             if tx.notes_flag:
-                ref_it = _ro("REFUND TO FLOAT", Qt.AlignCenter)
+                ref_it = _ro("REFUND TO FLOAT", Qt.AlignCenter, bg=row_bg)
                 ref_it.setForeground(QColor("#EA580C"))
                 t.setItem(i, _A_COL_REFUND, ref_it)
             else:
-                t.setItem(i, _A_COL_REFUND, _ro(""))
+                t.setItem(i, _A_COL_REFUND, _ro("", bg=row_bg))
 
             amt = tx.amount or 0
-            amt_it = _ro(f"TZS {amt:,.0f}" if amt else "—", Qt.AlignRight | Qt.AlignVCenter)
+            amt_it = _ro(
+                f"TZS {amt:,.0f}" if amt else "—",
+                Qt.AlignRight | Qt.AlignVCenter,
+                bg=row_bg,
+            )
             if amt < 0:
                 amt_it.setForeground(QColor("#dc2626"))
             t.setItem(i, _A_COL_TZS, amt_it)
@@ -1046,7 +1069,7 @@ class TransactionBrowser(QWidget):
                 "missing": "MISSING",
                 "no_receipt": "NO RECEIPT",
             }.get(status, status.upper() if status else "—")
-            rec_it = _ro(_rcpt_lbl, Qt.AlignCenter)
+            rec_it = _ro(_rcpt_lbl, Qt.AlignCenter, bg=row_bg)
             rec_it.setForeground(QColor(
                 {
                     "received": "#16a34a",
@@ -1056,12 +1079,13 @@ class TransactionBrowser(QWidget):
                 }.get(status, "#6b7280")
             ))
             t.setItem(i, _A_COL_RECEIPT, rec_it)
-            t.setItem(i, _A_COL_OWNERSHIP, _ro(tx.ownership or ""))
-            t.setItem(i, _A_COL_APR, _ro(tx.approver or ""))
+            t.setItem(i, _A_COL_OWNERSHIP, _ro(tx.ownership or "", bg=row_bg))
+            t.setItem(i, _A_COL_APR, _ro(tx.approver or "", bg=row_bg))
             cashier = names.get(tx.cashier_id, "—") if tx.cashier_id else "—"
             edited = names.get(tx.last_edited_by, "—") if tx.last_edited_by else "—"
-            t.setItem(i, _A_COL_CASHIER, _ro(cashier))
-            t.setItem(i, _A_COL_EDITED_BY, _ro(edited))
+            t.setItem(i, _A_COL_CASHIER, _ro(cashier, bg=row_bg))
+            t.setItem(i, _A_COL_EDITED_BY, _ro(edited, bg=row_bg))
+            _finish_table_row(t, i, row_bg)
 
         n = len(txs)
         self._count_label.setText(f"Transactions: {n}")
@@ -1209,10 +1233,18 @@ class TransactionBrowser(QWidget):
 
 # ── Module helpers ────────────────────────────────────────────────────────────
 
-def _ro(text: str, align=Qt.AlignVCenter | Qt.AlignLeft) -> QTableWidgetItem:
+def _ro(
+    text: str,
+    align=Qt.AlignVCenter | Qt.AlignLeft,
+    *,
+    bg: str = "",
+) -> QTableWidgetItem:
     it = QTableWidgetItem(text)
     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
     it.setTextAlignment(align)
+    it.setFont(_table_cell_font())
+    if bg:
+        it.setBackground(QColor(bg))
     return it
 
 

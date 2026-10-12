@@ -112,7 +112,7 @@ _RECEIPT_MAP = {
     "no_receipt": ("No Receipt", _RED),
 }
 
-_CELL_FONT_PX = 10
+_CELL_FONT_PT = 10
 _HDR_H = 22
 _ROW_H = 24
 
@@ -120,7 +120,7 @@ _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE};"
     f"  gridline-color: {_BORDER};"
-    f"  font-size: {_CELL_FONT_PX}px;"
+    f"  font-size: {_CELL_FONT_PT}pt;"
     f"  font-family:'Segoe UI';"
     f"  color: {_T1};"
     f"  border: none;"

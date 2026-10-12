@@ -12,11 +12,14 @@ from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QLineEdit, QMessageBox, QCheckBox,
+    QLineEdit, QMessageBox,
 )
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
+from tahmeed.ui.accountant.separate_expenses import (
+    _ROW_H, _finish_table_row, _stripe_bg, _table_cell_font, _table_style,
+)
 
 _BG = "#F4F6F8"
 _WHITE = "#FFFFFF"
@@ -27,12 +30,22 @@ _RED_L = "#FEF2F2"
 _T1 = "#111827"
 _T2 = "#6B7280"
 _TM = "#9CA3AF"
-_HDR_BG = "#F3F4F6"
 
+# Day Issues–style leading columns: checkbox, then serial #.
 _COL_CHK = 0
+_COL_NUM = 1
+_COL_DATE = 2
+_COL_ITEM = 3
+_COL_DESC = 4
+_COL_TRUCK = 5
+_COL_AMOUNT = 6
+_COL_CURR = 7
+_COL_TRASHED = 8
+
 _HEADERS = [
-    "", "Date", "Item", "Description", "Truck", "Amount", "Currency", "Trashed",
+    "", "#", "Date", "Item", "Description", "Truck", "Amount", "Currency", "Trashed",
 ]
+_COL_DEFAULTS = [36, 40, 100, 120, 220, 110, 90, 80, 110]
 _NCOLS = len(_HEADERS)
 
 
@@ -40,7 +53,7 @@ def _lbl(text="", size=13, weight=400, color=_T1) -> QLabel:
     w = QLabel(text)
     w.setStyleSheet(
         f"color:{color};font-size:{size}px;font-weight:{weight};"
-        "font-family:'Segoe UI',sans-serif;background:transparent;"
+        "font-family:'Segoe UI';background:transparent;"
     )
     return w
 
@@ -54,8 +67,8 @@ def _btn(text: str, icon: str = "", *, primary=False, danger=False) -> QPushButt
         btn.setIconSize(QSize(14, 14))
     if primary:
         btn.setStyleSheet(
-            f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:4px;"
-            "font-size:12px;font-weight:600;font-family:'Segoe UI',sans-serif;"
+            f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:5px;"
+            "font-size:12px;font-weight:600;font-family:'Segoe UI';"
             "padding:0 14px;}"
             "QPushButton:hover{background:#005EA3;}"
             "QPushButton:disabled{background:#93C5FD;}"
@@ -63,16 +76,16 @@ def _btn(text: str, icon: str = "", *, primary=False, danger=False) -> QPushButt
     elif danger:
         btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{_RED};border:1px solid #FECACA;"
-            "border-radius:4px;font-size:12px;font-weight:600;"
-            "font-family:'Segoe UI',sans-serif;padding:0 14px;}"
+            "border-radius:5px;font-size:12px;font-weight:600;"
+            "font-family:'Segoe UI';padding:0 14px;}"
             f"QPushButton:hover{{background:{_RED_L};}}"
             "QPushButton:disabled{color:#FCA5A5;border-color:#FEE2E2;}"
         )
     else:
         btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{_T1};border:1px solid {_BORDER};"
-            "border-radius:4px;font-size:12px;font-weight:500;"
-            "font-family:'Segoe UI',sans-serif;padding:0 14px;}"
+            "border-radius:5px;font-size:12px;font-weight:500;"
+            "font-family:'Segoe UI';padding:0 14px;}"
             f"QPushButton:hover{{background:{_BG};}}"
             "QPushButton:disabled{color:#D1D5DB;}"
         )
@@ -90,6 +103,22 @@ def _fmt_money(amount: float) -> str:
         return f"{float(amount):,.0f}"
     except (TypeError, ValueError):
         return "0"
+
+
+def _cell(
+    text: str,
+    align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
+    *,
+    bg: str = "",
+) -> QTableWidgetItem:
+    item = QTableWidgetItem(str(text) if text is not None else "—")
+    item.setTextAlignment(align)
+    item.setFont(_table_cell_font())
+    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+    if bg:
+        item.setBackground(QBrush(QColor(bg)))
+    item.setForeground(QBrush(QColor(_T1)))
+    return item
 
 
 class TrashWidget(QWidget):
@@ -124,22 +153,9 @@ class TrashWidget(QWidget):
         )
         title_box.addWidget(self._subtitle)
         header.addLayout(title_box, 1)
-
-        self._restore_btn = _btn("Restore Selected", "mdi.restore", primary=True)
-        self._restore_btn.setEnabled(False)
-        self._restore_btn.clicked.connect(self._on_bulk_restore)
-        header.addWidget(self._restore_btn)
-
-        self._purge_btn = _btn("Delete Permanently", "mdi.delete-forever", danger=True)
-        self._purge_btn.setEnabled(False)
-        self._purge_btn.clicked.connect(self._on_bulk_purge)
-        header.addWidget(self._purge_btn)
-
-        refresh_btn = _btn("Refresh", "mdi.refresh")
-        refresh_btn.clicked.connect(self.refresh)
-        header.addWidget(refresh_btn)
         root.addLayout(header)
 
+        # One toolbar: compact Table-sized search + Restore / Delete / Refresh.
         tools = QFrame()
         tools.setStyleSheet(
             f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};border-radius:6px;}}"
@@ -151,17 +167,36 @@ class TrashWidget(QWidget):
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search description, item, or truck…")
         self._search.setClearButtonEnabled(True)
-        self._search.setFixedHeight(30)
+        self._search.setFixedHeight(32)
+        self._search.setFixedWidth(220)
         self._search.setStyleSheet(
-            f"QLineEdit{{border:1px solid {_BORDER};border-radius:4px;padding:0 8px;"
-            "font-size:12px;font-family:'Segoe UI',sans-serif;}"
+            f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
+            f"background:#F9FAFB;color:{_T1};font-size:12px;"
+            "font-family:'Segoe UI';padding:0 10px;}"
+            f"QLineEdit:focus{{border-color:{_BLUE};background:{_WHITE};}}"
         )
         self._search.returnPressed.connect(self.refresh)
-        tools_hl.addWidget(self._search, 1)
+        tools_hl.addWidget(self._search, 0)
 
         search_btn = _btn("Search", "mdi.magnify")
         search_btn.clicked.connect(self.refresh)
         tools_hl.addWidget(search_btn)
+
+        self._restore_btn = _btn("Restore Selected", "mdi.restore", primary=True)
+        self._restore_btn.setEnabled(False)
+        self._restore_btn.clicked.connect(self._on_bulk_restore)
+        tools_hl.addWidget(self._restore_btn)
+
+        self._purge_btn = _btn("Delete Permanently", "mdi.delete-forever", danger=True)
+        self._purge_btn.setEnabled(False)
+        self._purge_btn.clicked.connect(self._on_bulk_purge)
+        tools_hl.addWidget(self._purge_btn)
+
+        tools_hl.addStretch(1)
+
+        refresh_btn = _btn("Refresh", "mdi.refresh")
+        refresh_btn.clicked.connect(self.refresh)
+        tools_hl.addWidget(refresh_btn)
         root.addWidget(tools)
 
         self._table = QTableWidget(0, _NCOLS)
@@ -170,28 +205,17 @@ class TrashWidget(QWidget):
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
-        self._table.setAlternatingRowColors(True)
-        self._table.setShowGrid(False)
-        self._table.setStyleSheet(
-            f"QTableWidget{{background:{_WHITE};border:1px solid {_BORDER};"
-            f"border-radius:6px;gridline-color:transparent;color:{_T1};"
-            "font-family:'Segoe UI',sans-serif;font-size:12px;}"
-            f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};border:none;"
-            f"border-bottom:1px solid {_BORDER};padding:6px 8px;font-weight:600;}}"
-            f"QTableWidget::item{{padding:4px 8px;color:{_T1};}}"
-            f"QTableWidget::item:selected{{background:#DBEAFE;color:{_T1};}}"
-        )
+        self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
+        self._table.setAlternatingRowColors(False)
+        self._table.setShowGrid(True)
+        # Phase 3 — Separate Expenses / Master compact density.
+        self._table.setStyleSheet(_table_style())
         hdr = self._table.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.Interactive)
         hdr.setStretchLastSection(False)
-        hdr.setSectionResizeMode(3, QHeaderView.Stretch)
-        self._table.setColumnWidth(_COL_CHK, 36)
-        self._table.setColumnWidth(1, 100)
-        self._table.setColumnWidth(2, 120)
-        self._table.setColumnWidth(4, 110)
-        self._table.setColumnWidth(5, 90)
-        self._table.setColumnWidth(6, 80)
-        self._table.setColumnWidth(7, 110)
+        hdr.setSectionResizeMode(_COL_DESC, QHeaderView.Stretch)
+        for i, width in enumerate(_COL_DEFAULTS):
+            self._table.setColumnWidth(i, width)
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.itemSelectionChanged.connect(self._sync_action_buttons)
         root.addWidget(self._table, 1)
@@ -202,8 +226,8 @@ class TrashWidget(QWidget):
     def _selected_ids(self) -> List[ObjectId]:
         ids: List[ObjectId] = []
         for r in range(self._table.rowCount()):
-            chk = self._table.cellWidget(r, _COL_CHK)
-            if isinstance(chk, QCheckBox) and chk.isChecked():
+            chk = self._table.item(r, _COL_CHK)
+            if chk is not None and chk.checkState() == Qt.Checked:
                 if r < len(self._transactions) and self._transactions[r]._id:
                     ids.append(self._transactions[r]._id)
         if ids:
@@ -219,8 +243,9 @@ class TrashWidget(QWidget):
         self._restore_btn.setEnabled(enabled)
         self._purge_btn.setEnabled(enabled)
 
-    def _on_item_changed(self, _item: QTableWidgetItem) -> None:
-        self._sync_action_buttons()
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if item is not None and item.column() == _COL_CHK:
+            self._sync_action_buttons()
 
     async def _reload(self) -> None:
         from tahmeed.services.accountant_service import (
@@ -252,46 +277,60 @@ class TrashWidget(QWidget):
     def _populate(self, txs: List[Transaction]) -> None:
         t = self._table
         t.blockSignals(True)
+        t.clearSpans()
         t.setRowCount(0)
         if not txs:
             t.setRowCount(1)
             empty = QTableWidgetItem("Trash is empty.")
             empty.setTextAlignment(Qt.AlignCenter)
             empty.setForeground(QColor(_TM))
+            empty.setFont(_table_cell_font())
             empty.setFlags(Qt.ItemIsEnabled)
             t.setItem(0, 0, empty)
             t.setSpan(0, 0, 1, _NCOLS)
+            t.setRowHeight(0, _ROW_H)
             t.blockSignals(False)
             return
 
         t.setRowCount(len(txs))
-        tint = QBrush(QColor("#FFF7ED"))
         for r, tx in enumerate(txs):
-            chk = QCheckBox()
-            chk.setStyleSheet("margin-left:8px;")
-            chk.stateChanged.connect(lambda *_: self._sync_action_buttons())
-            t.setCellWidget(r, _COL_CHK, chk)
+            # Phase 4 — plain Items-style zebra (white / slate), no peach tint.
+            row_bg = _stripe_bg(r)
 
-            values = [
-                "",
-                _fmt_date(tx.date),
-                tx.item or tx.category_name or "—",
-                tx.description or "—",
-                tx.truck_number or "—",
-                _fmt_money(tx.amount),
-                tx.currency or "TZS",
-                _fmt_date(tx.trashed_at),
-            ]
-            for c, text in enumerate(values):
-                if c == _COL_CHK:
-                    continue
-                item = QTableWidgetItem(text)
-                item.setBackground(tint)
-                item.setForeground(QBrush(QColor(_T1)))
-                if c == 5:
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                t.setItem(r, c, item)
-            t.setRowHeight(r, 32)
+            # Phase 2 — native checkable cell (Day Issues pattern).
+            check = QTableWidgetItem()
+            check.setFlags(
+                Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+            )
+            check.setCheckState(Qt.Unchecked)
+            check.setBackground(QBrush(QColor(row_bg)))
+            t.setItem(r, _COL_CHK, check)
+
+            t.setItem(
+                r, _COL_NUM,
+                _cell(str(r + 1), Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
+            )
+            t.setItem(r, _COL_DATE, _cell(_fmt_date(tx.date), bg=row_bg))
+            t.setItem(
+                r, _COL_ITEM,
+                _cell(tx.item or tx.category_name or "—", bg=row_bg),
+            )
+            t.setItem(r, _COL_DESC, _cell(tx.description or "—", bg=row_bg))
+            t.setItem(r, _COL_TRUCK, _cell(tx.truck_number or "—", bg=row_bg))
+            t.setItem(
+                r, _COL_AMOUNT,
+                _cell(
+                    _fmt_money(tx.amount),
+                    Qt.AlignRight | Qt.AlignVCenter,
+                    bg=row_bg,
+                ),
+            )
+            t.setItem(
+                r, _COL_CURR,
+                _cell(tx.currency or "TZS", Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
+            )
+            t.setItem(r, _COL_TRASHED, _cell(_fmt_date(tx.trashed_at), bg=row_bg))
+            _finish_table_row(t, r, row_bg)
         t.blockSignals(False)
 
     def _on_bulk_restore(self) -> None:

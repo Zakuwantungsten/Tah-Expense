@@ -659,6 +659,14 @@ class ManageSuppliersWidget(QWidget):
 
     def _show_row_menu(self, item: Category, anchor: QWidget) -> None:
         menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background: {_WHITE}; border: 1px solid {_BORDER};"
+            " padding: 4px; border-radius: 6px; }"
+            f"QMenu::item {{ padding: 6px 20px; border-radius: 4px;"
+            f" color: {_T1}; font-size: 12px; font-family:'Segoe UI'; }}"
+            f"QMenu::item:selected {{ background: {_BLUE_L}; color: {_T1}; }}"
+            f"QMenu::separator {{ height: 1px; background: {_BORDER}; margin: 4px 8px; }}"
+        )
         menu.addAction("Open report", lambda: self._open_report(item))
         menu.addAction("Edit…", lambda: self._on_edit(item))
         menu.addAction(

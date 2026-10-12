@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from time import monotonic
-from typing import List, Sequence
+from typing import List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import Qt, Signal, QEvent
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer
 from PySide6.QtGui import QColor, QFontMetrics, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import QComboBox
+from PySide6.QtWidgets import QApplication, QComboBox
 
 from tahmeed.ui.widgets.combo_styles import with_combo_popup
 
@@ -90,6 +90,10 @@ class CheckableMultiCombo(QComboBox):
         self._model = QStandardItemModel(self)
         self.setModel(self._model)
         self._updating = False
+        self._popup_open = False
+        self._popup_shown_at = 0.0
+        self._block_hide_until = 0.0
+        self._pending_options: Optional[Tuple[Sequence[str], bool, bool]] = None
 
         all_item = self._make_item(all_label, "all")
         all_item.setCheckState(Qt.Checked)
@@ -119,6 +123,19 @@ class CheckableMultiCombo(QComboBox):
         emit: bool = True,
     ) -> None:
         """Replace option rows; optionally preserve still-valid selections."""
+        # Rebuilding the model while the list is open closes it; defer until hide.
+        if self._popup_is_open():
+            self._pending_options = (list(options), keep_selected, emit)
+            return
+        self._apply_options(options, keep_selected=keep_selected, emit=emit)
+
+    def _apply_options(
+        self,
+        options: Sequence[str],
+        *,
+        keep_selected: bool = True,
+        emit: bool = True,
+    ) -> None:
         prev = set(self.selected_values()) if keep_selected else set()
         self._updating = True
         try:
@@ -147,10 +164,35 @@ class CheckableMultiCombo(QComboBox):
         # Keep our contrast rules last so parent dark themes cannot override.
         super().setStyleSheet((ss or "") + "\n" + _COMBO_SS)
 
+    def _popup_is_open(self) -> bool:
+        if self._popup_open:
+            return True
+        view = self.view()
+        container = view.parentWidget() if view is not None else None
+        return bool(
+            (view is not None and view.isVisible())
+            or (container is not None and container.isVisible())
+        )
+
+    def _hide_guard_seconds(self) -> float:
+        """How long to ignore dismiss after open (opening click release race)."""
+        app = QApplication.instance()
+        dbl = (app.doubleClickInterval() / 1000.0) if app is not None else 0.2
+        return max(0.3, dbl)
+
     def showPopup(self) -> None:
         width = self._size_popup_to_contents()
-        self._popup_shown_at = monotonic()
+        now = monotonic()
+        self._popup_shown_at = now
+        self._block_hide_until = now + self._hide_guard_seconds()
+        self._popup_open = True
         super().showPopup()
+        # Defer width bump — resizing the live popup on Windows can dismiss it.
+        QTimer.singleShot(0, lambda w=width: self._ensure_popup_width(w))
+
+    def _ensure_popup_width(self, width: int) -> None:
+        if not self._popup_is_open():
+            return
         container = self.view().parentWidget()
         if container is not None and container.width() < width:
             container.resize(width, container.height())
@@ -184,13 +226,25 @@ class CheckableMultiCombo(QComboBox):
         return width
 
     def hidePopup(self) -> None:
-        if monotonic() - getattr(self, "_popup_shown_at", 0) < 0.2:
+        # Opening click: press shows the list, then the same click's release (or a
+        # focus glitch from sizing) tries to dismiss it immediately — ignore that.
+        if QApplication.mouseButtons() & Qt.LeftButton:
             return
+        if monotonic() < self._block_hide_until:
+            return
+        self._popup_open = False
         super().hidePopup()
         self._refresh_label()
+        pending = self._pending_options
+        self._pending_options = None
+        if pending is not None:
+            options, keep_selected, emit = pending
+            self._apply_options(options, keep_selected=keep_selected, emit=emit)
 
     def mousePressEvent(self, event) -> None:
+        # Whole control opens the list (not only the tiny arrow).
         self.showPopup()
+        event.accept()
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self.lineEdit() and event.type() == QEvent.MouseButtonPress:
@@ -202,6 +256,9 @@ class CheckableMultiCombo(QComboBox):
                 if index.isValid():
                     return True
             if event.type() == QEvent.MouseButtonRelease:
+                # Ignore the release that belongs to the click that opened us.
+                if monotonic() < self._block_hide_until:
+                    return True
                 index = self.view().indexAt(event.position().toPoint())
                 if index.isValid():
                     item = self._model.itemFromIndex(index)

@@ -167,7 +167,7 @@ class CashierTrashWidget(QWidget):
         self._table.setStyleSheet(
             f"QTableWidget{{background:{_WHITE};border:1px solid {_BORDER};"
             f"border-radius:6px;gridline-color:transparent;color:{_T1};"
-            "font-family:'Segoe UI',sans-serif;font-size:12px;}"
+            "font-family:'Segoe UI',sans-serif;font-size:10pt;}"
             f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};border:none;"
             f"border-bottom:1px solid {_BORDER};padding:6px 8px;font-weight:600;}}"
             f"QTableWidget::item{{padding:4px 8px;color:{_T1};}}"

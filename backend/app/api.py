@@ -34,6 +34,7 @@ from .schemas import (
     ChangePasswordRequest,
     FleetWrite,
     LoginRequest,
+    MappingBulkDelete,
     MappingWrite,
     PatchDocument,
     PayeeWrite,
@@ -1281,19 +1282,61 @@ async def delete_rule(item_id: str, request: Request, manager: Manager) -> Respo
     return await delete_named("keyword_rules", item_id, request, actor=manager)
 
 
+def _mapping_search_query(search: str) -> dict[str, Any]:
+    text = (search or "").strip()
+    if not text:
+        return {}
+    return {
+        "$or": [
+            {field: {"$regex": re.escape(text), "$options": "i"}}
+            for field in ("description", "payee", "category_name")
+        ]
+    }
+
+
 @mappings.delete("")
-async def delete_mappings(request: Request, manager: Manager) -> dict:
+async def delete_mappings(
+    request: Request,
+    manager: Manager,
+    search: str = "",
+) -> dict:
     db = database(request)
-    result = await db.description_mappings.delete_many({})
+    query = _mapping_search_query(search)
+    result = await db.description_mappings.delete_many(query)
     await record_operation_event(
         db,
         action="mapping.delete_all",
         actor=manager,
         request=request,
         entity_type="mapping",
-        details={"deleted_count": int(result.deleted_count)},
+        details={
+            "deleted_count": int(result.deleted_count),
+            "search": (search or "").strip() or None,
+        },
     )
     return {"deleted_count": result.deleted_count}
+
+
+@mappings.post("/bulk-delete")
+async def bulk_delete_mappings(
+    body: MappingBulkDelete,
+    request: Request,
+    manager: Manager,
+) -> dict:
+    db = database(request)
+    ids = [valid_id(item_id) for item_id in body.ids]
+    result = await db.description_mappings.delete_many({"_id": {"$in": ids}})
+    if result.deleted_count:
+        await record_operation_event(
+            db,
+            action="mapping.bulk_delete",
+            actor=manager,
+            request=request,
+            entity_type="mapping",
+            entity_ids=[str(item_id) for item_id in ids[:40]],
+            details={"deleted_count": int(result.deleted_count), "requested": len(ids)},
+        )
+    return {"deleted_count": int(result.deleted_count)}
 
 
 @mappings.delete("/{item_id}", status_code=204)

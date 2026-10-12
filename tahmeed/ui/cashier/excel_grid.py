@@ -1442,8 +1442,14 @@ class DailyRegister(QWidget):
         self._emit_undo_redo_state()
         self._update_footer()
         self._apply_filters()
+        if self._search_text:
+            self._scroll_to_first_filter_match()
         self.edit_state_changed.emit(False, 0)
-        if self._table.currentRow() < 0 and self._table.rowCount() > self._saved_count:
+        if (
+            not self._search_text
+            and self._table.currentRow() < 0
+            and self._table.rowCount() > self._saved_count
+        ):
             self._table.setCurrentCell(self._saved_count, COL_DESC)
         self._sync_header_cheque_from_grid()
         self._emit_active_cheque()
@@ -2046,6 +2052,11 @@ class DailyRegister(QWidget):
     def set_search(self, text: str) -> None:
         self._search_text = text.strip().lower()
         self._apply_filters()
+        # Keep matches in view: blank editable rows no longer bury results,
+        # and Clear must immediately restore the full grid.
+        if self._search_text:
+            self._scroll_to_first_filter_match()
+        self._table.viewport().update()
 
     def scroll_and_highlight(self, term: str) -> None:
         """Scroll to the first saved row that contains term and flash-highlight it.
@@ -2191,32 +2202,34 @@ class DailyRegister(QWidget):
         # here so cascade_column_values just collects target_col values.
         return cascade_column_values(rows, target_col=col, active_filters={})
 
+    def _row_matches_search(self, row: int, search: str) -> bool:
+        if not search:
+            return True
+        for col in range(self._table.columnCount()):
+            it = self._table.item(row, col)
+            if not it:
+                continue
+            if col == COL_RECEIPT:
+                label = _RCPT_LABEL.get(it.text().strip().lower(), it.text())
+                if search in label.lower() or search in it.text().lower():
+                    return True
+            elif search in it.text().lower():
+                return True
+        return False
+
     def _apply_filters(self) -> None:
         search = self._search_text
         for row in range(self._table.rowCount()):
-            # Always show editable rows so new entry is never hidden
-            if row >= self._saved_count:
-                self._table.setRowHidden(row, False)
+            # Blank entry rows: keep visible for typing when not searching.
+            # While searching, hide them so matches aren't buried under empties.
+            if row >= self._saved_count and not self._row_has_data(row):
+                self._table.setRowHidden(row, bool(search))
                 continue
 
             # ── Search ───────────────────────────────────────────────
-            if search:
-                matched = False
-                for col in range(self._table.columnCount()):
-                    it = self._table.item(row, col)
-                    if not it:
-                        continue
-                    if col == COL_RECEIPT:
-                        label = _RCPT_LABEL.get(it.text().strip().lower(), it.text())
-                        if search in label.lower() or search in it.text().lower():
-                            matched = True
-                            break
-                    elif search in it.text().lower():
-                        matched = True
-                        break
-                if not matched:
-                    self._table.setRowHidden(row, True)
-                    continue
+            if search and not self._row_matches_search(row, search):
+                self._table.setRowHidden(row, True)
+                continue
 
             # ── Column filters ───────────────────────────────────────
             visible = True
@@ -2228,6 +2241,21 @@ class DailyRegister(QWidget):
                     break
 
             self._table.setRowHidden(row, not visible)
+
+    def _scroll_to_first_filter_match(self) -> None:
+        """Scroll to the first visible saved/data row after a search apply."""
+        for row in range(self._table.rowCount()):
+            if self._table.isRowHidden(row):
+                continue
+            if row >= self._saved_count and not self._row_has_data(row):
+                continue
+            index = self._table.model().index(row, COL_DESC)
+            self._table.scrollTo(index, QAbstractItemView.PositionAtTop)
+            if self._table.currentRow() < 0 or self._table.isRowHidden(
+                self._table.currentRow()
+            ):
+                self._table.setCurrentCell(row, COL_DESC)
+            return
 
     def _go_to_first_empty(self) -> None:
         """Scroll to and focus the first empty editable row (New button)."""

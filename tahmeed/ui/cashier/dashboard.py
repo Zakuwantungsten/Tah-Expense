@@ -470,11 +470,12 @@ class _ActionBar(QFrame):
         tg.addWidget(self._merged_btn)
         hl.addWidget(toggle, 0, Qt.AlignVCenter)
 
-        search = QLineEdit()
-        search.setPlaceholderText("Search entries…")
-        search.setFixedWidth(220)
-        search.setFixedHeight(_BTN_H)
-        search.setStyleSheet(
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search entries…")
+        self._search.setFixedWidth(220)
+        self._search.setFixedHeight(_BTN_H)
+        self._search.setClearButtonEnabled(True)
+        self._search.setStyleSheet(
             "QLineEdit {"
             "  border: 1px solid #D1D5DB; border-radius: 5px;"
             "  padding: 0 10px; font-size: 12px;"
@@ -484,27 +485,17 @@ class _ActionBar(QFrame):
             "  border-color: #0077C5; background: #ffffff;"
             "}"
         )
-        hl.addWidget(search, 0, Qt.AlignVCenter)
+        hl.addWidget(self._search, 0, Qt.AlignVCenter)
 
         self._search_clear_btn = QPushButton("Search")
         self._search_clear_btn.setFixedHeight(_BTN_H)
         self._search_clear_btn.setFixedWidth(68)
         self._search_clear_btn.setCursor(Qt.PointingHandCursor)
         self._search_clear_btn.setStyleSheet(_BTN_STYLES["secondary"])
+        self._search_clear_btn.setToolTip("Clear the table search filter")
 
-        def _on_search_clear_clicked():
-            if search.text():
-                search.clear()
-
-        def _on_text_changed(text: str):
-            self.search_changed.emit(text)
-            self._search_clear_btn.setText("Clear" if text else "Search")
-            self._search_clear_btn.setStyleSheet(
-                _BTN_STYLES["active"] if text else _BTN_STYLES["secondary"]
-            )
-
-        search.textChanged.connect(_on_text_changed)
-        self._search_clear_btn.clicked.connect(_on_search_clear_clicked)
+        self._search.textChanged.connect(self._on_search_text_changed)
+        self._search_clear_btn.clicked.connect(self._on_search_clear_clicked)
         hl.addWidget(self._search_clear_btn, 0, Qt.AlignVCenter)
 
         self._status = QLabel("")
@@ -535,6 +526,21 @@ class _ActionBar(QFrame):
         fields_hl.addWidget(cheque_wrap)
 
         hl.addWidget(fields, 0, Qt.AlignVCenter)
+
+    def _on_search_text_changed(self, text: str) -> None:
+        self.search_changed.emit(text)
+        has_text = bool((text or "").strip())
+        self._search_clear_btn.setText("Clear" if has_text else "Search")
+        self._search_clear_btn.setStyleSheet(
+            _BTN_STYLES["active"] if has_text else _BTN_STYLES["secondary"]
+        )
+
+    def _on_search_clear_clicked(self) -> None:
+        if self._search.text():
+            # clear() emits textChanged → set_search("") on the register.
+            self._search.clear()
+        else:
+            self._search.setFocus()
 
     def _on_reconciled_date(self, qd: QDate) -> None:
         if not qd.isValid() or qd == _RECONCILED_DATE_UNSET:
