@@ -45,6 +45,7 @@ from tahmeed.ui.accountant.separate_expenses import (
 from tahmeed.models.reconciliation import ReconciliationEntry
 from tahmeed.services import reconciliation_service as recon_svc
 from tahmeed.ui.dialog_theme import show_question
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 try:
     import openpyxl
@@ -707,7 +708,9 @@ class _ReconAllEntries(QWidget):
             return
         self._loading = True
         self._update_status()
+        show_widget_loading(self, "Loading reconciliation…")
         month = self._effective_month()
+        ok = False
         try:
             rows, total, totals = await asyncio.gather(
                 recon_svc.get_recon_all_records(
@@ -721,21 +724,24 @@ class _ReconAllEntries(QWidget):
                 ),
             )
         except Exception:
-            self._loading = False
             self._status_lbl.setText("Failed to load records.")
-            return
-        self._total = total
-        self._append_rows(rows)
-        self._loaded = len(rows)
-        self._totals.set_total("charge", totals["invoiced"], "$ ")
-        self._totals.set_total("count", totals["count"], "")
-        if self._bonds:
-            self._inv_lbl.setText(f"Invoiced: $ {totals['invoiced']:,.0f}")
-            self._conf_lbl.setText(f"Confirmed: $ {totals['confirmed']:,.0f}")
-            self._var_lbl.setText(f"Variance: $ {totals['variance']:,.0f}")
-            self._disp_lbl.setText(f"Disputed: {totals['disputed']}")
-        self._loading = False
-        self._update_status()
+        else:
+            self._total = total
+            self._append_rows(rows)
+            self._loaded = len(rows)
+            self._totals.set_total("charge", totals["invoiced"], "$ ")
+            self._totals.set_total("count", totals["count"], "")
+            if self._bonds:
+                self._inv_lbl.setText(f"Invoiced: $ {totals['invoiced']:,.0f}")
+                self._conf_lbl.setText(f"Confirmed: $ {totals['confirmed']:,.0f}")
+                self._var_lbl.setText(f"Variance: $ {totals['variance']:,.0f}")
+                self._disp_lbl.setText(f"Disputed: {totals['disputed']}")
+            ok = True
+        finally:
+            self._loading = False
+            hide_widget_loading(self)
+            if ok:
+                self._update_status()
 
     async def _load_more(self) -> None:
         if self._loading or self._loaded >= self._total:
@@ -991,9 +997,13 @@ class _ReconUploadBrowse(QWidget):
         asyncio.ensure_future(self._load())
 
     async def _load(self) -> None:
-        uploads = await recon_svc.get_recon_uploads(self._table)
-        self._uploads = uploads
-        self._fill(uploads)
+        show_widget_loading(self, "Loading uploads…")
+        try:
+            uploads = await recon_svc.get_recon_uploads(self._table)
+            self._uploads = uploads
+            self._fill(uploads)
+        finally:
+            hide_widget_loading(self)
 
     def _fill(self, uploads: List[dict]) -> None:
         t = self._table_w
@@ -1240,6 +1250,8 @@ class _ReconUploadDetail(QWidget):
             return
         self._loading = True
         self._update_status()
+        show_widget_loading(self, "Loading upload records…")
+        ok = False
         try:
             rows, total, totals = await asyncio.gather(
                 recon_svc.get_recon_upload_records(
@@ -1253,21 +1265,24 @@ class _ReconUploadDetail(QWidget):
                 ),
             )
         except Exception:
-            self._loading = False
             self._status_lbl.setText("Failed to load records.")
-            return
-        self._total = total
-        self._append_rows(rows)
-        self._loaded = len(rows)
-        self._totals.set_total("charge", totals["invoiced"], "$ ")
-        self._totals.set_total("count", totals["count"], "")
-        if self._bonds:
-            self._inv_lbl.setText(f"Invoiced: $ {totals['invoiced']:,.0f}")
-            self._conf_lbl.setText(f"Confirmed: $ {totals['confirmed']:,.0f}")
-            self._var_lbl.setText(f"Variance: $ {totals['variance']:,.0f}")
-            self._disp_lbl.setText(f"Disputed: {totals['disputed']}")
-        self._loading = False
-        self._update_status()
+        else:
+            self._total = total
+            self._append_rows(rows)
+            self._loaded = len(rows)
+            self._totals.set_total("charge", totals["invoiced"], "$ ")
+            self._totals.set_total("count", totals["count"], "")
+            if self._bonds:
+                self._inv_lbl.setText(f"Invoiced: $ {totals['invoiced']:,.0f}")
+                self._conf_lbl.setText(f"Confirmed: $ {totals['confirmed']:,.0f}")
+                self._var_lbl.setText(f"Variance: $ {totals['variance']:,.0f}")
+                self._disp_lbl.setText(f"Disputed: {totals['disputed']}")
+            ok = True
+        finally:
+            self._loading = False
+            hide_widget_loading(self)
+            if ok:
+                self._update_status()
 
     async def _load_more(self) -> None:
         if not self._upload_id or self._loading or self._loaded >= self._total:

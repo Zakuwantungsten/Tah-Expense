@@ -33,6 +33,7 @@ from tahmeed.ui.widgets.column_persistence import (
     apply_pending_column_autofit,
     bind_column_width_persistence,
 )
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 # Date | Entries | Total | Cashiers — Cashiers stretch
 _DAYS_COL_DEFAULTS = [110, 72, 120, 160]
@@ -291,6 +292,7 @@ class DraftsView(QWidget):
         schedule_coro(self._load_days())
 
     async def _load_days(self) -> None:
+        show_widget_loading(self, "Loading drafts…")
         try:
             cashier_id = None if self._show_all else self._user._id
             self._days = await get_draft_day_summaries(
@@ -301,16 +303,17 @@ class DraftsView(QWidget):
             for d in self._days:
                 ids.extend(d.get("cashier_ids") or [])
             self._cashier_names = await get_cashier_names(ids) if ids else {}
+            self._populate_days()
+            if self._days:
+                self._days_table.selectRow(0)
+            else:
+                self._selected_day = None
+                self._rows = []
+                self._populate_rows()
         except Exception as exc:
             QMessageBox.critical(self, "Drafts", f"Could not load drafts:\n{exc}")
-            return
-        self._populate_days()
-        if self._days:
-            self._days_table.selectRow(0)
-        else:
-            self._selected_day = None
-            self._rows = []
-            self._populate_rows()
+        finally:
+            hide_widget_loading(self)
 
     def _populate_days(self) -> None:
         self._days_table.setRowCount(len(self._days))
@@ -349,6 +352,7 @@ class DraftsView(QWidget):
         asyncio.ensure_future(self._load_rows(day))
 
     async def _load_rows(self, day: date) -> None:
+        show_widget_loading(self, "Loading draft entries…")
         try:
             merged = self._show_all
             cashier_id = None if merged else self._user._id
@@ -359,10 +363,11 @@ class DraftsView(QWidget):
             if ids:
                 extra = await get_cashier_names(ids)
                 self._cashier_names.update(extra)
+            self._populate_rows()
         except Exception as exc:
             QMessageBox.critical(self, "Drafts", f"Could not load entries:\n{exc}")
-            return
-        self._populate_rows()
+        finally:
+            hide_widget_loading(self)
 
     def _populate_rows(self) -> None:
         if self._selected_day:

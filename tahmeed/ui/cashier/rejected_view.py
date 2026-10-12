@@ -41,6 +41,7 @@ from tahmeed.services.settings_service import get_setting
 from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.services.subtable_service import get_subtables
 from tahmeed.ui.cashier.excel_row_header import ExcelRowHeaderView, ROW_HEADER_QSS, sync_row_header_labels
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 # ── Design tokens ────────────────────────────────────────────────────────────
 _WHITE = "#FFFFFF"
@@ -458,6 +459,7 @@ class RejectedView(QWidget):
             get_rejected_transactions_for_cashier,
             get_discarded_transactions_for_cashier,
         )
+        show_widget_loading(self, "Loading rejected entries…")
         try:
             rejected = await get_rejected_transactions_for_cashier(self._user._id)
             discarded = await get_discarded_transactions_for_cashier(self._user._id)
@@ -471,6 +473,8 @@ class RejectedView(QWidget):
             self._count_badge.setText(str(len(txs)))
         except Exception as exc:
             self._show_empty(f"Failed to load: {exc}")
+        finally:
+            hide_widget_loading(self)
 
     def _fill_table(self, txs: List[Transaction]) -> None:
         t = self._table

@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from tahmeed.app_state import app_state
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 # ── Design tokens (minimal dashboard) ────────────────────────────────────────
 _WHITE   = "#FFFFFF"
@@ -732,6 +733,7 @@ class OverviewWidget(QWidget):
         if self._loading:
             return
         self._loading = True
+        show_widget_loading(self, "Loading overview…")
         from tahmeed.services.accountant_service import get_overview_dashboard
         try:
             data = await get_overview_dashboard(self._year)
@@ -740,6 +742,7 @@ class OverviewWidget(QWidget):
             pass
         finally:
             self._loading = False
+            hide_widget_loading(self)
 
     def _apply(self, data: dict) -> None:
         kpis = data["kpis"]

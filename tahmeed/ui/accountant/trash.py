@@ -20,6 +20,7 @@ from tahmeed.models.user import User
 from tahmeed.ui.accountant.separate_expenses import (
     _ROW_H, _finish_table_row, _stripe_bg, _table_cell_font, _table_style,
 )
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 _BG = "#F4F6F8"
 _WHITE = "#FFFFFF"
@@ -254,6 +255,7 @@ class TrashWidget(QWidget):
         if self._busy:
             return
         self._busy = True
+        show_widget_loading(self, "Loading trash…")
         self._status.setText("Loading…")
         try:
             search = self._search.text().strip()
@@ -272,6 +274,7 @@ class TrashWidget(QWidget):
             self._status.setText(f"Failed to load trash: {exc}")
         finally:
             self._busy = False
+            hide_widget_loading(self)
             self._sync_action_buttons()
 
     def _populate(self, txs: List[Transaction]) -> None:

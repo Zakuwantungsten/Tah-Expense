@@ -16,6 +16,7 @@ from PySide6.QtGui import QFont, QColor, QBrush
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
 from tahmeed.services.cashier_service import get_transactions_by_category
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 # ── Design tokens (match accountant palette) ──────────────────────────────────────
 _WHITE   = "#FFFFFF"
@@ -206,6 +207,8 @@ class CashierCategoryView(QWidget):
         asyncio.ensure_future(self._load())
 
     async def _load(self) -> None:
+        title = getattr(self, "_title", None) or getattr(self, "_name", "category")
+        show_widget_loading(self, f"Loading {title}…")
         try:
             self._rows = await get_transactions_by_category(
                 cashier_id=self._user._id,
@@ -214,6 +217,8 @@ class CashierCategoryView(QWidget):
             )
         except Exception:
             self._rows = []
+        finally:
+            hide_widget_loading(self)
         self._populate()
 
     def _populate(self) -> None:

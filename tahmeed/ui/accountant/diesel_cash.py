@@ -38,6 +38,7 @@ from tahmeed.ui.accountant.separate_expenses import (
 from tahmeed.ui.accountant.feed_sort_helpers import (
     DIESEL_CASH_SORT, wire_feed_table_sort, sort_kw, reset_feed_sort,
 )
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 _MONTH_SHORT = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -388,6 +389,7 @@ class _DieselCashAllEntries(QWidget):
         if self._loading:
             return
         self._loading = True
+        show_widget_loading(self, "Loading diesel cash…")
         try:
             from tahmeed.services.accountant_service import (
                 get_diesel_cash_transactions, count_diesel_cash_transactions,
@@ -417,6 +419,7 @@ class _DieselCashAllEntries(QWidget):
             self._table.setRowCount(0)
             self._page_info.setText(f"Failed to load: {exc}")
         finally:
+            hide_widget_loading(self)
             self._loading = False
 
     def _populate(self, txs: List[Transaction], skip: int) -> None:
@@ -615,6 +618,7 @@ class _DieselCashMonthBrowse(QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services.accountant_service import get_diesel_cash_month_summaries
+        show_widget_loading(self, "Loading months…")
         try:
             summaries = await get_diesel_cash_month_summaries(self._year)
         except Exception as exc:
@@ -622,9 +626,11 @@ class _DieselCashMonthBrowse(QWidget):
             self._all_summaries = []
             self._summaries = []
             self._summary_lbl.setText(f"Failed to load: {exc}")
-            return
-        self._all_summaries = summaries
-        self._apply_filters()
+        else:
+            self._all_summaries = summaries
+            self._apply_filters()
+        finally:
+            hide_widget_loading(self)
 
     def _apply_filters(self) -> None:
         date_from, date_to = self.date_filters()
@@ -953,6 +959,7 @@ class _DieselCashMonthDetail(QWidget):
         if self._loading or not self._month:
             return
         self._loading = True
+        show_widget_loading(self, "Loading month entries…")
         try:
             from tahmeed.services.accountant_service import (
                 get_diesel_cash_transactions, count_diesel_cash_transactions,
@@ -991,6 +998,7 @@ class _DieselCashMonthDetail(QWidget):
             self._table.setRowCount(0)
             self._page_info.setText(f"Failed to load: {exc}")
         finally:
+            hide_widget_loading(self)
             self._loading = False
 
     def _populate(self, txs: List[Transaction], skip: int) -> None:
@@ -1312,6 +1320,7 @@ class _DieselCashItemsConfig(QWidget):
         if self._loading:
             return
         self._loading = True
+        show_widget_loading(self, "Loading items…")
         try:
             from tahmeed.services.accountant_service import get_diesel_cash_item_names
             from tahmeed.services.category_service import get_all_categories
@@ -1347,6 +1356,7 @@ class _DieselCashItemsConfig(QWidget):
                 " background: transparent;"
             )
         finally:
+            hide_widget_loading(self)
             self._loading = False
 
     def _populate(self, rows: List[tuple[str, bool, bool]]) -> None:

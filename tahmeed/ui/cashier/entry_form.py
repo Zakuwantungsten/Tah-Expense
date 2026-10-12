@@ -37,6 +37,7 @@ from tahmeed.ui.dialogs.attachment_dialog import AttachmentDialog
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.cashier.excel_row_header import ExcelRowHeaderView, ROW_HEADER_QSS, sync_row_header_labels
 from tahmeed.ui.widgets.combo_styles import with_combo_popup
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -579,11 +580,14 @@ class EntryForm(QWidget):
 
     async def _refresh_table(self) -> None:
         self._update_day_label()
+        show_widget_loading(self, "Loading day entries…")
         try:
             txs = await get_transactions_by_date(self._selected_date(), cashier_id=self._user._id)
             self._fill_table(txs)
         except Exception:
             pass
+        finally:
+            hide_widget_loading(self)
 
     def _fill_table(self, txs: List[Transaction]) -> None:
         self._day_txs = list(txs)

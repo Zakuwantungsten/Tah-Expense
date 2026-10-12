@@ -67,6 +67,7 @@ from tahmeed.ui.widgets.export_runner import (
 )
 from tahmeed.ui.widgets.split_export_button import make_export_menu_btn
 from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 from tahmeed.ui.accountant.fuel_sort_helpers import diesel_columns_sort
 from tahmeed.ui.accountant.feed_sort_helpers import (
     wire_feed_table_sort, sort_kw, reset_feed_sort, clear_upload_detail_filters,
@@ -1529,8 +1530,10 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
             return
         self._loading = True
         self._update_status()
+        show_widget_loading(self, "Loading fuel records…")
         from tahmeed.services import accountant_service as svc
         month = self._effective_month()
+        ok = False
         try:
             totals, recs, total = await asyncio.gather(
                 svc.get_diesel_all_totals(
@@ -1545,18 +1548,20 @@ class _DieselAllEntries(_DieselExportMixin, QWidget):
                 ),
             )
         except Exception:
-            self._loading = False
             self._status_lbl.setText("Failed to load records.")
-            return
-
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("count", int(totals.get("count", 0) or 0))
-        self._totals.set_total("ltrs", float(totals.get("ltrs", 0) or 0))
-        self._set_amount_total(totals)
-        self._loading = False
-        self._update_status()
+        else:
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("count", int(totals.get("count", 0) or 0))
+            self._totals.set_total("ltrs", float(totals.get("ltrs", 0) or 0))
+            self._set_amount_total(totals)
+            ok = True
+        finally:
+            self._loading = False
+            hide_widget_loading(self)
+            if ok:
+                self._update_status()
 
     async def _load_more(self) -> None:
         if self._loading or self._loaded >= self._total:
@@ -1721,15 +1726,18 @@ class _DieselUploadBrowse(QWidget):
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
+        show_widget_loading(self, "Loading uploads…")
         try:
             uploads = await svc.get_diesel_uploads(self._feed_type)
         except Exception:
             self._uploads = []
             self._table.setRowCount(0)
             self._totals.set_total("count", 0)
-            return
-        self._uploads = uploads
-        self._fill(uploads)
+        else:
+            self._uploads = uploads
+            self._fill(uploads)
+        finally:
+            hide_widget_loading(self)
 
     def _fill(self, uploads: List[dict]) -> None:
         t = self._table
@@ -1951,6 +1959,8 @@ class _DieselUploadDetail(_DieselExportMixin, QWidget):
             return
         self._loading = True
         self._update_status()
+        show_widget_loading(self, "Loading upload records…")
+        ok = False
         try:
             recs, total, totals = await asyncio.gather(
                 svc.get_diesel_upload_records(
@@ -1965,23 +1975,26 @@ class _DieselUploadDetail(_DieselExportMixin, QWidget):
                 ),
             )
         except Exception:
-            self._loading = False
             self._status_lbl.setText("Failed to load records.")
-            return
-        self._total = total
-        self._append_rows(recs)
-        self._loaded = len(recs)
-        self._totals.set_total("count", total)
-        self._totals.set_total("ltrs", float(totals.get("ltrs", 0) or 0))
-        if self._has_amount:
-            amt = float(totals.get("total_amount", 0) or 0)
-            if _lake_zambia_per_upload_currency(self._feed_type):
-                cur = self._currency or "USD"
-                self._totals.set_text("amount", f"{cur} {_fmt_num(amt, decimals=0)}")
-            else:
-                self._totals.set_total("amount", amt)
-        self._loading = False
-        self._update_status()
+        else:
+            self._total = total
+            self._append_rows(recs)
+            self._loaded = len(recs)
+            self._totals.set_total("count", total)
+            self._totals.set_total("ltrs", float(totals.get("ltrs", 0) or 0))
+            if self._has_amount:
+                amt = float(totals.get("total_amount", 0) or 0)
+                if _lake_zambia_per_upload_currency(self._feed_type):
+                    cur = self._currency or "USD"
+                    self._totals.set_text("amount", f"{cur} {_fmt_num(amt, decimals=0)}")
+                else:
+                    self._totals.set_total("amount", amt)
+            ok = True
+        finally:
+            self._loading = False
+            hide_widget_loading(self)
+            if ok:
+                self._update_status()
 
     async def _load_more(self) -> None:
         from tahmeed.services import accountant_service as svc

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from tahmeed.models.user import User
 from tahmeed.services.auth import create_user
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 from tahmeed.services.password_policy import (
     password_placeholder,
     password_policy_errors,
@@ -248,11 +249,14 @@ class UsersTab(QWidget):
         layout.addWidget(self._table)
 
     async def _load(self) -> None:
+        show_widget_loading(self, "Loading users…")
         try:
             self._users = await get_all_users()
             self._refresh()
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to load users:\n{exc}")
+        finally:
+            hide_widget_loading(self)
 
     def _status_color(self, user: User) -> QColor:
         label = user.status_label

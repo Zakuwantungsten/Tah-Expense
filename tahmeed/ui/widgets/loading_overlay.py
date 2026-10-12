@@ -64,3 +64,19 @@ class LoadingOverlay(QFrame):
         self._panel.reset_progress()
         self._panel.stop()
         self.hide()
+
+
+def show_widget_loading(widget: QWidget, message: str = "Loading…") -> LoadingOverlay:
+    """Attach (if needed) and show a branded horse overlay on ``widget``."""
+    overlay = getattr(widget, "_loading_overlay", None)
+    if not isinstance(overlay, LoadingOverlay):
+        overlay = LoadingOverlay(widget, message)
+        widget._loading_overlay = overlay  # type: ignore[attr-defined]
+    overlay.show_loading(message)
+    return overlay
+
+
+def hide_widget_loading(widget: QWidget) -> None:
+    overlay = getattr(widget, "_loading_overlay", None)
+    if isinstance(overlay, LoadingOverlay):
+        overlay.hide_loading()

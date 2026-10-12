@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 _BG = "#F4F6F8"
 _WHITE = "#FFFFFF"
@@ -232,6 +233,7 @@ class CashierTrashWidget(QWidget):
         if self._busy:
             return
         self._busy = True
+        show_widget_loading(self, "Loading trash…")
         self._status.setText("Loading…")
         try:
             search = self._search.text().strip()
@@ -250,6 +252,7 @@ class CashierTrashWidget(QWidget):
             self._status.setText(f"Failed to load trash: {exc}")
         finally:
             self._busy = False
+            hide_widget_loading(self)
             self._sync_action_buttons()
 
     def _populate(self, txs: List[Transaction]) -> None:

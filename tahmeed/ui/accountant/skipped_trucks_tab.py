@@ -38,6 +38,7 @@ from tahmeed.ui.dialog_theme import (
     show_warning,
 )
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 try:
     import openpyxl
@@ -358,22 +359,24 @@ class SkippedTrucksTab(QWidget):
         from tahmeed.services import accountant_service as svc
 
         search = self._search.text().strip()
+        show_widget_loading(self, "Loading skipped trucks…")
         try:
             total = await svc.count_skipped_import_rows(self._feed_key, search)
             self._rows = await svc.list_skipped_import_rows(
                 self._feed_key, search=search, limit=500, skip=0
             )
+            self._fill()
+            selected = self._checked_count()
+            if selected:
+                self._status.setText(
+                    f"{total:,} skipped row(s)  ·  {selected:,} selected"
+                )
+            else:
+                self._status.setText(f"{total:,} skipped row(s)")
         except Exception as exc:
             show_critical(self, "Skipped", str(exc))
-            return
-        self._fill()
-        selected = self._checked_count()
-        if selected:
-            self._status.setText(
-                f"{total:,} skipped row(s)  ·  {selected:,} selected"
-            )
-        else:
-            self._status.setText(f"{total:,} skipped row(s)")
+        finally:
+            hide_widget_loading(self)
 
     def _fill(self) -> None:
         t = self._table

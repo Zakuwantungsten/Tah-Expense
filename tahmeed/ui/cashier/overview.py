@@ -28,6 +28,7 @@ from tahmeed.services.cashier_service import (
     get_overview_charts,
     get_overview_stats,
 )
+from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 # ── Design tokens (aligned with accountant Overview) ─────────────────────────
 _WHITE = "#FFFFFF"
@@ -795,6 +796,7 @@ class CashierOverview(QWidget):
         if self._loading:
             return
         self._loading = True
+        show_widget_loading(self, "Loading overview…")
         try:
             charts, stats = await asyncio.gather(
                 get_overview_charts(self._year),
@@ -809,6 +811,7 @@ class CashierOverview(QWidget):
             pass
         finally:
             self._loading = False
+            hide_widget_loading(self)
 
     def _apply_charts(self, data: dict) -> None:
         self._year = int(data.get("year") or self._year)
