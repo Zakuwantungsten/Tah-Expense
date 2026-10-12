@@ -223,6 +223,14 @@ class SubmitDayRequest(StrictModel):
     date: date
 
 
+class DiscardDraftDayRequest(StrictModel):
+    """Hard-delete every draft row for one register calendar day."""
+
+    date: date
+    cashier_id: str | None = None
+    allow_any_cashier: bool = False
+
+
 class DayOrderRequest(StrictModel):
     date: date
     ordered_ids: list[str] = Field(default_factory=list, max_length=2000)

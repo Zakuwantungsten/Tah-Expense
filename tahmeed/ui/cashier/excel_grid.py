@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer, QEventLoop,
-    QItemSelection, QItemSelectionModel,
+    QItemSelection, QItemSelectionModel, QSettings,
 )
 from PySide6.QtGui import (
     QAction, QKeyEvent, QColor, QBrush, QFont, QPen, QPainter, QMouseEvent, QCursor,
@@ -104,9 +104,35 @@ from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
 
 from tahmeed.ui.cashier.excel_cursors import excel_hover_cursor, excel_drag_cursor
 from tahmeed.ui.cashier.excel_row_header import (
+    DEFAULT_ROW_HEIGHT,
     ExcelRowHeaderView,
+    MIN_ROW_HEIGHT,
     sync_row_header_labels,
 )
+
+_TABLE_FONT_PT_DEFAULT = 11
+_TABLE_FONT_PT_MIN = 8
+_TABLE_FONT_PT_MAX = 18
+_TABLE_FONT_SETTINGS_ORG = "Tahmeed"
+_TABLE_FONT_SETTINGS_APP = "tahmeed-expense"
+_TABLE_FONT_SETTINGS_KEY = "daily_register/table_font_pt"
+
+
+def _load_table_font_pt() -> int:
+    raw = QSettings(_TABLE_FONT_SETTINGS_ORG, _TABLE_FONT_SETTINGS_APP).value(
+        _TABLE_FONT_SETTINGS_KEY, _TABLE_FONT_PT_DEFAULT
+    )
+    try:
+        pt = int(raw)
+    except (TypeError, ValueError):
+        return _TABLE_FONT_PT_DEFAULT
+    return max(_TABLE_FONT_PT_MIN, min(_TABLE_FONT_PT_MAX, pt))
+
+
+def _save_table_font_pt(pt: int) -> None:
+    QSettings(_TABLE_FONT_SETTINGS_ORG, _TABLE_FONT_SETTINGS_APP).setValue(
+        _TABLE_FONT_SETTINGS_KEY, int(pt)
+    )
 
 
 def _amount_item_from_raw(raw: str) -> QTableWidgetItem:
@@ -795,11 +821,14 @@ class DailyRegister(QWidget):
     save_busy_changed = Signal(bool)               # True while Save/Submit is in flight
     # Day-level Cheque for the always-visible header field
     active_cheque_changed = Signal(str, bool)  # cheque, editable
+    # Table text zoom (Larger / Smaller toolbar) — (can_larger, can_smaller)
+    font_size_changed = Signal(bool, bool)
 
     def __init__(self, user: User, categories: List[Category], parent=None):
         super().__init__(parent)
         self._user        = user
         self._categories  = categories
+        self._table_font_pt = _load_table_font_pt()
         self._cat_by_name: dict = {c.name.lower(): c for c in categories}
         self._locked_subitems: dict = {}   # item name (lower) -> [sub-item names]
         self._restrict_items: bool = False
@@ -907,51 +936,6 @@ class DailyRegister(QWidget):
         sno_hdr = self._table.horizontalHeaderItem(COL_SNO)
         if sno_hdr is not None:
             sno_hdr.setTextAlignment(Qt.AlignCenter)
-        self._table.setStyleSheet("""
-            QTableWidget {
-                background: #ffffff;
-                gridline-color: #e5e7eb;
-                border: none;
-                font-family: Calibri;
-                font-size: 11pt;
-                selection-background-color: #cde0f5;
-                selection-color: #1B2B4B;
-            }
-            QHeaderView::section:horizontal {
-                background: #253A5C;
-                color: #F9FAFB;
-                font-weight: 600;
-                font-size: 11px;
-                padding: 5px 4px;
-                border: none;
-                border-right: 1px solid #1B2B4B;
-                border-bottom: 2px solid #0077C5;
-            }
-            QHeaderView::section:vertical {
-                background: #F2F2F2;
-                color: #333333;
-                font-family: Calibri;
-                font-size: 11pt;
-                padding: 0 2px;
-                border: none;
-                border-right: 1px solid #D4D4D4;
-                border-bottom: 1px solid #D4D4D4;
-            }
-            QHeaderView:vertical {
-                background: #ffffff;
-                border: none;
-            }
-            QTableCornerButton::section {
-                background: #F2F2F2;
-                border: none;
-                border-right: 1px solid #D4D4D4;
-                border-bottom: 2px solid #0077C5;
-            }
-            QTableWidget::item         { padding: 2px 3px; color: #111827; }
-            QTableWidget::item:selected { color: #1B2B4B; font-weight: 500; }
-            QLineEdit { color: #111827; background: #ffffff; font-family: Calibri; font-size: 11pt; }
-        """)
-
         hh = self._table.horizontalHeader()
         hh.setSectionsMovable(False)
         hh.setStretchLastSection(False)
@@ -969,6 +953,7 @@ class DailyRegister(QWidget):
 
         self._table.setSelectionMode(QAbstractItemView.ContiguousSelection)
         self._table.setVerticalHeader(ExcelRowHeaderView(self._table, owner=self))
+        self._apply_table_font_size(persist=False, emit=False)
         self._table.setTabKeyNavigation(False)
         sm = self._table.selectionModel()
         sm.selectionChanged.connect(lambda *_: self._table.viewport().update())
@@ -4349,6 +4334,115 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
     # QuickBooks-style toolbar actions
     # ------------------------------------------------------------------
+
+    def _table_stylesheet(self, font_pt: int) -> str:
+        hdr_px = max(9, int(round(11 * font_pt / _TABLE_FONT_PT_DEFAULT)))
+        return f"""
+            QTableWidget {{
+                background: #ffffff;
+                gridline-color: #e5e7eb;
+                border: none;
+                font-family: Calibri;
+                font-size: {font_pt}pt;
+                selection-background-color: #cde0f5;
+                selection-color: #1B2B4B;
+            }}
+            QHeaderView::section:horizontal {{
+                background: #253A5C;
+                color: #F9FAFB;
+                font-weight: 600;
+                font-size: {hdr_px}px;
+                padding: 5px 4px;
+                border: none;
+                border-right: 1px solid #1B2B4B;
+                border-bottom: 2px solid #0077C5;
+            }}
+            QHeaderView::section:vertical {{
+                background: #F2F2F2;
+                color: #333333;
+                font-family: Calibri;
+                font-size: {font_pt}pt;
+                padding: 0 2px;
+                border: none;
+                border-right: 1px solid #D4D4D4;
+                border-bottom: 1px solid #D4D4D4;
+            }}
+            QHeaderView:vertical {{
+                background: #ffffff;
+                border: none;
+            }}
+            QTableCornerButton::section {{
+                background: #F2F2F2;
+                border: none;
+                border-right: 1px solid #D4D4D4;
+                border-bottom: 2px solid #0077C5;
+            }}
+            QTableWidget::item         {{ padding: 2px 3px; color: #111827; }}
+            QTableWidget::item:selected {{ color: #1B2B4B; font-weight: 500; }}
+            QLineEdit {{
+                color: #111827;
+                background: #ffffff;
+                font-family: Calibri;
+                font-size: {font_pt}pt;
+            }}
+            QComboBox {{
+                color: #111827;
+                background: #ffffff;
+                font-family: Calibri;
+                font-size: {font_pt}pt;
+            }}
+        """
+
+    def _row_height_for_font(self, font_pt: int) -> int:
+        scaled = int(round(DEFAULT_ROW_HEIGHT * font_pt / _TABLE_FONT_PT_DEFAULT))
+        return max(MIN_ROW_HEIGHT, scaled)
+
+    def can_increase_font(self) -> bool:
+        return self._table_font_pt < _TABLE_FONT_PT_MAX
+
+    def can_decrease_font(self) -> bool:
+        return self._table_font_pt > _TABLE_FONT_PT_MIN
+
+    def _emit_font_size_state(self) -> None:
+        self.font_size_changed.emit(
+            self.can_increase_font(),
+            self.can_decrease_font(),
+        )
+
+    def _apply_table_font_size(
+        self, *, persist: bool = True, emit: bool = True
+    ) -> None:
+        """Restyle the register grid + row heights for ``_table_font_pt``."""
+        pt = self._table_font_pt
+        font = QFont("Calibri")
+        font.setPointSize(pt)
+        self._table.setFont(font)
+        self._table.setStyleSheet(self._table_stylesheet(pt))
+
+        vh = self._table.verticalHeader()
+        if isinstance(vh, ExcelRowHeaderView):
+            vh.set_font_pt(pt)
+        row_h = self._row_height_for_font(pt)
+        vh.setDefaultSectionSize(row_h)
+        for row in range(self._table.rowCount()):
+            self._table.setRowHeight(row, row_h)
+
+        if persist:
+            _save_table_font_pt(pt)
+        if emit:
+            self._emit_font_size_state()
+
+    def toolbar_font_larger(self) -> None:
+        if not self.can_increase_font():
+            return
+        self._table_font_pt += 1
+        self._apply_table_font_size()
+
+    def toolbar_font_smaller(self) -> None:
+        if not self.can_decrease_font():
+            return
+        self._table_font_pt -= 1
+        self._apply_table_font_size()
 
     def _data_rows(self) -> List[int]:
         """Saved + non-empty editable rows (for Find navigation)."""

@@ -23,6 +23,14 @@ def register(qapp, monkeypatch):
         "tahmeed.ui.cashier.excel_grid.asyncio.ensure_future",
         lambda *_a, **_k: None,
     )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid._load_table_font_pt",
+        lambda: 11,
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid._save_table_font_pt",
+        lambda _pt: None,
+    )
     from tahmeed.ui.cashier.excel_grid import DailyRegister
     from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_ITEM, COL_TZS
     from PySide6.QtCore import Qt

@@ -202,7 +202,7 @@ def test_toolbar_sits_on_search_row() -> None:
         widget._table.horizontalHeaderItem(i).text()
         for i in range(widget._table.columnCount())
     ]
-    assert headers == ["#", "Description", "Item / Supplier", "Payee"]
+    assert headers == ["#", "Description", "Item", "Payee"]
     widget._rows = [
         _mapping("PARKING KURASINI 7TH OCTB", item="Parking", payee="PARKING DAR"),
     ]

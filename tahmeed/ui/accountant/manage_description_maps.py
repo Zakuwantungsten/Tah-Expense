@@ -7,10 +7,10 @@ from typing import List, Optional
 
 import qtawesome as qta
 from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QColor, QFont, QBrush
+from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QCompleter, QDialog, QFrame,
-    QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -18,7 +18,7 @@ from tahmeed.models.category import Category
 from tahmeed.models.description_mapping import DescriptionMapping
 from tahmeed.services.mapping_assignment_service import MappingAssignment
 from tahmeed.ui.accountant.separate_expenses import (
-    _finish_table_row, _stripe_bg, _table_style, _ROW_H,
+    _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
 )
 from tahmeed.ui.dialog_theme import show_critical, show_info, show_warning
 from tahmeed.ui.dialogs.item_dialog import ItemDialog
@@ -91,7 +91,7 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
           bg: str = "") -> QTableWidgetItem:
     item = QTableWidgetItem(str(text) if text is not None else "—")
     item.setTextAlignment(align)
-    item.setFont(QFont("Segoe UI", 11))
+    item.setFont(_table_cell_font())
     if bg:
         item.setBackground(QBrush(QColor(bg)))
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -479,6 +479,7 @@ class DescriptionMapsWidget(QWidget):
         root.setContentsMargins(24, 20, 24, 20)
         root.setSpacing(16)
 
+        # Header — same chrome as Payees / People: title + count + primary Add.
         hdr = QHBoxLayout()
         hdr.setSpacing(10)
         try:
@@ -500,18 +501,25 @@ class DescriptionMapsWidget(QWidget):
         )
         hdr.addWidget(self._count_chip)
         hdr.addStretch()
+
         hint = _lbl(
             "Select rows to re-assign or delete · right-click for more",
             size=11, color=_TM,
         )
         hdr.addWidget(hint)
+
+        add_btn = _btn("+ Add Mapping", primary=True, height=32)
+        add_btn.clicked.connect(self._add_mapping)
+        hdr.addWidget(add_btn)
         root.addLayout(hdr)
 
+        # Toolbar — search + bulk actions (Maps-specific; Payees uses filter combo).
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search by description, payee, or item…")
         self._search.setFixedHeight(32)
+        self._search.setClearButtonEnabled(True)
         self._search.setStyleSheet(
             f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
@@ -544,10 +552,6 @@ class DescriptionMapsWidget(QWidget):
         clear_btn.setToolTip("Delete every description → Payee + Item mapping")
         clear_btn.clicked.connect(self._confirm_clear_all)
         toolbar.addWidget(clear_btn)
-
-        add_btn = _btn("+ Add Mapping", primary=True, height=32)
-        add_btn.clicked.connect(self._add_mapping)
-        toolbar.addWidget(add_btn)
         root.addLayout(toolbar)
 
         self._table_host = QFrame()
@@ -560,12 +564,13 @@ class DescriptionMapsWidget(QWidget):
 
         self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(
-            ["#", "Description", "Item / Supplier", "Payee"]
+            ["#", "Description", "Item", "Payee"]
         )
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._table.setAlternatingRowColors(False)
+        self._table.setShowGrid(True)
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
         self._table.setStyleSheet(_table_style())
@@ -581,7 +586,11 @@ class DescriptionMapsWidget(QWidget):
         hdr_view.setMinimumSectionSize(48)
         for i, width in enumerate(_COL_DEFAULTS):
             self._table.setColumnWidth(i, width)
-        # Stretch description; keep Item + Payee readable (not scrolled away).
+            if i == _COL_DESC:
+                hdr_view.setSectionResizeMode(i, QHeaderView.Stretch)
+            else:
+                hdr_view.setSectionResizeMode(i, QHeaderView.Interactive)
+        # Stretch Description; keep Item + Payee readable (not scrolled away).
         bind_column_width_persistence(
             self._table,
             "description_maps_desc_item_payee",
@@ -593,9 +602,23 @@ class DescriptionMapsWidget(QWidget):
 
         self._loading_overlay = LoadingOverlay(self._table_host, "Loading…")
 
-        self._footer = _lbl("", size=11, color=_TM)
-        self._footer.setAlignment(Qt.AlignCenter)
-        root.addWidget(self._footer)
+        # Status bar — same frame chrome as Payees pager (scroll-load, no Prev/Next).
+        status_bar = QFrame()
+        status_bar.setFixedHeight(44)
+        status_bar.setStyleSheet(
+            f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};border-radius:6px;}}"
+        )
+        sl = QHBoxLayout(status_bar)
+        sl.setContentsMargins(12, 0, 12, 0)
+        sl.setSpacing(10)
+        self._footer = _lbl("", size=12, color=_T2)
+        sl.addWidget(self._footer, 1)
+        tip = _lbl(
+            "Maps apply Payee + Item to matching open register rows.",
+            size=11, color=_TM,
+        )
+        sl.addWidget(tip)
+        root.addWidget(status_bar)
 
     def refresh(self) -> None:
         self._reset_and_load()

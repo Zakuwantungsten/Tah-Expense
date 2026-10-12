@@ -53,19 +53,23 @@ _RECEIPT_MAP = {
     "missing":  ("No Receipt", _RED,   _RED_L),
 }
 
+_CELL_FONT_PX = 10
+_ROW_H = 24
+_HDR_H = 22
+
 _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE}; gridline-color: {_BORDER};"
-    f"  font-size: 12px; font-family: 'Segoe UI', sans-serif;"
+    f"  font-size: {_CELL_FONT_PX}px; font-family: 'Segoe UI', sans-serif;"
     f"  color: {_T1}; border: none;"
     f"  selection-background-color: #DBEAFE; selection-color: {_T1};"
     f"}}"
-    f"QTableWidget::item {{ padding: 2px 6px; border: none; }}"
+    f"QTableWidget::item {{ padding: 1px 6px; border: none; }}"
     f"QHeaderView::section {{"
     f"  background: {_HDR_BG}; color: {_T2};"
-    f"  font-size: 11px; font-weight: 600; font-family: 'Segoe UI', sans-serif;"
-    f"  border: none; border-bottom: 2px solid {_BORDER};"
-    f"  border-right: 1px solid {_BORDER}; padding: 0 6px; min-height: 30px;"
+    f"  font-size: 9px; font-weight: 600; font-family: 'Segoe UI', sans-serif;"
+    f"  border: none; border-bottom: 1px solid {_BORDER};"
+    f"  border-right: 1px solid {_BORDER}; padding: 0 6px; min-height: {_HDR_H}px;"
     f"}}"
     f"QHeaderView::section:hover {{ background: #E2E8F0; }}"
     f"QScrollBar:horizontal {{ background: {_BG}; height: 8px; margin: 0; }}"
@@ -174,7 +178,7 @@ class CashierCategoryView(QWidget):
         for i, (_, w, _align) in enumerate(_COLS):
             self._table.setColumnWidth(i, w)
         hdr.setSectionResizeMode(3, QHeaderView.Stretch)
-        self._table.verticalHeader().setDefaultSectionSize(34)
+        self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
         root.addWidget(self._table, 1)
 
         # ── Footer ────────────────────────────────────────────────────────────
@@ -226,7 +230,10 @@ class CashierCategoryView(QWidget):
                 it.setTextAlignment(align)
                 it.setBackground(QBrush(bg))
                 if mono:
-                    it.setFont(QFont("Consolas", 11))
+                    f = QFont("Consolas")
+                    f.setStyleHint(QFont.Monospace)
+                    f.setPixelSize(_CELL_FONT_PX)
+                    it.setFont(f)
                 return it
 
             self._table.setItem(r, 0, _cell(str(r + 1), Qt.AlignCenter | Qt.AlignVCenter))

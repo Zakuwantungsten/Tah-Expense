@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from bson import ObjectId
 from PySide6.QtCore import Qt, Signal
@@ -19,21 +19,29 @@ from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
 from tahmeed.services.cashier_service import (
     count_draft_transactions,
+    discard_draft_day,
     discard_draft_transactions,
     get_draft_day_summaries,
     get_draft_transactions,
     submit_day_for_verify,
 )
 from tahmeed.services.accountant_service import get_cashier_names
+from tahmeed.ui.accountant.separate_expenses import (
+    _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
+)
 from tahmeed.ui.widgets.column_persistence import (
     apply_pending_column_autofit,
     bind_column_width_persistence,
 )
 
-_DAYS_COL_DEFAULTS = [110, 72, 120, 180]
-_ROWS_COL_DEFAULTS = [280, 100, 90, 110, 100, 52]
-_DAYS_COL_KEY = "drafts_days_table"
-_ROWS_COL_KEY = "drafts_rows_table"
+# Date | Entries | Total | Cashiers — Cashiers stretch
+_DAYS_COL_DEFAULTS = [110, 72, 120, 160]
+_DAYS_COL_CASHIERS = 3
+# Description | Item | Truck | Amount | Cashier | Dup? — Description stretches
+_ROWS_COL_DEFAULTS = [220, 110, 90, 120, 100, 52]
+_ROWS_COL_DESC = 0
+_DAYS_COL_KEY = "drafts_days_table_v2"
+_ROWS_COL_KEY = "drafts_rows_table_v2"
 
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -43,7 +51,39 @@ _GOLD = "#B18E5E"
 _T1 = "#111827"
 _T2 = "#6B7280"
 _AMBER = "#B45309"
-_HDR_BG = "#FFFBEB"
+_DRAFT_ROW = "#FFFBEB"
+
+
+def should_discard_whole_day(
+    *,
+    selected_row_ids: Sequence[ObjectId],
+    day_row_ids: Sequence[ObjectId],
+) -> bool:
+    """True when no rows are selected, or every loaded day row is selected.
+
+    Qt often auto-selects the first detail row after a day loads, which used to
+    make "discard" delete only that one ID. Empty or full selection means the
+    whole draft day.
+    """
+    if not day_row_ids:
+        return False
+    if not selected_row_ids:
+        return True
+    return set(selected_row_ids) >= set(day_row_ids)
+
+
+def discard_target_ids(
+    *,
+    selected_row_ids: Sequence[ObjectId],
+    day_row_ids: Sequence[ObjectId],
+) -> List[ObjectId]:
+    """IDs to delete for a partial discard (subset of day rows)."""
+    if should_discard_whole_day(
+        selected_row_ids=selected_row_ids,
+        day_row_ids=day_row_ids,
+    ):
+        return list(day_row_ids)
+    return list(selected_row_ids)
 
 
 def _lbl(text: str = "", *, size: int = 13, weight: int = 400, color: str = _T1) -> QLabel:
@@ -95,6 +135,7 @@ def _cell(text: object, *, align=Qt.AlignLeft | Qt.AlignVCenter) -> QTableWidget
     item = QTableWidgetItem("" if text is None else str(text))
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
     item.setTextAlignment(align)
+    item.setFont(_table_cell_font())
     return item
 
 
@@ -141,7 +182,10 @@ class DraftsView(QWidget):
         self._btn_open.clicked.connect(self._on_open_register)
         self._btn_submit = _tool_btn("Submit day", gold=True)
         self._btn_submit.clicked.connect(self._on_submit_day)
-        self._btn_discard = _tool_btn("Discard selected", danger=True)
+        self._btn_discard = _tool_btn("Discard draft", danger=True)
+        self._btn_discard.setToolTip(
+            "Discard selected rows, or the whole day's draft when no rows are selected."
+        )
         self._btn_discard.clicked.connect(self._on_discard)
         for b in (self._btn_refresh, self._btn_open, self._btn_submit, self._btn_discard):
             hl.addWidget(b)
@@ -160,18 +204,27 @@ class DraftsView(QWidget):
         self._days_table = QTableWidget(0, 4)
         self._days_table.setHorizontalHeaderLabels(["Date", "Entries", "Total TZS", "Cashiers"])
         self._days_table.verticalHeader().setVisible(False)
+        self._days_table.verticalHeader().setDefaultSectionSize(_ROW_H)
+        self._days_table.setStyleSheet(_table_style())
         self._days_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._days_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._days_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._days_table.setShowGrid(True)
         days_hdr = self._days_table.horizontalHeader()
         days_hdr.setStretchLastSection(False)
         days_hdr.setSectionsMovable(False)
+        days_hdr.setMinimumSectionSize(48)
         for col in range(self._days_table.columnCount()):
-            days_hdr.setSectionResizeMode(col, QHeaderView.Interactive)
+            self._days_table.setColumnWidth(col, _DAYS_COL_DEFAULTS[col])
+            if col == _DAYS_COL_CASHIERS:
+                days_hdr.setSectionResizeMode(col, QHeaderView.Stretch)
+            else:
+                days_hdr.setSectionResizeMode(col, QHeaderView.Interactive)
         bind_column_width_persistence(
             self._days_table,
             _DAYS_COL_KEY,
             _DAYS_COL_DEFAULTS,
+            stretch_columns=(_DAYS_COL_CASHIERS,),
             auto_fit_if_unset=True,
         )
         self._days_table.itemSelectionChanged.connect(self._on_day_selected)
@@ -190,24 +243,35 @@ class DraftsView(QWidget):
             "Description", "Item", "Truck", "Amount", "Cashier", "Dup?",
         ])
         self._rows_table.verticalHeader().setVisible(False)
+        self._rows_table.verticalHeader().setDefaultSectionSize(_ROW_H)
+        self._rows_table.setStyleSheet(_table_style())
         self._rows_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._rows_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._rows_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._rows_table.setShowGrid(True)
         rows_hdr = self._rows_table.horizontalHeader()
         rows_hdr.setStretchLastSection(False)
         rows_hdr.setSectionsMovable(False)
+        rows_hdr.setMinimumSectionSize(48)
         for col in range(self._rows_table.columnCount()):
-            rows_hdr.setSectionResizeMode(col, QHeaderView.Interactive)
+            self._rows_table.setColumnWidth(col, _ROWS_COL_DEFAULTS[col])
+            if col == _ROWS_COL_DESC:
+                rows_hdr.setSectionResizeMode(col, QHeaderView.Stretch)
+            else:
+                rows_hdr.setSectionResizeMode(col, QHeaderView.Interactive)
         bind_column_width_persistence(
             self._rows_table,
             _ROWS_COL_KEY,
             _ROWS_COL_DEFAULTS,
+            stretch_columns=(_ROWS_COL_DESC,),
             auto_fit_if_unset=True,
         )
+        self._rows_table.itemSelectionChanged.connect(self._sync_discard_label)
         right_vl.addWidget(self._rows_table, 1)
 
         hint = _lbl(
-            "Orange rows on the Daily Register are drafts. Submit sends the whole day to Verify.",
+            "Select a day to work the whole draft. Discard with no row selected "
+            "removes every draft entry for that day; select rows to discard only those.",
             size=11, color=_AMBER,
         )
         hint.setWordWrap(True)
@@ -220,6 +284,7 @@ class DraftsView(QWidget):
         root.addWidget(split, 1)
 
         self.setStyleSheet(f"background:{_BG};")
+        self._sync_discard_label()
 
     def refresh(self) -> None:
         from tahmeed.ui.async_utils import schedule_coro
@@ -267,8 +332,10 @@ class DraftsView(QWidget):
             self._days_table.setItem(i, 2, _cell(f"TZS {tzs:,.0f}" if tzs else "—"))
             self._days_table.setItem(i, 3, _cell(cashiers))
             self._days_table.item(i, 0).setData(Qt.UserRole, day)
+            _finish_table_row(self._days_table, i, _stripe_bg(i))
 
         apply_pending_column_autofit(self._days_table)
+        self._sync_discard_label()
 
     def _on_day_selected(self) -> None:
         items = self._days_table.selectedItems()
@@ -278,6 +345,7 @@ class DraftsView(QWidget):
         if not isinstance(day, date):
             return
         self._selected_day = day
+        self._sync_discard_label()
         asyncio.ensure_future(self._load_rows(day))
 
     async def _load_rows(self, day: date) -> None:
@@ -326,9 +394,18 @@ class DraftsView(QWidget):
             self._rows_table.setItem(i, 5, _cell(dup, align=Qt.AlignCenter))
             for col in range(6):
                 self._rows_table.item(i, col).setData(Qt.UserRole, tx._id)
-                self._rows_table.item(i, col).setBackground(QBrush(QColor(_HDR_BG)))
+            # Soft amber tint keeps drafts recognizable without fighting density chrome.
+            bg = _DRAFT_ROW if i % 2 == 0 else "#FEF3C7"
+            _finish_table_row(self._rows_table, i, bg)
 
         apply_pending_column_autofit(self._rows_table)
+        # Avoid Qt leaving the first detail row selected after a day load —
+        # that made Discard delete only one row instead of the whole day.
+        self._rows_table.clearSelection()
+        sm = self._rows_table.selectionModel()
+        if sm is not None:
+            sm.clearCurrentIndex()
+        self._sync_discard_label()
 
     def _selected_row_ids(self) -> List[ObjectId]:
         rows = sorted({idx.row() for idx in self._rows_table.selectedIndexes()})
@@ -340,6 +417,25 @@ class DraftsView(QWidget):
             if oid is not None:
                 ids.append(oid)
         return ids
+
+    def _day_row_ids(self) -> List[ObjectId]:
+        return [tx._id for tx in self._rows if tx._id is not None]
+
+    def _sync_discard_label(self) -> None:
+        selected = self._selected_row_ids()
+        day_ids = self._day_row_ids()
+        if self._selected_day is not None and should_discard_whole_day(
+            selected_row_ids=selected,
+            day_row_ids=day_ids,
+        ):
+            self._btn_discard.setText("Discard whole day")
+        elif selected:
+            n = len(selected)
+            self._btn_discard.setText(
+                f"Discard {n} row{'s' if n != 1 else ''}"
+            )
+        else:
+            self._btn_discard.setText("Discard draft")
 
     def _on_open_register(self) -> None:
         if self._selected_day is None:
@@ -412,23 +508,97 @@ class DraftsView(QWidget):
             QMessageBox.critical(self, "Submit Failed", str(exc))
 
     def _on_discard(self) -> None:
-        ids = self._selected_row_ids()
+        selected = self._selected_row_ids()
+        day_ids = self._day_row_ids()
+        whole_day = should_discard_whole_day(
+            selected_row_ids=selected,
+            day_row_ids=day_ids,
+        )
+        if whole_day:
+            if self._selected_day is None:
+                QMessageBox.information(
+                    self, "Discard",
+                    "Select a draft day to discard the whole day.",
+                )
+                return
+            n = len(day_ids) or int(
+                next(
+                    (
+                        d.get("entries_count") or 0
+                        for d in self._days
+                        if d.get("date") == self._selected_day
+                    ),
+                    0,
+                )
+            )
+            label = self._selected_day.strftime("%d %b %Y")
+            msg = (
+                f"Permanently delete the whole draft for {label}"
+                + (f" ({n} entr{'y' if n == 1 else 'ies'})" if n else "")
+                + "?\n\nThis cannot be undone."
+            )
+            resp = QMessageBox.warning(
+                self, "Discard drafts",
+                msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if resp != QMessageBox.Yes:
+                return
+            asyncio.ensure_future(self._do_discard_day(self._selected_day))
+            return
+
+        ids = discard_target_ids(
+            selected_row_ids=selected,
+            day_row_ids=day_ids,
+        )
         if not ids:
-            QMessageBox.information(self, "Discard", "Select one or more draft rows to discard.")
+            QMessageBox.information(
+                self, "Discard",
+                "Select a draft day (to discard the whole day) or one or more rows.",
+            )
             return
         n = len(ids)
+        msg = (
+            f"Permanently delete {n} draft entr{'y' if n == 1 else 'ies'}?\n\n"
+            "This cannot be undone."
+        )
         resp = QMessageBox.warning(
             self, "Discard drafts",
-            f"Permanently delete {n} draft entr{'y' if n == 1 else 'ies'}?\n\n"
-            "This cannot be undone.",
+            msg,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if resp != QMessageBox.Yes:
             return
-        asyncio.ensure_future(self._do_discard(ids))
+        asyncio.ensure_future(self._do_discard_ids(ids))
 
-    async def _do_discard(self, ids: List[ObjectId]) -> None:
+    async def _do_discard_day(self, day: date) -> None:
+        try:
+            role = getattr(self._user, "role", "") or ""
+            allow_any = self._show_all and role in ("admin", "accountant")
+            n = await discard_draft_day(
+                day,
+                self._user._id,
+                allow_any_cashier=allow_any,
+            )
+            if n == 0:
+                QMessageBox.warning(
+                    self, "Discard",
+                    "No rows were discarded. You may only discard your own drafts.",
+                )
+                return
+            QMessageBox.information(
+                self, "Discarded",
+                f"Deleted {n:,} draft entr{'y' if n == 1 else 'ies'} for "
+                f"{day.strftime('%d %b %Y')}.",
+            )
+            self.drafts_changed.emit()
+            await self._load_days()
+        except Exception as exc:
+            QMessageBox.critical(self, "Discard Failed", str(exc))
+
+    async def _do_discard_ids(self, ids: List[ObjectId]) -> None:
         try:
             role = getattr(self._user, "role", "") or ""
             allow_any = self._show_all and role in ("admin", "accountant")

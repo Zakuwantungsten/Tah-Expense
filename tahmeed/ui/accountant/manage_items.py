@@ -68,23 +68,24 @@ _AMBER   = "#D97706"
 _AMBER_L = "#FEF3C7"
 _BLUE_L  = "#E8F4FD"   # row selection highlight (matches SM Burhani Bonds)
 _STRIPE  = "#F1F5F9"   # subtle slate zebra stripe (matches SM Burhani Bonds)
-_ROW_H   = 32
-_HDR_H   = 28
+_ROW_H   = 24
+_HDR_H   = 22
+_CELL_FONT_PX = 10
 _PAGE_SIZE = 100
 
 _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE}; gridline-color: {_BORDER};"
-    f"  font-size: 11px; font-family:'Segoe UI';"
+    f"  font-size: {_CELL_FONT_PX}px; font-family:'Segoe UI';"
     f"  color: {_T1}; border: none;"
     f"}}"
-    f"QTableWidget::item {{ padding: 2px 8px; border: none; }}"
+    f"QTableWidget::item {{ padding: 1px 6px; border: none; }}"
     f"QTableWidget::item:selected {{ background: {_BLUE_L}; color: {_T1}; }}"
     f"QHeaderView::section {{"
     f"  background: {_HDR_BG}; color: {_T2};"
-    f"  font-size: 10px; font-weight: 600; font-family:'Segoe UI';"
+    f"  font-size: 9px; font-weight: 600; font-family:'Segoe UI';"
     f"  border: none; border-bottom: 1px solid {_BORDER};"
-    f"  padding: 0 8px; min-height: {_HDR_H}px;"
+    f"  padding: 0 6px; min-height: {_HDR_H}px;"
     f"}}"
     f"QHeaderView::section:hover {{ background: #E2E8F0; }}"
     f"QScrollBar:vertical {{ background: {_BG}; width: 8px; margin: 0; }}"
@@ -94,9 +95,9 @@ _TABLE_SS = (
 
 
 def _item_table_font(*, bold: bool = False, italic: bool = False) -> QFont:
-    """Uniform 11px cell font — matches the Description column (CSS px, not pt)."""
+    """Uniform cell font in CSS pixels (matches ``_TABLE_SS``)."""
     f = QFont("Segoe UI")
-    f.setPixelSize(11)
+    f.setPixelSize(_CELL_FONT_PX)
     f.setBold(bold)
     f.setItalic(italic)
     return f

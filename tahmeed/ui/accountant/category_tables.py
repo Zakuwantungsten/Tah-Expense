@@ -79,8 +79,9 @@ _TM         = "#9CA3AF"
 _HDR_BG     = "#F1F5F9"
 
 _SCROLL_CHUNK = 50
-_ROW_H        = 28
-_HDR_H      = 28
+_ROW_H        = 24
+_HDR_H        = 22
+_CELL_FONT_PX = 10
 
 # (label, pixel width, right-aligned?, mono?)
 _COLS = [
@@ -133,16 +134,16 @@ _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE};"
     f"  gridline-color: {_BORDER};"
-    f"  font-size: 11px; font-family:'Segoe UI';"
+    f"  font-size: {_CELL_FONT_PX}px; font-family:'Segoe UI';"
     f"  color: {_T1}; border: none;"
     f"}}"
-    f"QTableWidget::item {{ padding: 2px 8px; border: none; }}"
+    f"QTableWidget::item {{ padding: 1px 6px; border: none; }}"
     f"QTableWidget::item:selected {{ background: {_BLUE_L}; color: {_T1}; }}"
     f"QHeaderView::section {{"
     f"  background: {_HDR_BG}; color: {_T2};"
-    f"  font-size: 10px; font-weight: 600; font-family:'Segoe UI';"
+    f"  font-size: 9px; font-weight: 600; font-family:'Segoe UI';"
     f"  border: none; border-bottom: 1px solid {_BORDER};"
-    f"  border-right: 1px solid {_BORDER}; padding: 0 8px; min-height: {_HDR_H}px;"
+    f"  border-right: 1px solid {_BORDER}; padding: 0 6px; min-height: {_HDR_H}px;"
     f"}}"
     f"QHeaderView::section:hover {{ background: #E2E8F0; }}"
     f"QScrollBar:horizontal {{ background: {_BG}; height: 8px; margin: 0; }}"
@@ -215,8 +216,9 @@ def _set_cell(table: QTableWidget, row: int, col: int, text: str,
     item.setForeground(QBrush(QColor(color)))
     item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
     if mono:
-        f = QFont("Cascadia Code", 11)
+        f = QFont("Cascadia Code")
         f.setStyleHint(QFont.Monospace)
+        f.setPixelSize(_CELL_FONT_PX)
         item.setFont(f)
     table.setItem(row, col, item)
 

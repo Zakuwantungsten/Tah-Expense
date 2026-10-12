@@ -16,6 +16,7 @@ from .errors import ApiError
 from .schemas import (
     BulkIdsRequest,
     DayOrderRequest,
+    DiscardDraftDayRequest,
     DuplicateCheckRequest,
     PendingEditRequest,
     RequestDeleteBody,
@@ -1067,6 +1068,32 @@ async def discard_draft_transactions(
         details={"deleted": int(result.deleted_count)},
     )
     return {"deleted": int(result.deleted_count)}
+
+
+@transactions.post("/drafts/discard-day")
+async def discard_draft_day(
+    body: DiscardDraftDayRequest, request: Request, actor: RegisterActor
+) -> dict:
+    """Hard-delete all draft rows for a register day (not just selected IDs)."""
+    query: dict[str, Any] = {
+        **register_day_clause(body.date),
+        **DRAFT_BASE_MATCH,
+    }
+    if not body.allow_any_cashier:
+        query["cashier_id"] = _actor_cashier_id(actor, body.cashier_id)
+    db = _database(request)
+    result = await db.transactions.delete_many(query)
+    deleted = int(result.deleted_count)
+    await record_operation_event(
+        db,
+        action="txn.draft_discard_day",
+        actor=actor,
+        request=request,
+        entity_type="register_day",
+        entity_ids=[body.date.isoformat()],
+        details={"deleted": deleted, "date": body.date.isoformat()},
+    )
+    return {"deleted": deleted}
 
 
 @transactions.post("/submit-day")

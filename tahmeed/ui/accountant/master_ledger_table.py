@@ -112,11 +112,15 @@ _RECEIPT_MAP = {
     "no_receipt": ("No Receipt", _RED),
 }
 
+_CELL_FONT_PX = 10
+_HDR_H = 22
+_ROW_H = 24
+
 _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE};"
     f"  gridline-color: {_BORDER};"
-    f"  font-size: 11px;"
+    f"  font-size: {_CELL_FONT_PX}px;"
     f"  font-family:'Segoe UI';"
     f"  color: {_T1};"
     f"  border: none;"
@@ -124,19 +128,19 @@ _TABLE_SS = (
     f"  selection-color: #1B2B4B;"
     f"}}"
     f"QTableWidget::item {{"
-    f"  padding: 2px 8px;"
+    f"  padding: 1px 6px;"
     f"  border: none;"
     f"}}"
     f"QHeaderView::section {{"
     f"  background: {_HDR_BG};"
     f"  color: {_T2};"
-    f"  font-size: 10px;"
+    f"  font-size: 9px;"
     f"  font-weight: 600;"
     f"  font-family:'Segoe UI';"
     f"  border: none;"
     f"  border-bottom: 1px solid {_BORDER};"
-    f"  padding: 0 18px 0 8px;"
-    f"  min-height: 28px;"
+    f"  padding: 0 18px 0 6px;"
+    f"  min-height: {_HDR_H}px;"
     f"}}"
     f"QHeaderView::section:hover {{ background: #E2E8F0; }}"
     f"QScrollBar:vertical {{"

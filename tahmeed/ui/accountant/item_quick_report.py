@@ -47,7 +47,9 @@ _TM = "#9CA3AF"
 _HDR_BG = "#F1F5F9"
 _STRIPE = "#F1F5F9"
 _BLUE_L = "#E8F4FD"
-_ROW_H = 28
+_ROW_H = 24
+_HDR_H = 22
+_CELL_FONT_PX = 10
 _PAGE_SIZE = 100
 
 # Master Expenses columns (no running Balance on this tab)
@@ -96,17 +98,17 @@ _RECEIPT_LABELS = {
 _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE}; gridline-color: {_BORDER};"
-    f"  font-size: 11px; font-family:'Segoe UI';"
+    f"  font-size: {_CELL_FONT_PX}px; font-family:'Segoe UI';"
     f"  color: {_T1}; border: 1px solid {_BORDER};"
     f"}}"
-    f"QTableWidget::item {{ padding: 2px 8px; border: none; }}"
+    f"QTableWidget::item {{ padding: 1px 6px; border: none; }}"
     f"QTableWidget::item:selected {{ background: {_BLUE_L}; color: {_T1}; }}"
     f"QHeaderView::section {{"
     f"  background: {_HDR_BG}; color: {_T2};"
-    f"  font-size: 10px; font-weight: 600; font-family:'Segoe UI';"
+    f"  font-size: 9px; font-weight: 600; font-family:'Segoe UI';"
     f"  border: none; border-bottom: 1px solid {_BORDER};"
     f"  border-right: 1px solid {_BORDER};"
-    f"  padding: 0 18px 0 8px; min-height: 28px;"
+    f"  padding: 0 18px 0 6px; min-height: {_HDR_H}px;"
     f"}}"
     f"QHeaderView::section:hover {{ background: #E2E8F0; }}"
     f"QScrollBar:vertical {{ background: {_BG}; width: 8px; margin: 0; }}"
@@ -138,7 +140,7 @@ def _cell_font(*, mono: bool = False, bold: bool = False) -> QFont:
     f = QFont("Cascadia Code" if mono else "Segoe UI")
     if mono:
         f.setStyleHint(QFont.Monospace)
-    f.setPixelSize(11)
+    f.setPixelSize(_CELL_FONT_PX)
     f.setBold(bold)
     return f
 

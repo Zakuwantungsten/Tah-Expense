@@ -11,7 +11,7 @@ from typing import List, Optional
 
 import qtawesome as qta
 from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QColor, QFont, QBrush
+from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from tahmeed.ui.accountant.separate_expenses import (
-    _finish_table_row, _stripe_bg, _table_style, _ROW_H,
+    _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
 )
 from tahmeed.ui.async_utils import pause_background_polls, schedule_call, schedule_coro
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
@@ -87,7 +87,7 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
           bg: str = "") -> QTableWidgetItem:
     item = QTableWidgetItem(str(text) if text is not None else "—")
     item.setTextAlignment(align)
-    item.setFont(QFont("Segoe UI", 11))
+    item.setFont(_table_cell_font())
     if bg:
         item.setBackground(QBrush(QColor(bg)))
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)

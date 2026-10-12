@@ -1043,6 +1043,25 @@ async def discard_draft_transactions(
     return int(payload.get("deleted") or 0)
 
 
+async def discard_draft_day(
+    register_date: date,
+    actor_id: ObjectId,
+    *,
+    allow_any_cashier: bool = False,
+) -> int:
+    """Hard-delete every draft row for one register calendar day."""
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/drafts/discard-day",
+        json={
+            "date": register_date.isoformat(),
+            "cashier_id": str(actor_id),
+            "allow_any_cashier": allow_any_cashier,
+        },
+    )
+    return int(payload.get("deleted") or 0)
+
+
 async def insert_pending_edit(
     original_tx_id: ObjectId,
     updates: dict,

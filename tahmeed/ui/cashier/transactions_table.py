@@ -63,14 +63,15 @@ QPushButton:disabled { background: #93C5FD; border-color: #93C5FD; }
 _TABLE_SS = """
 QTableWidget {
     background: #ffffff; gridline-color: #e5e7eb; border: none;
+    font-size: 10px; font-family: 'Segoe UI';
     selection-background-color: #E8F4FD; selection-color: #111827;
 }
 QHeaderView::section {
-    background: #f1f5f9; color: #334155; font-weight: 600; font-size: 11px;
-    padding: 5px 8px; border: none;
-    border-right: 1px solid #cbd5e1; border-bottom: 2px solid #cbd5e1;
+    background: #f1f5f9; color: #334155; font-weight: 600; font-size: 9px;
+    padding: 0 6px; border: none; min-height: 22px;
+    border-right: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1;
 }
-QTableWidget::item { padding: 2px 8px; color: #111827; }
+QTableWidget::item { padding: 1px 6px; color: #111827; }
 QTableWidget::item:alternate { background: #f8fafc; }
 """
 
@@ -421,7 +422,7 @@ class TransactionBrowser(QWidget):
         t.verticalHeader().setVisible(False)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        t.verticalHeader().setDefaultSectionSize(32)
+        t.verticalHeader().setDefaultSectionSize(24)
         t.itemSelectionChanged.connect(self._on_selection_changed)
         t.doubleClicked.connect(self._on_open_upload)
         return t
@@ -449,7 +450,7 @@ class TransactionBrowser(QWidget):
         t.verticalHeader().setVisible(False)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        t.verticalHeader().setDefaultSectionSize(30)
+        t.verticalHeader().setDefaultSectionSize(24)
         t.doubleClicked.connect(self._on_go_to)
         t.itemSelectionChanged.connect(self._on_selection_changed)
         return t
@@ -484,7 +485,7 @@ class TransactionBrowser(QWidget):
         t.verticalHeader().setVisible(False)
         t.setSelectionBehavior(QAbstractItemView.SelectRows)
         t.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        t.verticalHeader().setDefaultSectionSize(28)
+        t.verticalHeader().setDefaultSectionSize(24)
         t.doubleClicked.connect(self._on_go_to)
         t.itemSelectionChanged.connect(self._on_selection_changed)
         return t

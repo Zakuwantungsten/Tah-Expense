@@ -13,11 +13,11 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import qtawesome as qta
 from bson import ObjectId
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont, QBrush
+from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QCompleter, QDialog, QFrame,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QStyledItemDelegate,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter, QDialog,
+    QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QStyledItemDelegate,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
     QDateEdit,
 )
@@ -48,9 +48,17 @@ from tahmeed.services.mapping_assignment_service import (
 from tahmeed.services.payee_service import get_payee_names
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
-    _finish_table_row, _stripe_bg, _table_style, _ROW_H,
+    _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
 )
 from tahmeed.ui.dialogs.item_dialog import ItemDialog
+from tahmeed.ui.widgets.column_persistence import (
+    apply_pending_column_autofit,
+    bind_column_width_persistence,
+)
+from tahmeed.ui.widgets.combo_styles import with_combo_popup
+from tahmeed.ui.widgets.excel_column_filter import (
+    ExcelFilterHeaderView, SORT_DESC,
+)
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 _WHITE   = "#FFFFFF"
@@ -95,6 +103,44 @@ def filter_day_issues(
             continue
         out.append(issue)
     return out
+
+
+def resolve_value_filter_selection(
+    selected_keys: set,
+    all_keys: set,
+) -> Optional[set]:
+    """Normalize dialog selection: None = show all (no filter)."""
+    if not selected_keys or selected_keys >= all_keys:
+        return None
+    return set(selected_keys)
+
+
+def value_filter_from_descriptions(
+    selected_descriptions: set,
+    issues: Sequence[DayIssue],
+) -> Optional[set]:
+    """Map Excel ▾ display descriptions → description_keys (or None = all)."""
+    by_desc = {i.description: i.description_key for i in issues}
+    keys = set()
+    for text in selected_descriptions or ():
+        if text in by_desc:
+            keys.add(by_desc[text])
+        else:
+            keys.add(normalize_description(text))
+    all_keys = {i.description_key for i in issues}
+    return resolve_value_filter_selection(keys, all_keys)
+
+
+def description_displays_for_value_filter(
+    value_filter: Optional[set],
+    issues: Sequence[DayIssue],
+) -> set:
+    """Display strings for active VALUE keys (empty set = no header filter)."""
+    if value_filter is None:
+        return set()
+    return {
+        i.description for i in issues if i.description_key in value_filter
+    }
 
 
 def map_target_issues(
@@ -146,7 +192,7 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
           bg: str = "") -> QTableWidgetItem:
     item = QTableWidgetItem(str(text) if text is not None else "—")
     item.setTextAlignment(align)
-    item.setFont(QFont("Segoe UI", 11))
+    item.setFont(_table_cell_font())
     if bg:
         item.setBackground(QBrush(QColor(bg)))
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -157,7 +203,7 @@ def _editable_cell(text: str, *, bg: str = "") -> QTableWidgetItem:
     display = "" if text in (None, "—") else str(text)
     item = QTableWidgetItem(display)
     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-    item.setFont(QFont("Segoe UI", 11))
+    item.setFont(_table_cell_font())
     if bg:
         item.setBackground(QBrush(QColor(bg)))
     item.setFlags(
@@ -400,7 +446,12 @@ class MapDescriptionsDialog(QDialog):
 
 
 class ValueFilterDialog(QDialog):
-    """Multi-select filter for Unmapped / Bad map description values."""
+    """Searchable multi-select filter for Unmapped / Bad map description values.
+
+    ``selected_keys is None`` means show-all (pre-check every description).
+    A non-empty set pre-checks only those keys. Apply returns the checked
+    key set; empty / all-selected is normalized by the caller to no filter.
+    """
 
     def __init__(
         self,
@@ -410,49 +461,70 @@ class ValueFilterDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Filter VALUE")
-        self.setMinimumWidth(420)
-        self.setMinimumHeight(360)
+        self.setMinimumWidth(440)
+        self.setMinimumHeight(420)
         self.setStyleSheet(f"QDialog{{background:{_WHITE};color:{_T1};}}")
         self.result_keys: Optional[set] = None
-        self._build(issues, selected_keys or set())
+        self._entries: List[DayIssue] = sorted(
+            issues,
+            key=lambda i: (0 if i.kind == "Unmapped" else 1, i.description.lower()),
+        )
+        all_keys = {i.description_key for i in self._entries}
+        if selected_keys is None:
+            self._checked_keys: set = set(all_keys)
+        else:
+            self._checked_keys = {k for k in selected_keys if k in all_keys}
+        self._build()
 
-    def _build(self, issues: Sequence[DayIssue], selected_keys: set) -> None:
+    def _build(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(10)
         root.addWidget(_lbl("Filter by description (VALUE)", size=15, weight=700))
         root.addWidget(_lbl(
-            "Unmapped first, then Bad map. Clear filter shows all.",
+            f"{len(self._entries)} description(s) · Unmapped first, then Bad map.",
             size=12, color=_T2,
         ))
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search descriptions…")
+        self._search.setClearButtonEnabled(True)
+        self._search.setFixedHeight(32)
+        self._search.setStyleSheet(
+            f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
+            f"background:{_WHITE};color:{_T1};font-size:12px;"
+            f"font-family:'Segoe UI';padding:0 8px;}}"
+            f"QLineEdit:focus{{border-color:{_BLUE};}}"
+        )
+        self._search.textChanged.connect(self._refilter)
+        root.addWidget(self._search)
+
+        self._select_all = QCheckBox("Select All (visible)")
+        self._select_all.setTristate(True)
+        self._select_all.setStyleSheet(
+            f"QCheckBox{{font-size:12px;color:{_T1};font-family:'Segoe UI';}}"
+        )
+        self._select_all.stateChanged.connect(self._on_select_all)
+        root.addWidget(self._select_all)
 
         self._list = QListWidget()
         self._list.setStyleSheet(
             f"QListWidget{{border:1px solid {_BORDER};border-radius:5px;"
-            f"background:{_WHITE};font-size:12px;font-family:'Segoe UI';}}"
+            f"background:{_WHITE};font-size:12px;font-family:'Segoe UI';"
+            f"color:{_T1};}}"
+            "QListWidget::item{padding:3px 6px;}"
         )
-        ordered = sorted(
-            issues,
-            key=lambda i: (0 if i.kind == "Unmapped" else 1, i.description.lower()),
-        )
-        for issue in ordered:
-            label = f"[{issue.kind}] {issue.description}  ({issue.count})"
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, issue.description_key)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(
-                Qt.Checked if issue.description_key in selected_keys else Qt.Unchecked
-            )
-            self._list.addItem(item)
+        self._list.itemChanged.connect(self._on_item_changed)
         root.addWidget(self._list, 1)
 
         row = QHBoxLayout()
-        sel_all = _btn("Select All", primary=False)
-        sel_all.clicked.connect(lambda: self._set_all(True))
-        row.addWidget(sel_all)
-        clear = _btn("Clear", primary=False)
-        clear.clicked.connect(lambda: self._set_all(False))
-        row.addWidget(clear)
+        clear_checks = _btn("Clear checks", primary=False)
+        clear_checks.clicked.connect(self._clear_visible_checks)
+        row.addWidget(clear_checks)
+        clear_filter = _btn("Clear filter", primary=False)
+        clear_filter.setToolTip("Show all descriptions (no VALUE filter)")
+        clear_filter.clicked.connect(self._accept_cleared)
+        row.addWidget(clear_filter)
         row.addStretch()
         cancel = _btn("Cancel", primary=False)
         cancel.clicked.connect(self.reject)
@@ -462,18 +534,97 @@ class ValueFilterDialog(QDialog):
         row.addWidget(apply_btn)
         root.addLayout(row)
 
-    def _set_all(self, checked: bool) -> None:
-        state = Qt.Checked if checked else Qt.Unchecked
-        for i in range(self._list.count()):
-            self._list.item(i).setCheckState(state)
+        self._refilter("")
+        self._search.setFocus()
 
-    def _accept(self) -> None:
-        keys = set()
+    def _sync_checks_from_list(self) -> None:
         for i in range(self._list.count()):
             item = self._list.item(i)
+            key = item.data(Qt.UserRole)
             if item.checkState() == Qt.Checked:
-                keys.add(item.data(Qt.UserRole))
-        self.result_keys = keys
+                self._checked_keys.add(key)
+            else:
+                self._checked_keys.discard(key)
+
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        key = item.data(Qt.UserRole)
+        if item.checkState() == Qt.Checked:
+            self._checked_keys.add(key)
+        else:
+            self._checked_keys.discard(key)
+        self._sync_select_all_state()
+
+    def _on_select_all(self, state: int) -> None:
+        if state == int(Qt.PartiallyChecked):
+            return
+        checked = state == int(Qt.Checked)
+        self._list.blockSignals(True)
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            key = item.data(Qt.UserRole)
+            if checked:
+                self._checked_keys.add(key)
+            else:
+                self._checked_keys.discard(key)
+        self._list.blockSignals(False)
+        self._sync_select_all_state()
+
+    def _clear_visible_checks(self) -> None:
+        self._select_all.blockSignals(True)
+        self._select_all.setCheckState(Qt.Unchecked)
+        self._select_all.blockSignals(False)
+        self._on_select_all(int(Qt.Unchecked))
+
+    def _sync_select_all_state(self) -> None:
+        n = self._list.count()
+        if n == 0:
+            self._select_all.blockSignals(True)
+            self._select_all.setCheckState(Qt.Unchecked)
+            self._select_all.blockSignals(False)
+            return
+        n_checked = sum(
+            1 for i in range(n)
+            if self._list.item(i).checkState() == Qt.Checked
+        )
+        self._select_all.blockSignals(True)
+        if n_checked == 0:
+            self._select_all.setCheckState(Qt.Unchecked)
+        elif n_checked == n:
+            self._select_all.setCheckState(Qt.Checked)
+        else:
+            self._select_all.setCheckState(Qt.PartiallyChecked)
+        self._select_all.blockSignals(False)
+
+    def _refilter(self, text: str = "") -> None:
+        self._sync_checks_from_list()
+        needle = (text or self._search.text() or "").strip().lower()
+        self._list.blockSignals(True)
+        self._list.clear()
+        for issue in self._entries:
+            hay = f"{issue.kind} {issue.description}".lower()
+            if needle and needle not in hay:
+                continue
+            label = f"[{issue.kind}] {issue.description}  ({issue.count})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, issue.description_key)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Checked
+                if issue.description_key in self._checked_keys
+                else Qt.Unchecked
+            )
+            self._list.addItem(item)
+        self._list.blockSignals(False)
+        self._sync_select_all_state()
+
+    def _accept_cleared(self) -> None:
+        self.result_keys = set()
+        self.accept()
+
+    def _accept(self) -> None:
+        self._sync_checks_from_list()
+        self.result_keys = set(self._checked_keys)
         self.accept()
 
 
@@ -552,11 +703,11 @@ class DayIssuesWidget(QWidget):
         self._scope_combo.addItem("All days", "all")
         self._scope_combo.setFixedHeight(32)
         self._scope_combo.setFixedWidth(110)
-        self._scope_combo.setStyleSheet(
+        self._scope_combo.setStyleSheet(with_combo_popup(
             f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
             f"font-family:'Segoe UI';padding:0 8px;}}"
-        )
+        ))
         self._scope_combo.currentIndexChanged.connect(self._on_scope_changed)
         hdr.addWidget(self._scope_combo)
 
@@ -642,9 +793,17 @@ class DayIssuesWidget(QWidget):
         self._filter_btn = _btn("Filter VALUE…", primary=False)
         self._filter_btn.clicked.connect(self._open_value_filter)
         search_row.addWidget(self._filter_btn)
+        self._value_chip = QLabel("")
+        self._value_chip.setStyleSheet(
+            f"background:{_BLUE_L};color:{_BLUE};font-size:11px;font-weight:700;"
+            "border-radius:10px;padding:2px 10px;font-family:'Segoe UI';"
+        )
+        self._value_chip.setVisible(False)
+        search_row.addWidget(self._value_chip)
         self._clear_filter_btn = _btn("Clear VALUE Filter", primary=False)
         self._clear_filter_btn.clicked.connect(self._clear_value_filter)
         self._clear_filter_btn.setEnabled(False)
+        self._clear_filter_btn.setVisible(False)
         search_row.addWidget(self._clear_filter_btn)
         root.addLayout(search_row)
 
@@ -666,7 +825,11 @@ class DayIssuesWidget(QWidget):
         )
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
-        self._table.setStyleSheet(_table_style())
+        # Extra right padding so Description ▾ chevron does not collide with text.
+        self._table.setStyleSheet(
+            _table_style()
+            + f"QHeaderView::section{{padding:0 18px 0 6px;}}"
+        )
         self._table.setItemDelegateForColumn(
             _COL_PAYEE,
             _IssuesCompleterDelegate(
@@ -682,10 +845,37 @@ class DayIssuesWidget(QWidget):
             ),
         )
         self._table.itemChanged.connect(self._on_issue_cell_changed)
+
+        filter_hdr = ExcelFilterHeaderView(
+            self._table,
+            filterable_columns={_COL_DESC},
+            sort_kinds={_COL_DESC: "text"},
+        )
+        filter_hdr.set_value_provider(self._desc_filter_menu_values)
+        filter_hdr.set_label_provider(
+            lambda c: "Description" if c == _COL_DESC else "",
+        )
+        filter_hdr.filter_changed.connect(self._on_desc_header_filter)
+        filter_hdr.sort_requested.connect(self._on_desc_header_sort)
+        self._table.setHorizontalHeader(filter_hdr)
+
         hdr_view = self._table.horizontalHeader()
-        hdr_view.setStretchLastSection(True)
+        hdr_view.setStretchLastSection(False)
+        hdr_view.setSectionsMovable(False)
+        hdr_view.setMinimumSectionSize(36)
         for i, width in enumerate(_COL_DEFAULTS):
             self._table.setColumnWidth(i, width)
+            if i == _COL_DESC:
+                hdr_view.setSectionResizeMode(i, QHeaderView.Stretch)
+            else:
+                hdr_view.setSectionResizeMode(i, QHeaderView.Interactive)
+        bind_column_width_persistence(
+            self._table,
+            "day_issues_table_v2",
+            _COL_DEFAULTS,
+            stretch_columns=(_COL_DESC,),
+            auto_fit_if_unset=True,
+        )
         tv.addWidget(self._table)
         root.addWidget(self._table_host, 1)
 
@@ -772,6 +962,10 @@ class DayIssuesWidget(QWidget):
                 }
             live_keys = {i.description_key for i in self._issues_all}
             self._checked_keys &= live_keys
+            if self._value_filter is not None:
+                kept = self._value_filter & live_keys
+                self._value_filter = kept or None
+            self._sync_value_filter_chrome()
             self._apply_filters(repaint=False)
             self._populate()
             self.issues_changed.emit(len(self._issues_all))
@@ -795,25 +989,82 @@ class DayIssuesWidget(QWidget):
         self._search_text = text or ""
         self._apply_filters()
 
+    def _sync_value_filter_chrome(self) -> None:
+        active = self._value_filter is not None
+        self._clear_filter_btn.setEnabled(active)
+        self._clear_filter_btn.setVisible(active)
+        if active:
+            n = len(self._value_filter)
+            self._value_chip.setText(f"VALUE · {n}")
+            self._value_chip.setVisible(True)
+            self._filter_btn.setText("Edit VALUE…")
+        else:
+            self._value_chip.clear()
+            self._value_chip.setVisible(False)
+            self._filter_btn.setText("Filter VALUE…")
+        self._sync_desc_header_filter()
+
+    def _sync_desc_header_filter(self) -> None:
+        hdr = self._table.horizontalHeader()
+        if not isinstance(hdr, ExcelFilterHeaderView):
+            return
+        displays = description_displays_for_value_filter(
+            self._value_filter, self._issues_all,
+        )
+        if displays:
+            hdr.sync_active({_COL_DESC: displays})
+        else:
+            hdr.clear_filters()
+
+    def _desc_filter_menu_values(self, col: int) -> set:
+        if col != _COL_DESC:
+            return set()
+        return {i.description for i in self._issues_all if i.description}
+
+    def _on_desc_header_filter(self, col: int, accepted) -> None:
+        if col != _COL_DESC:
+            return
+        accepted_set = set(accepted or [])
+        if not accepted_set:
+            self._value_filter = None
+        else:
+            self._value_filter = value_filter_from_descriptions(
+                accepted_set, self._issues_all,
+            )
+        self._sync_value_filter_chrome()
+        self._apply_filters()
+
+    def _on_desc_header_sort(self, col: int, mode: str) -> None:
+        if col != _COL_DESC:
+            return
+        reverse = mode == SORT_DESC
+        self._issues_all.sort(
+            key=lambda i: (i.description or "").lower(),
+            reverse=reverse,
+        )
+        self._apply_filters()
+
     def _open_value_filter(self) -> None:
         if not self._issues_all:
             QMessageBox.information(self, "Filter VALUE", "No issues to filter.")
             return
-        pre = self._value_filter or set()
-        dlg = ValueFilterDialog(self._issues_all, selected_keys=pre, parent=self)
+        dlg = ValueFilterDialog(
+            self._issues_all,
+            selected_keys=self._value_filter,  # None = pre-check all
+            parent=self,
+        )
         if dlg.exec() != QDialog.Accepted:
             return
-        keys = dlg.result_keys or set()
-        if not keys or len(keys) >= len(self._issues_all):
-            self._value_filter = None
-        else:
-            self._value_filter = keys
-        self._clear_filter_btn.setEnabled(self._value_filter is not None)
+        all_keys = {i.description_key for i in self._issues_all}
+        self._value_filter = resolve_value_filter_selection(
+            dlg.result_keys or set(), all_keys,
+        )
+        self._sync_value_filter_chrome()
         self._apply_filters()
 
     def _clear_value_filter(self) -> None:
         self._value_filter = None
-        self._clear_filter_btn.setEnabled(False)
+        self._sync_value_filter_chrome()
         self._apply_filters()
 
     def _check_highlighted(self) -> None:
@@ -1004,6 +1255,7 @@ class DayIssuesWidget(QWidget):
                 "Payee/Item inline and Save Filled."
                 if issues else "All clear — this day can be submitted."
             )
+            apply_pending_column_autofit(self._table)
         finally:
             self._table.blockSignals(False)
             self._populating = False

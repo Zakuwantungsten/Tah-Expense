@@ -90,8 +90,9 @@ _ROW_EVEN = "#FFFFFF"
 _ROW_ODD  = "#F1F5F9"   # slate-100
 
 _PAGE_SIZES = [25, 50, 100]
-_ROW_H      = 28
-_HDR_H      = 26
+_ROW_H      = 24
+_HDR_H      = 22
+_CELL_FONT_PX = 10
 
 _LAKE_ZAMBIA_FEED = "diesel_lake_zambia"
 
@@ -532,13 +533,13 @@ def _hsep() -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        "border:none;font-size:11px;font-family:'Segoe UI';}"
-        f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
+        f"border:none;font-size:{_CELL_FONT_PX}px;font-family:'Segoe UI';}}"
+        f"QTableWidget::item{{padding:1px 6px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
-        "font-size:10px;font-weight:600;font-family:'Segoe UI';"
+        "font-size:9px;font-weight:600;font-family:'Segoe UI';"
         f"border:none;border-bottom:1px solid {_BORDER};"
-        f"padding:0 8px;height:{_HDR_H}px;}}"
+        f"padding:0 6px;height:{_HDR_H}px;}}"
         "QScrollBar:vertical{width:8px;background:transparent;}"
         f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
     )
@@ -572,7 +573,10 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
     item = QTableWidgetItem(str(text) if text is not None else "—")
     item.setTextAlignment(align)
     if mono:
-        item.setFont(QFont("Cascadia Code", 11))
+        f = QFont("Cascadia Code")
+        f.setStyleHint(QFont.Monospace)
+        f.setPixelSize(_CELL_FONT_PX)
+        item.setFont(f)
     if color:
         item.setForeground(QColor(color))
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)

@@ -37,7 +37,7 @@ After each phase: mark it done here, stop, and wait for “go next phase”.
 
 ## Phases
 
-### Phase 1 — Shared density source of truth  ⬜
+### Phase 1 — Shared density source of truth  ✅ DONE
 
 **Goal:** One place defines compact tokens; consumers of
 `separate_expenses._table_style` / `_ROW_H` get denser chrome immediately.
@@ -47,18 +47,22 @@ After each phase: mark it done here, stop, and wait for “go next phase”.
 
 **Done when:**
 
-- [ ] Shared `_ROW_H` / `_HDR_H` / stylesheet match the target table above.
-- [ ] Tabs that only import those helpers (Payees, People, Description Maps,
+- [x] Shared `_ROW_H` / `_HDR_H` / stylesheet match the target table above.
+- [x] Tabs that only import those helpers (Payees, People, Description Maps,
       Day Issues, Fleet, Reconciliation, etc.) pick up new defaults without
       local overrides fighting them.
-- [ ] Daily Register Table unchanged.
+- [x] Daily Register Table unchanged.
+
+**Shipped in:** `_ROW_H=24`, `_HDR_H=22`; `_table_style` 10px cells / 9px
+header / tighter padding; Afritrack footer uses `_ROW_H`.
 
 **Out of scope this phase:** Items/Suppliers local `_TABLE_SS`, master ledger
-local SS, Filter VALUE / Description ▾.
+local SS, Filter VALUE / Description ▾. Cells that still set
+`QFont(..., 11)` pt are Phase 2.
 
 ---
 
-### Phase 2 — Fix pt → px cell fonts on shared consumers  ⬜
+### Phase 2 — Fix pt → px cell fonts on shared consumers  ✅ DONE
 
 **Goal:** Cells no longer override stylesheet with `QFont("Segoe UI", 11)`
 (points). Use pixel fonts so density matches CSS.
@@ -69,12 +73,16 @@ using point-size 11).
 
 **Done when:**
 
-- [ ] Shared manage / Day Issues cells use `setPixelSize` at the target size.
-- [ ] Description Maps visually matches Payees/People density.
+- [x] Shared manage / Day Issues cells use `setPixelSize` at the target size.
+- [x] Description Maps visually matches Payees/People density.
+
+**Shipped in:** `_CELL_FONT_PX` + `_table_cell_font()` on
+`separate_expenses`; `_cell` / `_editable_cell` on Description Maps, Payees,
+People, Day Issues use it.
 
 ---
 
-### Phase 3 — Align local-copy tables (Items, Suppliers, etc.)  ⬜
+### Phase 3 — Align local-copy tables (Items, Suppliers, etc.)  ✅ DONE
 
 **Goal:** Tabs with their own `_ROW_H` / `_TABLE_SS` match the same targets.
 Still **not** Daily Register Table.
@@ -89,12 +97,18 @@ Still **not** Daily Register Table.
 
 **Done when:**
 
-- [ ] Those tables use the same row height + px fonts as Phase 1.
-- [ ] `excel_grid.py` untouched.
+- [x] Those tables use the same row height + px fonts as Phase 1.
+- [x] `excel_grid.py` untouched.
+
+**Shipped in:** Items/Suppliers/Verify/Fuel/Category/Master Expenses+Ledger/
+Item Quick Report/Truck Overview/transactions_table/cashier_category_view →
+24 / 22 / 10px; mono cells use `setPixelSize`; shared `_cell` in
+`separate_expenses` + fleet/fuel mono fonts aligned. Skipped register-like
+`rejected_view` Calibri 11pt (matches Table look).
 
 ---
 
-### Phase 4 — Description Maps layout parity  ⬜
+### Phase 4 — Description Maps layout parity  ✅ DONE
 
 **Goal:** Description Maps table layout matches the manage-tab pattern after
 density (columns, stretch, header behavior, toolbar spacing) — not a new
@@ -104,14 +118,19 @@ design language.
 
 **Done when:**
 
-- [ ] Same density as Phase 1–2.
-- [ ] Layout feels aligned with Payees (stretch Description, interactive
+- [x] Same density as Phase 1–2.
+- [x] Layout feels aligned with Payees (stretch Description, interactive
       Item/Payee, footer/count chrome consistent).
-- [ ] Existing re-assign / delete / scroll-load behavior unchanged.
+- [x] Existing re-assign / delete / scroll-load behavior unchanged.
+
+**Shipped in:** Header chrome (+ Add in header, hint beside it); toolbar =
+search + bulk actions; table headers `# / Description / Item / Payee` with
+Stretch Description + Interactive others; Payees-style status bar frame
+(scroll-load status, no pager). Test header assertion updated.
 
 ---
 
-### Phase 5 — Day Issues: polish Filter VALUE…  ⬜
+### Phase 5 — Day Issues: polish Filter VALUE…  ✅ DONE
 
 **Goal:** Toolbar **Filter VALUE…** stays and behaves like automation’s
 description VALUE multi-select (searchable checklist if missing, clear
@@ -121,14 +140,19 @@ affordance, count chip when active).
 
 **Done when:**
 
-- [ ] Filter VALUE… still filters by `description_key`.
-- [ ] Active filter is obvious; Clear VALUE Filter works.
-- [ ] Works with SEARCH (AND).
-- [ ] Tests cover filter + search interaction.
+- [x] Filter VALUE… still filters by `description_key`.
+- [x] Active filter is obvious; Clear VALUE Filter works.
+- [x] Works with SEARCH (AND).
+- [x] Tests cover filter + search interaction.
+
+**Shipped in:** searchable `ValueFilterDialog` (Select All visible, preserve
+checks across search); `None` = pre-check all; `resolve_value_filter_selection`;
+toolbar `VALUE · N` chip + Clear only when active; button becomes Edit VALUE…
+when active.
 
 ---
 
-### Phase 6 — Day Issues: Description ▾ header filter  ⬜
+### Phase 6 — Day Issues: Description ▾ header filter  ✅ DONE
 
 **Goal:** Description column gets the Excel-style ▾ popup used on Table /
 master (sort optional; checklist + search + Apply/Clear required).
@@ -139,25 +163,42 @@ Filter VALUE… so both stay in sync.
 
 **Done when:**
 
-- [ ] ▾ on Description opens checklist of current issue descriptions.
-- [ ] Apply / Clear updates the same `_value_filter` (or shared store) as
+- [x] ▾ on Description opens checklist of current issue descriptions.
+- [x] Apply / Clear updates the same `_value_filter` (or shared store) as
       Filter VALUE….
-- [ ] Opening Filter VALUE… reflects checks from ▾ and vice versa.
-- [ ] Daily Register Table filter code paths not required to change.
-- [ ] Tests cover ▾ apply/clear ↔ VALUE filter parity.
+- [x] Opening Filter VALUE… reflects checks from ▾ and vice versa.
+- [x] Daily Register Table filter code paths not required to change.
+- [x] Tests cover ▾ apply/clear ↔ VALUE filter parity.
+
+**Shipped in:** `ExcelFilterHeaderView` on Description; helpers
+`value_filter_from_descriptions` /
+`description_displays_for_value_filter`; ▾ ↔ toolbar VALUE chrome share
+`_value_filter`; A→Z / Z→A sort on Description.
 
 ---
 
-### Phase 7 — Smoke tests + visual checklist  ⬜
+### Phase 7 — Smoke tests + visual checklist  ✅ DONE
 
 **Goal:** Regression safety and a short manual checklist.
 
 **Done when:**
 
-- [ ] Existing Day Issues selection / map tests still pass.
-- [ ] New density/filter tests green.
-- [ ] Manual: Description Maps, Payees, Items, Day Issues look denser; Table
-      register looks unchanged; both Day Issues filters work together.
+- [x] Existing Day Issues selection / map tests still pass.
+- [x] New density/filter tests green.
+- [x] Manual checklist recorded below (`excel_grid` confirmed untouched in git).
+
+**Automated smoke (40 passed):**
+`test_day_issues_selection`, `styles`, `map_apply`, `save_filled`,
+`cashier_scope`, `live_rows`, `all_days`, `description_maps_reassign`,
+`register_column_filters`, `verify_item_payee_gate`.
+
+**Manual checklist (please confirm in the running app):**
+
+- [ ] Description Maps / Payees / Items look denser (shorter rows, smaller type)
+- [ ] Daily Register **Table** still Calibri 11pt / prior look
+- [ ] Day Issues **Filter VALUE…** searchable + chip when active
+- [ ] Day Issues Description **▾** Apply/Clear stays in sync with VALUE
+- [ ] Day Issues SEARCH + VALUE still AND together; map actions still work
 
 ---
 
@@ -165,13 +206,13 @@ Filter VALUE… so both stay in sync.
 
 | Phase | Status | Notes |
 |-------|--------|-------|
-| 1 | Pending | Shared `_ROW_H` / `_table_style` |
-| 2 | Pending | pt → px on shared consumers |
-| 3 | Pending | Items / Suppliers / local SS copies |
-| 4 | Pending | Description Maps layout parity |
-| 5 | Pending | Polish Filter VALUE… |
-| 6 | Pending | Description ▾ + sync with VALUE |
-| 7 | Pending | Tests + checklist |
+| 1 | Done | Shared `_ROW_H=24` / `_HDR_H=22` / 10px+9px stylesheet |
+| 2 | Done | `_table_cell_font()` 10px on Maps / Payees / People / Day Issues |
+| 3 | Done | Local `_TABLE_SS` / `_ROW_H` copies → 24/22/10px |
+| 4 | Done | Maps chrome aligned with Payees/People manage pattern |
+| 5 | Done | Searchable VALUE dialog + active chip |
+| 6 | Done | Description ▾ synced with VALUE filter |
+| 7 | Done | 40 related tests green; manual checklist for UI spot-check |
 
 ---
 

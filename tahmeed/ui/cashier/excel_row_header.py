@@ -10,25 +10,32 @@ from tahmeed.ui.cashier.register_delegates import COL_DESC
 ROW_HEADER_WIDTH = 40
 DEFAULT_ROW_HEIGHT = 24   # slightly taller than Excel 15pt for readability
 MIN_ROW_HEIGHT = 15
+DEFAULT_ROW_HEADER_FONT_PT = 11
 _ROW_HEADER_RESIZE_HIT = 5
 
-# QSS snippet — pair with view-specific horizontal header rules.
-ROW_HEADER_QSS = """
-QHeaderView:vertical {
+
+def row_header_qss(font_pt: int = DEFAULT_ROW_HEADER_FONT_PT) -> str:
+    """QSS for the Excel-style vertical gutter; pair with horizontal header rules."""
+    return f"""
+QHeaderView:vertical {{
     background: #ffffff;
     border: none;
-}
-QHeaderView::section:vertical {
+}}
+QHeaderView::section:vertical {{
     background: #F2F2F2;
     color: #333333;
     font-family: Calibri;
-    font-size: 11pt;
+    font-size: {int(font_pt)}pt;
     padding: 0 2px;
     border: none;
     border-right: 1px solid #D4D4D4;
     border-bottom: 1px solid #D4D4D4;
-}
+}}
 """
+
+
+# Back-compat alias for callers that import the constant stylesheet.
+ROW_HEADER_QSS = row_header_qss()
 
 _ROW_HEADER_FILL = QColor("#ffffff")
 
@@ -72,8 +79,15 @@ class ExcelRowHeaderView(QHeaderView):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setStyleSheet(ROW_HEADER_QSS)
+        self._font_pt = DEFAULT_ROW_HEADER_FONT_PT
+        self.setStyleSheet(row_header_qss(self._font_pt))
         self.viewport().setAutoFillBackground(True)
+
+    def set_font_pt(self, font_pt: int) -> None:
+        """Update gutter label size (used by Daily Register text zoom)."""
+        self._font_pt = int(font_pt)
+        self.setStyleSheet(row_header_qss(self._font_pt))
+        self.viewport().update()
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)

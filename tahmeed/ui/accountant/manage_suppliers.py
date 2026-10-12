@@ -46,23 +46,24 @@ _GREEN_L = "#DCFCE7"
 _RED = "#DC2626"
 _RED_L = "#FEE2E2"
 _STRIPE = "#F1F5F9"
-_ROW_H = 32
-_HDR_H = 28
+_ROW_H = 24
+_HDR_H = 22
+_CELL_FONT_PX = 10
 _PAGE_SIZE = 100
 
 _TABLE_SS = (
     f"QTableWidget {{"
     f"  background: {_WHITE}; gridline-color: {_BORDER};"
-    f"  font-size: 11px; font-family:'Segoe UI';"
+    f"  font-size: {_CELL_FONT_PX}px; font-family:'Segoe UI';"
     f"  color: {_T1}; border: none;"
     f"}}"
-    f"QTableWidget::item {{ padding: 2px 8px; border: none; }}"
+    f"QTableWidget::item {{ padding: 1px 6px; border: none; }}"
     f"QTableWidget::item:selected {{ background: {_BLUE_L}; color: {_T1}; }}"
     f"QHeaderView::section {{"
     f"  background: {_HDR_BG}; color: {_T2};"
-    f"  font-size: 10px; font-weight: 600; font-family:'Segoe UI';"
+    f"  font-size: 9px; font-weight: 600; font-family:'Segoe UI';"
     f"  border: none; border-bottom: 1px solid {_BORDER};"
-    f"  padding: 0 8px; min-height: {_HDR_H}px;"
+    f"  padding: 0 6px; min-height: {_HDR_H}px;"
     f"}}"
     f"QHeaderView::section:hover {{ background: #E2E8F0; }}"
     f"QScrollBar:vertical {{ background: {_BG}; width: 8px; margin: 0; }}"
@@ -93,7 +94,7 @@ def _input_ss() -> str:
 
 def _item_table_font(*, bold: bool = False) -> QFont:
     f = QFont("Segoe UI")
-    f.setPixelSize(11)
+    f.setPixelSize(_CELL_FONT_PX)
     f.setBold(bold)
     return f
 

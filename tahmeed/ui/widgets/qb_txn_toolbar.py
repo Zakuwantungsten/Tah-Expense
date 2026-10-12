@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Optional
 
 import qtawesome as qta
-from PySide6.QtCore import Qt, Signal, QSize
-from PySide6.QtGui import QAction
+from PySide6.QtCore import Qt, Signal, QSize, QRectF
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QToolButton, QCheckBox, QWidget, QSizePolicy,
     QMenu,
@@ -19,14 +19,41 @@ _TEXT = "#1B2B4B"
 _BLUE = "#0077C5"
 _MUTED = "#9CA3AF"
 _HOVER = "#E5E7EB"
+_A_COLOR = "#4B5563"
+
+
+def _font_size_icon(*, larger: bool, size: int = 40) -> QIcon:
+    """Paint A⁺ / A⁻ icons (dark A + blue superscript +/−)."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.TextAntialiasing)
+
+    a_font = QFont("Segoe UI")
+    a_font.setPixelSize(int(size * 0.72))
+    a_font.setBold(True)
+    p.setFont(a_font)
+    p.setPen(QColor(_A_COLOR))
+    p.drawText(QRectF(0, 1, size * 0.62, size), Qt.AlignCenter, "A")
+
+    mark_font = QFont("Segoe UI")
+    mark_font.setPixelSize(int(size * 0.42))
+    mark_font.setBold(True)
+    p.setFont(mark_font)
+    p.setPen(QColor(_BLUE))
+    mark = "+" if larger else "−"
+    p.drawText(QRectF(size * 0.48, 0, size * 0.48, size * 0.55), Qt.AlignCenter, mark)
+    p.end()
+    return QIcon(pm)
 
 
 class QbTxnToolbar(QFrame):
     """Classic QB Desktop-style strip: icon above label, one shared row.
 
     Core: Undo, Redo, Find, New, Save, Delete, Copy, Print, Attach File.
-    With ``register_actions=True`` (cashier Table): also Export, Import,
-    Today, Edit, Submit day — same icon style as New/Save.
+    With ``register_actions=True`` (cashier/accountant Table): also Larger,
+    Smaller (right after Redo), Export, Import, Today, Edit, Submit day.
     """
 
     find_prev = Signal()
@@ -46,6 +73,8 @@ class QbTxnToolbar(QFrame):
     edit_clicked = Signal()
     submit_clicked = Signal()
     clear_table_clicked = Signal()
+    font_larger_clicked = Signal()
+    font_smaller_clicked = Signal()
 
     def __init__(
         self,
@@ -112,6 +141,8 @@ class QbTxnToolbar(QFrame):
 
         self._btn_undo: Optional[QToolButton] = None
         self._btn_redo: Optional[QToolButton] = None
+        self._btn_font_larger: Optional[QToolButton] = None
+        self._btn_font_smaller: Optional[QToolButton] = None
         if register_actions:
             self._btn_undo = self._tool_btn(
                 "mdi.undo", "Undo", "Undo last change (Ctrl+Z)"
@@ -125,6 +156,22 @@ class QbTxnToolbar(QFrame):
             self._btn_redo.setEnabled(False)
             lay.addWidget(self._btn_undo)
             lay.addWidget(self._btn_redo)
+
+            # Immediately after Redo: table text size
+            self._btn_font_larger = self._icon_tool_btn(
+                _font_size_icon(larger=True),
+                "Larger",
+                "Increase table text size",
+            )
+            self._btn_font_smaller = self._icon_tool_btn(
+                _font_size_icon(larger=False),
+                "Smaller",
+                "Decrease table text size",
+            )
+            self._btn_font_larger.clicked.connect(self.font_larger_clicked.emit)
+            self._btn_font_smaller.clicked.connect(self.font_smaller_clicked.emit)
+            lay.addWidget(self._btn_font_larger)
+            lay.addWidget(self._btn_font_smaller)
             lay.addWidget(self._sep())
 
         self._btn_find_prev = self._icon_btn(
@@ -314,6 +361,18 @@ class QbTxnToolbar(QFrame):
             b.setIconSize(QSize(20, 20))
         return b
 
+    def _icon_tool_btn(self, icon: QIcon, text: str, tip: str) -> QToolButton:
+        b = QToolButton()
+        b.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setToolTip(tip)
+        b.setText(text)
+        b.setAutoRaise(True)
+        b.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        b.setIcon(icon)
+        b.setIconSize(QSize(20, 20))
+        return b
+
     def _load_icon(self, *names: str):
         """Return the first qtawesome icon that resolves; try common aliases."""
         candidates: list[str] = []
@@ -381,6 +440,15 @@ class QbTxnToolbar(QFrame):
             self._btn_undo.setEnabled(can_undo)
         if self._btn_redo is not None:
             self._btn_redo.setEnabled(can_redo)
+
+    def set_font_size_controls_enabled(
+        self, *, can_larger: bool, can_smaller: bool
+    ) -> None:
+        """Enable Larger/Smaller when the register font can still move."""
+        if self._btn_font_larger is not None:
+            self._btn_font_larger.setEnabled(can_larger)
+        if self._btn_font_smaller is not None:
+            self._btn_font_smaller.setEnabled(can_smaller)
 
     def set_actions_enabled(
         self,

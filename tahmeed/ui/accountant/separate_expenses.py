@@ -88,8 +88,11 @@ _ALT_ROW = "#F9FAFB"
 _NAVY    = "#1B2B4B"
 
 _PAGE_SIZES = [25, 50, 100]
-_ROW_H      = 28
-_HDR_H      = 26
+# Compact density — QuickBooks-like; shared by manage / Day Issues / feeds.
+# Daily Register Table (excel_grid) does not use these tokens.
+_ROW_H      = 24
+_HDR_H      = 22
+_CELL_FONT_PX = 10  # CSS px via QFont.setPixelSize — not point size
 _ROW_EVEN   = "#FFFFFF"
 _ROW_ODD    = "#F1F5F9"   # slate-100 — manual stripe (readable on all row types)
 _CREDIT_ROW_BG = "#E6F4EC"  # soft mint for money-in / credit rows
@@ -192,16 +195,25 @@ def _card(widget: QWidget) -> QFrame:
 def _table_style() -> str:
     return (
         f"QTableWidget{{background:{_WHITE};gridline-color:{_BORDER};"
-        f"border:none;font-size:11px;font-family:'Segoe UI';}}"
-        f"QTableWidget::item{{padding:2px 8px;color:{_T1};}}"
+        f"border:none;font-size:{_CELL_FONT_PX}px;font-family:'Segoe UI';}}"
+        f"QTableWidget::item{{padding:1px 6px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
-        f"font-size:10px;font-weight:600;font-family:'Segoe UI';"
+        f"font-size:9px;font-weight:600;font-family:'Segoe UI';"
         f"border:none;border-bottom:1px solid {_BORDER};"
-        f"padding:0 8px;height:{_HDR_H}px;}}"
+        f"padding:0 6px;height:{_HDR_H}px;}}"
         "QScrollBar:vertical{width:8px;background:transparent;}"
         f"QScrollBar::handle:vertical{{background:#D1D5DB;border-radius:4px;}}"
     )
+
+
+def _table_cell_font(*, bold: bool = False, italic: bool = False) -> QFont:
+    """Uniform cell font in CSS pixels (matches ``_table_style``)."""
+    f = QFont("Segoe UI")
+    f.setPixelSize(_CELL_FONT_PX)
+    f.setBold(bold)
+    f.setItalic(italic)
+    return f
 
 
 def _stripe_bg(row_idx: int) -> str:
@@ -549,7 +561,12 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
     item = QTableWidgetItem(str(text) if text is not None else "—")
     item.setTextAlignment(align)
     if mono:
-        item.setFont(QFont("Cascadia Code", 11))
+        f = QFont("Cascadia Code")
+        f.setStyleHint(QFont.Monospace)
+        f.setPixelSize(_CELL_FONT_PX)
+        item.setFont(f)
+    else:
+        item.setFont(_table_cell_font())
     if color:
         item.setForeground(QColor(color))
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -8118,7 +8135,7 @@ class _AfritrackFooter(QWidget):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.horizontalHeader().setVisible(False)
         self._table.verticalHeader().setVisible(False)
-        self._table.verticalHeader().setDefaultSectionSize(24)
+        self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
         self._table.setShowGrid(True)
         self._table.setStyleSheet(self._foot_ss())
         self._table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)

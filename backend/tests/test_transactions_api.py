@@ -807,6 +807,44 @@ def test_rejected_discarded_and_drafts() -> None:
             "/v1/transactions/drafts/discard",
             json={"ids": [str(draft_id)]},
         )
+        # Re-seed a second draft day with two rows, then discard-by-day.
+        d1, d2 = ObjectId(), ObjectId()
+        collection.documents.extend(
+            [
+                {
+                    "_id": d1,
+                    "cashier_id": user["_id"],
+                    "register_status": "draft",
+                    "verified": False,
+                    "rejected": False,
+                    "discarded": False,
+                    "deletion_requested": False,
+                    "trashed": False,
+                    "date": datetime(2026, 6, 4, 9, 0, 0),
+                    "import_primary_date": None,
+                    "amount": 1,
+                    "description": "draft-a",
+                },
+                {
+                    "_id": d2,
+                    "cashier_id": user["_id"],
+                    "register_status": "draft",
+                    "verified": False,
+                    "rejected": False,
+                    "discarded": False,
+                    "deletion_requested": False,
+                    "trashed": False,
+                    "date": datetime(2026, 6, 4, 10, 0, 0),
+                    "import_primary_date": None,
+                    "amount": 2,
+                    "description": "draft-b",
+                },
+            ]
+        )
+        drop_day = client.post(
+            "/v1/transactions/drafts/discard-day",
+            json={"date": "2026-06-04"},
+        )
         resubmit = client.post(
             "/v1/transactions/cashier/resubmit",
             json={"updates_by_id": {str(discarded_id): {"description": "fixed"}}},
@@ -820,6 +858,8 @@ def test_rejected_discarded_and_drafts() -> None:
     assert drafts.json()["total"] == 1
     assert draft_days.status_code == 200
     assert drop_drafts.json()["deleted"] == 1
+    assert drop_day.status_code == 200
+    assert drop_day.json()["deleted"] == 2
     # discarded_id was restored to rejected=False via restore, so resubmit of
     # discarded_id as rejected may be 0; after restore discarded=False and rejected
     # still True on discarded_id — wait, restore only sets discarded False, keeps rejected True.

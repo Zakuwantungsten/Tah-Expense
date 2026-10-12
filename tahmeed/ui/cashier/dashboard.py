@@ -630,6 +630,17 @@ class _TablePage(QWidget):
         )
         self._qb_toolbar.edit_clicked.connect(register.toggle_edit_mode)
         self._qb_toolbar.submit_clicked.connect(register.submit_for_verify)
+        self._qb_toolbar.font_larger_clicked.connect(register.toolbar_font_larger)
+        self._qb_toolbar.font_smaller_clicked.connect(register.toolbar_font_smaller)
+        register.font_size_changed.connect(
+            lambda larger, smaller: self._qb_toolbar.set_font_size_controls_enabled(
+                can_larger=larger, can_smaller=smaller
+            )
+        )
+        self._qb_toolbar.set_font_size_controls_enabled(
+            can_larger=register.can_increase_font(),
+            can_smaller=register.can_decrease_font(),
+        )
         register.attachment_count_changed.connect(self._qb_toolbar.set_attachment_count)
         register.edit_state_changed.connect(self._qb_toolbar.set_edit_state)
         register.save_busy_changed.connect(self._qb_toolbar.set_mutation_busy)
