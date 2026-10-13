@@ -49,9 +49,9 @@ _HDR_BG    = "#F1F5F9"
 _STRIPE    = "#F1F5F9"
 _ROW_EVEN  = "#FFFFFF"
 _ROW_ODD   = "#F1F5F9"   # slate-100 — manual stripe (readable on all row types)
-_HDR_H     = 22
-_ROW_H     = 24
-_CELL_FONT_PX = 10
+_HDR_H     = 24
+_ROW_H     = 26
+_CELL_FONT_PX = 12
 
 _SCROLL_CHUNK      = 50
 _SELECT_ALL_CHUNK  = 500
@@ -156,6 +156,29 @@ def _preferred_day_issues_date(txs: Sequence[Transaction]) -> Optional[date]:
     return sorted(d for d, n in counts.items() if n == top)[0]
 
 
+def _day_issues_nav_from_unmapped(txs: Sequence[Transaction]):
+    """Build Day Issues deep-link for Verify-blocked descriptions."""
+    from tahmeed.services.description_mapping_service import normalize_description
+    from tahmeed.ui.cashier.day_issues import DayIssuesNavTarget
+
+    keys: set[str] = set()
+    days: set[date] = set()
+    for tx in txs:
+        raw = (getattr(tx, "description", None) or "").strip()
+        if raw:
+            key = normalize_description(raw)
+            if key:
+                keys.add(key)
+        day = _tx_register_day(tx)
+        if day is not None:
+            days.add(day)
+    return DayIssuesNavTarget(
+        date=_preferred_day_issues_date(txs),
+        description_keys=tuple(sorted(keys)),
+        all_days=len(days) > 1,
+    )
+
+
 # ── Primitive helpers ──────────────────────────────────────────────────────────
 
 def _lbl(text: str = "", size: int = 13, weight: int = 400,
@@ -225,7 +248,7 @@ def _table_style() -> str:
         f"QTableWidget::item{{padding:1px 6px;color:{_T1};}}"
         f"QTableWidget::item:selected{{background:{_BLUE_L};color:{_T1};}}"
         f"QHeaderView::section{{background:{_HDR_BG};color:{_T2};"
-        "font-size:9px;font-weight:600;font-family:'Segoe UI';"
+        "font-size:10px;font-weight:600;font-family:'Segoe UI';"
         f"border:none;border-right:1px solid {_BORDER};"
         f"border-bottom:1px solid {_BORDER};padding:0 6px;height:{_HDR_H}px;}}"
         f"QHeaderView::section:hover{{background:#E2E8F0;}}"
@@ -2400,7 +2423,7 @@ class VerifyInboxWidget(QWidget):
             if len(unique) > len(sample) else ""
         )
         n = len(still_need)
-        target = _preferred_day_issues_date(still_need)
+        target = _day_issues_nav_from_unmapped(still_need)
         self._clear_busy()
         open_issues = await self._await_ui(
             lambda: self._ask_open_day_issues(

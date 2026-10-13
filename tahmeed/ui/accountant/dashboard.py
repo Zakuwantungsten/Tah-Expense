@@ -26,6 +26,7 @@ _LAZY_PAGE_KEYS = frozenset({
     "truck_overview",
     "verify",
     "drafts",
+    "saved",
     "day_issues",
     "master_expenses",
     "trash",
@@ -73,6 +74,10 @@ class AccountantDashboard(QWidget):
         self._pending_categories: list | None = None
         self._pending_people: list | None = None
         self._pending_payees: list | None = None
+        self._day_issues_badge_timer = QTimer(self)
+        self._day_issues_badge_timer.setSingleShot(True)
+        self._day_issues_badge_timer.setInterval(350)
+        self._day_issues_badge_timer.timeout.connect(self._run_debounced_day_issues_badge)
         self._build()
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._load_categories())
@@ -213,9 +218,14 @@ class AccountantDashboard(QWidget):
             from tahmeed.ui.cashier.drafts_view import DraftsView
             widget = DraftsView(user=self._user, show_all_cashiers=True)
             widget.open_register_date.connect(self._on_drafts_open_register)
-            widget.drafts_changed.connect(
-                lambda: asyncio.ensure_future(self._refresh_drafts_badge())
-            )
+            widget.drafts_changed.connect(self._on_drafts_data_changed)
+            return widget
+
+        if key == "saved":
+            from tahmeed.ui.cashier.saved_view import SavedView
+            widget = SavedView(user=self._user, show_all_cashiers=True)
+            widget.open_merged_date.connect(self._on_saved_open_merged)
+            widget.drafts_changed.connect(self._on_drafts_data_changed)
             return widget
 
         if key == "day_issues":
@@ -228,6 +238,7 @@ class AccountantDashboard(QWidget):
             widget.open_register.connect(self._on_day_issues_open_register)
             widget.issues_changed.connect(self._on_day_issues_badge)
             widget.mappings_applied.connect(self._on_day_issues_mapped)
+            widget.auto_fill_maps_changed.connect(self._on_auto_fill_maps_changed)
             return widget
 
         if key == "master_expenses":
@@ -364,17 +375,21 @@ class AccountantDashboard(QWidget):
             self._register.drafts_changed.connect(
                 lambda: asyncio.ensure_future(self._refresh_drafts_badge())
             )
+            self._register.rows_saved.connect(lambda _: self._refresh_saved_page())
+            self._register.drafts_changed.connect(self._refresh_saved_page)
             self._register.day_issues_requested.connect(self._on_open_day_issues)
             self._register.rows_saved.connect(
-                lambda _: asyncio.ensure_future(self._refresh_day_issues_badge())
+                lambda _: self._on_day_issues_data_changed()
             )
-            self._register.drafts_changed.connect(
-                lambda: asyncio.ensure_future(self._refresh_day_issues_badge())
-            )
+            self._register.drafts_changed.connect(self._on_day_issues_data_changed)
             self._register.day_issues_source_changed.connect(
                 self._on_day_issues_source_changed
             )
             page = _TablePage(self._register)
+            # Match current window chrome (labels only when maximized).
+            win = self.window()
+            if win is not None and hasattr(page, "set_chrome_maximized"):
+                page.set_chrome_maximized(win.isMaximized())
             return page
 
         if key == "browse":
@@ -460,6 +475,10 @@ class AccountantDashboard(QWidget):
     def sync_chrome_maximized(self, maximized: bool) -> None:
         """Keep title-bar restore/maximize icon in sync with the host window."""
         self._title_bar.set_maximized(maximized)
+        table_page = self._pages.get("table")
+        sync_tb = getattr(table_page, "set_chrome_maximized", None)
+        if callable(sync_tb):
+            sync_tb(maximized)
 
     def _on_change_password(self) -> None:
         dlg = ChangePasswordDialog(parent=self)
@@ -495,6 +514,24 @@ class AccountantDashboard(QWidget):
         except Exception:
             count = 0
         self._sidebar.set_drafts_badge(count)
+        if hasattr(self._sidebar, "set_saved_badge"):
+            self._sidebar.set_saved_badge(count)
+
+    def _refresh_saved_page(self) -> None:
+        widget = self._pages.get("saved")
+        if widget is not None and hasattr(widget, "refresh"):
+            widget.refresh()
+
+    def _on_drafts_data_changed(self) -> None:
+        """Keep Drafts + Saved + badges aligned after discard/submit."""
+        asyncio.ensure_future(self._refresh_drafts_badge())
+        drafts = self._pages.get("drafts")
+        saved = self._pages.get("saved")
+        current = self._stack.currentWidget()
+        if drafts is not None and current is not drafts and hasattr(drafts, "refresh"):
+            drafts.refresh()
+        if saved is not None and current is not saved and hasattr(saved, "refresh"):
+            saved.refresh()
 
     def _on_day_issues_badge(self, count: int) -> None:
         if hasattr(self._sidebar, "set_day_issues_badge"):
@@ -512,10 +549,36 @@ class AccountantDashboard(QWidget):
             target, descriptions, **kwargs
         )
 
+    def _day_issues_page_visible(self) -> bool:
+        widget = self._pages.get("day_issues")
+        return widget is not None and self._stack.currentWidget() is widget
+
+    def _schedule_day_issues_badge_refresh(self) -> None:
+        self._day_issues_badge_timer.start()
+
+    def _run_debounced_day_issues_badge(self) -> None:
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._refresh_day_issues_badge())
+
+    def _on_day_issues_data_changed(self) -> None:
+        widget = self._pages.get("day_issues")
+        visible = self._day_issues_page_visible()
+        if widget is not None:
+            if visible:
+                widget.on_register_source_changed(visible=True)
+            else:
+                widget.mark_dirty()
+                self._schedule_day_issues_badge_refresh()
+        else:
+            self._schedule_day_issues_badge_refresh()
+
     async def _refresh_day_issues_badge(self) -> None:
         from datetime import date as _date
         from tahmeed.services.day_issues_service import count_day_issues
 
+        # When Day Issues is open, badge comes from issues_changed — skip duplicate collect.
+        if self._day_issues_page_visible():
+            return
         target = _date.today()
         if self._register is not None and getattr(self._register, "_current_date", None):
             target = self._register._current_date
@@ -533,25 +596,41 @@ class AccountantDashboard(QWidget):
         self._on_day_issues_badge(count)
 
     def _on_day_issues_source_changed(self) -> None:
-        from tahmeed.ui.async_utils import schedule_coro
-
-        schedule_coro(self._refresh_day_issues_badge())
         widget = self._pages.get("day_issues")
-        if widget is not None and self._stack.currentWidget() is widget:
-            schedule_coro(widget.refresh())
+        visible = self._day_issues_page_visible()
+        if widget is not None:
+            widget.on_register_source_changed(visible=visible)
+        if not visible:
+            self._schedule_day_issues_badge_refresh()
 
     def _on_open_day_issues(self, target=None) -> None:
-        from tahmeed.ui.async_utils import in_running_task, schedule_call, schedule_coro
+        from datetime import date as _date
+        from tahmeed.ui.async_utils import in_running_task, schedule_call
+        from tahmeed.ui.cashier.day_issues import DayIssuesNavTarget
 
         self._sidebar.select("day_issues")
 
         def _go() -> None:
             widget = self._ensure_page("day_issues")
             self._stack.setCurrentIndex(self._page_indices["day_issues"])
-            if target is not None and hasattr(widget, "set_date"):
-                widget.set_date(target)
-            elif hasattr(widget, "refresh"):
-                schedule_coro(widget.refresh())
+            nav = target if isinstance(target, DayIssuesNavTarget) else None
+            day = nav.date if nav is not None else target
+            if day is None:
+                day = _date.today()
+                if self._register is not None and getattr(
+                    self._register, "_current_date", None
+                ):
+                    day = self._register._current_date
+            if nav is not None and hasattr(widget, "open_from_verify"):
+                widget.open_from_verify(
+                    day,
+                    description_keys=nav.description_keys,
+                    all_days=nav.all_days,
+                )
+            elif hasattr(widget, "open_for_date"):
+                widget.open_for_date(day)
+            elif hasattr(widget, "set_date"):
+                widget.set_date(day)
 
         if in_running_task() and "day_issues" not in self._pages:
             schedule_call(_go)
@@ -562,9 +641,14 @@ class AccountantDashboard(QWidget):
         self._on_drafts_open_register(d)
 
     def _on_day_issues_mapped(self) -> None:
-        # Table already stamped in-place (including unsaved); do not full-refresh.
-        from tahmeed.ui.async_utils import schedule_coro
-        schedule_coro(self._refresh_day_issues_badge())
+        # issues_changed from the widget already updates the badge.
+        pass
+
+    def _on_auto_fill_maps_changed(self, on: bool) -> None:
+        if self._register is not None and hasattr(
+            self._register, "set_auto_fill_from_maps"
+        ):
+            self._register.set_auto_fill_from_maps(on)
 
     def _on_drafts_open_register(self, d) -> None:
         from tahmeed.ui.async_utils import in_running_task, schedule_call
@@ -582,6 +666,10 @@ class AccountantDashboard(QWidget):
             schedule_call(_go)
         else:
             _go()
+
+    def _on_saved_open_merged(self, d) -> None:
+        """Saved row click → Table Merged for that day (all cashiers)."""
+        self._on_drafts_open_register(d)
 
     def _on_overview_nav(self, key: str) -> None:
         self._sidebar.select(key)
@@ -684,6 +772,9 @@ class AccountantDashboard(QWidget):
                             self._register, "_current_date", None
                         ):
                             target = self._register._current_date
+                        if hasattr(widget, "open_for_date"):
+                            widget.open_for_date(target)
+                            return
                         if hasattr(widget, "set_date"):
                             widget.set_date(target)
                             return

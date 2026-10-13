@@ -324,8 +324,15 @@ async def collect_day_issues_all_days(
     live_transactions: Optional[Sequence] = None,
     live_extras: Optional[Sequence] = None,
     limit_days: int = 120,
+    day_cache: Optional[dict] = None,
+    payee_names: Optional[Sequence[str]] = None,
 ) -> DayIssuesSnapshot:
-    """Build Day Issues across open register days (incomplete rows only)."""
+    """Build Day Issues across open register days (incomplete rows only).
+
+    When *day_cache* is provided, previously scanned days are reused unless they
+    are the live register day (always refreshed from live rows). Successful
+    scans are written back into *day_cache*.
+    """
     from tahmeed.services.cashier_service import get_open_day_summaries
 
     anchor = anchor_date or date.today()
@@ -353,13 +360,23 @@ async def collect_day_issues_all_days(
 
     snaps: list[DayIssuesSnapshot] = []
     for d in sorted(set(days)):
+        is_live = live_target is not None and d == live_target
+        cached = None if day_cache is None else day_cache.get(d)
+        if cached is not None and not is_live:
+            snaps.append(cached)
+            continue
         kwargs: dict = {"cashier_id": cashier_id}
-        if live_target is not None and d == live_target:
+        if payee_names is not None:
+            kwargs["payee_names"] = payee_names
+        if is_live:
             if live_transactions is not None:
                 kwargs["transactions"] = live_transactions
             if live_extras is not None:
                 kwargs["extra_transactions"] = live_extras
-        snaps.append(await collect_day_issues(d, **kwargs))
+        snap = await collect_day_issues(d, **kwargs)
+        if day_cache is not None:
+            day_cache[d] = snap
+        snaps.append(snap)
 
     if not snaps:
         return DayIssuesSnapshot(

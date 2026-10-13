@@ -36,6 +36,27 @@ def _capture_stylesheet_errors(build) -> list[str]:
     return [m for m in msgs if "Could not parse stylesheet" in m]
 
 
+def test_day_issues_autofit_and_checkbox_style_constants(qapp) -> None:
+    from tahmeed.ui.cashier.day_issues import (
+        _BLUE_L,
+        _COL_DESC,
+        _COL_KEY,
+        _FIXED_COLS,
+        _checkbox_style,
+        payee_needs_create,
+    )
+
+    assert _COL_KEY == "day_issues_table_v3"
+    assert _COL_DESC not in _FIXED_COLS
+    style = _checkbox_style()
+    assert _BLUE_L in style
+    assert "indicator:checked" in style
+    assert "image:url(" in style
+    assert payee_needs_create("NEW CO", ["CITY", "BANK"]) is True
+    assert payee_needs_create("city", ["CITY", "BANK"]) is False
+    assert payee_needs_create("", ["CITY"]) is False
+
+
 def test_day_issues_widget_stylesheets_parse(qapp):
     from tahmeed.ui.cashier.day_issues import DayIssuesWidget
 

@@ -49,13 +49,18 @@ def register(qapp, monkeypatch):
     return reg
 
 
-def test_build_transaction_requires_item_when_defer_off(register):
+def test_build_transaction_allows_blank_item_for_draft_save(register):
+    """Register Save-as-draft always allows blank Item (Day Issues workflow)."""
     register._defer_item_to_verify = False
     register._put(0, register._COL_DESC, "Office supplies")
     register._put(0, register._COL_TZS, "1,000.00")
 
-    with pytest.raises(ValueError, match="Item is required"):
-        register._build_transaction_from_row(0)
+    tx = register._build_transaction_from_row(0)
+    assert tx is not None
+    assert tx.description == "OFFICE SUPPLIES"
+    assert tx.item == ""
+    assert tx.category_name is None
+    assert tx.register_status == "draft"
 
 
 def test_build_transaction_allows_blank_item_when_defer_on(register):

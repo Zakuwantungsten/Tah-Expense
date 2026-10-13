@@ -337,7 +337,7 @@ async def overview_charts(
     top_payees: int = Query(5, ge=1, le=12),
     cashier_id: str | None = None,
 ) -> dict:
-    """Item spend donut + top-payee daily series for cashier Overview."""
+    """Item donut + daily money/counts + named-payee series for cashier Overview."""
     fy = int(year or date.today().year)
     year_start = datetime(fy, 1, 1)
     year_end = datetime(fy, 12, 31, 23, 59, 59)
@@ -1439,6 +1439,19 @@ async def request_or_delete_transaction(
     if not doc:
         return {"result": "not_found"}
 
+    # Cashiers may only delete / trash their own rows (Merged view safety).
+    # Accountants and admins may act on any cashier's register row.
+    role = str(actor.get("role") or "").lower()
+    actor_id = actor.get("_id")
+    owner_id = doc.get("cashier_id")
+    if role == "cashier" and owner_id is not None and actor_id is not None:
+        if str(owner_id) != str(actor_id):
+            raise ApiError(
+                403,
+                "forbidden",
+                "You can only delete your own register entries.",
+            )
+
     # Pending-edit clones are disposable — hard-delete the clone only.
     is_pending_edit = bool(doc.get("original_transaction_id")) and not doc.get("verified")
     if is_pending_edit:
@@ -1454,9 +1467,10 @@ async def request_or_delete_transaction(
         )
         return {"result": "deleted"}
 
-    actor_id = actor.get("_id") or doc.get("cashier_id")
-    if body and body.cashier_id:
+    # Attribute trash / deletion request to the acting user (not a spoofed body id).
+    if body and body.cashier_id and role in ("admin", "accountant"):
         actor_id = _valid_id(body.cashier_id) or actor_id
+    actor_id = actor_id or doc.get("cashier_id")
     now = utcnow().replace(tzinfo=None)
 
     # Draft / submitted but unverified → Cashier Trash (soft), no accountant gate.

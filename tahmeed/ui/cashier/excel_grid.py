@@ -70,6 +70,7 @@ from tahmeed.services.register_draft_service import (
     cells_for_json,
     cells_from_json,
     clear_register_draft,
+    clear_register_drafts_for_date,
     draft_is_empty,
     hydrate_pending_meta,
     load_register_draft,
@@ -989,6 +990,8 @@ class DailyRegister(QWidget):
         self._restrict_items: bool = False
         self._export_restrict_surfaces: set = set()
         self._defer_item_to_verify: bool = False
+        # When True, typed/pasted descriptions fill blank Item/Payee from maps.
+        self._auto_fill_from_maps: bool = True
         self._restrict_trucks: bool = True  # always on — only registered fleet numbers
         self._fleet_numbers: set = set()   # uppercased valid fleet numbers
         self._fleet_kinds: dict = {}       # number → "truck" | "trailer" | "motor_vehicle"
@@ -1015,6 +1018,8 @@ class DailyRegister(QWidget):
         self._pending_row_meta: dict = {}
         # When True, skip async side-effects from itemChanged (bulk paste/import).
         self._bulk_mutating: bool = False
+        # Coalesce Day Issues badge updates: suppress per-cell during bulk, emit once after.
+        self._day_issues_notify_pending: bool = False
         # When True, queue truck issues but do not open the correction dialog yet
         # (avoids nested asyncio during daily import modals on Python 3.14).
         self._suppress_truck_dialog: bool = False
@@ -1038,6 +1043,7 @@ class DailyRegister(QWidget):
         self._pending_row_edit: dict | None = None
         self._closing_row_edit: dict | None = None
         self._auto_fill_row: int | None = None
+        self._auto_fill_seq: int = 0  # ignore stale single-row map lookups
         self._edit_finalize_timer = QTimer(self)
         self._edit_finalize_timer.setSingleShot(True)
         self._edit_finalize_timer.setInterval(50)
@@ -1319,7 +1325,11 @@ class DailyRegister(QWidget):
         self.navigate_to_date(d, merged=True)
 
     async def _save_then_navigate(self, d: date) -> None:
-        await self._do_save()
+        ok = await self._do_save()
+        if not ok or self.has_unsaved_work():
+            self._pending_highlight = ""
+            self._load_upload_id = ""
+            return
         self._current_date = d
         if self._load_upload_id:
             self._show_register_loading("Loading upload…")
@@ -1391,22 +1401,18 @@ class DailyRegister(QWidget):
                 self._hide_register_loading()
 
     def set_merged_mode(self, merged: bool) -> None:
-        """Switch My entries ↔ Merged (all cashiers for the day)."""
+        """Switch My entries ↔ Merged (scope reload — no save-draft prompt).
+
+        Unsaved My work is stashed to the My local draft file before the flip;
+        returning to My restores it. Merged is a day browser, not an entry form.
+        """
         if bool(merged) == self._merged_mode:
             return
+        self._draft_timer.stop()
         self._commit_open_editor()
+        # Stash current-mode recovery file before flipping the merged key.
         if self.has_unsaved_work():
             self._flush_local_draft()
-            choice = self._prompt_unsaved_work(
-                "You have unsaved changes.\nSave as draft before switching mode?"
-            )
-            if choice == "cancel":
-                self.mode_changed.emit(self._merged_mode)
-                return
-            if choice == "save":
-                asyncio.ensure_future(self._save_then_switch_mode(bool(merged)))
-                return
-            self._clear_local_draft()
         self._merged_mode = bool(merged)
         self._reset_edit_state()
         self.mode_changed.emit(self._merged_mode)
@@ -1415,19 +1421,6 @@ class DailyRegister(QWidget):
             return
         self._show_register_loading("Loading…")
         asyncio.ensure_future(self._load_date(self._current_date))
-
-    async def _save_then_switch_mode(self, merged: bool) -> None:
-        ok = await self._do_save()
-        if not ok:
-            self.mode_changed.emit(self._merged_mode)
-            return
-        self._merged_mode = merged
-        self.mode_changed.emit(self._merged_mode)
-        if self._current_date is None:
-            self._populate([])
-            return
-        self._show_register_loading("Loading…")
-        await self._load_date(self._current_date)
 
     def submit_for_verify(self) -> None:
         """Submit every draft row for the current calendar day to Verify."""
@@ -1587,7 +1580,9 @@ class DailyRegister(QWidget):
         self._saved_ids   = {}
         self._saved_txs   = {}
 
-        total_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+        # Merged is a day browser — no blank entry rows. Data entry is My only.
+        editable_tail = 0 if self._merged_mode else DEFAULT_EDITABLE_ROWS
+        total_rows = self._saved_count + editable_tail
         self._table.setRowCount(total_rows)
 
         for i, tx in enumerate(transactions):
@@ -1595,7 +1590,8 @@ class DailyRegister(QWidget):
             self._saved_ids[i] = tx._id
             self._saved_txs[i] = tx
 
-        self._init_editable_rows(self._saved_count, total_rows)
+        if editable_tail:
+            self._init_editable_rows(self._saved_count, total_rows)
         self._table.blockSignals(False)
         self._renumber()
         self._clear_column_filters()
@@ -1611,9 +1607,12 @@ class DailyRegister(QWidget):
         if (
             not self._search_text
             and self._table.currentRow() < 0
-            and self._table.rowCount() > self._saved_count
+            and self._table.rowCount() > 0
         ):
-            self._table.setCurrentCell(self._saved_count, COL_DESC)
+            focus_row = (
+                self._saved_count if editable_tail else max(0, self._saved_count - 1)
+            )
+            self._table.setCurrentCell(focus_row, COL_DESC)
         self._sync_header_cheque_from_grid()
         self._emit_active_cheque()
 
@@ -1672,8 +1671,10 @@ class DailyRegister(QWidget):
         self._table.setItem(row, COL_REF,   saved_item(_ref_float_text(tx)))
 
         tzs_txt, usd_txt = _display_money_cells(tx)
-        self._table.setItem(row, COL_TZS, _money_item(tzs_txt))
-        self._table.setItem(row, COL_USD, _money_item(usd_txt))
+        # Same saved/draft chrome as sibling columns (was _money_item → white).
+        money_align = Qt.AlignRight | Qt.AlignVCenter
+        self._table.setItem(row, COL_TZS, saved_item(tzs_txt, money_align))
+        self._table.setItem(row, COL_USD, saved_item(usd_txt, money_align))
 
         # Receipt
         rcpt_it = saved_item(tx.receipt_status or "pending")
@@ -1787,10 +1788,9 @@ class DailyRegister(QWidget):
 
         item_name = txt(COL_ITEM)
         meta = self._pending_row_meta.get(row) or {}
-        allow_blank_item = self._defer_item_to_verify or bool(meta.get("daily_import_id"))
-        if not item_name and not allow_blank_item:
-            raise ValueError("Item is required. Enter an item or ask the accountant to enable description-only entries.")
-
+        # Save-as-draft allows blank Item/Payee so rows land in Drafts + Day Issues.
+        # Submit-for-Verify still gated by Day Issues. Entry form may still require
+        # Item unless defer_item_to_verify is on.
         cat = self._cat_by_name.get(item_name.lower()) if item_name else None
         if cat is not None:
             item_name = cat.name.upper()
@@ -2652,6 +2652,8 @@ class DailyRegister(QWidget):
             self._deactivate_row(row)
 
     def _append_editable_rows(self, n: int = 10) -> None:
+        if self._merged_mode:
+            return
         start = self._table.rowCount()
         self._table.setRowCount(start + n)
         self._init_editable_rows(start, start + n)
@@ -2706,8 +2708,15 @@ class DailyRegister(QWidget):
             sel_rows = sorted({i.row() for i in self._table.selectedIndexes()})
             if sel_rows and self._selection_is_full_rows(sel_rows):
                 saved = [r for r in sel_rows if r < self._saved_count]
-                if saved:
-                    self._delete_saved_rows(saved)
+                owned = self._owned_saved_rows(saved)
+                if owned:
+                    self._delete_saved_rows(owned)
+                elif saved:
+                    QMessageBox.information(
+                        self,
+                        "Delete",
+                        "You can only delete your own register entries.",
+                    )
                 # Unsaved full rows still use the existing row-remove path.
                 if any(r >= self._saved_count for r in sel_rows):
                     self._delete_rows()
@@ -2820,6 +2829,9 @@ class DailyRegister(QWidget):
 
     def _cell_editable(self, row: int, col: int) -> bool:
         if col in READONLY_COLS or col == COL_SNO:
+            return False
+        # Merged has no entry surface below the saved block.
+        if self._merged_mode and row >= self._saved_count:
             return False
         if row < self._saved_count and not self._edit_mode:
             return False
@@ -2938,6 +2950,7 @@ class DailyRegister(QWidget):
         self._update_footer()
         self._table.viewport().update()
         self._schedule_draft_autosave()
+        self._flush_day_issues_source_changed(force=True)
 
     def _apply_row_ops(self, ops: list, *, forward: bool) -> None:
         """Apply row insert/remove ops. ``forward=True`` runs as recorded; False inverts."""
@@ -2993,6 +3006,7 @@ class DailyRegister(QWidget):
         self._renumber()
         self._update_footer()
         self._schedule_draft_autosave()
+        self._flush_day_issues_source_changed(force=True)
 
     def _invert_undo_entry(self, entry: dict) -> dict:
         entry = self._normalize_undo_entry(entry)
@@ -3173,12 +3187,14 @@ class DailyRegister(QWidget):
         if not indexes:
             return
         rows = sorted({i.row() for i in indexes})
+        # Full-row copy must match `_serialize_row` / cut maps: absolute column
+        # indices including empty S/NO + Cashier. Omitting READONLY cols used to
+        # shift Date→Item on `_paste_rows` (enumerate assumed table indices).
         if self._selection_is_full_rows(rows):
-            cols = sorted(
-                c for c in range(self._table.columnCount()) if c not in READONLY_COLS
-            )
-        else:
-            cols = sorted({i.column() for i in indexes})
+            lines = ["\t".join(self._serialize_row(r)) for r in rows]
+            QApplication.clipboard().setText("\n".join(lines))
+            return
+        cols = sorted({i.column() for i in indexes})
         lines = []
         for row in rows:
             row_cells = []
@@ -3279,6 +3295,30 @@ class DailyRegister(QWidget):
             else:
                 cells.append(it.text())
         return cells
+
+    def _tsv_cells_to_column_map(self, cells: list) -> dict:
+        """Map a TSV row to table column→text without shifting fields.
+
+        Prefers full-width serialize (len == columnCount). Also accepts the
+        older "data columns only" shape that omitted S/NO + Cashier.
+        """
+        ncols = self._table.columnCount()
+        if not cells:
+            return {}
+        if len(cells) >= ncols:
+            return {
+                col: cells[col]
+                for col in range(ncols)
+                if col != COL_SNO
+            }
+        data_cols = [c for c in range(ncols) if c not in READONLY_COLS]
+        if len(cells) == len(data_cols):
+            return {col: cells[i] for i, col in enumerate(data_cols)}
+        return {
+            col: cell
+            for col, cell in enumerate(cells)
+            if col < ncols and col != COL_SNO
+        }
 
     def _row_value_map(self, row: int) -> dict:
         """Column index → exact cell text for cut/insert (preserves Receipt/Cashier)."""
@@ -3469,14 +3509,17 @@ class DailyRegister(QWidget):
             insert_at = max(0, insert_at - removed_before)
             self._clear_cut_marquee()
             clear_cut_after = False
-            min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+            pad = 0 if self._merged_mode else DEFAULT_EDITABLE_ROWS
+            min_rows = self._saved_count + pad
             if self._table.rowCount() < min_rows:
                 start = self._table.rowCount()
                 self._table.setRowCount(min_rows)
-                self._init_editable_rows(start, min_rows)
+                if pad:
+                    self._init_editable_rows(start, min_rows)
 
         self._record_row_insert_undo(insert_at, len(maps))
         truck_cells: list = []
+        written_rows: list = []
         self._bulk_mutating = True
         prev = self._table.blockSignals(True)
         try:
@@ -3489,14 +3532,25 @@ class DailyRegister(QWidget):
                 if was_saved:
                     insert_at = min(insert_at, self._saved_count)
                 else:
+                    if self._merged_mode:
+                        # Merged is not an entry surface — skip unsaved row inserts.
+                        continue
                     insert_at = max(insert_at, self._saved_count)
 
                 self._shift_row_maps_on_insert(insert_at)
                 self._table.insertRow(insert_at)
-                self._init_editable_rows(insert_at, insert_at + 1)
+                if was_saved:
+                    # Saved move: read-only style until _restore_moved_row_meta.
+                    for col in range(self._table.columnCount()):
+                        it = QTableWidgetItem("")
+                        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                        self._table.setItem(insert_at, col, it)
+                else:
+                    self._init_editable_rows(insert_at, insert_at + 1)
                 truck_cells.extend(self._write_row_values(insert_at, values))
                 self._restore_moved_row_meta(insert_at, meta)
                 self._sync_row_date(insert_at)
+                written_rows.append(insert_at)
                 if was_saved:
                     self._saved_count += 1
                 insert_at += 1
@@ -3510,6 +3564,7 @@ class DailyRegister(QWidget):
             self._clear_cut_source_cells()
         self.edit_state_changed.emit(self._edit_mode, len(self._dirty_rows))
         self._schedule_draft_autosave()
+        self._schedule_bulk_auto_fill_from_maps(written_rows)
 
     def _clear_cut_source_cells(self) -> None:
         """After a successful paste/insert, clear/remove the original cut source."""
@@ -3526,11 +3581,13 @@ class DailyRegister(QWidget):
                     self._table.removeRow(row)
                     if row < self._saved_count:
                         self._saved_count -= 1
-                min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+                pad = 0 if self._merged_mode else DEFAULT_EDITABLE_ROWS
+                min_rows = self._saved_count + pad
                 if self._table.rowCount() < min_rows:
                     start = self._table.rowCount()
                     self._table.setRowCount(min_rows)
-                    self._init_editable_rows(start, min_rows)
+                    if pad:
+                        self._init_editable_rows(start, min_rows)
             else:
                 for row, col in list(self._cut_cells):
                     if row < 0 or row >= self._table.rowCount():
@@ -3625,14 +3682,16 @@ class DailyRegister(QWidget):
             )
             return
 
+        # TSV row insert creates new entry rows — My entries only.
+        if self._merged_mode:
+            return
+
         cur = self._table.currentRow()
-        if self._merged_mode and self._edit_mode:
-            insert_at = max(cur, 0)
-        else:
-            insert_at = max(cur, self._saved_count)
+        insert_at = max(cur, self._saved_count)
 
         self._record_row_insert_undo(insert_at, len(lines))
         truck_cells: list = []
+        written_rows: list = []
         self._bulk_mutating = True
         prev = self._table.blockSignals(True)
         try:
@@ -3641,13 +3700,10 @@ class DailyRegister(QWidget):
                 self._table.insertRow(insert_at)
                 self._init_editable_rows(insert_at, insert_at + 1)
                 cells = line.split("\t")
-                values = {
-                    col: cell
-                    for col, cell in enumerate(cells)
-                    if col < self._table.columnCount() and col != COL_SNO
-                }
+                values = self._tsv_cells_to_column_map(cells)
                 truck_cells.extend(self._write_row_values(insert_at, values))
                 self._sync_row_date(insert_at)
+                written_rows.append(insert_at)
                 if insert_at < self._saved_count:
                     self._saved_count += 1
                 insert_at += 1
@@ -3659,6 +3715,7 @@ class DailyRegister(QWidget):
         self._finalize_truck_cells(truck_cells)
         if clear_cut_after and self._has_cut_buffer() and self._cut_is_rows:
             self._clear_cut_source_cells()
+        self._schedule_bulk_auto_fill_from_maps(written_rows)
 
     def _paste(self) -> None:
         text = QApplication.clipboard().text()
@@ -3695,6 +3752,7 @@ class DailyRegister(QWidget):
             sel_cols = []
 
         truck_cells: list = []  # (row, raw_text)
+        autofill_rows: set = set()
         self._bulk_mutating = True
         try:
             # Single clipboard value pasted onto a multi-cell selection: fill every
@@ -3705,6 +3763,8 @@ class DailyRegister(QWidget):
                 cell_value = lines[0].strip()
                 prev = self._table.blockSignals(True)
                 for row in sel_rows:
+                    if self._merged_mode and row >= self._saved_count:
+                        continue
                     for col in sel_cols:
                         if col in READONLY_COLS:
                             continue
@@ -3727,6 +3787,8 @@ class DailyRegister(QWidget):
                                 truck_cells.append((row, cell_value))
                         else:
                             self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell_value)))
+                            if col == COL_DESC and cell_value:
+                                autofill_rows.add(row)
                     if row < self._saved_count and self._edit_mode:
                         self._mark_dirty(row)
                     self._sync_row_date(row)
@@ -3742,7 +3804,11 @@ class DailyRegister(QWidget):
                         row = start_row + r
                         col = start_col + c
                         if row >= self._table.rowCount():
+                            if self._merged_mode:
+                                break
                             self._append_editable_rows(20)
+                        if self._merged_mode and row >= self._saved_count:
+                            continue
                         if col >= self._table.columnCount() or col in READONLY_COLS:
                             continue
                         if row < self._saved_count and not self._edit_mode:
@@ -3768,10 +3834,16 @@ class DailyRegister(QWidget):
                                 truck_cells.append((row, raw))
                         else:
                             self._table.setItem(row, col, QTableWidgetItem(_upper_text(col, cell.strip())))
+                            if col == COL_DESC and cell.strip():
+                                autofill_rows.add(row)
                 for row in touched_rows:
                     if row < self._saved_count and self._edit_mode:
                         self._mark_dirty(row)
                     self._sync_row_date(row)
+                # If paste was Descs-only column or multi-col including Desc via row maps
+                # of blank item/payee, also consider all touched rows that now have Desc.
+                if not autofill_rows:
+                    autofill_rows = set(touched_rows)
                 self._table.blockSignals(prev)
                 self._renumber()
                 self._finalize_truck_cells(truck_cells)
@@ -3782,6 +3854,8 @@ class DailyRegister(QWidget):
             self._clear_cut_source_cells()
         self._update_footer()
         self._schedule_draft_autosave()
+        # blockSignals skipped itemChanged — map-fill then one badge update.
+        self._schedule_bulk_auto_fill_from_maps(autofill_rows)
 
     def _clear_selected(self) -> None:
         snap = self._snapshot_selection()
@@ -3804,6 +3878,8 @@ class DailyRegister(QWidget):
             self._push_undo_cells(snap)
         self._renumber()
         self._update_footer()
+        if cleared_rows:
+            self._flush_day_issues_source_changed(force=True)
 
     def _fill_down(self) -> None:
         """Ctrl+D: copy the top row of the selection into all rows below it."""
@@ -3846,6 +3922,8 @@ class DailyRegister(QWidget):
         self._table.blockSignals(False)
         self._renumber()
         self._finalize_truck_cells(truck_cells)
+        # Fill-down may copy Description into blank Item/Payee rows.
+        self._schedule_bulk_auto_fill_from_maps(rows[1:])
 
     def _copy_cell_from_to(
         self, src_row: int, src_col: int, dst_row: int, dst_col: int,
@@ -3994,39 +4072,102 @@ class DailyRegister(QWidget):
     # Context menu
     # ------------------------------------------------------------------
 
+    def _owns_saved_row(self, row: int) -> bool:
+        """True when the signed-in user may delete/edit this saved register row.
+
+        Cashiers: own rows only. Accountants/admins: any row (Merged oversight).
+        """
+        role = (getattr(self._user, "role", "") or "").lower()
+        if role in ("admin", "accountant"):
+            return True
+        tx = self._saved_txs.get(row)
+        if tx is None:
+            return False
+        owner = getattr(tx, "cashier_id", None)
+        uid = getattr(self._user, "_id", None)
+        if owner is None or uid is None:
+            return False
+        return str(owner) == str(uid)
+
+    def _owned_saved_rows(self, rows: list) -> list:
+        return [r for r in rows if r in self._saved_ids and self._owns_saved_row(r)]
+
+    def _add_delete_own_saved_actions(
+        self, menu: QMenu, *, row: int, saved_sel: list, owned_sel: list
+    ) -> bool:
+        """Add Delete for owned saved rows. Returns True if an action was added."""
+        if owned_sel and self._selection_is_full_rows(saved_sel):
+            label = (
+                "Delete Saved Entr"
+                + ("ies" if len(owned_sel) > 1 else "y")
+            )
+            act = menu.addAction(label)
+            act.triggered.connect(lambda: self._delete_saved_rows(owned_sel))
+            return True
+        if 0 <= row < self._saved_count and self._owns_saved_row(row):
+            act = menu.addAction("Delete Saved Entry")
+            act.triggered.connect(lambda: self._delete_saved_row(row))
+            return True
+        return False
+
     def _populate_context_menu(self, menu: QMenu) -> None:
         row = self._table.currentRow()
         sel_rows = sorted({i.row() for i in self._table.selectedIndexes()})
         saved_sel = [r for r in sel_rows if r < self._saved_count]
-        if (
-            saved_sel
-            and self._selection_is_full_rows(saved_sel)
-            and not self._edit_mode
-        ):
-            label = (
-                "Delete Saved Entr"
-                + ("ies" if len(saved_sel) > 1 else "y")
+        owned_sel = self._owned_saved_rows(saved_sel)
+
+        # Copy is always useful in Merged browse and My entry.
+        menu.addAction("Copy", self._copy)
+
+        if self._merged_mode and not self._edit_mode:
+            # Day browser: copy + delete own only. No entry / insert actions.
+            self._add_delete_own_saved_actions(
+                menu, row=row, saved_sel=saved_sel, owned_sel=owned_sel
             )
-            act = menu.addAction(label)
-            act.triggered.connect(lambda: self._delete_saved_rows(saved_sel))
-        elif 0 <= row < self._saved_count and not self._edit_mode:
-            act = menu.addAction("Delete Saved Entry")
-            act.triggered.connect(lambda: self._delete_saved_row(row))
-        else:
-            menu.addAction("Copy",  self._copy)
-            menu.addAction("Cut",   self._cut)
+            return
+
+        if self._merged_mode and self._edit_mode:
+            # Reorder saved drafts (cut/insert); still no blank-row entry.
+            menu.addAction("Cut", self._cut)
             menu.addAction("Paste", self._paste)
             if self._has_cut_buffer():
                 menu.addAction("Insert Cut Cells", self._insert_cut_cells)
-            menu.addSeparator()
-            menu.addAction("Insert Row Above",       self._insert_above)
-            menu.addAction("Insert Row Below",       self._insert_below)
-            menu.addAction("Delete Selected Row(s)", self._delete_rows)
-            if self._undo_stack:
+            if self._add_delete_own_saved_actions(
+                menu, row=row, saved_sel=saved_sel, owned_sel=owned_sel
+            ):
+                pass
+            if self._undo_stack or self._redo_stack:
                 menu.addSeparator()
+            if self._undo_stack:
                 menu.addAction("Undo", self._undo)
             if self._redo_stack:
                 menu.addAction("Redo", self._redo)
+            return
+
+        # My entries — full entry surface.
+        if not self._edit_mode and (
+            owned_sel
+            or (0 <= row < self._saved_count and self._owns_saved_row(row))
+        ):
+            menu.addSeparator()
+            self._add_delete_own_saved_actions(
+                menu, row=row, saved_sel=saved_sel, owned_sel=owned_sel
+            )
+            return
+
+        menu.addAction("Cut", self._cut)
+        menu.addAction("Paste", self._paste)
+        if self._has_cut_buffer():
+            menu.addAction("Insert Cut Cells", self._insert_cut_cells)
+        menu.addSeparator()
+        menu.addAction("Insert Row Above", self._insert_above)
+        menu.addAction("Insert Row Below", self._insert_below)
+        menu.addAction("Delete Selected Row(s)", self._delete_rows)
+        if self._undo_stack:
+            menu.addSeparator()
+            menu.addAction("Undo", self._undo)
+        if self._redo_stack:
+            menu.addAction("Redo", self._redo)
 
     def _show_context_menu(self, pos) -> None:
         menu = QMenu(self._table)
@@ -4039,6 +4180,8 @@ class DailyRegister(QWidget):
         menu.exec(global_pos)
 
     def _insert_above(self) -> None:
+        if self._merged_mode:
+            return
         row = max(self._table.currentRow(), self._saved_count)
         self._record_row_insert_undo(row, 1)
         self._shift_row_maps_on_insert(row)
@@ -4047,6 +4190,8 @@ class DailyRegister(QWidget):
         self._renumber()
 
     def _insert_below(self) -> None:
+        if self._merged_mode:
+            return
         row = max(self._table.currentRow() + 1, self._saved_count)
         self._record_row_insert_undo(row, 1)
         self._shift_row_maps_on_insert(row)
@@ -4055,6 +4200,8 @@ class DailyRegister(QWidget):
         self._renumber()
 
     def _delete_rows(self) -> None:
+        if self._merged_mode:
+            return
         rows = sorted(
             {i.row() for i in self._table.selectedIndexes()
              if i.row() >= self._saved_count},
@@ -4081,10 +4228,25 @@ class DailyRegister(QWidget):
         self._delete_saved_rows([row])
 
     def _delete_saved_rows(self, rows: list) -> None:
-        rows = sorted({r for r in rows if r in self._saved_ids})
+        requested = sorted({r for r in rows if r in self._saved_ids})
+        rows = self._owned_saved_rows(requested)
+        skipped = len(requested) - len(rows)
         n_rows = len(rows)
         if not n_rows:
+            if skipped:
+                QMessageBox.information(
+                    self,
+                    "Delete",
+                    "You can only delete your own register entries.",
+                )
             return
+        if skipped:
+            QMessageBox.information(
+                self,
+                "Delete",
+                f"{skipped} selected entr{'y belongs' if skipped == 1 else 'ies belong'} "
+                "to another cashier and will be skipped.",
+            )
 
         verified_n = 0
         pending_n = 0
@@ -4183,17 +4345,25 @@ class DailyRegister(QWidget):
             trashed = 0
             deleted = 0
             missing = 0
+            forbidden = 0
             for tx_id in tx_ids:
                 result = await request_or_delete_transaction(tx_id, cashier_id)
                 if result == "not_found":
                     missing += 1
+                elif result == "forbidden":
+                    forbidden += 1
                 elif result == "deletion_requested":
                     requested += 1
                 elif result in ("trashed", "already_trashed"):
                     trashed += 1
                 elif result == "deleted":
                     deleted += 1
-            if missing and not (requested or trashed or deleted):
+            if forbidden and not (requested or trashed or deleted):
+                QMessageBox.warning(
+                    self, "Delete",
+                    "You can only delete your own register entries.",
+                )
+            elif missing and not (requested or trashed or deleted or forbidden):
                 QMessageBox.warning(
                     self, "Not Found",
                     "Those entries were already removed.",
@@ -4212,6 +4382,11 @@ class DailyRegister(QWidget):
                     )
                 if deleted:
                     parts.append(f"{deleted} pending-edit clone(s) removed.")
+                if forbidden:
+                    parts.append(
+                        f"{forbidden} entr{'y was' if forbidden == 1 else 'ies were'} "
+                        "skipped (not yours)."
+                    )
                 title = (
                     "Moved to Trash"
                     if trashed and not requested
@@ -4231,6 +4406,15 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
 
     def import_from_file(self) -> None:
+        if self._merged_mode:
+            QMessageBox.information(
+                self,
+                "My entries only",
+                "Switch to My entries to import.\n\n"
+                "Merged shows every cashier’s saved rows for the day — "
+                "it is not used for data entry.",
+            )
+            return
         asyncio.ensure_future(self._run_daily_import())
 
     async def _run_daily_import(self) -> None:
@@ -4332,11 +4516,37 @@ class DailyRegister(QWidget):
         self._populate(txs)
         self._apply_column_visibility(show_cashier=show_cashier)
 
-    def _kick_auto_fill_item(self, row: int, description: str) -> None:
-        if self._bulk_mutating or not description.strip():
+    def _kick_auto_fill_item(self, row: int, description: str = "") -> None:
+        """Schedule exact Description-Map fill for one row (type / Tab / Enter)."""
+        if self._bulk_mutating:
             return
+        if not getattr(self, "_auto_fill_from_maps", True):
+            return
+        # Prefer live cell text — Tab accept + uppercase may have just settled.
+        live = self._cell_text(row, COL_DESC).strip() or (description or "").strip()
+        if not live:
+            return
+        self._auto_fill_seq += 1
+        seq = self._auto_fill_seq
         self._auto_fill_row = row
-        asyncio.ensure_future(self._auto_fill_from_mapping(row, description))
+        asyncio.ensure_future(self._auto_fill_from_mapping(row, live, seq=seq))
+
+    def set_auto_fill_from_maps(self, enabled: bool) -> None:
+        """Toggle live cache used by type/paste auto-fill (setting persisted elsewhere)."""
+        self._auto_fill_from_maps = bool(enabled)
+
+    def _schedule_bulk_auto_fill_from_maps(self, rows) -> None:
+        """After paste/bulk desc edits: one batched map lookup, then badge flush."""
+        row_list = sorted({int(r) for r in (rows or []) if r is not None and int(r) >= 0})
+        if not row_list:
+            self._flush_day_issues_source_changed(force=True)
+            return
+        if not getattr(self, "_auto_fill_from_maps", True):
+            self._flush_day_issues_source_changed(force=True)
+            return
+        from tahmeed.ui.async_utils import schedule_coro
+
+        schedule_coro(self._auto_fill_rows_from_mappings(row_list))
 
     def _load_staged_import_rows(self, payloads: list) -> None:
         if not payloads:
@@ -4447,6 +4657,7 @@ class DailyRegister(QWidget):
         self._finalize_truck_cells(truck_cells)
         self._update_footer()
         self._schedule_draft_autosave()
+        self._flush_day_issues_source_changed(force=True)
 
     def _load_rows(self, file_rows: List[List]) -> None:
         """Legacy positional loader kept for CSV paste-compat helpers."""
@@ -4546,6 +4757,14 @@ class DailyRegister(QWidget):
                 self,
                 "Reconciled Date required",
                 "Set Reconciled Date before saving.",
+            )
+            return
+        if self._merged_mode and not self._dirty_rows:
+            QMessageBox.information(
+                self,
+                "My entries only",
+                "Switch to My entries to add new drafts.\n\n"
+                "Merged is for browsing everyone’s saved rows for this day.",
             )
             return
         if self._save_in_flight or self._submit_in_flight:
@@ -4846,6 +5065,10 @@ class DailyRegister(QWidget):
         self._pending_truck_issues.clear()
         self._header_cheque = ""
         self._current_date = None
+        # New table is always My entries (Merged has no entry surface).
+        if self._merged_mode:
+            self._merged_mode = False
+            self.mode_changed.emit(False)
         self._populate([])
         self._apply_column_visibility(show_cashier=False)
         self._hide_register_loading()
@@ -5097,7 +5320,30 @@ class DailyRegister(QWidget):
         return False
 
     def _notify_day_issues_source_changed(self) -> None:
+        """Mark Day Issues dirty / refresh badge.
+
+        During bulk paste/import, defer to one emit via
+        ``_flush_day_issues_source_changed`` so the sidebar count stays live
+        without scanning on every cell.
+        """
         if self._bulk_mutating:
+            self._day_issues_notify_pending = True
+            return
+        self._day_issues_notify_pending = False
+        self.day_issues_source_changed.emit()
+
+    def _flush_day_issues_source_changed(self, *, force: bool = False) -> None:
+        """Emit one Day Issues source-changed after a blocked-signal bulk edit.
+
+        Paste/clear/fill-down use ``blockSignals`` so ``itemChanged`` never runs;
+        callers must flush once afterward (Qt bulk-update best practice).
+        """
+        if not force and not self._day_issues_notify_pending:
+            return
+        self._day_issues_notify_pending = False
+        if self._bulk_mutating:
+            # Still inside a nested bulk — keep pending for the outer flush.
+            self._day_issues_notify_pending = True
             return
         self.day_issues_source_changed.emit()
 
@@ -5211,12 +5457,16 @@ class DailyRegister(QWidget):
         item_name: str,
         category_id=None,
         cashier_id=None,
+        emit_source_changed: bool = True,
     ) -> int:
         """Stamp Payee + Item onto matching live / draft rows for *target*.
 
         Updates unsaved Table rows in place (no Save required). Also updates
         saved-row cells on the open register so the UI matches the DB patch.
         When the Table is on another date, patches the local draft file.
+
+        Pass ``emit_source_changed=False`` when the caller (e.g. Day Issues map)
+        will refresh Day Issues itself — avoids a duplicate full scan.
         """
         from tahmeed.services.description_mapping_service import normalize_description
 
@@ -5237,6 +5487,7 @@ class DailyRegister(QWidget):
                 item_name=item_text,
                 category_id=category_id,
                 cashier_id=cashier_id,
+                emit_source_changed=emit_source_changed,
             )
         return self._apply_mapping_to_local_draft(
             target,
@@ -5254,6 +5505,7 @@ class DailyRegister(QWidget):
         item_name: str,
         category_id=None,
         cashier_id=None,
+        emit_source_changed: bool = True,
     ) -> int:
         from dataclasses import replace
 
@@ -5314,7 +5566,8 @@ class DailyRegister(QWidget):
             self._bulk_mutating = prev_bulk
         if updated:
             self._schedule_draft_autosave()
-            self.day_issues_source_changed.emit()
+            if emit_source_changed:
+                self.day_issues_source_changed.emit()
         return updated
 
     def _write_mapping_cells(
@@ -5400,14 +5653,17 @@ class DailyRegister(QWidget):
             # Local draft must never break typing / save.
             pass
 
-    def _clear_local_draft(self) -> None:
+    def _clear_local_draft(self, *, both_modes: bool = False) -> None:
         self._draft_timer.stop()
         if self._current_date is None:
             return
         try:
-            clear_register_draft(
-                self._user._id, self._current_date, merged=self._merged_mode
-            )
+            if both_modes:
+                clear_register_drafts_for_date(self._user._id, self._current_date)
+            else:
+                clear_register_draft(
+                    self._user._id, self._current_date, merged=self._merged_mode
+                )
         except Exception:
             pass
 
@@ -5425,15 +5681,17 @@ class DailyRegister(QWidget):
                     "cells": cells_for_json(self._row_value_map(row)),
                 })
 
+        # Merged never persists typed "new" rows — entry belongs in My.
         new_rows: list = []
-        for row in range(self._saved_count, self._table.rowCount()):
-            if not self._row_has_data(row):
-                continue
-            pending = self._pending_row_meta.get(row)
-            new_rows.append({
-                "cells": cells_for_json(self._row_value_map(row)),
-                "pending_meta": serialize_pending_meta(pending),
-            })
+        if not self._merged_mode:
+            for row in range(self._saved_count, self._table.rowCount()):
+                if not self._row_has_data(row):
+                    continue
+                pending = self._pending_row_meta.get(row)
+                new_rows.append({
+                    "cells": cells_for_json(self._row_value_map(row)),
+                    "pending_meta": serialize_pending_meta(pending),
+                })
 
         return build_draft_payload(
             user_id=self._user._id,
@@ -5499,7 +5757,8 @@ class DailyRegister(QWidget):
                         it.setBackground(QBrush(DIRTY_BG))
                 dirty_applied += 1
 
-            if new_entries:
+            # Never restore typed new rows onto Merged (entry is My-only).
+            if new_entries and not self._merged_mode:
                 start = self._first_empty_editable_row()
                 needed = start + len(new_entries) - self._table.rowCount()
                 if needed > 0:
@@ -5524,6 +5783,8 @@ class DailyRegister(QWidget):
         self._renumber()
         self._finalize_truck_cells(truck_cells)
         self._update_footer()
+        if dirty_applied or new_applied:
+            self._flush_day_issues_source_changed(force=True)
         if dirty_applied:
             self.edit_state_changed.emit(True, len(self._dirty_rows))
         elif self._edit_mode:
@@ -5642,7 +5903,7 @@ class DailyRegister(QWidget):
         return await self._do_save()
 
     async def _do_save(self) -> bool:
-        """Persist dirty + new rows. Returns False if the user cancelled mid-save."""
+        """Persist dirty + new rows. Returns False if cancelled or leftovers remain."""
         if self._save_in_flight:
             return False
         self._save_in_flight = True
@@ -5650,12 +5911,14 @@ class DailyRegister(QWidget):
         nested_under_submit = self._submit_in_flight
         if not nested_under_submit:
             self.save_busy_changed.emit(True)
+            self._show_register_loading("Saving draft…")
         try:
             return await self._do_save_body()
         finally:
             self._save_in_flight = False
             if not nested_under_submit and not self._submit_in_flight:
                 self.save_busy_changed.emit(False)
+                self._hide_register_loading()
 
     async def _do_save_body(self) -> bool:
         """Inner save implementation (caller holds `_save_in_flight`)."""
@@ -5736,116 +5999,115 @@ class DailyRegister(QWidget):
             except Exception as exc:
                 errors.append(f"Row {row + 1}: {exc}")
 
-        # ── Pass 2: insert brand-new rows (INSERT) ───────────────────────
-        try:
-            dup_days = int(await get_setting("duplicate_check_days") or 5)
-        except Exception:
-            dup_days = 5
-
-        # ── Pre-scan: warn once if any new rows carry a date other than the open register day
-        register_label = self._current_date.strftime("%d %b %Y")
-        _off_date = 0
-        for _s in range(self._saved_count, self._table.rowCount()):
-            if not self._row_has_data(_s):
-                continue
-            _it = self._table.item(_s, COL_DATE)
-            _ds = _it.text().strip() if _it else ""
-            _parsed = _parse_optional_date(_ds, default_year=self._current_date.year)
-            if _parsed is not None:
-                _td = _parsed.date()
-            else:
-                _td = self._current_date
-            if _td != self._current_date:
-                _off_date += 1
-        if _off_date:
-            _plural = "s" if _off_date != 1 else ""
-            _are    = "are" if _off_date != 1 else "is"
-            if QMessageBox.warning(
-                self, "Off-date Entries",
-                f"{_off_date} row{_plural} {_are} not dated {register_label}.\n\n"
-                "They will stay on this register day (visible after Save) but "
-                "will be flagged in the accountant's Verify inbox.\n\n"
-                "Proceed with save?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            ) == QMessageBox.No:
-                return False
-
+        # ── Pass 2: insert brand-new rows (INSERT) — My entries only ───
         pending_inserts: list[tuple[int, Transaction]] = []
-        duplicate_items: list[DuplicateReviewItem] = []
-
-        append_order = None
         if not self._merged_mode:
+            try:
+                dup_days = int(await get_setting("duplicate_check_days") or 5)
+            except Exception:
+                dup_days = 5
+
+            # Pre-scan: warn once if any new rows carry a date other than the open day
+            register_label = self._current_date.strftime("%d %b %Y")
+            _off_date = 0
+            for _s in range(self._saved_count, self._table.rowCount()):
+                if not self._row_has_data(_s):
+                    continue
+                _it = self._table.item(_s, COL_DATE)
+                _ds = _it.text().strip() if _it else ""
+                _parsed = _parse_optional_date(
+                    _ds, default_year=self._current_date.year
+                )
+                if _parsed is not None:
+                    _td = _parsed.date()
+                else:
+                    _td = self._current_date
+                if _td != self._current_date:
+                    _off_date += 1
+            if _off_date:
+                _plural = "s" if _off_date != 1 else ""
+                _are = "are" if _off_date != 1 else "is"
+                if QMessageBox.warning(
+                    self, "Off-date Entries",
+                    f"{_off_date} row{_plural} {_are} not dated {register_label}.\n\n"
+                    "They will stay on this register day (visible after Save) but "
+                    "will be flagged in the accountant's Verify inbox.\n\n"
+                    "Proceed with save?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                ) == QMessageBox.No:
+                    return False
+
+            duplicate_items: list[DuplicateReviewItem] = []
+            append_order = None
             try:
                 append_order = await next_day_order(self._current_date)
             except Exception:
                 append_order = None
 
-        for row in range(self._saved_count, self._table.rowCount()):
-            if not self._row_has_data(row):
-                continue
-            try:
-                tx = self._build_transaction_from_row(row)
-            except ValueError as exc:
-                errors.append(f"Row {row + 1}: {exc}")
-                continue
-            if tx is None:
-                continue
+            for row in range(self._saved_count, self._table.rowCount()):
+                if not self._row_has_data(row):
+                    continue
+                try:
+                    tx = self._build_transaction_from_row(row)
+                except ValueError as exc:
+                    errors.append(f"Row {row + 1}: {exc}")
+                    continue
+                if tx is None:
+                    continue
 
-            if self._merged_mode:
-                tx.day_order = row
-            elif append_order is not None:
-                tx.day_order = append_order
-                append_order += 1
-            else:
-                tx.day_order = row
+                if append_order is not None:
+                    tx.day_order = append_order
+                    append_order += 1
+                else:
+                    tx.day_order = row
 
-            dupes = []
-            try:
-                dupes = await check_for_duplicates(
-                    truck_number=tx.truck_number or "",
-                    amount=tx.amount,
-                    item=tx.item or "",
-                    description=tx.description or "",
-                    days=dup_days,
-                )
-            except Exception:
                 dupes = []
+                try:
+                    dupes = await check_for_duplicates(
+                        truck_number=tx.truck_number or "",
+                        amount=tx.amount,
+                        item=tx.item or "",
+                        description=tx.description or "",
+                        days=dup_days,
+                    )
+                except Exception:
+                    dupes = []
 
-            if dupes:
-                duplicate_items.append(DuplicateReviewItem(
-                    row=row,
-                    row_display=row + 1,
-                    description=tx.description or "—",
-                    truck_number=tx.truck_number or "",
-                    item=tx.item or "",
-                    amount=tx.amount,
-                    amount_label=format_amount_label(tx),
-                    existing=dupes[0],
-                ))
-            pending_inserts.append((row, tx))
+                if dupes:
+                    duplicate_items.append(DuplicateReviewItem(
+                        row=row,
+                        row_display=row + 1,
+                        description=tx.description or "—",
+                        truck_number=tx.truck_number or "",
+                        item=tx.item or "",
+                        amount=tx.amount,
+                        amount_label=format_amount_label(tx),
+                        existing=dupes[0],
+                    ))
+                pending_inserts.append((row, tx))
 
-        save_anyway: set[int] = set()
-        if duplicate_items:
-            dlg = DuplicateReviewDialog(
-                duplicate_items, dup_days=dup_days, parent=self,
-            )
-            if dlg.exec() != QDialog.Accepted:
-                self._flush_local_draft()
-                return False
-            save_anyway = dlg.save_anyway_rows()
+            save_anyway: set[int] = set()
+            if duplicate_items:
+                dlg = DuplicateReviewDialog(
+                    duplicate_items, dup_days=dup_days, parent=self,
+                )
+                if dlg.exec() != QDialog.Accepted:
+                    self._flush_local_draft()
+                    return False
+                save_anyway = dlg.save_anyway_rows()
 
-        duplicate_rows = {item.row for item in duplicate_items}
-        for row, tx in pending_inserts:
-            if row in duplicate_rows and row not in save_anyway:
-                continue
-            tx.possible_duplicate = row in save_anyway
-            try:
-                await save_transaction(tx)
-                saved += 1
-                self._pending_row_meta.pop(row, None)
-            except Exception as exc:
-                errors.append(f"Row {row + 1}: {exc}")
+            duplicate_rows = {item.row for item in duplicate_items}
+            for row, tx in pending_inserts:
+                if row in duplicate_rows and row not in save_anyway:
+                    continue
+                tx.possible_duplicate = row in save_anyway
+                try:
+                    await save_transaction(tx)
+                    saved += 1
+                    self._pending_row_meta.pop(row, None)
+                except Exception as exc:
+                    errors.append(f"Row {row + 1}: {exc}")
 
         if self._merged_mode and (saved or updated):
             try:
@@ -5859,19 +6121,47 @@ class DailyRegister(QWidget):
                 f"{saved} added, {updated} updated.\n\nErrors:\n" + "\n".join(errors),
             )
             # Keep the grid as-is and refresh the local draft so a crash still
-            # recovers remaining unsaved / failed rows.
+            # recovers remaining unsaved / failed rows. False so mode-switch /
+            # navigate callers stay on this view until leftovers are resolved.
             self._flush_local_draft()
-            return True
-        elif saved == 0 and updated == 0:
+            if saved or updated:
+                self.drafts_changed.emit()
+            return False
+        if saved == 0 and updated == 0:
+            if self.has_unsaved_work():
+                # Typed rows that could not become transactions (e.g. no
+                # description) — keep local recovery; do not claim success.
+                QMessageBox.warning(
+                    self,
+                    "Nothing saved",
+                    "No rows could be saved as draft.\n\n"
+                    "Each draft row needs at least a Description.",
+                )
+                self._flush_local_draft()
+                return False
             QMessageBox.information(self, "Nothing to save", "No changes to save.")
-            self._clear_local_draft()
+            self._clear_local_draft(both_modes=True)
             return True
-        # else: clean save — reload silently, no popup
 
-        self._clear_local_draft()
+        self._clear_local_draft(both_modes=True)
         self._reset_edit_state()
         self.rows_saved.emit(saved)
         self.drafts_changed.emit()
+        if not self._submit_in_flight:
+            parts = []
+            if saved:
+                parts.append(f"{saved} added")
+            if updated:
+                parts.append(f"{updated} updated")
+            summary = ", ".join(parts) if parts else "saved"
+            # Hide busy overlay before the dialog so it does not sit under the box.
+            self._hide_register_loading()
+            QMessageBox.information(
+                self,
+                "Draft saved",
+                f"Saved as draft: {summary}.\n\n"
+                "Open Drafts to submit for Verify when ready.",
+            )
         await self._load_date(self._current_date)
         return True
 
@@ -5944,6 +6234,12 @@ class DailyRegister(QWidget):
         except Exception:
             self._defer_item_to_verify = False
         try:
+            self._auto_fill_from_maps = bool(
+                await get_setting("auto_fill_from_description_maps")
+            )
+        except Exception:
+            self._auto_fill_from_maps = True
+        try:
             self._restrict_trucks = True
             # Persist intended default so accountant UI / other clients stay in sync.
             current = await get_setting("restrict_trucks")
@@ -5960,33 +6256,25 @@ class DailyRegister(QWidget):
         except Exception:
             self._export_restrict_surfaces = set()
 
-    async def _auto_fill_from_mapping(self, row: int, description: str) -> None:
-        """Pre-fill Item and Payee from a saved description map (blank cells only)."""
+    def _apply_mapping_fields_to_row(
+        self, row: int, cat_name: str, payee: str
+    ) -> bool:
+        """Fill blank Item/Payee on *row* from mapping fields. Returns True if changed."""
+        item_it = self._table.item(row, COL_ITEM)
+        payee_it = self._table.item(row, COL_PAYEE)
+        need_item = not (item_it and item_it.text().strip())
+        need_payee = not (payee_it and payee_it.text().strip())
+        if not need_item and not need_payee:
+            return False
+        cat_name = (cat_name or "").strip()
+        payee = (payee or "").strip()
+        if not cat_name and not payee:
+            return False
+
+        prev = self._table.blockSignals(True)
+        filled_item = None
+        changed = False
         try:
-            if not description.strip():
-                return
-            item_it = self._table.item(row, COL_ITEM)
-            payee_it = self._table.item(row, COL_PAYEE)
-            need_item = not (item_it and item_it.text().strip())
-            need_payee = not (payee_it and payee_it.text().strip())
-            if not need_item and not need_payee:
-                return
-
-            from tahmeed.services.cashier_service import (
-                resolve_mapping_fields_for_description,
-            )
-
-            try:
-                cat_name, payee = await resolve_mapping_fields_for_description(
-                    description
-                )
-            except Exception:
-                return
-            if not cat_name and not payee:
-                return
-
-            prev = self._table.blockSignals(True)
-            filled_item = None
             if need_item and cat_name:
                 if item_it is None:
                     item_it = QTableWidgetItem(cat_name)
@@ -5997,6 +6285,7 @@ class DailyRegister(QWidget):
                 else:
                     item_it.setText(cat_name)
                 filled_item = item_it
+                changed = True
             if need_payee and payee:
                 payee_text = payee.strip().upper()
                 if payee_it is None:
@@ -6007,16 +6296,138 @@ class DailyRegister(QWidget):
                     self._table.setItem(row, COL_PAYEE, payee_it)
                 else:
                     payee_it.setText(payee_text)
+                changed = True
+        finally:
             self._table.blockSignals(prev)
-            if filled_item is not None:
-                self._validate_item_cell(row, filled_item)
-                self._update_truck_required_highlight(row)
-            if (need_item and cat_name) or (need_payee and payee):
+        if filled_item is not None:
+            self._validate_item_cell(row, filled_item)
+            self._update_truck_required_highlight(row)
+        return changed
+
+    async def _auto_fill_from_mapping(
+        self, row: int, description: str = "", *, seq: int | None = None
+    ) -> None:
+        """Pre-fill Item/Payee from an exact Description Map (blank cells only).
+
+        No map → leave blank (history suggestions do not invent Item/Payee).
+        Shows the loading horse only when the lookup is slow.
+        """
+        loading_shown = False
+        # Parent may be absent in unit stubs; unparented QTimer is fine here.
+        delay = QTimer(self if isinstance(self, QObject) else None)
+        delay.setSingleShot(True)
+
+        def _show_slow_loading() -> None:
+            nonlocal loading_shown
+            if seq is not None and seq != self._auto_fill_seq:
+                return
+            if self._auto_fill_row != row:
+                return
+            self._show_register_loading("Looking up Description Map…")
+            loading_shown = True
+
+        delay.timeout.connect(_show_slow_loading)
+        delay.start(280)
+        try:
+            if not getattr(self, "_auto_fill_from_maps", True):
+                return
+            if seq is not None and seq != self._auto_fill_seq:
+                return
+            # Re-read after Tab/uppercase settle so lookup uses the committed text.
+            live = self._cell_text(row, COL_DESC).strip() or (description or "").strip()
+            if not live:
+                return
+            item_it = self._table.item(row, COL_ITEM)
+            payee_it = self._table.item(row, COL_PAYEE)
+            need_item = not (item_it and item_it.text().strip())
+            need_payee = not (payee_it and payee_it.text().strip())
+            if not need_item and not need_payee:
+                return
+
+            from tahmeed.services.description_mapping_service import (
+                resolve_mapping_for_description,
+            )
+
+            try:
+                mapping = await resolve_mapping_for_description(live)
+            except Exception:
+                return
+            if seq is not None and seq != self._auto_fill_seq:
+                return
+            if mapping is None:
+                return
+            cat_name = (getattr(mapping, "category_name", None) or "").strip()
+            payee = (getattr(mapping, "payee", None) or "").strip()
+            if self._apply_mapping_fields_to_row(row, cat_name, payee):
                 self._notify_day_issues_source_changed()
         finally:
-            if self._auto_fill_row == row:
+            delay.stop()
+            if loading_shown:
+                self._hide_register_loading()
+            if self._auto_fill_row == row and (
+                seq is None or seq == self._auto_fill_seq
+            ):
                 self._auto_fill_row = None
             self._schedule_finalize_row_edit()
+
+    async def _auto_fill_rows_from_mappings(self, rows: list) -> None:
+        """Batch exact-map auto-fill after paste — one lookup; horse if multi-row."""
+        loading_shown = False
+        try:
+            if not getattr(self, "_auto_fill_from_maps", True):
+                return
+            from tahmeed.services.description_mapping_service import (
+                get_mappings_for_descriptions,
+                normalize_description,
+            )
+
+            targets: list[tuple[int, str]] = []
+            for row in rows:
+                if row < 0 or row >= self._table.rowCount():
+                    continue
+                if row < self._saved_count and not self._edit_mode:
+                    continue
+                desc = self._cell_text(row, COL_DESC).strip()
+                if not desc:
+                    continue
+                item_blank = not self._cell_text(row, COL_ITEM).strip()
+                payee_blank = not self._cell_text(row, COL_PAYEE).strip()
+                if not item_blank and not payee_blank:
+                    continue
+                targets.append((row, desc))
+            if not targets:
+                return
+
+            if len(targets) >= 2:
+                self._show_register_loading(
+                    f"Applying Description Maps ({len(targets)})…"
+                )
+                loading_shown = True
+
+            try:
+                mappings = await get_mappings_for_descriptions(
+                    [desc for _r, desc in targets]
+                )
+            except Exception:
+                return
+
+            changed = False
+            for row, desc in targets:
+                mapping = mappings.get(normalize_description(desc))
+                if mapping is None:
+                    continue
+                cat_name = (getattr(mapping, "category_name", None) or "").strip()
+                payee = (getattr(mapping, "payee", None) or "").strip()
+                if self._apply_mapping_fields_to_row(row, cat_name, payee):
+                    changed = True
+                    if row < self._saved_count and self._edit_mode:
+                        self._mark_dirty(row)
+            if changed:
+                self._schedule_draft_autosave()
+        finally:
+            if loading_shown:
+                self._hide_register_loading()
+            self._flush_day_issues_source_changed(force=True)
 
     async def _load_fleet_numbers(self) -> None:
         from tahmeed.services.truck_service import get_fleet_kinds, get_fleet_numbers

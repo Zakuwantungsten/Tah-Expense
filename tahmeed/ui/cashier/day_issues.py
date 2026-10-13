@@ -7,13 +7,16 @@ multi-select descriptions, assign one Payee + Item, apply to open rows.
 from __future__ import annotations
 
 import asyncio
+import tempfile
+from dataclasses import dataclass
 from datetime import date
-from typing import Callable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Callable, List, Optional, Sequence, Set, Tuple
 
 import qtawesome as qta
 from bson import ObjectId
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QBrush
+from PySide6.QtCore import QDate, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter, QDialog,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
@@ -21,7 +24,6 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
     QDateEdit,
 )
-from PySide6.QtCore import QDate
 
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
 
@@ -45,16 +47,13 @@ from tahmeed.services.mapping_assignment_service import (
     materialize_mapping_assignment,
     remember_category,
 )
-from tahmeed.services.payee_service import get_payee_names
+from tahmeed.services.payee_service import add_payee, get_payee_names
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
     _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
 )
 from tahmeed.ui.dialogs.item_dialog import ItemDialog
-from tahmeed.ui.widgets.column_persistence import (
-    apply_pending_column_autofit,
-    bind_column_width_persistence,
-)
+from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.combo_styles import with_combo_popup
 from tahmeed.ui.widgets.excel_column_filter import (
     ExcelFilterHeaderView, SORT_DESC,
@@ -84,7 +83,87 @@ _COL_ROWS = 4
 _COL_PAYEE = 5
 _COL_ITEM = 6
 _COL_DETAIL = 7
-_COL_DEFAULTS = [36, 40, 90, 250, 55, 140, 140, 200]
+# Check | # | Type | Description | Rows | Payee | Item | Detail
+_COL_DEFAULTS = [36, 40, 90, 180, 55, 160, 160, 180]
+_COL_KEY = "day_issues_table_v3"
+_FIXED_COLS = frozenset({_COL_CHECK, _COL_NUM, _COL_ROWS})
+
+
+@dataclass(frozen=True)
+class DayIssuesNavTarget:
+    """Deep-link payload for Day Issues (plain date still works elsewhere).
+
+    Verify approve-gate uses this so Day Issues can list the blocked
+    descriptions (VALUE filter) and switch to All days when they span
+    more than one register day.
+    """
+
+    date: Optional[date] = None
+    description_keys: Tuple[str, ...] = ()
+    all_days: bool = False
+
+_CHECKMARK_PATH: Optional[str] = None
+
+
+def payee_needs_create(payee: str, known: Sequence[str]) -> bool:
+    """True when *payee* is non-empty and not already in the known list."""
+    name = " ".join((payee or "").strip().upper().split())
+    if not name:
+        return False
+    known_set = {(" ".join(str(p).strip().upper().split())) for p in known if str(p).strip()}
+    return name not in known_set
+
+
+def _ensure_checkmark_path() -> str:
+    """Cached PNG checkmark for faint-blue checked indicators."""
+    global _CHECKMARK_PATH
+    if _CHECKMARK_PATH and Path(_CHECKMARK_PATH).is_file():
+        return _CHECKMARK_PATH
+    path = Path(tempfile.gettempdir()) / "tahmeed_day_issues_check.png"
+    try:
+        pm = qta.icon("mdi.check-bold", color=_BLUE).pixmap(12, 12)
+        if pm.isNull():
+            raise RuntimeError("empty checkmark pixmap")
+        pm.save(str(path), "PNG")
+    except Exception:
+        pm = QPixmap(16, 16)
+        pm.fill(Qt.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor(_BLUE))
+        pen.setWidth(2)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.drawLine(4, 8, 7, 11)
+        painter.drawLine(7, 11, 12, 4)
+        painter.end()
+        pm.save(str(path), "PNG")
+    _CHECKMARK_PATH = path.resolve().as_posix()
+    return _CHECKMARK_PATH
+
+
+def _checkbox_style() -> str:
+    url = _ensure_checkmark_path()
+    return (
+        f"QCheckBox{{font-size:12px;color:{_T1};font-family:'Segoe UI';spacing:8px;}}"
+        "QCheckBox::indicator{width:16px;height:16px;border-radius:3px;"
+        f"border:1.5px solid #93C5FD;background:{_WHITE};}}"
+        f"QCheckBox::indicator:hover{{border-color:{_BLUE};}}"
+        f"QCheckBox::indicator:checked{{background:{_BLUE_L};border:1.5px solid {_BLUE};"
+        f'image:url("{url}");}}'
+        "QCheckBox::indicator:checked:hover{background:#DBEAFE;}"
+    )
+
+
+def _table_checkbox_indicator_qss() -> str:
+    url = _ensure_checkmark_path()
+    return (
+        "QTableWidget::indicator{width:14px;height:14px;border-radius:3px;"
+        f"border:1.5px solid #93C5FD;background:{_WHITE};}}"
+        f"QTableWidget::indicator:checked{{background:{_BLUE_L};"
+        f'border:1.5px solid {_BLUE};image:url("{url}");}}'
+    )
 
 
 def filter_day_issues(
@@ -252,6 +331,64 @@ class _IssuesCompleterDelegate(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
+class _NewPayeeDialog(QDialog):
+    """Create a payee name to use in Map Descriptions (persisted on Save Mapping)."""
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        prefill: str = "",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("New Payee")
+        self.setMinimumWidth(360)
+        self.setStyleSheet(f"QDialog{{background:{_WHITE};color:{_T1};}}")
+        self.result_name: str = ""
+
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(24, 24, 24, 24)
+        vl.setSpacing(12)
+        vl.addWidget(_lbl("New Payee", size=15, weight=700))
+        vl.addWidget(_lbl(
+            "Added to the Payee list and used for this mapping.",
+            size=12, color=_T2,
+        ))
+        vl.addWidget(_lbl("NAME *", size=12, color=_T2))
+        self._inp = QLineEdit()
+        self._inp.setPlaceholderText("e.g. CITY COUNCIL")
+        self._inp.setText(" ".join((prefill or "").upper().split()))
+        self._inp.setStyleSheet(
+            f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
+            f"background:{_WHITE};color:{_T1};font-size:13px;"
+            "font-family:'Segoe UI';padding:0 8px;"
+            "min-height:34px;max-height:34px;}"
+            f"QLineEdit:focus{{border-color:{_BLUE};}}"
+        )
+        self._inp.returnPressed.connect(self._accept)
+        vl.addWidget(self._inp)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel = _btn("Cancel", primary=False)
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        save = _btn("Add Payee", primary=True)
+        save.clicked.connect(self._accept)
+        btn_row.addWidget(save)
+        vl.addLayout(btn_row)
+        self._inp.setFocus()
+        self._inp.selectAll()
+
+    def _accept(self) -> None:
+        name = " ".join(self._inp.text().upper().split())
+        if not name:
+            QMessageBox.warning(self, "Validation", "Payee name is required.")
+            return
+        self.result_name = name
+        self.accept()
+
+
 class MapDescriptionsDialog(QDialog):
     """Map one or many descriptions → the same Payee + Item."""
 
@@ -269,9 +406,12 @@ class MapDescriptionsDialog(QDialog):
         self._descriptions = [d for d in descriptions if str(d).strip()]
         self._categories = sort_payment_targets(list(categories))
         self._payees = [str(p).strip().upper() for p in payees if str(p).strip()]
+        self._known_payees_at_open: Set[str] = set(self._payees)
+        self._pending_new_payees: Set[str] = set()
         self.result_payee: str = ""
         self.result_category: Optional[Category] = None
         self.result_assignment: Optional[MappingAssignment] = None
+        self.result_create_payee: bool = False
         n = len(self._descriptions)
         self.setWindowTitle(
             f"Map {n} Description{'s' if n != 1 else ''}"
@@ -366,6 +506,9 @@ class MapDescriptionsDialog(QDialog):
         cancel.clicked.connect(self.reject)
         btn_row.addWidget(cancel)
         btn_row.addStretch()
+        new_payee = _btn("New Payee…", primary=False)
+        new_payee.clicked.connect(self._on_new_payee)
+        btn_row.addWidget(new_payee)
         new_item = _btn("New Item…", primary=False)
         new_item.clicked.connect(self._on_new_item)
         btn_row.addWidget(new_item)
@@ -375,6 +518,33 @@ class MapDescriptionsDialog(QDialog):
         vl.addLayout(btn_row)
 
         self._payee.setFocus()
+
+    def _select_payee(self, name: str, *, mark_create: bool = False) -> None:
+        payee = " ".join((name or "").upper().split())
+        if not payee:
+            return
+        if payee not in self._payees:
+            self._payees.append(payee)
+            self._payee.addItem(payee)
+            completer = QCompleter(self._payees, self)
+            completer.setCaseSensitivity(Qt.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchContains)
+            self._payee.setCompleter(completer)
+        if mark_create and payee_needs_create(payee, self._known_payees_at_open):
+            self._pending_new_payees.add(payee)
+        idx = self._payee.findText(payee)
+        if idx >= 0:
+            self._payee.setCurrentIndex(idx)
+        else:
+            self._payee.setEditText(payee)
+
+    def _on_new_payee(self) -> None:
+        typed = " ".join(self._payee.currentText().upper().split())
+        prefill = typed if payee_needs_create(typed, self._known_payees_at_open) else ""
+        dlg = _NewPayeeDialog(parent=self, prefill=prefill)
+        if dlg.exec() != QDialog.Accepted or not dlg.result_name:
+            return
+        self._select_payee(dlg.result_name, mark_create=True)
 
     def _on_new_item(self) -> None:
         prefill = self._descriptions[0] if len(self._descriptions) == 1 else ""
@@ -403,6 +573,9 @@ class MapDescriptionsDialog(QDialog):
         if not self.result_payee:
             QMessageBox.warning(self, "Validation", "Payee is required.")
             return
+        self.result_create_payee = payee_needs_create(
+            self.result_payee, self._known_payees_at_open
+        )
         self.accept()
 
     def _accept(self) -> None:
@@ -417,16 +590,21 @@ class MapDescriptionsDialog(QDialog):
         if not item_name:
             QMessageBox.warning(self, "Validation", "Item is required.")
             return
-        if self._payees and payee not in {p.upper() for p in self._payees}:
-            tip = next((p for p in self._payees if payee in p or p in payee), "")
+        create_payee = payee_needs_create(payee, self._known_payees_at_open)
+        if create_payee and payee not in self._pending_new_payees:
+            tip = next(
+                (p for p in self._known_payees_at_open if payee in p or p in payee),
+                "",
+            )
             extra = f"\nDid you mean: {tip}?" if tip else ""
             if QMessageBox.question(
                 self,
-                "Payee not in list",
-                f"Payee {payee!r} was not found in the Payee list.{extra}\n\n"
-                "Save anyway?",
+                "Create payee?",
+                f"Payee {payee!r} is not in the Payee list.{extra}\n\n"
+                "Create it and save this mapping?",
             ) != QMessageBox.Yes:
                 return
+            self._pending_new_payees.add(payee)
         idx = self._item.findText(item_name)
         cat_id = self._item.itemData(idx) if idx >= 0 else None
         cat = next(
@@ -443,6 +621,7 @@ class MapDescriptionsDialog(QDialog):
             )
             return
         self.result_payee = payee
+        self.result_create_payee = create_payee
         self.result_category = cat
         self.result_assignment = MappingAssignment(
             action="assign",
@@ -510,9 +689,7 @@ class ValueFilterDialog(QDialog):
 
         self._select_all = QCheckBox("Select All (visible)")
         self._select_all.setTristate(True)
-        self._select_all.setStyleSheet(
-            f"QCheckBox{{font-size:12px;color:{_T1};font-family:'Segoe UI';}}"
-        )
+        self._select_all.setStyleSheet(_checkbox_style())
         self._select_all.stateChanged.connect(self._on_select_all)
         root.addWidget(self._select_all)
 
@@ -643,6 +820,7 @@ class DayIssuesWidget(QWidget):
     issues_changed = Signal(int)   # badge count
     open_register = Signal(object)  # date
     mappings_applied = Signal()     # refresh register rows
+    auto_fill_maps_changed = Signal(bool)  # setting: auto-fill Table from maps
 
     def __init__(
         self,
@@ -669,6 +847,12 @@ class DayIssuesWidget(QWidget):
         self._value_filter: Optional[set] = None  # description keys; None = all
         self._loading = False
         self._populating = False
+        # Perf: skip full scan on tab return unless date/scope changed or dirty.
+        self._loaded = False
+        self._dirty = True
+        # Per-day snapshots for All days (re-scan only dirty / live day).
+        self._day_snap_cache: dict = {}
+        self._lookups_loaded = False
         # Optional: (replace_transactions, extra_transactions) for live/unsaved rows.
         self._row_source = row_source
         # Optional: stamp Payee+Item onto live Table / draft rows (Phase 3).
@@ -677,6 +861,10 @@ class DayIssuesWidget(QWidget):
         self._cashier_scope_id: Optional[ObjectId] = (
             user._id if getattr(user, "role", "") == "cashier" else None
         )
+        self._source_refresh_timer = QTimer(self)
+        self._source_refresh_timer.setSingleShot(True)
+        self._source_refresh_timer.setInterval(350)
+        self._source_refresh_timer.timeout.connect(self._schedule_refresh)
         self._build()
 
     def _build(self) -> None:
@@ -689,18 +877,19 @@ class DayIssuesWidget(QWidget):
         try:
             icon_lbl = QLabel()
             icon_lbl.setPixmap(
-                qta.icon("mdi.alert-decagram-outline", color=_AMBER).pixmap(24, 24)
+                qta.icon("mdi.alert-decagram-outline", color=_BLUE).pixmap(24, 24)
             )
             icon_lbl.setFixedSize(24, 24)
             icon_lbl.setStyleSheet("background:transparent;")
             hdr.addWidget(icon_lbl)
         except Exception:
             pass
-        hdr.addWidget(_lbl("Day Issues", size=18, weight=700))
+        # Title + count chip match Description Maps / Drafts (system navy + QB blue).
+        hdr.addWidget(_lbl("Day Issues", size=18, weight=700, color=_NAVY))
 
         self._count_chip = QLabel("—")
         self._count_chip.setStyleSheet(
-            f"background:{_AMBER_L};color:{_AMBER};font-size:11px;font-weight:700;"
+            f"background:{_BLUE_L};color:{_BLUE};font-size:11px;font-weight:700;"
             "border-radius:10px;padding:2px 10px;font-family:'Segoe UI';"
         )
         hdr.addWidget(self._count_chip)
@@ -737,7 +926,7 @@ class DayIssuesWidget(QWidget):
         hdr.addWidget(self._date)
 
         refresh = _btn("Refresh", primary=False)
-        refresh.clicked.connect(lambda: self._schedule_refresh())
+        refresh.clicked.connect(lambda: self.force_refresh())
         hdr.addWidget(refresh)
 
         self._open_reg_btn = _btn("Open Table", primary=False)
@@ -760,6 +949,26 @@ class DayIssuesWidget(QWidget):
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
+
+        opts = QHBoxLayout()
+        opts.setSpacing(8)
+        self._auto_fill_maps_chk = QCheckBox(
+            "Auto-fill Item / Payee from Description Maps when typing or pasting"
+        )
+        self._auto_fill_maps_chk.setChecked(True)
+        self._auto_fill_maps_chk.setStyleSheet(_checkbox_style())
+        self._auto_fill_maps_chk.setToolTip(
+            "When on, a known description map fills blank Item and Payee cells "
+            "on the Table. Partial maps fill what they have; Day Issues still "
+            "lists rows that remain incomplete. Turn off to map only here."
+        )
+        self._auto_fill_maps_chk.toggled.connect(self._on_auto_fill_maps_toggled)
+        opts.addWidget(self._auto_fill_maps_chk)
+        opts.addStretch(1)
+        root.addLayout(opts)
+        # Load persisted setting without racing the toggled handler.
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._load_auto_fill_maps_setting())
 
         # One toolbar row: search first, then actions, status at the end.
         tools = QHBoxLayout()
@@ -842,9 +1051,11 @@ class DayIssuesWidget(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
         # Extra right padding so Description ▾ chevron does not collide with text.
+        # Table row ☐ indicators: faint-blue fill + visible checkmark.
         self._table.setStyleSheet(
             _table_style()
-            + f"QHeaderView::section{{padding:0 18px 0 6px;}}"
+            + "QHeaderView::section{padding:0 18px 0 6px;}"
+            + _table_checkbox_indicator_qss()
         )
         self._table.setItemDelegateForColumn(
             _COL_PAYEE,
@@ -881,15 +1092,14 @@ class DayIssuesWidget(QWidget):
         hdr_view.setMinimumSectionSize(36)
         for i, width in enumerate(_COL_DEFAULTS):
             self._table.setColumnWidth(i, width)
-            if i == _COL_DESC:
-                hdr_view.setSectionResizeMode(i, QHeaderView.Stretch)
+            if i in _FIXED_COLS:
+                hdr_view.setSectionResizeMode(i, QHeaderView.Fixed)
             else:
                 hdr_view.setSectionResizeMode(i, QHeaderView.Interactive)
         bind_column_width_persistence(
             self._table,
-            "day_issues_table_v2",
+            _COL_KEY,
             _COL_DEFAULTS,
-            stretch_columns=(_COL_DESC,),
             auto_fit_if_unset=True,
         )
         tv.addWidget(self._table)
@@ -903,27 +1113,148 @@ class DayIssuesWidget(QWidget):
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self.refresh())
 
+    async def _load_auto_fill_maps_setting(self) -> None:
+        from tahmeed.services.settings_service import get_setting
+
+        try:
+            on = bool(await get_setting("auto_fill_from_description_maps"))
+        except Exception:
+            on = True
+        self._auto_fill_maps_chk.blockSignals(True)
+        self._auto_fill_maps_chk.setChecked(on)
+        self._auto_fill_maps_chk.blockSignals(False)
+        self.auto_fill_maps_changed.emit(on)
+
+    def _on_auto_fill_maps_toggled(self, on: bool) -> None:
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._save_auto_fill_maps_setting(bool(on)))
+
+    async def _save_auto_fill_maps_setting(self, on: bool) -> None:
+        from tahmeed.services.settings_service import set_setting
+
+        try:
+            await set_setting("auto_fill_from_description_maps", on)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Setting not saved",
+                f"Could not save auto-fill preference:\n{exc}",
+            )
+            # Revert checkbox to last known server/default without re-saving.
+            self._auto_fill_maps_chk.blockSignals(True)
+            self._auto_fill_maps_chk.setChecked(not on)
+            self._auto_fill_maps_chk.blockSignals(False)
+            return
+        self.auto_fill_maps_changed.emit(on)
+
+    def force_refresh(self) -> None:
+        """Manual Refresh — always re-scan (clears All-days cache)."""
+        self._dirty = True
+        self._day_snap_cache.clear()
+        self._lookups_loaded = False
+        self._source_refresh_timer.stop()
+        self._schedule_refresh()
+
+    def mark_dirty(self, days: Optional[Sequence[date]] = None) -> None:
+        """Register rows / mappings changed — next show or soft refresh will scan."""
+        self._dirty = True
+        if days is None:
+            self._day_snap_cache.clear()
+        else:
+            for d in days:
+                if isinstance(d, date):
+                    self._day_snap_cache.pop(d, None)
+
+    def on_register_source_changed(self, *, visible: bool) -> None:
+        """Table Desc/Payee/Item changed. Debounced refresh only while this page is shown."""
+        # Only the open register day changed — keep other All-days cache entries.
+        self.mark_dirty(days=[self._target])
+        if not visible:
+            self._source_refresh_timer.stop()
+            return
+        self._source_refresh_timer.start()
+
     def _schedule_save_filled(self) -> None:
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._save_filled_mappings())
 
-    def set_date(self, target: date) -> None:
+    def set_date(self, target: date, *, force: bool = False) -> None:
+        """Set the register date. Full scan only when needed (or *force*)."""
+        date_changed = target != self._target
         self._target = target
         qd = QDate(target.year, target.month, target.day)
         self._date.blockSignals(True)
         self._date.setDate(qd)
         self._date.blockSignals(False)
-        self._schedule_refresh()
+        if force or date_changed or self._dirty or not self._loaded:
+            self._schedule_refresh()
+
+    def _set_show_scope(self, scope: str) -> None:
+        """Switch SHOW combo without emitting (caller schedules refresh)."""
+        scope = "all" if scope == "all" else "day"
+        if self._scope == scope:
+            return
+        self._scope_combo.blockSignals(True)
+        idx = self._scope_combo.findData(scope)
+        if idx >= 0:
+            self._scope_combo.setCurrentIndex(idx)
+        self._scope_combo.blockSignals(False)
+        self._scope = scope
+        self._date.setEnabled(scope == "day")
+        self._open_reg_btn.setEnabled(scope == "day")
+        self._dirty = True
+
+    def open_for_date(self, target: date) -> None:
+        """Deep-link from Table / sidebar: This day + *target* date, then load."""
+        self._set_show_scope("day")
+        self.set_date(target, force=True)
+
+    def open_from_verify(
+        self,
+        target: Optional[date] = None,
+        *,
+        description_keys: Optional[Sequence[str]] = None,
+        all_days: bool = False,
+    ) -> None:
+        """Deep-link from Verify approve gate: list the blocked descriptions.
+
+        Applies a VALUE filter for *description_keys* and pre-checks them for
+        Map Selected. Uses All days when the selection spans multiple register
+        days so every blocked description can appear.
+        """
+        keys = {
+            normalize_description(k)
+            for k in (description_keys or ())
+            if (k or "").strip()
+        }
+        keys.discard("")
+        if keys:
+            self._value_filter = set(keys)
+            self._checked_keys = set(keys)
+            if self._search.text() or self._search_text:
+                self._search.blockSignals(True)
+                self._search.clear()
+                self._search.blockSignals(False)
+                self._on_search_changed("")
+            self._sync_value_filter_chrome()
+        day = target or date.today()
+        if all_days:
+            self._set_show_scope("all")
+            self.set_date(day, force=True)
+        else:
+            self.open_for_date(day)
 
     def _on_date_changed(self, qd: QDate) -> None:
         self._target = date(qd.year(), qd.month(), qd.day())
         if self._scope == "day":
+            self._dirty = True
             self._schedule_refresh()
 
     def _on_scope_changed(self, _index: int = 0) -> None:
         self._scope = self._scope_combo.currentData() or "day"
         self._date.setEnabled(self._scope == "day")
         self._open_reg_btn.setEnabled(self._scope == "day")
+        self._dirty = True
         self._schedule_refresh()
 
     def _row_source_args(self) -> tuple:
@@ -936,38 +1267,84 @@ class DayIssuesWidget(QWidget):
                 replace_txs, extra_txs = None, None
         return replace_txs, extra_txs
 
-    async def refresh(self) -> None:
+    def _drop_issue_keys(self, keys: set) -> None:
+        """Instant UI update after map — remove resolved descriptions from the list."""
+        if not keys:
+            return
+        self._issues_all = [
+            i for i in self._issues_all if i.description_key not in keys
+        ]
+        for key in keys:
+            self._issue_dates.pop(key, None)
+            self._checked_keys.discard(key)
+            self._mapping_drafts.pop(key, None)
+        if self._value_filter is not None:
+            kept = self._value_filter - keys
+            self._value_filter = kept or None
+        self._sync_value_filter_chrome()
+        self._apply_filters(repaint=False)
+        self._populate()
+        self.issues_changed.emit(len(self._issues_all))
+
+    async def refresh(self, *, quiet: bool = False) -> None:
         if self._loading:
             return
         self._loading = True
-        self._loading_overlay.show_loading("Scanning day issues…")
+        if not quiet:
+            self._loading_overlay.show_loading("Scanning day issues…")
         try:
             replace_txs, extra_txs = self._row_source_args()
+            need_lookups = not self._lookups_loaded or not self._categories or not self._payees
             if self._scope == "all":
-                cats, payees, snap = await asyncio.gather(
-                    get_payment_target_categories(),
-                    get_payee_names(active_only=True),
-                    collect_day_issues_all_days(
+                if need_lookups:
+                    cats, payees, snap = await asyncio.gather(
+                        get_payment_target_categories(),
+                        get_payee_names(active_only=True),
+                        collect_day_issues_all_days(
+                            cashier_id=self._cashier_scope_id,
+                            anchor_date=self._target,
+                            live_target=self._target,
+                            live_transactions=replace_txs,
+                            live_extras=extra_txs,
+                            day_cache=self._day_snap_cache,
+                        ),
+                    )
+                    self._categories = sort_payment_targets(cats)
+                    self._payees = list(payees)
+                    self._lookups_loaded = True
+                else:
+                    snap = await collect_day_issues_all_days(
                         cashier_id=self._cashier_scope_id,
                         anchor_date=self._target,
                         live_target=self._target,
                         live_transactions=replace_txs,
                         live_extras=extra_txs,
-                    ),
-                )
+                        day_cache=self._day_snap_cache,
+                        payee_names=self._payees,
+                    )
             else:
-                cats, payees, snap = await asyncio.gather(
-                    get_payment_target_categories(),
-                    get_payee_names(active_only=True),
-                    collect_day_issues(
+                if need_lookups:
+                    cats, payees, snap = await asyncio.gather(
+                        get_payment_target_categories(),
+                        get_payee_names(active_only=True),
+                        collect_day_issues(
+                            self._target,
+                            transactions=replace_txs,
+                            extra_transactions=extra_txs,
+                            cashier_id=self._cashier_scope_id,
+                        ),
+                    )
+                    self._categories = sort_payment_targets(cats)
+                    self._payees = list(payees)
+                    self._lookups_loaded = True
+                else:
+                    snap = await collect_day_issues(
                         self._target,
                         transactions=replace_txs,
                         extra_transactions=extra_txs,
                         cashier_id=self._cashier_scope_id,
-                    ),
-                )
-            self._categories = sort_payment_targets(cats)
-            self._payees = list(payees)
+                        payee_names=self._payees,
+                    )
             self._issues_all = list(snap.issues)
             self._issue_dates = dict(getattr(snap, "issue_dates", None) or {})
             self._days_scanned = list(getattr(snap, "days_scanned", None) or [])
@@ -976,6 +1353,8 @@ class DayIssuesWidget(QWidget):
                 self._issue_dates = {
                     i.description_key: [self._target] for i in self._issues_all
                 }
+                # Keep single-day cache in sync for later All-days switches.
+                self._day_snap_cache[self._target] = snap
             live_keys = {i.description_key for i in self._issues_all}
             self._checked_keys &= live_keys
             if self._value_filter is not None:
@@ -985,12 +1364,15 @@ class DayIssuesWidget(QWidget):
             self._apply_filters(repaint=False)
             self._populate()
             self.issues_changed.emit(len(self._issues_all))
+            self._dirty = False
+            self._loaded = True
         except Exception as exc:
             QMessageBox.critical(self, "Day Issues", f"Could not load issues:\n{exc}")
             self.issues_changed.emit(0)
         finally:
             self._loading = False
-            self._loading_overlay.hide_loading()
+            if not quiet:
+                self._loading_overlay.hide_loading()
 
     def _apply_filters(self, *, repaint: bool = True) -> None:
         self._issues = filter_day_issues(
@@ -1293,11 +1675,34 @@ class DayIssuesWidget(QWidget):
                 "Payee/Item inline and Save Filled."
                 if issues else "All clear — this day can be submitted."
             )
-            apply_pending_column_autofit(self._table)
+            self._autofit_columns()
         finally:
             self._table.blockSignals(False)
             self._populating = False
         self._update_save_filled_enabled()
+
+    def _autofit_columns(self) -> None:
+        """Size content columns so Payee / Item / Detail are not ellipsized."""
+        if self._table.rowCount() <= 0:
+            return
+        self._table._col_width_suspend = True  # type: ignore[attr-defined]
+        try:
+            for col in range(self._table.columnCount()):
+                if col in _FIXED_COLS:
+                    self._table.setColumnWidth(col, _COL_DEFAULTS[col])
+                    continue
+                self._table.resizeColumnToContents(col)
+                width = self._table.columnWidth(col) + 16
+                # Description filter chevron needs a little extra room.
+                if col == _COL_DESC:
+                    width += 12
+                floor = _COL_DEFAULTS[col] if col < len(_COL_DEFAULTS) else 48
+                self._table.setColumnWidth(col, min(max(width, floor), 520))
+            saver = getattr(self._table, "_col_width_save", None)
+            if callable(saver):
+                saver()
+        finally:
+            self._table._col_width_suspend = False  # type: ignore[attr-defined]
 
     def _selected_issues(self) -> List[DayIssue]:
         rows = sorted({idx.row() for idx in self._table.selectedIndexes()})
@@ -1366,20 +1771,31 @@ class DayIssuesWidget(QWidget):
             if not resolved:
                 return
 
-        if self._payees:
-            payee_set = {p.upper() for p in self._payees}
-            odd = sorted({p for _d, p, _c in resolved if p not in payee_set})
-            if odd:
-                tip = "\n".join(f"  · {p}" for p in odd[:8])
-                if QMessageBox.question(
-                    self,
-                    "Payee not in list",
-                    f"Some payees are not in the Payee list:\n{tip}\n\n"
-                    "Save anyway?",
-                ) != QMessageBox.Yes:
-                    return
+        odd_payees = sorted({
+            p for _d, p, _c in resolved
+            if payee_needs_create(p, self._payees)
+        })
+        if odd_payees:
+            tip = "\n".join(f"  · {p}" for p in odd_payees[:8])
+            if QMessageBox.question(
+                self,
+                "Create payee(s)?",
+                f"These payees are not in the Payee list:\n{tip}\n\n"
+                "Create them and save the mappings?",
+            ) != QMessageBox.Yes:
+                return
 
         self._loading_overlay.show_loading("Saving filled mappings…")
+        for name in odd_payees:
+            try:
+                await add_payee(name)
+            except Exception as exc:
+                self._loading_overlay.hide_loading()
+                QMessageBox.warning(self, "Could Not Create Payee", str(exc))
+                return
+            if payee_needs_create(name, self._payees):
+                self._payees.append(name)
+
         saved_n = 0
         live_n = 0
         committed = 0
@@ -1407,42 +1823,8 @@ class DayIssuesWidget(QWidget):
             f"Updated {applied:,} open row(s)"
             + (f" ({live_n:,} on Table/draft)." if live_n else "."),
         )
-        self.mappings_applied.emit()
-        await self.refresh()
-
-    async def _apply_mapping_everywhere(
-        self,
-        descriptions: Sequence[str],
-        payee: str,
-        item_name: str,
-        category_id: ObjectId,
-    ) -> tuple:
-        apply_days = self._dates_for_descriptions(descriptions)
-        saved_n = await self._apply_to_saved_rows(
-            descriptions,
-            payee,
-            item_name,
-            category_id,
-            days=apply_days,
-        )
-        live_n = 0
-        if self._apply_live is not None:
-            for day in apply_days:
-                try:
-                    live_n += int(
-                        self._apply_live(
-                            day,
-                            descriptions,
-                            payee=payee,
-                            item_name=item_name,
-                            category_id=category_id,
-                            cashier_id=self._cashier_scope_id,
-                        )
-                        or 0
-                    )
-                except Exception:
-                    continue
-        return saved_n, live_n
+        descs = [desc for desc, _p, _c in resolved]
+        await self._finish_mapping_ui(descs)
 
     async def _do_map(
         self,
@@ -1482,6 +1864,15 @@ class DayIssuesWidget(QWidget):
             return
         remember_category(self._categories, category)
 
+        if dlg.result_create_payee or payee_needs_create(payee, self._payees):
+            try:
+                await add_payee(payee)
+            except Exception as exc:
+                QMessageBox.warning(self, "Could Not Create Payee", str(exc))
+                return
+            if payee_needs_create(payee, self._payees):
+                self._payees.append(payee)
+
         self._loading_overlay.show_loading("Saving mappings…")
         try:
             for desc in descriptions:
@@ -1520,8 +1911,67 @@ class DayIssuesWidget(QWidget):
             f"Updated {applied:,} open row(s) across {scope_txt}"
             f"{detail}",
         )
+        await self._finish_mapping_ui(descriptions)
+
+    async def _finish_mapping_ui(self, descriptions: Sequence[str]) -> None:
+        """Drop mapped rows instantly, then one quiet resync (no cascade scans)."""
+        keys = {normalize_description(d) for d in descriptions if normalize_description(d)}
+        touched = self._dates_for_descriptions(descriptions)
+        self._drop_issue_keys(keys)
+        self.mark_dirty(days=touched)
         self.mappings_applied.emit()
-        await self.refresh()
+        await self.refresh(quiet=True)
+
+    async def _apply_mapping_everywhere(
+        self,
+        descriptions: Sequence[str],
+        payee: str,
+        item_name: str,
+        category_id: ObjectId,
+    ) -> tuple:
+        apply_days = self._dates_for_descriptions(descriptions)
+        saved_n = await self._apply_to_saved_rows(
+            descriptions,
+            payee,
+            item_name,
+            category_id,
+            days=apply_days,
+        )
+        live_n = 0
+        if self._apply_live is not None:
+            for day in apply_days:
+                try:
+                    live_n += int(
+                        self._apply_live(
+                            day,
+                            descriptions,
+                            payee=payee,
+                            item_name=item_name,
+                            category_id=category_id,
+                            cashier_id=self._cashier_scope_id,
+                            emit_source_changed=False,
+                        )
+                        or 0
+                    )
+                except TypeError:
+                    # Older apply_live callables without emit_source_changed.
+                    try:
+                        live_n += int(
+                            self._apply_live(
+                                day,
+                                descriptions,
+                                payee=payee,
+                                item_name=item_name,
+                                category_id=category_id,
+                                cashier_id=self._cashier_scope_id,
+                            )
+                            or 0
+                        )
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+        return saved_n, live_n
 
     def _dates_for_descriptions(self, descriptions: Sequence[str]) -> List[date]:
         keys = {normalize_description(d) for d in descriptions}

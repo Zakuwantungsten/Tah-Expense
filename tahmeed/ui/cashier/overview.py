@@ -2,7 +2,8 @@
 CashierOverview — spend analytics (Overview tab).
 
 Layout:
-  ┌─ Welcome banner ─────────────────────────────────────────────┐
+  ┌─ This month KPIs ────────────────────────────────────────────┐
+  ├─ This month by day (money + entries) ────────────────────────┤
   ├─ Top payees (line) ──────────────┬─ By item (donut) ─────────┤
   └──────────────────────────────────┴───────────────────────────┘
 """
@@ -11,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from datetime import date, datetime
+from datetime import date
 from typing import Optional
 
 import qtawesome as qta
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from tahmeed.models.user import User
 from tahmeed.services.cashier_service import (
+    bucket_daily_overview,
     bucket_payee_spend,
     get_overview_charts,
     get_overview_stats,
@@ -35,7 +37,6 @@ _WHITE = "#FFFFFF"
 _BORDER = "#E5E7EB"
 _BG = "#F1F5F9"
 _NAVY = "#1B2B4B"
-_NAVY_2 = "#253A5C"
 _BLUE = "#0077C5"
 _BLUE_L = "#E8F4FD"
 _GREEN = "#16A34A"
@@ -169,9 +170,9 @@ class _CurrencyToggle(QWidget):
 class _PeriodToggle(QWidget):
     changed = Signal(str)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, default: str = "month") -> None:
         super().__init__(parent)
-        self._period = "year"
+        self._period = default if default in {k for k, _ in _PERIODS} else "month"
         self.setStyleSheet("background: transparent; border: none;")
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
@@ -184,8 +185,8 @@ class _PeriodToggle(QWidget):
             btn.setCheckable(True)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFixedHeight(26)
-            btn.setChecked(key == "year")
-            btn.setStyleSheet(_currency_toggle_style(key == "year"))
+            btn.setChecked(key == self._period)
+            btn.setStyleSheet(_currency_toggle_style(key == self._period))
             btn.clicked.connect(lambda _=False, k=key: self._on_clicked(k))
             self._group.addButton(btn)
             self._buttons[key] = btn
@@ -195,7 +196,7 @@ class _PeriodToggle(QWidget):
         return self._period
 
     def set_period(self, period: str, *, emit: bool = True) -> None:
-        key = period if period in self._buttons else "year"
+        key = period if period in self._buttons else "month"
         if key == self._period:
             return
         self._period = key
@@ -573,7 +574,7 @@ class _ReceiptStatusCard(QFrame):
 
 
 class CashierOverview(QWidget):
-    """Cashier Overview — month KPIs, top-payee trend + by-item donut."""
+    """Cashier Overview — month KPIs, daily activity, top-payee + by-item."""
 
     def __init__(self, user: User, parent=None):
         super().__init__(parent)
@@ -581,13 +582,20 @@ class CashierOverview(QWidget):
         self._loading = False
         self._year = date.today().year
         self._chart_currency = "TZS"
-        self._period = "year"
+        self._period = "month"
         self._items: list[dict] = []
         self._payees: list[dict] = []
+        self._daily: dict = {}
+        self._payee_top_n = 5
         self._kpi_entries: Optional[_KPICard] = None
         self._kpi_tzs: Optional[_KPICard] = None
         self._kpi_avg: Optional[_KPICard] = None
         self._receipt_card: Optional[_ReceiptStatusCard] = None
+        self._daily_money_chart: Optional[_LineChartWidget] = None
+        self._daily_count_chart: Optional[_LineChartWidget] = None
+        self._daily_money_subtitle: Optional[QLabel] = None
+        self._daily_count_subtitle: Optional[QLabel] = None
+        self._daily_currency: Optional[_CurrencyToggle] = None
         self._payee_chart: Optional[_LineChartWidget] = None
         self._payee_subtitle: Optional[QLabel] = None
         self._payee_legend_host: Optional[QVBoxLayout] = None
@@ -625,8 +633,6 @@ class CashierOverview(QWidget):
         cl.setContentsMargins(28, 24, 28, 28)
         cl.setSpacing(16)
 
-        cl.addWidget(self._build_banner())
-
         # ── Month KPI row ─────────────────────────────────────────────
         month_name = date.today().strftime("%B %Y")
         cl.addWidget(_lbl(f"This month — {month_name}", size=12, weight=600, color=_TM))
@@ -649,6 +655,40 @@ class CashierOverview(QWidget):
         kpi_row.addWidget(self._receipt_card)
         cl.addLayout(kpi_row)
 
+        # ── Daily activity (money + entries) — first chart ────────────
+        daily_card = _card()
+        daily_card.setMinimumHeight(360)
+        daily_vl = QVBoxLayout(daily_card)
+        daily_vl.setContentsMargins(20, 18, 20, 18)
+        daily_vl.setSpacing(6)
+
+        daily_header = QHBoxLayout()
+        daily_titles = QVBoxLayout()
+        daily_titles.setSpacing(2)
+        daily_titles.setContentsMargins(0, 0, 0, 0)
+        daily_titles.addWidget(_lbl("This month by day", size=14, weight=600))
+        self._daily_money_subtitle = _lbl(
+            "Spend by day", size=12, color=_TM,
+        )
+        daily_titles.addWidget(self._daily_money_subtitle)
+        daily_header.addLayout(daily_titles)
+        daily_header.addStretch()
+        self._daily_currency = _CurrencyToggle()
+        self._daily_currency.changed.connect(self._on_currency_changed)
+        daily_header.addWidget(self._daily_currency)
+        daily_vl.addLayout(daily_header)
+
+        self._daily_money_chart = _LineChartWidget()
+        self._daily_money_chart.setMinimumHeight(150)
+        daily_vl.addWidget(self._daily_money_chart, 1)
+
+        self._daily_count_subtitle = _lbl("Entries by day", size=12, color=_TM)
+        daily_vl.addWidget(self._daily_count_subtitle)
+        self._daily_count_chart = _LineChartWidget()
+        self._daily_count_chart.setMinimumHeight(120)
+        daily_vl.addWidget(self._daily_count_chart, 1)
+        cl.addWidget(daily_card)
+
         charts = QHBoxLayout()
         charts.setSpacing(16)
 
@@ -664,14 +704,14 @@ class CashierOverview(QWidget):
         titles.setSpacing(2)
         titles.setContentsMargins(0, 0, 0, 0)
         titles.addWidget(_lbl("Top payees", size=14, weight=600))
-        self._payee_subtitle = _lbl("Spend by month", size=12, color=_TM)
+        self._payee_subtitle = _lbl("Spend by day", size=12, color=_TM)
         titles.addWidget(self._payee_subtitle)
         payee_header.addLayout(titles)
         payee_header.addStretch()
         self._payee_currency = _CurrencyToggle()
         self._payee_currency.changed.connect(self._on_currency_changed)
         payee_header.addWidget(self._payee_currency)
-        self._period_toggle = _PeriodToggle()
+        self._period_toggle = _PeriodToggle(default="month")
         self._period_toggle.changed.connect(self._on_period_changed)
         payee_header.addWidget(self._period_toggle)
         payee_vl.addLayout(payee_header)
@@ -711,83 +751,6 @@ class CashierOverview(QWidget):
         scroll.setWidget(content)
         root.addWidget(scroll)
 
-    def _build_banner(self) -> QWidget:
-        banner = QWidget()
-        banner.setObjectName("Banner")
-        banner.setStyleSheet(f"""
-            QWidget#Banner {{
-                background: qlineargradient(
-                    x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {_NAVY},
-                    stop:1 {_NAVY_2}
-                );
-                border-radius: 12px;
-            }}
-        """)
-        banner.setFixedHeight(82)
-
-        bl = QHBoxLayout(banner)
-        bl.setContentsMargins(20, 0, 20, 0)
-        bl.setSpacing(14)
-
-        initials = "".join(p[0].upper() for p in self._user.full_name.split()[:2]) or "U"
-        avatar = QLabel(initials)
-        avatar.setFixedSize(46, 46)
-        avatar.setAlignment(Qt.AlignCenter)
-        avatar.setStyleSheet(
-            "background: rgba(0,119,197,0.25); border-radius: 23px;"
-            " color: #7DD3FC; font-size: 16px; font-weight: 700;"
-        )
-
-        text_w = QWidget()
-        text_w.setStyleSheet("background: transparent;")
-        tl = QVBoxLayout(text_w)
-        tl.setContentsMargins(0, 0, 0, 0)
-        tl.setSpacing(3)
-
-        hour = datetime.now().hour
-        greeting = (
-            "Good morning" if hour < 12
-            else ("Good afternoon" if hour < 17 else "Good evening")
-        )
-        greet_lbl = QLabel(f"{greeting}, {self._user.full_name.split()[0]}")
-        greet_lbl.setStyleSheet(
-            "color: #f1f5f9; font-size: 15px; font-weight: 700; background: transparent;"
-        )
-        sub_lbl = QLabel("Item and payee money consumption")
-        sub_lbl.setStyleSheet(
-            "color: #93C5FD; font-size: 11px; background: transparent;"
-        )
-        tl.addWidget(greet_lbl)
-        tl.addWidget(sub_lbl)
-
-        bl.addWidget(avatar)
-        bl.addWidget(text_w)
-        bl.addStretch()
-
-        date_badge = QWidget()
-        date_badge.setStyleSheet(
-            "background: rgba(255,255,255,0.10); border-radius: 8px;"
-        )
-        dbl = QVBoxLayout(date_badge)
-        dbl.setContentsMargins(16, 10, 16, 10)
-        dbl.setSpacing(1)
-        today = date.today()
-        day_lbl = QLabel(today.strftime("%B %d"))
-        day_lbl.setAlignment(Qt.AlignCenter)
-        day_lbl.setStyleSheet(
-            "color: #f1f5f9; font-size: 13px; font-weight: 700; background: transparent;"
-        )
-        yr_lbl = QLabel(today.strftime("%Y  ·  %A"))
-        yr_lbl.setAlignment(Qt.AlignCenter)
-        yr_lbl.setStyleSheet(
-            "color: #93C5FD; font-size: 10px; background: transparent;"
-        )
-        dbl.addWidget(day_lbl)
-        dbl.addWidget(yr_lbl)
-        bl.addWidget(date_badge)
-        return banner
-
     def refresh(self) -> None:
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._load())
@@ -817,6 +780,9 @@ class CashierOverview(QWidget):
         self._year = int(data.get("year") or self._year)
         self._items = list(data.get("items") or [])
         self._payees = list(data.get("payees") or [])
+        self._daily = dict(data.get("daily") or {})
+        self._payee_top_n = int(data.get("payee_top_n") or 5)
+        self._refresh_daily_chart()
         self._refresh_payee_chart()
         self._refresh_item_chart()
 
@@ -848,10 +814,13 @@ class CashierOverview(QWidget):
         if currency == self._chart_currency:
             return
         self._chart_currency = currency
+        if self._daily_currency and self._daily_currency.currency() != currency:
+            self._daily_currency.set_currency(currency, emit=False)
         if self._payee_currency and self._payee_currency.currency() != currency:
             self._payee_currency.set_currency(currency, emit=False)
         if self._item_currency and self._item_currency.currency() != currency:
             self._item_currency.set_currency(currency, emit=False)
+        self._refresh_daily_chart()
         self._refresh_payee_chart()
         self._refresh_item_chart()
 
@@ -861,12 +830,54 @@ class CashierOverview(QWidget):
         self._period = period
         self._refresh_payee_chart()
 
+    def _scale_money_series(
+        self, raw: list[float], unit: str,
+    ) -> list[float]:
+        if unit in ("TZS millions", "ZMW millions"):
+            return [v / 1_000_000 for v in raw]
+        if unit in ("USD thousands", "ZMW thousands"):
+            return [v / 1_000 for v in raw]
+        return list(raw)
+
+    def _refresh_daily_chart(self) -> None:
+        chart = bucket_daily_overview(
+            self._daily,
+            "month",
+            self._year,
+            self._chart_currency,
+        )
+        labels = list(chart.get("labels") or [])
+        money_raw = [float(v or 0.0) for v in (chart.get("money") or [])]
+        count_raw = [float(v or 0.0) for v in (chart.get("counts") or [])]
+        _, unit = _chart_values(self._chart_currency, money_raw or [0.0])
+        money_scaled = self._scale_money_series(money_raw, unit)
+
+        if self._daily_money_chart:
+            self._daily_money_chart.set_data(
+                labels,
+                [("spend", _BLUE, money_scaled)],
+            )
+        if self._daily_money_subtitle:
+            base = chart.get("subtitle") or "Activity by day"
+            self._daily_money_subtitle.setText(f"{base}  ·  {unit}")
+        if self._daily_count_chart:
+            self._daily_count_chart.set_data(
+                labels,
+                [("entries", _AMBER, count_raw)],
+            )
+        if self._daily_count_subtitle:
+            total_entries = int(sum(count_raw))
+            self._daily_count_subtitle.setText(
+                f"Entries by day  ·  {total_entries:,} this month"
+            )
+
     def _refresh_payee_chart(self) -> None:
         chart = bucket_payee_spend(
             self._payees,
             self._period,
             self._year,
             self._chart_currency,
+            top_n=self._payee_top_n,
         )
         all_raw = [
             float(v or 0.0)
@@ -880,12 +891,7 @@ class CashierOverview(QWidget):
         for i, item in enumerate(chart.get("series") or []):
             color = _PAYEE_COLORS[i % len(_PAYEE_COLORS)]
             raw = [float(v or 0.0) for v in (item.get("values") or [])]
-            if unit in ("TZS millions", "ZMW millions"):
-                scaled = [v / 1_000_000 for v in raw]
-            elif unit in ("USD thousands", "ZMW thousands"):
-                scaled = [v / 1_000 for v in raw]
-            else:
-                scaled = list(raw)
+            scaled = self._scale_money_series(raw, unit)
             key = item.get("key") or f"p{i}"
             label = item.get("label") or "Payee"
             painted.append((key, color, scaled))
@@ -905,7 +911,7 @@ class CashierOverview(QWidget):
                 self._payee_legend_host.addWidget(_payee_legend(legend))
             else:
                 self._payee_legend_host.addWidget(
-                    _lbl("No payee spend yet.", size=12, color=_TM)
+                    _lbl("No named payee spend yet.", size=12, color=_TM)
                 )
 
     def _refresh_item_chart(self) -> None:

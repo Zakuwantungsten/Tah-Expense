@@ -1,3 +1,4 @@
+- 4.6.8: Cashier soft-trash for draft/submitted deletes (restore/purge in Cashier Trash; verified still needs accountant confirm); Trash UI parity + sidebar badge; Daily Register wrap text, column hide/unhide, and viewport-only resize cursor; bulk approve no longer capped at 200 ids; Day Issues asyncio scheduling fix on Python 3.14
 - 4.6.7: Branded loading horse while Overview and other data tabs fetch (Cashier + Accountant overviews, Drafts, Rejected, Trash, Form, Reconciliation, Fuel, Diesel Cash, Skipped Trucks, Manage Users)
 - 4.6.6: Larger table entry text (10pt) across Separate Expenses, Master Expenses, Browse, Items, Payees, Description Maps, Trash, and Day Issues (Daily Register unchanged)
 - 4.6.5: Daily Register Larger/Smaller text zoom (cashier + accountant); Day Issues SHOW filter readable again; denser Excel-style column filters across tables; draft day discard/deletion; Day Issues selection polish; open-day summaries API support

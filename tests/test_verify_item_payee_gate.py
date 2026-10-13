@@ -74,7 +74,11 @@ async def test_ensure_blocks_when_item_set_but_payee_empty(monkeypatch) -> None:
     ok = await VerifyInboxWidget._ensure_item_and_payee(widget, [tx])
     assert ok is False
     assert warnings == ["warned"]
-    assert opened and opened[0] == datetime(2026, 1, 1).date()
+    assert opened
+    nav = opened[0]
+    assert nav.date == datetime(2026, 1, 1).date()
+    assert "TRIANGLE" in nav.description_keys
+    assert nav.all_days is False
 
 
 @pytest.mark.asyncio
@@ -175,6 +179,34 @@ def test_preferred_day_issues_date_prefers_import_primary() -> None:
         import_primary_date=datetime(2026, 1, 10),
     )
     assert _preferred_day_issues_date([tx]) == date(2026, 1, 10)
+
+
+def test_day_issues_nav_from_unmapped_multi_day_and_keys() -> None:
+    from tahmeed.services.description_mapping_service import normalize_description
+    from tahmeed.ui.accountant.verify_inbox import _day_issues_nav_from_unmapped
+
+    a = _tx(
+        description="AGENCY FEE",
+        date=datetime(2026, 1, 5),
+        import_primary_date=datetime(2026, 1, 5),
+    )
+    b = _tx(
+        description="ALLOWANCE",
+        date=datetime(2026, 1, 10),
+        import_primary_date=datetime(2026, 1, 10),
+    )
+    c = _tx(
+        description="agency fee",
+        date=datetime(2026, 1, 5),
+        import_primary_date=datetime(2026, 1, 5),
+    )
+    nav = _day_issues_nav_from_unmapped([a, b, c])
+    assert nav.all_days is True
+    assert nav.date == date(2026, 1, 5)  # most common
+    assert set(nav.description_keys) == {
+        normalize_description("AGENCY FEE"),
+        normalize_description("ALLOWANCE"),
+    }
 
 
 def test_action_panel_has_no_map_on_approve_placeholder() -> None:

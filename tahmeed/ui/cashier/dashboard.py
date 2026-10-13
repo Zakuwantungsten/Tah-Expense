@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QFrame, QLabel, QLineEdit, QPushButton, QDialog, QMessageBox,
     QSizePolicy, QDateEdit,
 )
-from PySide6.QtCore import Qt, Signal, QDate
+from PySide6.QtCore import Qt, Signal, QDate, QTimer
 
 from tahmeed.config import APP_NAME, APP_VERSION, COMPANY_NAME
 from tahmeed.models.user import User
@@ -39,6 +39,7 @@ from tahmeed.ui.cashier.transactions_table import TransactionBrowser
 from tahmeed.ui.cashier.cashier_category_view import CashierCategoryView
 from tahmeed.ui.cashier.rejected_view import RejectedView
 from tahmeed.ui.cashier.drafts_view import DraftsView, fetch_draft_badge_count
+from tahmeed.ui.cashier.saved_view import SavedView
 from tahmeed.ui.cashier.day_issues import DayIssuesWidget
 from tahmeed.ui.cashier.trash import CashierTrashWidget
 
@@ -698,6 +699,9 @@ class _TablePage(QWidget):
         if not self._register.navigate_to_date(d):
             self._action_bar.set_reconciled_date(self._register.current_date())
 
+    def set_chrome_maximized(self, maximized: bool) -> None:
+        """Show toolbar labels only when the host window is maximized."""
+        self._qb_toolbar.set_compact(not bool(maximized))
 
 
 # ── CashierDashboard ─────────────────────────────────────────────────────────────
@@ -709,6 +713,10 @@ class CashierDashboard(QWidget):
         super().__init__(parent)
         self._user = user
         self._category_indices: dict[str, int] = {}
+        self._day_issues_badge_timer = QTimer(self)
+        self._day_issues_badge_timer.setSingleShot(True)
+        self._day_issues_badge_timer.setInterval(350)
+        self._day_issues_badge_timer.timeout.connect(self._run_debounced_day_issues_badge)
         self._build_ui()
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._load_categories())
@@ -798,7 +806,11 @@ class CashierDashboard(QWidget):
         self._drafts_view = DraftsView(user=self._user, show_all_cashiers=False)
         self._stack.addWidget(self._drafts_view)
 
-        # index 4 — Day Issues
+        # index 4 — Saved (flat saved-but-not-submitted list)
+        self._saved_view = SavedView(user=self._user, show_all_cashiers=False)
+        self._stack.addWidget(self._saved_view)
+
+        # index 5 — Day Issues
         self._day_issues = DayIssuesWidget(
             user=self._user,
             row_source=self._register.day_issues_row_source,
@@ -806,27 +818,23 @@ class CashierDashboard(QWidget):
         )
         self._day_issues.open_register.connect(self._on_day_issues_open_register)
         self._day_issues.issues_changed.connect(self._on_day_issues_badge)
-        # Live apply already stamps the Table; avoid full refresh (would wipe unsaved).
-        # schedule_coro: mapping runs under an asyncio Task + QMessageBox nested loop
-        # (Python 3.14 / qasync forbids ensure_future while that Task is current).
-        from tahmeed.ui.async_utils import schedule_coro as _sched_di
-
-        self._day_issues.mappings_applied.connect(
-            lambda: _sched_di(self._refresh_day_issues_badge())
+        self._day_issues.auto_fill_maps_changed.connect(
+            self._register.set_auto_fill_from_maps
         )
+        # Badge updates via issues_changed after map; do not re-collect.
         self._stack.addWidget(self._day_issues)
 
-        # index 5 — Rejected entries
+        # index 6 — Rejected entries
         self._rejected_view = RejectedView(user=self._user)
         self._stack.addWidget(self._rejected_view)
 
-        # index 6 — Browse (embedded)
+        # index 7 — Browse (embedded)
         self._browser = TransactionBrowser(can_manage_uploads=False)
         self._browser.go_to_date.connect(self._on_go_to_date)
         self._browser.go_to_upload.connect(self._on_go_to_upload)
         self._stack.addWidget(self._browser)
 
-        # index 7 — Trash (own soft-trash + accountant-confirmed)
+        # index 8 — Trash (own soft-trash + accountant-confirmed)
         self._trash_view = CashierTrashWidget(user=self._user)
         self._trash_view.count_changed.connect(self._on_trash_badge)
         self._stack.addWidget(self._trash_view)
@@ -847,7 +855,9 @@ class CashierDashboard(QWidget):
         self._form.transaction_saved.connect(lambda _: self._register.refresh())
         self._form.trash_changed.connect(self._on_register_trash_changed)
         self._drafts_view.open_register_date.connect(self._on_drafts_open_register)
-        self._drafts_view.drafts_changed.connect(self._refresh_draft_badge)
+        self._drafts_view.drafts_changed.connect(self._on_drafts_data_changed)
+        self._saved_view.open_merged_date.connect(self._on_saved_open_merged)
+        self._saved_view.drafts_changed.connect(self._on_drafts_data_changed)
         from tahmeed.ui.async_utils import schedule_coro
 
         self._register.rows_saved.connect(
@@ -856,13 +866,13 @@ class CashierDashboard(QWidget):
         self._register.drafts_changed.connect(
             lambda: schedule_coro(self._refresh_draft_badge())
         )
+        self._register.rows_saved.connect(lambda _: self._saved_view.refresh())
+        self._register.drafts_changed.connect(self._saved_view.refresh)
         self._register.day_issues_requested.connect(self._on_open_day_issues)
         self._register.rows_saved.connect(
-            lambda _: schedule_coro(self._refresh_day_issues_badge())
+            lambda _: self._on_day_issues_data_changed()
         )
-        self._register.drafts_changed.connect(
-            lambda: schedule_coro(self._refresh_day_issues_badge())
-        )
+        self._register.drafts_changed.connect(self._on_day_issues_data_changed)
         self._register.day_issues_source_changed.connect(self._on_day_issues_source_changed)
         self._register.trash_changed.connect(self._on_register_trash_changed)
 
@@ -920,6 +930,10 @@ class CashierDashboard(QWidget):
     def sync_chrome_maximized(self, maximized: bool) -> None:
         """Keep title-bar restore/maximize icon in sync with the host window."""
         self._title_bar.set_maximized(maximized)
+        self._table_page.set_chrome_maximized(maximized)
+        form_tb = getattr(self._form, "_qb_toolbar", None)
+        if form_tb is not None and hasattr(form_tb, "set_compact"):
+            form_tb.set_compact(not bool(maximized))
 
     def _on_about(self) -> None:
         QMessageBox.about(
@@ -984,18 +998,21 @@ class CashierDashboard(QWidget):
         elif key == "drafts":
             self._stack.setCurrentIndex(3)
             self._drafts_view.refresh()
-        elif key == "day_issues":
+        elif key == "saved":
             self._stack.setCurrentIndex(4)
-            target = getattr(self._register, "_current_date", None) or date.today()
-            self._day_issues.set_date(target)
-        elif key == "rejected":
+            self._saved_view.refresh()
+        elif key == "day_issues":
             self._stack.setCurrentIndex(5)
+            target = getattr(self._register, "_current_date", None) or date.today()
+            self._day_issues.open_for_date(target)
+        elif key == "rejected":
+            self._stack.setCurrentIndex(6)
             self._rejected_view.refresh()
         elif key == "browse":
-            self._stack.setCurrentIndex(6)
+            self._stack.setCurrentIndex(7)
             self._browser.refresh()
         elif key == "trash":
-            self._stack.setCurrentIndex(7)
+            self._stack.setCurrentIndex(8)
             self._trash_view.refresh()
         elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
@@ -1032,6 +1049,21 @@ class CashierDashboard(QWidget):
         self._on_nav("table")
         self._register.navigate_to_date(d, merged=False)
 
+    def _on_saved_open_merged(self, d: date) -> None:
+        self._on_nav("table")
+        self._register.navigate_to_date(d, merged=True)
+
+    def _on_drafts_data_changed(self) -> None:
+        """Keep Drafts + Saved + badges aligned after discard/submit."""
+        from tahmeed.ui.async_utils import schedule_coro
+
+        schedule_coro(self._refresh_draft_badge())
+        # Refresh the sibling inbox so discard/submit stays in sync.
+        if self._stack.currentWidget() is not self._drafts_view:
+            self._drafts_view.refresh()
+        if self._stack.currentWidget() is not self._saved_view:
+            self._saved_view.refresh()
+
     async def _refresh_draft_badge(self) -> None:
         try:
             count = await fetch_draft_badge_count(self._user, all_cashiers=False)
@@ -1039,6 +1071,8 @@ class CashierDashboard(QWidget):
             count = 0
         if hasattr(self._sidebar, "set_drafts_badge"):
             self._sidebar.set_drafts_badge(count)
+        if hasattr(self._sidebar, "set_saved_badge"):
+            self._sidebar.set_saved_badge(count)
 
     def _on_day_issues_badge(self, count: int) -> None:
         if hasattr(self._sidebar, "set_day_issues_badge"):
@@ -1065,9 +1099,29 @@ class CashierDashboard(QWidget):
         if self._stack.currentIndex() == 7:
             self._trash_view.refresh()
 
+    def _day_issues_page_visible(self) -> bool:
+        return self._stack.currentIndex() == 4
+
+    def _schedule_day_issues_badge_refresh(self) -> None:
+        self._day_issues_badge_timer.start()
+
+    def _run_debounced_day_issues_badge(self) -> None:
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._refresh_day_issues_badge())
+
+    def _on_day_issues_data_changed(self) -> None:
+        """Save/draft changes — mark Day Issues dirty; badge only if page hidden."""
+        visible = self._day_issues_page_visible()
+        self._day_issues.on_register_source_changed(visible=visible)
+        if not visible:
+            self._schedule_day_issues_badge_refresh()
+
     async def _refresh_day_issues_badge(self) -> None:
         from tahmeed.services.day_issues_service import count_day_issues
 
+        # When Day Issues is open, badge comes from issues_changed — skip duplicate collect.
+        if self._day_issues_page_visible():
+            return
         target = getattr(self._register, "_current_date", None) or date.today()
         try:
             replace_txs, extra_txs = self._register.day_issues_row_source(target)
@@ -1082,16 +1136,18 @@ class CashierDashboard(QWidget):
         self._on_day_issues_badge(count)
 
     def _on_day_issues_source_changed(self) -> None:
-        from tahmeed.ui.async_utils import schedule_coro
-
-        schedule_coro(self._refresh_day_issues_badge())
-        if self._stack.currentIndex() == 4:
-            schedule_coro(self._day_issues.refresh())
+        visible = self._day_issues_page_visible()
+        self._day_issues.on_register_source_changed(visible=visible)
+        if not visible:
+            self._schedule_day_issues_badge_refresh()
 
     def _on_open_day_issues(self, target=None) -> None:
-        self._on_nav("day_issues")
-        if target is not None:
-            self._day_issues.set_date(target)
+        self._sidebar.select("day_issues")
+        self._stack.setCurrentIndex(5)
+        day = target
+        if day is None:
+            day = getattr(self._register, "_current_date", None) or date.today()
+        self._day_issues.open_for_date(day)
 
     def _on_day_issues_open_register(self, d: date) -> None:
         self._on_nav("table")

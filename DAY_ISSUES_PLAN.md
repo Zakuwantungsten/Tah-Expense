@@ -164,3 +164,64 @@ cashier + accountant; `tests/test_day_issues_selection.py`.
 | 5 | Done | This day / All days scope |
 | 6 | Done | Inline Payee/Item + Save Filled |
 | 7 | Done | Search / VALUE filter / checkboxes |
+
+---
+
+## Performance — stop redundant Day Issues scans
+
+Problem: tab switch / map / Table edits each force a full `collect_day_issues`
+(+ overlay + table rebuild). Badge often runs a second full collect in parallel.
+
+### Perf Phase A — Dirty flag + smart tab open  ✅ DONE
+
+- Widget tracks `_loaded` / `_dirty`.
+- Nav / `set_date`: full scan only if date changed, dirty, or never loaded.
+- Manual **Refresh** always scans.
+- Table/source changes mark dirty when Day Issues is not visible.
+
+### Perf Phase B — Debounce + one scan when visible  ✅ DONE
+
+- Coalesce `day_issues_source_changed` (~350ms).
+- When Day Issues is visible: one widget `refresh`; badge from `issues_changed`.
+- When not visible: debounced badge-only count.
+
+### Perf Phase C — Map / Save Filled without cascade  ✅ DONE
+
+- Live apply does not emit source-changed when Day Issues will refresh itself.
+- Single post-map update (no double/triple collect).
+
+### Perf Phase D — Lighter refresh + incremental drop  ✅ DONE
+
+- Reuse cached categories/payees across scans.
+- After map: drop resolved keys from local list immediately (badge updates).
+
+### Perf Phase E — All-days per-day cache  ✅ DONE
+
+- Cache per-day snapshots; re-scan only dirty / live day after edits.
+
+**Shipped in:** `DayIssuesWidget` dirty/debounce/cache; cashier + accountant
+dashboard wiring; `emit_source_changed=False` on map apply; `day_cache` on
+`collect_day_issues_all_days`; `tests/test_day_issues_perf.py`.
+
+### Perf follow-up — paste must update badge  ✅ DONE
+
+Paste/clear/fill-down used `blockSignals` + `_bulk_mutating`, so
+`day_issues_source_changed` never fired until you opened Day Issues.
+Fix: coalesce — suppress per-cell, then **one** `_flush_day_issues_source_changed`
+after bulk paste (and related bulk edits). Sidebar badge updates via the
+existing debounced path while you stay on the Table.
+
+**Shipped in:** `excel_grid._flush_day_issues_source_changed`;
+`tests/test_day_issues_paste_badge.py`.
+
+### Auto-fill from Description Maps (paste + setting)  ✅ DONE
+
+- Setting `auto_fill_from_description_maps` (default **On**).
+- Typing already auto-filled; **paste / fill-down** now batch-apply maps to
+  blank Item/Payee only (does not overwrite typed values; import staging unchanged).
+- Day Issues checkbox toggles the setting and updates the live Table cache.
+- Partial maps fill what they have; incomplete rows still appear in Day Issues
+  with known fields available to finish.
+
+**Shipped in:** `excel_grid._auto_fill_rows_from_mappings`; Day Issues checkbox;
+`tests/test_auto_fill_paste_from_maps.py`.

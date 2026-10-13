@@ -14,6 +14,9 @@ DEFAULTS = {
     "defer_item_to_verify": False,
     # When True cashiers may Submit for Verify even if Day Issues remain.
     "allow_submit_with_day_issues": False,
+    # When True, typing/pasting a description auto-fills blank Item/Payee from
+    # Description Maps (does not overwrite user-entered values).
+    "auto_fill_from_description_maps": True,
     # When True the cashier register's Truck No. column only accepts numbers that
     # exist in the accountant's fleet registries (trucks, trailers, motor vehicles).
     # Default On — always intended.

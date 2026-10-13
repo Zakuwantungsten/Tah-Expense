@@ -52,6 +52,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     ("CASHIER FLOW", [
         ("verify",          "Verify",            "mdi.inbox-arrow-down",             {"badge": True}),
         ("drafts",          "Drafts",            "mdi.file-document-edit-outline",   {"badge": True}),
+        ("saved",           "Saved",             "mdi.content-save-outline",         {"badge": True}),
         ("day_issues",      "Day Issues",        "mdi.alert-decagram-outline",       {"badge": True}),
         ("table",           "Table",             "mdi.table-large",                  {}),
         ("browse",          "Browse",            "mdi.magnify",                      {}),
@@ -148,6 +149,7 @@ class _NavItem(QWidget):
 
         self.setFixedHeight(36)
         self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
         self._build(label, badge, expandable)
         self._paint(hover=False)
 
@@ -180,9 +182,12 @@ class _NavItem(QWidget):
         hl.addSpacerItem(self._gap2)
 
         self._text_lbl = QLabel(label)
+        self._text_lbl.setFocusPolicy(Qt.NoFocus)
+        self._text_lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._text_lbl.setStyleSheet(
             f"color: {_MUTED}; font-size: 13px;"
             " font-family:'Segoe UI'; background: transparent;"
+            " border: none; outline: none;"
         )
         self._text_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         hl.addWidget(self._text_lbl)
@@ -299,25 +304,28 @@ class _NavItem(QWidget):
 
     def _paint(self, hover: bool) -> None:
         if self._active:
-            self.setStyleSheet(f"background: {_ACTIVE_BG};{_TOOLTIP_SS}")
-            self._indicator.setStyleSheet(f"background: {_BLUE};")
+            self.setStyleSheet(f"background: {_ACTIVE_BG}; border: none;{_TOOLTIP_SS}")
+            self._indicator.setStyleSheet(f"background: {_BLUE}; border: none;")
             self._text_lbl.setStyleSheet(
                 f"color: {_WHITE}; font-size: 13px; font-weight: 600;"
                 " font-family:'Segoe UI'; background: transparent;"
+                " border: none; outline: none;"
             )
         elif hover:
-            self.setStyleSheet(f"background: {_ACTIVE_BG};{_TOOLTIP_SS}")
-            self._indicator.setStyleSheet("background: transparent;")
+            self.setStyleSheet(f"background: {_ACTIVE_BG}; border: none;{_TOOLTIP_SS}")
+            self._indicator.setStyleSheet("background: transparent; border: none;")
             self._text_lbl.setStyleSheet(
                 f"color: {_WHITE}; font-size: 13px;"
                 " font-family:'Segoe UI'; background: transparent;"
+                " border: none; outline: none;"
             )
         else:
-            self.setStyleSheet(f"background: transparent;{_TOOLTIP_SS}")
-            self._indicator.setStyleSheet("background: transparent;")
+            self.setStyleSheet(f"background: transparent; border: none;{_TOOLTIP_SS}")
+            self._indicator.setStyleSheet("background: transparent; border: none;")
             self._text_lbl.setStyleSheet(
                 f"color: {_MUTED}; font-size: 13px;"
                 " font-family:'Segoe UI'; background: transparent;"
+                " border: none; outline: none;"
             )
 
     # ── Qt events ──────────────────────────────────────────────────────────
@@ -715,6 +723,10 @@ class SidebarWidget(QFrame):
     def set_drafts_badge(self, count: int) -> None:
         if "drafts" in self._items:
             self._items["drafts"].set_badge(count)
+
+    def set_saved_badge(self, count: int) -> None:
+        if "saved" in self._items:
+            self._items["saved"].set_badge(count)
 
     def set_day_issues_badge(self, count: int) -> None:
         if "day_issues" in self._items:

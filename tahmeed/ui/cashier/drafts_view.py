@@ -23,8 +23,8 @@ from tahmeed.services.cashier_service import (
     discard_draft_transactions,
     get_draft_day_summaries,
     get_draft_transactions,
-    submit_day_for_verify,
 )
+from tahmeed.ui.cashier.draft_submit import submit_draft_day_with_gates
 from tahmeed.services.accountant_service import get_cashier_names
 from tahmeed.ui.accountant.separate_expenses import (
     _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
@@ -39,10 +39,12 @@ from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_
 _DAYS_COL_DEFAULTS = [110, 72, 120, 160]
 _DAYS_COL_CASHIERS = 3
 # Description | Item | Truck | Amount | Cashier | Dup? — Description stretches
-_ROWS_COL_DEFAULTS = [220, 110, 90, 120, 100, 52]
+_ROWS_COL_DEFAULTS = [220, 110, 100, 140, 100, 52]
 _ROWS_COL_DESC = 0
+_ROWS_COL_TRUCK = 2
+_ROWS_COL_AMOUNT = 3
 _DAYS_COL_KEY = "drafts_days_table_v2"
-_ROWS_COL_KEY = "drafts_rows_table_v2"
+_ROWS_COL_KEY = "drafts_rows_table_v3"
 
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -52,36 +54,55 @@ _GOLD = "#B18E5E"
 _T1 = "#111827"
 _T2 = "#6B7280"
 _AMBER = "#B45309"
-_DRAFT_ROW = "#FFFBEB"
 
 
 def should_discard_whole_day(
     *,
     selected_row_ids: Sequence[ObjectId],
     day_row_ids: Sequence[ObjectId],
+    day_selected: bool = True,
 ) -> bool:
-    """True when no rows are selected, or every loaded day row is selected.
+    """True when the day should be discarded as a whole.
 
-    Qt often auto-selects the first detail row after a day loads, which used to
-    make "discard" delete only that one ID. Empty or full selection means the
-    whole draft day.
+    - Day selected and detail rows not loaded yet → whole day (API by date).
+    - No row selection, or every loaded day row selected → whole day.
+    - A proper multi-row subset stays a partial discard (caller handles
+      single-row ambiguity separately — Qt often auto-selects one row).
     """
-    if not day_row_ids:
+    if not day_selected:
         return False
+    if not day_row_ids:
+        # Left pane has a day; right pane empty/still loading — discard by date.
+        return True
     if not selected_row_ids:
         return True
     return set(selected_row_ids) >= set(day_row_ids)
+
+
+def is_ambiguous_single_row_discard(
+    *,
+    selected_row_ids: Sequence[ObjectId],
+    day_row_ids: Sequence[ObjectId],
+) -> bool:
+    """True when exactly one of many day rows is selected (often Qt auto-select)."""
+    if len(selected_row_ids) != 1:
+        return False
+    if len(day_row_ids) <= 1:
+        return False
+    return set(selected_row_ids) < set(day_row_ids)
 
 
 def discard_target_ids(
     *,
     selected_row_ids: Sequence[ObjectId],
     day_row_ids: Sequence[ObjectId],
+    day_selected: bool = True,
 ) -> List[ObjectId]:
     """IDs to delete for a partial discard (subset of day rows)."""
     if should_discard_whole_day(
         selected_row_ids=selected_row_ids,
         day_row_ids=day_row_ids,
+        day_selected=day_selected,
     ):
         return list(day_row_ids)
     return list(selected_row_ids)
@@ -181,7 +202,7 @@ class DraftsView(QWidget):
         self._btn_refresh.clicked.connect(self.refresh)
         self._btn_open = _tool_btn("Open in Register")
         self._btn_open.clicked.connect(self._on_open_register)
-        self._btn_submit = _tool_btn("Submit day", gold=True)
+        self._btn_submit = _tool_btn("Submit day", primary=True)
         self._btn_submit.clicked.connect(self._on_submit_day)
         self._btn_discard = _tool_btn("Discard draft", danger=True)
         self._btn_discard.setToolTip(
@@ -399,11 +420,11 @@ class DraftsView(QWidget):
             self._rows_table.setItem(i, 5, _cell(dup, align=Qt.AlignCenter))
             for col in range(6):
                 self._rows_table.item(i, col).setData(Qt.UserRole, tx._id)
-            # Soft amber tint keeps drafts recognizable without fighting density chrome.
-            bg = _DRAFT_ROW if i % 2 == 0 else "#FEF3C7"
-            _finish_table_row(self._rows_table, i, bg)
+            # Master Expenses-style alternating white / slate stripes.
+            _finish_table_row(self._rows_table, i, _stripe_bg(i))
 
         apply_pending_column_autofit(self._rows_table)
+        self._autofit_truck_amount_columns()
         # Avoid Qt leaving the first detail row selected after a day load —
         # that made Discard delete only one row instead of the whole day.
         self._rows_table.clearSelection()
@@ -411,6 +432,23 @@ class DraftsView(QWidget):
         if sm is not None:
             sm.clearCurrentIndex()
         self._sync_discard_label()
+
+    def _autofit_truck_amount_columns(self) -> None:
+        """Size Truck / Amount to content so values are not ellipsized."""
+        if self._rows_table.rowCount() <= 0:
+            return
+        self._rows_table._col_width_suspend = True  # type: ignore[attr-defined]
+        try:
+            for col in (_ROWS_COL_TRUCK, _ROWS_COL_AMOUNT):
+                self._rows_table.resizeColumnToContents(col)
+                width = self._rows_table.columnWidth(col) + 16
+                floor = _ROWS_COL_DEFAULTS[col]
+                self._rows_table.setColumnWidth(col, min(max(width, floor), 520))
+            saver = getattr(self._rows_table, "_col_width_save", None)
+            if callable(saver):
+                saver()
+        finally:
+            self._rows_table._col_width_suspend = False  # type: ignore[attr-defined]
 
     def _selected_row_ids(self) -> List[ObjectId]:
         rows = sorted({idx.row() for idx in self._rows_table.selectedIndexes()})
@@ -429,10 +467,18 @@ class DraftsView(QWidget):
     def _sync_discard_label(self) -> None:
         selected = self._selected_row_ids()
         day_ids = self._day_row_ids()
-        if self._selected_day is not None and should_discard_whole_day(
+        day_selected = self._selected_day is not None
+        if day_selected and should_discard_whole_day(
+            selected_row_ids=selected,
+            day_row_ids=day_ids,
+            day_selected=day_selected,
+        ):
+            self._btn_discard.setText("Discard whole day")
+        elif day_selected and is_ambiguous_single_row_discard(
             selected_row_ids=selected,
             day_row_ids=day_ids,
         ):
+            # Prefer whole-day wording; click will confirm row vs day.
             self._btn_discard.setText("Discard whole day")
         elif selected:
             n = len(selected)
@@ -466,59 +512,56 @@ class DraftsView(QWidget):
         asyncio.ensure_future(self._do_submit_day(self._selected_day))
 
     async def _do_submit_day(self, day: date) -> None:
-        from tahmeed.services.day_issues_service import collect_day_issues
-        from tahmeed.services.settings_service import get_setting
-
-        try:
-            snap = await collect_day_issues(day)
-        except Exception:
-            snap = None
-        if snap is not None and snap.total > 0:
-            allow = False
-            try:
-                allow = bool(await get_setting("allow_submit_with_day_issues"))
-            except Exception:
-                allow = False
-            label = day.strftime("%d %b %Y")
-            summary = (
-                f"{snap.total} Day Issue(s) on {label}:\n"
-                f"  · {snap.unmapped_count} unmapped\n"
-                f"  · {snap.bad_map_count} bad map\n\n"
-            )
-            if not allow:
-                QMessageBox.warning(
-                    self,
-                    "Day Issues block submit",
-                    summary + "Open Day Issues and map descriptions before submitting.",
-                )
-                return
-            if QMessageBox.question(
-                self,
-                "Submit with Day Issues?",
-                summary + "Submit anyway?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            ) != QMessageBox.Yes:
-                return
-        try:
-            n = await submit_day_for_verify(day)
-            QMessageBox.information(
-                self, "Submitted",
-                f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for "
-                f"{day.strftime('%d %b %Y')}.",
-            )
-            self.drafts_changed.emit()
-            await self._load_days()
-        except Exception as exc:
-            QMessageBox.critical(self, "Submit Failed", str(exc))
+        n = await submit_draft_day_with_gates(self, day)
+        if n is None:
+            return
+        QMessageBox.information(
+            self, "Submitted",
+            f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for "
+            f"{day.strftime('%d %b %Y')}.",
+        )
+        self.drafts_changed.emit()
+        await self._load_days()
 
     def _on_discard(self) -> None:
         selected = self._selected_row_ids()
         day_ids = self._day_row_ids()
+        day_selected = self._selected_day is not None
         whole_day = should_discard_whole_day(
             selected_row_ids=selected,
             day_row_ids=day_ids,
+            day_selected=day_selected,
         )
+        if (
+            not whole_day
+            and day_selected
+            and is_ambiguous_single_row_discard(
+                selected_row_ids=selected,
+                day_row_ids=day_ids,
+            )
+        ):
+            # Qt often leaves one row selected; ask before deleting only that row.
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Discard drafts")
+            box.setText(
+                "One draft row is selected.\n\n"
+                "Discard only that row, or the whole draft day?"
+            )
+            whole_btn = box.addButton("Whole day", QMessageBox.AcceptRole)
+            row_btn = box.addButton("This row only", QMessageBox.ActionRole)
+            cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(whole_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == cancel_btn or clicked is None:
+                return
+            if clicked == whole_btn:
+                whole_day = True
+            else:
+                asyncio.ensure_future(self._do_discard_ids(list(selected)))
+                return
+
         if whole_day:
             if self._selected_day is None:
                 QMessageBox.information(
@@ -556,6 +599,7 @@ class DraftsView(QWidget):
         ids = discard_target_ids(
             selected_row_ids=selected,
             day_row_ids=day_ids,
+            day_selected=day_selected,
         )
         if not ids:
             QMessageBox.information(

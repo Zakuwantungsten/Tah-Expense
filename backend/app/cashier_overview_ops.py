@@ -7,10 +7,14 @@ from typing import Any, Iterable
 
 
 _CURRENCY_BUCKETS: tuple[tuple[str, frozenset[str]], ...] = (
-    ("tzs", frozenset({"TZS", "TSH", "TZ"})),
+    ("tzs", frozenset({"TZS", "TSH", "TZ", ""})),
     ("usd", frozenset({"USD"})),
     ("zmw", frozenset({"ZMW", "ZMB", "ZK"})),
 )
+
+_UNASSIGNED_PAYEE = "Unassigned"
+# Pool large enough for client period re-rank (Month/3m/Year).
+_DEFAULT_PAYEE_POOL = 100
 
 
 def item_label(doc: dict[str, Any]) -> str:
@@ -20,7 +24,7 @@ def item_label(doc: dict[str, Any]) -> str:
 
 def payee_label(doc: dict[str, Any]) -> str:
     raw = (doc.get("payee") or "").strip()
-    return raw or "Unassigned"
+    return raw or _UNASSIGNED_PAYEE
 
 
 def _day_key(value: Any) -> date | None:
@@ -28,22 +32,41 @@ def _day_key(value: Any) -> date | None:
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if "T" in text:
+            text = text.split("T", 1)[0]
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _currency_key(doc: dict[str, Any]) -> str | None:
+    cur = str(doc.get("currency") or "").strip().upper()
+    for key, codes in _CURRENCY_BUCKETS:
+        if cur in codes:
+            return key
     return None
 
 
 def _add_money(bucket: dict[str, float], doc: dict[str, Any]) -> None:
-    cur = str(doc.get("currency") or "").upper()
+    cur_key = _currency_key(doc)
     amt = abs(float(doc.get("amount") or 0.0))
-    if amt <= 0:
+    if amt <= 0 or cur_key is None:
         return
-    for key, codes in _CURRENCY_BUCKETS:
-        if cur in codes:
-            bucket[key] = float(bucket.get(key) or 0.0) + amt
-            return
+    bucket[cur_key] = float(bucket.get(cur_key) or 0.0) + amt
 
 
 def _empty_money() -> dict[str, float]:
     return {"tzs": 0.0, "usd": 0.0, "zmw": 0.0}
+
+
+def _empty_daily() -> dict[str, float]:
+    return {"tzs": 0.0, "usd": 0.0, "zmw": 0.0, "count": 0.0}
 
 
 def _rank_key(row: dict[str, float]) -> float:
@@ -101,14 +124,22 @@ def compute_overview_charts(
     year: int,
     top_items: int = 4,
     top_payees: int = 5,
+    payee_pool: int = _DEFAULT_PAYEE_POOL,
 ) -> dict[str, Any]:
-    """Build item breakdown + top-payee daily series for one fiscal year."""
+    """Build item breakdown, daily totals, and named-payee daily series for one year.
+
+    Unassigned payees are excluded from the top-payee series. A larger named
+    payee pool is returned so the client can re-rank for Month / 3m / Year.
+    """
     item_totals: dict[str, dict[str, float]] = {}
     payee_totals: dict[str, dict[str, float]] = {}
     payee_daily: dict[str, dict[str, dict[str, float]]] = {}
+    daily_totals: dict[str, dict[str, float]] = {}
 
     year_start = date(year, 1, 1)
     year_end = date(year, 12, 31)
+    display_n = max(1, int(top_payees))
+    pool_n = max(display_n, int(payee_pool))
 
     for doc in docs:
         day = _day_key(doc.get("date"))
@@ -117,23 +148,30 @@ def compute_overview_charts(
         if doc.get("trashed") is True or doc.get("discarded") is True:
             continue
 
-        cur = str(doc.get("currency") or "").upper()
         amt = abs(float(doc.get("amount") or 0.0))
-        if amt <= 0 or not any(cur in codes for _, codes in _CURRENCY_BUCKETS):
+        if amt <= 0 or _currency_key(doc) is None:
             continue
 
         item = item_label(doc)
         payee = payee_label(doc)
+        day_iso = day.isoformat()
 
         item_bucket = item_totals.setdefault(item, _empty_money())
         _add_money(item_bucket, doc)
 
+        day_bucket = daily_totals.setdefault(day_iso, _empty_daily())
+        _add_money(day_bucket, doc)
+        day_bucket["count"] = float(day_bucket.get("count") or 0.0) + 1.0
+
+        if payee == _UNASSIGNED_PAYEE:
+            continue
+
         payee_bucket = payee_totals.setdefault(payee, _empty_money())
         _add_money(payee_bucket, doc)
 
-        day_map = payee_daily.setdefault(payee, {})
-        day_bucket = day_map.setdefault(day.isoformat(), _empty_money())
-        _add_money(day_bucket, doc)
+        payee_day_map = payee_daily.setdefault(payee, {})
+        payee_day_bucket = payee_day_map.setdefault(day_iso, _empty_money())
+        _add_money(payee_day_bucket, doc)
 
     items = _top_breakdown(item_totals, top_n=top_items)
 
@@ -143,8 +181,10 @@ def compute_overview_charts(
         reverse=True,
     )
     payee_ranked = [
-        (name, money) for name, money in payee_ranked if _rank_key(money) > 0
-    ][: max(1, int(top_payees))]
+        (name, money)
+        for name, money in payee_ranked
+        if name != _UNASSIGNED_PAYEE and _rank_key(money) > 0
+    ][:pool_n]
 
     series: list[dict[str, Any]] = []
     for name, _money in payee_ranked:
@@ -159,5 +199,6 @@ def compute_overview_charts(
     return {
         "year": int(year),
         "items": items,
-        "payees": {"series": series},
+        "daily": daily_totals,
+        "payees": {"series": series, "top_n": display_n},
     }

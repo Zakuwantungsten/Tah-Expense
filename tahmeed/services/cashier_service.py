@@ -157,22 +157,31 @@ async def request_or_delete_transaction(
       - ``"already_trashed"`` — already in trash
       - ``"deleted"`` — hard-deleted (pending-edit clone only)
       - ``"deletion_requested"`` — verified row flagged for accountant confirm
+      - ``"forbidden"`` — cashier tried to delete another cashier's row
       - ``"not_found"`` — no matching document
     """
     body: dict = {}
     if cashier_id is not None:
         body["cashier_id"] = str(cashier_id)
-    payload = await api_client.request(
-        "POST",
-        f"v1/transactions/{tx_id}/request-delete",
-        json=body,
-    )
+    try:
+        payload = await api_client.request(
+            "POST",
+            f"v1/transactions/{tx_id}/request-delete",
+            json=body,
+        )
+    except ApiError as exc:
+        if exc.status_code == 403:
+            return "forbidden"
+        if exc.status_code == 404:
+            return "not_found"
+        raise
     result = str(payload.get("result") or "not_found")
     if result in {
         "trashed",
         "already_trashed",
         "deleted",
         "deletion_requested",
+        "forbidden",
         "not_found",
     }:
         return result
@@ -432,13 +441,21 @@ def bucket_payee_spend(
     year: int,
     currency: str = "TZS",
     today: date | None = None,
+    top_n: int = 5,
 ) -> dict:
-    """Roll top-payee daily money into Overview line-chart buckets."""
+    """Roll named-payee daily money into Overview line-chart buckets.
+
+    Re-ranks by spend inside the selected period (excludes Unassigned upstream)
+    and keeps the top *top_n* series for display.
+    """
     spec = _overview_period_spec(period, year, today)
     cur_key = _CURRENCY_KEYS.get((currency or "TZS").upper(), "tzs")
     index = {key: i for i, key in enumerate(spec["keys"])}
-    series = []
+    ranked: list[tuple[float, dict]] = []
     for item in payee_series or []:
+        label = (item.get("label") or item.get("key") or "Payee").strip()
+        if not label or label.lower() == "unassigned":
+            continue
         values = [0.0] * len(spec["keys"])
         daily = item.get("daily") or {}
         for raw_day, money in daily.items():
@@ -452,13 +469,22 @@ def bucket_payee_spend(
                 values[slot] += float(money.get(cur_key) or 0.0)
             else:
                 values[slot] += float(money or 0.0)
-        series.append(
-            {
-                "key": item.get("key") or item.get("label") or "payee",
-                "label": item.get("label") or item.get("key") or "Payee",
-                "values": values,
-            }
+        period_total = sum(values)
+        if period_total <= 0:
+            continue
+        ranked.append(
+            (
+                period_total,
+                {
+                    "key": item.get("key") or label,
+                    "label": label,
+                    "values": values,
+                },
+            )
         )
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    keep = max(1, int(top_n))
+    series = [row for _, row in ranked[:keep]]
     return {
         "period": spec["period"],
         "labels": spec["labels"],
@@ -467,8 +493,45 @@ def bucket_payee_spend(
     }
 
 
+def bucket_daily_overview(
+    daily: dict,
+    period: str,
+    year: int,
+    currency: str = "TZS",
+    today: date | None = None,
+) -> dict:
+    """Roll all-transaction daily money + entry counts into chart buckets."""
+    spec = _overview_period_spec(period, year, today)
+    cur_key = _CURRENCY_KEYS.get((currency or "TZS").upper(), "tzs")
+    index = {key: i for i, key in enumerate(spec["keys"])}
+    money_values = [0.0] * len(spec["keys"])
+    count_values = [0.0] * len(spec["keys"])
+    for raw_day, row in (daily or {}).items():
+        day = _parse_overview_day(raw_day)
+        if day is None or day < spec["start"] or day > spec["end"]:
+            continue
+        slot = index.get(_bucket_day(day, spec["grain"]))
+        if slot is None:
+            continue
+        if isinstance(row, dict):
+            money_values[slot] += float(row.get(cur_key) or 0.0)
+            count_values[slot] += float(row.get("count") or 0.0)
+        else:
+            money_values[slot] += float(row or 0.0)
+    subtitle = spec["subtitle"]
+    if period == "month":
+        subtitle = subtitle.replace("Spend by day", "Activity by day", 1)
+    return {
+        "period": spec["period"],
+        "labels": spec["labels"],
+        "subtitle": subtitle,
+        "money": money_values,
+        "counts": count_values,
+    }
+
+
 async def get_overview_charts(year: int | None = None) -> dict:
-    """Item breakdown + top-payee daily series for cashier Overview charts."""
+    """Item breakdown + daily totals + named-payee series for cashier Overview."""
     params: dict = {}
     if year is not None:
         params["year"] = int(year)
@@ -485,8 +548,9 @@ async def get_overview_charts(year: int | None = None) -> dict:
                 "zmw": float(row.get("zmw") or 0.0),
             }
         )
+    payees_block = payload.get("payees") or {}
     payees = []
-    for row in (payload.get("payees") or {}).get("series") or []:
+    for row in payees_block.get("series") or []:
         daily_raw = row.get("daily") or {}
         daily: dict = {}
         for day_key, money in daily_raw.items():
@@ -496,17 +560,32 @@ async def get_overview_charts(year: int | None = None) -> dict:
                     "usd": float(money.get("usd") or 0.0),
                     "zmw": float(money.get("zmw") or 0.0),
                 }
+        label = row.get("label") or row.get("key") or "Payee"
+        if str(label).strip().lower() == "unassigned":
+            continue
         payees.append(
             {
-                "key": row.get("key") or row.get("label") or "payee",
-                "label": row.get("label") or row.get("key") or "Payee",
+                "key": row.get("key") or label,
+                "label": label,
                 "daily": daily,
             }
         )
+    daily_out: dict = {}
+    for day_key, row in (payload.get("daily") or {}).items():
+        if not isinstance(row, dict):
+            continue
+        daily_out[str(day_key)] = {
+            "tzs": float(row.get("tzs") or 0.0),
+            "usd": float(row.get("usd") or 0.0),
+            "zmw": float(row.get("zmw") or 0.0),
+            "count": float(row.get("count") or 0.0),
+        }
     return {
         "year": int(payload.get("year") or year or date.today().year),
         "items": items,
+        "daily": daily_out,
         "payees": payees,
+        "payee_top_n": int(payees_block.get("top_n") or 5),
     }
 
 

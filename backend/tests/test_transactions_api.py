@@ -313,6 +313,14 @@ def _cashier(user_id: ObjectId | None = None) -> dict:
     }
 
 
+def _accountant(user_id: ObjectId | None = None) -> dict:
+    return {
+        "_id": user_id or ObjectId(),
+        "username": "acct1",
+        "role": "accountant",
+    }
+
+
 def test_create_transaction() -> None:
     collection = FakeTransactions()
     events = FakeOperationEvents()
@@ -578,6 +586,58 @@ def test_request_delete_soft_trash_unverified_and_request_verified() -> None:
     assert by_id[verified].get("trashed") is not True
 
 
+def test_cashier_cannot_request_delete_another_cashiers_row() -> None:
+    actor = _cashier()
+    owner = ObjectId()
+    tx_id = ObjectId()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": tx_id,
+                "verified": False,
+                "register_status": "draft",
+                "cashier_id": owner,
+                "trashed": False,
+            }
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: actor
+
+    with TestClient(app) as client:
+        resp = client.post(f"/v1/transactions/{tx_id}/request-delete", json={})
+
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "forbidden"
+    assert collection.documents[0].get("trashed") is not True
+
+
+def test_accountant_can_request_delete_any_cashiers_row() -> None:
+    actor = _accountant()
+    owner = ObjectId()
+    tx_id = ObjectId()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": tx_id,
+                "verified": False,
+                "register_status": "draft",
+                "cashier_id": owner,
+                "trashed": False,
+            }
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: actor
+
+    with TestClient(app) as client:
+        resp = client.post(f"/v1/transactions/{tx_id}/request-delete", json={})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"result": "trashed"}
+    assert collection.documents[0]["trashed"] is True
+
+
 def test_pending_edit_creates_clone() -> None:
     user = _cashier()
     original = ObjectId()
@@ -779,6 +839,10 @@ def test_overview_charts() -> None:
     payee_labels = [row["label"] for row in body["payees"]["series"]]
     assert payee_labels[0] == "INFINITY"
     assert "SOMEONE" not in payee_labels
+    assert "Unassigned" not in payee_labels
+    assert body["daily"]["2026-03-12"]["tzs"] == 40_000.0
+    assert body["daily"]["2026-03-12"]["count"] == 1.0
+    assert body["payees"]["top_n"] == 5
 
 
 def test_rejected_discarded_and_drafts() -> None:

@@ -118,6 +118,8 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "defer_item_to_verify": False,
     # When True, cashiers may Submit for Verify even if Day Issues remain.
     "allow_submit_with_day_issues": False,
+    # When True, typing/pasting a description auto-fills blank Item/Payee from maps.
+    "auto_fill_from_description_maps": True,
     "restrict_trucks": True,
     "duplicate_check_days": 5,
     "allowed_truck_labels": ["YARD", "GARAGE"],

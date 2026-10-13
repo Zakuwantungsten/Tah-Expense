@@ -85,8 +85,12 @@ class QbTxnToolbar(QFrame):
     ) -> None:
         super().__init__(parent)
         self._register_actions = register_actions
+        # Default icon-only; dashboards expand labels when the window is maximized.
+        self._compact = True
+        self._labeled_btns: list[QToolButton] = []
+        self._find_lbl: Optional[QLabel] = None
         self.setObjectName("qbTxnToolbar")
-        self.setFixedHeight(56)
+        self.setFixedHeight(40)
         self.setStyleSheet(
             f"""
             QFrame#qbTxnToolbar {{
@@ -210,11 +214,12 @@ class QbTxnToolbar(QFrame):
         fc.setContentsMargins(0, 0, 0, 0)
         fc.setSpacing(4)
         fc.addWidget(find_wrap)
-        find_lbl = QLabel("Find")
-        find_lbl.setStyleSheet(
+        self._find_lbl = QLabel("Find")
+        self._find_lbl.setStyleSheet(
             f"color:{_TEXT};font-size:10px;font-family:'Segoe UI';background:transparent;"
         )
-        fc.addWidget(find_lbl)
+        self._find_lbl.setVisible(not self._compact)
+        fc.addWidget(self._find_lbl)
         lay.addWidget(find_col)
 
         lay.addWidget(self._sep())
@@ -328,9 +333,13 @@ class QbTxnToolbar(QFrame):
         self._btn_attach.clicked.connect(self.attach_clicked.emit)
         lay.addWidget(self._btn_attach)
 
-        self._vat_cb = QCheckBox("Amts Inc VAT")
+        self._vat_cb = QCheckBox("" if self._compact else "Amts Inc VAT")
         self._vat_cb.setEnabled(False)
-        self._vat_cb.setToolTip("Tax-inclusive amounts — coming in a later phase")
+        self._vat_cb.setToolTip(
+            "Amts Inc VAT — coming in a later phase"
+            if self._compact
+            else "Tax-inclusive amounts — coming in a later phase"
+        )
         lay.addWidget(self._vat_cb)
 
         lay.addStretch(1)
@@ -364,7 +373,10 @@ class QbTxnToolbar(QFrame):
 
     def _tool_btn(self, icon: str, text: str, tip: str) -> QToolButton:
         b = QToolButton()
-        b.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        style = (
+            Qt.ToolButtonIconOnly if self._compact else Qt.ToolButtonTextUnderIcon
+        )
+        b.setToolButtonStyle(style)
         b.setCursor(Qt.PointingHandCursor)
         b.setToolTip(tip)
         b.setText(text)
@@ -374,11 +386,15 @@ class QbTxnToolbar(QFrame):
         if pix is not None:
             b.setIcon(pix)
             b.setIconSize(QSize(20, 20))
+        self._labeled_btns.append(b)
         return b
 
     def _icon_tool_btn(self, icon: QIcon, text: str, tip: str) -> QToolButton:
         b = QToolButton()
-        b.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        style = (
+            Qt.ToolButtonIconOnly if self._compact else Qt.ToolButtonTextUnderIcon
+        )
+        b.setToolButtonStyle(style)
         b.setCursor(Qt.PointingHandCursor)
         b.setToolTip(tip)
         b.setText(text)
@@ -386,7 +402,28 @@ class QbTxnToolbar(QFrame):
         b.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
         b.setIcon(icon)
         b.setIconSize(QSize(20, 20))
+        self._labeled_btns.append(b)
         return b
+
+    def set_compact(self, compact: bool) -> None:
+        """Icon-only strip when the window is not maximized (avoids L…r labels)."""
+        compact = bool(compact)
+        if compact == self._compact:
+            return
+        self._compact = compact
+        style = Qt.ToolButtonIconOnly if compact else Qt.ToolButtonTextUnderIcon
+        for b in self._labeled_btns:
+            b.setToolButtonStyle(style)
+        if self._find_lbl is not None:
+            self._find_lbl.setVisible(not compact)
+        # Keep tip usable; hide the long VAT caption in compact mode.
+        if compact:
+            self._vat_cb.setText("")
+            self._vat_cb.setToolTip("Amts Inc VAT — coming in a later phase")
+        else:
+            self._vat_cb.setText("Amts Inc VAT")
+            self._vat_cb.setToolTip("Tax-inclusive amounts — coming in a later phase")
+        self.setFixedHeight(40 if compact else 56)
 
     def _load_icon(self, *names: str):
         """Return the first qtawesome icon that resolves; try common aliases."""

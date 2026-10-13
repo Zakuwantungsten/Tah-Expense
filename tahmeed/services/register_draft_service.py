@@ -226,3 +226,12 @@ def clear_register_draft(
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+def clear_register_drafts_for_date(
+    user_id: ObjectId | str,
+    register_date: date,
+) -> None:
+    """Remove My and Merged local recovery files for one register day."""
+    clear_register_draft(user_id, register_date, merged=False)
+    clear_register_draft(user_id, register_date, merged=True)
