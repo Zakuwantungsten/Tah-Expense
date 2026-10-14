@@ -32,6 +32,26 @@ sudo systemctl enable --now docker
 sudo docker run --rm hello-world
 ```
 
+### Reliable DNS for image builds (recommended on VPS)
+
+If `docker compose build` fails with `could not resolve` or hangs for minutes on
+`apt-get` / MongoDB repo / `pip install`, Docker’s container DNS is often the
+cause. Point the daemon at public resolvers, then restart Docker:
+
+```bash
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json >/dev/null <<'EOF'
+{
+  "dns": ["1.1.1.1", "8.8.8.8"]
+}
+EOF
+sudo systemctl restart docker
+```
+
+Compose builds in this folder already use `network: host` (Linux only) so the
+build shares the host’s DNS and routing. That does **not** change how the API
+runs — containers still use `network_mode: host` at runtime as below.
+
 Keep production Docker administration restricted to root. Membership in the
 `docker` group is effectively root access.
 
@@ -72,11 +92,16 @@ maintenance window:
 
 ```bash
 cd /opt/tahmeed-expense/deployment/docker
+# Build uses host networking (see compose.yaml) so apt/PyPI/Mongo mirrors resolve.
 sudo env TAHMEED_IMAGE_TAG=1.0.0 docker compose build --pull
 sudo env TAHMEED_IMAGE_TAG=1.0.0 scripts/preflight.sh
 # Review the JSON conflict report. Resolve every conflict before continuing.
 sudo env TAHMEED_IMAGE_TAG=1.0.0 scripts/preflight.sh --apply-indexes
 ```
+
+If a build still cannot resolve hostnames after the DNS step in §1, confirm
+outbound HTTPS from the host (`curl -I https://pypi.org`) and retry. Manual
+equivalent: `docker build --network=host -f ../../backend/Dockerfile …`.
 
 The migration adds the unique `backup_jobs.schedule_id` index used to prevent a
 second dump for one schedule slot. The scheduler stores daily, weekly, and
@@ -202,6 +227,11 @@ sudo scripts/rollback.sh 1.0.0        # explicit retained image
 
 Troubleshooting:
 
+- Build `could not resolve` / hung on apt or pip: apply the Docker `dns`
+  block in §1, `sudo systemctl restart docker`, then rebuild. Compose already
+  sets `build.network: host`. Check host egress with
+  `curl -fsS -o /dev/null -w '%{http_code}\n' https://pypi.org` and
+  `https://repo.mongodb.org`.
 - `connection refused 127.0.0.1:27017`: verify host MongoDB is running and
   listening on loopback. Host networking is Linux-only; Docker Desktop on
   Windows cannot validate this production topology.

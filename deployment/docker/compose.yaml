@@ -28,6 +28,9 @@ services:
     build:
       context: ../../backend
       dockerfile: Dockerfile
+      # Linux VPS: use host DNS/routing so apt / MongoDB repo / PyPI resolve
+      # during build (avoids flaky Docker-bridge DNS and long download hangs).
+      network: host
     command:
       - uvicorn
       - app.main:app
@@ -57,6 +60,7 @@ services:
     build:
       context: ../../backend
       dockerfile: Dockerfile
+      network: host
     command:
       - tahmeed-scheduler
     volumes:
