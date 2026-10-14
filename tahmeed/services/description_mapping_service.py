@@ -170,6 +170,43 @@ async def save_mapping(
     return mapping
 
 
+async def save_mappings_bulk(
+    entries: List[Tuple[str, ObjectId, str, str]],
+) -> List[DescriptionMapping]:
+    """Upsert many description maps in one request.
+
+    Each entry is ``(description, category_id, category_name, payee)``.
+    """
+    payload_items: List[dict] = []
+    seen: set[str] = set()
+    for description, category_id, category_name, payee in entries:
+        text = " ".join((description or "").strip().split())
+        key = normalize_description(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        payload_items.append(
+            {
+                "description": text,
+                "category_id": str(category_id),
+                "category_name": category_name,
+                "payee": " ".join((payee or "").strip().upper().split()),
+            }
+        )
+    if not payload_items:
+        return []
+    payload = await api_client.request(
+        "POST",
+        "v1/description-mappings/bulk",
+        json={"mappings": payload_items},
+        timeout=_BULK_MUTATION_TIMEOUT,
+    )
+    mappings = [_mapping(document) for document in payload.get("items") or []]
+    for mapping in mappings:
+        _cache_put(mapping)
+    return mappings
+
+
 async def delete_mapping(mapping_id: ObjectId | str) -> None:
     await api_client.request(
         "DELETE",

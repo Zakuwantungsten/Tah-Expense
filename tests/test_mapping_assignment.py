@@ -102,13 +102,14 @@ async def test_apply_assignment_reuses_item_and_saves_each_description(monkeypat
     cat = Category(_id=ObjectId(), name="Parking")
     saved: list[tuple] = []
 
-    async def fake_save(description, category_id, category_name, payee=""):
-        saved.append((description, category_id, category_name, payee))
+    async def fake_bulk(entries):
+        saved.extend(list(entries))
+        return []
 
     monkeypatch.setattr(mas, "create_item_for_mapping", AsyncMock())
     monkeypatch.setattr(
-        "tahmeed.services.description_mapping_service.save_mapping",
-        fake_save,
+        "tahmeed.services.description_mapping_service.save_mappings_bulk",
+        fake_bulk,
     )
     chosen, failed = await mas.apply_assignment_to_descriptions(
         ["TRIANGLE", "PARKING KURASINI", " triangle "],
@@ -132,16 +133,18 @@ async def test_apply_assignment_creates_item_once_then_maps_all(monkeypatch) -> 
     created = AsyncMock(return_value=new_cat)
     saved: list[str] = []
 
-    async def fake_save(description, category_id, category_name, payee=""):
-        saved.append(description)
-        assert category_id == new_cat._id
-        assert category_name == "Council Fees"
-        assert payee == "SPARE PARTS"
+    async def fake_bulk(entries):
+        for description, category_id, category_name, payee in entries:
+            saved.append(description)
+            assert category_id == new_cat._id
+            assert category_name == "Council Fees"
+            assert payee == "SPARE PARTS"
+        return []
 
     monkeypatch.setattr(mas, "create_item_for_mapping", created)
     monkeypatch.setattr(
-        "tahmeed.services.description_mapping_service.save_mapping",
-        fake_save,
+        "tahmeed.services.description_mapping_service.save_mappings_bulk",
+        fake_bulk,
     )
     catalog: list[Category] = []
     chosen, failed = await mas.apply_assignment_to_descriptions(

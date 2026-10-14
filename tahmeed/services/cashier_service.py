@@ -129,11 +129,20 @@ async def save_transaction(tx: Transaction) -> Transaction:
     return saved
 
 
-async def update_transaction(tx_id: ObjectId, updates: dict) -> bool:
+async def update_transaction(
+    tx_id: ObjectId,
+    updates: dict,
+    *,
+    client_audit: bool = False,
+) -> bool:
     """Apply a $set update to an existing transaction. Used by the explicit
     Save action when committing edits to already-saved rows. The caller is
     responsible for building `updates` from the edited cell values (excluding
-    immutable / accountant-managed fields)."""
+    immutable / accountant-managed fields).
+
+    Server PATCH already writes ``txn.update`` audit — client audit is opt-in
+    (off by default) so Save does not pay a second RTT per row.
+    """
     try:
         await api_client.request(
             "PATCH",
@@ -144,19 +153,92 @@ async def update_transaction(tx_id: ObjectId, updates: dict) -> bool:
         if exc.status_code == 404:
             return False
         raise
-    try:
-        from tahmeed.services.audit_service import record_event
+    if client_audit:
+        try:
+            from tahmeed.services.audit_service import record_event
 
-        await record_event(
-            "txn.update",
-            actor_id=updates.get("last_edited_by"),
-            entity_type="transaction",
-            entity_ids=[tx_id],
-            details={"fields": sorted(str(k) for k in updates.keys())},
-        )
-    except Exception:
-        pass
+            await record_event(
+                "txn.update",
+                actor_id=updates.get("last_edited_by"),
+                entity_type="transaction",
+                entity_ids=[tx_id],
+                details={"fields": sorted(str(k) for k in updates.keys())},
+            )
+        except Exception:
+            pass
     return True
+
+
+async def bulk_update_transactions(
+    items: Sequence[Tuple[ObjectId, dict]],
+) -> int:
+    """Patch many saved rows in one ``POST /v1/transactions/bulk-patch``.
+
+    Each item is ``(tx_id, updates)``. Returns the server ``updated`` count.
+    """
+    if not items:
+        return 0
+    body = {
+        "items": [
+            {
+                "id": str(tx_id),
+                "values": jsonable_document(dict(updates)),
+            }
+            for tx_id, updates in items
+            if tx_id and updates
+        ]
+    }
+    if not body["items"]:
+        return 0
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/bulk-patch",
+        json=body,
+        timeout=_BULK_CREATE_TIMEOUT,
+    )
+    return int(payload.get("updated") or 0)
+
+
+async def apply_description_mapping_bulk(
+    description_keys: Sequence[str],
+    *,
+    payee: str,
+    category_name: str,
+    category_id: ObjectId,
+    dates: Sequence[date] | None = None,
+    cashier_id: ObjectId | None = None,
+    client_job_id: str | None = None,
+) -> int:
+    """Stamp Payee + Item onto matching open rows in one server ``update_many``.
+
+    Used by cashiers and accountants (accountants may omit ``cashier_id`` to
+    apply across all cashiers, or pass a scope id).
+    """
+    keys = [
+        " ".join((key or "").strip().upper().split())
+        for key in description_keys
+        if " ".join((key or "").strip().upper().split())
+    ]
+    if not keys:
+        return 0
+    body: dict = {
+        "description_keys": keys,
+        "payee": " ".join((payee or "").strip().upper().split()),
+        "category_name": category_name,
+        "category_id": str(category_id),
+    }
+    if dates:
+        body["dates"] = [d.isoformat() for d in dates]
+    if cashier_id is not None:
+        body["cashier_id"] = str(cashier_id)
+    if client_job_id:
+        body["client_job_id"] = client_job_id
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/apply-description-mapping",
+        json=body,
+    )
+    return int(payload.get("updated") or 0)
 
 
 async def delete_transaction(tx_id: ObjectId) -> None:

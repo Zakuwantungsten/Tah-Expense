@@ -58,7 +58,7 @@ from tahmeed.services.truck_format import (
 )
 from tahmeed.services.cashier_service import (
     get_transactions_by_date, save_transaction, request_or_delete_transaction,
-    update_transaction, insert_pending_edit,
+    update_transaction, bulk_update_transactions, insert_pending_edit,
     check_for_duplicates_bulk, bulk_save_transactions,
     submit_day_for_verify, recount_day_order,
     next_day_order,
@@ -1021,6 +1021,7 @@ class DailyRegister(QWidget):
         self._defer_item_to_verify: bool = False
         # When True, typed/pasted descriptions fill blank Item/Payee from maps.
         self._auto_fill_from_maps: bool = True
+        self._duplicate_check_days: int = 5
         self._restrict_trucks: bool = True  # always on — only registered fleet numbers
         self._fleet_numbers: set = set()   # uppercased valid fleet numbers
         self._fleet_kinds: dict = {}       # number → "truck" | "trailer" | "motor_vehicle"
@@ -5317,10 +5318,12 @@ class DailyRegister(QWidget):
         self._sync_row_date(row)
         self._deactivate_row(row)
 
-    def _mark_new_row_saved(self, row: int) -> None:
+    def _mark_new_row_saved(self, row: int, *, flush: bool = True) -> None:
         """After a successful insert: clear the editable row and prune local draft.
 
         Keeps mid-save crashes from recovering rows that already reached Mongo.
+        Pass ``flush=False`` when clearing many rows, then call
+        ``_flush_local_draft()`` once after the batch.
         """
         if row < self._saved_count:
             return
@@ -5329,7 +5332,8 @@ class DailyRegister(QWidget):
             self._clear_editable_row(row)
         finally:
             self._table.blockSignals(prev)
-        self._flush_local_draft()
+        if flush:
+            self._flush_local_draft()
 
     def _row_date_iso(self, row: int) -> str:
         """Normalize the Date cell (or register day) to ``YYYY-MM-DD``."""
@@ -6026,7 +6030,7 @@ class DailyRegister(QWidget):
                         synced += 1
                         if status_key == "already_exists":
                             already_exists += 1
-                        self._mark_new_row_saved(row)
+                        self._mark_new_row_saved(row, flush=False)
                     else:
                         any_fail = True
                         self._set_row_sync_status(row, SYNC_FAILED)
@@ -6469,7 +6473,11 @@ class DailyRegister(QWidget):
                 )
             return True
 
-        # ── Pass 1: commit edits to already-saved rows (UPDATE) ──────────
+        # ── Pass 1: commit edits to already-saved rows ─────────────────
+        # In-place draft/unverified edits → one bulk-patch. Verified rows
+        # still go through per-row pending-edit (rarer, different semantics).
+        inplace_updates: list[tuple[int, object, dict]] = []
+        pending_edit_rows: list[tuple[int, object, dict]] = []
         for row in sorted(self._dirty_rows):
             tx_id = self._saved_ids.get(row)
             if tx_id is None:
@@ -6484,31 +6492,48 @@ class DailyRegister(QWidget):
             updates["last_edited_at"] = datetime.utcnow()
             updates["last_edited_by"] = self._user._id
             orig = self._saved_txs.get(row)
+            if orig is not None and getattr(orig, "original_transaction_id", None):
+                updates["edited_after_verification"] = True
+                inplace_updates.append((row, tx_id, updates))
+            elif orig is not None and orig.verified:
+                pending_edit_rows.append((row, tx_id, updates))
+            elif orig is not None and (getattr(orig, "register_status", "") or "") == "draft":
+                inplace_updates.append((row, tx_id, updates))
+            elif orig is not None:
+                updates["edited_after_verification"] = True
+                if getattr(orig, "rejected", False):
+                    updates["rejected"] = False
+                    updates["rejection_reason"] = None
+                    updates["discarded"] = False
+                inplace_updates.append((row, tx_id, updates))
+            else:
+                inplace_updates.append((row, tx_id, updates))
+
+        if inplace_updates:
             try:
-                if orig is not None and getattr(orig, "original_transaction_id", None):
-                    # Already a pending-edit clone — refresh it in place.
-                    updates["edited_after_verification"] = True
-                    await update_transaction(tx_id, updates)
-                elif orig is not None and orig.verified:
-                    # Leave the original in Master Expenses intact; insert a
-                    # pending-edit document that the accountant reviews in the
-                    # Edited tab. On re-approval the new values cascade to the
-                    # original in-place.
-                    await insert_pending_edit(tx_id, updates, self._user._id)
-                elif orig is not None and (getattr(orig, "register_status", "") or "") == "draft":
-                    # Still in Merged draft — update in place; do not send to Edited yet.
-                    await update_transaction(tx_id, updates)
-                elif orig is not None:
-                    # Option B: any edit of a saved (unverified / rejected) row
-                    # moves it to Verify → Edited for accountant re-approval.
-                    updates["edited_after_verification"] = True
-                    if getattr(orig, "rejected", False):
-                        updates["rejected"] = False
-                        updates["rejection_reason"] = None
-                        updates["discarded"] = False
-                    await update_transaction(tx_id, updates)
-                else:
-                    await update_transaction(tx_id, updates)
+                self._show_register_loading(
+                    f"Updating {len(inplace_updates)} saved row"
+                    f"{'s' if len(inplace_updates) != 1 else ''}…"
+                )
+                await bulk_update_transactions(
+                    [(tx_id, body) for _row, tx_id, body in inplace_updates]
+                )
+                for row, _tx_id, _body in inplace_updates:
+                    updated += 1
+                    self._dirty_rows.discard(row)
+            except Exception:
+                # Fall back to per-row PATCH so one bad row does not block all.
+                for row, tx_id, body in inplace_updates:
+                    try:
+                        await update_transaction(tx_id, body)
+                        updated += 1
+                        self._dirty_rows.discard(row)
+                    except Exception as row_exc:
+                        errors.append(f"Row {row + 1}: {row_exc}")
+
+        for row, tx_id, updates in pending_edit_rows:
+            try:
+                await insert_pending_edit(tx_id, updates, self._user._id)
                 updated += 1
                 self._dirty_rows.discard(row)
             except Exception as exc:
@@ -6517,10 +6542,7 @@ class DailyRegister(QWidget):
         # ── Pass 2: insert brand-new rows (INSERT) — My entries only ───
         pending_inserts: list[tuple[int, Transaction]] = []
         if not self._merged_mode:
-            try:
-                dup_days = int(await get_setting("duplicate_check_days") or 5)
-            except Exception:
-                dup_days = 5
+            dup_days = int(getattr(self, "_duplicate_check_days", 5) or 5)
 
             # Pre-scan: warn once if any new rows carry a date other than the open day
             register_label = self._current_date.strftime("%d %b %Y")
@@ -6655,11 +6677,13 @@ class DailyRegister(QWidget):
                         saved += 1
                         if status_key == "already_exists":
                             already_exists += 1
-                        self._mark_new_row_saved(row)
+                        self._mark_new_row_saved(row, flush=False)
                     else:
                         errors.append(
                             f"Row {row + 1}: {err or status_key or 'save failed'}"
                         )
+                # One draft prune per chunk (not per row) — crash-safe mid-save.
+                self._flush_local_draft()
 
         if self._merged_mode and (saved or updated):
             try:
@@ -6799,6 +6823,12 @@ class DailyRegister(QWidget):
             )
         except Exception:
             self._auto_fill_from_maps = True
+        try:
+            self._duplicate_check_days = int(
+                await get_setting("duplicate_check_days") or 5
+            )
+        except Exception:
+            self._duplicate_check_days = 5
         try:
             self._restrict_trucks = True
             # Persist intended default so accountant UI / other clients stay in sync.
@@ -7215,6 +7245,11 @@ class DailyRegister(QWidget):
         if norm.status == "place_label":
             return "ok", norm.value
         if norm.status == "invalid":
+            # Bikes/cars (and any freeform fleet plate) skip truck format —
+            # registry membership wins (parity with import_truck_check).
+            matched = try_match_fleet(raw, self._fleet_numbers)
+            if matched is not None:
+                return "ok", matched
             allowed = self._truck_allow_anyway.get(row) if row is not None else None
             if allowed and self._truck_key(raw) == self._truck_key(allowed):
                 return "ok", allowed

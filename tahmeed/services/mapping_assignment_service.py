@@ -150,7 +150,7 @@ async def apply_assignment_to_descriptions(
     Returns ``(category, failed_count)``. Failed rows are skipped so a later
     mapping can still be updated.
     """
-    from tahmeed.services.description_mapping_service import save_mapping
+    from tahmeed.services.description_mapping_service import save_mappings_bulk
 
     category = await materialize_mapping_assignment(assignment, categories)
     if category is None or category._id is None:
@@ -158,13 +158,16 @@ async def apply_assignment_to_descriptions(
     failed = 0
     seen: set[str] = set()
     payee = assignment.payee_name
+    entries: list[tuple[str, object, str, str]] = []
     for raw in descriptions:
         text = " ".join((raw or "").strip().split())
         if not text or text.lower() in seen:
             continue
         seen.add(text.lower())
+        entries.append((text, category._id, category.name, payee))
+    if entries:
         try:
-            await save_mapping(text, category._id, category.name, payee=payee)
+            await save_mappings_bulk(entries)
         except Exception:
-            failed += 1
+            failed = len(entries)
     return category, failed

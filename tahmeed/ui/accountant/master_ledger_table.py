@@ -1105,6 +1105,10 @@ class MasterLedgerTable(QFrame):
         if norm.status == "place_label":
             return "ok", norm.value
         if norm.status == "invalid":
+            # Bikes/cars freeform plates: fleet membership beats truck format.
+            matched = try_match_fleet(raw, self._fleet_numbers)
+            if matched is not None:
+                return "ok", matched
             return "invalid_format", norm.value or raw.strip().upper()
         matched = try_match_fleet(norm.value, self._fleet_numbers)
         if matched is None:

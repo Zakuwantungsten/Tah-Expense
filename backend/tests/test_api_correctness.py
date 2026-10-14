@@ -444,6 +444,24 @@ class FakeMappings:
         self.documents.append(created)
         return dict(created)
 
+    async def bulk_write(self, ops: list, ordered: bool = True) -> None:
+        for op in ops:
+            filt = op._filter
+            doc_update = op._doc
+            await self.find_one_and_update(filt, doc_update, upsert=True)
+
+    def find(self, query: dict, _projection: dict | None = None) -> "FakeCursor":
+        keys = None
+        key_clause = query.get("description_key")
+        if isinstance(key_clause, dict) and "$in" in key_clause:
+            keys = set(key_clause["$in"])
+        docs = []
+        for document in self.documents:
+            if keys is not None and document.get("description_key") not in keys:
+                continue
+            docs.append(dict(document))
+        return FakeCursor(docs)
+
 
 def test_cashier_can_save_description_mapping() -> None:
     mappings = FakeMappings()
@@ -451,13 +469,29 @@ def test_cashier_can_save_description_mapping() -> None:
     class MappingDb:
         def __init__(self) -> None:
             self.description_mappings = mappings
+            self.operation_events = SimpleNamespace(
+                insert_one=lambda *_a, **_k: None
+            )
 
         def __getitem__(self, key: str):
             return getattr(self, key)
 
-    database = SimpleNamespace(db=MappingDb())
+        async def insert_one(self, *_a, **_k):
+            return SimpleNamespace(inserted_id=ObjectId())
+
+    # operation_events.insert_one must be awaitable for record_operation_event
+    class _Events:
+        documents: list = []
+
+        async def insert_one(self, document: dict):
+            self.documents.append(document)
+            return SimpleNamespace(inserted_id=ObjectId())
+
+    db = MappingDb()
+    db.operation_events = _Events()
+    database = SimpleNamespace(db=db)
     app = create_app(settings=settings(), database=database)
-    app.dependency_overrides[current_user] = lambda: {"role": "cashier"}
+    app.dependency_overrides[current_user] = lambda: {"role": "cashier", "_id": ObjectId()}
     body = {
         "description": "PARKING KURASINI",
         "category_id": str(ObjectId()),
@@ -468,6 +502,68 @@ def test_cashier_can_save_description_mapping() -> None:
     assert response.status_code == 200
     assert len(mappings.documents) == 1
     assert mappings.documents[0]["description_key"] == "PARKING KURASINI"
+
+
+def test_bulk_upsert_description_mappings_cashier_and_accountant() -> None:
+    mappings = FakeMappings()
+
+    class _Events:
+        documents: list = []
+
+        async def insert_one(self, document: dict):
+            self.documents.append(document)
+            return SimpleNamespace(inserted_id=ObjectId())
+
+    class MappingDb:
+        def __init__(self) -> None:
+            self.description_mappings = mappings
+            self.operation_events = _Events()
+
+        def __getitem__(self, key: str):
+            return getattr(self, key)
+
+    database = SimpleNamespace(db=MappingDb())
+    app = create_app(settings=settings(), database=database)
+    app.dependency_overrides[current_user] = lambda: {
+        "role": "accountant",
+        "_id": ObjectId(),
+        "username": "acct",
+    }
+    cat_id = str(ObjectId())
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/description-mappings/bulk",
+            json={
+                "mappings": [
+                    {
+                        "description": "mileage",
+                        "category_id": cat_id,
+                        "category_name": "DIRECT COSTS:MILEAGE EXPENSE",
+                        "payee": "mileage",
+                    },
+                    {
+                        "description": "LATRA FEE",
+                        "category_id": cat_id,
+                        "category_name": "Parking",
+                        "payee": "CITY",
+                    },
+                    {
+                        "description": "mileage",
+                        "category_id": cat_id,
+                        "category_name": "DIRECT COSTS:MILEAGE EXPENSE",
+                        "payee": "mileage",
+                    },
+                ]
+            },
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["upserted_count"] == 2
+    assert len(body["items"]) == 2
+    keys = {item["description_key"] for item in body["items"]}
+    assert keys == {"MILEAGE", "LATRA FEE"}
+    payees = {item["description_key"]: item["payee"] for item in body["items"]}
+    assert payees["MILEAGE"] == "MILEAGE"
 
 
 class FakeCursor:
@@ -485,8 +581,10 @@ class FakeCursor:
     def limit(self, _limit: int) -> "FakeCursor":
         return self
 
-    async def to_list(self) -> list[dict]:
-        return self.documents
+    async def to_list(self, length: int | None = None) -> list[dict]:
+        if length is None:
+            return self.documents
+        return self.documents[:length]
 
 
 class FakePagedCollection:

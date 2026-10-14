@@ -233,11 +233,16 @@ class FakeTransactions:
                 count += 1
         return SimpleNamespace(matched_count=count, modified_count=count)
 
-    async def bulk_write(self, ops: list, ordered: bool = True) -> None:
+    async def bulk_write(self, ops: list, ordered: bool = True) -> SimpleNamespace:
+        matched = 0
+        modified = 0
         for op in ops:
             filt = op._filter  # pymongo UpdateOne
             doc_update = op._doc
-            await self.update_one(filt, doc_update)
+            result = await self.update_one(filt, doc_update)
+            matched += int(getattr(result, "matched_count", 0) or 0)
+            modified += int(getattr(result, "modified_count", 0) or 0)
+        return SimpleNamespace(matched_count=matched, modified_count=modified)
 
     async def delete_one(self, query: dict) -> SimpleNamespace:
         for index, doc in enumerate(self.documents):
@@ -1126,3 +1131,214 @@ def test_rejected_discarded_and_drafts() -> None:
     # still True on discarded_id — wait, restore only sets discarded False, keeps rejected True.
     # resubmit requires rejected True and discarded ne True — after restore that matches.
     assert resubmit.json()["updated"] == 1
+
+
+def test_bulk_patch_transactions_one_audit() -> None:
+    cat_id = ObjectId()
+    a = ObjectId()
+    b = ObjectId()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": a,
+                "description": "OLD A",
+                "payee": "",
+                "item": "",
+                "verified": False,
+            },
+            {
+                "_id": b,
+                "description": "OLD B",
+                "payee": "",
+                "item": "",
+                "verified": False,
+            },
+        ]
+    )
+    events = FakeOperationEvents()
+    app = _app(collection, events=events)
+    app.dependency_overrides[current_user] = lambda: _cashier()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/transactions/bulk-patch",
+            json={
+                "items": [
+                    {
+                        "id": str(a),
+                        "values": {
+                            "payee": "CITY",
+                            "item": "Parking",
+                            "category_name": "Parking",
+                            "category_id": str(cat_id),
+                        },
+                    },
+                    {
+                        "id": str(b),
+                        "values": {"description": "LATRA FEE"},
+                    },
+                ]
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["matched"] == 2
+    assert body["updated"] == 2
+    docs = {d["_id"]: d for d in collection.documents}
+    assert docs[a]["payee"] == "CITY"
+    assert docs[a]["item"] == "Parking"
+    assert docs[a]["category_id"] == cat_id
+    assert docs[b]["description"] == "LATRA FEE"
+    assert sum(1 for e in events.documents if e["action"] == "txn.bulk_update") == 1
+
+
+def test_apply_description_mapping_cashier_scoped() -> None:
+    cash_a = ObjectId()
+    cash_b = ObjectId()
+    cat_id = ObjectId()
+    day = datetime(2026, 10, 13, 8, 0, 0)
+    own = ObjectId()
+    other = ObjectId()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": own,
+                "cashier_id": cash_a,
+                "description": "  mileage  trip ",
+                "date": day,
+                "import_primary_date": None,
+                "verified": False,
+                "rejected": False,
+                "discarded": False,
+                "deletion_requested": False,
+                "trashed": False,
+                "payee": "",
+                "item": "",
+            },
+            {
+                "_id": other,
+                "cashier_id": cash_b,
+                "description": "MILEAGE TRIP",
+                "date": day,
+                "import_primary_date": None,
+                "verified": False,
+                "rejected": False,
+                "discarded": False,
+                "deletion_requested": False,
+                "trashed": False,
+                "payee": "",
+                "item": "",
+            },
+        ]
+    )
+    events = FakeOperationEvents()
+    app = _app(collection, events=events)
+    app.dependency_overrides[current_user] = lambda: _cashier(cash_a)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/transactions/apply-description-mapping",
+            json={
+                "description_keys": ["MILEAGE TRIP"],
+                "payee": "MILEAGE",
+                "category_name": "DIRECT COSTS:MILEAGE EXPENSE",
+                "category_id": str(cat_id),
+                "dates": ["2026-10-13"],
+                "client_job_id": "job-1",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["matched"] == 1
+    assert body["updated"] == 1
+    own_doc = next(d for d in collection.documents if d["_id"] == own)
+    other_doc = next(d for d in collection.documents if d["_id"] == other)
+    assert own_doc["payee"] == "MILEAGE"
+    assert own_doc["item"] == "DIRECT COSTS:MILEAGE EXPENSE"
+    assert own_doc["category_id"] == cat_id
+    assert other_doc["payee"] == ""
+    assert any(e["action"] == "txn.bulk_mapping_apply" for e in events.documents)
+
+
+def test_apply_description_mapping_accountant_all_cashiers() -> None:
+    cash_a = ObjectId()
+    cash_b = ObjectId()
+    cat_id = ObjectId()
+    day = datetime(2026, 10, 13, 8, 0, 0)
+    collection = FakeTransactions(
+        [
+            {
+                "_id": ObjectId(),
+                "cashier_id": cash_a,
+                "description": "LATRA FEE",
+                "date": day,
+                "import_primary_date": None,
+                "verified": False,
+                "rejected": False,
+                "discarded": False,
+                "deletion_requested": False,
+                "trashed": False,
+            },
+            {
+                "_id": ObjectId(),
+                "cashier_id": cash_b,
+                "description": "LATRA FEE",
+                "date": day,
+                "import_primary_date": None,
+                "verified": False,
+                "rejected": False,
+                "discarded": False,
+                "deletion_requested": False,
+                "trashed": False,
+            },
+            {
+                "_id": ObjectId(),
+                "cashier_id": cash_a,
+                "description": "LATRA FEE",
+                "date": day,
+                "import_primary_date": None,
+                "verified": True,
+                "rejected": False,
+                "discarded": False,
+                "deletion_requested": False,
+                "trashed": False,
+            },
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: _accountant()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/transactions/apply-description-mapping",
+            json={
+                "description_keys": ["LATRA FEE"],
+                "payee": "CITY",
+                "category_name": "Parking",
+                "category_id": str(cat_id),
+                "dates": ["2026-10-13"],
+            },
+        )
+        again = client.post(
+            "/v1/transactions/apply-description-mapping",
+            json={
+                "description_keys": ["LATRA FEE"],
+                "payee": "CITY",
+                "category_name": "Parking",
+                "category_id": str(cat_id),
+                "dates": ["2026-10-13"],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["matched"] == 2
+    assert response.json()["updated"] == 2
+    # Idempotent second apply still matches open rows.
+    assert again.status_code == 200
+    assert again.json()["matched"] == 2
+    stamped = [
+        d for d in collection.documents if d.get("payee") == "CITY" and not d.get("verified")
+    ]
+    assert len(stamped) == 2

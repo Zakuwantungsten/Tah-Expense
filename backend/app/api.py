@@ -9,7 +9,7 @@ from typing import Annotated, Any
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request, Response, status
-from pymongo import ReturnDocument
+from pymongo import ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError
 
 from .audit_ops import parse_audit_filters, record_operation_event
@@ -35,6 +35,7 @@ from .schemas import (
     FleetWrite,
     LoginRequest,
     MappingBulkDelete,
+    MappingBulkUpsert,
     MappingWrite,
     PatchDocument,
     PayeeWrite,
@@ -1207,6 +1208,59 @@ async def list_mappings(
 async def put_mapping(body: MappingWrite, request: Request, user: Authenticated) -> dict:
     """Cashiers save maps during daily import; accountants/admins manage them too."""
     return await create_named(request, "description_mappings", body, actor=user)
+
+
+@mappings.post("/bulk", status_code=200)
+async def bulk_upsert_mappings(
+    body: MappingBulkUpsert,
+    request: Request,
+    user: Authenticated,
+) -> dict:
+    """Upsert many description maps in one ``bulk_write`` (cashier + accountant)."""
+    db = database(request)
+    now = utcnow()
+    ops: list[UpdateOne] = []
+    keys: list[str] = []
+    seen: set[str] = set()
+    for item in body.mappings:
+        description = " ".join((item.description or "").strip().split())
+        key = " ".join(description.upper().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+        payee = " ".join((item.payee or "").strip().upper().split())
+        doc = {
+            "description": description,
+            "description_key": key,
+            "category_id": valid_id(item.category_id),
+            "category_name": item.category_name,
+            "payee": payee,
+            "created_at": now,
+        }
+        ops.append(
+            UpdateOne(
+                {"description_key": key},
+                {"$set": doc},
+                upsert=True,
+            )
+        )
+    if not ops:
+        return {"items": [], "upserted_count": 0}
+    await db.description_mappings.bulk_write(ops, ordered=False)
+    docs = await db.description_mappings.find(
+        {"description_key": {"$in": keys}}
+    ).to_list(length=len(keys))
+    await record_operation_event(
+        db,
+        action="mapping.bulk_upsert",
+        actor=user,
+        request=request,
+        entity_type="mapping",
+        entity_ids=[str(doc.get("_id") or "") for doc in docs[:40]],
+        details={"upserted_count": len(docs), "requested": len(body.mappings)},
+    )
+    return {"items": json_safe(docs), "upserted_count": len(docs)}
 
 
 async def patch_named(

@@ -94,8 +94,24 @@ class MappingWrite(StrictModel):
     payee: str = ""
 
 
+class MappingBulkUpsert(StrictModel):
+    mappings: list[MappingWrite] = Field(min_length=1, max_length=500)
+
+
 class MappingBulkDelete(StrictModel):
     ids: list[str] = Field(min_length=1, max_length=10000)
+
+
+class ApplyDescriptionMappingRequest(StrictModel):
+    """Stamp Payee + Item onto matching open register rows in one update_many."""
+
+    description_keys: list[str] = Field(min_length=1, max_length=500)
+    payee: str = ""
+    category_name: str = Field(min_length=1, max_length=200)
+    category_id: str
+    dates: list[str] = Field(default_factory=list, max_length=366)
+    cashier_id: str | None = None
+    client_job_id: str | None = Field(None, max_length=80)
 
 
 class PayeeWrite(StrictModel):
@@ -222,6 +238,27 @@ class TransactionPatch(StrictModel):
         if blocked.intersection(value):
             raise ValueError("immutable field included")
         return value
+
+
+class BulkTransactionPatchItem(StrictModel):
+    id: str
+    values: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("values")
+    @classmethod
+    def prevent_unsafe_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
+        blocked = {"_id", "created_at"}
+        if blocked.intersection(value):
+            raise ValueError("immutable field included")
+        return value
+
+
+class BulkTransactionPatchRequest(StrictModel):
+    """Batch in-place patches for dirty register rows (one bulk_write)."""
+
+    items: list[BulkTransactionPatchItem] = Field(
+        default_factory=list, min_length=1, max_length=500
+    )
 
 
 class SubmitDayRequest(StrictModel):

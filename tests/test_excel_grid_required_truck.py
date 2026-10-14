@@ -162,3 +162,39 @@ def test_truck_cell_highlight_cleared_when_truck_entered(register):
     truck_it = register._table.item(0, register._COL_TRUCK)
     assert truck_it.background().color() != register._TRUCK_REQUIRED_BG
     assert truck_it.toolTip() == ""
+
+
+def test_resolve_truck_accepts_registered_bike_without_truck_format(register):
+    """Freeform bike/car plates in fleet must not be flagged invalid_format."""
+    register._fleet_numbers = {"MC 123 ABC", "T688 EAF"}
+    register._fleet_kinds = {"MC 123 ABC": "motor_vehicle", "T688 EAF": "truck"}
+
+    status, value = register._resolve_truck_text("mc 123 abc")
+    assert status == "ok"
+    assert value == "MC 123 ABC"
+
+    # Unknown freeform still invalid_format (unchanged).
+    status, value = register._resolve_truck_text("weird/99")
+    assert status == "invalid_format"
+
+    # Truck-format plates still require registry membership.
+    status, value = register._resolve_truck_text("T999 ZZZ")
+    assert status == "not_in_registry"
+
+
+def test_master_ledger_resolve_accepts_registered_bike():
+    """Master ledger shares the same fleet-before-format rule."""
+    from types import SimpleNamespace
+
+    from tahmeed.ui.accountant.master_ledger_table import MasterLedgerTable
+
+    stub = SimpleNamespace(
+        _allowed_truck_labels={"YARD", "GARAGE"},
+        _fleet_numbers={"BUS 45 TZ"},
+    )
+    status, value = MasterLedgerTable._resolve_truck_text(stub, "bus 45 tz")
+    assert status == "ok"
+    assert value == "BUS 45 TZ"
+
+    status, _ = MasterLedgerTable._resolve_truck_text(stub, "UNKNOWN BIKE")
+    assert status == "invalid_format"

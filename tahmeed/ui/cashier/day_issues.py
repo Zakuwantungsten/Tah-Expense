@@ -36,12 +36,8 @@ from tahmeed.services.day_issues_service import (
     as_of_label,
     collect_day_issues,
     collect_day_issues_all_days,
-    filter_rows_for_cashier_scope,
 )
-from tahmeed.services.description_mapping_service import (
-    normalize_description,
-    save_mapping,
-)
+from tahmeed.services.description_mapping_service import normalize_description
 from tahmeed.services.mapping_assignment_service import (
     MappingAssignment,
     materialize_mapping_assignment,
@@ -1108,10 +1104,33 @@ class DayIssuesWidget(QWidget):
         self._loading_overlay = LoadingOverlay(self._table_host, "Loading…")
         self._footer = _lbl("", size=11, color=_TM)
         root.addWidget(self._footer)
+        self._wire_mapping_apply_outbox()
+
+    def _wire_mapping_apply_outbox(self) -> None:
+        """Background apply failures: soft toast only (maps + live UI already ok)."""
+        from tahmeed.services.mapping_apply_outbox import set_failure_handler
+
+        def _on_failed(job, exc: BaseException) -> None:
+            try:
+                self._footer.setText(
+                    f"Background row update delayed ({len(job.description_keys)} map(s)). "
+                    f"Will retry when Day Issues refreshes."
+                )
+            except Exception:
+                pass
+            _ = exc
+
+        set_failure_handler(_on_failed)
 
     def _schedule_refresh(self) -> None:
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self.refresh())
+
+    def _kick_mapping_apply_drain(self) -> None:
+        from tahmeed.services.mapping_apply_outbox import drain_mapping_apply_outbox
+        from tahmeed.ui.async_utils import schedule_coro
+
+        schedule_coro(drain_mapping_apply_outbox())
 
     async def _load_auto_fill_maps_setting(self) -> None:
         from tahmeed.services.settings_service import get_setting
@@ -1289,6 +1308,7 @@ class DayIssuesWidget(QWidget):
     async def refresh(self, *, quiet: bool = False) -> None:
         if self._loading:
             return
+        self._kick_mapping_apply_drain()
         self._loading = True
         if not quiet:
             self._loading_overlay.show_loading("Scanning day issues…")
@@ -1796,32 +1816,45 @@ class DayIssuesWidget(QWidget):
             if payee_needs_create(name, self._payees):
                 self._payees.append(name)
 
-        saved_n = 0
         live_n = 0
         committed = 0
         try:
+            # Optimistic: stamp live Table/draft first, then one bulk map save.
             for desc, payee, cat in resolved:
-                await save_mapping(desc, cat._id, cat.name, payee=payee)
-                s, l = await self._apply_mapping_everywhere(
+                live_n += self._stamp_live_rows(
                     [desc], payee, cat.name, cat._id
                 )
-                saved_n += s
-                live_n += l
-                committed += 1
+            from tahmeed.services.description_mapping_service import save_mappings_bulk
+
+            await save_mappings_bulk(
+                [
+                    (desc, cat._id, cat.name, payee)
+                    for desc, payee, cat in resolved
+                ]
+            )
+            # Group by (payee, item, category_id) for background DB apply.
+            groups: dict[tuple, list[str]] = {}
+            for desc, payee, cat in resolved:
+                key = (payee, cat.name, str(cat._id))
+                groups.setdefault(key, []).append(desc)
                 self._mapping_drafts.pop(normalize_description(desc), None)
+                committed += 1
+            for (payee, item_name, cat_id_str), descs in groups.items():
+                self._enqueue_saved_row_apply(
+                    descs, payee, item_name, ObjectId(cat_id_str)
+                )
         except Exception as exc:
             QMessageBox.critical(self, "Save Filled Failed", str(exc))
             return
         finally:
             self._loading_overlay.hide_loading()
 
-        applied = max(saved_n, live_n) if live_n else saved_n
         QMessageBox.information(
             self,
             "Mappings saved",
             f"Saved {committed:,} filled mapping(s) to Description Maps.\n"
-            f"Updated {applied:,} open row(s)"
-            + (f" ({live_n:,} on Table/draft)." if live_n else "."),
+            f"Updated {live_n:,} open row(s) on Table/draft"
+            f"{' (DB rows updating in background).' if live_n or committed else '.'}",
         )
         descs = [desc for desc, _p, _c in resolved]
         await self._finish_mapping_ui(descs)
@@ -1875,11 +1908,19 @@ class DayIssuesWidget(QWidget):
 
         self._loading_overlay.show_loading("Saving mappings…")
         try:
-            for desc in descriptions:
-                await save_mapping(
-                    desc, category._id, category.name, payee=payee
-                )
-            saved_n, live_n = await self._apply_mapping_everywhere(
+            # Optimistic: live stamp first, bulk map upsert, DB apply in outbox.
+            live_n = self._stamp_live_rows(
+                descriptions, payee, category.name, category._id
+            )
+            from tahmeed.services.description_mapping_service import save_mappings_bulk
+
+            await save_mappings_bulk(
+                [
+                    (desc, category._id, category.name, payee)
+                    for desc in descriptions
+                ]
+            )
+            self._enqueue_saved_row_apply(
                 descriptions, payee, category.name, category._id
             )
             for desc in descriptions:
@@ -1890,17 +1931,16 @@ class DayIssuesWidget(QWidget):
         finally:
             self._loading_overlay.hide_loading()
 
-        applied = max(saved_n, live_n) if live_n else saved_n
-        detail = (
-            f" ({live_n:,} on Table/draft including unsaved)."
-            if live_n
-            else "."
-        )
         apply_days = self._dates_for_descriptions(descriptions)
         scope_txt = (
             f"{len(apply_days)} day(s)"
             if self._scope == "all"
             else as_of_label(self._target)
+        )
+        detail = (
+            f" ({live_n:,} on Table/draft including unsaved)."
+            if live_n
+            else "."
         )
         QMessageBox.information(
             self,
@@ -1908,8 +1948,9 @@ class DayIssuesWidget(QWidget):
             f"Mapped {len(descriptions):,} description(s) to:\n"
             f"Payee: {payee}\nItem: {category.name}\n\n"
             f"Saved to Description Maps.\n"
-            f"Updated {applied:,} open row(s) across {scope_txt}"
-            f"{detail}",
+            f"Updated {live_n:,} open row(s) across {scope_txt}"
+            f"{detail}\n"
+            f"Saved register rows are updating in the background.",
         )
         await self._finish_mapping_ui(descriptions)
 
@@ -1922,24 +1963,33 @@ class DayIssuesWidget(QWidget):
         self.mappings_applied.emit()
         await self.refresh(quiet=True)
 
-    async def _apply_mapping_everywhere(
+    def _stamp_live_rows(
         self,
         descriptions: Sequence[str],
         payee: str,
         item_name: str,
         category_id: ObjectId,
-    ) -> tuple:
+    ) -> int:
+        """Sync stamp onto open Table/draft rows (optimistic, no network)."""
         apply_days = self._dates_for_descriptions(descriptions)
-        saved_n = await self._apply_to_saved_rows(
-            descriptions,
-            payee,
-            item_name,
-            category_id,
-            days=apply_days,
-        )
         live_n = 0
-        if self._apply_live is not None:
-            for day in apply_days:
+        if self._apply_live is None:
+            return 0
+        for day in apply_days:
+            try:
+                live_n += int(
+                    self._apply_live(
+                        day,
+                        descriptions,
+                        payee=payee,
+                        item_name=item_name,
+                        category_id=category_id,
+                        cashier_id=self._cashier_scope_id,
+                        emit_source_changed=False,
+                    )
+                    or 0
+                )
+            except TypeError:
                 try:
                     live_n += int(
                         self._apply_live(
@@ -1949,28 +1999,59 @@ class DayIssuesWidget(QWidget):
                             item_name=item_name,
                             category_id=category_id,
                             cashier_id=self._cashier_scope_id,
-                            emit_source_changed=False,
                         )
                         or 0
                     )
-                except TypeError:
-                    # Older apply_live callables without emit_source_changed.
-                    try:
-                        live_n += int(
-                            self._apply_live(
-                                day,
-                                descriptions,
-                                payee=payee,
-                                item_name=item_name,
-                                category_id=category_id,
-                                cashier_id=self._cashier_scope_id,
-                            )
-                            or 0
-                        )
-                    except Exception:
-                        continue
                 except Exception:
                     continue
+            except Exception:
+                continue
+        return live_n
+
+    def _enqueue_saved_row_apply(
+        self,
+        descriptions: Sequence[str],
+        payee: str,
+        item_name: str,
+        category_id: ObjectId,
+    ) -> None:
+        """Enqueue one bulk DB stamp; drain runs in the background."""
+        from tahmeed.services.mapping_apply_outbox import enqueue_mapping_apply
+
+        keys = [
+            normalize_description(d)
+            for d in descriptions
+            if normalize_description(d)
+        ]
+        if not keys:
+            return
+        enqueue_mapping_apply(
+            description_keys=keys,
+            payee=payee,
+            item=item_name,
+            category_id=category_id,
+            dates=self._dates_for_descriptions(descriptions),
+            cashier_id=self._cashier_scope_id,
+        )
+
+    async def _apply_mapping_everywhere(
+        self,
+        descriptions: Sequence[str],
+        payee: str,
+        item_name: str,
+        category_id: ObjectId,
+    ) -> tuple:
+        """Legacy helper: live stamp + await one bulk DB apply (tests / callers)."""
+        live_n = self._stamp_live_rows(
+            descriptions, payee, item_name, category_id
+        )
+        saved_n = await self._apply_to_saved_rows(
+            descriptions,
+            payee,
+            item_name,
+            category_id,
+            days=self._dates_for_descriptions(descriptions),
+        )
         return saved_n, live_n
 
     def _dates_for_descriptions(self, descriptions: Sequence[str]) -> List[date]:
@@ -1993,45 +2074,25 @@ class DayIssuesWidget(QWidget):
         *,
         days: Optional[Sequence[date]] = None,
     ) -> int:
-        """Patch saved open (unverified) rows for the given day(s)."""
-        from tahmeed.services.cashier_service import (
-            get_transactions_by_date,
-            update_transaction,
-        )
+        """One bulk ``update_many`` for matching open (unverified) rows."""
+        from tahmeed.services.cashier_service import apply_description_mapping_bulk
 
-        keys = {normalize_description(d) for d in descriptions}
+        keys = [
+            normalize_description(d)
+            for d in descriptions
+            if normalize_description(d)
+        ]
+        if not keys:
+            return 0
         target_days = list(days) if days else [self._target]
-        updated = 0
-        for day in target_days:
-            if self._cashier_scope_id is not None:
-                txs = await get_transactions_by_date(
-                    day,
-                    merged=False,
-                    cashier_id=self._cashier_scope_id,
-                )
-            else:
-                txs = await get_transactions_by_date(day, merged=True)
-            txs = filter_rows_for_cashier_scope(txs, self._cashier_scope_id)
-            for tx in txs:
-                if getattr(tx, "verified", False) or getattr(tx, "trashed", False):
-                    continue
-                if getattr(tx, "discarded", False):
-                    continue
-                key = normalize_description(getattr(tx, "description", "") or "")
-                if key not in keys:
-                    continue
-                if tx._id is None:
-                    continue
-                body = {
-                    "payee": payee,
-                    "item": item_name,
-                    "category_name": item_name,
-                    "category_id": category_id,
-                }
-                try:
-                    ok = await update_transaction(tx._id, body)
-                except Exception:
-                    continue
-                if ok:
-                    updated += 1
-        return updated
+        try:
+            return await apply_description_mapping_bulk(
+                keys,
+                payee=payee,
+                category_name=item_name,
+                category_id=category_id,
+                dates=target_days,
+                cashier_id=self._cashier_scope_id,
+            )
+        except Exception:
+            return 0

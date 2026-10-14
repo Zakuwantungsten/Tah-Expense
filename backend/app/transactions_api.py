@@ -16,7 +16,9 @@ from .audit_ops import record_operation_event
 from .dependencies import Authenticated, require_roles
 from .errors import ApiError
 from .schemas import (
+    ApplyDescriptionMappingRequest,
     BulkIdsRequest,
+    BulkTransactionPatchRequest,
     DayOrderRequest,
     DiscardDraftDayRequest,
     DuplicateCheckBulkRequest,
@@ -1596,14 +1598,159 @@ async def bulk_purge_own_unverified_trash(
     return {"deleted": n}
 
 
-@transactions.get("/{tx_id}")
-async def get_transaction(
-    tx_id: str, request: Request, _user: Authenticated
+def _normalize_description_key(value: str) -> str:
+    return " ".join((value or "").strip().upper().split())
+
+
+@transactions.post("/bulk-patch")
+async def bulk_patch_transactions(
+    body: BulkTransactionPatchRequest,
+    request: Request,
+    actor: RegisterActor,
 ) -> dict:
-    doc = await _database(request).transactions.find_one({"_id": _valid_id(tx_id)})
-    if not doc:
-        raise ApiError(404, "not_found", "Transaction not found")
-    return json_safe(doc)
+    """Apply many in-place register edits in one ``bulk_write`` + one audit.
+
+    Used by Daily Register Save for dirty draft / unverified rows. Verified
+    pending-edit clones stay on the per-row pending-edit path.
+    """
+    ops: list[UpdateOne] = []
+    ids: list[ObjectId] = []
+    for item in body.items:
+        oid = _valid_id(item.id)
+        values = _coerce_write_fields(dict(item.values or {}))
+        if not values:
+            continue
+        ops.append(UpdateOne({"_id": oid}, {"$set": values}))
+        ids.append(oid)
+    if not ops:
+        return {"updated": 0, "matched": 0, "requested": len(body.items)}
+
+    db = _database(request)
+    result = await db.transactions.bulk_write(ops, ordered=False)
+    updated = int(getattr(result, "modified_count", 0) or 0)
+    matched = int(getattr(result, "matched_count", 0) or 0)
+    await record_operation_event(
+        db,
+        action="txn.bulk_update",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(oid) for oid in ids[:40]],
+        details={
+            "updated": updated,
+            "matched": matched,
+            "requested": len(body.items),
+        },
+    )
+    return {"updated": updated, "matched": matched, "requested": len(body.items)}
+
+
+@transactions.post("/apply-description-mapping")
+async def apply_description_mapping(
+    body: ApplyDescriptionMappingRequest,
+    request: Request,
+    actor: RegisterActor,
+) -> dict:
+    """Stamp Payee + Item onto matching open rows in one ``update_many``.
+
+    Cashiers (and accountants using the register) share this path. Cashiers are
+    always scoped to their own rows; accountants/admins may stamp any open rows
+    or optionally narrow with ``cashier_id``.
+    """
+    keys = {
+        _normalize_description_key(raw)
+        for raw in body.description_keys
+        if _normalize_description_key(raw)
+    }
+    if not keys:
+        raise ApiError(422, "empty_keys", "At least one description key is required")
+
+    category_id = _valid_id(body.category_id)
+    payee = " ".join((body.payee or "").strip().upper().split())
+    item_name = " ".join((body.category_name or "").strip().split())
+    if not item_name:
+        raise ApiError(422, "empty_item", "Item / category name is required")
+
+    parsed_dates: list[date] = []
+    for raw in body.dates or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        try:
+            parsed_dates.append(date.fromisoformat(text[:10]))
+        except ValueError as exc:
+            raise ApiError(422, "invalid_date", f"Invalid date: {raw}") from exc
+
+    role = str(actor.get("role") or "").lower()
+    actor_id = actor.get("_id")
+    scope_cashier: ObjectId | None = None
+    if role == "cashier":
+        if not isinstance(actor_id, ObjectId):
+            try:
+                actor_id = object_id(str(actor_id))
+            except ValueError as exc:
+                raise ApiError(500, "invalid_actor", "Authenticated user id is invalid") from exc
+        scope_cashier = actor_id
+    elif body.cashier_id:
+        scope_cashier = _valid_id(body.cashier_id)
+
+    query: dict[str, Any] = dict(OPEN_REGISTER_MATCH)
+    if scope_cashier is not None:
+        query["cashier_id"] = scope_cashier
+    if parsed_dates:
+        if len(parsed_dates) == 1:
+            query = {"$and": [query, register_day_clause(parsed_dates[0])]}
+        else:
+            query = {
+                "$and": [
+                    query,
+                    {"$or": [register_day_clause(day) for day in parsed_dates]},
+                ]
+            }
+
+    db = _database(request)
+    candidates = await db.transactions.find(
+        query, {"_id": 1, "description": 1}
+    ).to_list(length=50_000)
+    ids = [
+        doc["_id"]
+        for doc in candidates
+        if _normalize_description_key(str(doc.get("description") or "")) in keys
+    ]
+    if not ids:
+        return {"updated": 0, "matched": 0}
+
+    result = await db.transactions.update_many(
+        {"_id": {"$in": ids}},
+        {
+            "$set": {
+                "payee": payee,
+                "item": item_name,
+                "category_name": item_name,
+                "category_id": category_id,
+            }
+        },
+    )
+    updated = int(result.modified_count)
+    matched = int(result.matched_count)
+    await record_operation_event(
+        db,
+        action="txn.bulk_mapping_apply",
+        actor=actor,
+        request=request,
+        entity_type="transaction",
+        entity_ids=[str(oid) for oid in ids[:40]],
+        details={
+            "updated": updated,
+            "matched": matched,
+            "description_keys": sorted(keys)[:40],
+            "client_job_id": body.client_job_id,
+            "payee": payee,
+            "item": item_name,
+            "dates": [day.isoformat() for day in parsed_dates][:40],
+        },
+    )
+    return {"updated": updated, "matched": matched}
 
 
 @transactions.patch("/{tx_id}")
