@@ -25,6 +25,7 @@ tahmeed-api = "app.main:run"
 tahmeed-migrate = "app.cli.migrate:main"
 tahmeed-backup = "app.cli.backup:main"
 tahmeed-scheduler = "app.cli.scheduler:main"
+tahmeed-find-duplicate-drafts = "app.cli.find_duplicate_drafts:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -1,5 +1,8 @@
 """Description-to-item mappings served by the FastAPI backend."""
 
+from __future__ import annotations
+
+import asyncio
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -11,6 +14,10 @@ from tahmeed.services.api_models import desktop_document, get_all_pages
 
 _BULK_MUTATION_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 
+# Warm in-memory index: normalized description_key → mapping (exact match).
+_maps_by_key: Optional[Dict[str, DescriptionMapping]] = None
+_cache_lock = asyncio.Lock()
+
 
 def normalize_description(description: str) -> str:
     return " ".join((description or "").strip().upper().split())
@@ -18,6 +25,63 @@ def normalize_description(description: str) -> str:
 
 def _mapping(document: dict) -> DescriptionMapping:
     return DescriptionMapping.from_doc(desktop_document(document))
+
+
+def invalidate_description_mapping_cache() -> None:
+    """Drop the warm Description Maps index (next ensure reloads from API)."""
+    global _maps_by_key
+    _maps_by_key = None
+
+
+def description_mapping_cache_ready() -> bool:
+    return _maps_by_key is not None
+
+
+def lookup_mapping_sync(description: str) -> Optional[DescriptionMapping]:
+    """Exact-map lookup against the warm cache (no await).
+
+    Returns ``None`` when the cache is cold *or* the key is unmapped. Callers
+    that must distinguish cold vs miss should check
+    ``description_mapping_cache_ready()`` first.
+    """
+    if _maps_by_key is None:
+        return None
+    key = normalize_description(description)
+    if not key:
+        return None
+    return _maps_by_key.get(key)
+
+
+def _cache_put(mapping: DescriptionMapping) -> None:
+    global _maps_by_key
+    if _maps_by_key is None:
+        return
+    key = (mapping.description_key or normalize_description(mapping.description)).strip()
+    if not key:
+        return
+    _maps_by_key[key] = mapping
+
+
+async def ensure_description_mapping_cache() -> Dict[str, DescriptionMapping]:
+    """Load all Description Maps into an O(1) key→mapping dict (once)."""
+    global _maps_by_key
+    if _maps_by_key is not None:
+        return _maps_by_key
+    async with _cache_lock:
+        if _maps_by_key is not None:
+            return _maps_by_key
+        documents = await get_all_pages(
+            "v1/description-mappings",
+            params={"include_inactive": "true"},
+        )
+        by_key: Dict[str, DescriptionMapping] = {}
+        for document in documents:
+            key = str(document.get("description_key") or "").strip()
+            if not key:
+                continue
+            by_key[key] = _mapping(document)
+        _maps_by_key = by_key
+        return _maps_by_key
 
 
 async def list_mappings(
@@ -74,6 +138,8 @@ async def get_mappings_for_descriptions(
     keys.discard("")
     if not keys:
         return {}
+    if _maps_by_key is not None:
+        return {key: _maps_by_key[key] for key in keys if key in _maps_by_key}
     documents = await get_all_pages(
         "v1/description-mappings", params={"description_keys": sorted(keys)}
     )
@@ -99,7 +165,9 @@ async def save_mapping(
             "payee": " ".join((payee or "").strip().upper().split()),
         },
     )
-    return _mapping(document)
+    mapping = _mapping(document)
+    _cache_put(mapping)
+    return mapping
 
 
 async def delete_mapping(mapping_id: ObjectId | str) -> None:
@@ -107,6 +175,7 @@ async def delete_mapping(mapping_id: ObjectId | str) -> None:
         "DELETE",
         f"v1/description-mappings/{mapping_id}",
     )
+    invalidate_description_mapping_cache()
 
 
 async def delete_all_mappings(*, search: str = "") -> int:
@@ -123,6 +192,7 @@ async def delete_all_mappings(*, search: str = "") -> int:
         timeout=_BULK_MUTATION_TIMEOUT,
         **kwargs,
     )
+    invalidate_description_mapping_cache()
     return int(payload["deleted_count"])
 
 
@@ -136,6 +206,7 @@ async def delete_mappings_bulk(mapping_ids: List[ObjectId | str]) -> int:
         json={"ids": ids},
         timeout=_BULK_MUTATION_TIMEOUT,
     )
+    invalidate_description_mapping_cache()
     return int(payload["deleted_count"])
 
 
@@ -143,14 +214,19 @@ async def resolve_mapping_for_description(
     description: str,
     cache: Optional[Dict[str, DescriptionMapping]] = None,
 ) -> Optional[DescriptionMapping]:
-    """Return the saved description map (item + payee), if any."""
+    """Return the saved description map (item + payee), if any.
+
+    Prefers an explicit *cache*, then the warm process-wide index, then a
+    keyed API lookup (which also avoids N+1 when callers pass a shared cache).
+    """
     key = normalize_description(description)
     if not key:
         return None
-    mapping = (cache or {}).get(key)
-    if mapping is None:
-        mapping = await get_mapping(description)
-    return mapping
+    if cache is not None:
+        return cache.get(key)
+    if _maps_by_key is not None:
+        return _maps_by_key.get(key)
+    return await get_mapping(description)
 
 
 async def resolve_category_for_description(

@@ -349,6 +349,62 @@ def test_create_transaction() -> None:
     assert any(e["action"] == "txn.create" for e in events.documents)
 
 
+def test_create_transaction_idempotent_on_client_row_id() -> None:
+    """Replay of the same client_row_id must return the original doc, not a duplicate."""
+    collection = FakeTransactions()
+    events = FakeOperationEvents()
+    app = _app(collection, events=events)
+    user = _cashier()
+    app.dependency_overrides[current_user] = lambda: user
+    rid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    payload = {
+        "date": "2026-04-01T00:00:00",
+        "description": "Diesel",
+        "truck_number": "T100",
+        "amount": 50.0,
+        "currency": "TZS",
+        "client_row_id": rid,
+    }
+
+    with TestClient(app) as client:
+        first = client.post("/v1/transactions", json=payload)
+        second = client.post(
+            "/v1/transactions",
+            json={**payload, "description": "Changed on retry", "amount": 999.0},
+        )
+
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.json()["_id"] == first.json()["_id"]
+    assert second.json()["description"] == "Diesel"
+    assert second.json()["amount"] == 50.0
+    assert second.json()["client_row_id"] == rid
+    assert len(collection.documents) == 1
+    assert sum(1 for e in events.documents if e["action"] == "txn.create") == 1
+
+
+def test_create_without_client_row_id_still_inserts_each_time() -> None:
+    collection = FakeTransactions()
+    app = _app(collection)
+    user = _cashier()
+    app.dependency_overrides[current_user] = lambda: user
+    payload = {
+        "date": "2026-04-01T00:00:00",
+        "description": "Parking",
+        "amount": 5.0,
+        "currency": "TZS",
+    }
+
+    with TestClient(app) as client:
+        a = client.post("/v1/transactions", json=payload)
+        b = client.post("/v1/transactions", json=payload)
+
+    assert a.status_code == 201
+    assert b.status_code == 201
+    assert a.json()["_id"] != b.json()["_id"]
+    assert len(collection.documents) == 2
+
+
 def test_get_and_patch_and_delete_transaction() -> None:
     tx_id = ObjectId()
     user = _cashier()
@@ -703,6 +759,113 @@ def test_check_duplicates() -> None:
 
     assert response.status_code == 200
     assert response.json()["total"] == 1
+
+
+def test_check_duplicates_bulk() -> None:
+    user = _cashier()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": ObjectId(),
+                "date": datetime.utcnow(),
+                "truck_number": "T1",
+                "amount": 5.0,
+                "item": "Diesel",
+                "description": "Fill",
+                "rejected": False,
+            }
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/transactions/check-duplicates/bulk",
+            json={
+                "days": 5,
+                "candidates": [
+                    {
+                        "truck_number": "T1",
+                        "amount": 5.0,
+                        "item": "Diesel",
+                        "description": "Fill",
+                    },
+                    {
+                        "truck_number": "T9",
+                        "amount": 1.0,
+                        "item": "Other",
+                        "description": "Nope",
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["results"][0]["total"] == 1
+    assert body["results"][1]["total"] == 0
+
+
+def test_bulk_create_transactions_idempotent() -> None:
+    collection = FakeTransactions()
+    events = FakeOperationEvents()
+    app = _app(collection, events=events)
+    user = _cashier()
+    app.dependency_overrides[current_user] = lambda: user
+    rid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    rid_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/v1/transactions/bulk-create",
+            json={
+                "items": [
+                    {
+                        "date": "2026-04-01T00:00:00",
+                        "description": "A",
+                        "amount": 10.0,
+                        "currency": "TZS",
+                        "client_row_id": rid_a,
+                    },
+                    {
+                        "date": "2026-04-01T00:00:00",
+                        "description": "B",
+                        "amount": 20.0,
+                        "currency": "TZS",
+                        "client_row_id": rid_b,
+                    },
+                ]
+            },
+        )
+        replay = client.post(
+            "/v1/transactions/bulk-create",
+            json={
+                "items": [
+                    {
+                        "date": "2026-04-01T00:00:00",
+                        "description": "A-retry",
+                        "amount": 99.0,
+                        "currency": "TZS",
+                        "client_row_id": rid_a,
+                    },
+                ]
+            },
+        )
+
+    assert first.status_code == 200
+    body = first.json()
+    assert body["created"] == 2
+    assert body["already_exists"] == 0
+    assert len(collection.documents) == 2
+    assert any(e["action"] == "txn.bulk_create" for e in events.documents)
+
+    assert replay.status_code == 200
+    assert replay.json()["created"] == 0
+    assert replay.json()["already_exists"] == 1
+    assert replay.json()["results"][0]["transaction"]["description"] == "A"
+    assert len(collection.documents) == 2
 
 
 def test_search_and_browse_and_meta() -> None:

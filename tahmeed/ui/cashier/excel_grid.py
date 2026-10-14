@@ -59,21 +59,31 @@ from tahmeed.services.truck_format import (
 from tahmeed.services.cashier_service import (
     get_transactions_by_date, save_transaction, request_or_delete_transaction,
     update_transaction, insert_pending_edit,
-    check_for_duplicates, submit_day_for_verify, recount_day_order,
+    check_for_duplicates_bulk, bulk_save_transactions,
+    submit_day_for_verify, recount_day_order,
     next_day_order,
 )
 from tahmeed.services.category_service import get_payment_target_categories, item_key
 from tahmeed.services.subtable_service import get_subtables
 from tahmeed.services.settings_service import get_setting, set_setting
 from tahmeed.services.register_draft_service import (
+    SYNC_FAILED,
+    SYNC_IN_FLIGHT,
+    SYNC_PENDING,
     build_draft_payload,
     cells_for_json,
     cells_from_json,
+    claim_fingerprint,
     clear_register_draft,
     clear_register_drafts_for_date,
     draft_is_empty,
+    entry_client_row_id,
+    expense_content_fingerprint,
+    fingerprint_is_meaningful,
     hydrate_pending_meta,
     load_register_draft,
+    new_client_row_id,
+    normalize_sync_status,
     save_register_draft,
     serialize_pending_meta,
 )
@@ -84,6 +94,7 @@ from tahmeed.ui.widgets.excel_column_filter import chevron_hit_contains
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
 from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
 from tahmeed.services.duplicate_review import DuplicateReviewItem, format_amount_label
+from tahmeed.services.register_metrics import log_register_event, timed_op
 
 # ---------------------------------------------------------------------------
 # Column indices / colors / delegates (shared with RejectedView)
@@ -96,7 +107,7 @@ from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
     DEFAULT_EDITABLE_ROWS, _REF_FLOAT_OPTS, _COL_PREFERRED, _COL_FLEX, _COL_MIN,
     _is_refund_float, _ref_float_text, _parse_optional_date, format_register_date,
     SAVED_BG, NEW_BG, EMPTY_BG, NEG_COLOR, EDIT_BG, DIRTY_BG, DRAFT_BG, DUP_BG, MISMATCH_BG,
-    TRUCK_REQUIRED_BG,
+    TRUCK_REQUIRED_BG, PENDING_SYNC_BG, FAILED_SYNC_BG,
     _FOOTER_BTN_STYLE,
     _accept_editor_completion, _upper_text,
     _ExcelCellDelegate, _DescriptionDelegate, _TruckDelegate, _DateDelegate,
@@ -730,6 +741,8 @@ class _ColumnFilterPopup(QFrame):
 _COLUMN_HIDE_LOCKED = {COL_SNO, COL_CASHIER}
 # Right-edge pixels that count as the Excel "hidden columns" gap affordance.
 _HIDE_GAP_HIT_PX = 8
+# Match excel_column_filter._FILTER_RESIZE_MARGIN — leave edge for Qt resize drag.
+_COLUMN_RESIZE_HIT_PX = 6
 
 
 class _FilterHeaderView(QHeaderView):
@@ -853,7 +866,23 @@ class _FilterHeaderView(QHeaderView):
             painter.drawLine(x, rect.top() + 2, x, rect.bottom() - 2)
             painter.restore()
 
+    def _on_column_resize_edge(self, pos) -> bool:
+        """True when *pos* is on a section boundary (Excel / Qt resize grip)."""
+        x = pos.x()
+        for visual in range(self.count()):
+            logical = self.logicalIndex(visual)
+            if self.isSectionHidden(logical):
+                continue
+            edge = self.sectionViewportPosition(logical) + self.sectionSize(logical)
+            if abs(x - edge) <= _COLUMN_RESIZE_HIT_PX:
+                return True
+        return False
+
     def mousePressEvent(self, event):
+        # Excel: drag the boundary to resize — must reach QHeaderView first.
+        if event.button() == Qt.LeftButton and self._on_column_resize_edge(event.pos()):
+            super().mousePressEvent(event)
+            return
         col = self.logicalIndexAt(event.pos())
         if event.button() == Qt.LeftButton and col >= 0:
             if col in _FILTER_COLS:
@@ -1051,6 +1080,12 @@ class DailyRegister(QWidget):
         # Re-entrancy guards — prevent double-click duplicate inserts.
         self._save_in_flight = False
         self._submit_in_flight = False
+        # Phase 4 — local outbox drain (reconnect sync).
+        self._outbox_drain_in_flight = False
+        self._outbox_backoff_attempt = 0
+        self._outbox_drain_timer = QTimer(self)
+        self._outbox_drain_timer.setSingleShot(True)
+        self._outbox_drain_timer.timeout.connect(self._kick_outbox_drain)
         # Local draft autosave (crash / power-loss recovery).
         self._draft_timer = QTimer(self)
         self._draft_timer.setSingleShot(True)
@@ -1073,6 +1108,12 @@ class DailyRegister(QWidget):
         self._build_ui()
         self._show_register_loading("Loading…")
         self._emit_undo_redo_state()
+        try:
+            from tahmeed.signals import app_signals
+
+            app_signals.connectivity_changed.connect(self._on_connectivity_changed)
+        except Exception:
+            pass
         asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_categories())
         asyncio.ensure_future(self._load_cashier_settings())
@@ -1081,6 +1122,7 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._load_people_names())
         asyncio.ensure_future(self._load_payee_names())
         asyncio.ensure_future(self._load_description_cache())
+        asyncio.ensure_future(self._load_description_mapping_cache())
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1393,6 +1435,8 @@ class DailyRegister(QWidget):
                 restored = self._restore_local_draft()
                 if restored:
                     self._show_draft_restored_notice(*restored)
+            # Reconnect / open-day: push any PENDING/FAILED outbox rows.
+            self._schedule_outbox_drain(delay_ms=800)
         except Exception as exc:
             if seq == self._load_gen:
                 QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
@@ -1534,6 +1578,30 @@ class DailyRegister(QWidget):
             asyncio.ensure_future(self._load_date(self._current_date))
         asyncio.ensure_future(self._load_cashier_settings())
 
+    def invalidate_after_server_draft_change(self, day: Optional[date] = None) -> None:
+        """Drafts/Saved discarded or submitted — drop stale grid / local recovery.
+
+        If this register day is open, reload from Mongo so deleted drafts cannot
+        linger as ghost rows. Preserves typed-but-unsaved work via local draft
+        restore; clears recovery files when there is nothing to keep.
+        """
+        if not isinstance(day, date):
+            return
+        open_here = self._current_date == day
+        try:
+            if open_here and self.has_unsaved_work():
+                # Keep only unsaved editable / dirty cells for restore after reload.
+                self._flush_local_draft()
+            else:
+                clear_register_drafts_for_date(self._user._id, day)
+        except Exception:
+            pass
+        if not open_here:
+            return
+        self._draft_timer.stop()
+        self._dirty_rows.clear()
+        asyncio.ensure_future(self._load_date(day))
+
     def reload_settings(self) -> None:
         """Re-read the restrict toggles, locked sub-items and fleet list without
         touching the grid rows (so unsaved entries survive). Called on entering
@@ -1545,6 +1613,7 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._load_people_names())
         asyncio.ensure_future(self._load_payee_names())
         asyncio.ensure_future(self._load_description_cache())
+        asyncio.ensure_future(self._load_description_mapping_cache())
 
     def update_people(self, names: list) -> None:
         """Refresh Ownership / APR BY suggestion list (free text still allowed)."""
@@ -1706,6 +1775,9 @@ class DailyRegister(QWidget):
     def _update_footer(self) -> None:
         """Recompute entries / TZS / USD / refund from the live grid."""
         n, tzs, usd, refund = 0, 0.0, 0.0, 0.0
+        # Multiset of saved-row fingerprints so editable copies of already-saved
+        # expenses (partial-save / bad restore) do not inflate money totals.
+        saved_fps = self._saved_expense_fingerprint_counts()
         for row in range(self._table.rowCount()):
             tzs_it = self._table.item(row, COL_TZS)
             usd_it = self._table.item(row, COL_USD)
@@ -1730,6 +1802,10 @@ class DailyRegister(QWidget):
                 and not raw_tzs
             ):
                 continue
+            if row >= self._saved_count:
+                fp = self._expense_fingerprint_for_row(row)
+                if claim_fingerprint(saved_fps, fp):
+                    continue
             n += 1
             tzs += tzs_amt
             usd += usd_amt
@@ -1890,6 +1966,7 @@ class DailyRegister(QWidget):
             lpo_do=(meta.get("lpo_do") or "").upper(),
             do_number=(meta.get("do_number") or "").upper(),
             reported_date=getattr(orig, "reported_date", None) if orig is not None else None,
+            client_row_id=self._ensure_row_client_id(row) or None,
         )
 
     # ------------------------------------------------------------------
@@ -2555,10 +2632,25 @@ class DailyRegister(QWidget):
         # Kept for receipt/other UserRole updates if added later.
         pass
 
+    def _ensure_row_client_id(self, row: int) -> str:
+        """Stable UUID for an unsaved editable row (first edit / import / save)."""
+        if row < self._saved_count:
+            return ""
+        meta = self._pending_row_meta.get(row) or {}
+        rid = str(meta.get("client_row_id") or "").strip()
+        if rid:
+            return rid
+        rid = new_client_row_id()
+        meta = dict(meta)
+        meta["client_row_id"] = rid
+        self._pending_row_meta[row] = meta
+        return rid
+
     def _activate_row(self, row: int) -> None:
         """Make a blank editable row visible: set S/NO number and create input items."""
         if row < self._saved_count:
             return
+        self._ensure_row_client_id(row)
         sno_it = self._table.item(row, COL_SNO)
         if sno_it and sno_it.text():
             return  # already active
@@ -4565,6 +4657,7 @@ class DailyRegister(QWidget):
                     continue
                 loaded_rows.add(target)
                 self._pending_row_meta[target] = {
+                    "client_row_id": new_client_row_id(),
                     "daily_import_id": data.get("daily_import_id"),
                     "daily_import_source": data.get("daily_import_source"),
                     "date_discrepancy": data.get("date_discrepancy"),
@@ -4735,6 +4828,7 @@ class DailyRegister(QWidget):
                         )
 
         for row in loaded_rows:
+            self._ensure_row_client_id(row)
             self._sync_row_date(row)
         self._table.blockSignals(False)
         self._renumber()
@@ -5223,6 +5317,124 @@ class DailyRegister(QWidget):
         self._sync_row_date(row)
         self._deactivate_row(row)
 
+    def _mark_new_row_saved(self, row: int) -> None:
+        """After a successful insert: clear the editable row and prune local draft.
+
+        Keeps mid-save crashes from recovering rows that already reached Mongo.
+        """
+        if row < self._saved_count:
+            return
+        prev = self._table.blockSignals(True)
+        try:
+            self._clear_editable_row(row)
+        finally:
+            self._table.blockSignals(prev)
+        self._flush_local_draft()
+
+    def _row_date_iso(self, row: int) -> str:
+        """Normalize the Date cell (or register day) to ``YYYY-MM-DD``."""
+        year = self._current_date.year if self._current_date else date.today().year
+        it = self._table.item(row, COL_DATE)
+        raw = it.text().strip() if it else ""
+        parsed = _parse_optional_date(raw, default_year=year) if raw else None
+        if parsed is not None:
+            return parsed.date().isoformat()
+        if self._current_date is not None:
+            return self._current_date.isoformat()
+        return ""
+
+    def _expense_fingerprint_for_row(self, row: int):
+        """Content fingerprint for a grid row (saved or editable)."""
+        def txt(col: int) -> str:
+            it = self._table.item(row, col)
+            return it.text().strip() if it else ""
+
+        tzs_raw = txt(COL_TZS)
+        usd_raw = txt(COL_USD)
+        return expense_content_fingerprint(
+            description=txt(COL_DESC),
+            truck_number=txt(COL_TRUCK),
+            item=txt(COL_ITEM),
+            tzs=_parse_amount_text(tzs_raw) if tzs_raw else 0.0,
+            usd=_parse_amount_text(usd_raw) if usd_raw else 0.0,
+            row_date_iso=self._row_date_iso(row),
+        )
+
+    def _expense_fingerprint_for_tx(self, tx: Transaction):
+        """Content fingerprint for a loaded server transaction."""
+        try:
+            tzs, usd = tx.money_parts()
+        except Exception:
+            tzs = float(getattr(tx, "amount", 0) or 0)
+            usd = float(getattr(tx, "amount_usd", 0) or 0)
+        row_date = ""
+        raw_date = getattr(tx, "date", None)
+        if raw_date is not None:
+            try:
+                row_date = (
+                    raw_date.date().isoformat()
+                    if hasattr(raw_date, "date")
+                    else str(raw_date)
+                )
+            except Exception:
+                row_date = ""
+        return expense_content_fingerprint(
+            description=getattr(tx, "description", None) or "",
+            truck_number=getattr(tx, "truck_number", None) or "",
+            item=getattr(tx, "item", None) or "",
+            tzs=tzs,
+            usd=usd,
+            row_date_iso=row_date,
+        )
+
+    def _expense_fingerprint_from_cells(self, values: dict) -> tuple:
+        """Fingerprint from a draft cell map (column index → text)."""
+        year = self._current_date.year if self._current_date else date.today().year
+        raw_date = (values.get(COL_DATE) or "").strip()
+        parsed = _parse_optional_date(raw_date, default_year=year) if raw_date else None
+        if parsed is not None:
+            row_date = parsed.date().isoformat()
+        elif self._current_date is not None:
+            row_date = self._current_date.isoformat()
+        else:
+            row_date = ""
+        tzs_raw = (values.get(COL_TZS) or "").strip()
+        usd_raw = (values.get(COL_USD) or "").strip()
+        return expense_content_fingerprint(
+            description=(values.get(COL_DESC) or "").strip(),
+            truck_number=(values.get(COL_TRUCK) or "").strip(),
+            item=(values.get(COL_ITEM) or "").strip(),
+            tzs=_parse_amount_text(tzs_raw) if tzs_raw else 0.0,
+            usd=_parse_amount_text(usd_raw) if usd_raw else 0.0,
+            row_date_iso=row_date,
+        )
+
+    def _saved_expense_fingerprint_counts(self) -> dict:
+        """Multiset of fingerprints for currently loaded saved rows."""
+        counts: dict = {}
+        for row in range(self._saved_count):
+            tx = self._saved_txs.get(row)
+            if tx is not None:
+                fp = self._expense_fingerprint_for_tx(tx)
+            else:
+                fp = self._expense_fingerprint_for_row(row)
+            if not fingerprint_is_meaningful(fp):
+                continue
+            counts[fp] = counts.get(fp, 0) + 1
+        return counts
+
+    def _saved_client_row_ids(self) -> set:
+        """``client_row_id`` values already present on loaded saved transactions."""
+        out: set = set()
+        for row in range(self._saved_count):
+            tx = self._saved_txs.get(row)
+            if tx is None:
+                continue
+            rid = getattr(tx, "client_row_id", None)
+            if rid:
+                out.add(str(rid).strip())
+        return out
+
     def toolbar_copy_row(self) -> None:
         """Duplicate the current row into a new unsaved editable row."""
         row = self._table.currentRow()
@@ -5247,6 +5459,8 @@ class DailyRegister(QWidget):
         self._table.insertRow(insert_at)
         self._init_editable_rows(insert_at, insert_at + 1)
         self._write_row_values(insert_at, values)
+        # Fresh id — never reuse the source row's client_row_id.
+        self._ensure_row_client_id(insert_at)
         self._renumber()
         self._table.selectRow(insert_at)
         self._table.setCurrentCell(insert_at, COL_DESC)
@@ -5628,6 +5842,229 @@ class DailyRegister(QWidget):
         return updated
 
     # ------------------------------------------------------------------
+    # Phase 4 — outbox drain (offline queue → sync on reconnect)
+    # ------------------------------------------------------------------
+
+    def _api_is_online(self) -> bool:
+        """True when the connectivity probe last succeeded (or probe unknown)."""
+        try:
+            from tahmeed.services.connectivity_service import connectivity_monitor
+
+            status = connectivity_monitor.status
+            if status is None:
+                # No probe yet — allow Save (legacy online-first path).
+                return True
+            return bool(status.online)
+        except Exception:
+            return True
+
+    def _on_connectivity_changed(self, status) -> None:
+        try:
+            online = bool(getattr(status, "online", False))
+        except Exception:
+            return
+        if online:
+            self._outbox_backoff_attempt = 0
+            self._schedule_outbox_drain(delay_ms=400)
+
+    def _schedule_outbox_drain(self, delay_ms: int = 500) -> None:
+        if self._merged_mode or self._current_date is None:
+            return
+        if self._save_in_flight or self._outbox_drain_in_flight:
+            return
+        if not self._api_is_online():
+            return
+        if not self._outbox_pending_rows():
+            return
+        self._outbox_drain_timer.start(max(0, int(delay_ms)))
+
+    def _kick_outbox_drain(self) -> None:
+        if self._outbox_drain_in_flight or self._save_in_flight:
+            return
+        asyncio.ensure_future(self._drain_register_outbox())
+
+    def _outbox_pending_rows(self) -> list[int]:
+        """Editable rows explicitly queued for sync (offline / failed / in-flight)."""
+        rows: list[int] = []
+        if self._merged_mode:
+            return rows
+        for row in range(self._saved_count, self._table.rowCount()):
+            if not self._row_has_data(row):
+                continue
+            meta = self._pending_row_meta.get(row) or {}
+            if not meta.get("sync_status"):
+                # Ordinary unsaved typing — user clicks Save; do not auto-drain.
+                continue
+            status = self._row_sync_status(row)
+            if status in (SYNC_PENDING, SYNC_FAILED, SYNC_IN_FLIGHT):
+                rows.append(row)
+        return rows
+
+    def _row_sync_status(self, row: int) -> str:
+        """Live outbox state for a grid row (preserves IN_FLIGHT for tint)."""
+        meta = self._pending_row_meta.get(row) or {}
+        raw = str(meta.get("sync_status") or SYNC_PENDING).strip().upper()
+        if raw == SYNC_IN_FLIGHT:
+            return SYNC_IN_FLIGHT
+        if raw == SYNC_FAILED:
+            return SYNC_FAILED
+        return SYNC_PENDING
+
+    def _set_row_sync_status(self, row: int, status: str) -> None:
+        if row < self._saved_count:
+            return
+        self._ensure_row_client_id(row)
+        meta = dict(self._pending_row_meta.get(row) or {})
+        if status == SYNC_IN_FLIGHT:
+            meta["sync_status"] = SYNC_IN_FLIGHT
+        elif status == SYNC_FAILED:
+            meta["sync_status"] = SYNC_FAILED
+        else:
+            meta["sync_status"] = SYNC_PENDING
+        self._pending_row_meta[row] = meta
+        self._apply_row_sync_tint(row)
+
+    def _apply_row_sync_tint(self, row: int) -> None:
+        if row < self._saved_count or not self._row_has_data(row):
+            return
+        status = self._row_sync_status(row)
+        if status == SYNC_FAILED:
+            bg = QBrush(FAILED_SYNC_BG)
+            tip = "Sync failed — will retry when online"
+        elif status == SYNC_IN_FLIGHT:
+            bg = QBrush(PENDING_SYNC_BG)
+            tip = "Syncing…"
+        else:
+            bg = QBrush(PENDING_SYNC_BG)
+            tip = "Queued — will sync when online"
+        prev = self._table.blockSignals(True)
+        try:
+            for col in range(self._table.columnCount()):
+                if col in READONLY_COLS:
+                    continue
+                it = self._table.item(row, col)
+                if it is None:
+                    continue
+                it.setBackground(bg)
+                it.setToolTip(tip)
+        finally:
+            self._table.blockSignals(prev)
+
+    def _enqueue_offline_outbox(self) -> None:
+        """Persist unsaved work as PENDING outbox entries (no network)."""
+        for row in range(self._saved_count, self._table.rowCount()):
+            if not self._row_has_data(row):
+                continue
+            self._set_row_sync_status(row, SYNC_PENDING)
+        self._flush_local_draft()
+
+    async def _drain_register_outbox(self) -> None:
+        """Push PENDING/FAILED new rows to the server (single-flight)."""
+        if (
+            self._outbox_drain_in_flight
+            or self._save_in_flight
+            or self._submit_in_flight
+            or self._merged_mode
+            or self._current_date is None
+        ):
+            return
+        if not self._api_is_online():
+            return
+        rows = self._outbox_pending_rows()
+        if not rows:
+            return
+
+        self._outbox_drain_in_flight = True
+        nested_busy = self._save_in_flight or self._submit_in_flight
+        with timed_op(
+            "outbox_drain",
+            day=str(self._current_date or ""),
+            pending=len(rows),
+        ) as meta:
+            try:
+                if not nested_busy:
+                    self.save_busy_changed.emit(True)
+                self._show_register_loading(
+                    f"Syncing {len(rows)} pending entr{'y' if len(rows) == 1 else 'ies'}…"
+                )
+
+                to_save: list[tuple[int, Transaction]] = []
+                for row in rows:
+                    try:
+                        tx = self._build_transaction_from_row(row)
+                    except ValueError:
+                        continue
+                    if tx is None:
+                        continue
+                    self._set_row_sync_status(row, SYNC_IN_FLIGHT)
+                    to_save.append((row, tx))
+                self._flush_local_draft()
+
+                if not to_save:
+                    meta["synced"] = 0
+                    return
+
+                try:
+                    outcomes = await bulk_save_transactions(
+                        [tx for _r, tx in to_save]
+                    )
+                except Exception as exc:
+                    for row, _tx in to_save:
+                        self._set_row_sync_status(row, SYNC_FAILED)
+                    self._flush_local_draft()
+                    self._outbox_backoff_attempt += 1
+                    self._schedule_outbox_backoff()
+                    meta["ok"] = False
+                    meta["error"] = f"{type(exc).__name__}: {exc}"
+                    return
+
+                any_fail = False
+                synced = 0
+                already_exists = 0
+                for (row, _tx), (status_key, _saved, _err) in zip(to_save, outcomes):
+                    if status_key in ("created", "already_exists"):
+                        synced += 1
+                        if status_key == "already_exists":
+                            already_exists += 1
+                        self._mark_new_row_saved(row)
+                    else:
+                        any_fail = True
+                        self._set_row_sync_status(row, SYNC_FAILED)
+
+                meta["synced"] = synced
+                meta["already_exists"] = already_exists
+                meta["failed"] = int(any_fail)
+                self._flush_local_draft()
+                if synced:
+                    self.drafts_changed.emit()
+                    self._outbox_backoff_attempt = 0
+                if any_fail:
+                    self._outbox_backoff_attempt += 1
+                    self._schedule_outbox_backoff()
+                elif synced and self._current_date is not None:
+                    # Refresh saved prefix without clobbering leftover failed rows:
+                    # leftover FAILED stay in draft; reload then restore.
+                    await self._load_date(self._current_date)
+            finally:
+                self._outbox_drain_in_flight = False
+                if (
+                    not nested_busy
+                    and not self._save_in_flight
+                    and not self._submit_in_flight
+                ):
+                    self.save_busy_changed.emit(False)
+                    self._hide_register_loading()
+
+    def _schedule_outbox_backoff(self) -> None:
+        """Exponential backoff with jitter after a failed drain."""
+        import random
+
+        attempt = max(1, min(self._outbox_backoff_attempt, 6))
+        base_ms = min(60_000, (2 ** attempt) * 1_000)
+        jitter = random.randint(0, 500)
+        self._schedule_outbox_drain(delay_ms=base_ms + jitter)
+
+    # ------------------------------------------------------------------
     # Local draft autosave (crash / power-loss recovery)
     # ------------------------------------------------------------------
 
@@ -5687,8 +6124,10 @@ class DailyRegister(QWidget):
             for row in range(self._saved_count, self._table.rowCount()):
                 if not self._row_has_data(row):
                     continue
+                rid = self._ensure_row_client_id(row)
                 pending = self._pending_row_meta.get(row)
                 new_rows.append({
+                    "client_row_id": rid,
                     "cells": cells_for_json(self._row_value_map(row)),
                     "pending_meta": serialize_pending_meta(pending),
                 })
@@ -5758,23 +6197,63 @@ class DailyRegister(QWidget):
                 dirty_applied += 1
 
             # Never restore typed new rows onto Merged (entry is My-only).
+            # Prefer client_row_id match (Phase 1); fall back to content fingerprint
+            # (Phase 0) so legacy drafts without ids still cannot inflate totals.
             if new_entries and not self._merged_mode:
-                start = self._first_empty_editable_row()
-                needed = start + len(new_entries) - self._table.rowCount()
-                if needed > 0:
-                    self._append_editable_rows(needed + 5)
-                for offset, entry in enumerate(new_entries):
-                    row = start + offset
-                    if row < self._saved_count:
+                known_ids = self._saved_client_row_ids()
+                saved_fps = self._saved_expense_fingerprint_counts()
+                to_restore: list = []
+                reconcile_id = 0
+                reconcile_fp = 0
+                for entry in new_entries:
+                    rid = entry_client_row_id(entry)
+                    if rid and rid in known_ids:
+                        reconcile_id += 1
                         continue
                     values = cells_from_json(entry.get("cells"))
-                    truck_cells.extend(self._write_row_values(row, values))
-                    meta = hydrate_pending_meta(entry.get("pending_meta"))
-                    if meta:
+                    fp = self._expense_fingerprint_from_cells(values)
+                    if claim_fingerprint(saved_fps, fp):
+                        reconcile_fp += 1
+                        continue
+                    to_restore.append((entry, values, rid))
+                if reconcile_id or reconcile_fp:
+                    log_register_event(
+                        "draft_reconcile",
+                        skipped_by_id=reconcile_id,
+                        skipped_by_fingerprint=reconcile_fp,
+                        restored=len(to_restore),
+                        day=str(self._current_date or ""),
+                    )
+                if to_restore:
+                    start = self._first_empty_editable_row()
+                    needed = start + len(to_restore) - self._table.rowCount()
+                    if needed > 0:
+                        self._append_editable_rows(needed + 5)
+                    for offset, (entry, values, rid) in enumerate(to_restore):
+                        row = start + offset
+                        if row < self._saved_count:
+                            continue
+                        truck_cells.extend(self._write_row_values(row, values))
+                        meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+                        if rid:
+                            meta["client_row_id"] = rid
+                        elif not meta.get("client_row_id"):
+                            meta["client_row_id"] = new_client_row_id()
+                        raw_sync = (
+                            meta.get("sync_status") or entry.get("sync_status") or ""
+                        )
+                        raw_sync = str(raw_sync).strip().upper()
+                        if raw_sync in (SYNC_PENDING, SYNC_FAILED, SYNC_IN_FLIGHT):
+                            # Crash mid-flight → PENDING so reconnect can retry.
+                            meta["sync_status"] = normalize_sync_status(raw_sync)
+                        else:
+                            meta.pop("sync_status", None)
                         self._pending_row_meta[row] = meta
-                    self._activate_row(row)
-                    self._sync_row_date(row)
-                    new_applied += 1
+                        self._activate_row(row)
+                        self._sync_row_date(row)
+                        if meta.get("sync_status"):
+                            self._apply_row_sync_tint(row)
+                        new_applied += 1
         finally:
             self._table.blockSignals(prev)
             self._bulk_mutating = False
@@ -5783,6 +6262,10 @@ class DailyRegister(QWidget):
         self._renumber()
         self._finalize_truck_cells(truck_cells)
         self._update_footer()
+        # Rewrite disk draft from the live grid so fingerprint-skipped rows
+        # (already on the server) are not re-offered on the next load.
+        if new_entries and not self._merged_mode:
+            self._flush_local_draft()
         if dirty_applied or new_applied:
             self._flush_day_issues_source_changed(force=True)
         if dirty_applied:
@@ -5905,6 +6388,7 @@ class DailyRegister(QWidget):
     async def _do_save(self) -> bool:
         """Persist dirty + new rows. Returns False if cancelled or leftovers remain."""
         if self._save_in_flight:
+            log_register_event("save_ignored", reason="already_in_flight")
             return False
         self._save_in_flight = True
         # Submit already holds the busy UI lock; avoid flickering it off early.
@@ -5913,16 +6397,24 @@ class DailyRegister(QWidget):
             self.save_busy_changed.emit(True)
             self._show_register_loading("Saving draft…")
         try:
-            return await self._do_save_body()
+            with timed_op(
+                "register_save",
+                day=str(self._current_date or ""),
+                merged=bool(self._merged_mode),
+            ) as meta:
+                ok = await self._do_save_body(meta)
+                meta["ok"] = bool(ok)
+                return ok
         finally:
             self._save_in_flight = False
             if not nested_under_submit and not self._submit_in_flight:
                 self.save_busy_changed.emit(False)
                 self._hide_register_loading()
 
-    async def _do_save_body(self) -> bool:
+    async def _do_save_body(self, meta: dict | None = None) -> bool:
         """Inner save implementation (caller holds `_save_in_flight`)."""
         saved, updated, errors = 0, 0, []
+        already_exists = 0
         self._commit_open_editor()
 
         if self._current_date is None:
@@ -5954,6 +6446,28 @@ class DailyRegister(QWidget):
                 QMessageBox.Ok,
             )
             return False
+
+        # Phase 4 — offline: queue locally; drain when connectivity returns.
+        if not self._api_is_online() and self.has_unsaved_work():
+            self._enqueue_offline_outbox()
+            if meta is not None:
+                meta["offline_queued"] = True
+            log_register_event(
+                "outbox_enqueue",
+                day=str(self._current_date or ""),
+                rows=len(self._outbox_pending_rows()),
+            )
+            if not self._submit_in_flight:
+                self._hide_register_loading()
+                QMessageBox.information(
+                    self,
+                    "Saved locally — will sync",
+                    "You appear to be offline.\n\n"
+                    "Your entries are kept on this computer and will sync "
+                    "automatically when the connection returns.\n\n"
+                    "You can keep editing; click Save again anytime.",
+                )
+            return True
 
         # ── Pass 1: commit edits to already-saved rows (UPDATE) ──────────
         for row in sorted(self._dirty_rows):
@@ -5996,6 +6510,7 @@ class DailyRegister(QWidget):
                 else:
                     await update_transaction(tx_id, updates)
                 updated += 1
+                self._dirty_rows.discard(row)
             except Exception as exc:
                 errors.append(f"Row {row + 1}: {exc}")
 
@@ -6061,19 +6576,32 @@ class DailyRegister(QWidget):
                     append_order += 1
                 else:
                     tx.day_order = row
+                pending_inserts.append((row, tx))
 
-                dupes = []
+            # Soft-dup scan in one RTT (falls back to empty on network errors).
+            dup_hits: list = [[] for _ in pending_inserts]
+            if pending_inserts:
                 try:
-                    dupes = await check_for_duplicates(
-                        truck_number=tx.truck_number or "",
-                        amount=tx.amount,
-                        item=tx.item or "",
-                        description=tx.description or "",
-                        days=dup_days,
+                    self._show_register_loading(
+                        f"Checking duplicates ({len(pending_inserts)})…"
+                    )
+                    dup_hits = await check_for_duplicates_bulk(
+                        [
+                            {
+                                "truck_number": tx.truck_number or "",
+                                "amount": tx.amount,
+                                "item": tx.item or "",
+                                "description": tx.description or "",
+                            }
+                            for _row, tx in pending_inserts
+                        ],
+                        dup_days,
                     )
                 except Exception:
-                    dupes = []
+                    dup_hits = [[] for _ in pending_inserts]
 
+            for i, (row, tx) in enumerate(pending_inserts):
+                dupes = dup_hits[i] if i < len(dup_hits) else []
                 if dupes:
                     duplicate_items.append(DuplicateReviewItem(
                         row=row,
@@ -6085,7 +6613,6 @@ class DailyRegister(QWidget):
                         amount_label=format_amount_label(tx),
                         existing=dupes[0],
                     ))
-                pending_inserts.append((row, tx))
 
             save_anyway: set[int] = set()
             if duplicate_items:
@@ -6098,16 +6625,41 @@ class DailyRegister(QWidget):
                 save_anyway = dlg.save_anyway_rows()
 
             duplicate_rows = {item.row for item in duplicate_items}
+            to_save: list[tuple[int, Transaction]] = []
             for row, tx in pending_inserts:
                 if row in duplicate_rows and row not in save_anyway:
                     continue
                 tx.possible_duplicate = row in save_anyway
+                to_save.append((row, tx))
+
+            # Bulk create in chunks (one RTT per chunk) with progress overlay.
+            total_to_save = len(to_save)
+            chunk_size = 50
+            for chunk_start in range(0, total_to_save, chunk_size):
+                chunk = to_save[chunk_start : chunk_start + chunk_size]
+                lo = chunk_start + 1
+                hi = chunk_start + len(chunk)
+                self._show_register_loading(
+                    f"Saving draft… {lo}–{hi} of {total_to_save}"
+                    if total_to_save > chunk_size
+                    else f"Saving draft… ({total_to_save})"
+                )
                 try:
-                    await save_transaction(tx)
-                    saved += 1
-                    self._pending_row_meta.pop(row, None)
+                    outcomes = await bulk_save_transactions([tx for _r, tx in chunk])
                 except Exception as exc:
-                    errors.append(f"Row {row + 1}: {exc}")
+                    for row, _tx in chunk:
+                        errors.append(f"Row {row + 1}: {exc}")
+                    continue
+                for (row, _tx), (status_key, _saved, err) in zip(chunk, outcomes):
+                    if status_key in ("created", "already_exists"):
+                        saved += 1
+                        if status_key == "already_exists":
+                            already_exists += 1
+                        self._mark_new_row_saved(row)
+                    else:
+                        errors.append(
+                            f"Row {row + 1}: {err or status_key or 'save failed'}"
+                        )
 
         if self._merged_mode and (saved or updated):
             try:
@@ -6115,17 +6667,25 @@ class DailyRegister(QWidget):
             except Exception as exc:
                 errors.append(f"Could not save row order: {exc}")
 
+        if meta is not None:
+            meta["saved"] = saved
+            meta["updated"] = updated
+            meta["already_exists"] = already_exists
+            meta["errors"] = len(errors)
+
         if errors:
             QMessageBox.warning(
                 self, "Save — partial errors",
                 f"{saved} added, {updated} updated.\n\nErrors:\n" + "\n".join(errors),
             )
-            # Keep the grid as-is and refresh the local draft so a crash still
-            # recovers remaining unsaved / failed rows. False so mode-switch /
-            # navigate callers stay on this view until leftovers are resolved.
+            # Draft already pruned of succeeded inserts; flush captures leftovers
+            # only. Reload when anything reached the server so the saved prefix
+            # matches Mongo and restore cannot stack duplicates.
             self._flush_local_draft()
             if saved or updated:
                 self.drafts_changed.emit()
+                if self._current_date is not None:
+                    await self._load_date(self._current_date)
             return False
         if saved == 0 and updated == 0:
             if self.has_unsaved_work():
@@ -6310,24 +6870,8 @@ class DailyRegister(QWidget):
         """Pre-fill Item/Payee from an exact Description Map (blank cells only).
 
         No map → leave blank (history suggestions do not invent Item/Payee).
-        Shows the loading horse only when the lookup is slow.
+        Lookup uses the warm Description Maps cache — silent, no register horse.
         """
-        loading_shown = False
-        # Parent may be absent in unit stubs; unparented QTimer is fine here.
-        delay = QTimer(self if isinstance(self, QObject) else None)
-        delay.setSingleShot(True)
-
-        def _show_slow_loading() -> None:
-            nonlocal loading_shown
-            if seq is not None and seq != self._auto_fill_seq:
-                return
-            if self._auto_fill_row != row:
-                return
-            self._show_register_loading("Looking up Description Map…")
-            loading_shown = True
-
-        delay.timeout.connect(_show_slow_loading)
-        delay.start(280)
         try:
             if not getattr(self, "_auto_fill_from_maps", True):
                 return
@@ -6361,9 +6905,6 @@ class DailyRegister(QWidget):
             if self._apply_mapping_fields_to_row(row, cat_name, payee):
                 self._notify_day_issues_source_changed()
         finally:
-            delay.stop()
-            if loading_shown:
-                self._hide_register_loading()
             if self._auto_fill_row == row and (
                 seq is None or seq == self._auto_fill_seq
             ):
@@ -6371,8 +6912,7 @@ class DailyRegister(QWidget):
             self._schedule_finalize_row_edit()
 
     async def _auto_fill_rows_from_mappings(self, rows: list) -> None:
-        """Batch exact-map auto-fill after paste — one lookup; horse if multi-row."""
-        loading_shown = False
+        """Batch exact-map auto-fill after paste — warm cache or one keyed lookup."""
         try:
             if not getattr(self, "_auto_fill_from_maps", True):
                 return
@@ -6398,12 +6938,6 @@ class DailyRegister(QWidget):
             if not targets:
                 return
 
-            if len(targets) >= 2:
-                self._show_register_loading(
-                    f"Applying Description Maps ({len(targets)})…"
-                )
-                loading_shown = True
-
             try:
                 mappings = await get_mappings_for_descriptions(
                     [desc for _r, desc in targets]
@@ -6425,8 +6959,6 @@ class DailyRegister(QWidget):
             if changed:
                 self._schedule_draft_autosave()
         finally:
-            if loading_shown:
-                self._hide_register_loading()
             self._flush_day_issues_source_changed(force=True)
 
     async def _load_fleet_numbers(self) -> None:
@@ -6453,6 +6985,16 @@ class DailyRegister(QWidget):
         from tahmeed.services.cashier_service import ensure_description_cache
         try:
             await ensure_description_cache()
+        except Exception:
+            pass
+
+    async def _load_description_mapping_cache(self) -> None:
+        """Warm Description Maps for silent Item/Payee auto-fill on type/paste."""
+        from tahmeed.services.description_mapping_service import (
+            ensure_description_mapping_cache,
+        )
+        try:
+            await ensure_description_mapping_cache()
         except Exception:
             pass
 

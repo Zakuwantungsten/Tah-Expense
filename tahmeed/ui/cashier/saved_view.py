@@ -269,7 +269,8 @@ class SavedView(QWidget):
     """Day-summary inbox of saved drafts; open / submit / discard per day."""
 
     open_merged_date = Signal(object)  # date
-    drafts_changed = Signal()
+    # date when a specific day changed; None = unknown / refresh lists only
+    drafts_changed = Signal(object)
 
     def __init__(self, user: User, *, show_all_cashiers: bool = False, parent=None) -> None:
         super().__init__(parent)
@@ -627,7 +628,7 @@ class SavedView(QWidget):
                 f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for "
                 f"{day.strftime('%d %b %Y')}.",
             )
-            self.drafts_changed.emit()
+            self.drafts_changed.emit(day)
             await self._load_rows()
         finally:
             hide_widget_loading(self)
@@ -671,7 +672,7 @@ class SavedView(QWidget):
                 f"Deleted {n:,} draft entr{'y' if n == 1 else 'ies'} for "
                 f"{day.strftime('%d %b %Y')}.",
             )
-            self.drafts_changed.emit()
+            self.drafts_changed.emit(day)
             await self._load_rows()
         except Exception as exc:
             QMessageBox.critical(self, "Discard Failed", str(exc))

@@ -1,11 +1,17 @@
 import asyncio
 from datetime import datetime, date
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
 from bson import ObjectId
+import httpx
 
 from tahmeed.models.transaction import Transaction
-from tahmeed.services.api_client import ApiError, api_client
+from tahmeed.services.api_client import ApiConnectionError, ApiError, api_client
 from tahmeed.services.api_models import desktop_document, jsonable_document
+
+# Bulk register create — one RTT for many rows; longer read timeout than single POST.
+_BULK_CREATE_CHUNK = 50
+_BULK_CREATE_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
+_BULK_DUP_TIMEOUT = httpx.Timeout(45.0, connect=5.0)
 
 
 def _tx_from_api(document: dict) -> Transaction:
@@ -86,11 +92,23 @@ async def next_day_order(target_date: date) -> int:
 
 
 async def save_transaction(tx: Transaction) -> Transaction:
-    payload = await api_client.request(
-        "POST", "v1/transactions", json=_tx_create_body(tx)
-    )
+    """POST a new register row.
+
+    On timeout with a ``client_row_id``, replay once. The server treats the same
+    (cashier, client_row_id) as idempotent so a lost ACK cannot double-insert.
+    """
+    body = _tx_create_body(tx)
+    try:
+        payload = await api_client.request("POST", "v1/transactions", json=body)
+    except ApiConnectionError as exc:
+        if getattr(exc, "code", None) == "timeout" and tx.client_row_id:
+            payload = await api_client.request("POST", "v1/transactions", json=body)
+        else:
+            raise
     saved = _tx_from_api(payload)
     tx._id = saved._id
+    if saved.client_row_id and not tx.client_row_id:
+        tx.client_row_id = saved.client_row_id
     try:
         from tahmeed.services.audit_service import record_event
 
@@ -103,6 +121,7 @@ async def save_transaction(tx: Transaction) -> Transaction:
                 "amount": tx.amount,
                 "description": (tx.description or "")[:120],
                 "register_status": tx.register_status,
+                "client_row_id": tx.client_row_id,
             },
         )
     except Exception:
@@ -1035,6 +1054,146 @@ async def check_for_duplicates(
         "POST", "v1/transactions/check-duplicates", json=body
     )
     return [_tx_from_api(doc) for doc in payload.get("items") or []]
+
+
+async def check_for_duplicates_bulk(
+    candidates: Sequence[dict],
+    days: int,
+) -> List[List[Transaction]]:
+    """Soft-dup check for many candidates in one request.
+
+    Each candidate dict may include truck_number, amount, item, description,
+    exclude_id. Returns a list aligned with *candidates* (empty list if no hits).
+    """
+    if not candidates:
+        return []
+    results: List[List[Transaction]] = [[] for _ in candidates]
+    # Chunk to match API max_length=100.
+    for offset in range(0, len(candidates), 100):
+        chunk = list(candidates[offset : offset + 100])
+        body = {
+            "days": int(days),
+            "candidates": [
+                {
+                    "truck_number": (c.get("truck_number") or ""),
+                    "amount": float(c.get("amount") or 0.0),
+                    "item": (c.get("item") or ""),
+                    "description": (c.get("description") or ""),
+                    **(
+                        {"exclude_id": str(c["exclude_id"])}
+                        if c.get("exclude_id") is not None
+                        else {}
+                    ),
+                }
+                for c in chunk
+            ],
+        }
+        payload = await api_client.request(
+            "POST",
+            "v1/transactions/check-duplicates/bulk",
+            json=body,
+            timeout=_BULK_DUP_TIMEOUT,
+        )
+        for row in payload.get("results") or []:
+            try:
+                idx = int(row.get("index"))
+            except (TypeError, ValueError):
+                continue
+            absolute = offset + idx
+            if absolute < 0 or absolute >= len(results):
+                continue
+            results[absolute] = [
+                _tx_from_api(doc) for doc in row.get("items") or []
+            ]
+    return results
+
+
+async def bulk_save_transactions(
+    txs: Sequence[Transaction],
+) -> List[Tuple[str, Optional[Transaction], Optional[str]]]:
+    """Create many drafts via ``/bulk-create`` (chunked).
+
+    Returns one ``(status, transaction|None, error|None)`` per input tx, where
+    status is ``created``, ``already_exists``, or ``error``.
+    """
+    if not txs:
+        return []
+
+    outcomes: List[Tuple[str, Optional[Transaction], Optional[str]]] = [
+        ("error", None, "not processed") for _ in txs
+    ]
+    created_ids: List[ObjectId] = []
+
+    for offset in range(0, len(txs), _BULK_CREATE_CHUNK):
+        chunk = list(txs[offset : offset + _BULK_CREATE_CHUNK])
+        body = {"items": [_tx_create_body(tx) for tx in chunk]}
+
+        async def _post_once() -> dict:
+            return await api_client.request(
+                "POST",
+                "v1/transactions/bulk-create",
+                json=body,
+                timeout=_BULK_CREATE_TIMEOUT,
+            )
+
+        try:
+            payload = await _post_once()
+        except ApiConnectionError as exc:
+            # Timeout with client_row_ids: safe to replay (server idempotent).
+            if getattr(exc, "code", None) == "timeout" and all(
+                tx.client_row_id for tx in chunk
+            ):
+                try:
+                    payload = await _post_once()
+                except Exception as exc2:
+                    for i, _tx in enumerate(chunk):
+                        outcomes[offset + i] = ("error", None, str(exc2))
+                    continue
+            else:
+                for i, _tx in enumerate(chunk):
+                    outcomes[offset + i] = ("error", None, str(exc))
+                continue
+        except Exception as exc:
+            for i, _tx in enumerate(chunk):
+                outcomes[offset + i] = ("error", None, str(exc))
+            continue
+
+        for row in payload.get("results") or []:
+            try:
+                idx = int(row.get("index"))
+            except (TypeError, ValueError):
+                continue
+            absolute = offset + idx
+            if absolute < 0 or absolute >= len(outcomes):
+                continue
+            status_key = str(row.get("status") or "error")
+            err = row.get("error")
+            raw = row.get("transaction")
+            saved = _tx_from_api(raw) if isinstance(raw, dict) else None
+            if saved is not None and absolute < len(txs):
+                txs[absolute]._id = saved._id
+                if saved.client_row_id and not txs[absolute].client_row_id:
+                    txs[absolute].client_row_id = saved.client_row_id
+                if status_key == "created" and saved._id:
+                    created_ids.append(saved._id)
+            outcomes[absolute] = (status_key, saved, str(err) if err else None)
+
+    if created_ids:
+        try:
+            from tahmeed.services.audit_service import record_event
+
+            actor_id = txs[0].cashier_id if txs else None
+            await record_event(
+                "txn.bulk_save",
+                actor_id=actor_id,
+                entity_type="transaction",
+                entity_ids=created_ids,
+                details={"count": len(created_ids)},
+            )
+        except Exception:
+            pass
+
+    return outcomes
 
 
 async def count_draft_transactions(

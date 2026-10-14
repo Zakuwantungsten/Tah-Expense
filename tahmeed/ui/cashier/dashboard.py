@@ -756,6 +756,7 @@ class CashierDashboard(QWidget):
             exit_app=self._on_exit,
             about=self._on_about,
             find=self._on_find,
+            register_help=self._on_register_save_help,
         )
         self._sidebar.items_changed.connect(self._menu_bar.set_item_entries)
         root.addWidget(self._menu_bar)
@@ -956,6 +957,11 @@ class CashierDashboard(QWidget):
             "Use Browse or the page filters for now.",
         )
 
+    def _on_register_save_help(self) -> None:
+        from tahmeed.ui.cashier.register_save_help import show_register_save_help
+
+        show_register_save_help(self)
+
     # ── Profile menu ────────────────────────────────────────────────────────────
 
     def _on_change_password(self) -> None:
@@ -1053,11 +1059,13 @@ class CashierDashboard(QWidget):
         self._on_nav("table")
         self._register.navigate_to_date(d, merged=True)
 
-    def _on_drafts_data_changed(self) -> None:
-        """Keep Drafts + Saved + badges aligned after discard/submit."""
+    def _on_drafts_data_changed(self, day=None) -> None:
+        """Keep Drafts + Saved + badges + open register aligned after discard/submit."""
         from tahmeed.ui.async_utils import schedule_coro
 
         schedule_coro(self._refresh_draft_badge())
+        # Drop ghost rows on the Daily Register when that day was discarded/submitted.
+        self._register.invalidate_after_server_draft_change(day)
         # Refresh the sibling inbox so discard/submit stays in sync.
         if self._stack.currentWidget() is not self._drafts_view:
             self._drafts_view.refresh()

@@ -52,6 +52,31 @@ async def find_conflicts(db: Any) -> list[dict[str, Any]]:
                     "ids": conflict["ids"],
                 }
             )
+    # Register client_row_id idempotency (cashier-scoped).
+    client_row_pipeline = [
+        {"$match": {"client_row_id": {"$type": "string"}, "cashier_id": {"$exists": True}}},
+        {
+            "$group": {
+                "_id": {
+                    "cashier_id": "$cashier_id",
+                    "client_row_id": "$client_row_id",
+                },
+                "count": {"$sum": 1},
+                "ids": {"$push": "$_id"},
+            }
+        },
+        {"$match": {"count": {"$gt": 1}}},
+    ]
+    async for conflict in await db.transactions.aggregate(client_row_pipeline):
+        conflicts.append(
+            {
+                "collection": "transactions",
+                "fields": ("cashier_id", "client_row_id"),
+                "values": conflict["_id"],
+                "count": conflict["count"],
+                "ids": conflict["ids"],
+            }
+        )
     return conflicts
 
 
@@ -112,6 +137,16 @@ async def create_indexes(db: Any) -> None:
             "master_serial": {"$exists": True},
         },
     )
+    # Idempotent register creates (Phase 2 — sparse on client_row_id).
+    await db.transactions.create_index(
+        [("cashier_id", ASCENDING), ("client_row_id", ASCENDING)],
+        name="uniq_cashier_client_row",
+        unique=True,
+        partialFilterExpression={
+            "client_row_id": {"$type": "string"},
+            "cashier_id": {"$exists": True},
+        },
+    )
     await db.imported_feeds.create_index(
         [("skipped_row_id", ASCENDING)],
         name="uniq_feed_skipped_row_id",
@@ -160,6 +195,19 @@ async def migrate(check_only: bool) -> int:
             {
                 "$set": {
                     "description": "Indexes for append-only operation_events audit trail",
+                    "applied_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+        await db.schema_migrations.update_one(
+            {"_id": "0004_client_row_id_idempotency"},
+            {
+                "$set": {
+                    "description": (
+                        "Unique (cashier_id, client_row_id) for idempotent "
+                        "register creates / timeout retries"
+                    ),
                     "applied_at": datetime.now(timezone.utc),
                 }
             },

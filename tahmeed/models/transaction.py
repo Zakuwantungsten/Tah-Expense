@@ -90,6 +90,8 @@ class Transaction:
     daily_import_source: Optional[str] = None   # original filename
     date_discrepancy: bool = False              # row date differs from import primary date
     import_primary_date: Optional[datetime] = None
+    # Stable per-row id stamped on the client before first save (retry / restore).
+    client_row_id: Optional[str] = None
     attachments: List[dict] = field(default_factory=list)  # receipt / file metadata
     _id: Optional[ObjectId] = None
 
@@ -174,6 +176,8 @@ class Transaction:
             doc["import_primary_date"] = self.import_primary_date
         if self.amount_usd is not None:
             doc["amount_usd"] = self.amount_usd
+        if self.client_row_id:
+            doc["client_row_id"] = self.client_row_id
         if self._id:
             doc["_id"] = self._id
         doc["truck_sort_key"] = truck_sort_key(self.truck_number or "")
@@ -242,5 +246,6 @@ class Transaction:
             daily_import_source=doc.get("daily_import_source"),
             date_discrepancy=doc.get("date_discrepancy", False),
             import_primary_date=doc.get("import_primary_date"),
+            client_row_id=(str(doc["client_row_id"]) if doc.get("client_row_id") else None),
             attachments=list(doc.get("attachments") or []),
         )

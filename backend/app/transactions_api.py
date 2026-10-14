@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date, datetime, timedelta
 from typing import Annotated, Any
@@ -9,6 +10,7 @@ from typing import Annotated, Any
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from pymongo import UpdateOne
+from pymongo.errors import DuplicateKeyError
 
 from .audit_ops import record_operation_event
 from .dependencies import Authenticated, require_roles
@@ -17,11 +19,13 @@ from .schemas import (
     BulkIdsRequest,
     DayOrderRequest,
     DiscardDraftDayRequest,
+    DuplicateCheckBulkRequest,
     DuplicateCheckRequest,
     PendingEditRequest,
     RequestDeleteBody,
     ResubmitRejectedRequest,
     SubmitDayRequest,
+    TransactionBulkCreateRequest,
     TransactionCreate,
     TransactionIdsRequest,
     TransactionPatch,
@@ -42,11 +46,37 @@ from .transaction_ops import (
     register_day_range_clause,
 )
 
+_log = logging.getLogger("tahmeed.transactions")
+
 transactions = APIRouter(prefix="/transactions", tags=["transactions"])
 transactions.include_router(attachments_router)
 
 _REGISTER_ROLES = ("admin", "cashier", "accountant")
 RegisterActor = Annotated[dict[str, Any], Depends(require_roles(*_REGISTER_ROLES))]
+
+_client_row_index_ensured = False
+
+
+async def _ensure_client_row_id_index(db: Any) -> None:
+    """Best-effort unique index for idempotent register creates (safe to call often)."""
+    global _client_row_index_ensured
+    if _client_row_index_ensured:
+        return
+    try:
+        await db.transactions.create_index(
+            [("cashier_id", 1), ("client_row_id", 1)],
+            name="uniq_cashier_client_row",
+            unique=True,
+            partialFilterExpression={
+                "client_row_id": {"$type": "string"},
+                "cashier_id": {"$exists": True},
+            },
+        )
+    except Exception:
+        # Pre-existing duplicates or permissions — find-before-insert still works;
+        # migrate.py is the authoritative conflict reporter.
+        pass
+    _client_row_index_ensured = True
 
 _OBJECT_ID_FIELDS = {
     "category_id",
@@ -118,7 +148,13 @@ def _coerce_write_fields(values: dict[str, Any]) -> dict[str, Any]:
 
 def _create_document(body: TransactionCreate, actor: dict[str, Any]) -> dict[str, Any]:
     raw = body.model_dump(exclude_none=False)
-    for key in ("daily_import_id", "daily_import_source", "import_primary_date", "amount_usd"):
+    for key in (
+        "daily_import_id",
+        "daily_import_source",
+        "import_primary_date",
+        "amount_usd",
+        "client_row_id",
+    ):
         if raw.get(key) in (None, ""):
             raw.pop(key, None)
     doc = _coerce_write_fields(raw)
@@ -138,21 +174,30 @@ def _create_document(body: TransactionCreate, actor: dict[str, Any]) -> dict[str
 
 @transactions.post("", status_code=201)
 async def create_transaction(
-    body: TransactionCreate, request: Request, actor: RegisterActor
+    body: TransactionCreate,
+    request: Request,
+    actor: RegisterActor,
+    response: Response,
 ) -> dict:
+    """Create a register row.
+
+    When ``client_row_id`` is present, create is idempotent for that cashier:
+    a retry after timeout / lost ACK returns the existing document (200) instead
+    of inserting a duplicate expense.
+    """
     doc = _create_document(body, actor)
     db = _database(request)
-    result = await db.transactions.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    await record_operation_event(
-        db,
-        action="txn.create",
+    await _ensure_client_row_id_index(db)
+    status_key, saved = await _create_one_transaction_doc(
+        db=db,
+        doc=doc,
         actor=actor,
         request=request,
-        entity_type="transaction",
-        entity_ids=[str(doc["_id"])],
+        record_event=True,
     )
-    return json_safe(doc)
+    if status_key == "already_exists":
+        response.status_code = status.HTTP_200_OK
+    return json_safe(saved)
 
 
 @transactions.get("")
@@ -1173,30 +1218,50 @@ async def next_day_order(
         return {"next": 0}
 
 
+def _duplicate_check_query(
+    *,
+    days: int,
+    truck_number: str = "",
+    amount: float = 0.0,
+    item: str = "",
+    description: str = "",
+    exclude_id: str | None = None,
+) -> dict[str, Any]:
+    cutoff = utcnow().replace(tzinfo=None) - timedelta(days=days)
+    query: dict[str, Any] = {
+        "date": {"$gte": cutoff},
+        "rejected": {"$ne": True},
+        "amount": amount,
+    }
+    if truck_number:
+        query["truck_number"] = {
+            "$regex": f"^{re.escape(truck_number)}$",
+            "$options": "i",
+        }
+    if item:
+        query["item"] = {"$regex": f"^{re.escape(item)}$", "$options": "i"}
+    if description:
+        query["description"] = {
+            "$regex": f"^{re.escape(description)}$",
+            "$options": "i",
+        }
+    if exclude_id:
+        query["_id"] = {"$ne": _valid_id(exclude_id)}
+    return query
+
+
 @transactions.post("/check-duplicates")
 async def check_for_duplicates(
     body: DuplicateCheckRequest, request: Request, _actor: RegisterActor
 ) -> dict:
-    cutoff = utcnow().replace(tzinfo=None) - timedelta(days=body.days)
-    query: dict[str, Any] = {
-        "date": {"$gte": cutoff},
-        "rejected": {"$ne": True},
-        "amount": body.amount,
-    }
-    if body.truck_number:
-        query["truck_number"] = {
-            "$regex": f"^{re.escape(body.truck_number)}$",
-            "$options": "i",
-        }
-    if body.item:
-        query["item"] = {"$regex": f"^{re.escape(body.item)}$", "$options": "i"}
-    if body.description:
-        query["description"] = {
-            "$regex": f"^{re.escape(body.description)}$",
-            "$options": "i",
-        }
-    if body.exclude_id:
-        query["_id"] = {"$ne": _valid_id(body.exclude_id)}
+    query = _duplicate_check_query(
+        days=body.days,
+        truck_number=body.truck_number,
+        amount=body.amount,
+        item=body.item,
+        description=body.description,
+        exclude_id=body.exclude_id,
+    )
     docs = (
         await _database(request)
         .transactions.find(query)
@@ -1205,6 +1270,166 @@ async def check_for_duplicates(
         .to_list(length=10)
     )
     return {"items": json_safe(docs), "total": len(docs)}
+
+
+@transactions.post("/check-duplicates/bulk")
+async def check_for_duplicates_bulk(
+    body: DuplicateCheckBulkRequest, request: Request, _actor: RegisterActor
+) -> dict:
+    """One RTT soft-duplicate scan for up to 100 register candidates."""
+    db = _database(request)
+    results: list[dict[str, Any]] = []
+    for index, candidate in enumerate(body.candidates):
+        query = _duplicate_check_query(
+            days=body.days,
+            truck_number=candidate.truck_number,
+            amount=candidate.amount,
+            item=candidate.item,
+            description=candidate.description,
+            exclude_id=candidate.exclude_id,
+        )
+        docs = (
+            await db.transactions.find(query)
+            .sort("date", -1)
+            .limit(10)
+            .to_list(length=10)
+        )
+        results.append(
+            {"index": index, "items": json_safe(docs), "total": len(docs)}
+        )
+    return {"results": results, "total": len(results)}
+
+
+async def _create_one_transaction_doc(
+    *,
+    db: Any,
+    doc: dict[str, Any],
+    actor: dict[str, Any],
+    request: Request,
+    record_event: bool = True,
+) -> tuple[str, dict[str, Any]]:
+    """Insert or return existing by client_row_id. Returns (status, doc)."""
+    client_row_id = doc.get("client_row_id")
+    cashier_id = doc.get("cashier_id")
+    if isinstance(client_row_id, str) and client_row_id and cashier_id is not None:
+        existing = await db.transactions.find_one(
+            {"cashier_id": cashier_id, "client_row_id": client_row_id}
+        )
+        if existing is not None:
+            _log.info(
+                "txn_idempotent_hit source=lookup cashier_id=%s client_row_id=%s",
+                cashier_id,
+                client_row_id,
+            )
+            return "already_exists", existing
+
+    try:
+        result = await db.transactions.insert_one(doc)
+    except DuplicateKeyError:
+        if isinstance(client_row_id, str) and client_row_id and cashier_id is not None:
+            existing = await db.transactions.find_one(
+                {"cashier_id": cashier_id, "client_row_id": client_row_id}
+            )
+            if existing is not None:
+                _log.info(
+                    "txn_idempotent_hit source=duplicate_key cashier_id=%s "
+                    "client_row_id=%s",
+                    cashier_id,
+                    client_row_id,
+                )
+                return "already_exists", existing
+        raise
+
+    doc["_id"] = result.inserted_id
+    if record_event:
+        await record_operation_event(
+            db,
+            action="txn.create",
+            actor=actor,
+            request=request,
+            entity_type="transaction",
+            entity_ids=[str(doc["_id"])],
+        )
+    return "created", doc
+
+
+@transactions.post("/bulk-create")
+async def bulk_create_transactions(
+    body: TransactionBulkCreateRequest,
+    request: Request,
+    actor: RegisterActor,
+) -> dict:
+    """Create many register drafts in one request (per-item idempotent)."""
+    if not body.items:
+        return {"results": [], "created": 0, "already_exists": 0, "errors": 0}
+
+    db = _database(request)
+    await _ensure_client_row_id_index(db)
+
+    results: list[dict[str, Any]] = []
+    created_ids: list[str] = []
+    n_created = n_exists = n_errors = 0
+
+    for index, item in enumerate(body.items):
+        try:
+            doc = _create_document(item, actor)
+            status_key, saved = await _create_one_transaction_doc(
+                db=db,
+                doc=doc,
+                actor=actor,
+                request=request,
+                record_event=False,
+            )
+            if status_key == "created":
+                n_created += 1
+                created_ids.append(str(saved["_id"]))
+            else:
+                n_exists += 1
+            results.append(
+                {
+                    "index": index,
+                    "status": status_key,
+                    "transaction": json_safe(saved),
+                    "error": None,
+                }
+            )
+        except Exception as exc:
+            n_errors += 1
+            results.append(
+                {
+                    "index": index,
+                    "status": "error",
+                    "transaction": None,
+                    "error": str(exc) or type(exc).__name__,
+                }
+            )
+
+    if created_ids:
+        await record_operation_event(
+            db,
+            action="txn.bulk_create",
+            actor=actor,
+            request=request,
+            entity_type="transaction",
+            entity_ids=created_ids,
+        )
+
+    _log.info(
+        "txn_bulk_create created=%s already_exists=%s errors=%s items=%s "
+        "cashier_id=%s",
+        n_created,
+        n_exists,
+        n_errors,
+        len(body.items),
+        actor.get("_id"),
+    )
+
+    return {
+        "results": results,
+        "created": n_created,
+        "already_exists": n_exists,
+        "errors": n_errors,
+    }
 
 
 @transactions.get("/trash")

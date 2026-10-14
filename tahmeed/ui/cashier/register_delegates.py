@@ -162,6 +162,8 @@ DRAFT_BG  = QColor("#FFF7ED")   # warm orange — saved draft (not yet submitted
 DUP_BG    = QColor("#FEE2E2")   # light red — possible duplicate flag
 MISMATCH_BG = QColor("#FEF3C7") # amber — date mismatch (submitted vs transaction date)
 TRUCK_REQUIRED_BG = QColor("#FECDD3")  # rose — item requires truck but cell is empty
+PENDING_SYNC_BG = QColor("#E0F2FE")  # sky — queued for sync (offline outbox)
+FAILED_SYNC_BG = QColor("#FEE2E2")   # light red — last sync attempt failed
 
 # Excel-like cell text inset (matches QTableWidget::item horizontal padding)
 _CELL_H_INSET = 3

@@ -40,6 +40,7 @@ class CashierMenuBar(QMenuBar):
         self._exit_cb = None
         self._about_cb = None
         self._find_cb = None
+        self._register_help_cb = None
         self._item_entries: list[tuple[str, str]] = []
         self._items_menu: Optional[QMenu] = None
         _style_menu_bar(self)
@@ -57,6 +58,7 @@ class CashierMenuBar(QMenuBar):
         exit_app=None,
         about=None,
         find=None,
+        register_help=None,
     ) -> None:
         """Wire callbacks after the dashboard shell is ready."""
         self._nav_cb = navigate
@@ -67,6 +69,7 @@ class CashierMenuBar(QMenuBar):
         self._exit_cb = exit_app
         self._about_cb = about
         self._find_cb = find
+        self._register_help_cb = register_help
 
     def set_item_entries(self, entries: list[tuple[str, str]]) -> None:
         """Refresh the Cashier → Items submenu from sidebar dynamic rows."""
@@ -242,6 +245,12 @@ class CashierMenuBar(QMenuBar):
 
     def _help_menu(self) -> None:
         m = self.addMenu("&Help")
+        self._add(
+            m,
+            "&Register Save && Recovery…",
+            lambda: self._register_help_cb and self._register_help_cb(),
+        )
+        m.addSeparator()
         self._add(
             m,
             f"&About {APP_NAME}…",

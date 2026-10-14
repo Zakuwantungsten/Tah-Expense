@@ -207,6 +207,7 @@ class TransactionCreate(BaseModel):
     date_discrepancy: bool = False
     import_primary_date: datetime | None = None
     original_transaction_id: str | None = None
+    client_row_id: str | None = None
     attachments: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime | None = None
 
@@ -247,6 +248,29 @@ class DuplicateCheckRequest(StrictModel):
     description: str = ""
     days: int = Field(5, ge=1, le=365)
     exclude_id: str | None = None
+
+
+class DuplicateCheckCandidate(StrictModel):
+    truck_number: str = ""
+    amount: float = 0.0
+    item: str = ""
+    description: str = ""
+    exclude_id: str | None = None
+
+
+class DuplicateCheckBulkRequest(StrictModel):
+    days: int = Field(5, ge=1, le=365)
+    candidates: list[DuplicateCheckCandidate] = Field(
+        default_factory=list, max_length=100
+    )
+
+
+class TransactionBulkCreateRequest(StrictModel):
+    """Batch register creates — each item mirrors TransactionCreate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[TransactionCreate] = Field(default_factory=list, max_length=100)
 
 
 class PendingEditRequest(StrictModel):

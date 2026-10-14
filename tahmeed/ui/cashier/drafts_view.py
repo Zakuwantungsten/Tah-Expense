@@ -165,7 +165,8 @@ class DraftsView(QWidget):
     """List draft days and rows; submit or discard without opening Verify."""
 
     open_register_date = Signal(object)  # date
-    drafts_changed = Signal()
+    # date when a specific day changed; None = unknown / refresh lists only
+    drafts_changed = Signal(object)
 
     def __init__(self, user: User, *, show_all_cashiers: bool = False, parent=None) -> None:
         super().__init__(parent)
@@ -520,7 +521,7 @@ class DraftsView(QWidget):
             f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for "
             f"{day.strftime('%d %b %Y')}.",
         )
-        self.drafts_changed.emit()
+        self.drafts_changed.emit(day)
         await self._load_days()
 
     def _on_discard(self) -> None:
@@ -642,7 +643,7 @@ class DraftsView(QWidget):
                 f"Deleted {n:,} draft entr{'y' if n == 1 else 'ies'} for "
                 f"{day.strftime('%d %b %Y')}.",
             )
-            self.drafts_changed.emit()
+            self.drafts_changed.emit(day)
             await self._load_days()
         except Exception as exc:
             QMessageBox.critical(self, "Discard Failed", str(exc))
@@ -662,7 +663,7 @@ class DraftsView(QWidget):
                     "No rows were discarded. You may only discard your own drafts.",
                 )
                 return
-            self.drafts_changed.emit()
+            self.drafts_changed.emit(self._selected_day)
             if self._selected_day:
                 await self._load_rows(self._selected_day)
             await self._load_days()

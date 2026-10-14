@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -18,7 +19,97 @@ from bson import ObjectId
 
 from tahmeed.config import APP_NAME
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+
+# Per-row outbox sync state (stored in pending_meta / draft new_rows).
+SYNC_PENDING = "PENDING"
+SYNC_IN_FLIGHT = "IN_FLIGHT"
+SYNC_FAILED = "FAILED"
+# SYNCED is implied by removal from the draft / editable zone after ACK.
+
+
+def new_client_row_id() -> str:
+    """UUID for a register row that has not yet been acknowledged by the server."""
+    return str(uuid.uuid4())
+
+
+def normalize_sync_status(raw: Any) -> str:
+    """Map stored status for drain. Unknown / mid-flight → PENDING (safe retry)."""
+    status = str(raw or "").strip().upper()
+    if status == SYNC_FAILED:
+        return SYNC_FAILED
+    if status == SYNC_IN_FLIGHT:
+        # Crash / timeout mid-send: treat as pending so reconnect can retry.
+        return SYNC_PENDING
+    return SYNC_PENDING
+
+
+def entry_sync_status(entry: dict | None) -> str:
+    if not isinstance(entry, dict):
+        return SYNC_PENDING
+    meta = entry.get("pending_meta")
+    if isinstance(meta, dict) and meta.get("sync_status"):
+        return normalize_sync_status(meta.get("sync_status"))
+    return normalize_sync_status(entry.get("sync_status"))
+
+
+def entry_client_row_id(entry: dict | None) -> str:
+    """Read ``client_row_id`` from a draft ``new_rows`` entry (top-level or meta)."""
+    if not isinstance(entry, dict):
+        return ""
+    rid = entry.get("client_row_id")
+    if rid:
+        return str(rid).strip()
+    meta = entry.get("pending_meta")
+    if isinstance(meta, dict) and meta.get("client_row_id"):
+        return str(meta["client_row_id"]).strip()
+    return ""
+
+
+def ensure_draft_client_row_ids(payload: dict | None) -> dict | None:
+    """Stamp missing ``client_row_id`` + normalize sync_status on draft new_rows."""
+    if not isinstance(payload, dict):
+        return payload
+    new_rows = list(payload.get("new_rows") or [])
+    changed = False
+    for entry in new_rows:
+        if not isinstance(entry, dict):
+            continue
+        rid = entry_client_row_id(entry)
+        if not rid:
+            rid = new_client_row_id()
+            changed = True
+        if entry.get("client_row_id") != rid:
+            entry["client_row_id"] = rid
+            changed = True
+        meta = entry.get("pending_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+            entry["pending_meta"] = meta
+            changed = True
+        else:
+            meta = dict(meta)
+            entry["pending_meta"] = meta
+        if meta.get("client_row_id") != rid:
+            meta["client_row_id"] = rid
+            changed = True
+        raw_sync = meta.get("sync_status") or entry.get("sync_status")
+        if raw_sync:
+            normalized = normalize_sync_status(raw_sync)
+            if meta.get("sync_status") != normalized:
+                meta["sync_status"] = normalized
+                changed = True
+            if entry.get("sync_status") != normalized:
+                entry["sync_status"] = normalized
+                changed = True
+        else:
+            # Leave ordinary unsaved rows without sync_status (manual Save).
+            meta.pop("sync_status", None)
+            entry.pop("sync_status", None)
+    if changed or int(payload.get("schema_version") or 1) < SCHEMA_VERSION:
+        payload["new_rows"] = new_rows
+        payload["schema_version"] = SCHEMA_VERSION
+    return payload
 
 
 def drafts_root() -> Path:
@@ -99,6 +190,58 @@ def cells_from_json(raw: dict | None) -> dict[int, str]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def _money_key(value: float | int | None) -> str:
+    try:
+        return f"{float(value or 0.0):.2f}"
+    except (TypeError, ValueError):
+        return "0.00"
+
+
+def expense_content_fingerprint(
+    *,
+    description: str,
+    truck_number: str = "",
+    item: str = "",
+    tzs: float = 0.0,
+    usd: float = 0.0,
+    row_date_iso: str = "",
+) -> tuple[str, str, str, str, str, str]:
+    """Stable content key for Phase-0 restore / footer dedupe (pre-client UUID).
+
+    Requires a non-empty description to be considered meaningful for matching.
+    """
+    return (
+        (description or "").strip().upper(),
+        (truck_number or "").strip().upper(),
+        (item or "").strip().upper(),
+        _money_key(tzs),
+        _money_key(usd),
+        (row_date_iso or "").strip(),
+    )
+
+
+def fingerprint_is_meaningful(fp: tuple[str, str, str, str, str, str] | None) -> bool:
+    """True when the fingerprint has enough content to safely match."""
+    return bool(fp and fp[0])
+
+
+def claim_fingerprint(
+    available: dict[tuple[str, str, str, str, str, str], int],
+    fp: tuple[str, str, str, str, str, str] | None,
+) -> bool:
+    """Consume one occurrence of *fp* from a multiset. Return True if claimed."""
+    if not fingerprint_is_meaningful(fp):
+        return False
+    left = available.get(fp, 0)
+    if left <= 0:
+        return False
+    if left == 1:
+        available.pop(fp, None)
+    else:
+        available[fp] = left - 1
+    return True
 
 
 def build_draft_payload(
@@ -212,6 +355,7 @@ def load_register_draft(
         return None
     if draft_is_empty(raw):
         return None
+    ensure_draft_client_row_ids(raw)
     return raw
 
 
