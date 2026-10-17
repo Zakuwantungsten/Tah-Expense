@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from time import monotonic
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, List, Optional, Sequence, Tuple, Union
 
 from PySide6.QtCore import Qt, Signal, QEvent, QTimer
 from PySide6.QtGui import QColor, QFontMetrics, QStandardItem, QStandardItemModel
@@ -94,6 +95,13 @@ class CheckableMultiCombo(QComboBox):
         self._popup_shown_at = 0.0
         self._block_hide_until = 0.0
         self._pending_options: Optional[Tuple[Sequence[str], bool, bool]] = None
+        # Optional lazy distincts (Browse Advanced Item / Sub-Item Phase 2).
+        self._options_loader: Optional[
+            Callable[[], Union[Awaitable[Sequence[str]], Any]]
+        ] = None
+        self._options_stale = False
+        self._lazy_loading = False
+        self._lazy_load_gen = 0
 
         all_item = self._make_item(all_label, "all")
         all_item.setCheckState(Qt.Checked)
@@ -114,6 +122,19 @@ class CheckableMultiCombo(QComboBox):
         item.setBackground(_BG)
         item.setToolTip(label)
         return item
+
+    def set_options_loader(
+        self,
+        loader: Optional[Callable[[], Union[Awaitable[Sequence[str]], Any]]],
+    ) -> None:
+        """Load distinct options on first ▾ open when marked stale (Phase 2)."""
+        self._options_loader = loader
+        self._options_stale = loader is not None
+
+    def mark_options_stale(self) -> None:
+        """Invalidate cached options (e.g. date range changed)."""
+        if self._options_loader is not None:
+            self._options_stale = True
 
     def set_options(
         self,
@@ -155,6 +176,7 @@ class CheckableMultiCombo(QComboBox):
                     self._model.item(row).setCheckState(Qt.Unchecked)
         finally:
             self._updating = False
+        self._options_stale = False
         self._refresh_label()
         if emit:
             self.selectionChanged.emit()
@@ -181,6 +203,37 @@ class CheckableMultiCombo(QComboBox):
         return max(0.3, dbl)
 
     def showPopup(self) -> None:
+        if self._options_loader is not None and self._options_stale:
+            if self._lazy_loading:
+                return
+            self._lazy_loading = True
+            self._lazy_load_gen += 1
+            gen = self._lazy_load_gen
+            asyncio.ensure_future(self._lazy_load_and_show(gen))
+            return
+        self._show_popup_now()
+
+    async def _lazy_load_and_show(self, gen: int) -> None:
+        try:
+            raw = self._options_loader()  # type: ignore[misc]
+            options = await raw
+            if gen != self._lazy_load_gen:
+                return
+            if options is not None:
+                self._apply_options(options, keep_selected=True, emit=False)
+            else:
+                self._options_stale = False
+        except Exception:
+            # Open with whatever rows we already have; retry next open.
+            if gen == self._lazy_load_gen:
+                self._options_stale = True
+        finally:
+            if gen == self._lazy_load_gen:
+                self._lazy_loading = False
+        if gen == self._lazy_load_gen:
+            self._show_popup_now()
+
+    def _show_popup_now(self) -> None:
         width = self._size_popup_to_contents()
         now = monotonic()
         self._popup_shown_at = now

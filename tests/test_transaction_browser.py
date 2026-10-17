@@ -68,3 +68,16 @@ def test_open_simple_day_jumps_to_register_not_advanced():
         browser._on_go_to()
     assert jumped == [(date(2026, 5, 4), "")]
     assert browser._current_mode == _MODE_SIMPLE
+
+
+def test_cashier_delete_only_own_uploads():
+    from types import SimpleNamespace
+
+    me = SimpleNamespace(_id="cashier-me")
+    browser = TransactionBrowser(user=me, can_manage_uploads=False)
+    browser._do_find = lambda: None
+    assert browser._can_delete_upload({"cashier_id": "cashier-me"}) is True
+    assert browser._can_delete_upload({"cashier_id": "cashier-other"}) is False
+    manager = TransactionBrowser(user=me, can_manage_uploads=True)
+    manager._do_find = lambda: None
+    assert manager._can_delete_upload({"cashier_id": "cashier-other"}) is True

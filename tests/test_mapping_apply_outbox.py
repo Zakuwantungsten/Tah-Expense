@@ -177,3 +177,50 @@ async def test_apply_description_mapping_bulk_client(monkeypatch) -> None:
     assert calls[0]["path"] == "v1/transactions/apply-description-mapping"
     assert calls[0]["json"]["description_keys"] == ["MILEAGE"]
     assert calls[0]["json"]["client_job_id"] == "abc"
+    assert calls[0]["json"].get("clear") is False
+
+
+@pytest.mark.asyncio
+async def test_apply_description_mapping_bulk_clear(monkeypatch) -> None:
+    from tahmeed.services import cashier_service as cs
+
+    calls: list[dict] = []
+
+    async def fake_request(method, path, **kwargs):
+        calls.append({"method": method, "path": path, "json": kwargs.get("json")})
+        return {"updated": 3, "matched": 3}
+
+    monkeypatch.setattr(cs.api_client, "request", fake_request)
+    n = await cs.apply_description_mapping_bulk(
+        ["MILEAGE"],
+        dates=[date(2026, 10, 13)],
+        clear=True,
+    )
+    assert n == 3
+    body = calls[0]["json"]
+    assert body["clear"] is True
+    assert body["category_name"] == ""
+    assert "category_id" not in body
+
+
+def test_cancel_pending_jobs_for_keys(monkeypatch) -> None:
+    monkeypatch.setattr(outbox, "_schedule_drain", lambda *a, **k: None)
+    cat = ObjectId()
+    keep = outbox.enqueue_mapping_apply(
+        description_keys=["KEEP"],
+        payee="A",
+        item="I",
+        category_id=cat,
+    )
+    drop = outbox.enqueue_mapping_apply(
+        description_keys=["UNDO ME"],
+        payee="B",
+        item="I",
+        category_id=cat,
+    )
+    n = outbox.cancel_pending_jobs_for_keys(["undo me"])
+    assert n == 1
+    assert drop.status == "cancelled"
+    assert keep.status == "pending"
+    assert keep in outbox.pending_jobs()
+    assert drop not in outbox.pending_jobs()

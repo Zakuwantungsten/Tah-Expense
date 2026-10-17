@@ -57,6 +57,7 @@ from tahmeed.services.truck_format import (
     is_allowed_place_label, DEFAULT_PLACE_LABELS, merge_allowed_labels,
 )
 from tahmeed.services.cashier_service import (
+    BULK_CREATE_CHUNK,
     get_transactions_by_date, save_transaction, request_or_delete_transaction,
     update_transaction, bulk_update_transactions, insert_pending_edit,
     check_for_duplicates_bulk, bulk_save_transactions,
@@ -756,6 +757,7 @@ class _FilterHeaderView(QHeaderView):
         super().__init__(Qt.Horizontal, parent)
         self._active: dict = {}   # col -> set of accepted values
         self._value_provider = None  # optional callable(col) -> set[str]
+        self._filters_enabled = True  # toolbar AutoFilter on/off
         self._popup = None
         self._sel_anchor: int | None = None
         self.setSectionsClickable(True)
@@ -765,13 +767,30 @@ class _FilterHeaderView(QHeaderView):
     def set_value_provider(self, provider) -> None:
         self._value_provider = provider
 
+    def filters_enabled(self) -> bool:
+        return bool(self._filters_enabled)
+
+    def set_filters_enabled(self, enabled: bool) -> None:
+        """Show/hide ▾ affordances; when off, close popup and clear active sets."""
+        enabled = bool(enabled)
+        self._filters_enabled = enabled
+        if not enabled:
+            if self._popup is not None:
+                self._popup.close()
+                self._popup = None
+            self._active.clear()
+        self.viewport().update()
+
     def clear_filters(self) -> None:
         self._active.clear()
         self.viewport().update()
 
     def sync_active(self, filters: dict) -> None:
         """Mirror DailyRegister._col_filters onto the chevron paint state."""
-        self._active = {c: set(v) for c, v in (filters or {}).items() if v}
+        if not self._filters_enabled:
+            self._active.clear()
+        else:
+            self._active = {c: set(v) for c, v in (filters or {}).items() if v}
         self.viewport().update()
 
     def _table(self):
@@ -841,7 +860,11 @@ class _FilterHeaderView(QHeaderView):
 
     def paintSection(self, painter, rect, logical_index):
         super().paintSection(painter, rect, logical_index)
-        if logical_index in _FILTER_COLS and rect.width() >= 28:
+        if (
+            self._filters_enabled
+            and logical_index in _FILTER_COLS
+            and rect.width() >= 28
+        ):
             painter.save()
             is_active = bool(self._active.get(logical_index))
             painter.setPen(QColor("#EA580C") if is_active else QColor("#94A3B8"))
@@ -885,7 +908,7 @@ class _FilterHeaderView(QHeaderView):
             return
         col = self.logicalIndexAt(event.pos())
         if event.button() == Qt.LeftButton and col >= 0:
-            if col in _FILTER_COLS:
+            if self._filters_enabled and col in _FILTER_COLS:
                 col_x = self.sectionViewportPosition(col)
                 col_w = self.sectionSize(col)
                 if chevron_hit_contains(col_x, col_w, event.pos().x()):
@@ -947,7 +970,7 @@ class _FilterHeaderView(QHeaderView):
         event.accept()
 
     def _open_menu(self, col: int, global_pos) -> None:
-        if not callable(self._value_provider):
+        if not self._filters_enabled or not callable(self._value_provider):
             return
         values = set(self._value_provider(col) or [])
         current = set(self._active.get(col, set()) or [])
@@ -964,6 +987,8 @@ class _FilterHeaderView(QHeaderView):
         self._popup = popup
 
         def _on_applied(new_filter):
+            if not self._filters_enabled:
+                return
             new_filter = set(new_filter or [])
             if new_filter:
                 self._active[col] = new_filter
@@ -1004,8 +1029,12 @@ class DailyRegister(QWidget):
     font_size_changed = Signal(bool, bool)
     # Wrap Text toolbar — True when any column is wrapping
     wrap_state_changed = Signal(bool)
+    # Excel AutoFilter toolbar — True when column ▾ filters are active
+    column_filters_state_changed = Signal(bool)
     # Soft-trash / deletion-request changed — refresh Cashier Trash badge
     trash_changed = Signal()
+    # Brief non-blocking status (e.g. after Save) — action bar flash pill
+    transient_status = Signal(str)
 
     def __init__(self, user: User, categories: List[Category], parent=None):
         super().__init__(parent)
@@ -1037,6 +1066,8 @@ class DailyRegister(QWidget):
         self._edit_mode: bool    = False
         self._dirty_rows: set    = set()  # saved row indices modified while editing
         self._col_filters: dict   = {}   # col -> set of accepted values
+        # Toolbar AutoFilter: when False, ▾ hidden and column filters cleared.
+        self._column_filters_enabled: bool = True
         self._search_text: str    = ""
         self._pending_highlight: str = ""  # set by navigate_to_date; consumed in _populate
         self._load_upload_id: str = ""     # one-shot: load this Excel batch instead of a day
@@ -1081,9 +1112,10 @@ class DailyRegister(QWidget):
         # Re-entrancy guards — prevent double-click duplicate inserts.
         self._save_in_flight = False
         self._submit_in_flight = False
-        # Phase 4 — local outbox drain (reconnect sync).
+        # Phase 4/C — local outbox drain (reconnect + async online Save).
         self._outbox_drain_in_flight = False
         self._outbox_backoff_attempt = 0
+        self._kick_outbox_after_save = False
         self._outbox_drain_timer = QTimer(self)
         self._outbox_drain_timer.setSingleShot(True)
         self._outbox_drain_timer.timeout.connect(self._kick_outbox_drain)
@@ -1939,6 +1971,14 @@ class DailyRegister(QWidget):
         primary_day = primary_dt.date() if primary_dt else self._current_date
         tx_day = tx_date.date() if hasattr(tx_date, "date") else tx_date
         date_discrep = bool(meta.get("date_discrepancy")) or (tx_day != primary_day)
+        try:
+            _meta_day_order = (
+                int(meta["day_order"])
+                if meta.get("day_order") is not None
+                else row
+            )
+        except (TypeError, ValueError):
+            _meta_day_order = row
         return Transaction(
             date=tx_date,
             description=description,
@@ -1958,7 +1998,8 @@ class DailyRegister(QWidget):
             payee=txt(COL_PAYEE).upper(),
             cheque=txt(COL_CHEQUE).upper(),
             cashier_id=self._user._id,
-            day_order=row,
+            day_order=_meta_day_order,
+            possible_duplicate=bool(meta.get("possible_duplicate")),
             register_status="draft",
             daily_import_id=meta.get("daily_import_id"),
             daily_import_source=meta.get("daily_import_source"),
@@ -2345,6 +2386,8 @@ class DailyRegister(QWidget):
         QTimer.singleShot(2000, _restore)
 
     def _on_col_filter_changed(self, col: int, accepted: set) -> None:
+        if not self._column_filters_enabled:
+            return
         if accepted:
             self._col_filters[col] = set(accepted)
         else:
@@ -2358,6 +2401,29 @@ class DailyRegister(QWidget):
         hdr = self._table.horizontalHeader()
         if isinstance(hdr, _FilterHeaderView):
             hdr.clear_filters()
+
+    def column_filters_enabled(self) -> bool:
+        return bool(self._column_filters_enabled)
+
+    def set_column_filters_enabled(self, enabled: bool) -> None:
+        """Excel-style AutoFilter: on shows ▾; off clears filters and hides ▾."""
+        enabled = bool(enabled)
+        if enabled == self._column_filters_enabled:
+            return
+        self._column_filters_enabled = enabled
+        hdr = self._table.horizontalHeader()
+        if isinstance(hdr, _FilterHeaderView):
+            hdr.set_filters_enabled(enabled)
+        if not enabled:
+            self._clear_column_filters()
+            self._apply_filters()
+        else:
+            self._sync_filter_header()
+        self.column_filters_state_changed.emit(enabled)
+
+    def toolbar_toggle_column_filters(self) -> None:
+        """Toolbar Filter button — toggle AutoFilter on/off."""
+        self.set_column_filters_enabled(not self._column_filters_enabled)
 
     def _sync_filter_header(self) -> None:
         hdr = self._table.horizontalHeader()
@@ -2474,12 +2540,13 @@ class DailyRegister(QWidget):
 
             # ── Column filters ───────────────────────────────────────
             visible = True
-            for col, accepted in self._col_filters.items():
-                if not accepted:
-                    continue
-                if self._cell_filter_value(row, col) not in accepted:
-                    visible = False
-                    break
+            if self._column_filters_enabled:
+                for col, accepted in self._col_filters.items():
+                    if not accepted:
+                        continue
+                    if self._cell_filter_value(row, col) not in accepted:
+                        visible = False
+                        break
 
             self._table.setRowHidden(row, not visible)
 
@@ -5335,6 +5402,48 @@ class DailyRegister(QWidget):
         if flush:
             self._flush_local_draft()
 
+    def _append_saved_transactions(self, txs: list) -> None:
+        """Grow the saved prefix from ACK'd transactions (no full day reload)."""
+        if not txs:
+            return
+        prev = self._table.blockSignals(True)
+        try:
+            for tx in txs:
+                at = self._saved_count
+                self._table.insertRow(at)
+                self._shift_row_maps_on_insert(at)
+                self._fill_saved_row(at, tx)
+                self._saved_ids[at] = tx._id
+                self._saved_txs[at] = tx
+                self._saved_count += 1
+        finally:
+            self._table.blockSignals(prev)
+        self._renumber()
+        self._update_footer()
+        self._emit_active_cheque()
+
+    def _enqueue_inserts_for_outbox(
+        self, to_save: list[tuple[int, "Transaction"]]
+    ) -> int:
+        """Mark new rows PENDING + flush draft (durable before any network)."""
+        for row, tx in to_save:
+            self._ensure_row_client_id(row)
+            meta = dict(self._pending_row_meta.get(row) or {})
+            meta["sync_status"] = SYNC_PENDING
+            if getattr(tx, "day_order", None) is not None:
+                try:
+                    meta["day_order"] = int(tx.day_order)
+                except (TypeError, ValueError):
+                    pass
+            if getattr(tx, "possible_duplicate", False):
+                meta["possible_duplicate"] = True
+            else:
+                meta.pop("possible_duplicate", None)
+            self._pending_row_meta[row] = meta
+            self._apply_row_sync_tint(row)
+        self._flush_local_draft()
+        return len(to_save)
+
     def _row_date_iso(self, row: int) -> str:
         """Normalize the Date cell (or register day) to ``YYYY-MM-DD``."""
         year = self._current_date.year if self._current_date else date.today().year
@@ -5676,6 +5785,7 @@ class DailyRegister(QWidget):
         category_id=None,
         cashier_id=None,
         emit_source_changed: bool = True,
+        clear_category: bool = False,
     ) -> int:
         """Stamp Payee + Item onto matching live / draft rows for *target*.
 
@@ -5685,6 +5795,8 @@ class DailyRegister(QWidget):
 
         Pass ``emit_source_changed=False`` when the caller (e.g. Day Issues map)
         will refresh Day Issues itself — avoids a duplicate full scan.
+        Pass ``clear_category=True`` (Undo) to wipe category_id while writing
+        blank Item / Payee.
         """
         from tahmeed.services.description_mapping_service import normalize_description
 
@@ -5706,6 +5818,7 @@ class DailyRegister(QWidget):
                 category_id=category_id,
                 cashier_id=cashier_id,
                 emit_source_changed=emit_source_changed,
+                clear_category=clear_category,
             )
         return self._apply_mapping_to_local_draft(
             target,
@@ -5713,6 +5826,7 @@ class DailyRegister(QWidget):
             payee=payee_text,
             item_name=item_text,
             category_id=category_id,
+            clear_category=clear_category,
         )
 
     def _apply_mapping_to_live_grid(
@@ -5724,6 +5838,7 @@ class DailyRegister(QWidget):
         category_id=None,
         cashier_id=None,
         emit_source_changed: bool = True,
+        clear_category: bool = False,
     ) -> int:
         from dataclasses import replace
 
@@ -5757,11 +5872,17 @@ class DailyRegister(QWidget):
                     self._write_mapping_cells(
                         row, item_name=item_name, payee=payee, saved=True
                     )
+                    if clear_category:
+                        next_cat_id = None
+                    elif category_id is not None:
+                        next_cat_id = category_id
+                    else:
+                        next_cat_id = tx.category_id
                     self._saved_txs[row] = replace(
                         tx,
                         item=item_name,
                         category_name=item_name,
-                        category_id=category_id if category_id is not None else tx.category_id,
+                        category_id=next_cat_id,
                         payee=payee,
                     )
                     updated += 1
@@ -5775,7 +5896,9 @@ class DailyRegister(QWidget):
                     row, item_name=item_name, payee=payee, saved=False
                 )
                 meta = dict(self._pending_row_meta.get(row) or {})
-                if category_id is not None:
+                if clear_category:
+                    meta.pop("category_id", None)
+                elif category_id is not None:
                     meta["category_id"] = category_id
                 self._pending_row_meta[row] = meta
                 updated += 1
@@ -5820,6 +5943,7 @@ class DailyRegister(QWidget):
         payee: str,
         item_name: str,
         category_id=None,
+        clear_category: bool = False,
     ) -> int:
         from tahmeed.services.register_draft_service import apply_mapping_to_draft_payload
 
@@ -5834,6 +5958,7 @@ class DailyRegister(QWidget):
             payee=payee,
             item_name=item_name,
             category_id=category_id,
+            clear_category=clear_category,
             desc_col=COL_DESC,
             item_col=COL_ITEM,
             payee_col=COL_PAYEE,
@@ -6025,11 +6150,14 @@ class DailyRegister(QWidget):
                 any_fail = False
                 synced = 0
                 already_exists = 0
-                for (row, _tx), (status_key, _saved, _err) in zip(to_save, outcomes):
+                acked_txs: list = []
+                for (row, _tx), (status_key, saved_tx, _err) in zip(to_save, outcomes):
                     if status_key in ("created", "already_exists"):
                         synced += 1
                         if status_key == "already_exists":
                             already_exists += 1
+                        if saved_tx is not None:
+                            acked_txs.append(saved_tx)
                         self._mark_new_row_saved(row, flush=False)
                     else:
                         any_fail = True
@@ -6041,14 +6169,26 @@ class DailyRegister(QWidget):
                 self._flush_local_draft()
                 if synced:
                     self.drafts_changed.emit()
+                    self.rows_saved.emit(synced)
                     self._outbox_backoff_attempt = 0
                 if any_fail:
                     self._outbox_backoff_attempt += 1
                     self._schedule_outbox_backoff()
-                elif synced and self._current_date is not None:
-                    # Refresh saved prefix without clobbering leftover failed rows:
-                    # leftover FAILED stay in draft; reload then restore.
-                    await self._load_date(self._current_date)
+                    # Partial success: full reload so saved prefix matches Mongo
+                    # while FAILED leftovers remain in the local draft restore.
+                    if synced and self._current_date is not None:
+                        await self._load_date(self._current_date)
+                elif synced:
+                    # Phase C — promote ACK'd rows; skip full day reload.
+                    if acked_txs and len(acked_txs) == synced:
+                        self._append_saved_transactions(acked_txs)
+                        if not nested_busy and not self._submit_in_flight:
+                            self.transient_status.emit(
+                                f"Draft saved: {synced} added · "
+                                "Open Drafts to submit for Verify"
+                            )
+                    elif self._current_date is not None:
+                        await self._load_date(self._current_date)
             finally:
                 self._outbox_drain_in_flight = False
                 if (
@@ -6395,6 +6535,7 @@ class DailyRegister(QWidget):
             log_register_event("save_ignored", reason="already_in_flight")
             return False
         self._save_in_flight = True
+        self._kick_outbox_after_save = False
         # Submit already holds the busy UI lock; avoid flickering it off early.
         nested_under_submit = self._submit_in_flight
         if not nested_under_submit:
@@ -6411,9 +6552,14 @@ class DailyRegister(QWidget):
                 return ok
         finally:
             self._save_in_flight = False
+            kick = bool(self._kick_outbox_after_save)
+            self._kick_outbox_after_save = False
             if not nested_under_submit and not self._submit_in_flight:
                 self.save_busy_changed.emit(False)
                 self._hide_register_loading()
+            # Drain only after Save releases its lock (outbox guards on in-flight).
+            if kick:
+                self._schedule_outbox_drain(delay_ms=0)
 
     async def _do_save_body(self, meta: dict | None = None) -> bool:
         """Inner save implementation (caller holds `_save_in_flight`)."""
@@ -6541,6 +6687,7 @@ class DailyRegister(QWidget):
 
         # ── Pass 2: insert brand-new rows (INSERT) — My entries only ───
         pending_inserts: list[tuple[int, Transaction]] = []
+        queued = 0
         if not self._merged_mode:
             dup_days = int(getattr(self, "_duplicate_check_days", 5) or 5)
 
@@ -6654,36 +6801,62 @@ class DailyRegister(QWidget):
                 tx.possible_duplicate = row in save_anyway
                 to_save.append((row, tx))
 
-            # Bulk create in chunks (one RTT per chunk) with progress overlay.
-            total_to_save = len(to_save)
-            chunk_size = 50
-            for chunk_start in range(0, total_to_save, chunk_size):
-                chunk = to_save[chunk_start : chunk_start + chunk_size]
-                lo = chunk_start + 1
-                hi = chunk_start + len(chunk)
-                self._show_register_loading(
-                    f"Saving draft… {lo}–{hi} of {total_to_save}"
-                    if total_to_save > chunk_size
-                    else f"Saving draft… ({total_to_save})"
+            # Phase C — online Save queues inserts and drains in the background
+            # (same durable outbox as offline). Submit still awaits the create
+            # so Verify never races a pending queue.
+            use_async_outbox = (
+                bool(to_save)
+                and not self._submit_in_flight
+                and not self._merged_mode
+            )
+            if use_async_outbox:
+                queued = self._enqueue_inserts_for_outbox(to_save)
+                self._kick_outbox_after_save = True
+                if meta is not None:
+                    meta["queued"] = queued
+                    meta["async_outbox"] = True
+                log_register_event(
+                    "outbox_enqueue",
+                    day=str(self._current_date or ""),
+                    rows=queued,
+                    online=True,
                 )
-                try:
-                    outcomes = await bulk_save_transactions([tx for _r, tx in chunk])
-                except Exception as exc:
-                    for row, _tx in chunk:
-                        errors.append(f"Row {row + 1}: {exc}")
-                    continue
-                for (row, _tx), (status_key, _saved, err) in zip(chunk, outcomes):
-                    if status_key in ("created", "already_exists"):
-                        saved += 1
-                        if status_key == "already_exists":
-                            already_exists += 1
-                        self._mark_new_row_saved(row, flush=False)
-                    else:
-                        errors.append(
-                            f"Row {row + 1}: {err or status_key or 'save failed'}"
+            else:
+                # Sync create (Submit path / Merged) — chunked bulk-create.
+                total_to_save = len(to_save)
+                chunk_size = BULK_CREATE_CHUNK
+                for chunk_start in range(0, total_to_save, chunk_size):
+                    chunk = to_save[chunk_start : chunk_start + chunk_size]
+                    lo = chunk_start + 1
+                    hi = chunk_start + len(chunk)
+                    self._show_register_loading(
+                        f"Saving draft… {lo}–{hi} of {total_to_save}"
+                        if total_to_save > chunk_size
+                        else f"Saving draft… ({total_to_save})"
+                    )
+                    try:
+                        outcomes = await bulk_save_transactions(
+                            [tx for _r, tx in chunk]
                         )
-                # One draft prune per chunk (not per row) — crash-safe mid-save.
-                self._flush_local_draft()
+                    except Exception as exc:
+                        for row, _tx in chunk:
+                            errors.append(f"Row {row + 1}: {exc}")
+                        continue
+                    for (row, _tx), (status_key, _saved, err) in zip(
+                        chunk, outcomes
+                    ):
+                        if status_key in ("created", "already_exists"):
+                            saved += 1
+                            if status_key == "already_exists":
+                                already_exists += 1
+                            self._mark_new_row_saved(row, flush=False)
+                        else:
+                            errors.append(
+                                f"Row {row + 1}: "
+                                f"{err or status_key or 'save failed'}"
+                            )
+                    # One draft prune per chunk (not per row) — crash-safe.
+                    self._flush_local_draft()
 
         if self._merged_mode and (saved or updated):
             try:
@@ -6695,23 +6868,26 @@ class DailyRegister(QWidget):
             meta["saved"] = saved
             meta["updated"] = updated
             meta["already_exists"] = already_exists
+            meta["queued"] = queued
             meta["errors"] = len(errors)
 
         if errors:
             QMessageBox.warning(
                 self, "Save — partial errors",
-                f"{saved} added, {updated} updated.\n\nErrors:\n" + "\n".join(errors),
+                f"{saved} added, {updated} updated.\n\nErrors:\n"
+                + "\n".join(errors),
             )
-            # Draft already pruned of succeeded inserts; flush captures leftovers
-            # only. Reload when anything reached the server so the saved prefix
-            # matches Mongo and restore cannot stack duplicates.
             self._flush_local_draft()
             if saved or updated:
                 self.drafts_changed.emit()
                 if self._current_date is not None:
                     await self._load_date(self._current_date)
+            elif queued:
+                # Updates failed but inserts are durable in the outbox — drain.
+                self._kick_outbox_after_save = True
             return False
-        if saved == 0 and updated == 0:
+
+        if saved == 0 and updated == 0 and queued == 0:
             if self.has_unsaved_work():
                 # Typed rows that could not become transactions (e.g. no
                 # description) — keep local recovery; do not claim success.
@@ -6727,10 +6903,27 @@ class DailyRegister(QWidget):
             self._clear_local_draft(both_modes=True)
             return True
 
+        # Async outbox path: keep PENDING rows on disk; drain promotes them.
+        if queued and not saved:
+            self._reset_edit_state()
+            if updated:
+                self.drafts_changed.emit()
+            if not self._submit_in_flight:
+                plural = "" if queued == 1 else "s"
+                parts = [f"Syncing {queued} draft{plural}"]
+                if updated:
+                    parts.append(f"{updated} updated")
+                self.transient_status.emit(" · ".join(parts) + "…")
+            return True
+
         self._clear_local_draft(both_modes=True)
         self._reset_edit_state()
         self.rows_saved.emit(saved)
         self.drafts_changed.emit()
+        # Updates-only: cells already match — skip full reload.
+        # Sync insert path (Submit): reload so Verify sees server state.
+        if saved and self._current_date is not None:
+            await self._load_date(self._current_date)
         if not self._submit_in_flight:
             parts = []
             if saved:
@@ -6738,15 +6931,9 @@ class DailyRegister(QWidget):
             if updated:
                 parts.append(f"{updated} updated")
             summary = ", ".join(parts) if parts else "saved"
-            # Hide busy overlay before the dialog so it does not sit under the box.
-            self._hide_register_loading()
-            QMessageBox.information(
-                self,
-                "Draft saved",
-                f"Saved as draft: {summary}.\n\n"
-                "Open Drafts to submit for Verify when ready.",
+            self.transient_status.emit(
+                f"Draft saved: {summary} · Open Drafts to submit for Verify"
             )
-        await self._load_date(self._current_date)
         return True
 
     def _ordered_saved_ids(self) -> list:

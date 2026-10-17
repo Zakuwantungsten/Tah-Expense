@@ -724,6 +724,8 @@ class MasterExpensesWidget(QWidget):
         self._item_names: List[str] = []
         self._item_by_name: Dict = {}
         self._edit_in_flight = False
+        # In-flight lazy ▾ distinct fetches keyed by column index.
+        self._col_value_inflight: Dict[int, asyncio.Future] = {}
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -836,6 +838,7 @@ class MasterExpensesWidget(QWidget):
 
         # ── Table ────────────────────────────────────────────────────────
         self._table = _LedgerTable()
+        self._table.set_column_values_loader(self._fetch_column_values)
         self._table.sort_changed.connect(self._on_sort_changed)
         self._table.col_filter_changed.connect(self._on_col_filter_changed)
         self._table.edit_state_changed.connect(self._on_edit_state_changed)
@@ -936,6 +939,10 @@ class MasterExpensesWidget(QWidget):
         self._total = 0
         if not keep_col_filters:
             self._table.clear_column_filters()
+        else:
+            # Cascade filters / range changed — distincts must be re-fetched.
+            self._table.clear_column_value_cache()
+        self._col_value_inflight.clear()
         self._table.clear_rows()
         self._update_status()
         asyncio.ensure_future(self._load_initial(self._reload_generation))
@@ -981,6 +988,8 @@ class MasterExpensesWidget(QWidget):
         self._sort_field = "date"
         self._sort_asc = False
         self._table.reset_default_sort()
+        # Restore From/To to the current FY/month window after Clear.
+        self._filter_bar.set_date_range(self._year, self._month)
         self._reset_and_load()
 
     def _on_col_filter_changed(self) -> None:
@@ -1125,45 +1134,45 @@ class MasterExpensesWidget(QWidget):
 
     async def _save_edits_async(self) -> None:
         from bson import ObjectId
-        from tahmeed.services.accountant_service import update_master_transaction
+        from tahmeed.services.accountant_service import bulk_patch_master_transactions
 
         self._table._commit_open_editor()
         dirty = self._table.dirty_rows()
         if not dirty:
             return
         await self._ensure_item_names()
+        patches: List[tuple] = []
+        for row in dirty:
+            tx = self._table.tx_at(row)
+            if tx is None or tx._id is None:
+                continue
+            updates = self._table.updates_from_row(row)
+            if not updates:
+                continue
+            patches.append(
+                (ObjectId(str(tx._id)), self._with_category_id(updates))
+            )
+        if not patches:
+            return
+
         self._edit_in_flight = True
-        self._loading_overlay.show_loading(f"Saving {len(dirty)} row(s)…")
-        saved = 0
-        errors: List[str] = []
+        self._loading_overlay.show_loading(f"Saving {len(patches)} row(s)…")
         try:
-            for row in dirty:
-                tx = self._table.tx_at(row)
-                if tx is None or tx._id is None:
-                    continue
-                updates = self._table.updates_from_row(row)
-                if not updates:
-                    continue
-                try:
-                    ok = await update_master_transaction(
-                        ObjectId(str(tx._id)),
-                        self._with_category_id(updates),
-                        self._accountant_id(),
-                    )
-                    if ok:
-                        saved += 1
-                    else:
-                        errors.append(f"Row {row + 1}: not updated")
-                except Exception as exc:
-                    errors.append(f"Row {row + 1}: {exc}")
-            if errors:
+            result = await bulk_patch_master_transactions(
+                patches, self._accountant_id(),
+            )
+            matched = int(result.get("matched") or 0)
+            if matched < len(patches):
                 QMessageBox.warning(
                     self, "Partial Save",
-                    f"Saved {saved} row(s).\n\n" + "\n".join(errors[:8]),
+                    f"Saved {matched} of {len(patches)} row(s).\n"
+                    "Some rows may no longer be in Master.",
                 )
             self._table.exit_edit_mode(discard=False)
             self._filters_loaded = False
             self._reset_and_load(keep_col_filters=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Failed", str(exc))
         finally:
             self._edit_in_flight = False
             self._loading_overlay.hide_loading()
@@ -1220,38 +1229,26 @@ class MasterExpensesWidget(QWidget):
         self._loading_overlay.show_loading("Loading master expenses…")
         self._update_status()
         try:
-            from tahmeed.services.accountant_service import (
-                get_master_transactions, count_master_transactions,
-                get_cashier_names,
-            )
+            from tahmeed.services.accountant_service import get_master_page
 
             await self._reload_year_options()
             if generation != self._reload_generation:
                 return
 
             kw = self._filter_kw()
-            txs, total = await asyncio.gather(
-                get_master_transactions(
-                    **kw, sort_field=self._sort_field,
-                    sort_asc=self._sort_asc, limit=_SCROLL_CHUNK, skip=0,
-                ),
-                count_master_transactions(**kw),
+            page = await get_master_page(
+                **kw, sort_field=self._sort_field,
+                sort_asc=self._sort_asc, limit=_SCROLL_CHUNK, skip=0,
             )
             if generation != self._reload_generation:
                 return
 
-            self._total = total
-            cashier_ids = [tx.cashier_id for tx in txs if tx.cashier_id]
-            cashier_names = (
-                await get_cashier_names(cashier_ids) if cashier_ids else {}
-            )
-            if generation != self._reload_generation:
-                return
-
-            if txs:
-                self._table.populate(txs, 0, cashier_names)
-            self._loaded = len(txs)
-            self._count_lbl.setText(f"{total:,} records")
+            self._total = page.total
+            # Always populate (including empty) so a tighter filter clears prior rows.
+            self._table.populate(page.items, 0, page.cashier_names)
+            self._table.sync_column_filter_header()
+            self._loaded = len(page.items)
+            self._count_lbl.setText(f"{page.total:,} records")
             self._update_status()
 
             asyncio.ensure_future(self._load_background(generation, kw))
@@ -1267,60 +1264,76 @@ class MasterExpensesWidget(QWidget):
 
     async def _load_background(self, generation: int, kw: dict) -> None:
         try:
-            from tahmeed.services.accountant_service import (
-                get_master_totals, get_master_month_totals,
-                get_master_trucks, get_master_categories,
-                get_master_column_values,
+            from tahmeed.services.accountant_service import get_master_bootstrap
+
+            boot = await get_master_bootstrap(
+                **kw,
+                include_year_meta=not self._filters_loaded,
             )
-            from tahmeed.ui.accountant.master_ledger_table import _COL_FIELD
+            if generation != self._reload_generation:
+                return
 
+            self._footer.update_totals(
+                boot.totals["tzs"], boot.totals["usd"], self._total,
+            )
             if not self._filters_loaded:
-                totals, month_data, trucks, cats = await asyncio.gather(
-                    get_master_totals(**kw),
-                    get_master_month_totals(self._year),
-                    get_master_trucks(self._year),
-                    get_master_categories(self._year),
-                )
-            else:
-                totals = await get_master_totals(**kw)
-                month_data = trucks = cats = None
-
-            if generation != self._reload_generation:
-                return
-
-            self._footer.update_totals(totals["tzs"], totals["usd"], self._total)
-            if not self._filters_loaded and month_data is not None:
-                self._filter_bar.populate_trucks(trucks)
-                self._filter_bar.populate_categories(cats)
-                self._month_bar.update_totals(month_data)
-                self._filters_loaded = True
-
-            # Distinct ▾ values for the whole selected range (cascaded).
-            base_kw = {
-                k: v for k, v in kw.items()
-                if k != "column_filters"
-            }
-            col_filters = kw.get("column_filters") or {}
-            fields = sorted(set(_COL_FIELD.values()))
-            results = await asyncio.gather(*[
-                get_master_column_values(
-                    field,
-                    **base_kw,
-                    column_filters=col_filters or None,
-                )
-                for field in fields
-            ])
-            if generation != self._reload_generation:
-                return
-            field_to_col = {f: c for c, f in _COL_FIELD.items()}
-            cache = {
-                field_to_col[field]: set(vals)
-                for field, vals in zip(fields, results)
-                if field in field_to_col
-            }
-            self._table.set_column_value_cache(cache)
+                if boot.trucks is not None:
+                    self._filter_bar.populate_trucks(boot.trucks)
+                if boot.categories is not None:
+                    self._filter_bar.populate_categories(boot.categories)
+                if boot.month_totals is not None:
+                    self._month_bar.update_totals(boot.month_totals)
+                # Mark loaded once we attempted year meta (even if empty lists).
+                if (
+                    boot.trucks is not None
+                    or boot.categories is not None
+                    or boot.month_totals is not None
+                ):
+                    self._filters_loaded = True
+            # Column ▾ distincts load lazily on first open (Phase 2).
         except Exception:
             pass
+
+    async def _fetch_column_values(self, col: int) -> Set[str]:
+        """Fetch distinct ▾ values for one column (deduped in-flight)."""
+        from tahmeed.services.accountant_service import get_master_column_values
+        from tahmeed.ui.accountant.master_ledger_table import _COL_FIELD
+
+        field = _COL_FIELD.get(col)
+        if not field:
+            return set()
+
+        existing = self._col_value_inflight.get(col)
+        if existing is not None and not existing.done():
+            return set(await existing)
+
+        gen = self._reload_generation
+
+        async def _do() -> Set[str]:
+            kw = self._filter_kw()
+            base_kw = {k: v for k, v in kw.items() if k != "column_filters"}
+            col_filters = kw.get("column_filters") or {}
+            vals = await get_master_column_values(
+                field,
+                **base_kw,
+                column_filters=col_filters or None,
+            )
+            return set(vals or [])
+
+        task = asyncio.ensure_future(_do())
+        self._col_value_inflight[col] = task
+        try:
+            values = set(await task)
+            # Drop stale results after a newer filter/search reload.
+            if gen != self._reload_generation:
+                return values
+            # Only cache non-empty full-range results; empty may be transient.
+            if values:
+                self._table.put_column_value_cache(col, values)
+            return values
+        finally:
+            if self._col_value_inflight.get(col) is task:
+                self._col_value_inflight.pop(col, None)
 
     async def _load_more(self) -> None:
         if self._scroll_loading or self._loading:
@@ -1332,29 +1345,22 @@ class MasterExpensesWidget(QWidget):
         self._scroll_loading = True
         self._update_status()
         try:
-            from tahmeed.services.accountant_service import (
-                get_master_transactions, get_cashier_names,
-            )
+            from tahmeed.services.accountant_service import get_master_page
 
             kw = self._filter_kw()
             gen = self._reload_generation
-            txs = await get_master_transactions(
+            page = await get_master_page(
                 **kw, sort_field=self._sort_field,
                 sort_asc=self._sort_asc, limit=_SCROLL_CHUNK, skip=self._loaded,
             )
             if gen != self._reload_generation:
                 return
 
-            cashier_ids = [tx.cashier_id for tx in txs if tx.cashier_id]
-            cashier_names = (
-                await get_cashier_names(cashier_ids) if cashier_ids else {}
-            )
-            if gen != self._reload_generation:
-                return
-
-            if txs:
-                self._table.append_rows(txs, self._loaded, cashier_names)
-                self._loaded += len(txs)
+            if page.items:
+                self._table.append_rows(
+                    page.items, self._loaded, page.cashier_names,
+                )
+                self._loaded += len(page.items)
         except Exception:
             pass
         finally:

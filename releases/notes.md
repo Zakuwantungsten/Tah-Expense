@@ -1,3 +1,13 @@
+- 4.7.10: Daily Register Table — Excel-style Filter toolbar toggle to show/hide column ▾ filters and clear them in one click (cashier + accountant)
+- 4.7.9: Browse period combos — one bootstrap call for years + months (fewer HTTP round-trips before Find)
+- 4.7.8: Browse Advanced Item / Sub-Item filters load lazily on ▾ open (no distincts fetch on every Find)
+- 4.7.7: Browse Simple / Advanced / Uploads — one composite list call returns rows + cashier names (and flat match total); fewer HTTP round-trips per Find
+- 4.7.6: Master Expenses filters — ▾ menus no longer freeze the UI (WaitCursor / disabled Apply); Clear restores date range; empty filter results clear the grid; receipt=All omitted from API params
+- 4.7.5: Master Expenses Save — one bulk-patch for dirty rows (no per-row PATCH storm)
+- 4.7.4: Master Expenses background meta — one bootstrap call for totals + month tabs + truck/category filters
+- 4.7.3: Master Expenses Excel ▾ filters load lazily on open (no ~12 column-value requests on every refresh)
+- 4.7.2: Master Expenses first paint / scroll — one composite list call returns rows + real total + cashier names (fewer HTTP round-trips)
+- 4.7.1: Faster Day Issues mapping (optimistic UI + bulk map upsert + background row apply); faster Daily Register Save for dirty rows (bulk-patch, one audit); registered bikes/cars accepted without truck plate format so they stop reappearing in Truck Issues after discard/re-upload
 - 4.7.0: Daily Register slow-network Save/recovery — idempotent creates (`client_row_id`), bulk save, offline outbox sync, no duplicate inflation on restore; discard draft clears ghost rows on the open table; Help → Register Save & Recovery; support CLI to find/soft-trash duplicate drafts
 - 4.6.9: Verify approve gate → Open Day Issues lists the blocked unmapped descriptions (VALUE filter; All days when the selection spans multiple register days) so accountants can map them before approving again
 - 4.6.8: Cashier soft-trash for draft/submitted deletes (restore/purge in Cashier Trash; verified still needs accountant confirm); Trash UI parity + sidebar badge; Daily Register wrap text, column hide/unhide, and viewport-only resize cursor; bulk approve no longer capped at 200 ids; Day Issues asyncio scheduling fix on Python 3.14

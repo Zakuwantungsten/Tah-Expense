@@ -72,3 +72,68 @@ def test_save_mapping_signature_includes_payee() -> None:
 
     params = inspect.signature(save_mapping).parameters
     assert "payee" in params
+
+
+def test_apply_mapping_to_draft_payload_clear_category() -> None:
+    from datetime import date
+
+    cat_id = ObjectId()
+    draft = build_draft_payload(
+        user_id=ObjectId(),
+        username="c1",
+        register_date=date(2026, 3, 15),
+        merged=False,
+        edit_mode=False,
+        dirty_saved=[],
+        new_rows=[
+            {
+                "cells": cells_for_json({
+                    COL_DESC: "LATRA FEE",
+                    COL_ITEM: "Parking",
+                    COL_PAYEE: "CITY COUNCIL",
+                }),
+                "pending_meta": {"category_id": str(cat_id)},
+            },
+        ],
+    )
+    keys = {normalize_description("LATRA FEE")}
+    n = apply_mapping_to_draft_payload(
+        draft,
+        keys,
+        payee="",
+        item_name="",
+        clear_category=True,
+        desc_col=COL_DESC,
+        item_col=COL_ITEM,
+        payee_col=COL_PAYEE,
+    )
+    assert n == 1
+    cells = cells_from_json(draft["new_rows"][0]["cells"])
+    assert cells[COL_ITEM] == ""
+    assert cells[COL_PAYEE] == ""
+    meta = draft["new_rows"][0]["pending_meta"] or {}
+    assert "category_id" not in meta
+
+
+def test_split_undo_map_actions_deletes_new_and_restores_prior() -> None:
+    from datetime import date
+
+    from tahmeed.ui.cashier.day_issues import (
+        MappingUndoSnapshot,
+        split_undo_map_actions,
+    )
+
+    new_id = ObjectId()
+    prior_cat = ObjectId()
+    snap = MappingUndoSnapshot(
+        descriptions=["NEW FEE", "OLD FEE"],
+        dates=[date(2026, 10, 13)],
+        prior_by_key={
+            "NEW FEE": None,
+            "OLD FEE": ("OLD FEE", prior_cat, "Old Item", "OLD PAYEE"),
+        },
+        new_ids_by_key={"NEW FEE": new_id, "OLD FEE": ObjectId()},
+    )
+    delete_ids, restore = split_undo_map_actions(snap)
+    assert delete_ids == [new_id]
+    assert restore == [("OLD FEE", prior_cat, "Old Item", "OLD PAYEE")]

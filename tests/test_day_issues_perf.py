@@ -102,7 +102,7 @@ def test_set_date_refreshes_when_dirty_or_date_changed() -> None:
 
 
 def test_open_for_date_forces_this_day_and_refreshes() -> None:
-    """Table / sidebar deep-link: SHOW=This day + table date, always reload."""
+    """Table deep-link: SHOW=This day + table date, always reload."""
     _app()
     user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
     widget = DayIssuesWidget(user)
@@ -128,6 +128,87 @@ def test_open_for_date_forces_this_day_and_refreshes() -> None:
     assert widget._target == day
     assert widget._date.isEnabled()
     assert widget._date.date().toPython() == day
+    assert calls == ["refresh"]
+
+
+def test_on_page_shown_preserves_verify_handoff() -> None:
+    """Sidebar tab return must not wipe Verify VALUE filter / All days."""
+    from tahmeed.services.description_mapping_service import normalize_description
+
+    _app()
+    user = User(username="a1", password_hash="x", role="accountant", full_name="A1")
+    widget = DayIssuesWidget(user)
+    calls: list[str] = []
+    widget._schedule_refresh = lambda: calls.append("refresh")  # type: ignore[method-assign]
+    widget._loaded = True
+    widget._dirty = False
+    keys = (
+        normalize_description("AGENCY FEE"),
+        normalize_description("ALLOWANCE"),
+    )
+    widget.open_from_verify(
+        date(2026, 3, 15),
+        description_keys=keys,
+        all_days=True,
+    )
+    assert calls == ["refresh"]
+    calls.clear()
+    # Simulate successful scan after handoff.
+    widget._loaded = True
+    widget._dirty = False
+
+    widget.on_page_shown(date(2026, 1, 1))
+
+    assert widget._scope == "all"
+    assert widget._value_filter == set(keys)
+    assert widget._checked_keys == set(keys)
+    assert widget._target == date(2026, 3, 15)
+    assert calls == []  # clean + loaded → no re-scan
+
+
+def test_on_page_shown_first_visit_opens_for_date() -> None:
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    calls: list[str] = []
+    widget._schedule_refresh = lambda: calls.append("refresh")  # type: ignore[method-assign]
+    widget._loaded = False
+    widget._dirty = True
+
+    widget.on_page_shown(date(2026, 4, 2))
+
+    assert widget._scope == "day"
+    assert widget._target == date(2026, 4, 2)
+    assert calls == ["refresh"]
+
+
+def test_on_page_shown_preserves_handoff_before_first_scan_finishes() -> None:
+    """Leaving mid-handoff must not reset via open_for_date."""
+    from tahmeed.services.description_mapping_service import normalize_description
+
+    _app()
+    user = User(username="a1", password_hash="x", role="accountant", full_name="A1")
+    widget = DayIssuesWidget(user)
+    calls: list[str] = []
+    widget._schedule_refresh = lambda: calls.append("refresh")  # type: ignore[method-assign]
+    widget._loaded = False
+    widget._dirty = False
+    key = normalize_description("CHANNELS")
+    widget.open_from_verify(
+        date(2026, 3, 15),
+        description_keys=[key],
+        all_days=True,
+    )
+    calls.clear()
+    # Scan not finished yet.
+    widget._loaded = False
+    widget._dirty = True
+
+    widget.on_page_shown(date.today())
+
+    assert widget._scope == "all"
+    assert widget._value_filter == {key}
+    assert widget._target == date(2026, 3, 15)
     assert calls == ["refresh"]
 
 

@@ -1,5 +1,6 @@
 """Popup sizing for long fuel-station file names in CheckableMultiCombo."""
 
+import asyncio
 from time import monotonic
 
 from PySide6.QtGui import QFont, QFontMetrics
@@ -80,4 +81,38 @@ def test_set_options_deferred_while_popup_open() -> None:
     assert combo.model().item(1).text() == "C"
     assert combo.model().item(2).text() == "D"
     assert combo._pending_options is None
+    assert _app is not None
+
+
+def test_lazy_options_loader_fills_before_popup() -> None:
+    """Phase 2: first ▾ open awaits distincts; later opens use the cache."""
+    _app = QApplication.instance() or QApplication([])
+    calls: list[int] = []
+
+    async def loader():
+        calls.append(1)
+        return ["Fuel", "Parking"]
+
+    combo = CheckableMultiCombo("All Items", noun_plural="items")
+    combo.set_options_loader(loader)
+    assert combo._options_stale is True
+
+    asyncio.run(combo._lazy_load_and_show(combo._lazy_load_gen))
+    assert calls == [1]
+    assert combo._options_stale is False
+    assert combo.model().item(1).text() == "Fuel"
+    assert combo.model().item(2).text() == "Parking"
+
+    # Cached — showPopup must not schedule another load.
+    combo.showPopup()
+    assert calls == [1]
+    combo._block_hide_until = monotonic() - 1
+    combo.hidePopup()
+
+    combo.mark_options_stale()
+    assert combo._options_stale is True
+    combo._lazy_load_gen += 1
+    asyncio.run(combo._lazy_load_and_show(combo._lazy_load_gen))
+    assert calls == [1, 1]
+    assert combo._options_stale is False
     assert _app is not None

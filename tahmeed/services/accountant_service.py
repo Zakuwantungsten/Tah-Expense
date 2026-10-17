@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, date, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 from urllib.parse import quote
 
 from bson import ObjectId
@@ -254,7 +254,7 @@ def _master_params(
         params["truck"] = truck
     if category:
         params["category"] = category
-    if receipt:
+    if receipt and str(receipt).strip().lower() != "all":
         params["receipt"] = receipt
     if description:
         params["description"] = description
@@ -2023,6 +2023,39 @@ async def bulk_update_master_transactions(
     return int(payload.get("updated") or 0)
 
 
+async def bulk_patch_master_transactions(
+    items: Sequence[Tuple[ObjectId, dict]],
+    accountant_id: Optional[ObjectId] = None,
+) -> dict:
+    """Apply heterogeneous Master dirty-row edits in one bulk-patch call.
+
+    Each item is ``(tx_id, updates)``. Returns ``{updated, matched, requested}``.
+    """
+    _ = accountant_id
+    if not items:
+        return {"updated": 0, "matched": 0, "requested": 0}
+    body_items = []
+    for tx_id, updates in items:
+        if not tx_id or not updates:
+            continue
+        prepared = _jsonable_master_updates(updates)
+        if not prepared:
+            continue
+        body_items.append({"id": str(tx_id), "updates": prepared})
+    if not body_items:
+        return {"updated": 0, "matched": 0, "requested": 0}
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/master/bulk-patch",
+        json={"items": body_items},
+    )
+    return {
+        "updated": int(payload.get("updated") or 0),
+        "matched": int(payload.get("matched") or 0),
+        "requested": int(payload.get("requested") or len(body_items)),
+    }
+
+
 # ── Master Expenses Table queries ────────────────────────────────────────────
 
 # Excel ▾ column filter keys (UI display values → Mongo clauses).
@@ -2330,7 +2363,35 @@ def _exclude_supplier_payments(query: dict, supplier_names_lower: Sequence[str])
     return _merge_and_clauses(query, [clause])
 
 
-async def get_master_transactions(
+class MasterPage(NamedTuple):
+    """One Master Expenses page: rows + full match count + cashier names."""
+
+    items: List[Transaction]
+    total: int
+    cashier_names: Dict[ObjectId, str]
+
+
+def _master_cashier_names_from_payload(
+    names_raw: Dict[str, Any],
+    txs: Sequence[Transaction],
+) -> Dict[ObjectId, str]:
+    names_by_oid: Dict[ObjectId, str] = {}
+    for raw_id, name in (names_raw or {}).items():
+        oid = _normalize_user_id(raw_id)
+        if oid is None:
+            continue
+        names_by_oid[oid] = (name or "").strip() or "Unknown cashier"
+    out: Dict[ObjectId, str] = {}
+    for tx in txs:
+        cid = tx.cashier_id
+        oid = _normalize_user_id(cid)
+        if cid is None or oid is None:
+            continue
+        out[cid] = names_by_oid.get(oid, "Unknown cashier")
+    return out
+
+
+async def get_master_page(
     year: Optional[int] = None,
     month: int = 0,
     search: str = "",
@@ -2345,7 +2406,8 @@ async def get_master_transactions(
     sort_asc: bool = False,
     limit: int = 50,
     skip: int = 0,
-) -> List[Transaction]:
+) -> MasterPage:
+    """Fetch one Master page with real total + cashier names (one HTTP call)."""
     params = _master_params(
         year=year,
         month=month,
@@ -2365,7 +2427,65 @@ async def get_master_transactions(
     payload = await api_client.request(
         "GET", "v1/accountant/master", params=params
     )
-    return [_tx_from_api(doc) for doc in payload.get("items") or []]
+    items = [_tx_from_api(doc) for doc in payload.get("items") or []]
+    # New API embeds cashier_names + real total. Old API only had page-length
+    # total and no names — fall back so mixed desktop/API deploys still work.
+    if "cashier_names" in payload:
+        total = int(payload.get("total") or 0)
+        names = _master_cashier_names_from_payload(
+            payload.get("cashier_names") or {}, items,
+        )
+    else:
+        cashier_ids = [tx.cashier_id for tx in items if tx.cashier_id]
+        names = await get_cashier_names(cashier_ids) if cashier_ids else {}
+        total = await count_master_transactions(
+            year=year,
+            month=month,
+            search=search,
+            truck=truck,
+            category=category,
+            receipt=receipt,
+            description=description,
+            date_from=date_from,
+            date_to=date_to,
+            column_filters=column_filters,
+        )
+    return MasterPage(items=items, total=total, cashier_names=names)
+
+
+async def get_master_transactions(
+    year: Optional[int] = None,
+    month: int = 0,
+    search: str = "",
+    truck: str = "",
+    category: str = "",
+    receipt: str = "",
+    description: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    sort_field: str = "date",
+    sort_asc: bool = False,
+    limit: int = 50,
+    skip: int = 0,
+) -> List[Transaction]:
+    page = await get_master_page(
+        year=year,
+        month=month,
+        search=search,
+        truck=truck,
+        category=category,
+        receipt=receipt,
+        description=description,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+        sort_field=sort_field,
+        sort_asc=sort_asc,
+        limit=limit,
+        skip=skip,
+    )
+    return page.items
 
 
 async def count_master_transactions(
@@ -2430,6 +2550,114 @@ async def get_master_totals(
         "tzs": float(payload.get("tzs") or 0.0),
         "usd": float(payload.get("usd") or 0.0),
     }
+
+
+class MasterBootstrap(NamedTuple):
+    """Background Master meta: footer totals + optional year filter chrome."""
+
+    totals: dict
+    month_totals: Optional[Dict[int, dict]]
+    trucks: Optional[List[str]]
+    categories: Optional[List[str]]
+
+
+async def get_master_bootstrap(
+    year: Optional[int] = None,
+    month: int = 0,
+    search: str = "",
+    truck: str = "",
+    category: str = "",
+    receipt: str = "",
+    description: str = "",
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    *,
+    include_year_meta: bool = True,
+) -> MasterBootstrap:
+    """One RTT for Master footer totals (+ trucks/categories/month tabs)."""
+    params = _master_params(
+        year=year,
+        month=month,
+        search=search,
+        truck=truck,
+        category=category,
+        receipt=receipt,
+        description=description,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+    )
+    params["include_year_meta"] = "true" if include_year_meta else "false"
+    try:
+        payload = await api_client.request(
+            "GET", "v1/accountant/master/meta/bootstrap", params=params
+        )
+    except Exception:
+        # Older API without bootstrap — fall back to parallel legacy calls.
+        if include_year_meta:
+            totals, month_data, trucks, cats = await asyncio.gather(
+                get_master_totals(
+                    year=year, month=month, search=search, truck=truck,
+                    category=category, receipt=receipt, description=description,
+                    date_from=date_from, date_to=date_to,
+                    column_filters=column_filters,
+                ),
+                get_master_month_totals(int(year or date.today().year)),
+                get_master_trucks(year),
+                get_master_categories(year),
+            )
+            return MasterBootstrap(
+                totals=totals,
+                month_totals=month_data,
+                trucks=trucks,
+                categories=cats,
+            )
+        totals = await get_master_totals(
+            year=year, month=month, search=search, truck=truck,
+            category=category, receipt=receipt, description=description,
+            date_from=date_from, date_to=date_to,
+            column_filters=column_filters,
+        )
+        return MasterBootstrap(
+            totals=totals,
+            month_totals=None,
+            trucks=None,
+            categories=None,
+        )
+
+    totals_raw = payload.get("totals") or {}
+    totals = {
+        "tzs": float(totals_raw.get("tzs") or 0.0),
+        "usd": float(totals_raw.get("usd") or 0.0),
+    }
+    if not include_year_meta:
+        return MasterBootstrap(
+            totals=totals,
+            month_totals=None,
+            trucks=None,
+            categories=None,
+        )
+    months_raw = payload.get("month_totals")
+    month_totals = (
+        _overview_int_months(months_raw) if months_raw is not None else None
+    )
+    trucks_raw = payload.get("trucks")
+    cats_raw = payload.get("categories")
+    return MasterBootstrap(
+        totals=totals,
+        month_totals=month_totals,
+        trucks=(
+            [str(v) for v in trucks_raw if v]
+            if isinstance(trucks_raw, list)
+            else None
+        ),
+        categories=(
+            [str(v) for v in cats_raw if v]
+            if isinstance(cats_raw, list)
+            else None
+        ),
+    )
 
 
 async def get_category_lifetime_usage(category: str) -> dict:

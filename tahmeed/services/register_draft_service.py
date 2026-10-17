@@ -280,12 +280,17 @@ def apply_mapping_to_draft_payload(
     payee: str,
     item_name: str,
     category_id: ObjectId | str | None = None,
+    clear_category: bool = False,
     desc_col: int = 3,
     item_col: int = 2,
     payee_col: int = 12,
     normalize_description=None,
 ) -> int:
-    """Stamp Payee + Item onto matching draft new/dirty rows. Mutates *draft*."""
+    """Stamp Payee + Item onto matching draft new/dirty rows. Mutates *draft*.
+
+    Pass ``clear_category=True`` (Day Issues Undo) to drop ``category_id`` from
+    pending meta while writing blank Item / Payee.
+    """
     if not draft or not description_keys:
         return 0
     if normalize_description is None:
@@ -305,7 +310,9 @@ def apply_mapping_to_draft_payload(
         cells[payee_col] = payee
         entry["cells"] = cells_for_json(cells)
         meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
-        if category_id is not None:
+        if clear_category:
+            meta.pop("category_id", None)
+        elif category_id is not None:
             meta["category_id"] = category_id
         entry["pending_meta"] = serialize_pending_meta(meta)
         updated += 1

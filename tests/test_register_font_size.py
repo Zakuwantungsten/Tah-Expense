@@ -71,7 +71,7 @@ def test_toolbar_font_larger_smaller_clamps(register):
     assert not register.can_decrease_font()
 
 
-def test_qb_toolbar_exposes_font_buttons():
+def test_qb_toolbar_exposes_font_buttons(qapp):
     from tahmeed.ui.widgets.qb_txn_toolbar import QbTxnToolbar
 
     bar = QbTxnToolbar(register_actions=True)
@@ -79,6 +79,9 @@ def test_qb_toolbar_exposes_font_buttons():
     assert bar._btn_font_smaller is not None
     assert bar._btn_wrap is not None
     assert bar._btn_wrap.isCheckable()
+    assert bar._btn_filter is not None
+    assert bar._btn_filter.isCheckable()
+    assert bar._btn_filter.isChecked()
     bar.set_font_size_controls_enabled(can_larger=False, can_smaller=True)
     assert not bar._btn_font_larger.isEnabled()
     assert bar._btn_font_smaller.isEnabled()
@@ -86,11 +89,14 @@ def test_qb_toolbar_exposes_font_buttons():
     assert bar._btn_wrap.isChecked()
     bar.set_wrap_active(False)
     assert not bar._btn_wrap.isChecked()
+    bar.set_filter_active(False)
+    assert not bar._btn_filter.isChecked()
 
     form_bar = QbTxnToolbar(register_actions=False)
     assert form_bar._btn_font_larger is None
     assert form_bar._btn_font_smaller is None
     assert form_bar._btn_wrap is None
+    assert form_bar._btn_filter is None
 
 
 def test_toolbar_toggle_wrap_selected_or_all(register):

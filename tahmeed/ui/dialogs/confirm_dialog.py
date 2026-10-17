@@ -102,7 +102,13 @@ class _WarningBadge(QWidget):
 
 
 class _FocusRingHost(QWidget):
-    """Wraps Cancel so a 2px focus ring can sit 2px outside the button."""
+    """Wraps Cancel so a 2px focus ring can sit 2px outside the button.
+
+    Must stay strongly referenced from ConfirmDialog: PySide can GC the Python
+    wrapper while Qt still delivers focus events, and a resurrected wrapper has
+    no ``_button`` — which used to raise inside ``eventFilter`` and abort the
+    Daily Register post-save reload.
+    """
 
     def __init__(self, button: QPushButton, *, ring: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -115,7 +121,11 @@ class _FocusRingHost(QWidget):
         button.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        if watched is self._button and event.type() in (
+        # Guard: resurrected / tearing-down wrappers must never raise here —
+        # an exception cascades through Qt as nested eventFilter failures and
+        # can surface as "Failed to load" on the register.
+        button = getattr(self, "_button", None)
+        if button is not None and watched is button and event.type() in (
             QEvent.Type.FocusIn,
             QEvent.Type.FocusOut,
         ):
@@ -124,7 +134,14 @@ class _FocusRingHost(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         del event
-        if not self._button.hasFocus():
+        button = getattr(self, "_button", None)
+        if button is None:
+            return
+        try:
+            focused = button.hasFocus()
+        except RuntimeError:
+            return
+        if not focused:
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -132,7 +149,7 @@ class _FocusRingHost(QWidget):
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
         # Button geometry is inset by 4px; ring at 2px offset → 2px from host edge.
-        r = QRectF(self._button.geometry()).adjusted(-2.0, -2.0, 2.0, 2.0)
+        r = QRectF(button.geometry()).adjusted(-2.0, -2.0, 2.0, 2.0)
         p.drawRoundedRect(r, 6.0, 6.0)
         p.end()
 
@@ -385,9 +402,11 @@ class ConfirmDialog(QDialog):
             """
         )
         cancel_btn.clicked.connect(self.reject)
-        footer_row.addWidget(
-            _FocusRingHost(cancel_btn, ring=c["ring"], parent=footer)
+        # Keep a Python ref so the event-filter wrapper cannot be GC'd mid-dialog.
+        self._cancel_ring_host = _FocusRingHost(
+            cancel_btn, ring=c["ring"], parent=footer
         )
+        footer_row.addWidget(self._cancel_ring_host)
 
         accept_bg = c["accept"] if destructive else c["accept_primary"]
         accept_btn = QPushButton(accept_label, footer)

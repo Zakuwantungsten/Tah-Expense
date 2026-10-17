@@ -61,10 +61,15 @@ async def test_bulk_save_transactions_maps_results(monkeypatch):
             "errors": 0,
         }
 
+    audit_calls: list = []
+
+    async def capture_audit(*a, **k):
+        audit_calls.append((a, k))
+
     monkeypatch.setattr(svc.api_client, "request", fake_request)
     monkeypatch.setattr(
         "tahmeed.services.audit_service.record_event",
-        lambda *a, **k: None,
+        capture_audit,
     )
 
     txs = [
@@ -91,6 +96,8 @@ async def test_bulk_save_transactions_maps_results(monkeypatch):
     assert outcomes[1][0] == "already_exists"
     assert txs[0]._id == id_a
     assert txs[1]._id == id_b
+    # Client no longer fires a second audit RTT (server txn.bulk_create covers it).
+    assert audit_calls == []
 
 
 @pytest.mark.asyncio
@@ -130,10 +137,6 @@ async def test_bulk_save_replays_chunk_on_timeout(monkeypatch):
         }
 
     monkeypatch.setattr(svc.api_client, "request", fake_request)
-    monkeypatch.setattr(
-        "tahmeed.services.audit_service.record_event",
-        lambda *a, **k: None,
-    )
 
     tx = Transaction(
         date=datetime(2026, 8, 8),
@@ -147,6 +150,61 @@ async def test_bulk_save_replays_chunk_on_timeout(monkeypatch):
     assert calls["n"] == 2
     assert outcomes[0][0] == "already_exists"
     assert tx._id == saved_id
+
+
+@pytest.mark.asyncio
+async def test_bulk_save_chunks_at_api_max(monkeypatch):
+    """Client posts at most BULK_CREATE_CHUNK (= API max 100) items per request."""
+    from tahmeed.services import cashier_service as svc
+
+    assert svc.BULK_CREATE_CHUNK == 100
+    sizes: list[int] = []
+
+    async def fake_request(method, path, **kwargs):
+        items = kwargs["json"]["items"]
+        sizes.append(len(items))
+        return {
+            "results": [
+                {
+                    "index": i,
+                    "status": "created",
+                    "transaction": {
+                        "_id": str(ObjectId()),
+                        "date": "2026-08-08T00:00:00",
+                        "description": f"R{i}",
+                        "truck_number": "",
+                        "amount": 1.0,
+                        "currency": "TZS",
+                        "client_row_id": it["client_row_id"],
+                        "register_status": "draft",
+                        "created_at": "2026-08-08T00:00:00",
+                    },
+                    "error": None,
+                }
+                for i, it in enumerate(items)
+            ],
+            "created": len(items),
+            "already_exists": 0,
+            "errors": 0,
+        }
+
+    monkeypatch.setattr(svc.api_client, "request", fake_request)
+    cashier = ObjectId()
+    txs = [
+        Transaction(
+            date=datetime(2026, 8, 8),
+            description=f"R{i}",
+            truck_number="",
+            amount=1.0,
+            cashier_id=cashier,
+            client_row_id=f"rid-{i}",
+        )
+        for i in range(150)
+    ]
+    outcomes = await svc.bulk_save_transactions(txs)
+    assert len(outcomes) == 150
+    assert all(o[0] == "created" for o in outcomes)
+    assert sizes == [100, 50]
 
 
 @pytest.mark.asyncio

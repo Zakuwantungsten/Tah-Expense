@@ -134,15 +134,19 @@ async def test_drain_outbox_marks_saved_on_success(register, monkeypatch):
         fake_bulk,
     )
     monkeypatch.setattr(register, "_api_is_online", lambda: True)
-    # Avoid reload side effects in unit test.
-    async def noop_load(_d):
-        return None
 
-    monkeypatch.setattr(register, "_load_date", noop_load)
+    load_calls: list = []
+
+    async def boom_load(_d):
+        load_calls.append(_d)
+
+    monkeypatch.setattr(register, "_load_date", boom_load)
 
     await register._drain_register_outbox()
 
-    assert not register._row_has_data(0)
+    # Phase C: promote into saved prefix — no full reload on clean success.
+    assert load_calls == []
+    assert register._saved_count == 1
     assert register._outbox_pending_rows() == []
 
 

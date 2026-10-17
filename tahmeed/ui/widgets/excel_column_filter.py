@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Set
+import asyncio
+from typing import Any, Awaitable, Callable, Optional, Set, Union
 
 from PySide6.QtCore import Qt, Signal, QRect, QSize
 from PySide6.QtGui import QColor
@@ -73,6 +74,7 @@ class ExcelColumnFilterPopup(QFrame):
         column_label: str = "Column",
         sort_kind: str = "text",  # "text" | "number" | "date" | "truck"
         sort_only: bool = False,
+        loading: bool = False,
     ):
         super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
         self.setObjectName("excelColFilterPopup")
@@ -89,7 +91,12 @@ class ExcelColumnFilterPopup(QFrame):
         self._column_label = column_label
         self._sort_kind = sort_kind
         self._sort_only = bool(sort_only)
+        self._loading = bool(loading)
+        self._hint: Optional[QLabel] = None
+        self._apply_btn: Optional[QPushButton] = None
         self._build()
+        if self._loading:
+            self._set_loading_ui(True)
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
@@ -139,9 +146,9 @@ class ExcelColumnFilterPopup(QFrame):
             sep.setStyleSheet("background:#E5E7EB;border:none;")
             root.addWidget(sep)
 
-            hint = QLabel(f"{len(self._all_values)} value(s) in this table")
-            hint.setStyleSheet("font-size:10px;color:#6B7280;padding:2px 4px;")
-            root.addWidget(hint)
+            self._hint = QLabel(f"{len(self._all_values)} value(s) in this table")
+            self._hint.setStyleSheet("font-size:10px;color:#6B7280;padding:2px 4px;")
+            root.addWidget(self._hint)
 
             self._search = QLineEdit()
             self._search.setPlaceholderText("Search…")
@@ -182,17 +189,17 @@ class ExcelColumnFilterPopup(QFrame):
                 "QPushButton:hover{background:#F3F4F6;}"
             )
             clear_btn.clicked.connect(self._on_uncheck_visible)
-            apply_btn = QPushButton("Apply")
-            apply_btn.setCursor(Qt.PointingHandCursor)
-            apply_btn.setStyleSheet(
+            self._apply_btn = QPushButton("Apply")
+            self._apply_btn.setCursor(Qt.PointingHandCursor)
+            self._apply_btn.setStyleSheet(
                 "QPushButton{background:#0077C5;color:#fff;border:none;"
                 "border-radius:4px;padding:5px 14px;font-weight:600;font-size:12px;}"
                 "QPushButton:hover{background:#005EA3;}"
             )
-            apply_btn.clicked.connect(self._on_apply)
+            self._apply_btn.clicked.connect(self._on_apply)
             btns.addWidget(clear_btn)
             btns.addStretch()
-            btns.addWidget(apply_btn)
+            btns.addWidget(self._apply_btn)
             root.addLayout(btns)
 
             self._refilter("")
@@ -201,6 +208,38 @@ class ExcelColumnFilterPopup(QFrame):
             self._search = None
             self._select_all = None
             self._list = None
+            self._hint = None
+            self._apply_btn = None
+
+    def replace_values(self, values: set) -> None:
+        """Swap checklist values after an async load finishes."""
+        self._loading = False
+        self._all_values = sorted(values or [], key=lambda v: (v.lower(), v))
+        self._set_loading_ui(False)
+        self._refilter(self._search.text() if self._search else "")
+        self.adjustSize()
+
+    def _set_loading_ui(self, loading: bool) -> None:
+        # Keep checklist / Apply / search usable on seed values while the
+        # full-range distincts load — never block the whole filter popup.
+        if self._hint is not None:
+            if loading:
+                n = len(self._all_values)
+                self._hint.setText(
+                    f"Loading full list… ({n} from this page)"
+                    if n
+                    else "Loading values…"
+                )
+            else:
+                self._hint.setText(f"{len(self._all_values)} value(s) in this table")
+        if self._apply_btn is not None:
+            self._apply_btn.setEnabled(True)
+        if self._search is not None:
+            self._search.setEnabled(True)
+        if self._select_all is not None:
+            self._select_all.setEnabled(True)
+        if self._list is not None:
+            self._list.setEnabled(True)
 
     def _emit_sort(self, mode: str) -> None:
         self.sort_requested.emit(mode)
@@ -305,6 +344,11 @@ class ExcelFilterHeaderView(QHeaderView):
         self._active: dict = {}
         self._value_provider: Optional[Callable[[int], set]] = None
         self._label_provider: Optional[Callable[[int], str]] = None
+        # Optional lazy DB loader: async def loader(col) -> set[str]
+        self._async_value_loader: Optional[
+            Callable[[int], Union[Awaitable[Set[str]], Any]]
+        ] = None
+        self._cache_hit_check: Optional[Callable[[int], bool]] = None
         self._filterable = set(filterable_columns or [])
         self._sort_kinds = dict(sort_kinds or {})
         self._sort_only = bool(sort_only)
@@ -321,6 +365,16 @@ class ExcelFilterHeaderView(QHeaderView):
 
     def set_label_provider(self, provider: Callable[[int], str]) -> None:
         self._label_provider = provider
+
+    def set_async_value_loader(
+        self,
+        loader: Optional[Callable[[int], Union[Awaitable[Set[str]], Any]]],
+        *,
+        cache_hit_check: Optional[Callable[[int], bool]] = None,
+    ) -> None:
+        """Lazy-load distinct ▾ values on first open when not cached."""
+        self._async_value_loader = loader
+        self._cache_hit_check = cache_hit_check
 
     def clear_filters(self) -> None:
         self._active.clear()
@@ -369,15 +423,63 @@ class ExcelFilterHeaderView(QHeaderView):
     def _open_menu(self, col: int, global_pos) -> None:
         if not self._sort_only and not callable(self._value_provider):
             return
+        current = set(self._active.get(col, set()) or [])
+        cache_hit = (
+            callable(self._cache_hit_check) and bool(self._cache_hit_check(col))
+        )
+        needs_async = (
+            not self._sort_only
+            and callable(self._async_value_loader)
+            and callable(self._cache_hit_check)
+            and not cache_hit
+        )
+        if needs_async:
+            self._open_menu_lazy(col, global_pos, current)
+            return
+
         values = set()
         if callable(self._value_provider):
             values = set(self._value_provider(col) or [])
-        current = set(self._active.get(col, set()) or [])
         values |= current
-        if not values and not current:
-            # Still allow sort-only menu when the column has no values yet.
-            values = set()
+        self._show_filter_popup(col, global_pos, values, current, loading=False)
 
+    def _open_menu_lazy(self, col: int, global_pos, current: set) -> None:
+        # Show immediately with page/seed values (Apply usable now). Refresh
+        # the checklist when the full-range fetch finishes — never freeze the
+        # app with a WaitCursor (that blocked toolbar search / Clear too).
+        seed = set(current)
+        if callable(self._value_provider):
+            seed |= set(self._value_provider(col) or [])
+        popup = self._show_filter_popup(
+            col, global_pos, seed, current, loading=True,
+        )
+
+        async def _load() -> None:
+            values: set = set()
+            try:
+                raw = self._async_value_loader(col)  # type: ignore[misc]
+                values = set(await raw or [])
+            except Exception:
+                if callable(self._value_provider):
+                    values = set(self._value_provider(col) or [])
+            values |= current
+            try:
+                if self._popup is popup and popup.isVisible():
+                    popup.replace_values(values)
+            except RuntimeError:
+                pass  # popup C++ object already deleted
+
+        asyncio.ensure_future(_load())
+
+    def _show_filter_popup(
+        self,
+        col: int,
+        global_pos,
+        values: set,
+        current: set,
+        *,
+        loading: bool,
+    ) -> ExcelColumnFilterPopup:
         if self._popup is not None:
             self._popup.close()
             self._popup = None
@@ -395,6 +497,7 @@ class ExcelFilterHeaderView(QHeaderView):
             column_label=label,
             sort_kind=kind,
             sort_only=self._sort_only,
+            loading=loading and not self._sort_only,
         )
         self._popup = popup
 
@@ -416,3 +519,4 @@ class ExcelFilterHeaderView(QHeaderView):
         # Anchor under the chevron, keep on-screen.
         popup.move(global_pos.x() - popup.width() + 16, global_pos.y() + 4)
         popup.show()
+        return popup

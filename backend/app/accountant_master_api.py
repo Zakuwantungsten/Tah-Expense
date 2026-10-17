@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import date, datetime
@@ -9,6 +10,7 @@ from typing import Annotated, Any
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request
+from pymongo import UpdateOne
 
 from .accountant_master_ops import (
     MASTER_COL_FIELDS,
@@ -29,7 +31,11 @@ from .accountant_master_ops import (
 )
 from .dependencies import require_roles
 from .errors import ApiError
-from .schemas import BulkMasterUpdateRequest, MasterPatchRequest
+from .schemas import (
+    BulkMasterPatchRequest,
+    BulkMasterUpdateRequest,
+    MasterPatchRequest,
+)
 from .security import utcnow
 from .serialization import json_safe, object_id
 from .mongo_async import aggregate_list
@@ -217,15 +223,32 @@ async def list_master(
         )
     )
     sort = ledger_sort_clauses(sort_field, sort_asc)
+    db = _database(request)
     docs = (
-        await _database(request)
-        .transactions.find(query)
+        await db.transactions.find(query)
         .sort(sort)
         .skip(skip)
         .limit(limit)
         .to_list(length=limit)
     )
-    return {"items": json_safe(docs), "total": len(docs)}
+    # Real match count (not page length) + names for this page — one RTT for
+    # Master Expenses first paint / scroll (Phase 1 composite list).
+    total = await db.transactions.count_documents(query)
+    cashier_oids: list[ObjectId] = []
+    for doc in docs:
+        oid = _normalize_user_id(doc.get("cashier_id"))
+        if oid is not None:
+            cashier_oids.append(oid)
+    names_map = await _cashier_names_map(db, cashier_oids)
+    cashier_names = {
+        str(oid): names_map.get(oid, "Unknown cashier")
+        for oid in set(cashier_oids)
+    }
+    return {
+        "items": json_safe(docs),
+        "total": int(total),
+        "cashier_names": cashier_names,
+    }
 
 
 @master.get("/count")
@@ -253,28 +276,9 @@ async def count_master(
     return {"count": int(total)}
 
 
-@master.get("/totals")
-async def master_totals(
-    request: Request,
-    _manager: Manager,
-    year: int | None = Query(None, ge=2000, le=2100),
-    month: int = Query(0, ge=0, le=12),
-    search: str = "",
-    truck: str = "",
-    category: str = "",
-    receipt: str = "",
-    description: str = "",
-    date_from: datetime | None = None,
-    date_to: datetime | None = None,
-    column_filters: str = "",
-) -> dict:
-    query = await _master_query(
-        request, **_common_filters(
-            year, month, search, truck, category, receipt, description,
-            date_from, date_to, column_filters,
-        )
-    )
-    result = await aggregate_list(_database(request).transactions, 
+async def _compute_master_totals(db: Any, query: dict[str, Any]) -> dict[str, float]:
+    result = await aggregate_list(
+        db.transactions,
         [
             {"$match": query},
             {
@@ -305,8 +309,9 @@ async def master_totals(
                     },
                 }
             },
-        ]
-    , 1)
+        ],
+        1,
+    )
     if result:
         return {
             "tzs": float(result[0].get("tzs_total") or 0),
@@ -315,12 +320,7 @@ async def master_totals(
     return {"tzs": 0.0, "usd": 0.0}
 
 
-@master.get("/month-totals")
-async def master_month_totals(
-    request: Request,
-    _manager: Manager,
-    year: int = Query(..., ge=2000, le=2100),
-) -> dict:
+async def _compute_master_month_totals(db: Any, year: int) -> dict[str, Any]:
     start = datetime(year, 1, 1)
     end = datetime(year, 12, 31, 23, 59, 59)
     pipeline = [
@@ -342,7 +342,7 @@ async def master_month_totals(
             }
         },
     ]
-    docs = await aggregate_list(_database(request).transactions, pipeline, 12)
+    docs = await aggregate_list(db.transactions, pipeline, 12)
     months = {
         str(int(doc["_id"])): {
             "tzs": float(doc.get("tzs") or 0),
@@ -354,6 +354,59 @@ async def master_month_totals(
         if doc.get("_id") is not None
     }
     return {"year": year, "months": months}
+
+
+async def _compute_master_trucks(db: Any, year: int | None) -> list[str]:
+    start, end, _ = master_year_bounds(year, 0)
+    query = {
+        "verified": True,
+        **master_period_clause(start, end),
+    }
+    vals = await db.transactions.distinct("truck_number", query)
+    return sorted(v for v in vals if v)
+
+
+async def _compute_master_categories(db: Any, year: int | None) -> list[str]:
+    start, end, _ = master_year_bounds(year, 0)
+    query = {
+        "verified": True,
+        **master_period_clause(start, end),
+    }
+    vals = await db.transactions.distinct("category_name", query)
+    return sorted(v for v in vals if v)
+
+
+@master.get("/totals")
+async def master_totals(
+    request: Request,
+    _manager: Manager,
+    year: int | None = Query(None, ge=2000, le=2100),
+    month: int = Query(0, ge=0, le=12),
+    search: str = "",
+    truck: str = "",
+    category: str = "",
+    receipt: str = "",
+    description: str = "",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: str = "",
+) -> dict:
+    query = await _master_query(
+        request, **_common_filters(
+            year, month, search, truck, category, receipt, description,
+            date_from, date_to, column_filters,
+        )
+    )
+    return await _compute_master_totals(_database(request), query)
+
+
+@master.get("/month-totals")
+async def master_month_totals(
+    request: Request,
+    _manager: Manager,
+    year: int = Query(..., ge=2000, le=2100),
+) -> dict:
+    return await _compute_master_month_totals(_database(request), year)
 
 
 @master.get("/years")
@@ -413,13 +466,7 @@ async def master_trucks(
     _manager: Manager,
     year: int | None = Query(None, ge=2000, le=2100),
 ) -> dict:
-    start, end, _ = master_year_bounds(year, 0)
-    query = {
-        "verified": True,
-        **master_period_clause(start, end),
-    }
-    vals = await _database(request).transactions.distinct("truck_number", query)
-    return {"items": sorted(v for v in vals if v)}
+    return {"items": await _compute_master_trucks(_database(request), year)}
 
 
 @master.get("/meta/categories")
@@ -428,13 +475,58 @@ async def master_categories(
     _manager: Manager,
     year: int | None = Query(None, ge=2000, le=2100),
 ) -> dict:
-    start, end, _ = master_year_bounds(year, 0)
-    query = {
-        "verified": True,
-        **master_period_clause(start, end),
+    return {"items": await _compute_master_categories(_database(request), year)}
+
+
+@master.get("/meta/bootstrap")
+async def master_bootstrap(
+    request: Request,
+    _manager: Manager,
+    year: int | None = Query(None, ge=2000, le=2100),
+    month: int = Query(0, ge=0, le=12),
+    search: str = "",
+    truck: str = "",
+    category: str = "",
+    receipt: str = "",
+    description: str = "",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: str = "",
+    include_year_meta: bool = Query(
+        True,
+        description="When true, also return month_totals / trucks / categories",
+    ),
+) -> dict:
+    """Composite Master background payload (one RTT for footer + filter meta)."""
+    db = _database(request)
+    query = await _master_query(
+        request,
+        **_common_filters(
+            year, month, search, truck, category, receipt, description,
+            date_from, date_to, column_filters,
+        ),
+    )
+    meta_year = year or date.today().year
+    if include_year_meta:
+        totals, month_payload, trucks, categories = await asyncio.gather(
+            _compute_master_totals(db, query),
+            _compute_master_month_totals(db, meta_year),
+            _compute_master_trucks(db, meta_year),
+            _compute_master_categories(db, meta_year),
+        )
+        return {
+            "totals": totals,
+            "month_totals": month_payload.get("months") or {},
+            "trucks": trucks,
+            "categories": categories,
+        }
+    totals = await _compute_master_totals(db, query)
+    return {
+        "totals": totals,
+        "month_totals": None,
+        "trucks": None,
+        "categories": None,
     }
-    vals = await _database(request).transactions.distinct("category_name", query)
-    return {"items": sorted(v for v in vals if v)}
 
 
 @master.get("/meta/column-values")
@@ -659,6 +751,58 @@ async def bulk_update_master(
             },
         )
     return {"updated": n}
+
+
+@master.post("/bulk-patch")
+async def bulk_patch_master(
+    body: BulkMasterPatchRequest, request: Request, manager: Manager
+) -> dict:
+    """Apply heterogeneous dirty-row edits in one ``bulk_write`` + one audit."""
+    actor_oid = _actor_oid(manager)
+    edited_at = utcnow().replace(tzinfo=None)
+    ops: list[UpdateOne] = []
+    ids: list[ObjectId] = []
+    for item in body.items:
+        oid = _valid_id(str(item.id).strip())
+        prepared = prepare_master_updates(dict(item.updates or {}))
+        if not prepared:
+            continue
+        prepared["last_edited_at"] = edited_at
+        prepared["last_edited_by"] = actor_oid
+        ops.append(
+            UpdateOne(
+                {"_id": oid, **MASTER_EDIT_FILTER},
+                {"$set": prepared},
+            )
+        )
+        ids.append(oid)
+    if not ops:
+        return {
+            "updated": 0,
+            "matched": 0,
+            "requested": len(body.items),
+        }
+
+    result = await _database(request).transactions.bulk_write(ops, ordered=False)
+    updated = int(getattr(result, "modified_count", 0) or 0)
+    matched = int(getattr(result, "matched_count", 0) or 0)
+    if matched:
+        await _audit(
+            request,
+            action="txn.master_update_bulk_patch",
+            actor=manager,
+            entity_ids=ids[:40],
+            details={
+                "updated": updated,
+                "matched": matched,
+                "requested": len(body.items),
+            },
+        )
+    return {
+        "updated": updated,
+        "matched": matched,
+        "requested": len(body.items),
+    }
 
 
 @master.patch("/{tx_id}")

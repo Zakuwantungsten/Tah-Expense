@@ -58,17 +58,25 @@ def _uploads_cashier_scope(
     actor: dict[str, Any],
     cashier_id: str | None = None,
 ) -> ObjectId | None:
-    """Cashiers only see their own uploads; managers may filter or see all."""
+    """Optional owner filter for upload list/records. Default: all cashiers."""
+    del actor  # auth is on the route; scope is opt-in via cashier_id
     if cashier_id:
         try:
             return object_id(cashier_id)
         except ValueError as exc:
             raise ApiError(422, "invalid_id", "cashier_id is invalid") from exc
+    return None
+
+
+def _heal_uploads_scope(
+    actor: dict[str, Any],
+    list_scope: ObjectId | None,
+) -> ObjectId | None:
+    """Phantom null-id heal: cashiers only touch their own rows."""
+    if list_scope is not None:
+        return list_scope
     if str(actor.get("role") or "").lower() == "cashier":
-        oid = _actor_oid(actor)
-        if oid is None:
-            raise ApiError(422, "cashier_required", "cashier_id is required")
-        return oid
+        return _actor_oid(actor)
     return None
 
 
@@ -170,13 +178,15 @@ async def list_daily_uploads(
     limit: int = Query(100, ge=1, le=500),
     cashier_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Shared upload list (all cashiers). Optional ``cashier_id`` narrows."""
     db = _database(request)
     scope = _uploads_cashier_scope(actor, cashier_id)
     # Heal legacy null-tagged rows so they never group as a phantom upload.
-    # Managers heal globally; cashiers only touch their own rows.
+    # Cashiers only unset their own phantoms; managers heal globally.
     heal_filter = null_daily_import_id_filter()
-    if scope is not None:
-        heal_filter = {"$and": [heal_filter, {"cashier_id": scope}]}
+    heal_scope = _heal_uploads_scope(actor, scope)
+    if heal_scope is not None:
+        heal_filter = {"$and": [heal_filter, {"cashier_id": heal_scope}]}
     await db.transactions.update_many(
         heal_filter,
         {
@@ -204,6 +214,7 @@ async def get_daily_upload_records(
     limit: int = Query(10000, ge=1, le=20000),
     cashier_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    """All rows for one upload batch (shared read). Optional ``cashier_id`` filter."""
     uid = (upload_id or "").strip()
     if not uid:
         return []
@@ -226,18 +237,38 @@ async def get_daily_upload_records(
 async def delete_daily_upload(
     upload_id: str,
     request: Request,
-    manager: Manager,
+    actor: RegisterActor,
 ) -> dict[str, Any]:
+    """Delete an upload batch. Cashiers may delete only their own; managers any."""
     uid = (upload_id or "").strip()
     if not uid:
         return {"deleted": 0}
     db = _database(request)
+    role = str(actor.get("role") or "").lower()
+    if role == "cashier":
+        actor_oid = _actor_oid(actor)
+        if actor_oid is None:
+            raise ApiError(422, "cashier_required", "cashier_id is required")
+        sample = await db.transactions.find_one(
+            {"daily_import_id": uid}, {"cashier_id": 1}
+        )
+        if sample is None:
+            return {"deleted": 0}
+        owner = sample.get("cashier_id")
+        if owner != actor_oid and str(owner or "") != str(actor_oid):
+            raise ApiError(
+                403,
+                "forbidden",
+                "You can only delete your own uploads",
+            )
+    elif role not in ("admin", "accountant"):
+        raise ApiError(403, "forbidden", "Not allowed to delete uploads")
     result = await db.transactions.delete_many({"daily_import_id": uid})
     deleted = int(result.deleted_count or 0)
     await _audit(
         request,
         action="import.daily_delete",
-        actor=manager,
+        actor=actor,
         upload_id=uid,
         details={"deleted": deleted},
     )

@@ -30,8 +30,8 @@ from PySide6.QtGui import QColor, QFont
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.cashier_service import (
-    get_daily_summaries, get_transactions_flat, get_available_months,
-    get_available_years, get_browse_items, get_browse_descriptions,
+    get_daily_summaries_page, get_transactions_flat_page, get_browse_bootstrap,
+    get_browse_items, get_browse_descriptions,
 )
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
@@ -147,14 +147,21 @@ class TransactionBrowser(QWidget):
     go_to_date = Signal(object, str)
     go_to_upload = Signal(str, object)
 
-    def __init__(self, parent=None, *, can_manage_uploads: bool = True):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        user=None,
+        can_manage_uploads: bool = True,
+    ):
         super().__init__(parent)
         self.setStyleSheet("QWidget { background: #ffffff; }")
+        self._user = user
+        # True (accountant): delete any upload. False (cashier): delete own only.
         self._can_manage_uploads = bool(can_manage_uploads)
         self._results_simple: List[dict] = []
         self._results_advanced: List[Transaction] = []
         self._results_uploads: list = []
-        self._filter_opts_loaded = False
         self._months_loaded = False
         self._years_loaded = False
         self._available_years: List[int] = []
@@ -165,6 +172,21 @@ class TransactionBrowser(QWidget):
         self._find_in_flight = False
         self._loading: Optional[LoadingOverlay] = None
         self._build_ui()
+
+    def _owns_upload(self, upload: dict) -> bool:
+        """True when the logged-in user owns this upload batch."""
+        me = getattr(self._user, "_id", None) if self._user is not None else None
+        if me is None:
+            return False
+        owner = upload.get("cashier_id")
+        if owner is None:
+            return False
+        return str(owner) == str(me)
+
+    def _can_delete_upload(self, upload: dict) -> bool:
+        if self._can_manage_uploads:
+            return True
+        return self._owns_upload(upload)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -308,6 +330,7 @@ class TransactionBrowser(QWidget):
         self._item_combo.setFixedHeight(28)
         self._item_combo.setFixedWidth(150)
         self._item_combo.setStyleSheet(_FIELD_SS)
+        self._item_combo.set_options_loader(self._load_item_filter_options)
         self._item_combo.selectionChanged.connect(self._on_items_changed)
         hl.addLayout(_field("Item", self._item_combo))
 
@@ -317,6 +340,7 @@ class TransactionBrowser(QWidget):
         self._subitem_combo.setFixedHeight(28)
         self._subitem_combo.setFixedWidth(160)
         self._subitem_combo.setStyleSheet(_FIELD_SS)
+        self._subitem_combo.set_options_loader(self._load_desc_filter_options)
         self._subitem_combo.selectionChanged.connect(self._on_descs_changed)
         hl.addLayout(_field("Sub-Item", self._subitem_combo))
 
@@ -558,13 +582,13 @@ class TransactionBrowser(QWidget):
 
     async def _load_months(self) -> None:
         try:
-            years = await get_available_years()
-            months = await get_available_months()
-            self._available_years = years
+            # Phase 3: years + months in one bootstrap call.
+            boot = await get_browse_bootstrap()
+            self._available_years = boot.years
             self._years_loaded = True
             self._months_loaded = True
-            self._populate_year_combos(years)
-            self._db_months = months
+            self._populate_year_combos(boot.years)
+            self._db_months = boot.months
         except Exception:
             self._months_loaded = True
             self._years_loaded = True
@@ -624,17 +648,15 @@ class TransactionBrowser(QWidget):
 
     # ── Async loaders ─────────────────────────────────────────────────────────
 
-    async def _ensure_filter_options(self) -> None:
-        await self._reload_cascade_options(from_items=True, from_descs=True)
-        self._filter_opts_loaded = True
-
     def _adv_date_range(self):
         return _qdate_to_py(self._a_from.date()), _qdate_to_py(self._a_to.date())
 
     def _on_adv_dates_changed(self) -> None:
         if self._current_mode != _MODE_ADVANCED:
             return
-        asyncio.ensure_future(self._reload_cascade_options(from_items=True, from_descs=True))
+        # Phase 2: invalidate Item/Sub-Item distincts; reload on next ▾ open.
+        self._item_combo.mark_options_stale()
+        self._subitem_combo.mark_options_stale()
 
     def _on_items_changed(self) -> None:
         if self._cascade_busy:
@@ -646,7 +668,28 @@ class TransactionBrowser(QWidget):
             return
         asyncio.ensure_future(self._cascade_from_descs())
 
+    async def _load_item_filter_options(self):
+        """Distinct Item values for the current Advanced date / Sub-Item scope."""
+        date_from, date_to = self._adv_date_range()
+        descs_sel = self._subitem_combo.selected_values()
+        return await get_browse_items(
+            date_from=date_from,
+            date_to=date_to,
+            descriptions=descs_sel or None,
+        )
+
+    async def _load_desc_filter_options(self):
+        """Distinct Sub-Item values for the current Advanced date / Item scope."""
+        date_from, date_to = self._adv_date_range()
+        items_sel = self._item_combo.selected_values()
+        return await get_browse_descriptions(
+            date_from=date_from,
+            date_to=date_to,
+            category_name=items_sel or None,
+        )
+
     async def _cascade_from_items(self) -> None:
+        # Selection changed — refresh related Sub-Item list now, then Find.
         await self._reload_cascade_options(from_items=False, from_descs=True)
         self._do_find()
 
@@ -657,24 +700,13 @@ class TransactionBrowser(QWidget):
     async def _reload_cascade_options(
         self, *, from_items: bool, from_descs: bool,
     ) -> None:
-        date_from, date_to = self._adv_date_range()
-        items_sel = self._item_combo.selected_values()
         self._cascade_busy = True
         try:
             if from_descs:
-                descs = await get_browse_descriptions(
-                    date_from=date_from,
-                    date_to=date_to,
-                    category_name=items_sel or None,
-                )
+                descs = await self._load_desc_filter_options()
                 self._subitem_combo.set_options(descs, keep_selected=True, emit=False)
             if from_items:
-                descs_sel = self._subitem_combo.selected_values()
-                items = await get_browse_items(
-                    date_from=date_from,
-                    date_to=date_to,
-                    descriptions=descs_sel or None,
-                )
+                items = await self._load_item_filter_options()
                 self._item_combo.set_options(items, keep_selected=True, emit=False)
         except Exception:
             pass
@@ -728,39 +760,25 @@ class TransactionBrowser(QWidget):
             if mode == _MODE_UPLOADS:
                 await self._load_uploads()
                 return
-            if mode == _MODE_ADVANCED and not self._filter_upload_id:
-                await self._ensure_filter_options()
-                if gen != self._find_generation:
-                    return
+            # Advanced Item/Sub-Item distincts load lazily on ▾ open (Phase 2).
             params = self._get_search_params()
             if mode == _MODE_SIMPLE:
-                self._results_simple = await get_daily_summaries(**params, limit=400)
+                page = await get_daily_summaries_page(**params, limit=400)
                 if gen != self._find_generation:
                     return
-                ids = []
-                for s in self._results_simple:
-                    ids.extend(s.get("cashier_ids") or [])
-                self._user_names = await self._resolve_cashier_names(ids)
-                if gen != self._find_generation:
-                    return
+                self._results_simple = page.items
+                self._user_names = page.cashier_names
                 self._populate_simple(self._results_simple)
             else:
                 limit = 10000 if params.get("daily_import_id") else 1000
-                self._results_advanced = await get_transactions_flat(
-                    **params, limit=limit
+                page = await get_transactions_flat_page(**params, limit=limit)
+                if gen != self._find_generation:
+                    return
+                self._results_advanced = page.items
+                self._user_names = page.cashier_names
+                self._populate_advanced(
+                    self._results_advanced, total=page.total,
                 )
-                if gen != self._find_generation:
-                    return
-                ids = []
-                for tx in self._results_advanced:
-                    if tx.cashier_id:
-                        ids.append(tx.cashier_id)
-                    if tx.last_edited_by:
-                        ids.append(tx.last_edited_by)
-                self._user_names = await self._resolve_cashier_names(ids)
-                if gen != self._find_generation:
-                    return
-                self._populate_advanced(self._results_advanced)
                 if params.get("daily_import_id"):
                     self._count_label.setText(
                         f"Upload rows: {len(self._results_advanced):,}"
@@ -789,19 +807,16 @@ class TransactionBrowser(QWidget):
             return {}
 
     async def _load_uploads(self) -> None:
-        from tahmeed.services.daily_import_service import list_daily_uploads
+        from tahmeed.services.daily_import_service import list_daily_uploads_page
 
-        uploads = await list_daily_uploads(limit=200)
+        page = await list_daily_uploads_page(limit=200)
         # Defense: never show groups without a real batch id.
-        uploads = [u for u in uploads if u.get("_id")]
+        uploads = [u for u in page.items if u.get("_id")]
         self._results_uploads = uploads
-        cashier_ids = [u.get("cashier_id") for u in uploads if u.get("cashier_id")]
-        names = await self._resolve_cashier_names(cashier_ids)
-        self._populate_uploads(uploads, names)
+        self._populate_uploads(uploads, page.cashier_names)
 
     def _populate_uploads(self, uploads: list, names: dict) -> None:
-        from PySide6.QtWidgets import QMessageBox
-
+        self._upload_cashier_names = names or {}
         t = self._uploads_table
         t.setRowCount(len(uploads))
         for i, u in enumerate(uploads):
@@ -859,7 +874,7 @@ class TransactionBrowser(QWidget):
             open_btn.clicked.connect(lambda _c=False, r=i: self._open_upload_at(r))
             hl.addWidget(open_btn)
 
-            if self._can_manage_uploads:
+            if self._can_delete_upload(u):
                 btn = QPushButton("Delete")
                 btn.setCursor(Qt.PointingHandCursor)
                 btn.setFixedHeight(_ROW_H - 4)
@@ -878,7 +893,7 @@ class TransactionBrowser(QWidget):
 
         self._count_label.setText(f"Uploads: {len(uploads)}")
         self._goto_btn.setEnabled(False)
-        self._export_btn.setEnabled(False)
+        self._export_btn.setEnabled(len(uploads) > 0)
 
     def _confirm_delete_upload(self, upload_id: str, filename: str, count: int) -> None:
         from PySide6.QtWidgets import QMessageBox
@@ -1022,17 +1037,12 @@ class TransactionBrowser(QWidget):
             return f"Merged by {', '.join(people)} · {state}"
         return f"Merged by {len(people)} users · {state}"
 
-    def _populate_advanced(self, txs: List[Transaction]) -> None:
+    def _populate_advanced(
+        self, txs: List[Transaction], *, total: int | None = None,
+    ) -> None:
         t = self._adv_table
         t.setRowCount(len(txs))
-
-        ids = []
-        for tx in txs:
-            if tx.cashier_id:
-                ids.append(tx.cashier_id)
-            if tx.last_edited_by:
-                ids.append(tx.last_edited_by)
-        # Names filled async in _async_find; use cached map when present.
+        # Names filled by composite list payload in _async_find.
         names = getattr(self, "_user_names", {}) or {}
 
         for i, tx in enumerate(txs):
@@ -1088,7 +1098,11 @@ class TransactionBrowser(QWidget):
             _finish_table_row(t, i, row_bg)
 
         n = len(txs)
-        self._count_label.setText(f"Transactions: {n}")
+        matched = int(total) if total is not None else n
+        if matched > n:
+            self._count_label.setText(f"Transactions: {n:,} of {matched:,}")
+        else:
+            self._count_label.setText(f"Transactions: {n:,}")
         self._export_btn.setEnabled(n > 0)
 
     # ── Reset ─────────────────────────────────────────────────────────────────
@@ -1131,7 +1145,8 @@ class TransactionBrowser(QWidget):
             self._a_year.blockSignals(False)
             self._a_month.blockSignals(False)
             self._apply_period_to_dates("advanced")
-            asyncio.ensure_future(self._reload_cascade_options(from_items=True, from_descs=True))
+            self._item_combo.mark_options_stale()
+            self._subitem_combo.mark_options_stale()
         self._goto_btn.setEnabled(False)
         self._export_btn.setEnabled(False)
         self._do_find()
@@ -1173,7 +1188,41 @@ class TransactionBrowser(QWidget):
     # ── Export ────────────────────────────────────────────────────────────────
 
     def _on_export(self) -> None:
-        if self._current_mode == _MODE_SIMPLE:
+        if self._current_mode == _MODE_UPLOADS:
+            lines = [
+                "File\tPrimary date\tEntries\tCashier\tIssues\tUploaded"
+            ]
+            name_map = getattr(self, "_upload_cashier_names", {}) or {}
+            for u in self._results_uploads:
+                primary = u.get("primary_date") or u.get("min_date")
+                if hasattr(primary, "strftime"):
+                    date_str = primary.strftime("%d/%m/%Y")
+                else:
+                    date_str = ""
+                created = u.get("created_at")
+                when = (
+                    created.strftime("%d/%m/%Y %H:%M")
+                    if hasattr(created, "strftime")
+                    else ""
+                )
+                cid = u.get("cashier_id")
+                outliers = int(u.get("outlier_count") or 0)
+                dupes = int(u.get("duplicate_count") or 0)
+                issue_bits = []
+                if outliers:
+                    issue_bits.append(f"{outliers} date")
+                if dupes:
+                    issue_bits.append(f"{dupes} dup")
+                lines.append("\t".join([
+                    u.get("source_filename") or "",
+                    date_str,
+                    str(int(u.get("count") or 0)),
+                    name_map.get(cid, "") if cid else "",
+                    ", ".join(issue_bits),
+                    when,
+                ]))
+            n = len(self._results_uploads)
+        elif self._current_mode == _MODE_SIMPLE:
             names = getattr(self, "_user_names", {}) or {}
             lines = [
                 "Date\tTransaction ID\tEntries\tMerged / Status"

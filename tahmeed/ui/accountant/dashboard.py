@@ -772,6 +772,10 @@ class AccountantDashboard(QWidget):
                             self._register, "_current_date", None
                         ):
                             target = self._register._current_date
+                        # Keep Verify VALUE filter / All-days / date on tab return.
+                        if hasattr(widget, "on_page_shown"):
+                            widget.on_page_shown(target)
+                            return
                         if hasattr(widget, "open_for_date"):
                             widget.open_for_date(target)
                             return

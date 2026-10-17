@@ -32,7 +32,7 @@ class MappingApplyJob:
     dates: List[date] = field(default_factory=list)
     cashier_id: Optional[ObjectId] = None
     attempts: int = 0
-    status: str = "pending"  # pending | in_flight | done | failed
+    status: str = "pending"  # pending | in_flight | done | failed | cancelled
 
 
 _jobs: List[MappingApplyJob] = []
@@ -51,6 +51,35 @@ def set_failure_handler(
 
 def pending_jobs() -> List[MappingApplyJob]:
     return [job for job in list(_jobs) if job.status in {"pending", "in_flight", "failed"}]
+
+
+def cancel_pending_jobs_for_keys(description_keys: Sequence[str]) -> int:
+    """Cancel pending/failed apply jobs that touch any of *description_keys*.
+
+    ``in_flight`` jobs are left alone; callers should ``await wait_outbox_idle()``
+    then clear stamps so a finishing apply cannot outrace Undo.
+    """
+    keys = {
+        " ".join((key or "").strip().upper().split())
+        for key in description_keys
+        if " ".join((key or "").strip().upper().split())
+    }
+    if not keys:
+        return 0
+    cancelled = 0
+    for job in _jobs:
+        if job.status not in {"pending", "failed"}:
+            continue
+        if keys.intersection(job.description_keys):
+            job.status = "cancelled"
+            cancelled += 1
+    return cancelled
+
+
+async def wait_outbox_idle() -> None:
+    """Block until any in-flight drain finishes (no-op if idle)."""
+    async with _drain_lock:
+        return
 
 
 def enqueue_mapping_apply(
@@ -142,8 +171,10 @@ async def drain_mapping_apply_outbox() -> None:
                 None,
             )
             if job is None:
-                # Drop completed jobs to keep memory small.
-                _jobs[:] = [j for j in _jobs if j.status != "done"]
+                # Drop finished jobs to keep memory small.
+                _jobs[:] = [
+                    j for j in _jobs if j.status not in {"done", "cancelled"}
+                ]
                 return
             job.status = "in_flight"
             job.attempts += 1

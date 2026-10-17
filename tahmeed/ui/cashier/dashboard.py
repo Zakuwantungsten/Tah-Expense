@@ -506,6 +506,7 @@ class _ActionBar(QFrame):
             "font-family:'Segoe UI',sans-serif;}"
         )
         self._status.hide()
+        self._transient_timer: Optional[QTimer] = None
         hl.addWidget(self._status, 0, Qt.AlignVCenter)
 
         hl.addStretch(1)
@@ -593,12 +594,49 @@ class _ActionBar(QFrame):
 
     def set_edit_state(self, active: bool, dirty_count: int = 0) -> None:
         """Show edit-mode status pill next to search."""
+        self._clear_transient_status()
         if active:
             plural = "" if dirty_count == 1 else "s"
             self._status.setText(f"Edit mode  ·  {dirty_count} unsaved change{plural}")
+            self._status.setStyleSheet(
+                "QLabel{background:#FEF3C7;color:#92400E;border:1px solid #FDE68A;"
+                "border-radius:5px;padding:2px 10px;font-size:11px;font-weight:600;"
+                "font-family:'Segoe UI',sans-serif;}"
+            )
             self._status.show()
         else:
             self._status.hide()
+
+    def flash_transient_status(self, message: str, *, ms: int = 4500) -> None:
+        """Non-blocking success/info pill (replaces modal “Draft saved”)."""
+        text = (message or "").strip()
+        if not text:
+            return
+        self._clear_transient_status()
+        self._status.setText(text)
+        self._status.setStyleSheet(
+            "QLabel{background:#ECFDF5;color:#065F46;border:1px solid #A7F3D0;"
+            "border-radius:5px;padding:2px 10px;font-size:11px;font-weight:600;"
+            "font-family:'Segoe UI',sans-serif;}"
+        )
+        self._status.show()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._clear_transient_status)
+        timer.start(max(1000, int(ms)))
+        self._transient_timer = timer
+
+    def _clear_transient_status(self) -> None:
+        timer = getattr(self, "_transient_timer", None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+            self._transient_timer = None
+        # Leave edit-mode styling to set_edit_state; only hide free-floating flashes.
+        if self._status.isVisible() and self._status.text().startswith("Edit mode"):
+            return
+        self._status.hide()
+        self._status.setText("")
 
 
 class _TablePage(QWidget):
@@ -640,17 +678,20 @@ class _TablePage(QWidget):
         self._qb_toolbar.font_larger_clicked.connect(register.toolbar_font_larger)
         self._qb_toolbar.font_smaller_clicked.connect(register.toolbar_font_smaller)
         self._qb_toolbar.wrap_clicked.connect(register.toolbar_toggle_wrap)
+        self._qb_toolbar.filter_clicked.connect(register.toolbar_toggle_column_filters)
         register.font_size_changed.connect(
             lambda larger, smaller: self._qb_toolbar.set_font_size_controls_enabled(
                 can_larger=larger, can_smaller=smaller
             )
         )
         register.wrap_state_changed.connect(self._qb_toolbar.set_wrap_active)
+        register.column_filters_state_changed.connect(self._qb_toolbar.set_filter_active)
         self._qb_toolbar.set_font_size_controls_enabled(
             can_larger=register.can_increase_font(),
             can_smaller=register.can_decrease_font(),
         )
         self._qb_toolbar.set_wrap_active(register.wrap_is_active())
+        self._qb_toolbar.set_filter_active(register.column_filters_enabled())
         register.attachment_count_changed.connect(self._qb_toolbar.set_attachment_count)
         register.edit_state_changed.connect(self._qb_toolbar.set_edit_state)
         register.save_busy_changed.connect(self._qb_toolbar.set_mutation_busy)
@@ -678,6 +719,7 @@ class _TablePage(QWidget):
         self._action_bar.cheque_edited.connect(register.set_active_cheque)
         self._action_bar.reconciled_date_changed.connect(self._on_reconciled_date)
         register.edit_state_changed.connect(self._action_bar.set_edit_state)
+        register.transient_status.connect(self._action_bar.flash_transient_status)
         register.mode_changed.connect(self._action_bar.sync_mode)
         register.mode_changed.connect(self._doc_header.set_merged)
         register.active_cheque_changed.connect(self._action_bar.set_cheque_value)
@@ -830,7 +872,10 @@ class CashierDashboard(QWidget):
         self._stack.addWidget(self._rejected_view)
 
         # index 7 — Browse (embedded)
-        self._browser = TransactionBrowser(can_manage_uploads=False)
+        self._browser = TransactionBrowser(
+            user=self._user,
+            can_manage_uploads=False,
+        )
         self._browser.go_to_date.connect(self._on_go_to_date)
         self._browser.go_to_upload.connect(self._on_go_to_upload)
         self._stack.addWidget(self._browser)
@@ -1010,7 +1055,8 @@ class CashierDashboard(QWidget):
         elif key == "day_issues":
             self._stack.setCurrentIndex(5)
             target = getattr(self._register, "_current_date", None) or date.today()
-            self._day_issues.open_for_date(target)
+            # Keep in-page date / scope / VALUE filter on tab return (e.g. Verify handoff).
+            self._day_issues.on_page_shown(target)
         elif key == "rejected":
             self._stack.setCurrentIndex(6)
             self._rejected_view.refresh()

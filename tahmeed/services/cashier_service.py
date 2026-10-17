@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, date
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 from bson import ObjectId
 import httpx
 
@@ -8,10 +8,12 @@ from tahmeed.models.transaction import Transaction
 from tahmeed.services.api_client import ApiConnectionError, ApiError, api_client
 from tahmeed.services.api_models import desktop_document, jsonable_document
 
-# Bulk register create — one RTT for many rows; longer read timeout than single POST.
-_BULK_CREATE_CHUNK = 50
+# Bulk register create — match API ``TransactionBulkCreateRequest`` max_length=100.
+BULK_CREATE_CHUNK = 100
 _BULK_CREATE_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 _BULK_DUP_TIMEOUT = httpx.Timeout(45.0, connect=5.0)
+# Back-compat alias for older imports / tests.
+_BULK_CREATE_CHUNK = BULK_CREATE_CHUNK
 
 
 def _tx_from_api(document: dict) -> Transaction:
@@ -202,17 +204,19 @@ async def bulk_update_transactions(
 async def apply_description_mapping_bulk(
     description_keys: Sequence[str],
     *,
-    payee: str,
-    category_name: str,
-    category_id: ObjectId,
+    payee: str = "",
+    category_name: str = "",
+    category_id: ObjectId | None = None,
     dates: Sequence[date] | None = None,
     cashier_id: ObjectId | None = None,
     client_job_id: str | None = None,
+    clear: bool = False,
 ) -> int:
     """Stamp Payee + Item onto matching open rows in one server ``update_many``.
 
     Used by cashiers and accountants (accountants may omit ``cashier_id`` to
-    apply across all cashiers, or pass a scope id).
+    apply across all cashiers, or pass a scope id). Pass ``clear=True`` to wipe
+    Payee / Item / category on matching open rows (Day Issues Undo).
     """
     keys = [
         " ".join((key or "").strip().upper().split())
@@ -223,10 +227,14 @@ async def apply_description_mapping_bulk(
         return 0
     body: dict = {
         "description_keys": keys,
-        "payee": " ".join((payee or "").strip().upper().split()),
-        "category_name": category_name,
-        "category_id": str(category_id),
+        "payee": "" if clear else " ".join((payee or "").strip().upper().split()),
+        "category_name": "" if clear else (category_name or ""),
+        "clear": bool(clear),
     }
+    if not clear:
+        if category_id is None:
+            raise ValueError("category_id is required unless clear=True")
+        body["category_id"] = str(category_id)
     if dates:
         body["dates"] = [d.isoformat() for d in dates]
     if cashier_id is not None:
@@ -723,6 +731,113 @@ def _parse_summary_date(raw) -> date:
     return date.fromisoformat(text)
 
 
+def _normalize_user_oid(value: Any) -> ObjectId | None:
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    if isinstance(value, str) and ObjectId.is_valid(value):
+        return ObjectId(value)
+    return None
+
+
+def _cashier_names_from_payload(
+    names_raw: Dict[str, Any] | None,
+    ids: Sequence[Any],
+) -> Dict[ObjectId, str]:
+    """Map API ``cashier_names`` string keys onto the caller's id objects."""
+    by_oid: Dict[ObjectId, str] = {}
+    for raw_id, name in (names_raw or {}).items():
+        oid = _normalize_user_oid(raw_id)
+        if oid is None:
+            continue
+        by_oid[oid] = (name or "").strip() or "Unknown cashier"
+    out: Dict[ObjectId, str] = {}
+    for cid in ids:
+        oid = _normalize_user_oid(cid)
+        if cid is None or oid is None:
+            continue
+        out[cid] = by_oid.get(oid, "Unknown cashier")
+    return out
+
+
+class BrowseSummariesPage(NamedTuple):
+    items: list
+    total: int
+    cashier_names: Dict[ObjectId, str]
+
+
+class BrowseFlatPage(NamedTuple):
+    items: List[Transaction]
+    total: int
+    cashier_names: Dict[ObjectId, str]
+
+
+class BrowseUploadsPage(NamedTuple):
+    items: list
+    total: int
+    cashier_names: Dict[ObjectId, str]
+
+
+async def get_daily_summaries_page(
+    date_from: date = None,
+    date_to: date = None,
+    keyword: str = "",
+    truck: str = "",
+    category_name="",
+    sub_item_match="",
+    descriptions="",
+    daily_import_id: str = "",
+    limit: int = 365,
+) -> BrowseSummariesPage:
+    """Daily summaries + embedded cashier names (Browse Simple, one RTT)."""
+    desc_filter = descriptions if descriptions not in ("", None, []) else sub_item_match
+    params: dict = {"limit": limit}
+    if date_from:
+        params["date_from"] = date_from.isoformat()
+    if date_to:
+        params["date_to"] = date_to.isoformat()
+    if keyword.strip():
+        params["keyword"] = keyword.strip()
+    if truck.strip():
+        params["truck"] = truck.strip()
+    cat = _csv_param(category_name)
+    if cat:
+        params["category_name"] = cat
+    desc = _csv_param(desc_filter)
+    if desc:
+        params["descriptions"] = desc
+    if daily_import_id:
+        params["daily_import_id"] = str(daily_import_id).strip()
+    payload = await api_client.request(
+        "GET", "v1/transactions/daily-summaries", params=params
+    )
+    result = []
+    all_ids: list = []
+    for row in payload.get("items") or []:
+        item = dict(row)
+        item["date"] = _parse_summary_date(item.get("date"))
+        cashier_ids = []
+        for cid in item.get("cashier_ids") or []:
+            if cid is None:
+                continue
+            oid = ObjectId(str(cid)) if ObjectId.is_valid(str(cid)) else cid
+            cashier_ids.append(oid)
+            all_ids.append(oid)
+        item["cashier_ids"] = cashier_ids
+        result.append(item)
+    if "cashier_names" in payload:
+        names = _cashier_names_from_payload(payload.get("cashier_names"), all_ids)
+    else:
+        from tahmeed.services.accountant_service import get_cashier_names
+        names = await get_cashier_names(all_ids) if all_ids else {}
+    return BrowseSummariesPage(
+        items=result,
+        total=int(payload.get("total") or len(result)),
+        cashier_names=names,
+    )
+
+
 async def get_daily_summaries(
     date_from: date = None,
     date_to: date = None,
@@ -747,42 +862,21 @@ async def get_daily_summaries(
     ``category_name`` / ``descriptions`` accept a string or list (multi-select).
     ``sub_item_match`` is kept for backward compatibility (maps into descriptions).
     """
-    desc_filter = descriptions if descriptions not in ("", None, []) else sub_item_match
-    params: dict = {"limit": limit}
-    if date_from:
-        params["date_from"] = date_from.isoformat()
-    if date_to:
-        params["date_to"] = date_to.isoformat()
-    if keyword.strip():
-        params["keyword"] = keyword.strip()
-    if truck.strip():
-        params["truck"] = truck.strip()
-    cat = _csv_param(category_name)
-    if cat:
-        params["category_name"] = cat
-    desc = _csv_param(desc_filter)
-    if desc:
-        params["descriptions"] = desc
-    if daily_import_id:
-        params["daily_import_id"] = str(daily_import_id).strip()
-    payload = await api_client.request(
-        "GET", "v1/transactions/daily-summaries", params=params
+    page = await get_daily_summaries_page(
+        date_from=date_from,
+        date_to=date_to,
+        keyword=keyword,
+        truck=truck,
+        category_name=category_name,
+        sub_item_match=sub_item_match,
+        descriptions=descriptions,
+        daily_import_id=daily_import_id,
+        limit=limit,
     )
-    result = []
-    for row in payload.get("items") or []:
-        item = dict(row)
-        item["date"] = _parse_summary_date(item.get("date"))
-        cashier_ids = []
-        for cid in item.get("cashier_ids") or []:
-            if cid is None:
-                continue
-            cashier_ids.append(ObjectId(str(cid)) if ObjectId.is_valid(str(cid)) else cid)
-        item["cashier_ids"] = cashier_ids
-        result.append(item)
-    return result
+    return page.items
 
 
-async def get_transactions_flat(
+async def get_transactions_flat_page(
     date_from: date = None,
     date_to: date = None,
     keyword: str = "",
@@ -791,8 +885,8 @@ async def get_transactions_flat(
     descriptions="",
     daily_import_id: str = "",
     limit: int = 1000,
-) -> List[Transaction]:
-    """Return individual transactions matching all supplied filters."""
+) -> BrowseFlatPage:
+    """Flat Browse rows + real total + cashier names (one RTT)."""
     desc_filter = descriptions if descriptions not in ("", None, []) else sub_item_match
     params: dict = {"limit": limit}
     if date_from:
@@ -812,7 +906,45 @@ async def get_transactions_flat(
     elif desc_filter:
         params["descriptions"] = str(desc_filter)
     payload = await api_client.request("GET", "v1/transactions/flat", params=params)
-    return [_tx_from_api(doc) for doc in payload.get("items") or []]
+    items = [_tx_from_api(doc) for doc in payload.get("items") or []]
+    ids: list = []
+    for tx in items:
+        if tx.cashier_id:
+            ids.append(tx.cashier_id)
+        if tx.last_edited_by:
+            ids.append(tx.last_edited_by)
+    if "cashier_names" in payload:
+        names = _cashier_names_from_payload(payload.get("cashier_names"), ids)
+        total = int(payload.get("total") or len(items))
+    else:
+        from tahmeed.services.accountant_service import get_cashier_names
+        names = await get_cashier_names(ids) if ids else {}
+        total = int(payload.get("total") or len(items))
+    return BrowseFlatPage(items=items, total=total, cashier_names=names)
+
+
+async def get_transactions_flat(
+    date_from: date = None,
+    date_to: date = None,
+    keyword: str = "",
+    category_name="",
+    sub_item_match="",
+    descriptions="",
+    daily_import_id: str = "",
+    limit: int = 1000,
+) -> List[Transaction]:
+    """Return individual transactions matching all supplied filters."""
+    page = await get_transactions_flat_page(
+        date_from=date_from,
+        date_to=date_to,
+        keyword=keyword,
+        category_name=category_name,
+        sub_item_match=sub_item_match,
+        descriptions=descriptions,
+        daily_import_id=daily_import_id,
+        limit=limit,
+    )
+    return page.items
 
 
 async def get_browse_items(
@@ -869,6 +1001,35 @@ async def get_available_years() -> list:
     """Calendar years that have transactions, newest first (always includes recent years)."""
     payload = await api_client.request("GET", "v1/transactions/meta/years")
     return [int(year) for year in payload.get("items") or []]
+
+
+class BrowseBootstrap(NamedTuple):
+    years: List[int]
+    months: List[Tuple[int, int]]
+
+
+def _months_from_bootstrap_rows(rows) -> List[Tuple[int, int]]:
+    return [
+        (int(row["year"]), int(row["month"]))
+        for row in (rows or [])
+        if row.get("year") is not None and row.get("month") is not None
+    ]
+
+
+async def get_browse_bootstrap() -> BrowseBootstrap:
+    """Years + months for Browse period combos (one RTT; legacy fallback)."""
+    try:
+        payload = await api_client.request("GET", "v1/transactions/meta/bootstrap")
+    except Exception:
+        years, months = await asyncio.gather(
+            get_available_years(),
+            get_available_months(),
+        )
+        return BrowseBootstrap(years=list(years or []), months=list(months or []))
+
+    years = [int(y) for y in (payload.get("years") or [])]
+    months = _months_from_bootstrap_rows(payload.get("months"))
+    return BrowseBootstrap(years=years, months=months)
 
 
 # In-memory description history for Excel-style autocomplete across all days.
@@ -1204,10 +1365,9 @@ async def bulk_save_transactions(
     outcomes: List[Tuple[str, Optional[Transaction], Optional[str]]] = [
         ("error", None, "not processed") for _ in txs
     ]
-    created_ids: List[ObjectId] = []
 
-    for offset in range(0, len(txs), _BULK_CREATE_CHUNK):
-        chunk = list(txs[offset : offset + _BULK_CREATE_CHUNK])
+    for offset in range(0, len(txs), BULK_CREATE_CHUNK):
+        chunk = list(txs[offset : offset + BULK_CREATE_CHUNK])
         body = {"items": [_tx_create_body(tx) for tx in chunk]}
 
         async def _post_once() -> dict:
@@ -1256,24 +1416,7 @@ async def bulk_save_transactions(
                 txs[absolute]._id = saved._id
                 if saved.client_row_id and not txs[absolute].client_row_id:
                     txs[absolute].client_row_id = saved.client_row_id
-                if status_key == "created" and saved._id:
-                    created_ids.append(saved._id)
             outcomes[absolute] = (status_key, saved, str(err) if err else None)
-
-    if created_ids:
-        try:
-            from tahmeed.services.audit_service import record_event
-
-            actor_id = txs[0].cashier_id if txs else None
-            await record_event(
-                "txn.bulk_save",
-                actor_id=actor_id,
-                entity_type="transaction",
-                entity_ids=created_ids,
-                details={"count": len(created_ids)},
-            )
-        except Exception:
-            pass
 
     return outcomes
 

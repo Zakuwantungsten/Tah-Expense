@@ -115,6 +115,17 @@ class FakeTransactions:
                 count += 1
         return SimpleNamespace(matched_count=count, modified_count=count)
 
+    async def bulk_write(self, ops: list, ordered: bool = True) -> SimpleNamespace:
+        matched = 0
+        modified = 0
+        for op in ops:
+            filt = op._filter
+            doc_update = op._doc
+            result = await self.update_one(filt, doc_update)
+            matched += int(getattr(result, "matched_count", 0) or 0)
+            modified += int(getattr(result, "modified_count", 0) or 0)
+        return SimpleNamespace(matched_count=matched, modified_count=modified)
+
     def aggregate(self, pipeline: list) -> FakeCursor:
         docs = [dict(d) for d in self.documents]
         for stage in pipeline:
@@ -304,9 +315,18 @@ def test_master_list_count_totals_and_meta() -> None:
         )
         years = client.get("/v1/accountant/master/years")
         months = client.get("/v1/accountant/master/month-totals", params={"year": 2026})
+        boot = client.get(
+            "/v1/accountant/master/meta/bootstrap",
+            params={"year": 2026, "include_year_meta": True},
+        )
+        totals_only = client.get(
+            "/v1/accountant/master/meta/bootstrap",
+            params={"year": 2026, "include_year_meta": False},
+        )
 
     assert listed.status_code == 200
     assert listed.json()["total"] == 2
+    assert "cashier_names" in listed.json()
     assert count.json()["count"] == 2
     assert totals.json()["tzs"] == 100.0
     assert totals.json()["usd"] == 50.0
@@ -315,6 +335,70 @@ def test_master_list_count_totals_and_meta() -> None:
     assert 2026 in years.json()["items"]
     assert "3" in months.json()["months"]
     assert months.json()["months"]["3"]["tzs"] == 100.0
+    assert boot.status_code == 200
+    body = boot.json()
+    assert body["totals"]["tzs"] == 100.0
+    assert body["totals"]["usd"] == 50.0
+    assert body["trucks"] == ["T100 AAA", "T101 BBB"]
+    assert "Fuel" in body["categories"]
+    assert "3" in body["month_totals"]
+    assert body["month_totals"]["3"]["tzs"] == 100.0
+    assert totals_only.status_code == 200
+    slim = totals_only.json()
+    assert slim["totals"]["tzs"] == 100.0
+    assert slim["month_totals"] is None
+    assert slim["trucks"] is None
+    assert slim["categories"] is None
+
+
+def test_master_list_composite_total_and_cashier_names() -> None:
+    """List returns full match count (not page length) + page cashier names."""
+    cashier_a = ObjectId()
+    cashier_b = ObjectId()
+    docs = [
+        _verified(cashier_id=cashier_a, description="A1"),
+        _verified(
+            date=datetime(2026, 4, 1),
+            cashier_id=cashier_b,
+            description="B1",
+            amount=50.0,
+            currency="USD",
+            category_name="Lube",
+        ),
+        _verified(
+            date=datetime(2026, 5, 1),
+            cashier_id=cashier_a,
+            description="A2",
+            amount=25.0,
+        ),
+    ]
+    users = FakeUsers(
+        [
+            {"_id": cashier_a, "full_name": "Alice Cashier", "username": "alice"},
+            {"_id": cashier_b, "username": "bob"},
+        ]
+    )
+    app = _app(FakeTransactions(docs), users=users)
+    app.dependency_overrides[current_user] = lambda: _manager()
+
+    with TestClient(app) as client:
+        page = client.get(
+            "/v1/accountant/master",
+            params={"year": 2026, "limit": 1, "skip": 0},
+        )
+        count = client.get("/v1/accountant/master/count", params={"year": 2026})
+
+    assert page.status_code == 200
+    body = page.json()
+    assert len(body["items"]) == 1
+    assert body["total"] == 3
+    assert body["total"] == count.json()["count"]
+    names = body["cashier_names"]
+    page_cashier = str(body["items"][0]["cashier_id"])
+    assert page_cashier in names
+    assert names[page_cashier] in {"Alice Cashier", "bob"}
+    # Names are scoped to this page (not every cashier in the full match set).
+    assert set(names.keys()) == {page_cashier}
 
 
 def test_master_excludes_supplier_categories() -> None:
@@ -412,3 +496,61 @@ def test_master_column_values_and_updates() -> None:
     assert bulk.json()["updated"] == 2
     assert all(d["receipt_status"] == "received" for d in collection.documents)
     assert any(e["action"] == "txn.master_update" for e in events.documents)
+
+
+def test_master_bulk_patch_heterogeneous_updates() -> None:
+    a = ObjectId()
+    b = ObjectId()
+    collection = FakeTransactions(
+        [
+            _verified(
+                _id=a,
+                description="A",
+                item="Fuel",
+                category_name="Fuel",
+                memo="old-a",
+            ),
+            _verified(
+                _id=b,
+                description="B",
+                item="Lube",
+                category_name="Lube",
+                memo="old-b",
+                amount=20.0,
+                currency="USD",
+            ),
+        ]
+    )
+    events = FakeEvents()
+    app = _app(collection, events=events)
+    app.dependency_overrides[current_user] = lambda: _manager()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/accountant/master/bulk-patch",
+            json={
+                "items": [
+                    {
+                        "id": str(a),
+                        "updates": {"description": "A2", "memo": "new-a"},
+                    },
+                    {
+                        "id": str(b),
+                        "updates": {"item": "Parking", "category_name": "Parking"},
+                    },
+                ]
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["matched"] == 2
+    assert body["requested"] == 2
+    docs = {d["_id"]: d for d in collection.documents}
+    assert docs[a]["description"] == "A2"
+    assert docs[a]["memo"] == "new-a"
+    assert docs[b]["item"] == "Parking"
+    assert docs[b]["category_name"] == "Parking"
+    assert any(
+        e["action"] == "txn.master_update_bulk_patch" for e in events.documents
+    )

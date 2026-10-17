@@ -98,6 +98,42 @@ class DayIssuesNavTarget:
     description_keys: Tuple[str, ...] = ()
     all_days: bool = False
 
+
+@dataclass
+class MappingUndoSnapshot:
+    """Enough state to reverse one successful Day Issues map commit."""
+
+    descriptions: List[str]
+    dates: List[date]
+    # description_key -> prior map tuple, or None if the map was newly created.
+    # tuple: (description, category_id, category_name, payee)
+    prior_by_key: dict
+    # description_key -> ObjectId of the upserted map (for delete when new)
+    new_ids_by_key: dict
+
+
+def split_undo_map_actions(
+    snapshot: MappingUndoSnapshot,
+) -> Tuple[List[ObjectId], List[Tuple[str, ObjectId, str, str]]]:
+    """Return ``(delete_ids, restore_entries)`` for a mapping undo."""
+    delete_ids: List[ObjectId] = []
+    restore: List[Tuple[str, ObjectId, str, str]] = []
+    seen_keys: set = set()
+    for desc in snapshot.descriptions:
+        key = normalize_description(desc)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        prior = snapshot.prior_by_key.get(key)
+        if prior is None:
+            mid = snapshot.new_ids_by_key.get(key)
+            if mid is not None:
+                delete_ids.append(mid)
+            continue
+        restore.append(prior)
+    return delete_ids, restore
+
+
 _CHECKMARK_PATH: Optional[str] = None
 
 
@@ -853,6 +889,8 @@ class DayIssuesWidget(QWidget):
         self._row_source = row_source
         # Optional: stamp Payee+Item onto live Table / draft rows (Phase 3).
         self._apply_live = apply_live
+        # Last successful map — offered once via the success dialog Undo button.
+        self._last_mapping_undo: Optional[MappingUndoSnapshot] = None
         # Cashier UI: own rows only. Accountant / admin: everyone.
         self._cashier_scope_id: Optional[ObjectId] = (
             user._id if getattr(user, "role", "") == "cashier" else None
@@ -1224,9 +1262,30 @@ class DayIssuesWidget(QWidget):
         self._dirty = True
 
     def open_for_date(self, target: date) -> None:
-        """Deep-link from Table / sidebar: This day + *target* date, then load."""
+        """Deep-link from Table (or first visit): This day + *target*, then load."""
         self._set_show_scope("day")
         self.set_date(target, force=True)
+
+    def on_page_shown(self, fallback_date: Optional[date] = None) -> None:
+        """Sidebar returned to Day Issues — keep date / scope / VALUE filter.
+
+        Verify handoff (``open_from_verify``) and any in-page filters must survive
+        leaving the tab. Only a true first visit (never loaded, no handoff) falls
+        back to ``open_for_date``.
+        """
+        preserve = (
+            self._loaded
+            or self._loading
+            or self._value_filter is not None
+            or self._scope == "all"
+            or bool(self._checked_keys)
+        )
+        if preserve:
+            if self._dirty or not self._loaded:
+                self._schedule_refresh()
+            return
+        day = fallback_date or self._target or date.today()
+        self.open_for_date(day)
 
     def open_from_verify(
         self,
@@ -1816,9 +1875,11 @@ class DayIssuesWidget(QWidget):
             if payee_needs_create(name, self._payees):
                 self._payees.append(name)
 
+        descs = [desc for desc, _p, _c in resolved]
         live_n = 0
         committed = 0
         try:
+            prior_by_key = await self._snapshot_prior_maps(descs)
             # Optimistic: stamp live Table/draft first, then one bulk map save.
             for desc, payee, cat in resolved:
                 live_n += self._stamp_live_rows(
@@ -1826,11 +1887,21 @@ class DayIssuesWidget(QWidget):
                 )
             from tahmeed.services.description_mapping_service import save_mappings_bulk
 
-            await save_mappings_bulk(
+            saved = await save_mappings_bulk(
                 [
                     (desc, cat._id, cat.name, payee)
                     for desc, payee, cat in resolved
                 ]
+            )
+            self._last_mapping_undo = MappingUndoSnapshot(
+                descriptions=list(descs),
+                dates=self._dates_for_descriptions(descs),
+                prior_by_key=prior_by_key,
+                new_ids_by_key={
+                    normalize_description(m.description): m._id
+                    for m in saved
+                    if m._id is not None and normalize_description(m.description)
+                },
             )
             # Group by (payee, item, category_id) for background DB apply.
             groups: dict[tuple, list[str]] = {}
@@ -1839,25 +1910,25 @@ class DayIssuesWidget(QWidget):
                 groups.setdefault(key, []).append(desc)
                 self._mapping_drafts.pop(normalize_description(desc), None)
                 committed += 1
-            for (payee, item_name, cat_id_str), descs in groups.items():
+            for (payee, item_name, cat_id_str), descs_g in groups.items():
                 self._enqueue_saved_row_apply(
-                    descs, payee, item_name, ObjectId(cat_id_str)
+                    descs_g, payee, item_name, ObjectId(cat_id_str)
                 )
         except Exception as exc:
+            self._last_mapping_undo = None
             QMessageBox.critical(self, "Save Filled Failed", str(exc))
             return
         finally:
             self._loading_overlay.hide_loading()
 
-        QMessageBox.information(
-            self,
-            "Mappings saved",
+        msg = (
             f"Saved {committed:,} filled mapping(s) to Description Maps.\n"
             f"Updated {live_n:,} open row(s) on Table/draft"
-            f"{' (DB rows updating in background).' if live_n or committed else '.'}",
+            f"{' (DB rows updating in background).' if live_n or committed else '.'}"
         )
-        descs = [desc for desc, _p, _c in resolved]
         await self._finish_mapping_ui(descs)
+        if self._confirm_mapping_undo(msg):
+            await self._undo_last_mapping()
 
     async def _do_map(
         self,
@@ -1908,17 +1979,28 @@ class DayIssuesWidget(QWidget):
 
         self._loading_overlay.show_loading("Saving mappings…")
         try:
+            prior_by_key = await self._snapshot_prior_maps(descriptions)
             # Optimistic: live stamp first, bulk map upsert, DB apply in outbox.
             live_n = self._stamp_live_rows(
                 descriptions, payee, category.name, category._id
             )
             from tahmeed.services.description_mapping_service import save_mappings_bulk
 
-            await save_mappings_bulk(
+            saved = await save_mappings_bulk(
                 [
                     (desc, category._id, category.name, payee)
                     for desc in descriptions
                 ]
+            )
+            self._last_mapping_undo = MappingUndoSnapshot(
+                descriptions=list(descriptions),
+                dates=self._dates_for_descriptions(descriptions),
+                prior_by_key=prior_by_key,
+                new_ids_by_key={
+                    normalize_description(m.description): m._id
+                    for m in saved
+                    if m._id is not None and normalize_description(m.description)
+                },
             )
             self._enqueue_saved_row_apply(
                 descriptions, payee, category.name, category._id
@@ -1926,6 +2008,7 @@ class DayIssuesWidget(QWidget):
             for desc in descriptions:
                 self._mapping_drafts.pop(normalize_description(desc), None)
         except Exception as exc:
+            self._last_mapping_undo = None
             QMessageBox.critical(self, "Mapping Failed", str(exc))
             return
         finally:
@@ -1942,17 +2025,17 @@ class DayIssuesWidget(QWidget):
             if live_n
             else "."
         )
-        QMessageBox.information(
-            self,
-            "Mappings saved",
+        msg = (
             f"Mapped {len(descriptions):,} description(s) to:\n"
             f"Payee: {payee}\nItem: {category.name}\n\n"
             f"Saved to Description Maps.\n"
             f"Updated {live_n:,} open row(s) across {scope_txt}"
             f"{detail}\n"
-            f"Saved register rows are updating in the background.",
+            f"Saved register rows are updating in the background."
         )
         await self._finish_mapping_ui(descriptions)
+        if self._confirm_mapping_undo(msg):
+            await self._undo_last_mapping()
 
     async def _finish_mapping_ui(self, descriptions: Sequence[str]) -> None:
         """Drop mapped rows instantly, then one quiet resync (no cascade scans)."""
@@ -1962,6 +2045,196 @@ class DayIssuesWidget(QWidget):
         self.mark_dirty(days=touched)
         self.mappings_applied.emit()
         await self.refresh(quiet=True)
+
+    async def _snapshot_prior_maps(self, descriptions: Sequence[str]) -> dict:
+        """Capture existing Description Maps before an upsert (for Undo restore)."""
+        from tahmeed.services.description_mapping_service import (
+            get_mappings_for_descriptions,
+        )
+
+        existing = await get_mappings_for_descriptions(list(descriptions))
+        prior: dict = {}
+        for desc in descriptions:
+            key = normalize_description(desc)
+            if not key or key in prior:
+                continue
+            mapping = existing.get(key)
+            if mapping is None:
+                prior[key] = None
+                continue
+            prior[key] = (
+                mapping.description or desc,
+                mapping.category_id,
+                mapping.category_name,
+                mapping.payee or "",
+            )
+        return prior
+
+    def _confirm_mapping_undo(self, message: str) -> bool:
+        """Success dialog with Undo. Returns True when the user chooses Undo."""
+        if self._last_mapping_undo is None:
+            QMessageBox.information(self, "Mappings saved", message)
+            return False
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("Mappings saved")
+        box.setText(message)
+        box.setInformativeText(
+            "Undo reverses Description Maps and clears Payee + Item on the "
+            "matching Table / register rows from this action."
+        )
+        undo_btn = box.addButton("Undo", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Ok)
+        # Ok is default so Enter dismisses; Undo is an explicit choice.
+        ok_btn = box.button(QMessageBox.Ok)
+        if ok_btn is not None:
+            box.setDefaultButton(ok_btn)
+        box.exec()
+        return box.clickedButton() is undo_btn
+
+    async def _undo_last_mapping(self) -> None:
+        """Reverse the last successful Map / Save Filled commit."""
+        snap = self._last_mapping_undo
+        if snap is None:
+            return
+        self._last_mapping_undo = None
+        self._loading_overlay.show_loading("Undoing mappings…")
+        try:
+            from tahmeed.services.mapping_apply_outbox import (
+                cancel_pending_jobs_for_keys,
+                wait_outbox_idle,
+            )
+
+            keys = [
+                normalize_description(d)
+                for d in snap.descriptions
+                if normalize_description(d)
+            ]
+            cancel_pending_jobs_for_keys(keys)
+            await wait_outbox_idle()
+
+            delete_ids, restore_entries = split_undo_map_actions(snap)
+            from tahmeed.services.description_mapping_service import (
+                delete_mappings_bulk,
+                get_mappings_for_descriptions,
+                save_mappings_bulk,
+            )
+
+            # Resolve new-map ids the bulk save did not return.
+            need_lookup = [
+                key
+                for key, prior in snap.prior_by_key.items()
+                if prior is None and key not in snap.new_ids_by_key
+            ]
+            if need_lookup:
+                current = await get_mappings_for_descriptions(
+                    [
+                        d
+                        for d in snap.descriptions
+                        if normalize_description(d) in need_lookup
+                    ]
+                )
+                for key in need_lookup:
+                    mapping = current.get(key)
+                    if mapping is not None and mapping._id is not None:
+                        delete_ids.append(mapping._id)
+
+            if delete_ids:
+                await delete_mappings_bulk(delete_ids)
+            if restore_entries:
+                await save_mappings_bulk(restore_entries)
+
+            self._clear_live_rows(snap.descriptions, days=snap.dates)
+            await self._clear_saved_rows(snap.descriptions, days=snap.dates)
+        except Exception as exc:
+            QMessageBox.critical(self, "Undo Failed", str(exc))
+            return
+        finally:
+            self._loading_overlay.hide_loading()
+
+        self.mark_dirty(days=snap.dates)
+        self.mappings_applied.emit()
+        await self.refresh(quiet=False)
+        QMessageBox.information(
+            self,
+            "Mapping undone",
+            f"Reverted {len(snap.descriptions):,} description(s).\n"
+            "Description Maps and Table / register stamps from that action "
+            "were reversed.",
+        )
+
+    def _clear_live_rows(
+        self,
+        descriptions: Sequence[str],
+        *,
+        days: Optional[Sequence[date]] = None,
+    ) -> int:
+        """Clear Payee + Item on open Table/draft rows for Undo."""
+        apply_days = list(days) if days else self._dates_for_descriptions(descriptions)
+        live_n = 0
+        if self._apply_live is None:
+            return 0
+        for day in apply_days:
+            try:
+                live_n += int(
+                    self._apply_live(
+                        day,
+                        descriptions,
+                        payee="",
+                        item_name="",
+                        category_id=None,
+                        cashier_id=self._cashier_scope_id,
+                        emit_source_changed=False,
+                        clear_category=True,
+                    )
+                    or 0
+                )
+            except TypeError:
+                try:
+                    live_n += int(
+                        self._apply_live(
+                            day,
+                            descriptions,
+                            payee="",
+                            item_name="",
+                            category_id=None,
+                            cashier_id=self._cashier_scope_id,
+                            emit_source_changed=False,
+                        )
+                        or 0
+                    )
+                except Exception:
+                    continue
+            except Exception:
+                continue
+        return live_n
+
+    async def _clear_saved_rows(
+        self,
+        descriptions: Sequence[str],
+        *,
+        days: Optional[Sequence[date]] = None,
+    ) -> int:
+        """Clear Payee + Item on matching open DB rows (Undo)."""
+        from tahmeed.services.cashier_service import apply_description_mapping_bulk
+
+        keys = [
+            normalize_description(d)
+            for d in descriptions
+            if normalize_description(d)
+        ]
+        if not keys:
+            return 0
+        target_days = list(days) if days else [self._target]
+        try:
+            return await apply_description_mapping_bulk(
+                keys,
+                dates=target_days,
+                cashier_id=self._cashier_scope_id,
+                clear=True,
+            )
+        except Exception:
+            return 0
 
     def _stamp_live_rows(
         self,

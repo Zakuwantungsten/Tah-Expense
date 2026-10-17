@@ -53,7 +53,8 @@ class QbTxnToolbar(QFrame):
 
     Core: Undo, Redo, Find, New, Save, Delete, Copy, Print, Attach File.
     With ``register_actions=True`` (cashier/accountant Table): also Larger,
-    Smaller, Wrap (right after Redo), Export, Import, Today, Edit, Submit day.
+    Smaller, Wrap, Filter (right after Redo), Export, Import, Today, Edit,
+    Submit day.
     """
 
     find_prev = Signal()
@@ -76,6 +77,7 @@ class QbTxnToolbar(QFrame):
     font_larger_clicked = Signal()
     font_smaller_clicked = Signal()
     wrap_clicked = Signal()
+    filter_clicked = Signal()
 
     def __init__(
         self,
@@ -153,6 +155,7 @@ class QbTxnToolbar(QFrame):
         self._btn_font_larger: Optional[QToolButton] = None
         self._btn_font_smaller: Optional[QToolButton] = None
         self._btn_wrap: Optional[QToolButton] = None
+        self._btn_filter: Optional[QToolButton] = None
         if register_actions:
             self._btn_undo = self._tool_btn(
                 "mdi.undo", "Undo", "Undo last change (Ctrl+Z)"
@@ -167,7 +170,7 @@ class QbTxnToolbar(QFrame):
             lay.addWidget(self._btn_undo)
             lay.addWidget(self._btn_redo)
 
-            # Immediately after Redo: table text size, then Wrap Text
+            # Immediately after Redo: table text size, Wrap Text, then Filter
             self._btn_font_larger = self._icon_tool_btn(
                 _font_size_icon(larger=True),
                 "Larger",
@@ -184,13 +187,22 @@ class QbTxnToolbar(QFrame):
                 "Wrap text in selected columns (or all if none selected)",
             )
             self._btn_wrap.setCheckable(True)
+            self._btn_filter = self._tool_btn(
+                "mdi.filter-variant",
+                "Filter",
+                "Column filters on — click to clear filters and hide ▾",
+            )
+            self._btn_filter.setCheckable(True)
+            self._btn_filter.setChecked(True)
             self._btn_font_larger.clicked.connect(self.font_larger_clicked.emit)
             self._btn_font_smaller.clicked.connect(self.font_smaller_clicked.emit)
             # clicked(bool) on checkable buttons — ignore the checked arg.
             self._btn_wrap.clicked.connect(lambda *_: self.wrap_clicked.emit())
+            self._btn_filter.clicked.connect(lambda *_: self.filter_clicked.emit())
             lay.addWidget(self._btn_font_larger)
             lay.addWidget(self._btn_font_smaller)
             lay.addWidget(self._btn_wrap)
+            lay.addWidget(self._btn_filter)
             lay.addWidget(self._sep())
 
         self._btn_find_prev = self._icon_btn(
@@ -506,6 +518,18 @@ class QbTxnToolbar(QFrame):
         """Mirror register Wrap Text state on the toolbar button."""
         if self._btn_wrap is not None:
             self._btn_wrap.setChecked(bool(active))
+
+    def set_filter_active(self, active: bool) -> None:
+        """Mirror register Excel AutoFilter state on the toolbar button."""
+        if self._btn_filter is None:
+            return
+        active = bool(active)
+        self._btn_filter.setChecked(active)
+        self._btn_filter.setToolTip(
+            "Column filters on — click to clear filters and hide ▾"
+            if active
+            else "Column filters off — click to show ▾ on headers"
+        )
 
     def set_actions_enabled(
         self,

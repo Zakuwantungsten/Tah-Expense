@@ -106,6 +106,20 @@ class FakeCollection:
             matched = [{k: d[k] for k in keep if k in d} for d in matched]
         return FakeCursor(matched)
 
+    async def find_one(
+        self, query: dict, projection: dict | None = None
+    ) -> dict | None:
+        for doc in self.documents:
+            if not _matches(doc, query):
+                continue
+            if not projection:
+                return dict(doc)
+            keep = {k for k, v in projection.items() if v}
+            if "_id" not in projection or projection.get("_id"):
+                keep.add("_id")
+            return {k: doc[k] for k in keep if k in doc}
+        return None
+
     async def count_documents(self, query: dict) -> int:
         return sum(1 for d in self.documents if _matches(d, query))
 
@@ -350,7 +364,7 @@ def test_daily_uploads_records_delete_cleanup() -> None:
     assert all(d.get("daily_import_id") != "up-a" for d in txs.documents)
 
 
-def test_cashier_can_list_own_daily_uploads() -> None:
+def test_cashier_sees_all_uploads_but_deletes_own_only() -> None:
     cashier_id = ObjectId()
     other_id = ObjectId()
     txs = FakeCollection(
@@ -382,13 +396,18 @@ def test_cashier_can_list_own_daily_uploads() -> None:
 
     with TestClient(app) as client:
         uploads = client.get("/v1/imports/daily/uploads")
-        forbidden = client.delete("/v1/imports/daily/uploads/mine")
+        records = client.get("/v1/imports/daily/uploads/theirs/records")
+        forbidden = client.delete("/v1/imports/daily/uploads/theirs")
+        own_delete = client.delete("/v1/imports/daily/uploads/mine")
 
     assert uploads.status_code == 200
     body = uploads.json()
-    assert len(body) == 1
-    assert body[0]["_id"] == "mine"
+    assert {row["_id"] for row in body} == {"mine", "theirs"}
+    assert records.status_code == 200
+    assert len(records.json()) == 1
     assert forbidden.status_code == 403
+    assert own_delete.status_code == 200
+    assert own_delete.json()["deleted"] == 1
 
 
 def test_daily_issues_list_count_clear() -> None:

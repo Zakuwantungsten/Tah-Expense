@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -103,15 +103,30 @@ class MappingBulkDelete(StrictModel):
 
 
 class ApplyDescriptionMappingRequest(StrictModel):
-    """Stamp Payee + Item onto matching open register rows in one update_many."""
+    """Stamp Payee + Item onto matching open register rows in one update_many.
+
+    When ``clear`` is True, matching open rows have Payee / Item / category
+    wiped (Day Issues Undo). Item fields are then optional.
+    """
 
     description_keys: list[str] = Field(min_length=1, max_length=500)
     payee: str = ""
-    category_name: str = Field(min_length=1, max_length=200)
-    category_id: str
+    category_name: str = Field("", max_length=200)
+    category_id: str | None = None
+    clear: bool = False
     dates: list[str] = Field(default_factory=list, max_length=366)
     cashier_id: str | None = None
     client_job_id: str | None = Field(None, max_length=80)
+
+    @model_validator(mode="after")
+    def _require_item_unless_clear(self) -> "ApplyDescriptionMappingRequest":
+        if self.clear:
+            return self
+        if not (self.category_name or "").strip():
+            raise ValueError("category_name is required unless clear=true")
+        if not (self.category_id or "").strip():
+            raise ValueError("category_id is required unless clear=true")
+        return self
 
 
 class PayeeWrite(StrictModel):
@@ -371,6 +386,27 @@ class MasterPatchRequest(StrictModel):
 class BulkMasterUpdateRequest(StrictModel):
     ids: list[str] = Field(default_factory=list, max_length=500)
     updates: dict[str, Any] = Field(default_factory=dict)
+
+
+class BulkMasterPatchItem(StrictModel):
+    id: str
+    updates: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("updates")
+    @classmethod
+    def prevent_unsafe_fields(cls, value: dict[str, Any]) -> dict[str, Any]:
+        blocked = {"_id", "created_at", "verified", "trashed"}
+        if blocked.intersection(value):
+            raise ValueError("immutable field included")
+        return value
+
+
+class BulkMasterPatchRequest(StrictModel):
+    """Per-row Master edits in one bulk_write (dirty Save)."""
+
+    items: list[BulkMasterPatchItem] = Field(
+        default_factory=list, min_length=1, max_length=500
+    )
 
 
 class CategoriesUsageTotalsRequest(StrictModel):

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from bson import ObjectId
 from fastapi.testclient import TestClient
+from pymongo.errors import BulkWriteError
 
 from app.config import Settings
 from app.dependencies import current_user
@@ -76,11 +77,61 @@ class FakeTransactions:
     def __init__(self, documents: list[dict] | None = None) -> None:
         self.documents = list(documents or [])
 
+    def _client_row_conflict(self, document: dict) -> bool:
+        crid = document.get("client_row_id")
+        cid = document.get("cashier_id")
+        if not (isinstance(crid, str) and crid and cid is not None):
+            return False
+        return any(
+            d.get("cashier_id") == cid and d.get("client_row_id") == crid
+            for d in self.documents
+        )
+
     async def insert_one(self, document: dict) -> SimpleNamespace:
+        if self._client_row_conflict(document):
+            from pymongo.errors import DuplicateKeyError
+
+            raise DuplicateKeyError("E11000 duplicate key")
         stored = dict(document)
-        stored["_id"] = ObjectId()
+        stored.setdefault("_id", ObjectId())
         self.documents.append(stored)
         return SimpleNamespace(inserted_id=stored["_id"])
+
+    async def insert_many(
+        self, documents: list[dict], ordered: bool = True
+    ) -> SimpleNamespace:
+        inserted_ids: dict[int, ObjectId] = {}
+        write_errors: list[dict] = []
+        for index, document in enumerate(documents):
+            if self._client_row_conflict(document):
+                write_errors.append(
+                    {"index": index, "code": 11000, "errmsg": "E11000 duplicate key"}
+                )
+                if ordered:
+                    raise BulkWriteError(
+                        {
+                            "nInserted": len(inserted_ids),
+                            "writeErrors": write_errors,
+                            "insertedIds": inserted_ids,
+                        }
+                    )
+                continue
+            stored = dict(document)
+            stored.setdefault("_id", ObjectId())
+            self.documents.append(stored)
+            inserted_ids[index] = stored["_id"]
+        if write_errors:
+            raise BulkWriteError(
+                {
+                    "nInserted": len(inserted_ids),
+                    "writeErrors": write_errors,
+                    "insertedIds": inserted_ids,
+                }
+            )
+        return SimpleNamespace(inserted_ids=inserted_ids)
+
+    async def create_index(self, *_args: object, **_kwargs: object) -> str:
+        return "uniq_cashier_client_row"
 
     async def find_one(self, query: dict) -> dict | None:
         for doc in self.documents:
@@ -295,16 +346,30 @@ class FakeOperationEvents:
         return SimpleNamespace(inserted_id=stored["_id"])
 
 
+class FakeUsers:
+    def __init__(self, documents: list[dict] | None = None) -> None:
+        self.documents = list(documents or [])
+
+    def find(self, query: dict, _projection: dict | None = None) -> FakeCursor:
+        ids = set()
+        if "_id" in query and isinstance(query["_id"], dict) and "$in" in query["_id"]:
+            ids = set(query["_id"]["$in"])
+        docs = [dict(d) for d in self.documents if not ids or d.get("_id") in ids]
+        return FakeCursor(docs)
+
+
 def _app(
     collection: FakeTransactions,
     mappings: list[dict] | None = None,
     events: FakeOperationEvents | None = None,
+    users: FakeUsers | None = None,
 ):
     database = SimpleNamespace(
         db=SimpleNamespace(
             transactions=collection,
             description_mappings=FakeMappings(mappings),
             operation_events=events or FakeOperationEvents(),
+            users=users or FakeUsers(),
         )
     )
     return create_app(settings=settings(), database=database)
@@ -732,6 +797,59 @@ def test_pending_edit_creates_clone() -> None:
     assert len(collection.documents) == 2
 
 
+def test_pending_edit_strips_idempotency_keys() -> None:
+    """Clone must not keep client_row_id / import keys (unique index collision)."""
+    user = _cashier()
+    original = ObjectId()
+    rid = "11111111-2222-3333-4444-555555555555"
+    collection = FakeTransactions(
+        [
+            {
+                "_id": original,
+                "date": datetime(2026, 4, 4),
+                "description": "Master",
+                "amount": 10,
+                "verified": True,
+                "cashier_id": user["_id"],
+                "client_row_id": rid,
+                "daily_import_id": "imp-1",
+                "import_row_key": "row-1",
+                "master_import_source": "xlsx",
+                "master_serial": 42,
+            }
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v1/transactions/{original}/pending-edit",
+            json={"updates": {"description": "Fixed mapping", "item": "Toll"}},
+        )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["description"] == "Fixed mapping"
+    assert body.get("client_row_id") is None
+    assert body.get("daily_import_id") is None
+    assert body.get("import_row_key") is None
+    assert body.get("master_import_source") is None
+    assert body.get("master_serial") is None
+    clone = next(d for d in collection.documents if d["_id"] != original)
+    for key in (
+        "client_row_id",
+        "daily_import_id",
+        "import_row_key",
+        "master_import_source",
+        "master_serial",
+    ):
+        assert key not in clone
+    original_doc = next(d for d in collection.documents if d["_id"] == original)
+    assert original_doc["client_row_id"] == rid
+    assert original_doc["daily_import_id"] == "imp-1"
+
+
 def test_check_duplicates() -> None:
     user = _cashier()
     collection = FakeTransactions(
@@ -859,18 +977,87 @@ def test_bulk_create_transactions_idempotent() -> None:
             },
         )
 
-    assert first.status_code == 200
-    body = first.json()
-    assert body["created"] == 2
-    assert body["already_exists"] == 0
-    assert len(collection.documents) == 2
-    assert any(e["action"] == "txn.bulk_create" for e in events.documents)
+        assert first.status_code == 200
+        body = first.json()
+        assert body["created"] == 2
+        assert body["already_exists"] == 0
+        assert len(collection.documents) == 2
+        assert any(e["action"] == "txn.bulk_create" for e in events.documents)
 
-    assert replay.status_code == 200
-    assert replay.json()["created"] == 0
-    assert replay.json()["already_exists"] == 1
-    assert replay.json()["results"][0]["transaction"]["description"] == "A"
-    assert len(collection.documents) == 2
+        assert replay.status_code == 200
+        assert replay.json()["created"] == 0
+        assert replay.json()["already_exists"] == 1
+        assert replay.json()["results"][0]["transaction"]["description"] == "A"
+        assert len(collection.documents) == 2
+
+        # Mixed batch: one new + one already-known client_row_id in one RTT.
+        mixed = client.post(
+            "/v1/transactions/bulk-create",
+            json={
+                "items": [
+                    {
+                        "date": "2026-04-01T00:00:00",
+                        "description": "B-retry",
+                        "amount": 20.0,
+                        "currency": "TZS",
+                        "client_row_id": rid_b,
+                    },
+                    {
+                        "date": "2026-04-01T00:00:00",
+                        "description": "C",
+                        "amount": 30.0,
+                        "currency": "TZS",
+                        "client_row_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                    },
+                ]
+            },
+        )
+
+        assert mixed.status_code == 200
+        mixed_body = mixed.json()
+        assert mixed_body["created"] == 1
+        assert mixed_body["already_exists"] == 1
+        assert mixed_body["results"][0]["status"] == "already_exists"
+        assert mixed_body["results"][1]["status"] == "created"
+        assert len(collection.documents) == 3
+
+
+def test_check_duplicates_bulk_case_insensitive() -> None:
+    user = _cashier()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": ObjectId(),
+                "date": datetime.utcnow(),
+                "truck_number": "t1",
+                "amount": 5.0,
+                "item": "diesel",
+                "description": "FILL",
+                "rejected": False,
+            }
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/transactions/check-duplicates/bulk",
+            json={
+                "days": 5,
+                "candidates": [
+                    {
+                        "truck_number": "T1",
+                        "amount": 5.0,
+                        "item": "Diesel",
+                        "description": "fill",
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["total"] == 1
 
 
 def test_search_and_browse_and_meta() -> None:
@@ -901,16 +1088,21 @@ def test_search_and_browse_and_meta() -> None:
         descs = client.get("/v1/transactions/browse/descriptions")
         months = client.get("/v1/transactions/meta/months")
         years = client.get("/v1/transactions/meta/years")
+        boot = client.get("/v1/transactions/meta/bootstrap")
         overview = client.get("/v1/transactions/overview-stats")
         resolve = client.get("/v1/transactions/resolve-item?description=Office%20supplies")
         prefix = client.get("/v1/transactions/descriptions?prefix=OFF")
 
     assert search.status_code == 200 and search.json()["total"] == 1
     assert flat.status_code == 200 and flat.json()["total"] == 1
+    assert "cashier_names" in flat.json()
     assert "Stationery" in items.json()["items"]
     assert "Office supplies" in descs.json()["items"]
     assert months.json()["total"] >= 1
     assert years.json()["total"] >= 1
+    assert boot.status_code == 200
+    assert boot.json()["total_months"] >= 1
+    assert 2026 in boot.json()["years"]
     assert overview.status_code == 200
     assert "today" in overview.json() and "recent" in overview.json()
     assert resolve.json()["item"] == "Stationery"
@@ -948,8 +1140,70 @@ def test_cashier_daily_uploads_endpoint() -> None:
 
     assert resp.status_code == 200
     body = resp.json()
-    assert len(body) == 1
-    assert body[0]["_id"] == "mine"
+    # Phase 1 composite: {items, total, cashier_names}
+    # Browse Uploads is shared — cashiers see every batch.
+    assert isinstance(body, dict)
+    assert body["total"] == 2
+    ids = {row["_id"] for row in body["items"]}
+    assert ids == {"mine", "theirs"}
+    assert "cashier_names" in body
+
+    with TestClient(app) as client:
+        scoped = client.get(
+            f"/v1/transactions/daily-uploads?limit=50&cashier_id={user['_id']}"
+        )
+    assert scoped.status_code == 200
+    scoped_body = scoped.json()
+    assert scoped_body["total"] == 1
+    assert scoped_body["items"][0]["_id"] == "mine"
+
+
+def test_overview_stats_includes_all_cashiers() -> None:
+    user = _cashier()
+    other = ObjectId()
+    today = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)
+    collection = FakeTransactions(
+        [
+            {
+                "_id": ObjectId(),
+                "cashier_id": user["_id"],
+                "date": today,
+                "amount": 1_000,
+                "trashed": False,
+                "verified": True,
+                "receipt_status": "received",
+            },
+            {
+                "_id": ObjectId(),
+                "cashier_id": other,
+                "date": today,
+                "amount": 4_000,
+                "trashed": False,
+                "verified": False,
+                "receipt_status": "pending",
+            },
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        all_cashiers = client.get("/v1/transactions/overview-stats")
+        scoped = client.get(
+            f"/v1/transactions/overview-stats?cashier_id={user['_id']}"
+        )
+
+    assert all_cashiers.status_code == 200
+    month = all_cashiers.json()["month"]
+    assert month["count"] == 2
+    assert month["tzs_total"] == 5_000.0
+    assert month["verified"] == 1
+    assert month["receipt_pending"] == 1
+
+    assert scoped.status_code == 200
+    scoped_month = scoped.json()["month"]
+    assert scoped_month["count"] == 1
+    assert scoped_month["tzs_total"] == 1_000.0
 
 
 def test_overview_charts() -> None:
@@ -1003,14 +1257,26 @@ def test_overview_charts() -> None:
     names = [row["name"] for row in body["items"]]
     assert "DIESEL" in names
     assert "MILEAGE" in names
-    assert "OTHER CASHIER" not in names
+    # Overview aggregates all cashiers (Merged-style), not only the actor.
+    assert "OTHER CASHIER" in names
     payee_labels = [row["label"] for row in body["payees"]["series"]]
-    assert payee_labels[0] == "INFINITY"
-    assert "SOMEONE" not in payee_labels
+    assert "INFINITY" in payee_labels
+    assert "SOMEONE" in payee_labels
     assert "Unassigned" not in payee_labels
     assert body["daily"]["2026-03-12"]["tzs"] == 40_000.0
     assert body["daily"]["2026-03-12"]["count"] == 1.0
+    assert body["daily"]["2026-04-02"]["tzs"] == 109_000.0
+    assert body["daily"]["2026-04-02"]["count"] == 2.0
     assert body["payees"]["top_n"] == 5
+
+    with TestClient(app) as client:
+        scoped = client.get(
+            f"/v1/transactions/overview-charts?year=2026&cashier_id={user['_id']}"
+        )
+    assert scoped.status_code == 200
+    scoped_names = [row["name"] for row in scoped.json()["items"]]
+    assert "DIESEL" in scoped_names
+    assert "OTHER CASHIER" not in scoped_names
 
 
 def test_rejected_discarded_and_drafts() -> None:
@@ -1342,3 +1608,52 @@ def test_apply_description_mapping_accountant_all_cashiers() -> None:
         d for d in collection.documents if d.get("payee") == "CITY" and not d.get("verified")
     ]
     assert len(stamped) == 2
+
+
+def test_apply_description_mapping_clear_wipes_payee_item() -> None:
+    cash_a = ObjectId()
+    cat_id = ObjectId()
+    day = datetime(2026, 10, 13, 8, 0, 0)
+    tx_id = ObjectId()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": tx_id,
+                "cashier_id": cash_a,
+                "description": "LATRA FEE",
+                "date": day,
+                "import_primary_date": None,
+                "verified": False,
+                "rejected": False,
+                "discarded": False,
+                "deletion_requested": False,
+                "trashed": False,
+                "payee": "CITY",
+                "item": "Parking",
+                "category_name": "Parking",
+                "category_id": cat_id,
+            },
+        ]
+    )
+    events = FakeOperationEvents()
+    app = _app(collection, events=events)
+    app.dependency_overrides[current_user] = lambda: _cashier(cash_a)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/transactions/apply-description-mapping",
+            json={
+                "description_keys": ["LATRA FEE"],
+                "clear": True,
+                "dates": ["2026-10-13"],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["updated"] == 1
+    doc = next(d for d in collection.documents if d["_id"] == tx_id)
+    assert doc["payee"] == ""
+    assert doc["item"] == ""
+    assert doc["category_name"] == ""
+    assert doc["category_id"] is None
+    assert any(e["action"] == "txn.bulk_mapping_clear" for e in events.documents)

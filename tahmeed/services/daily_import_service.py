@@ -758,19 +758,44 @@ async def cleanup_null_daily_import_ids() -> int:
     return int(payload.get("modified") or 0)
 
 
-async def list_daily_uploads(limit: int = 100) -> List[dict]:
-    """List Excel daily-import batches.
+async def list_daily_uploads_page(limit: int = 100):
+    """List Excel daily-import batches + cashier names (Browse Uploads, one RTT)."""
+    from tahmeed.services.cashier_service import (
+        BrowseUploadsPage,
+        _cashier_names_from_payload,
+    )
 
-    Cashiers use ``/v1/transactions/daily-uploads`` (register actor). Managers
-    may still hit the imports route; this client path is shared by Browse.
-    """
     payload = await api_client.request(
         "GET",
         "v1/transactions/daily-uploads",
         params={"limit": limit},
     )
-    rows = payload if isinstance(payload, list) else payload.get("items") or []
-    return [desktop_document(row) for row in rows]
+    if isinstance(payload, list):
+        rows_raw = payload
+        names_raw = None
+        total = len(payload)
+    else:
+        rows_raw = payload.get("items") or []
+        names_raw = payload.get("cashier_names")
+        total = int(payload.get("total") or len(rows_raw))
+    rows = [desktop_document(row) for row in rows_raw]
+    cashier_ids = [u.get("cashier_id") for u in rows if u.get("cashier_id")]
+    if names_raw is not None:
+        names = _cashier_names_from_payload(names_raw, cashier_ids)
+    else:
+        from tahmeed.services.accountant_service import get_cashier_names
+        names = await get_cashier_names(cashier_ids) if cashier_ids else {}
+    return BrowseUploadsPage(items=rows, total=total, cashier_names=names)
+
+
+async def list_daily_uploads(limit: int = 100) -> List[dict]:
+    """List Excel daily-import batches (shared across cashiers).
+
+    Browse uses ``/v1/transactions/daily-uploads``; managers may also hit the
+    imports route. Default response includes every cashier's batches.
+    """
+    page = await list_daily_uploads_page(limit=limit)
+    return page.items
 
 
 async def get_daily_upload_records(

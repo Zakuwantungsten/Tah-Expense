@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import gc
 import sys
 
 import pytest
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+from PySide6.QtCore import QEvent
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton
 
 from tahmeed.ui.dialogs.confirm_dialog import (
     ConfirmDialog,
+    _FocusRingHost,
     _split_message,
     ask_confirm,
     ask_standard_question,
@@ -144,3 +147,35 @@ def test_ask_standard_question_maps_cancel_to_no(qapp, monkeypatch):
         QMessageBox.No,
     )
     assert result == QMessageBox.Yes
+
+
+def test_confirm_dialog_keeps_focus_ring_host_ref(qapp, monkeypatch):
+    monkeypatch.setattr(
+        "tahmeed.ui.dialogs.confirm_dialog.is_dark_theme",
+        lambda: False,
+    )
+    dlg = ConfirmDialog(
+        None,
+        title="Clear Table",
+        heading="Clear this table?",
+        accept_label="Clear table",
+    )
+    assert isinstance(dlg._cancel_ring_host, _FocusRingHost)
+    assert dlg._cancel_ring_host._button is dlg._cancel_btn
+    # Strong dialog ref must survive a GC sweep (PySide eventFilter pitfall).
+    host_id = id(dlg._cancel_ring_host)
+    gc.collect()
+    assert id(dlg._cancel_ring_host) == host_id
+    dlg.close()
+
+
+def test_focus_ring_host_event_filter_tolerates_missing_button(qapp):
+    """Resurrected / tearing-down wrappers must not raise in eventFilter."""
+    btn = QPushButton("Cancel")
+    host = _FocusRingHost(btn, ring="#2563EB")
+    del host.__dict__["_button"]
+    focus = QEvent(QEvent.Type.FocusIn)
+    assert host.eventFilter(btn, focus) is False
+    host.paintEvent(QEvent(QEvent.Type.Paint))
+    btn.deleteLater()
+    host.deleteLater()

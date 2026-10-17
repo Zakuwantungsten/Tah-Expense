@@ -10,7 +10,7 @@ from typing import Annotated, Any
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from pymongo import UpdateOne
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import BulkWriteError, DuplicateKeyError
 
 from .audit_ops import record_operation_event
 from .dependencies import Authenticated, require_roles
@@ -57,6 +57,41 @@ _REGISTER_ROLES = ("admin", "cashier", "accountant")
 RegisterActor = Annotated[dict[str, Any], Depends(require_roles(*_REGISTER_ROLES))]
 
 _client_row_index_ensured = False
+
+
+def _normalize_user_oid(value: Any) -> ObjectId | None:
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return value
+    try:
+        return object_id(str(value))
+    except ValueError:
+        return None
+
+
+async def _cashier_names_map(db: Any, cashier_ids: list[ObjectId]) -> dict[str, str]:
+    """Bulk user display names keyed by ObjectId string (Browse Phase 1)."""
+    oids = [oid for oid in cashier_ids if oid is not None]
+    if not oids:
+        return {}
+    try:
+        docs = await db.users.find(
+            {"_id": {"$in": list(set(oids))}},
+            {"_id": 1, "full_name": 1, "username": 1},
+        ).to_list(length=None)
+    except Exception:
+        return {str(oid): "Unknown cashier" for oid in set(oids)}
+    found: dict[str, str] = {}
+    for doc in docs:
+        name = (doc.get("full_name") or "").strip()
+        if not name:
+            name = (doc.get("username") or "").strip()
+        found[str(doc["_id"])] = name or "Unknown cashier"
+    return {
+        str(oid): found.get(str(oid), "Unknown cashier")
+        for oid in set(oids)
+    }
 
 
 async def _ensure_client_row_id_index(db: Any) -> None:
@@ -296,15 +331,23 @@ async def overview_stats(
     actor: RegisterActor,
     cashier_id: str | None = None,
 ) -> dict:
+    """Month/today KPIs for Cashier Overview — all cashiers by default.
+
+    Optional ``cashier_id`` narrows the aggregate; otherwise Overview mirrors
+    Merged browse and includes every non-trashed row for the period.
+    """
+    _ = actor  # auth via RegisterActor
     db = _database(request)
     today = date.today()
     today_start = datetime(today.year, today.month, today.day)
     today_end = datetime(today.year, today.month, today.day, 23, 59, 59)
     month_start = datetime(today.year, today.month, 1)
-    scope = _actor_cashier_id(actor, cashier_id)
+    scope = _valid_id(cashier_id) if cashier_id else None
 
     def _money_group(match: dict[str, Any]) -> list[dict[str, Any]]:
-        scoped = {**match, "cashier_id": scope, "trashed": {"$ne": True}}
+        scoped: dict[str, Any] = {**match, "trashed": {"$ne": True}}
+        if scope is not None:
+            scoped["cashier_id"] = scope
         return [
             {"$match": scoped},
             {
@@ -343,10 +386,11 @@ async def overview_stats(
     month_res = await aggregate_list(db.transactions, 
         _money_group({"date": {"$gte": month_start}})
     , 1)
+    recent_match: dict[str, Any] = {"trashed": {"$ne": True}}
+    if scope is not None:
+        recent_match["cashier_id"] = scope
     recent_docs = (
-        await db.transactions.find(
-            {"cashier_id": scope, "trashed": {"$ne": True}}
-        )
+        await db.transactions.find(recent_match)
         .sort([("date", -1), ("created_at", -1)])
         .limit(8)
         .to_list(8)
@@ -384,17 +428,22 @@ async def overview_charts(
     top_payees: int = Query(5, ge=1, le=12),
     cashier_id: str | None = None,
 ) -> dict:
-    """Item donut + daily money/counts + named-payee series for cashier Overview."""
+    """Item donut + daily money/counts + named-payee series for cashier Overview.
+
+    Aggregates all cashiers by default (same as Merged browse). Pass
+    ``cashier_id`` only when intentionally narrowing to one owner.
+    """
+    _ = actor  # auth via RegisterActor
     fy = int(year or date.today().year)
     year_start = datetime(fy, 1, 1)
     year_end = datetime(fy, 12, 31, 23, 59, 59)
-    scope = _actor_cashier_id(actor, cashier_id)
     match: dict[str, Any] = {
-        "cashier_id": scope,
         "date": {"$gte": year_start, "$lte": year_end},
         "trashed": {"$ne": True},
         "discarded": {"$ne": True},
     }
+    if cashier_id:
+        match["cashier_id"] = _valid_id(cashier_id)
     docs = (
         await _database(request)
         .transactions.find(
@@ -428,21 +477,21 @@ async def cashier_daily_uploads(
     actor: RegisterActor,
     limit: int = Query(100, ge=1, le=500),
     cashier_id: str | None = None,
-) -> list[dict[str, Any]]:
+) -> dict:
     """Excel upload batches for Browse → Uploads.
 
-    Cashiers only see their own batches; admin/accountant see all (optional filter).
+    Shared list (all cashiers) by default — same idea as Merged browse.
+    Optional ``cashier_id`` narrows; phantom null-id heal stays own-only for cashiers.
+    Phase 1 composite: ``{items, total, cashier_names}``.
     """
-    if cashier_id:
-        scope: ObjectId | None = _valid_id(cashier_id)
-    elif str(actor.get("role") or "").lower() == "cashier":
-        scope = _actor_cashier_id(actor, None)
-    else:
-        scope = None
+    scope: ObjectId | None = _valid_id(cashier_id) if cashier_id else None
     db = _database(request)
     heal_filter: dict[str, Any] = null_daily_import_id_filter()
-    if scope is not None:
-        heal_filter = {"$and": [heal_filter, {"cashier_id": scope}]}
+    heal_scope = scope
+    if heal_scope is None and str(actor.get("role") or "").lower() == "cashier":
+        heal_scope = _actor_cashier_id(actor, None)
+    if heal_scope is not None:
+        heal_filter = {"$and": [heal_filter, {"cashier_id": heal_scope}]}
     await db.transactions.update_many(
         heal_filter,
         {
@@ -458,7 +507,21 @@ async def cashier_daily_uploads(
         daily_uploads_pipeline(limit=limit, cashier_id=scope),
         length=limit,
     )
-    return json_safe(rows)
+    cashier_oids = [
+        oid
+        for oid in (_normalize_user_oid(row.get("cashier_id")) for row in rows)
+        if oid is not None
+    ]
+    names = await _cashier_names_map(db, cashier_oids)
+    # Composite payload (Phase 1). Clients that still expect a bare list keep
+    # working via ``payload if list else payload["items"]``.
+    return json_safe(
+        {
+            "items": rows,
+            "total": len(rows),
+            "cashier_names": names,
+        }
+    )
 
 
 @transactions.get("/by-category")
@@ -558,13 +621,19 @@ async def daily_summaries(
         {"$sort": {"_id.year": -1, "_id.month": -1, "_id.day": -1}},
         {"$limit": limit},
     ]
-    docs = await aggregate_list(_database(request).transactions, pipeline, length=limit)
+    db = _database(request)
+    docs = await aggregate_list(db.transactions, pipeline, length=limit)
     items = []
+    all_cashier_oids: list[ObjectId] = []
     for doc in docs:
         group = doc["_id"]
         cashier_ids = [
             cid for cid in (doc.get("cashier_ids") or []) if cid is not None
         ]
+        for cid in cashier_ids:
+            oid = _normalize_user_oid(cid)
+            if oid is not None:
+                all_cashier_oids.append(oid)
         items.append(
             {
                 "date": date(group["year"], group["month"], group["day"]).isoformat(),
@@ -576,7 +645,10 @@ async def daily_summaries(
                 "submitted_count": int(doc.get("submitted_count") or 0),
             }
         )
-    return json_safe({"items": items, "total": len(items)})
+    names = await _cashier_names_map(db, all_cashier_oids)
+    return json_safe(
+        {"items": items, "total": len(items), "cashier_names": names}
+    )
 
 
 @transactions.get("/flat")
@@ -599,14 +671,27 @@ async def transactions_flat(
         descriptions=descriptions,
         daily_import_id=daily_import_id,
     )
+    db = _database(request)
     docs = (
-        await _database(request)
-        .transactions.find(match)
+        await db.transactions.find(match)
         .sort([("date", -1), ("created_at", -1)])
         .limit(limit)
         .to_list(length=limit)
     )
-    return {"items": json_safe(docs), "total": len(docs)}
+    # Real match count (not page length) + names for this page — one RTT.
+    total = await db.transactions.count_documents(match)
+    cashier_oids: list[ObjectId] = []
+    for doc in docs:
+        for key in ("cashier_id", "last_edited_by"):
+            oid = _normalize_user_oid(doc.get(key))
+            if oid is not None:
+                cashier_oids.append(oid)
+    names = await _cashier_names_map(db, cashier_oids)
+    return {
+        "items": json_safe(docs),
+        "total": int(total),
+        "cashier_names": names,
+    }
 
 
 @transactions.get("/browse/items")
@@ -647,8 +732,7 @@ async def browse_descriptions(
     return {"items": names, "total": len(names)}
 
 
-@transactions.get("/meta/months")
-async def available_months(request: Request, _actor: RegisterActor) -> dict:
+async def _browse_month_items(db: Any) -> list[dict[str, int]]:
     pipeline = [
         {
             "$group": {
@@ -660,29 +744,47 @@ async def available_months(request: Request, _actor: RegisterActor) -> dict:
         },
         {"$sort": {"_id.year": -1, "_id.month": -1}},
     ]
-    docs = await aggregate_list(_database(request).transactions, pipeline, length=None)
-    items = [
+    docs = await aggregate_list(db.transactions, pipeline, length=None)
+    return [
         {"year": int(doc["_id"]["year"]), "month": int(doc["_id"]["month"])}
         for doc in docs
         if doc.get("_id")
     ]
+
+
+def _browse_years_from_months(months: list[dict[str, int]]) -> list[int]:
+    years = [int(row["year"]) for row in months if row.get("year") is not None]
+    today_y = date.today().year
+    for year in (today_y + 1, today_y, today_y - 1):
+        if year not in years:
+            years.append(year)
+    return sorted(set(years), reverse=True)
+
+
+@transactions.get("/meta/months")
+async def available_months(request: Request, _actor: RegisterActor) -> dict:
+    items = await _browse_month_items(_database(request))
     return {"items": items, "total": len(items)}
 
 
 @transactions.get("/meta/years")
 async def available_years(request: Request, _actor: RegisterActor) -> dict:
-    pipeline = [
-        {"$group": {"_id": {"$year": "$date"}}},
-        {"$sort": {"_id": -1}},
-    ]
-    docs = await aggregate_list(_database(request).transactions, pipeline, length=40)
-    years = [int(doc["_id"]) for doc in docs if doc.get("_id") is not None]
-    today_y = date.today().year
-    for year in (today_y + 1, today_y, today_y - 1):
-        if year not in years:
-            years.append(year)
-    years = sorted(set(years), reverse=True)
+    months = await _browse_month_items(_database(request))
+    years = _browse_years_from_months(months)
     return {"items": years, "total": len(years)}
+
+
+@transactions.get("/meta/bootstrap")
+async def browse_meta_bootstrap(request: Request, _actor: RegisterActor) -> dict:
+    """Browse Phase 3 — years + months in one RTT for period combos."""
+    months = await _browse_month_items(_database(request))
+    years = _browse_years_from_months(months)
+    return {
+        "years": years,
+        "months": months,
+        "total_years": len(years),
+        "total_months": len(months),
+    }
 
 
 @transactions.get("/descriptions")
@@ -1252,6 +1354,41 @@ def _duplicate_check_query(
     return query
 
 
+def _ci_eq(actual: Any, expected: str) -> bool:
+    """Case-insensitive exact match (same intent as anchored ``$regex`` / ``i``)."""
+    return str(actual or "").strip().casefold() == expected.strip().casefold()
+
+
+def _soft_dup_doc_matches(doc: dict[str, Any], *, candidate: Any) -> bool:
+    """In-memory filter matching ``_duplicate_check_query`` field rules."""
+    try:
+        if float(doc.get("amount") or 0) != float(candidate.amount):
+            return False
+    except (TypeError, ValueError):
+        return False
+    exclude_id = getattr(candidate, "exclude_id", None)
+    if exclude_id:
+        try:
+            if doc.get("_id") == _valid_id(exclude_id):
+                return False
+        except Exception:
+            pass
+    truck = (getattr(candidate, "truck_number", None) or "").strip()
+    if truck and not _ci_eq(doc.get("truck_number"), truck):
+        return False
+    item = (getattr(candidate, "item", None) or "").strip()
+    if item and not _ci_eq(doc.get("item"), item):
+        return False
+    description = (getattr(candidate, "description", None) or "").strip()
+    if description and not _ci_eq(doc.get("description"), description):
+        return False
+    return True
+
+
+# Soft-dup pool cap — advisory scan; keeps one find bounded for large days.
+_SOFT_DUP_POOL_LIMIT = 5000
+
+
 @transactions.post("/check-duplicates")
 async def check_for_duplicates(
     body: DuplicateCheckRequest, request: Request, _actor: RegisterActor
@@ -1278,26 +1415,52 @@ async def check_for_duplicates(
 async def check_for_duplicates_bulk(
     body: DuplicateCheckBulkRequest, request: Request, _actor: RegisterActor
 ) -> dict:
-    """One RTT soft-duplicate scan for up to 100 register candidates."""
+    """One RTT soft-duplicate scan for up to 100 register candidates.
+
+    Fetches a single amount-filtered pool for the window, then matches each
+    candidate in memory (same case-insensitive exact rules as the single check).
+    """
+    if not body.candidates:
+        return {"results": [], "total": 0}
+
     db = _database(request)
+    cutoff = utcnow().replace(tzinfo=None) - timedelta(days=body.days)
+    amounts: list[float] = []
+    seen_amounts: set[float] = set()
+    for candidate in body.candidates:
+        try:
+            amount = float(candidate.amount)
+        except (TypeError, ValueError):
+            continue
+        if amount not in seen_amounts:
+            seen_amounts.add(amount)
+            amounts.append(amount)
+
+    pool: list[dict[str, Any]] = []
+    if amounts:
+        pool = (
+            await db.transactions.find(
+                {
+                    "date": {"$gte": cutoff},
+                    "rejected": {"$ne": True},
+                    "amount": {"$in": amounts},
+                }
+            )
+            .sort("date", -1)
+            .to_list(length=_SOFT_DUP_POOL_LIMIT)
+        )
+
     results: list[dict[str, Any]] = []
     for index, candidate in enumerate(body.candidates):
-        query = _duplicate_check_query(
-            days=body.days,
-            truck_number=candidate.truck_number,
-            amount=candidate.amount,
-            item=candidate.item,
-            description=candidate.description,
-            exclude_id=candidate.exclude_id,
-        )
-        docs = (
-            await db.transactions.find(query)
-            .sort("date", -1)
-            .limit(10)
-            .to_list(length=10)
-        )
+        hits: list[dict[str, Any]] = []
+        for doc in pool:
+            if not _soft_dup_doc_matches(doc, candidate=candidate):
+                continue
+            hits.append(doc)
+            if len(hits) >= 10:
+                break
         results.append(
-            {"index": index, "items": json_safe(docs), "total": len(docs)}
+            {"index": index, "items": json_safe(hits), "total": len(hits)}
         )
     return {"results": results, "total": len(results)}
 
@@ -1355,56 +1518,182 @@ async def _create_one_transaction_doc(
     return "created", doc
 
 
+def _client_row_key(doc: dict[str, Any]) -> tuple[Any, str] | None:
+    client_row_id = doc.get("client_row_id")
+    cashier_id = doc.get("cashier_id")
+    if isinstance(client_row_id, str) and client_row_id and cashier_id is not None:
+        return cashier_id, client_row_id
+    return None
+
+
+async def _prefetch_existing_by_client_row_id(
+    db: Any, docs: list[dict[str, Any]]
+) -> dict[tuple[Any, str], dict[str, Any]]:
+    """One (or few) finds for existing ``(cashier_id, client_row_id)`` pairs."""
+    by_cashier: dict[Any, set[str]] = {}
+    for doc in docs:
+        key = _client_row_key(doc)
+        if key is None:
+            continue
+        cashier_id, client_row_id = key
+        by_cashier.setdefault(cashier_id, set()).add(client_row_id)
+
+    found: dict[tuple[Any, str], dict[str, Any]] = {}
+    for cashier_id, row_ids in by_cashier.items():
+        id_list = list(row_ids)
+        cursor = db.transactions.find(
+            {"cashier_id": cashier_id, "client_row_id": {"$in": id_list}}
+        )
+        existing = await cursor.to_list(length=len(id_list))
+        for doc in existing:
+            crid = doc.get("client_row_id")
+            if isinstance(crid, str) and crid:
+                found[(cashier_id, crid)] = doc
+    return found
+
+
 @transactions.post("/bulk-create")
 async def bulk_create_transactions(
     body: TransactionBulkCreateRequest,
     request: Request,
     actor: RegisterActor,
 ) -> dict:
-    """Create many register drafts in one request (per-item idempotent)."""
+    """Create many register drafts in one request (per-item idempotent).
+
+    Prefetches existing ``client_row_id``s, then ``insert_many`` for the rest.
+    Duplicate-key races still map to ``already_exists`` (zero double-insert).
+    """
     if not body.items:
         return {"results": [], "created": 0, "already_exists": 0, "errors": 0}
 
     db = _database(request)
     await _ensure_client_row_id_index(db)
 
-    results: list[dict[str, Any]] = []
-    created_ids: list[str] = []
-    n_created = n_exists = n_errors = 0
+    slots: list[dict[str, Any] | None] = [None] * len(body.items)
+    prepared: list[tuple[int, dict[str, Any]]] = []
 
     for index, item in enumerate(body.items):
         try:
-            doc = _create_document(item, actor)
-            status_key, saved = await _create_one_transaction_doc(
-                db=db,
-                doc=doc,
-                actor=actor,
-                request=request,
-                record_event=False,
+            prepared.append((index, _create_document(item, actor)))
+        except Exception as exc:
+            slots[index] = {
+                "index": index,
+                "status": "error",
+                "transaction": None,
+                "error": str(exc) or type(exc).__name__,
+            }
+
+    existing_map = await _prefetch_existing_by_client_row_id(
+        db, [doc for _i, doc in prepared]
+    )
+
+    to_insert: list[tuple[int, dict[str, Any]]] = []
+    for index, doc in prepared:
+        key = _client_row_key(doc)
+        if key is not None and key in existing_map:
+            slots[index] = {
+                "index": index,
+                "status": "already_exists",
+                "transaction": json_safe(existing_map[key]),
+                "error": None,
+            }
+            continue
+        doc.setdefault("_id", ObjectId())
+        to_insert.append((index, doc))
+
+    async def _resolve_duplicate(index: int, doc: dict[str, Any]) -> None:
+        key = _client_row_key(doc)
+        existing = existing_map.get(key) if key is not None else None
+        if existing is None and key is not None:
+            existing = await db.transactions.find_one(
+                {"cashier_id": key[0], "client_row_id": key[1]}
             )
-            if status_key == "created":
-                n_created += 1
-                created_ids.append(str(saved["_id"]))
-            else:
-                n_exists += 1
-            results.append(
-                {
+            if existing is not None:
+                existing_map[key] = existing
+        if existing is not None:
+            slots[index] = {
+                "index": index,
+                "status": "already_exists",
+                "transaction": json_safe(existing),
+                "error": None,
+            }
+            return
+        slots[index] = {
+            "index": index,
+            "status": "error",
+            "transaction": None,
+            "error": "duplicate_key_without_existing_row",
+        }
+
+    if to_insert:
+        docs_only = [doc for _i, doc in to_insert]
+        try:
+            await db.transactions.insert_many(docs_only, ordered=False)
+            for index, doc in to_insert:
+                slots[index] = {
                     "index": index,
-                    "status": status_key,
-                    "transaction": json_safe(saved),
+                    "status": "created",
+                    "transaction": json_safe(doc),
                     "error": None,
                 }
-            )
+        except BulkWriteError as exc:
+            details = exc.details or {}
+            err_by_index = {
+                int(err["index"]): err
+                for err in (details.get("writeErrors") or [])
+                if err.get("index") is not None
+            }
+            for batch_i, (index, doc) in enumerate(to_insert):
+                err = err_by_index.get(batch_i)
+                if err is None:
+                    slots[index] = {
+                        "index": index,
+                        "status": "created",
+                        "transaction": json_safe(doc),
+                        "error": None,
+                    }
+                    continue
+                if int(err.get("code") or 0) == 11000:
+                    await _resolve_duplicate(index, doc)
+                    continue
+                slots[index] = {
+                    "index": index,
+                    "status": "error",
+                    "transaction": None,
+                    "error": str(err.get("errmsg") or err) or "bulk_write_error",
+                }
         except Exception as exc:
-            n_errors += 1
-            results.append(
-                {
+            for index, _doc in to_insert:
+                if slots[index] is not None:
+                    continue
+                slots[index] = {
                     "index": index,
                     "status": "error",
                     "transaction": None,
                     "error": str(exc) or type(exc).__name__,
                 }
-            )
+
+    results = [
+        slot
+        if slot is not None
+        else {
+            "index": i,
+            "status": "error",
+            "transaction": None,
+            "error": "not processed",
+        }
+        for i, slot in enumerate(slots)
+    ]
+    n_created = sum(1 for r in results if r["status"] == "created")
+    n_exists = sum(1 for r in results if r["status"] == "already_exists")
+    n_errors = sum(1 for r in results if r["status"] == "error")
+    created_ids = [
+        str(r["transaction"]["_id"])
+        for r in results
+        if r["status"] == "created"
+        and isinstance(r.get("transaction"), dict)
+        and r["transaction"].get("_id")
+    ]
 
     if created_ids:
         await record_operation_event(
@@ -1665,11 +1954,17 @@ async def apply_description_mapping(
     if not keys:
         raise ApiError(422, "empty_keys", "At least one description key is required")
 
-    category_id = _valid_id(body.category_id)
-    payee = " ".join((body.payee or "").strip().upper().split())
-    item_name = " ".join((body.category_name or "").strip().split())
-    if not item_name:
-        raise ApiError(422, "empty_item", "Item / category name is required")
+    clear = bool(body.clear)
+    if clear:
+        category_id = None
+        payee = ""
+        item_name = ""
+    else:
+        category_id = _valid_id(body.category_id)
+        payee = " ".join((body.payee or "").strip().upper().split())
+        item_name = " ".join((body.category_name or "").strip().split())
+        if not item_name:
+            raise ApiError(422, "empty_item", "Item / category name is required")
 
     parsed_dates: list[date] = []
     for raw in body.dates or []:
@@ -1735,7 +2030,7 @@ async def apply_description_mapping(
     matched = int(result.matched_count)
     await record_operation_event(
         db,
-        action="txn.bulk_mapping_apply",
+        action="txn.bulk_mapping_clear" if clear else "txn.bulk_mapping_apply",
         actor=actor,
         request=request,
         entity_type="transaction",
@@ -1747,6 +2042,7 @@ async def apply_description_mapping(
             "client_job_id": body.client_job_id,
             "payee": payee,
             "item": item_name,
+            "clear": clear,
             "dates": [day.isoformat() for day in parsed_dates][:40],
         },
     )
@@ -2048,6 +2344,16 @@ async def insert_pending_edit(
     pending.pop("_id", None)
     pending.update(updates)
     pending.update(meta)
+    # Clones must not reuse register/import idempotency keys — unique indexes
+    # on those fields would reject the insert (409 "already exists").
+    for key in (
+        "client_row_id",
+        "daily_import_id",
+        "import_row_key",
+        "master_import_source",
+        "master_serial",
+    ):
+        pending.pop(key, None)
     pending["created_at"] = now
     result = await db.transactions.insert_one(pending)
     pending["_id"] = result.inserted_id

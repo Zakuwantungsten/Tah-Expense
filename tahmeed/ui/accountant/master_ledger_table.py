@@ -235,7 +235,9 @@ class MasterLedgerTable(QFrame):
         self._sort_asc = False
         self._col_filters: Dict[int, Set[str]] = {}
         # Distinct values for the whole selected range (from DB), keyed by col.
+        # Filled lazily on ▾ open (not on every reload).
         self._col_value_cache: Dict[int, Set[str]] = {}
+        self._column_values_loader = None  # async (col) -> Set[str]
         self._txs: List[Optional[Transaction]] = []
         self._edit_mode = False
         self._dirty_rows: Set[int] = set()
@@ -286,6 +288,10 @@ class MasterLedgerTable(QFrame):
         filter_hdr.set_value_provider(self._filter_menu_values)
         filter_hdr.set_label_provider(
             lambda c: _COLS[c][0] if 0 <= c < len(_COLS) else "",
+        )
+        filter_hdr.set_async_value_loader(
+            self._load_column_values_async,
+            cache_hit_check=lambda c: c in self._col_value_cache,
         )
         filter_hdr.filter_changed.connect(self._on_col_filter_changed)
         filter_hdr.sort_requested.connect(self._on_excel_sort)
@@ -492,11 +498,15 @@ class MasterLedgerTable(QFrame):
 
     def clear_column_filters(self) -> None:
         self._col_filters.clear()
-        self._col_value_cache.clear()
+        self.clear_column_value_cache()
         hdr = self._tbl.horizontalHeader()
         if isinstance(hdr, ExcelFilterHeaderView):
             hdr.clear_filters()
         self._show_all_rows()
+
+    def clear_column_value_cache(self) -> None:
+        """Drop cached ▾ distincts (e.g. after range / cascade filter change)."""
+        self._col_value_cache.clear()
 
     def reset_default_sort(self) -> None:
         """Restore newest-first date sort (Clear filters)."""
@@ -521,6 +531,13 @@ class MasterLedgerTable(QFrame):
         self._col_value_cache = {
             int(c): set(vals) for c, vals in (cache or {}).items()
         }
+
+    def set_column_values_loader(self, loader) -> None:
+        """``async def loader(col: int) -> Set[str]`` for lazy ▾ distincts."""
+        self._column_values_loader = loader
+
+    def put_column_value_cache(self, col: int, values: Set[str]) -> None:
+        self._col_value_cache[int(col)] = set(values or set())
 
     def _cell_text(self, row: int, col: int) -> str:
         it = self._tbl.item(row, col)
@@ -547,11 +564,27 @@ class MasterLedgerTable(QFrame):
         # Prefer full-range distincts from DB (already cascaded by the service).
         if col in self._col_value_cache:
             return set(self._col_value_cache.get(col) or set())
+        # Until lazy fetch finishes, seed from loaded page rows.
         return cascade_column_values(
             self._filter_source_rows(),
             target_col=col,
             active_filters=self._col_filters,
         )
+
+    async def _load_column_values_async(self, col: int) -> Set[str]:
+        if col in self._col_value_cache:
+            return set(self._col_value_cache[col])
+        loader = self._column_values_loader
+        if loader is None:
+            return self._filter_menu_values(col)
+        # Caching is owned by the loader (generation-aware on MasterExpenses).
+        return set(await loader(col) or set())
+
+    def sync_column_filter_header(self) -> None:
+        """Re-paint ▾ active indicators after a keep-filters reload."""
+        hdr = self._tbl.horizontalHeader()
+        if isinstance(hdr, ExcelFilterHeaderView):
+            hdr.sync_active(self._col_filters)
 
     def _on_col_filter_changed(self, col: int, accepted) -> None:
         accepted = set(accepted or [])
