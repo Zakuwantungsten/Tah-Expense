@@ -173,6 +173,8 @@ class FakeCollection:
             if "$match" in stage:
                 docs = [d for d in docs if _matches(d, stage["$match"])]
             elif "$group" in stage:
+                from app.import_ops import doc_money_parts
+
                 group = stage["$group"]
                 gid = group.get("_id")
                 buckets: dict[str, dict] = {}
@@ -189,6 +191,8 @@ class FakeCollection:
                             "_id": key,
                             "source_filename": d.get("daily_import_source"),
                             "count": 0,
+                            "total_tzs": 0.0,
+                            "total_usd": 0.0,
                             "primary_date": d.get("import_primary_date"),
                             "min_date": d.get("date"),
                             "max_date": d.get("date"),
@@ -199,11 +203,24 @@ class FakeCollection:
                         },
                     )
                     bucket["count"] += 1
+                    tzs, usd = doc_money_parts(d)
+                    bucket["total_tzs"] += tzs
+                    bucket["total_usd"] += usd
                     if d.get("possible_duplicate"):
                         bucket["duplicate_count"] += 1
                 docs = list(buckets.values())
             elif "$sort" in stage:
                 continue
+            elif "$facet" in stage:
+                facet = stage["$facet"]
+                items = list(docs)
+                for sub in facet.get("items") or []:
+                    if "$skip" in sub:
+                        items = items[int(sub["$skip"]) :]
+                    elif "$limit" in sub:
+                        items = items[: int(sub["$limit"])]
+                meta = [{"total": len(docs)}] if docs else []
+                docs = [{"items": items, "meta": meta}]
             elif "$limit" in stage:
                 docs = docs[: int(stage["$limit"])]
         return FakeCursor(docs)

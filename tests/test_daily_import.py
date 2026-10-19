@@ -17,6 +17,8 @@ from tahmeed.services.daily_import_service import (
     absorb_import_problems,
     analyze_date_allocation,
     apply_date_policy,
+    daily_batch_content_hash,
+    daily_batch_content_hash_from_txs,
     detect_date_from_name,
     normalize_receipt,
     parse_amount,
@@ -721,4 +723,47 @@ def test_master_query_filters_by_excel_date() -> None:
     assert q["date"]["$lte"].month == 12
     assert "import_primary_date" not in q
     assert "$or" not in q
+
+
+def _sample_import_row(**kwargs) -> DailyImportRow:
+    defaults = dict(
+        serial=1,
+        date=datetime(2026, 8, 20),
+        description="PARKING",
+        truck_number="YARD",
+        lpo_do="",
+        do_number="",
+        memo="",
+        notes="",
+        amount=5000.0,
+        currency="TZS",
+        receipt_status="pending",
+        ownership="",
+        approver="",
+    )
+    defaults.update(kwargs)
+    return DailyImportRow(**defaults)
+
+
+def test_daily_batch_content_hash_stable_and_order_sensitive() -> None:
+    a = _sample_import_row(description="A", amount=100)
+    b = _sample_import_row(description="B", amount=200)
+    h1 = daily_batch_content_hash([a, b])
+    h2 = daily_batch_content_hash([a, b])
+    assert h1 == h2
+    assert h1 != daily_batch_content_hash([b, a])
+    assert h1 != daily_batch_content_hash([a])
+
+
+def test_daily_batch_content_hash_matches_saved_txs() -> None:
+    row = _sample_import_row(memo="NOTE")
+    tx = Transaction(
+        date=row.date,
+        description=row.description,
+        truck_number=row.truck_number,
+        amount=row.amount,
+        currency=row.currency,
+        memo=row.memo,
+    )
+    assert daily_batch_content_hash([row]) == daily_batch_content_hash_from_txs([tx])
 

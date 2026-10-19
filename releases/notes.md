@@ -1,3 +1,5 @@
+- 4.7.12: Sidebar item tabs (Items → show in sidebar) — auto-fit table column widths on first open so ITEM / DESCRIPTION etc. are readable without manual resize each session
+- 4.7.11: Daily Register Save — faster + safer: fix post-save “Failed to load” (`_FocusRingHost` event-filter crash left the grid stale while Saved showed the real count); bulk create uses true `insert_many` + batched soft-dup; chunk size 100; online Save queues to the durable outbox and promotes on ACK (no blocking “Draft saved” dialog / full reload on clean success); Submit still awaits sync create
 - 4.7.10: Daily Register Table — Excel-style Filter toolbar toggle to show/hide column ▾ filters and clear them in one click (cashier + accountant)
 - 4.7.9: Browse period combos — one bootstrap call for years + months (fewer HTTP round-trips before Find)
 - 4.7.8: Browse Advanced Item / Sub-Item filters load lazily on ▾ open (no distincts fetch on every Find)

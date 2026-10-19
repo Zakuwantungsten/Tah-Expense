@@ -6635,9 +6635,10 @@ class ZambiaParkingImportDialog(QDialog):
                 for u in matching[:3]
             )
             self._stats_lbl.setText(
-                f"Exact file contents already uploaded ({names}"
-                f"{'…' if len(matching) > 3 else ''}) — import blocked. "
-                f"Trucks are not checked until the file is new."
+                f"Already imported — same statement content as {names}"
+                f"{'…' if len(matching) > 3 else ''}. Import blocked "
+                f"(open the prior upload instead). Trucks are not checked "
+                f"until the file is new."
             )
             self._import_btn.setEnabled(False)
             self._import_btn.setText("Already Uploaded")
@@ -6715,7 +6716,9 @@ class ZambiaParkingImportDialog(QDialog):
                     QMessageBox.warning(
                         self,
                         "Already Uploaded",
-                        "This exact statement content was already uploaded — import blocked.",
+                        "Already imported — this exact statement content is already "
+                        "in the system.\n\nImport is blocked. Open the prior upload "
+                        "instead of importing again.",
                     )
                     self._import_btn.setEnabled(False)
                     self._import_btn.setText("Already Uploaded")

@@ -49,9 +49,13 @@ _HDR_BG    = "#F1F5F9"
 _STRIPE    = "#F1F5F9"
 _ROW_EVEN  = "#FFFFFF"
 _ROW_ODD   = "#F1F5F9"   # slate-100 — manual stripe (readable on all row types)
+_EXISTING_BG = "#fff8f0"  # matched original expense (register saved tint)
 _HDR_H     = 24
 _ROW_H     = 26
 _CELL_FONT_PX = 12
+# Checkbox UserRole: index into _transactions, or -1 for a matched-original row.
+_TX_IDX_ROLE = Qt.UserRole
+_MATCH_ROW_MARKER = -1
 
 _SCROLL_CHUNK      = 50
 _SELECT_ALL_CHUNK  = 500
@@ -1068,6 +1072,7 @@ class VerifyInboxWidget(QWidget):
         self._categories: List[str] = []
         self._category_objects: List[Category] = []
         self._transactions: List[Transaction] = []
+        self._duplicate_matches: Dict[ObjectId, Transaction] = {}
         self._cashier_names: Dict = {}
         self._loaded = 0
         self._total = 0
@@ -1475,11 +1480,14 @@ class VerifyInboxWidget(QWidget):
         self._open_review_panel(item.row())
 
     def _open_review_panel(self, row: int) -> None:
-        if row < 0 or row >= len(self._transactions):
+        idx = self._tx_index_for_table_row(row)
+        if idx is None:
             return
-        asyncio.ensure_future(self._open_review_panel_async(row))
+        asyncio.ensure_future(self._open_review_panel_async(idx))
 
     async def _open_review_panel_async(self, row: int) -> None:
+        if row < 0 or row >= len(self._transactions):
+            return
         tx = self._transactions[row]
         if self._tx_needs_item(tx) and tx.description:
             from tahmeed.services.description_mapping_service import resolve_category_for_description
@@ -1588,6 +1596,8 @@ class VerifyInboxWidget(QWidget):
                     cname_map.update(page_names)
                     self._cashier_names = cname_map
 
+                if self._current_tab == 3:
+                    await self._merge_duplicate_matches(txs)
                 self._fill_table(txs, cname_map, self._loaded, append=True)
                 self._loaded += len(txs)
 
@@ -1846,6 +1856,9 @@ class VerifyInboxWidget(QWidget):
                 new_count, edited_count, rejected_count,
                 issues_count, deleted_count, restore_count,
             )
+            if tab == 3:
+                self._duplicate_matches = {}
+                await self._merge_duplicate_matches(txs)
             self._fill_table(txs, cname_map, 0, append=False)
             self._loaded = len(txs)
             self._pending_badge.setText(str(pending))
@@ -1907,6 +1920,8 @@ class VerifyInboxWidget(QWidget):
                 self._cashier_names = cname_map
 
             if txs:
+                if self._current_tab == 3:
+                    await self._merge_duplicate_matches(txs)
                 self._fill_table(txs, cname_map, self._loaded, append=True)
                 self._loaded += len(txs)
         except Exception:
@@ -1916,6 +1931,89 @@ class VerifyInboxWidget(QWidget):
             self._update_status()
 
     # ── Table fill ──────────────────────────────────────────────────────────────
+
+    async def _merge_duplicate_matches(self, txs: List[Transaction]) -> None:
+        """Batch-load matched originals for Issues duplicate pairs."""
+        needed: List[ObjectId] = []
+        for tx in txs:
+            if not getattr(tx, "possible_duplicate", False):
+                continue
+            oid = getattr(tx, "duplicate_of_id", None)
+            if oid is not None and oid not in self._duplicate_matches:
+                needed.append(oid)
+        if not needed:
+            return
+        from tahmeed.services.accountant_service import get_transactions_by_ids
+
+        try:
+            found = await get_transactions_by_ids(needed)
+        except Exception:
+            return
+        for match in found:
+            if match._id is not None:
+                self._duplicate_matches[match._id] = match
+
+    def _tx_index_for_table_row(self, row: int) -> Optional[int]:
+        """Map a visible table row to ``_transactions`` index (None for match rows)."""
+        it = self._table.item(row, _COL_CHK)
+        if it is None:
+            return None
+        data = it.data(_TX_IDX_ROLE)
+        if data is None:
+            return row if 0 <= row < len(self._transactions) else None
+        try:
+            idx = int(data)
+        except (TypeError, ValueError):
+            return None
+        if idx == _MATCH_ROW_MARKER or idx < 0:
+            return None
+        return idx if idx < len(self._transactions) else None
+
+    def _append_matched_expense_row(
+        self,
+        t: QTableWidget,
+        match: Transaction,
+        cnames: Dict,
+    ) -> None:
+        """Non-selectable cream row showing the original expense under a duplicate."""
+        r = t.rowCount()
+        t.insertRow(r)
+
+        chk = QTableWidgetItem("")
+        chk.setFlags(Qt.ItemIsEnabled)
+        chk.setData(_TX_IDX_ROLE, _MATCH_ROW_MARKER)
+        chk.setTextAlignment(Qt.AlignCenter)
+        t.setItem(r, _COL_CHK, chk)
+
+        sn = QTableWidgetItem("↳")
+        sn.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+        sn.setForeground(QColor(_T2))
+        sn.setFlags(sn.flags() & ~Qt.ItemIsEditable)
+        t.setItem(r, _COL_SN, sn)
+
+        t.setItem(r, _COL_DATE, _cell(_fmt_date(match.date), color=_T2))
+        cashier = cnames.get(match.cashier_id, "") if match.cashier_id else ""
+        t.setItem(r, _COL_CASH, _cell(_short_name(cashier), color=_T2))
+        t.setItem(r, _COL_ITEM, _cell(match.item or match.category_name or "—"))
+        t.setItem(
+            r,
+            _COL_PAYEE,
+            _cell((match.payee or "").strip() or "—", color=_T2),
+        )
+        t.setItem(r, _COL_DESC, _cell(match.description or "—"))
+        t.setItem(r, _COL_TRUCK, _cell(match.truck_number or "—", color=_T2))
+        t.setItem(
+            r,
+            _COL_AMT,
+            _cell(_fmt_amount(match), align=Qt.AlignRight | Qt.AlignVCenter),
+        )
+        t.setItem(r, _COL_MEO, _cell(match.memo or "—", color=_T2))
+        t.setItem(r, _COL_NOTES, _cell(""))
+        t.setItem(r, _COL_RCPT, _cell(""))
+        issue = _cell("Matched expense", color=_T2)
+        issue.setToolTip("Existing expense that matched this duplicate warning")
+        t.setItem(r, _COL_APP, issue)
+        _finish_table_row(t, r, _EXISTING_BG)
 
     def _fill_table(
         self,
@@ -1930,6 +2028,10 @@ class VerifyInboxWidget(QWidget):
 
         if not append:
             self._transactions = list(txs)
+            # Matches are refreshed by the loader before fill; drop stale ones
+            # when leaving Issues or doing a full reload.
+            if tab != 3:
+                self._duplicate_matches = {}
             self._panel.hide()
             t.clearSpans()
             t.blockSignals(True)
@@ -1951,13 +2053,16 @@ class VerifyInboxWidget(QWidget):
             self._transactions.extend(txs)
             t.blockSignals(True)
 
+        base_idx = len(self._transactions) - len(txs)
         for i, tx in enumerate(txs):
             r = t.rowCount()
             t.insertRow(r)
+            abs_idx = base_idx + i
 
             chk = QTableWidgetItem()
             chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
             chk.setCheckState(Qt.Unchecked)
+            chk.setData(_TX_IDX_ROLE, abs_idx)
             chk.setTextAlignment(Qt.AlignCenter)
             t.setItem(r, _COL_CHK, chk)
 
@@ -1991,9 +2096,16 @@ class VerifyInboxWidget(QWidget):
             if tx.possible_duplicate:
                 desc_item.setBackground(QColor("#FEE2E2"))
                 desc_item.setForeground(QColor(_RED))
-                desc_item.setToolTip(
-                    "Cashier overrode a duplicate warning — similar entry exists in the system"
+                tip = (
+                    "Cashier overrode a duplicate warning — similar entry exists "
+                    "in the system"
                 )
+                if tab == 3 and getattr(tx, "duplicate_of_id", None):
+                    tip = (
+                        "Possible duplicate — matched original expense is shown "
+                        "on the cream row below"
+                    )
+                desc_item.setToolTip(tip)
             t.setItem(r, _COL_DESC, desc_item)
 
             t.setItem(r, _COL_TRUCK, _cell(tx.truck_number or "—", color=_T2))
@@ -2042,8 +2154,14 @@ class VerifyInboxWidget(QWidget):
                 row_bg = "#FFF7ED"
             elif tab == 3:
                 bits = []
+                match = None
                 if getattr(tx, "possible_duplicate", False):
                     bits.append("Duplicate")
+                    oid = getattr(tx, "duplicate_of_id", None)
+                    if oid is not None:
+                        match = self._duplicate_matches.get(oid)
+                    if match is not None:
+                        bits.append(f"vs {_fmt_date(match.date)}")
                 if getattr(tx, "date_discrepancy", False):
                     primary = getattr(tx, "import_primary_date", None)
                     if primary and hasattr(primary, "strftime"):
@@ -2053,7 +2171,16 @@ class VerifyInboxWidget(QWidget):
                 issue_item = _cell(" · ".join(bits) if bits else "Issue", color=_AMBER)
                 tip_parts = []
                 if getattr(tx, "possible_duplicate", False):
-                    tip_parts.append("Cashier overrode a duplicate warning.")
+                    if match is not None:
+                        tip_parts.append(
+                            "Cashier saved anyway — matched expense shown on the "
+                            "cream row below."
+                        )
+                    else:
+                        tip_parts.append(
+                            "Cashier overrode a duplicate warning "
+                            "(original match not recorded)."
+                        )
                 if getattr(tx, "date_discrepancy", False):
                     tip_parts.append(
                         "Row date differs from the Excel upload's main date."
@@ -2104,6 +2231,13 @@ class VerifyInboxWidget(QWidget):
                 if desc_cell:
                     desc_cell.setBackground(QColor("#FEE2E2"))
                     desc_cell.setForeground(QColor(_RED))
+
+            # Issues: show the matched original expense directly under the flag.
+            if tab == 3 and getattr(tx, "possible_duplicate", False):
+                oid = getattr(tx, "duplicate_of_id", None)
+                match = self._duplicate_matches.get(oid) if oid is not None else None
+                if match is not None:
+                    self._append_matched_expense_row(t, match, cnames)
 
         t.blockSignals(False)
         self._update_bulk_buttons()
@@ -2166,26 +2300,29 @@ class VerifyInboxWidget(QWidget):
             asyncio.ensure_future(self._do_reject_restore(tx_id))
 
     def _selected_tx_ids(self) -> List[ObjectId]:
-        checked = [
-            r for r in range(self._table.rowCount())
-            if self._table.item(r, _COL_CHK) and
-               self._table.item(r, _COL_CHK).checkState() == Qt.Checked
-        ]
-        return [
-            self._transactions[r]._id
-            for r in checked
-            if r < len(self._transactions) and self._transactions[r]._id
-        ]
+        ids: List[ObjectId] = []
+        for r in range(self._table.rowCount()):
+            chk = self._table.item(r, _COL_CHK)
+            if not chk or chk.checkState() != Qt.Checked:
+                continue
+            idx = self._tx_index_for_table_row(r)
+            if idx is None:
+                continue
+            tx = self._transactions[idx]
+            if tx._id:
+                ids.append(tx._id)
+        return ids
 
     def _on_bulk_approve(self) -> None:
-        checked = [
-            r for r in range(self._table.rowCount())
-            if self._table.item(r, _COL_CHK) and
-               self._table.item(r, _COL_CHK).checkState() == Qt.Checked
-        ]
-        if not checked:
-            return
-        tx_rows = [(r, self._transactions[r]) for r in checked if r < len(self._transactions)]
+        tx_rows: List[Tuple[int, Transaction]] = []
+        for r in range(self._table.rowCount()):
+            chk = self._table.item(r, _COL_CHK)
+            if not chk or chk.checkState() != Qt.Checked:
+                continue
+            idx = self._tx_index_for_table_row(r)
+            if idx is None:
+                continue
+            tx_rows.append((r, self._transactions[idx]))
         if not tx_rows:
             return
 

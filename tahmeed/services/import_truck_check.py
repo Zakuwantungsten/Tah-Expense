@@ -17,7 +17,7 @@ from tahmeed.services.truck_format import (
     normalize_truck_number,
     try_match_fleet,
 )
-from tahmeed.ui.dialogs.truck_correction_dialog import TruckIssue
+from tahmeed.ui.dialogs.truck_correction_dialog import TruckIssue, snapshot_row_details
 
 # feed_type / expense_type → truck column on the import record
 FEED_TRUCK_FIELDS: Dict[str, str] = {
@@ -356,6 +356,8 @@ def scan_import_trucks(
             original=raw,
             kind=status if status in ("invalid_format", "not_in_registry") else "not_in_registry",
             combo_suffix=combo_suffix_of(raw),
+            row_label=f"File row {i + 1}",
+            row_details=snapshot_row_details(row),
         ))
     return result
 

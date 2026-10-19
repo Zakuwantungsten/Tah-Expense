@@ -77,7 +77,7 @@ class ZambiaDuplicateReviewDialog(QDialog):
         root.setContentsMargins(18, 18, 18, 18)
         root.setSpacing(10)
 
-        title = QLabel("This exact statement was already uploaded")
+        title = QLabel("Already imported — this exact statement is in the system")
         title.setStyleSheet(f"font-size:16px; font-weight:700; color:{_T1};")
         root.addWidget(title)
 
@@ -95,10 +95,10 @@ class ZambiaDuplicateReviewDialog(QDialog):
         root.addWidget(summary)
 
         hint = QLabel(
-            "Import is blocked because every row in this file matches an existing "
-            "Zambia Parking upload (exact content). Ticket numbers are not checked "
-            "individually — only the whole statement body. Truck registry checks "
-            "still run on new imports."
+            "Import is blocked — you are reimporting a statement that is already "
+            "uploaded (exact file content). Open the prior upload below instead of "
+            "importing again. Ticket numbers are not checked individually; only the "
+            "whole statement body. Truck registry checks still run on new imports."
         )
         hint.setStyleSheet(f"font-size:12px; color:{_T2};")
         hint.setWordWrap(True)

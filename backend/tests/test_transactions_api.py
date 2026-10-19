@@ -235,6 +235,8 @@ class FakeTransactions:
                     )
                     docs = [{"_id": year} for year in years]
                 elif group.get("_id") == "$daily_import_id":
+                    from app.import_ops import doc_money_parts
+
                     buckets: dict[str, dict] = {}
                     for d in docs:
                         key = str(d.get("daily_import_id") or "")
@@ -246,6 +248,8 @@ class FakeTransactions:
                                 "_id": key,
                                 "source_filename": d.get("daily_import_source"),
                                 "count": 0,
+                                "total_tzs": 0.0,
+                                "total_usd": 0.0,
                                 "primary_date": d.get("import_primary_date"),
                                 "min_date": d.get("date"),
                                 "max_date": d.get("date"),
@@ -256,11 +260,24 @@ class FakeTransactions:
                             },
                         )
                         bucket["count"] += 1
+                        tzs, usd = doc_money_parts(d)
+                        bucket["total_tzs"] += tzs
+                        bucket["total_usd"] += usd
                         if d.get("possible_duplicate"):
                             bucket["duplicate_count"] += 1
                     docs = list(buckets.values())
             elif "$sort" in stage:
                 continue
+            elif "$facet" in stage:
+                facet = stage["$facet"]
+                items = list(docs)
+                for sub in facet.get("items") or []:
+                    if "$skip" in sub:
+                        items = items[int(sub["$skip"]) :]
+                    elif "$limit" in sub:
+                        items = items[: int(sub["$limit"])]
+                meta = [{"total": len(docs)}] if docs else []
+                docs = [{"items": items, "meta": meta}]
             elif "$limit" in stage:
                 docs = docs[: int(stage["$limit"])]
         return FakeCursor(docs)
@@ -1121,6 +1138,19 @@ def test_cashier_daily_uploads_endpoint() -> None:
                 "daily_import_source": "mine.xlsx",
                 "date": datetime(2026, 3, 1),
                 "created_at": datetime(2026, 3, 2),
+                "amount": -1000,
+                "currency": "TZS",
+            },
+            {
+                "_id": ObjectId(),
+                "cashier_id": user["_id"],
+                "daily_import_id": "mine",
+                "daily_import_source": "mine.xlsx",
+                "date": datetime(2026, 3, 1),
+                "created_at": datetime(2026, 3, 2),
+                "amount": -25,
+                "currency": "USD",
+                "amount_usd": -25,
             },
             {
                 "_id": ObjectId(),
@@ -1129,6 +1159,9 @@ def test_cashier_daily_uploads_endpoint() -> None:
                 "daily_import_source": "theirs.xlsx",
                 "date": datetime(2026, 3, 1),
                 "created_at": datetime(2026, 3, 2),
+                "amount": -500,
+                "currency": "TZS",
+                "amount_usd": -10,
             },
         ]
     )
@@ -1144,9 +1177,26 @@ def test_cashier_daily_uploads_endpoint() -> None:
     # Browse Uploads is shared — cashiers see every batch.
     assert isinstance(body, dict)
     assert body["total"] == 2
-    ids = {row["_id"] for row in body["items"]}
-    assert ids == {"mine", "theirs"}
+    by_id = {row["_id"]: row for row in body["items"]}
+    assert set(by_id) == {"mine", "theirs"}
+    assert by_id["mine"]["count"] == 2
+    assert by_id["mine"]["total_tzs"] == -1000.0
+    assert by_id["mine"]["total_usd"] == -25.0
+    assert by_id["theirs"]["total_tzs"] == -500.0
+    assert by_id["theirs"]["total_usd"] == -10.0
     assert "cashier_names" in body
+
+    with TestClient(app) as client:
+        page = client.get("/v1/transactions/daily-uploads?limit=1&skip=0")
+        page2 = client.get("/v1/transactions/daily-uploads?limit=1&skip=1")
+    assert page.status_code == 200
+    assert page2.status_code == 200
+    p1, p2 = page.json(), page2.json()
+    assert p1["total"] == 2
+    assert p2["total"] == 2
+    assert len(p1["items"]) == 1
+    assert len(p2["items"]) == 1
+    assert {p1["items"][0]["_id"], p2["items"][0]["_id"]} == {"mine", "theirs"}
 
     with TestClient(app) as client:
         scoped = client.get(

@@ -10,6 +10,7 @@ from tahmeed.ui.dialogs.truck_correction_dialog import (
     TruckCorrectionDialog,
     TruckIssue,
     _norm_key,
+    snapshot_row_details,
 )
 
 
@@ -78,7 +79,7 @@ def test_similar_open_rows_match_same_pasted_value(qapp) -> None:
     dlg.close()
 
 
-def test_register_mode_shows_allow_anyway_button(qapp) -> None:
+def test_register_mode_shows_allow_park_and_add_buttons(qapp) -> None:
     issues = [
         TruckIssue(row=0, original="T128 EFP", kind="not_in_registry"),
     ]
@@ -86,12 +87,164 @@ def test_register_mode_shows_allow_anyway_button(qapp) -> None:
         issues,
         fleet={"T880 CUL"},
         fleet_kinds={"T880 CUL": "truck"},
+        can_add=False,  # ignored — Add is always offered
         import_mode=False,
     )
     rw = dlg._rows[0]
     assert rw.allow_btn is not None
-    assert rw.skip_row_btn is None
-    assert rw.allow_btn.text() == "Allow anyway"
+    assert rw.skip_row_btn is not None
+    assert rw.allow_btn.text() == "Allow"
+    assert rw.skip_row_btn.text() == "Park"
+    assert rw.add_btn is not None
+    assert rw.add_btn.text() == "Add to registry"
+    dlg.close()
+
+
+def test_register_park_sets_parked_flag(qapp) -> None:
+    dlg = TruckCorrectionDialog(
+        [TruckIssue(row=0, original="T999 ZZZ", kind="not_in_registry")],
+        fleet=set(),
+        import_mode=False,
+    )
+    rw = dlg._rows[0]
+    dlg._park_row(rw)
+    assert dlg._rows == []
+    assert len(dlg.issues) == 1
+    assert dlg.issues[0].parked is True
+    assert dlg.issues[0].corrected == "T999 ZZZ"
+    dlg.close()
+
+
+def test_commit_registry_add_requires_confirm(qapp, monkeypatch) -> None:
+    """Kind pick + confirm must both accept before queuing a registry add."""
+    dlg = TruckCorrectionDialog(
+        [TruckIssue(row=0, original="T999 ZZZ", kind="not_in_registry")],
+        fleet=set(),
+        can_add=False,
+    )
+    monkeypatch.setattr(dlg, "_ask_registry_kind", lambda _t: "trucks")
+    monkeypatch.setattr(dlg, "_confirm_registry_add", lambda _n, _k: False)
+    assert dlg._commit_registry_add("T999 ZZZ") is None
+    assert dlg.pending_registry_adds == []
+
+    monkeypatch.setattr(dlg, "_confirm_registry_add", lambda _n, _k: True)
+    number = dlg._commit_registry_add("T999 ZZZ")
+    assert number == "T999 ZZZ"
+    assert dlg.pending_registry_adds == [("trucks", "T999 ZZZ")]
+    dlg.close()
+
+
+def test_allow_anyway_cancel_keeps_row(qapp, monkeypatch) -> None:
+    dlg = TruckCorrectionDialog(
+        [TruckIssue(row=0, original="T999 ZZZ", kind="not_in_registry")],
+        fleet=set(),
+    )
+    monkeypatch.setattr(dlg, "_confirm_allow", lambda **_kw: False)
+    rw = dlg._rows[0]
+    dlg._allow_anyway_row(rw)
+    assert len(dlg._rows) == 1
+    assert dlg.issues == []
+    dlg.close()
+
+
+def test_allow_anyway_accept_resolves_override(qapp, monkeypatch) -> None:
+    dlg = TruckCorrectionDialog(
+        [TruckIssue(row=0, original="T999 ZZZ", kind="not_in_registry")],
+        fleet=set(),
+    )
+    monkeypatch.setattr(dlg, "_confirm_allow", lambda **_kw: True)
+    monkeypatch.setattr(dlg, "_confirm_apply_similar", lambda *_a, **_k: [])
+    rw = dlg._rows[0]
+    dlg._allow_anyway_row(rw)
+    assert dlg._rows == []
+    assert len(dlg.issues) == 1
+    assert dlg.issues[0].allow_anyway is True
+    assert dlg.issues[0].corrected == "T999 ZZZ"
+    dlg.close()
+
+
+def test_allow_all_cancel_keeps_rows(qapp, monkeypatch) -> None:
+    dlg = TruckCorrectionDialog(
+        [
+            TruckIssue(row=0, original="T111 AAA", kind="not_in_registry"),
+            TruckIssue(row=1, original="T222 BBB", kind="not_in_registry"),
+        ],
+        fleet=set(),
+    )
+    monkeypatch.setattr(dlg, "_confirm_allow", lambda **_kw: False)
+    dlg._allow_all_remaining()
+    assert len(dlg._rows) == 2
+    assert dlg.issues == []
+    dlg.close()
+
+
+def test_allow_all_confirm_resolves_all(qapp, monkeypatch) -> None:
+    dlg = TruckCorrectionDialog(
+        [
+            TruckIssue(row=0, original="T111 AAA", kind="not_in_registry"),
+            TruckIssue(row=1, original="T222 BBB", kind="not_in_registry"),
+        ],
+        fleet=set(),
+    )
+    monkeypatch.setattr(dlg, "_confirm_allow", lambda **_kw: True)
+    dlg._allow_all_remaining()
+    assert dlg._rows == []
+    assert len(dlg.issues) == 2
+    assert all(i.allow_anyway for i in dlg.issues)
+    dlg.close()
+
+
+def test_snapshot_row_details_prefers_known_fields() -> None:
+    details = snapshot_row_details({
+        "_raw": {"x": 1},
+        "description": "FUEL",
+        "amount": 1200,
+        "mystery": "keep",
+        "empty": "",
+    })
+    assert details["Description"] == "FUEL"
+    assert details["Amount"] == "1200"
+    assert details["Mystery"] == "keep"
+    assert "_raw" not in details
+    assert "Empty" not in details
+
+
+def test_details_tab_peep_and_see_all(qapp) -> None:
+    issues = [
+        TruckIssue(
+            row=0,
+            original="T111 AAA",
+            kind="not_in_registry",
+            row_details={"Description": "Toll", "Amount": "50"},
+        ),
+        TruckIssue(
+            row=1,
+            original="T222 BBB",
+            kind="invalid_format",
+            row_details={"Description": "Parking"},
+        ),
+    ]
+    dlg = TruckCorrectionDialog(issues, fleet=set())
+    assert dlg._tabs is not None
+    assert dlg._tabs.count() == 2
+    assert dlg._tabs.tabText(0) == "Incorrect trucks"
+    assert dlg._tabs.tabText(1) == "Row details"
+
+    rw = dlg._rows[0]
+    assert rw.details_btn is not None
+    dlg._peep_row(rw)
+    assert dlg._tabs.currentIndex() == 1
+    assert dlg._details_mode == "selected"
+    assert dlg._details_focus_row == 0
+    assert dlg._details_form is not None
+    # Form has Row / Pasted / Issue + detail pairs
+    assert dlg._details_form.rowCount() >= 4
+
+    dlg._set_details_mode("all")
+    assert dlg._details_table is not None
+    assert dlg._details_table.rowCount() == 2
+    assert dlg._details_table.item(0, 1).text() == "T111 AAA"
+    assert "Toll" in dlg._details_table.item(0, 3).text()
     dlg.close()
 
 
@@ -160,6 +313,7 @@ def test_combo_card_two_trailers_keeps_suffix(qapp) -> None:
     assert rw.edit.text() == "T724 CPQ"
     assert dlg._is_two_trailer_issue(rw.issue)
     assert "two trailers" in rw.kind_label.text().lower()
-    assert "allow anyway" in rw.kind_label.text().lower()
+    assert "allow" in rw.kind_label.text().lower()
+    assert "park" in rw.kind_label.text().lower()
     assert dlg._with_combo_suffix(rw.issue, "T724 CPQ") == "T724 CPQ/T631DZX/T632DZX"
     dlg.close()

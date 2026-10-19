@@ -37,7 +37,11 @@ from tahmeed.ui.dialog_theme import (
     show_question,
     show_warning,
 )
-from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
+from tahmeed.ui.dialogs.truck_correction_dialog import (
+    TruckCorrectionDialog,
+    TruckIssue,
+    snapshot_row_details,
+)
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 try:
@@ -578,12 +582,14 @@ class SkippedTrucksTab(QWidget):
                 if src != "—"
                 else f"Skipped row {i + 1}"
             )
+            rec = doc.get("record") or {}
             issues.append(TruckIssue(
                 row=i,
                 original=raw,
                 kind=kind,
                 row_label=row_label,
                 combo_suffix=combo_suffix_of(raw),
+                row_details=snapshot_row_details(rec if isinstance(rec, dict) else {}),
             ))
 
         dlg = TruckCorrectionDialog(

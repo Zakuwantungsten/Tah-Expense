@@ -408,14 +408,104 @@ def build_issue_query(
     return query
 
 
+def doc_money_parts(doc: dict[str, Any]) -> tuple[float, float]:
+    """Return (tzs, usd) for one transaction doc — mirrors desktop ``money_parts``.
+
+    Used by upload-batch totals and test fakes so TZS-only, USD-only, and
+    dual-currency rows each contribute correctly.
+    """
+    cur = str(doc.get("currency") or "TZS").upper()
+    amt = float(doc.get("amount") or 0.0)
+    amount_usd = doc.get("amount_usd")
+    if amount_usd is not None:
+        usd = float(amount_usd or 0.0)
+        if cur == "USD" and abs(amt - usd) < 1e-9:
+            return 0.0, usd
+        return amt, usd
+    if cur == "USD":
+        return 0.0, amt
+    return amt, 0.0
+
+
+def _tzs_amount_expr() -> dict[str, Any]:
+    """Per-row TZS contribution for ``$sum`` (see ``doc_money_parts``)."""
+    return {
+        "$let": {
+            "vars": {
+                "cur": {"$toUpper": {"$ifNull": ["$currency", "TZS"]}},
+                "amt": {"$ifNull": ["$amount", 0]},
+                "usd": "$amount_usd",
+            },
+            "in": {
+                "$cond": [
+                    {"$ne": ["$$usd", None]},
+                    {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$eq": ["$$cur", "USD"]},
+                                    {"$eq": ["$$amt", "$$usd"]},
+                                ]
+                            },
+                            0,
+                            "$$amt",
+                        ]
+                    },
+                    {
+                        "$cond": [
+                            {"$eq": ["$$cur", "USD"]},
+                            0,
+                            "$$amt",
+                        ]
+                    },
+                ]
+            },
+        }
+    }
+
+
+def _usd_amount_expr() -> dict[str, Any]:
+    """Per-row USD contribution for ``$sum`` (see ``doc_money_parts``)."""
+    return {
+        "$let": {
+            "vars": {
+                "cur": {"$toUpper": {"$ifNull": ["$currency", "TZS"]}},
+                "amt": {"$ifNull": ["$amount", 0]},
+                "usd": "$amount_usd",
+            },
+            "in": {
+                "$cond": [
+                    {"$ne": ["$$usd", None]},
+                    {"$ifNull": ["$$usd", 0]},
+                    {
+                        "$cond": [
+                            {"$eq": ["$$cur", "USD"]},
+                            "$$amt",
+                            0,
+                        ]
+                    },
+                ]
+            },
+        }
+    }
+
+
 def daily_uploads_pipeline(
     *,
     limit: int = 100,
+    skip: int = 0,
     cashier_id: Any | None = None,
 ) -> list[dict[str, Any]]:
+    """Group transactions into upload batches with page + true total.
+
+    Final stage is ``$facet`` → one doc ``{items, meta:[{total}]}``.
+    Use :func:`unpack_daily_uploads_page` to unwrap.
+    """
     match: dict[str, Any] = {"daily_import_id": {"$type": "string", "$ne": ""}}
     if cashier_id is not None:
         match["cashier_id"] = cashier_id
+    page_limit = max(1, int(limit))
+    page_skip = max(0, int(skip))
     return [
         {"$match": match},
         {
@@ -423,6 +513,8 @@ def daily_uploads_pipeline(
                 "_id": "$daily_import_id",
                 "source_filename": {"$first": "$daily_import_source"},
                 "count": {"$sum": 1},
+                "total_tzs": {"$sum": _tzs_amount_expr()},
+                "total_usd": {"$sum": _usd_amount_expr()},
                 "primary_date": {"$first": "$import_primary_date"},
                 "min_date": {"$min": "$date"},
                 "max_date": {"$max": "$date"},
@@ -463,8 +555,30 @@ def daily_uploads_pipeline(
             }
         },
         {"$sort": {"created_at": -1}},
-        {"$limit": max(1, int(limit))},
+        {
+            "$facet": {
+                "items": [
+                    {"$skip": page_skip},
+                    {"$limit": page_limit},
+                ],
+                "meta": [{"$count": "total"}],
+            }
+        },
     ]
+
+
+def unpack_daily_uploads_page(
+    facet_rows: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Unwrap ``daily_uploads_pipeline`` facet result → (items, total)."""
+    if not facet_rows:
+        return [], 0
+    row = facet_rows[0] or {}
+    items = list(row.get("items") or [])
+    meta = row.get("meta") or []
+    if not meta:
+        return items, 0
+    return items, int((meta[0] or {}).get("total") or 0)
 
 
 def null_daily_import_id_filter() -> dict[str, Any]:

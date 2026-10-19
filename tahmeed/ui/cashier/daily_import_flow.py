@@ -9,10 +9,12 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox, QWidget
 from tahmeed.services.daily_import_service import (
     DailyImportCancelled,
     DailyImportPreview,
+    find_prior_daily_imports,
     preview_daily_import,
     skip_all_unmapped,
 )
 from tahmeed.ui.dialogs.daily_import_preview_dialog import DailyImportPreviewDialog
+from tahmeed.ui.dialogs.daily_reimport_dialog import DailyReimportDialog
 from tahmeed.ui.dialogs.date_outlier_dialog import resolve_import_date_policy
 from tahmeed.ui.dialogs.import_problem_rows_dialog import prompt_import_problems
 from tahmeed.ui.widgets.upload_busy import UploadBusy, UploadCancelled
@@ -87,6 +89,30 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
     # ── One reconciled date for the whole upload ──────────────────────────
     if not resolve_import_date_policy(preview, parent=parent):
         return None
+
+    # ── Reimport gate — same filename / exact content already uploaded ───
+    try:
+        with UploadBusy(
+            parent, "Checking prior imports…", title="Import", cancellable=True
+        ) as busy:
+            await busy.tick()
+            prior = await busy.await_or_cancel(
+                find_prior_daily_imports(preview)
+            )
+    except (UploadCancelled, DailyImportCancelled):
+        return None
+    except Exception:
+        prior = []
+
+    if prior:
+        reimport = DailyReimportDialog(
+            prior,
+            source_filename=preview.source_filename,
+            row_count=len(preview.rows),
+            parent=parent,
+        )
+        if reimport.exec() != DailyReimportDialog.Accepted:
+            return None
 
     # ── Confirm preview before staging into the table ─────────────────────
     confirm = DailyImportPreviewDialog(preview, parent=parent)

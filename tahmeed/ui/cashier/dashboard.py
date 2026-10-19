@@ -401,10 +401,10 @@ def _qb_inline_date_field(label: str) -> tuple[QWidget, QDateEdit]:
 # ── Action bar (mode / search / cheque) ─────────────────────────────────────
 
 class _ActionBar(QFrame):
-    """My entries / Merged / Search on the left; Reconciled Date / Cheque on the right."""
+    """Search → pills (My entries / Parked / Merged); Reconciled Date / Cheque on the right."""
 
     search_changed = Signal(str)
-    mode_changed   = Signal(bool)  # True = Merged
+    mode_changed = Signal(str)  # "my" | "parked" | "merged"
     cheque_edited  = Signal(str)
     reconciled_date_changed = Signal(object)  # date
 
@@ -421,55 +421,6 @@ class _ActionBar(QFrame):
         hl = QHBoxLayout(self)
         hl.setContentsMargins(16, 6, 16, 6)
         hl.setSpacing(8)
-
-        # My / Merged segmented toggle
-        toggle = QFrame()
-        toggle.setObjectName("modeToggle")
-        toggle.setStyleSheet(
-            "QFrame#modeToggle{background:transparent;border:none;}"
-        )
-        tg = QHBoxLayout(toggle)
-        tg.setContentsMargins(0, 0, 0, 0)
-        tg.setSpacing(0)
-
-        self._my_btn = QPushButton("My entries")
-        self._merged_btn = QPushButton("Merged")
-        _toggle_ss = (
-            "QPushButton{"
-            " background:#FFFFFF;border:1px solid #D1D5DB;"
-            " padding:0 14px;font-size:12px;font-weight:600;color:#6B7280;"
-            f" min-height:{_BTN_H}px;"
-            "}"
-            f"QPushButton:checked{{background:{_NAVY};border-color:{_NAVY};color:#FFFFFF;}}"
-            "QPushButton:hover:!checked{background:#F9FAFB;color:#374151;}"
-        )
-        self._my_btn.setCheckable(True)
-        self._merged_btn.setCheckable(True)
-        self._my_btn.setCursor(Qt.PointingHandCursor)
-        self._merged_btn.setCursor(Qt.PointingHandCursor)
-        self._my_btn.setFixedHeight(_BTN_H)
-        self._merged_btn.setFixedHeight(_BTN_H)
-        self._my_btn.setStyleSheet(
-            _toggle_ss
-            + "QPushButton{"
-            " border-top-left-radius:5px;border-bottom-left-radius:5px;"
-            " border-top-right-radius:0;border-bottom-right-radius:0;"
-            "}"
-        )
-        self._merged_btn.setStyleSheet(
-            _toggle_ss
-            + "QPushButton{"
-            " border-top-left-radius:0;border-bottom-left-radius:0;"
-            " border-top-right-radius:5px;border-bottom-right-radius:5px;"
-            " border-left:none;"
-            "}"
-        )
-        self._my_btn.setChecked(True)
-        self._my_btn.clicked.connect(lambda: self._set_mode(False))
-        self._merged_btn.clicked.connect(lambda: self._set_mode(True))
-        tg.addWidget(self._my_btn)
-        tg.addWidget(self._merged_btn)
-        hl.addWidget(toggle, 0, Qt.AlignVCenter)
 
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search entries…")
@@ -498,6 +449,66 @@ class _ActionBar(QFrame):
         self._search.textChanged.connect(self._on_search_text_changed)
         self._search_clear_btn.clicked.connect(self._on_search_clear_clicked)
         hl.addWidget(self._search_clear_btn, 0, Qt.AlignVCenter)
+
+        # My / Parked / Merged segmented toggle (after search)
+        toggle = QFrame()
+        toggle.setObjectName("modeToggle")
+        toggle.setStyleSheet(
+            "QFrame#modeToggle{background:transparent;border:none;}"
+        )
+        tg = QHBoxLayout(toggle)
+        tg.setContentsMargins(0, 0, 0, 0)
+        tg.setSpacing(0)
+
+        _toggle_ss = (
+            "QPushButton{"
+            " background:#FFFFFF;border:1px solid #D1D5DB;"
+            " padding:0 14px;font-size:12px;font-weight:600;color:#6B7280;"
+            f" min-height:{_BTN_H}px;"
+            "}"
+            f"QPushButton:checked{{background:{_NAVY};border-color:{_NAVY};color:#FFFFFF;}}"
+            "QPushButton:hover:!checked{background:#F9FAFB;color:#374151;}"
+        )
+        self._my_btn = QPushButton("My entries")
+        self._parked_btn = QPushButton("Parked")
+        self._merged_btn = QPushButton("Merged")
+        for btn in (self._my_btn, self._parked_btn, self._merged_btn):
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(_BTN_H)
+        self._my_btn.setStyleSheet(
+            _toggle_ss
+            + "QPushButton{"
+            " border-top-left-radius:5px;border-bottom-left-radius:5px;"
+            " border-top-right-radius:0;border-bottom-right-radius:0;"
+            "}"
+        )
+        self._parked_btn.setStyleSheet(
+            _toggle_ss
+            + "QPushButton{"
+            " border-radius:0; border-left:none;"
+            "}"
+        )
+        self._merged_btn.setStyleSheet(
+            _toggle_ss
+            + "QPushButton{"
+            " border-top-left-radius:0;border-bottom-left-radius:0;"
+            " border-top-right-radius:5px;border-bottom-right-radius:5px;"
+            " border-left:none;"
+            "}"
+        )
+        self._my_btn.setChecked(True)
+        self._my_btn.clicked.connect(lambda: self._set_mode("my"))
+        self._parked_btn.clicked.connect(lambda: self._set_mode("parked"))
+        self._merged_btn.clicked.connect(lambda: self._set_mode("merged"))
+        self._parked_btn.setToolTip(
+            "Incorrect truck rows parked for follow-up — fix here, then they return to My entries"
+        )
+        self._parked_count = 0
+        tg.addWidget(self._my_btn)
+        tg.addWidget(self._parked_btn)
+        tg.addWidget(self._merged_btn)
+        hl.addWidget(toggle, 0, Qt.AlignVCenter)
 
         self._status = QLabel("")
         self._status.setStyleSheet(
@@ -578,19 +589,33 @@ class _ActionBar(QFrame):
         self._cheque.setReadOnly(not editable)
         self._cheque.blockSignals(False)
 
-    def _set_mode(self, merged: bool) -> None:
-        self._my_btn.setChecked(not merged)
-        self._merged_btn.setChecked(merged)
-        self.mode_changed.emit(merged)
+    def _set_mode(self, mode: str) -> None:
+        mode = mode if mode in ("my", "parked", "merged") else "my"
+        self._my_btn.setChecked(mode == "my")
+        self._parked_btn.setChecked(mode == "parked")
+        self._merged_btn.setChecked(mode == "merged")
+        self.mode_changed.emit(mode)
 
-    def sync_mode(self, merged: bool) -> None:
+    def sync_mode(self, mode) -> None:
         """Reflect register mode without emitting (e.g. after cancel)."""
-        self._my_btn.blockSignals(True)
-        self._merged_btn.blockSignals(True)
-        self._my_btn.setChecked(not merged)
-        self._merged_btn.setChecked(merged)
-        self._my_btn.blockSignals(False)
-        self._merged_btn.blockSignals(False)
+        if isinstance(mode, bool):
+            mode = "merged" if mode else "my"
+        mode = mode if mode in ("my", "parked", "merged") else "my"
+        for btn in (self._my_btn, self._parked_btn, self._merged_btn):
+            btn.blockSignals(True)
+        self._my_btn.setChecked(mode == "my")
+        self._parked_btn.setChecked(mode == "parked")
+        self._merged_btn.setChecked(mode == "merged")
+        for btn in (self._my_btn, self._parked_btn, self._merged_btn):
+            btn.blockSignals(False)
+
+    def set_parked_count(self, count: int) -> None:
+        """Badge the Parked pill with how many rows need truck follow-up."""
+        self._parked_count = max(0, int(count or 0))
+        if self._parked_count:
+            self._parked_btn.setText(f"Parked ({self._parked_count})")
+        else:
+            self._parked_btn.setText("Parked")
 
     def set_edit_state(self, active: bool, dirty_count: int = 0) -> None:
         """Show edit-mode status pill next to search."""
@@ -715,13 +740,18 @@ class _TablePage(QWidget):
         self._register = register
         self._action_bar = _ActionBar()
         self._action_bar.search_changed.connect(register.set_search)
-        self._action_bar.mode_changed.connect(register.set_merged_mode)
+        self._action_bar.mode_changed.connect(register.set_view_mode)
         self._action_bar.cheque_edited.connect(register.set_active_cheque)
         self._action_bar.reconciled_date_changed.connect(self._on_reconciled_date)
         register.edit_state_changed.connect(self._action_bar.set_edit_state)
         register.transient_status.connect(self._action_bar.flash_transient_status)
         register.mode_changed.connect(self._action_bar.sync_mode)
-        register.mode_changed.connect(self._doc_header.set_merged)
+        register.mode_changed.connect(
+            lambda mode: self._doc_header.set_merged(
+                mode == "merged" if isinstance(mode, str) else bool(mode)
+            )
+        )
+        register.parked_count_changed.connect(self._action_bar.set_parked_count)
         register.active_cheque_changed.connect(self._action_bar.set_cheque_value)
         register.stats_updated.connect(self._sync_reconciled_date)
         self._action_bar.set_reconciled_date(register.current_date())

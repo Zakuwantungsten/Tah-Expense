@@ -28,7 +28,11 @@ from tahmeed.services.cashier_service import (
     request_or_delete_transaction,
 )
 from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
-from tahmeed.services.duplicate_review import DuplicateReviewItem, format_amount_label
+from tahmeed.services.duplicate_review import (
+    DuplicateReviewItem,
+    format_amount_label,
+    format_new_date,
+)
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
 from tahmeed.ui.widgets.qb_txn_toolbar import QbTxnToolbar
@@ -861,6 +865,7 @@ class EntryForm(QWidget):
             dup_days = 5
 
         possible_dup = False
+        matched_id = None
         try:
             dupes = await check_for_duplicates(
                 truck_number=truck_number,
@@ -889,6 +894,7 @@ class EntryForm(QWidget):
                 amount=self._amount.value(),
                 amount_label=format_amount_label(probe),
                 existing=dupes[0],
+                date_label=format_new_date(tx_date),
             )
             dlg = DuplicateReviewDialog([item], dup_days=dup_days, parent=self)
             if dlg.exec() != QDialog.Accepted:
@@ -896,6 +902,7 @@ class EntryForm(QWidget):
             if 0 not in dlg.save_anyway_rows():
                 return
             possible_dup = True
+            matched_id = getattr(dupes[0], "_id", None)
 
         primary_day = tx_date.date() if hasattr(tx_date, "date") else tx_date
         tx = Transaction(
@@ -920,6 +927,7 @@ class EntryForm(QWidget):
             ).upper(),
             cashier_id=self._user._id,
             possible_duplicate=possible_dup,
+            duplicate_of_id=matched_id if possible_dup else None,
             register_status="draft",
             import_primary_date=datetime(
                 primary_day.year, primary_day.month, primary_day.day,

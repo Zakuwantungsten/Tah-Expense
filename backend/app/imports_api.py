@@ -19,6 +19,7 @@ from .import_ops import (
     commit_master_import,
     daily_uploads_pipeline,
     null_daily_import_id_filter,
+    unpack_daily_uploads_page,
 )
 from .payee_import_ops import commit_payee_list
 from .schemas import (
@@ -176,6 +177,7 @@ async def list_daily_uploads(
     request: Request,
     actor: RegisterActor,
     limit: int = Query(100, ge=1, le=500),
+    skip: int = Query(0, ge=0),
     cashier_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Shared upload list (all cashiers). Optional ``cashier_id`` narrows."""
@@ -197,11 +199,12 @@ async def list_daily_uploads(
             }
         },
     )
-    rows = await aggregate_list(
+    facet_rows = await aggregate_list(
         db.transactions,
-        daily_uploads_pipeline(limit=limit, cashier_id=scope),
-        length=limit,
+        daily_uploads_pipeline(limit=limit, skip=skip, cashier_id=scope),
+        length=1,
     )
+    rows, _total = unpack_daily_uploads_page(facet_rows)
     return json_safe(rows)
 
 
@@ -365,7 +368,10 @@ async def clear_issue_flags(
     oid = _valid_id(tx_id)
     result = await _database(request).transactions.update_one(
         {"_id": oid},
-        {"$set": {"possible_duplicate": False, "date_discrepancy": False}},
+        {
+            "$set": {"possible_duplicate": False, "date_discrepancy": False},
+            "$unset": {"duplicate_of_id": ""},
+        },
     )
     return {"cleared": result.modified_count == 1}
 

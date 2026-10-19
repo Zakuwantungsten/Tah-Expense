@@ -1131,6 +1131,18 @@ class MasterLedgerTable(QFrame):
         self._tbl.blockSignals(prev)
         self._mark_dirty(row)
 
+    def _truck_issue_row_details(self, row: int) -> dict:
+        """Snapshot visible ledger cells for the truck correction Details tab."""
+        details: dict[str, str] = {}
+        for col, (header, _align, _field) in enumerate(_COLS):
+            if col == 0:
+                continue
+            it = self._tbl.item(row, col)
+            text = (it.text().strip() if it else "")
+            if text:
+                details[header.title() if header.isupper() else header] = text
+        return details
+
     def _resolve_truck_text(self, raw: str) -> tuple[str, Optional[str]]:
         norm = normalize_truck_number(raw, allowed_labels=self._allowed_truck_labels)
         if norm.status == "empty":
@@ -1162,12 +1174,18 @@ class MasterLedgerTable(QFrame):
             elif status == "invalid_format":
                 self._set_truck_cell(row, value or "")
                 self._pending_truck_issues[row] = TruckIssue(
-                    row=row, original=raw, kind="invalid_format",
+                    row=row,
+                    original=raw,
+                    kind="invalid_format",
+                    row_details=self._truck_issue_row_details(row),
                 )
             else:
                 self._set_truck_cell(row, value or "")
                 self._pending_truck_issues[row] = TruckIssue(
-                    row=row, original=raw, kind="not_in_registry",
+                    row=row,
+                    original=raw,
+                    kind="not_in_registry",
+                    row_details=self._truck_issue_row_details(row),
                 )
         self._schedule_truck_correction()
 
@@ -1192,7 +1210,10 @@ class MasterLedgerTable(QFrame):
             item.setText(value or "")
             self._tbl.blockSignals(prev)
         self._pending_truck_issues[row] = TruckIssue(
-            row=row, original=value or raw, kind=kind,
+            row=row,
+            original=value or raw,
+            kind=kind,
+            row_details=self._truck_issue_row_details(row),
         )
         self._schedule_truck_correction()
 

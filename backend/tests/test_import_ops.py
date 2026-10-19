@@ -11,11 +11,13 @@ from app.import_ops import (
     build_issue_query,
     daily_import_row_key,
     daily_uploads_pipeline,
+    doc_money_parts,
     insert_many_idempotent,
     month_label,
     normalize_receipt,
     null_daily_import_id_filter,
     reset_import_index_cache,
+    unpack_daily_uploads_page,
     verified_doc_from_daily_payload,
     verified_doc_from_master_payload,
 )
@@ -133,11 +135,37 @@ def test_build_issue_query_filters() -> None:
 
 
 def test_uploads_pipeline_and_null_filter() -> None:
-    pipe = daily_uploads_pipeline(limit=25)
+    pipe = daily_uploads_pipeline(limit=25, skip=10)
     assert pipe[0]["$match"]["daily_import_id"]["$type"] == "string"
-    assert pipe[-1]["$limit"] == 25
+    group = pipe[1]["$group"]
+    assert "total_tzs" in group
+    assert "total_usd" in group
+    facet = pipe[-1]["$facet"]
+    assert facet["items"] == [{"$skip": 10}, {"$limit": 25}]
+    assert facet["meta"] == [{"$count": "total"}]
     filt = null_daily_import_id_filter()
     assert "$or" in filt
+
+
+def test_unpack_daily_uploads_page() -> None:
+    items, total = unpack_daily_uploads_page(
+        [{"items": [{"_id": "a"}, {"_id": "b"}], "meta": [{"total": 5}]}]
+    )
+    assert [r["_id"] for r in items] == ["a", "b"]
+    assert total == 5
+    assert unpack_daily_uploads_page([]) == ([], 0)
+    assert unpack_daily_uploads_page([{"items": [], "meta": []}]) == ([], 0)
+
+
+def test_doc_money_parts_tzs_usd_and_both() -> None:
+    assert doc_money_parts({"amount": -1000, "currency": "TZS"}) == (-1000.0, 0.0)
+    assert doc_money_parts({"amount": -50, "currency": "USD"}) == (0.0, -50.0)
+    assert doc_money_parts(
+        {"amount": -50, "currency": "USD", "amount_usd": -50}
+    ) == (0.0, -50.0)
+    assert doc_money_parts(
+        {"amount": -1000, "currency": "TZS", "amount_usd": -20}
+    ) == (-1000.0, -20.0)
 
 
 @pytest.mark.asyncio

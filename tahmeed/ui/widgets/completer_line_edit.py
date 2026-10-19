@@ -357,6 +357,18 @@ class CompleterLineEdit(QLineEdit):
         )
         self._preview_active = shown
 
+    def event(self, event: QEvent) -> bool:
+        # QWidget::event steals Tab for the focus chain *before* keyPressEvent
+        # whenever another focusable widget exists (e.g. Payee → Item in a
+        # dialog). Handle Tab/Backtab here so we still accept the first
+        # suggestion, then advance focus ourselves.
+        if event.type() == QEvent.KeyPress:
+            key = event.key()  # type: ignore[attr-defined]
+            if key in (Qt.Key_Tab, Qt.Key_Backtab):
+                self.keyPressEvent(event)  # type: ignore[arg-type]
+                return True
+        return super().event(event)
+
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = event.key()
 
@@ -388,7 +400,7 @@ class CompleterLineEdit(QLineEdit):
                 self.setCursorPosition(len(self.text()))
             self._preview_active = False
 
-        if key == Qt.Key_Tab:
+        if key in (Qt.Key_Tab, Qt.Key_Backtab):
             # Accept highlighted suggestion, or keep the inline preview text.
             if not accept_completion(self, self._completer):
                 hide_completion_popup(self._completer)
@@ -398,9 +410,10 @@ class CompleterLineEdit(QLineEdit):
             self._preview_active = False
             # Defer focus move; when embedded in the grid the delegate's Tab
             # filter usually handles this first and calls _tab_forward instead.
-            self.focusNextPrevChild(
-                not bool(event.modifiers() & Qt.ShiftModifier)
+            forward = key == Qt.Key_Tab and not bool(
+                event.modifiers() & Qt.ShiftModifier
             )
+            self.focusNextPrevChild(forward)
             event.accept()
             return
 

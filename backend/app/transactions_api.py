@@ -36,7 +36,11 @@ from .security import utcnow
 from .serialization import json_safe, object_id
 from .attachments_api import attachments as attachments_router
 from .cashier_overview_ops import compute_overview_charts
-from .import_ops import daily_uploads_pipeline, null_daily_import_id_filter
+from .import_ops import (
+    daily_uploads_pipeline,
+    null_daily_import_id_filter,
+    unpack_daily_uploads_page,
+)
 from .mongo_async import aggregate_list
 from .transaction_ops import (
     DRAFT_BASE_MATCH,
@@ -124,6 +128,7 @@ _OBJECT_ID_FIELDS = {
     "trashed_by",
     "restore_requested_by",
     "original_transaction_id",
+    "duplicate_of_id",
 }
 _DATETIME_FIELDS = {
     "date",
@@ -191,6 +196,7 @@ def _create_document(body: TransactionCreate, actor: dict[str, Any]) -> dict[str
         "import_primary_date",
         "amount_usd",
         "client_row_id",
+        "duplicate_of_id",
     ):
         if raw.get(key) in (None, ""):
             raw.pop(key, None)
@@ -476,13 +482,15 @@ async def cashier_daily_uploads(
     request: Request,
     actor: RegisterActor,
     limit: int = Query(100, ge=1, le=500),
+    skip: int = Query(0, ge=0),
     cashier_id: str | None = None,
 ) -> dict:
     """Excel upload batches for Browse → Uploads.
 
     Shared list (all cashiers) by default — same idea as Merged browse.
     Optional ``cashier_id`` narrows; phantom null-id heal stays own-only for cashiers.
-    Phase 1 composite: ``{items, total, cashier_names}``.
+    Composite: ``{items, total, cashier_names}``. ``total`` is the full batch
+    count (not page length). Each item includes ``total_tzs`` / ``total_usd``.
     """
     scope: ObjectId | None = _valid_id(cashier_id) if cashier_id else None
     db = _database(request)
@@ -502,23 +510,24 @@ async def cashier_daily_uploads(
             }
         },
     )
-    rows = await aggregate_list(
+    facet_rows = await aggregate_list(
         db.transactions,
-        daily_uploads_pipeline(limit=limit, cashier_id=scope),
-        length=limit,
+        daily_uploads_pipeline(limit=limit, skip=skip, cashier_id=scope),
+        length=1,
     )
+    rows, total = unpack_daily_uploads_page(facet_rows)
     cashier_oids = [
         oid
         for oid in (_normalize_user_oid(row.get("cashier_id")) for row in rows)
         if oid is not None
     ]
     names = await _cashier_names_map(db, cashier_oids)
-    # Composite payload (Phase 1). Clients that still expect a bare list keep
-    # working via ``payload if list else payload["items"]``.
+    # Composite payload. Clients that still expect a bare list keep working
+    # via ``payload if list else payload["items"]``.
     return json_safe(
         {
             "items": rows,
-            "total": len(rows),
+            "total": total,
             "cashier_names": names,
         }
     )

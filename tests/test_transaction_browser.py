@@ -12,7 +12,11 @@ from tahmeed.ui.cashier.transactions_table import (
     TransactionBrowser,
     _MODE_SIMPLE,
     _MODE_UPLOADS,
+    _U_COL_CASHIER,
+    _U_COL_SN,
+    _U_COL_TOTAL,
     _as_py_date,
+    _format_upload_total,
 )
 
 
@@ -81,3 +85,25 @@ def test_cashier_delete_only_own_uploads():
     manager = TransactionBrowser(user=me, can_manage_uploads=True)
     manager._do_find = lambda: None
     assert manager._can_delete_upload({"cashier_id": "cashier-other"}) is True
+
+
+def test_format_upload_total_tzs_usd_or_both():
+    assert _format_upload_total({"total_tzs": -1900, "total_usd": 0}) == "TZS -1,900"
+    assert _format_upload_total({"total_tzs": 0, "total_usd": -25.5}) == "USD -25.50"
+    assert _format_upload_total(
+        {"total_tzs": -1000, "total_usd": -10}
+    ) == "TZS -1,000 · USD -10.00"
+    assert _format_upload_total({}) == "—"
+
+
+def test_uploads_table_has_sn_and_total_after_cashier():
+    browser = _browser()
+    headers = [
+        browser._uploads_table.horizontalHeaderItem(i).text()
+        for i in range(browser._uploads_table.columnCount())
+    ]
+    assert headers[_U_COL_SN] == "SN"
+    assert headers[_U_COL_CASHIER] == "Cashier"
+    assert headers[_U_COL_TOTAL] == "Total"
+    assert _U_COL_TOTAL == _U_COL_CASHIER + 1
+    assert headers.index("Total") == headers.index("Cashier") + 1

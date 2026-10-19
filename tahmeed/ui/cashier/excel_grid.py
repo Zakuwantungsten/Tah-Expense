@@ -31,6 +31,8 @@ import time
 from datetime import datetime, date
 from typing import List, Optional
 
+from bson import ObjectId
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QToolButton, QLabel,
     QTableWidget, QTableWidgetItem, QApplication,
@@ -94,7 +96,11 @@ from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit, accept_com
 from tahmeed.ui.widgets.excel_column_filter import chevron_hit_contains
 from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, TruckIssue
 from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
-from tahmeed.services.duplicate_review import DuplicateReviewItem, format_amount_label
+from tahmeed.services.duplicate_review import (
+    DuplicateReviewItem,
+    format_amount_label,
+    format_new_date,
+)
 from tahmeed.services.register_metrics import log_register_event, timed_op
 
 # ---------------------------------------------------------------------------
@@ -1020,7 +1026,8 @@ class DailyRegister(QWidget):
     day_issues_source_changed = Signal()
     undo_redo_changed     = Signal(bool, bool)  # can_undo, can_redo
     edit_state_changed = Signal(bool, int)         # (edit_mode_active, dirty_row_count)
-    mode_changed      = Signal(bool)               # merged mode on/off
+    mode_changed      = Signal(str)                # "my" | "parked" | "merged"
+    parked_count_changed = Signal(int)             # parked truck rows for the day
     attachment_count_changed = Signal(int)         # selected row attachment count
     save_busy_changed = Signal(bool)               # True while Save/Submit is in flight
     # Day-level Cheque for the always-visible header field
@@ -1058,7 +1065,10 @@ class DailyRegister(QWidget):
         self._people_names: list = []      # Ownership / APR BY suggestions (unrestricted)
         self._payee_names: list = []       # Payee catalog suggestions (unrestricted)
         self._cashier_names: dict = {}     # ObjectId -> display name
+        self._view_mode: str = "my"        # "my" | "parked" | "merged"
         self._merged_mode: bool = False    # Shared/Merged day (all cashiers)
+        self._parked_mode: bool = False    # Parked incorrect-truck follow-up
+        self._parked_day_count: int = 0
         self._current_date: Optional[date] = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
@@ -1328,9 +1338,11 @@ class DailyRegister(QWidget):
         if self._current_date is None:
             self._pending_highlight = highlight_term
             self._commit_open_editor()
-            if merged is True and not self._merged_mode:
+            if merged is True and self._view_mode != "merged":
+                self._view_mode = "merged"
                 self._merged_mode = True
-                self.mode_changed.emit(True)
+                self._parked_mode = False
+                self.mode_changed.emit("merged")
             if self.has_unsaved_work():
                 # Keep typed rows; stamp them onto the chosen day.
                 self._current_date = d
@@ -1353,9 +1365,11 @@ class DailyRegister(QWidget):
             return True
         self._pending_highlight = highlight_term
         self._commit_open_editor()
-        if merged is True and not self._merged_mode:
+        if merged is True and self._view_mode != "merged":
+            self._view_mode = "merged"
             self._merged_mode = True
-            self.mode_changed.emit(True)
+            self._parked_mode = False
+            self.mode_changed.emit("merged")
         if self.has_unsaved_work():
             self._flush_local_draft()
             choice = self._prompt_unsaved_work(
@@ -1452,6 +1466,30 @@ class DailyRegister(QWidget):
                 txs = await get_transactions_by_date(d, cashier_id=self._user._id)
             if seq != self._load_gen:
                 return
+            # Split parked truck follow-up rows from the normal register surfaces.
+            parked_all = [
+                tx for tx in txs
+                if (getattr(tx, "register_status", "") or "") == "parked"
+            ]
+            if not self._merged_mode:
+                # Parked count is per cashier (own rows), even while viewing My.
+                own_parked = [
+                    tx for tx in parked_all
+                    if tx.cashier_id == self._user._id
+                    or str(tx.cashier_id) == str(self._user._id)
+                ]
+                self._parked_day_count = len(own_parked)
+                self.parked_count_changed.emit(self._parked_day_count)
+            if self._parked_mode:
+                txs = [
+                    tx for tx in txs
+                    if (getattr(tx, "register_status", "") or "") == "parked"
+                ]
+            else:
+                txs = [
+                    tx for tx in txs
+                    if (getattr(tx, "register_status", "") or "") != "parked"
+                ]
             ids = [tx.cashier_id for tx in txs if tx.cashier_id]
             cashier_names = {}
             if ids:
@@ -1478,21 +1516,29 @@ class DailyRegister(QWidget):
                 self._hide_register_loading()
 
     def set_merged_mode(self, merged: bool) -> None:
-        """Switch My entries ↔ Merged (scope reload — no save-draft prompt).
+        """Compat: My ↔ Merged. Prefer ``set_view_mode``."""
+        self.set_view_mode("merged" if merged else "my")
+
+    def set_view_mode(self, mode: str) -> None:
+        """Switch My entries / Parked / Merged (scope reload — no save prompt).
 
         Unsaved My work is stashed to the My local draft file before the flip;
         returning to My restores it. Merged is a day browser, not an entry form.
+        Parked shows saved rows with ``register_status=parked`` for truck follow-up.
         """
-        if bool(merged) == self._merged_mode:
+        mode = mode if mode in ("my", "parked", "merged") else "my"
+        if mode == self._view_mode:
             return
         self._draft_timer.stop()
         self._commit_open_editor()
         # Stash current-mode recovery file before flipping the merged key.
         if self.has_unsaved_work():
             self._flush_local_draft()
-        self._merged_mode = bool(merged)
+        self._view_mode = mode
+        self._merged_mode = mode == "merged"
+        self._parked_mode = mode == "parked"
         self._reset_edit_state()
-        self.mode_changed.emit(self._merged_mode)
+        self.mode_changed.emit(self._view_mode)
         if self._current_date is None:
             self._populate([])
             return
@@ -1532,6 +1578,8 @@ class DailyRegister(QWidget):
                     return
             d = self._current_date
             label = d.strftime("%d %b %Y")
+            if not await self._confirm_parked_trucks_for_submit(d):
+                return
             if not await self._confirm_day_issues_for_submit(d):
                 return
             resp = QMessageBox.question(
@@ -1557,6 +1605,40 @@ class DailyRegister(QWidget):
             self._submit_in_flight = False
             if not self._save_in_flight:
                 self.save_busy_changed.emit(False)
+
+    async def _confirm_parked_trucks_for_submit(self, d: date) -> bool:
+        """Block submit while parked incorrect-truck rows remain for this cashier."""
+        count = int(getattr(self, "_parked_day_count", 0) or 0)
+        if count <= 0 and self._current_date == d:
+            # Refresh count from server if we have not loaded Parked yet.
+            try:
+                txs = await get_transactions_by_date(d, cashier_id=self._user._id)
+                count = sum(
+                    1
+                    for tx in txs
+                    if (getattr(tx, "register_status", "") or "") == "parked"
+                )
+                self._parked_day_count = count
+                self.parked_count_changed.emit(count)
+            except Exception:
+                count = 0
+        if count <= 0:
+            return True
+        label = d.strftime("%d %b %Y")
+        plural = "s" if count != 1 else ""
+        resp = QMessageBox.warning(
+            self,
+            "Parked trucks block submit",
+            f"{count} parked truck row{plural} on {label} still need a correct "
+            "fleet number.\n\n"
+            "Open the Parked tab, fix the truck(s), then submit again.\n\n"
+            "Open Parked now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if resp == QMessageBox.Yes:
+            self.set_view_mode("parked")
+        return False
 
     async def _confirm_day_issues_for_submit(self, d: date) -> bool:
         """Block submit when Day Issues remain, unless the accountant setting allows it."""
@@ -1682,8 +1764,10 @@ class DailyRegister(QWidget):
         self._saved_ids   = {}
         self._saved_txs   = {}
 
-        # Merged is a day browser — no blank entry rows. Data entry is My only.
-        editable_tail = 0 if self._merged_mode else DEFAULT_EDITABLE_ROWS
+        # Merged / Parked are not blank-entry surfaces — only My has a typed pad.
+        editable_tail = (
+            0 if (self._merged_mode or self._parked_mode) else DEFAULT_EDITABLE_ROWS
+        )
         total_rows = self._saved_count + editable_tail
         self._table.setRowCount(total_rows)
 
@@ -1691,6 +1775,10 @@ class DailyRegister(QWidget):
             self._fill_saved_row(i, tx)
             self._saved_ids[i] = tx._id
             self._saved_txs[i] = tx
+            if (getattr(tx, "register_status", "") or "") == "parked":
+                meta = dict(self._pending_row_meta.get(i) or {})
+                meta["parked"] = True
+                self._pending_row_meta[i] = meta
 
         if editable_tail:
             self._init_editable_rows(self._saved_count, total_rows)
@@ -1925,11 +2013,19 @@ class DailyRegister(QWidget):
             description = description.upper()
 
         truck_raw = txt(COL_TRUCK)
-        if cat is not None and getattr(cat, "requires_truck", True) and not truck_raw:
+        parking = bool(meta.get("parked")) or self._parked_mode
+        if (
+            cat is not None
+            and getattr(cat, "requires_truck", True)
+            and not truck_raw
+            and not parking
+        ):
             raise ValueError(
                 f'Truck number is required for item "{item_name}".'
             )
         truck_number = ""
+        truck_ok = True
+        reg_status = "draft"
         if truck_raw:
             allowed_anyway = self._truck_allow_anyway.get(row)
             if (
@@ -1946,13 +2042,21 @@ class DailyRegister(QWidget):
                         truck_raw, allowed_labels=self._allowed_truck_labels
                     )
                     label = norm.value if norm.status != "empty" else truck_raw
-                    if norm.status == "invalid":
+                    if norm.status == "place_label":
+                        truck_number = norm.value
+                    elif parking:
+                        # Parked follow-up: keep the value even when not in fleet.
+                        truck_number = (
+                            norm.value
+                            if norm.status in ("ok", "normalized", "invalid")
+                            else " ".join(truck_raw.upper().split())
+                        )
+                        truck_ok = False
+                    elif norm.status == "invalid":
                         raise ValueError(
                             f'"{label}" is not a valid truck number '
                             f"(expected T + number + space + suffix, e.g. T688 EAF)."
                         )
-                    if norm.status == "place_label":
-                        truck_number = norm.value
                     else:
                         raise ValueError(
                             f'"{norm.value}" is not a registered fleet vehicle.'
@@ -1964,6 +2068,18 @@ class DailyRegister(QWidget):
                 self._table.blockSignals(True)
                 it_truck.setText(truck_number)
                 self._table.blockSignals(False)
+        # Parked while truck still bad; promote to draft once the truck is valid.
+        if meta.get("parked") and not truck_ok:
+            reg_status = "parked"
+        elif self._parked_mode and not truck_ok:
+            reg_status = "parked"
+        elif meta.get("parked") and not truck_raw:
+            reg_status = "parked"
+        else:
+            reg_status = "draft"
+            if meta.get("parked") and truck_ok:
+                meta.pop("parked", None)
+                self._pending_row_meta[row] = meta
 
         ref_text = txt(COL_REF).upper()
         orig = self._saved_txs.get(row)
@@ -2000,7 +2116,13 @@ class DailyRegister(QWidget):
             cashier_id=self._user._id,
             day_order=_meta_day_order,
             possible_duplicate=bool(meta.get("possible_duplicate")),
-            register_status="draft",
+            duplicate_of_id=(
+                ObjectId(meta["duplicate_of_id"])
+                if meta.get("duplicate_of_id")
+                and ObjectId.is_valid(str(meta.get("duplicate_of_id")))
+                else None
+            ),
+            register_status=reg_status,
             daily_import_id=meta.get("daily_import_id"),
             daily_import_source=meta.get("daily_import_source"),
             date_discrepancy=date_discrep,
@@ -2195,6 +2317,7 @@ class DailyRegister(QWidget):
             "payee": tx.payee,
             "cheque": tx.cheque,
             "import_primary_date": tx.import_primary_date,
+            "register_status": tx.register_status or "draft",
         }
 
     # ------------------------------------------------------------------
@@ -5227,10 +5350,12 @@ class DailyRegister(QWidget):
         self._pending_truck_issues.clear()
         self._header_cheque = ""
         self._current_date = None
-        # New table is always My entries (Merged has no entry surface).
-        if self._merged_mode:
+        # New table is always My entries (Merged / Parked have no entry surface).
+        if self._view_mode != "my":
+            self._view_mode = "my"
             self._merged_mode = False
-            self.mode_changed.emit(False)
+            self._parked_mode = False
+            self.mode_changed.emit("my")
         self._populate([])
         self._apply_column_visibility(show_cashier=False)
         self._hide_register_loading()
@@ -5437,8 +5562,14 @@ class DailyRegister(QWidget):
                     pass
             if getattr(tx, "possible_duplicate", False):
                 meta["possible_duplicate"] = True
+                dup_of = getattr(tx, "duplicate_of_id", None)
+                if dup_of is not None:
+                    meta["duplicate_of_id"] = str(dup_of)
+                else:
+                    meta.pop("duplicate_of_id", None)
             else:
                 meta.pop("possible_duplicate", None)
+                meta.pop("duplicate_of_id", None)
             self._pending_row_meta[row] = meta
             self._apply_row_sync_tint(row)
         self._flush_local_draft()
@@ -6575,7 +6706,11 @@ class DailyRegister(QWidget):
             )
             return False
 
-        missing_truck_rows = self._rows_missing_required_truck()
+        missing_truck_rows = [
+            row for row in self._rows_missing_required_truck()
+            if not (self._pending_row_meta.get(row) or {}).get("parked")
+            and not self._parked_mode
+        ]
         if missing_truck_rows:
             detail_lines = []
             for row in missing_truck_rows[:12]:
@@ -6781,12 +6916,16 @@ class DailyRegister(QWidget):
                         amount=tx.amount,
                         amount_label=format_amount_label(tx),
                         existing=dupes[0],
+                        date_label=format_new_date(tx.date),
                     ))
 
             save_anyway: set[int] = set()
             if duplicate_items:
                 dlg = DuplicateReviewDialog(
-                    duplicate_items, dup_days=dup_days, parent=self,
+                    duplicate_items,
+                    dup_days=dup_days,
+                    parent=self,
+                    pending_total=len(pending_inserts),
                 )
                 if dlg.exec() != QDialog.Accepted:
                     self._flush_local_draft()
@@ -6794,11 +6933,23 @@ class DailyRegister(QWidget):
                 save_anyway = dlg.save_anyway_rows()
 
             duplicate_rows = {item.row for item in duplicate_items}
+            match_by_row = {
+                item.row: item.existing
+                for item in duplicate_items
+                if getattr(item.existing, "_id", None) is not None
+            }
             to_save: list[tuple[int, Transaction]] = []
             for row, tx in pending_inserts:
                 if row in duplicate_rows and row not in save_anyway:
                     continue
                 tx.possible_duplicate = row in save_anyway
+                if row in save_anyway:
+                    matched = match_by_row.get(row)
+                    tx.duplicate_of_id = (
+                        matched._id if matched is not None else None
+                    )
+                else:
+                    tx.duplicate_of_id = None
                 to_save.append((row, tx))
 
             # Phase C — online Save queues inserts and drains in the background
@@ -6922,7 +7073,8 @@ class DailyRegister(QWidget):
         self.drafts_changed.emit()
         # Updates-only: cells already match — skip full reload.
         # Sync insert path (Submit): reload so Verify sees server state.
-        if saved and self._current_date is not None:
+        # Parked: always reload so fixed trucks leave Parked → My entries.
+        if self._current_date is not None and (saved or self._parked_mode):
             await self._load_date(self._current_date)
         if not self._submit_in_flight:
             parts = []
@@ -6931,9 +7083,14 @@ class DailyRegister(QWidget):
             if updated:
                 parts.append(f"{updated} updated")
             summary = ", ".join(parts) if parts else "saved"
-            self.transient_status.emit(
-                f"Draft saved: {summary} · Open Drafts to submit for Verify"
-            )
+            if self._parked_mode:
+                self.transient_status.emit(
+                    f"Parked saved: {summary} · Fixed trucks return to My entries"
+                )
+            else:
+                self.transient_status.emit(
+                    f"Draft saved: {summary} · Open Drafts to submit for Verify"
+                )
         return True
 
     def _ordered_saved_ids(self) -> list:
@@ -7403,6 +7560,18 @@ class DailyRegister(QWidget):
     def _can_add_fleet(self) -> bool:
         return getattr(self._user, "role", "") in ("admin", "accountant")
 
+    def _truck_issue_row_details(self, row: int) -> dict:
+        """Snapshot visible grid cells for the truck correction Details tab."""
+        details: dict[str, str] = {}
+        for col, header in enumerate(HEADERS):
+            if col == COL_SNO:
+                continue
+            it = self._table.item(row, col)
+            text = (it.text().strip() if it else "")
+            if text:
+                details[header] = text
+        return details
+
     def _set_truck_cell(self, row: int, value: str) -> None:
         it = self._table.item(row, COL_TRUCK)
         prev = self._table.blockSignals(True)
@@ -7468,12 +7637,18 @@ class DailyRegister(QWidget):
             elif status == "invalid_format":
                 self._set_truck_cell(row, value)
                 self._pending_truck_issues[row] = TruckIssue(
-                    row=row, original=raw, kind="invalid_format"
+                    row=row,
+                    original=raw,
+                    kind="invalid_format",
+                    row_details=self._truck_issue_row_details(row),
                 )
             else:
                 self._set_truck_cell(row, value)
                 self._pending_truck_issues[row] = TruckIssue(
-                    row=row, original=raw, kind="not_in_registry"
+                    row=row,
+                    original=raw,
+                    kind="not_in_registry",
+                    row_details=self._truck_issue_row_details(row),
                 )
 
         for row, _raw in cells:
@@ -7556,11 +7731,35 @@ class DailyRegister(QWidget):
         if getattr(dlg, "new_labels", None):
             asyncio.ensure_future(self._remember_truck_labels(dlg.new_labels))
         asyncio.ensure_future(self._load_fleet_numbers())
+        parked_any = any(getattr(i, "parked", False) for i in dlg.issues)
         if result != QDialog.Accepted:
             resolved_rows = {i.row for i in dlg.issues}
             for issue in live:
                 if issue.row not in resolved_rows:
                     self._set_truck_cell(issue.row, "")
+        if parked_any:
+            asyncio.ensure_future(self._persist_parked_after_dialog())
+
+    async def _persist_parked_after_dialog(self) -> None:
+        """Save rows marked parked and open the Parked tab."""
+        parked_rows = [
+            row for row, meta in self._pending_row_meta.items()
+            if isinstance(meta, dict) and meta.get("parked")
+        ]
+        for row in parked_rows:
+            if row in self._saved_ids and row not in self._dirty_rows:
+                self._dirty_rows.add(row)
+        if parked_rows and not self._edit_mode and any(
+            r in self._saved_ids for r in parked_rows
+        ):
+            self._enter_edit_mode()
+        ok = await self._do_save()
+        if ok:
+            self.transient_status.emit("Parked for truck follow-up")
+            if self._view_mode != "parked":
+                self.set_view_mode("parked")
+            elif self._current_date is not None:
+                await self._load_date(self._current_date)
 
     async def _persist_truck_registry_adds(self, adds: list) -> None:
         from tahmeed.services.truck_service import add_fleet_by_collection
@@ -7578,6 +7777,17 @@ class DailyRegister(QWidget):
 
     def _on_truck_issue_resolved_live(self, issue: TruckIssue) -> None:
         """Apply one resolved truck to the grid as soon as it leaves the dialog list."""
+        if getattr(issue, "parked", False):
+            truck = (issue.corrected or issue.original or "").strip()
+            self._set_truck_cell(issue.row, truck)
+            meta = dict(self._pending_row_meta.get(issue.row) or {})
+            meta["parked"] = True
+            self._pending_row_meta[issue.row] = meta
+            self._truck_allow_anyway.pop(issue.row, None)
+            self._pending_truck_issues.pop(issue.row, None)
+            if issue.row in self._saved_ids:
+                self._dirty_rows.add(issue.row)
+            return
         if issue.skip or not issue.corrected:
             self._truck_allow_anyway.pop(issue.row, None)
             self._set_truck_cell(issue.row, "")
@@ -7591,6 +7801,12 @@ class DailyRegister(QWidget):
             self._truck_allow_anyway.pop(issue.row, None)
             self._fleet_numbers.add(issue.corrected)
         self._set_truck_cell(issue.row, issue.corrected)
+        # Fixed while on Parked → will save as draft and leave Parked on reload.
+        if self._parked_mode and issue.row in self._saved_ids:
+            meta = dict(self._pending_row_meta.get(issue.row) or {})
+            meta.pop("parked", None)
+            self._pending_row_meta[issue.row] = meta
+            self._dirty_rows.add(issue.row)
 
     def _validate_truck_cell(self, row: int, item: QTableWidgetItem) -> None:
         raw = item.text().strip()
@@ -7619,7 +7835,10 @@ class DailyRegister(QWidget):
             item.setText(value)
             self._table.blockSignals(prev)
         self._pending_truck_issues[row] = TruckIssue(
-            row=row, original=value or raw, kind=kind
+            row=row,
+            original=value or raw,
+            kind=kind,
+            row_details=self._truck_issue_row_details(row),
         )
         self._schedule_truck_correction()
 
@@ -7629,7 +7848,10 @@ class DailyRegister(QWidget):
         if it is None or it.text().strip().upper() != number.upper():
             return
         self._pending_truck_issues[row] = TruckIssue(
-            row=row, original=number, kind="not_in_registry"
+            row=row,
+            original=number,
+            kind="not_in_registry",
+            row_details=self._truck_issue_row_details(row),
         )
         self._schedule_truck_correction()
 

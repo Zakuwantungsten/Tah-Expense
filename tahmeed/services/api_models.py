@@ -18,6 +18,7 @@ _OBJECT_ID_FIELDS = (
     "deletion_requested_by",
     "trashed_by",
     "original_transaction_id",
+    "duplicate_of_id",
     "imported_by",
 )
 

@@ -233,6 +233,7 @@ class TransactionCreate(BaseModel):
     month: str | None = None
     year: int | None = None
     possible_duplicate: bool = False
+    duplicate_of_id: str | None = None
     daily_import_id: str | None = None
     daily_import_source: str | None = None
     date_discrepancy: bool = False

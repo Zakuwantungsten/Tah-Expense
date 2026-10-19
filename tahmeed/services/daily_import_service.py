@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import openpyxl
 from bson import ObjectId
@@ -720,6 +721,148 @@ def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict
     }
 
 
+def _hash_field(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value).strip().casefold()
+
+
+def daily_batch_content_hash(rows: Sequence[DailyImportRow]) -> str:
+    """SHA-256 of ordered daily Excel rows (whole-file reimport gate)."""
+    lines = []
+    for row in rows:
+        amt = float(row.amount or 0.0)
+        usd = row.amount_usd
+        lines.append(
+            "|".join(
+                [
+                    _hash_field(row.date),
+                    _hash_field(row.description),
+                    _hash_field(row.truck_number),
+                    f"{amt:.4f}",
+                    _hash_field(row.currency or "TZS"),
+                    f"{float(usd):.4f}" if usd is not None else "",
+                    _hash_field(row.memo),
+                ]
+            )
+        )
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def daily_batch_content_hash_from_txs(txs: Sequence[Transaction]) -> str:
+    """Same fingerprint shape as ``daily_batch_content_hash``, from saved txs."""
+    lines = []
+    for tx in txs:
+        amt = float(tx.amount or 0.0)
+        usd = tx.amount_usd
+        lines.append(
+            "|".join(
+                [
+                    _hash_field(tx.date),
+                    _hash_field(tx.description),
+                    _hash_field(tx.truck_number),
+                    f"{amt:.4f}",
+                    _hash_field(tx.currency or "TZS"),
+                    f"{float(usd):.4f}" if usd is not None else "",
+                    _hash_field(tx.memo),
+                ]
+            )
+        )
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def _norm_upload_name(name: str) -> str:
+    return Path(str(name or "").strip()).name.casefold()
+
+
+@dataclass
+class PriorDailyImport:
+    """A previous Excel upload that looks like the file being imported."""
+
+    upload_id: str
+    source_filename: str
+    row_count: int
+    created_at: Optional[datetime] = None
+    primary_date: Optional[datetime] = None
+    reason: str = "same_filename"  # same_filename | exact_content
+
+
+async def find_prior_daily_imports(
+    preview: DailyImportPreview,
+    *,
+    upload_limit: int = 100,
+) -> List[PriorDailyImport]:
+    """Detect reimport of an already-imported daily Excel file.
+
+    1. Match recent uploads by filename.
+    2. For the closest filename matches (same/near row count), compare content
+       hashes of saved rows when available → ``exact_content``.
+    """
+    filename = _norm_upload_name(preview.source_filename)
+    if not filename or not preview.rows:
+        return []
+
+    try:
+        uploads = await list_daily_uploads(limit=upload_limit)
+    except Exception:
+        return []
+
+    candidates: List[dict] = []
+    for up in uploads:
+        src = _norm_upload_name(up.get("source_filename") or "")
+        if not src or src != filename:
+            continue
+        candidates.append(up)
+
+    if not candidates:
+        return []
+
+    content_hash = daily_batch_content_hash(preview.rows)
+    row_count = len(preview.rows)
+    # Prefer same row-count uploads first when checking content.
+    candidates.sort(
+        key=lambda u: (
+            0 if int(u.get("count") or 0) == row_count else 1,
+            -(int(u.get("count") or 0)),
+        )
+    )
+
+    results: List[PriorDailyImport] = []
+    seen_ids: set[str] = set()
+    for up in candidates[:5]:
+        uid = str(up.get("_id") or up.get("upload_id") or "").strip()
+        if not uid or uid in seen_ids:
+            continue
+        seen_ids.add(uid)
+        reason = "same_filename"
+        try:
+            records = await get_daily_upload_records(uid, limit=max(row_count + 50, 500))
+            if records and daily_batch_content_hash_from_txs(records) == content_hash:
+                reason = "exact_content"
+        except Exception:
+            pass
+        results.append(
+            PriorDailyImport(
+                upload_id=uid,
+                source_filename=str(up.get("source_filename") or preview.source_filename),
+                row_count=int(up.get("count") or 0),
+                created_at=up.get("created_at"),
+                primary_date=up.get("primary_date"),
+                reason=reason,
+            )
+        )
+
+    # Exact content matches first in the list.
+    results.sort(key=lambda p: (0 if p.reason == "exact_content" else 1))
+    return results
+
+
 def preview_rows_as_truck_dicts(
     preview: DailyImportPreview,
 ) -> List[dict]:
@@ -758,8 +901,11 @@ async def cleanup_null_daily_import_ids() -> int:
     return int(payload.get("modified") or 0)
 
 
-async def list_daily_uploads_page(limit: int = 100):
-    """List Excel daily-import batches + cashier names (Browse Uploads, one RTT)."""
+async def list_daily_uploads_page(limit: int = 100, skip: int = 0):
+    """List Excel daily-import batches + cashier names (Browse Uploads, one RTT).
+
+    ``total`` is the full batch count across all pages (not just this page).
+    """
     from tahmeed.services.cashier_service import (
         BrowseUploadsPage,
         _cashier_names_from_payload,
@@ -768,7 +914,7 @@ async def list_daily_uploads_page(limit: int = 100):
     payload = await api_client.request(
         "GET",
         "v1/transactions/daily-uploads",
-        params={"limit": limit},
+        params={"limit": int(limit), "skip": max(0, int(skip))},
     )
     if isinstance(payload, list):
         rows_raw = payload
@@ -788,13 +934,13 @@ async def list_daily_uploads_page(limit: int = 100):
     return BrowseUploadsPage(items=rows, total=total, cashier_names=names)
 
 
-async def list_daily_uploads(limit: int = 100) -> List[dict]:
+async def list_daily_uploads(limit: int = 100, skip: int = 0) -> List[dict]:
     """List Excel daily-import batches (shared across cashiers).
 
     Browse uses ``/v1/transactions/daily-uploads``; managers may also hit the
     imports route. Default response includes every cashier's batches.
     """
-    page = await list_daily_uploads_page(limit=limit)
+    page = await list_daily_uploads_page(limit=limit, skip=skip)
     return page.items
 
 

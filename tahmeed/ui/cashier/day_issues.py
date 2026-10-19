@@ -18,7 +18,7 @@ from bson import ObjectId
 from PySide6.QtCore import QDate, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter, QDialog,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QStyledItemDelegate,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -61,6 +61,10 @@ _BG      = "#F4F6F8"
 _BORDER  = "#E5E7EB"
 _BLUE    = "#0077C5"
 _BLUE_L  = "#E8F4FD"
+# Row click-drag highlight — stronger than shared _table_style (#E8F4FD),
+# which barely shows against stripe rows (#F1F5F9 / white).
+_SEL_BG  = "#93C5FD"   # blue-300
+_SEL_FG  = "#0F172A"
 _GOLD    = "#B18E5E"
 _AMBER   = "#D97706"
 _AMBER_L = "#FEF3C7"
@@ -477,59 +481,36 @@ class MapDescriptionsDialog(QDialog):
         summary.setWordWrap(True)
         vl.addWidget(summary)
 
-        vl.addWidget(_lbl("PAYEE *", size=12, color=_T2))
-        self._payee = QComboBox()
-        self._payee.setEditable(True)
-        self._payee.setInsertPolicy(QComboBox.NoInsert)
-        self._payee.setFixedHeight(34)
-        self._payee.addItems(self._payees)
-        payee_completer = QCompleter(self._payees, self)
-        payee_completer.setCaseSensitivity(Qt.CaseInsensitive)
-        payee_completer.setFilterMode(Qt.MatchContains)
-        self._payee.setCompleter(payee_completer)
-        self._payee.setStyleSheet(
-            f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
+        # CompleterLineEdit (same as table inline editors): Tab accepts the
+        # first highlighted suggestion, then advances focus to the next field.
+        field_ss = (
+            f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
-            f"font-family:'Segoe UI';padding:0 8px;}}"
-            f"QComboBox:focus{{border-color:{_BLUE};}}"
+            f"font-family:'Segoe UI';padding:0 8px;"
+            "min-height:34px;max-height:34px;}"
+            f"QLineEdit:focus{{border-color:{_BLUE};}}"
         )
+        vl.addWidget(_lbl("PAYEE *", size=12, color=_T2))
+        self._payee = CompleterLineEdit(
+            list(self._payees), parent=self, ranked_contains=True,
+        )
+        self._payee.setStyleSheet(field_ss)
         if prefill_payee:
-            idx = self._payee.findText(prefill_payee.upper())
-            if idx >= 0:
-                self._payee.setCurrentIndex(idx)
-            else:
-                self._payee.setEditText(prefill_payee.upper())
-        else:
-            self._payee.setCurrentIndex(-1)
-            self._payee.setEditText("")
+            payee_pre = " ".join(prefill_payee.upper().split())
+            self._payee.setText(payee_pre)
+            self._payee._typed = payee_pre
         vl.addWidget(self._payee)
 
         vl.addWidget(_lbl("ITEM *", size=12, color=_T2))
-        self._item = QComboBox()
-        self._item.setEditable(True)
-        self._item.setInsertPolicy(QComboBox.NoInsert)
-        self._item.setFixedHeight(34)
-        for cat in self._categories:
-            self._item.addItem(cat.name, cat._id)
-        item_completer = QCompleter([c.name for c in self._categories], self)
-        item_completer.setCaseSensitivity(Qt.CaseInsensitive)
-        item_completer.setFilterMode(Qt.MatchContains)
-        self._item.setCompleter(item_completer)
-        self._item.setStyleSheet(
-            f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
-            f"background:{_WHITE};color:{_T1};font-size:12px;"
-            f"font-family:'Segoe UI';padding:0 8px;}}"
-            f"QComboBox:focus{{border-color:{_BLUE};}}"
+        self._item = CompleterLineEdit(
+            [c.name for c in self._categories],
+            parent=self,
+            ranked_contains=True,
         )
+        self._item.setStyleSheet(field_ss)
         if prefill_item:
-            idx = self._item.findText(prefill_item)
-            if idx >= 0:
-                self._item.setCurrentIndex(idx)
-            else:
-                self._item.setEditText(prefill_item)
-        else:
-            self._item.setCurrentIndex(-1)
-            self._item.setEditText("")
+            self._item.setText(prefill_item)
+            self._item._typed = prefill_item
         vl.addWidget(self._item)
 
         btn_row = QHBoxLayout()
@@ -557,21 +538,15 @@ class MapDescriptionsDialog(QDialog):
             return
         if payee not in self._payees:
             self._payees.append(payee)
-            self._payee.addItem(payee)
-            completer = QCompleter(self._payees, self)
-            completer.setCaseSensitivity(Qt.CaseInsensitive)
-            completer.setFilterMode(Qt.MatchContains)
-            self._payee.setCompleter(completer)
+            self._payee._values = list(self._payees)
+            self._payee._model.setStringList(self._payees)
         if mark_create and payee_needs_create(payee, self._known_payees_at_open):
             self._pending_new_payees.add(payee)
-        idx = self._payee.findText(payee)
-        if idx >= 0:
-            self._payee.setCurrentIndex(idx)
-        else:
-            self._payee.setEditText(payee)
+        self._payee.setText(payee)
+        self._payee._typed = payee
 
     def _on_new_payee(self) -> None:
-        typed = " ".join(self._payee.currentText().upper().split())
+        typed = " ".join(self._payee.text().upper().split())
         prefill = typed if payee_needs_create(typed, self._known_payees_at_open) else ""
         dlg = _NewPayeeDialog(parent=self, prefill=prefill)
         if dlg.exec() != QDialog.Accepted or not dlg.result_name:
@@ -592,7 +567,7 @@ class MapDescriptionsDialog(QDialog):
             (c for c in self._categories if c.name.strip().lower() == name.lower()),
             None,
         )
-        self.result_payee = " ".join(self._payee.currentText().upper().split())
+        self.result_payee = " ".join(self._payee.text().upper().split())
         self.result_category = existing or Category(name=name)
         self.result_assignment = MappingAssignment(
             action="assign",
@@ -611,8 +586,9 @@ class MapDescriptionsDialog(QDialog):
         self.accept()
 
     def _accept(self) -> None:
-        payee = " ".join(self._payee.currentText().upper().split())
-        item_name = self._item.currentText().strip()
+        payee = " ".join(self._payee.text().upper().split())
+        raw_item = self._item.text().strip()
+        item_name = self._item.canonical(raw_item) or raw_item
         if not self._descriptions:
             QMessageBox.warning(self, "Validation", "Select at least one description.")
             return
@@ -637,14 +613,10 @@ class MapDescriptionsDialog(QDialog):
             ) != QMessageBox.Yes:
                 return
             self._pending_new_payees.add(payee)
-        idx = self._item.findText(item_name)
-        cat_id = self._item.itemData(idx) if idx >= 0 else None
         cat = next(
             (c for c in self._categories if c.name.strip().lower() == item_name.lower()),
             None,
         )
-        if cat is None and cat_id is not None:
-            cat = Category(name=item_name, _id=ObjectId(str(cat_id)))
         if cat is None:
             QMessageBox.warning(
                 self,
@@ -1086,10 +1058,12 @@ class DayIssuesWidget(QWidget):
         self._table.verticalHeader().setDefaultSectionSize(_ROW_H)
         # Extra right padding so Description ▾ chevron does not collide with text.
         # Table row ☐ indicators: faint-blue fill + visible checkmark.
+        # Override shared _table_style selection — pale #E8F4FD is nearly invisible.
         self._table.setStyleSheet(
             _table_style()
             + "QHeaderView::section{padding:0 18px 0 6px;}"
             + _table_checkbox_indicator_qss()
+            + f"QTableWidget::item:selected{{background:{_SEL_BG};color:{_SEL_FG};}}"
         )
         self._table.setItemDelegateForColumn(
             _COL_PAYEE,

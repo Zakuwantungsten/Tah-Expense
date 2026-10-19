@@ -86,6 +86,8 @@ class Transaction:
     year: Optional[int] = None    # e.g. 2025
     created_at: datetime = field(default_factory=datetime.utcnow)
     possible_duplicate: bool = False   # set True when cashier overrides a duplicate warning
+    # Existing expense the cashier matched when saving anyway (Issues comparison).
+    duplicate_of_id: Optional[ObjectId] = None
     daily_import_id: Optional[str] = None       # shared id for one Excel upload batch
     daily_import_source: Optional[str] = None   # original filename
     date_discrepancy: bool = False              # row date differs from import primary date
@@ -178,6 +180,8 @@ class Transaction:
             doc["amount_usd"] = self.amount_usd
         if self.client_row_id:
             doc["client_row_id"] = self.client_row_id
+        if self.duplicate_of_id is not None:
+            doc["duplicate_of_id"] = self.duplicate_of_id
         if self._id:
             doc["_id"] = self._id
         doc["truck_sort_key"] = truck_sort_key(self.truck_number or "")
@@ -242,6 +246,7 @@ class Transaction:
             year=doc.get("year"),
             created_at=doc.get("created_at", datetime.utcnow()),
             possible_duplicate=doc.get("possible_duplicate", False),
+            duplicate_of_id=doc.get("duplicate_of_id"),
             daily_import_id=doc.get("daily_import_id"),
             daily_import_source=doc.get("daily_import_source"),
             date_discrepancy=doc.get("date_discrepancy", False),

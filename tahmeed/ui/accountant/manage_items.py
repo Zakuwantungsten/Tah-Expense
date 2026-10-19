@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QMessageBox, QAbstractItemView,
     QDialog, QFormLayout, QMenu, QWidgetAction,
     QSplitter, QStackedWidget, QSizePolicy,
-    QFileDialog, QListWidget, QListWidgetItem,
+    QFileDialog, QListWidget, QListWidgetItem, QSpinBox,
 )
 from PySide6.QtCore import Qt, QSize, Signal, QTimer
 from PySide6.QtGui import QColor, QBrush, QFont
@@ -1043,6 +1043,46 @@ class ManageItemsWidget(QWidget):
         self._allow_issues_btn.toggled.connect(self._on_allow_issues_toggled)
         hl.addWidget(self._allow_issues_btn)
 
+        dup_wrap = QFrame()
+        dup_wrap.setFixedHeight(32)
+        dup_wrap.setToolTip(
+            "When a cashier saves a new expense, look back this many days for an\n"
+            "identical row (same truck, amount, item, and description).\n"
+            "Matches are reviewed in the duplicate dialog; Save anyway flags them\n"
+            "for Verify → Issues."
+        )
+        dup_wrap.setStyleSheet(
+            f"QFrame {{ background: {_WHITE}; border: 1px solid {_BORDER};"
+            f" border-radius: 5px; }}"
+            f"QLabel {{ background: transparent; border: none; color: {_T2};"
+            " font-size: 12px; font-family:'Segoe UI'; }"
+            f"QSpinBox {{ background: transparent; border: none; color: {_T1};"
+            " font-size: 12px; font-family:'Segoe UI'; min-width: 52px; }}"
+        )
+        dup_lay = QHBoxLayout(dup_wrap)
+        dup_lay.setContentsMargins(10, 0, 6, 0)
+        dup_lay.setSpacing(4)
+        try:
+            dup_icon = QLabel()
+            dup_icon.setFixedSize(15, 15)
+            dup_icon.setPixmap(
+                qta.icon("mdi.content-duplicate", color=_T2).pixmap(15, 15)
+            )
+            dup_lay.addWidget(dup_icon)
+        except Exception:
+            pass
+        dup_lay.addWidget(QLabel("Dup check:"))
+        self._dup_days = QSpinBox()
+        self._dup_days.setRange(1, 30)
+        self._dup_days.setSuffix(" d")
+        self._dup_days.setValue(5)
+        self._dup_days.setFixedHeight(28)
+        self._dup_days.setCursor(Qt.PointingHandCursor)
+        self._dup_days.setToolTip(dup_wrap.toolTip())
+        self._dup_days.valueChanged.connect(self._on_dup_days_changed)
+        dup_lay.addWidget(self._dup_days)
+        hl.addWidget(dup_wrap)
+
         self._export_restricted_btn = QPushButton("Export restricted")
         self._export_restricted_btn.setFixedHeight(32)
         self._export_restricted_btn.setCheckable(True)
@@ -1372,6 +1412,15 @@ class ManageItemsWidget(QWidget):
         )
         self._allow_issues_btn.blockSignals(False)
 
+        try:
+            dup_days = int(await get_setting("duplicate_check_days") or 5)
+        except Exception:
+            dup_days = 5
+        dup_days = max(1, min(30, dup_days))
+        self._dup_days.blockSignals(True)
+        self._dup_days.setValue(dup_days)
+        self._dup_days.blockSignals(False)
+
     def _on_restrict_toggled(self, on: bool) -> None:
         self._restrict_btn.setText("  Restrict items: On" if on else "  Restrict items: Off")
         asyncio.ensure_future(self._save_restrict_setting(on))
@@ -1388,6 +1437,9 @@ class ManageItemsWidget(QWidget):
         )
         asyncio.ensure_future(self._save_allow_issues_setting(on))
 
+    def _on_dup_days_changed(self, days: int) -> None:
+        asyncio.ensure_future(self._save_dup_days_setting(int(days)))
+
     async def _save_restrict_setting(self, on: bool) -> None:
         try:
             await set_setting("restrict_items", on)
@@ -1403,6 +1455,12 @@ class ManageItemsWidget(QWidget):
     async def _save_allow_issues_setting(self, on: bool) -> None:
         try:
             await set_setting("allow_submit_with_day_issues", on)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
+
+    async def _save_dup_days_setting(self, days: int) -> None:
+        try:
+            await set_setting("duplicate_check_days", max(1, min(30, int(days))))
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
 

@@ -130,7 +130,10 @@ async def bulk_approve(
                 "verified_by": actor_id,
                 "verified_at": now,
                 "rejection_reason": None,
-            }
+                "possible_duplicate": False,
+                "date_discrepancy": False,
+            },
+            "$unset": {"duplicate_of_id": ""},
         },
     )
     n = int(result.modified_count)
@@ -257,7 +260,8 @@ async def approve_transaction(
                 "rejection_reason": None,
                 "possible_duplicate": False,
                 "date_discrepancy": False,
-            }
+            },
+            "$unset": {"duplicate_of_id": ""},
         },
     )
     ok = result.modified_count == 1

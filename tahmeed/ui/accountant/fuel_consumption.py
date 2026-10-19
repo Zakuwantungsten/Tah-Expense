@@ -1218,8 +1218,8 @@ class _FuelImportDialog(QDialog):
             extra = "…" if len(matching) > 3 else ""
             where = f"“{sheet_label}” · " if sheet_label else ""
             self._show_already_uploaded(
-                f"{where}This upload was already imported ({names}{extra}) "
-                "— import blocked."
+                f"{where}Already imported — same file content as {names}{extra}. "
+                "Import blocked (open the prior upload instead)."
             )
             return
         self._already_exists = False
@@ -1307,10 +1307,13 @@ class _FuelImportDialog(QDialog):
                 QMessageBox.warning(
                     self,
                     "Already Uploaded",
-                    f"This upload was already imported ({names}{extra}) — import blocked.",
+                    f"Already imported — same file content as {names}{extra}.\n\n"
+                    "Import is blocked. Open the prior upload from this feed "
+                    "instead of importing again.",
                 )
                 self._show_already_uploaded(
-                    f"This upload was already imported ({names}{extra}) — import blocked."
+                    f"Already imported — same file content as {names}{extra}. "
+                    "Import blocked (open the prior upload instead)."
                 )
                 return
 

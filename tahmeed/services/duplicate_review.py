@@ -21,6 +21,7 @@ class DuplicateReviewItem:
     amount: float
     amount_label: str
     existing: Transaction
+    date_label: str = ""
 
 
 def format_amount_label(tx: Transaction) -> str:
@@ -42,6 +43,11 @@ def format_existing_date(dt: Optional[datetime]) -> str:
         return dt.strftime("%d %b %Y")
     except Exception:
         return str(dt)
+
+
+def format_new_date(dt: Optional[datetime]) -> str:
+    """Date label for the candidate (new) row in the duplicate dialog."""
+    return format_existing_date(dt)
 
 
 def rows_to_save_with_duplicate_flags(

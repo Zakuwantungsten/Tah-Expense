@@ -66,7 +66,8 @@ class SettingsTab(QWidget):
         dup_note = QLabel(
             "When saving a new entry, the system looks back this many days for an identical "
             "transaction (same truck, amount, item, and description). The cashier is warned "
-            "but can still save — the entry is then flagged for the accountant."
+            "but can still save — the entry is then flagged for the accountant.\n"
+            "Accountants can also change this under Manage Items (Dup check)."
         )
         dup_note.setStyleSheet("color: #888; font-size: 12px;")
         dup_note.setWordWrap(True)

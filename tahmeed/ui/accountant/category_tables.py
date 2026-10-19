@@ -40,7 +40,10 @@ from tahmeed.services.category_service import item_key
 from tahmeed.ui.accountant.date_filters import (
     add_from_to_editors, read_from_to, sync_from_to,
 )
-from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.column_persistence import (
+    apply_pending_column_autofit,
+    bind_column_width_persistence,
+)
 from tahmeed.ui.widgets.export_runner import (
     attach_export_overlay,
     export_file_ready,
@@ -406,10 +409,12 @@ class CategoryTableWidget(QWidget):
         for i, (_, width, _a, _m) in enumerate(_COLS):
             self._table.setColumnWidth(i, width)
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
+        # v2: one-time content autofit for sidebar item tabs (then persist).
         bind_column_width_persistence(
             self._table,
-            f"category_{item_key(self._category)}",
+            f"category_v2_{item_key(self._category)}",
             [c[1] for c in _COLS],
+            auto_fit_if_unset=True,
         )
         self._sort_state = wire_feed_table_sort(
             self._table,
@@ -617,6 +622,14 @@ class CategoryTableWidget(QWidget):
             self._update_status()
 
     def _populate(self, txs: List[Transaction], skip: int, *, append: bool = False) -> None:
+        # Hold one-time autofit until this chunk is filled (insertRow would
+        # otherwise size columns from the first row alone).
+        pending_autofit = (
+            not append and getattr(self._table, "_col_auto_fit_pending", False)
+        )
+        if pending_autofit:
+            self._table._col_auto_fit_pending = False  # type: ignore[attr-defined]
+
         if not append:
             self._table.setRowCount(0)
         start_row = self._table.rowCount()
@@ -647,6 +660,11 @@ class CategoryTableWidget(QWidget):
             _set_cell(self._table, r, 9, tx.ownership or "—", "left", row_bg)
             _set_cell(self._table, r, 10, tx.approver or "—", "left", row_bg)
             self._table.setRowHeight(r, _ROW_H)
+
+        if pending_autofit:
+            # Keep pending if this load was empty so the next fill can autofit.
+            self._table._col_auto_fit_pending = True  # type: ignore[attr-defined]
+            apply_pending_column_autofit(self._table)
 
     # ── Excel export ───────────────────────────────────────────────────────
     def _on_export(self) -> None:

@@ -132,13 +132,32 @@ _MONTH_NAMES = (
     "July", "August", "September", "October", "November", "December",
 )
 
-_U_COL_FILE    = 0
-_U_COL_DATE    = 1
-_U_COL_COUNT   = 2
-_U_COL_CASHIER = 3
-_U_COL_ISSUES  = 4
-_U_COL_WHEN    = 5
-_U_COL_ACT     = 6
+_U_COL_SN      = 0
+_U_COL_FILE    = 1
+_U_COL_DATE    = 2
+_U_COL_COUNT   = 3
+_U_COL_CASHIER = 4
+_U_COL_TOTAL   = 5
+_U_COL_ISSUES  = 6
+_U_COL_WHEN    = 7
+_U_COL_ACT     = 8
+
+_UPLOAD_PAGE_SIZE = 50
+
+
+def _format_upload_total(upload: dict) -> str:
+    """Show TZS, USD, or both — whichever the batch actually has."""
+    tzs = float(upload.get("total_tzs") or 0.0)
+    usd = float(upload.get("total_usd") or 0.0)
+    has_tzs = tzs != 0.0
+    has_usd = usd != 0.0
+    if has_tzs and has_usd:
+        return f"TZS {tzs:,.0f} · USD {usd:,.2f}"
+    if has_usd:
+        return f"USD {usd:,.2f}"
+    if has_tzs:
+        return f"TZS {tzs:,.0f}"
+    return "—"
 
 
 # ── Main page ─────────────────────────────────────────────────────────────────
@@ -162,6 +181,9 @@ class TransactionBrowser(QWidget):
         self._results_simple: List[dict] = []
         self._results_advanced: List[Transaction] = []
         self._results_uploads: list = []
+        self._uploads_total = 0
+        self._uploads_scroll_loading = False
+        self._upload_cashier_names: dict = {}
         self._months_loaded = False
         self._years_loaded = False
         self._available_years: List[int] = []
@@ -417,21 +439,23 @@ class TransactionBrowser(QWidget):
 
     def _build_uploads_table(self) -> QTableWidget:
         t = QTableWidget()
-        t.setColumnCount(7)
+        t.setColumnCount(9)
         t.setHorizontalHeaderLabels([
-            "Filename", "Primary Date", "Rows", "Cashier",
+            "SN", "Filename", "Primary Date", "Rows", "Cashier", "Total",
             "Issues", "Imported", "",
         ])
         t.setStyleSheet(_TABLE_SS)
         t.setAlternatingRowColors(False)
         hh = t.horizontalHeader()
-        for i in range(7):
+        for i in range(9):
             hh.setSectionResizeMode(i, QHeaderView.Interactive)
         hh.setStretchLastSection(False)
         hh.setSectionResizeMode(_U_COL_FILE, QHeaderView.Stretch)
+        t.setColumnWidth(_U_COL_SN, 44)
         t.setColumnWidth(_U_COL_DATE, 110)
         t.setColumnWidth(_U_COL_COUNT, 60)
         t.setColumnWidth(_U_COL_CASHIER, 120)
+        t.setColumnWidth(_U_COL_TOTAL, 160)
         t.setColumnWidth(_U_COL_ISSUES, 90)
         t.setColumnWidth(_U_COL_WHEN, 140)
         t.setColumnWidth(_U_COL_ACT, 170)
@@ -441,6 +465,7 @@ class TransactionBrowser(QWidget):
         t.verticalHeader().setDefaultSectionSize(_ROW_H)
         t.itemSelectionChanged.connect(self._on_selection_changed)
         t.doubleClicked.connect(self._on_open_upload)
+        t.verticalScrollBar().valueChanged.connect(self._on_uploads_scroll)
         return t
 
     def _build_simple_table(self) -> QTableWidget:
@@ -809,20 +834,102 @@ class TransactionBrowser(QWidget):
     async def _load_uploads(self) -> None:
         from tahmeed.services.daily_import_service import list_daily_uploads_page
 
-        page = await list_daily_uploads_page(limit=200)
+        page = await list_daily_uploads_page(limit=_UPLOAD_PAGE_SIZE, skip=0)
         # Defense: never show groups without a real batch id.
         uploads = [u for u in page.items if u.get("_id")]
         self._results_uploads = uploads
-        self._populate_uploads(uploads, page.cashier_names)
+        self._uploads_total = int(page.total or 0)
+        self._upload_cashier_names = dict(page.cashier_names or {})
+        self._populate_uploads(uploads, reset=True)
+        self._fill_uploads_if_needed()
 
-    def _populate_uploads(self, uploads: list, names: dict) -> None:
-        self._upload_cashier_names = names or {}
+    async def _load_more_uploads(self) -> None:
+        if self._uploads_scroll_loading or self._find_in_flight:
+            return
+        if len(self._results_uploads) >= self._uploads_total:
+            return
+        from tahmeed.services.daily_import_service import list_daily_uploads_page
+
+        self._uploads_scroll_loading = True
+        self._update_uploads_count_label(loading=True)
+        try:
+            skip = len(self._results_uploads)
+            page = await list_daily_uploads_page(
+                limit=_UPLOAD_PAGE_SIZE, skip=skip,
+            )
+            more = [u for u in page.items if u.get("_id")]
+            if not more:
+                self._uploads_total = len(self._results_uploads)
+                return
+            self._uploads_total = int(page.total or self._uploads_total)
+            names = page.cashier_names or {}
+            self._upload_cashier_names.update(names)
+            start = len(self._results_uploads)
+            self._results_uploads.extend(more)
+            self._populate_uploads(more, reset=False, start_row=start)
+            self._fill_uploads_if_needed()
+        finally:
+            self._uploads_scroll_loading = False
+            self._update_uploads_count_label()
+
+    def _on_uploads_scroll(self, _value: int) -> None:
+        if self._current_mode != _MODE_UPLOADS:
+            return
+        bar = self._uploads_table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if bar.value() >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more_uploads())
+
+    def _fill_uploads_if_needed(self) -> None:
+        """Keep loading while the viewport has no scrollbar yet."""
+        bar = self._uploads_table.verticalScrollBar()
+        if (
+            not self._uploads_scroll_loading
+            and not self._find_in_flight
+            and len(self._results_uploads) < self._uploads_total
+            and bar.maximum() <= 0
+        ):
+            asyncio.ensure_future(self._load_more_uploads())
+
+    def _update_uploads_count_label(self, *, loading: bool = False) -> None:
+        loaded = len(self._results_uploads)
+        total = self._uploads_total
+        if loading or self._uploads_scroll_loading:
+            suffix = "  ·  Loading…"
+        elif total and loaded < total:
+            suffix = "  ·  Scroll for more"
+        else:
+            suffix = ""
+        if total:
+            self._count_label.setText(f"Uploads: {loaded:,} of {total:,}{suffix}")
+        else:
+            self._count_label.setText(f"Uploads: {loaded:,}{suffix}")
+
+    def _populate_uploads(
+        self,
+        uploads: list,
+        *,
+        reset: bool = True,
+        start_row: int = 0,
+    ) -> None:
+        names = self._upload_cashier_names or {}
         t = self._uploads_table
-        t.setRowCount(len(uploads))
-        for i, u in enumerate(uploads):
+        if reset:
+            t.setRowCount(len(uploads))
+            start_row = 0
+        else:
+            t.setRowCount(start_row + len(uploads))
+
+        for offset, u in enumerate(uploads):
+            i = start_row + offset
             row_bg = _stripe_bg(i)
             upload_id = str(u.get("_id") or "")
             fname = u.get("source_filename") or "—"
+            t.setItem(
+                i, _U_COL_SN,
+                _ro(str(i + 1), Qt.AlignCenter, bg=row_bg),
+            )
             t.setItem(i, _U_COL_FILE, _ro(fname, bg=row_bg))
 
             primary = u.get("primary_date") or u.get("min_date")
@@ -840,6 +947,17 @@ class TransactionBrowser(QWidget):
                 i, _U_COL_CASHIER,
                 _ro(names.get(cid, "—") if cid else "—", bg=row_bg),
             )
+
+            total_txt = _format_upload_total(u)
+            tot_it = _ro(
+                total_txt,
+                Qt.AlignRight | Qt.AlignVCenter,
+                bg=row_bg,
+            )
+            tzs = float(u.get("total_tzs") or 0.0)
+            if tzs < 0 or float(u.get("total_usd") or 0.0) < 0:
+                tot_it.setForeground(QColor("#dc2626"))
+            t.setItem(i, _U_COL_TOTAL, tot_it)
 
             outliers = int(u.get("outlier_count") or 0)
             dupes = int(u.get("duplicate_count") or 0)
@@ -891,9 +1009,9 @@ class TransactionBrowser(QWidget):
             t.setCellWidget(i, _U_COL_ACT, acts)
             _finish_table_row(t, i, row_bg)
 
-        self._count_label.setText(f"Uploads: {len(uploads)}")
+        self._update_uploads_count_label()
         self._goto_btn.setEnabled(False)
-        self._export_btn.setEnabled(len(uploads) > 0)
+        self._export_btn.setEnabled(len(self._results_uploads) > 0)
 
     def _confirm_delete_upload(self, upload_id: str, filename: str, count: int) -> None:
         from PySide6.QtWidgets import QMessageBox
@@ -1190,10 +1308,10 @@ class TransactionBrowser(QWidget):
     def _on_export(self) -> None:
         if self._current_mode == _MODE_UPLOADS:
             lines = [
-                "File\tPrimary date\tEntries\tCashier\tIssues\tUploaded"
+                "SN\tFile\tPrimary date\tEntries\tCashier\tTotal\tIssues\tUploaded"
             ]
             name_map = getattr(self, "_upload_cashier_names", {}) or {}
-            for u in self._results_uploads:
+            for sn, u in enumerate(self._results_uploads, start=1):
                 primary = u.get("primary_date") or u.get("min_date")
                 if hasattr(primary, "strftime"):
                     date_str = primary.strftime("%d/%m/%Y")
@@ -1214,10 +1332,12 @@ class TransactionBrowser(QWidget):
                 if dupes:
                     issue_bits.append(f"{dupes} dup")
                 lines.append("\t".join([
+                    str(sn),
                     u.get("source_filename") or "",
                     date_str,
                     str(int(u.get("count") or 0)),
                     name_map.get(cid, "") if cid else "",
+                    _format_upload_total(u),
                     ", ".join(issue_bits),
                     when,
                 ]))

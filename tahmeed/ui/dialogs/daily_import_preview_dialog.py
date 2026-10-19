@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
@@ -17,9 +18,18 @@ _BORDER = "#E5E7EB"
 _BLUE = "#0077C5"
 _T1 = "#111827"
 _T2 = "#6B7280"
+# Match Master Expenses / Separate Expenses zebra + header.
+_HDR_BG = "#F1F5F9"
+_ROW_EVEN = "#FFFFFF"
+_ROW_ODD = "#F1F5F9"
+_ROW_H = 24
 
 _PREVIEW_HEADERS = ("Date", "Description", "Truck", "Amount", "Item")
 _PREVIEW_LIMIT = 10
+
+
+def _stripe_bg(row_idx: int) -> str:
+    return _ROW_ODD if row_idx % 2 else _ROW_EVEN
 
 
 class DailyImportPreviewDialog(QDialog):
@@ -122,12 +132,16 @@ class DailyImportPreviewDialog(QDialog):
         table.setSelectionMode(QAbstractItemView.NoSelection)
         table.setFocusPolicy(Qt.NoFocus)
         table.verticalHeader().setVisible(False)
-        table.setAlternatingRowColors(True)
+        table.verticalHeader().setDefaultSectionSize(_ROW_H)
+        # Manual zebra — same white / slate-100 as Master Expenses.
+        table.setAlternatingRowColors(False)
         table.setStyleSheet(
-            "QTableWidget { background: #fff; gridline-color: #e5e7eb;"
-            " border: 1px solid #e5e7eb; border-radius: 6px; }"
-            "QHeaderView::section { background: #253A5C; color: #F9FAFB;"
-            " padding: 6px; border: none; font-weight: 600; }"
+            f"QTableWidget {{ background: {_WHITE}; gridline-color: {_BORDER};"
+            f" border: 1px solid {_BORDER}; border-radius: 6px;"
+            " font-family:'Segoe UI'; font-size: 12px; color: #111827; }"
+            f"QHeaderView::section {{ background: {_HDR_BG}; color: {_T1};"
+            f" padding: 6px; border: none; border-bottom: 1px solid {_BORDER};"
+            " font-weight: 600; }}"
         )
         hh = table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -145,12 +159,15 @@ class DailyImportPreviewDialog(QDialog):
                 amt,
                 row.category_name or "—",
             )
+            bg = QBrush(QColor(_stripe_bg(i)))
             for c, text in enumerate(vals):
                 it = QTableWidgetItem(text)
                 it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                it.setBackground(bg)
                 if c == 3:
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 table.setItem(i, c, it)
+            table.setRowHeight(i, _ROW_H)
 
         cvl.addWidget(table)
         root.addWidget(card, 1)
