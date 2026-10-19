@@ -12,7 +12,7 @@ Short guide for cashiers.
 
 - If the app closed before sync finished (or while offline), local recovery brings those rows back.
 - **Sync pending** means some rows were still queued for the server (sky tint) — they retry automatically when online, or click Save.
-- **Draft restored** means ordinary unsaved typing was recovered — click Save to store it.
+- **Draft restored** is cold recovery only (reopen day / app with leftover My draft) — click Save to store it. Switching My ↔ Parked / Merged restores silently and never dumps My draft onto Parked.
 - Recovered rows are **not** double-counted against rows already on the server — matching rows are skipped.
 
 ## Offline / slow network
@@ -33,8 +33,13 @@ Short guide for cashiers.
 ## Parked trucks
 
 - Incorrect trucks can be **Parked** for follow-up (**Park all** / **Park remaining**).
-- Parking persists **only** those parked rows and skips Off-date / duplicate save prompts so other unsaved entries stay on My.
-- The app finishes sync before opening the Parked tab so rows are not lost mid-sync.
+- Parking **saves nothing**: rows with a correct truck stay on My entries ready for Save; rows with a wrong truck move to the **Parked** tab (kept on this computer only).
+- On Parked, use **Fix trucks** → Correct / **Allow** / **Allow all** — accepted rows move to **My entries** immediately (no longer parked). You can also type a truck fix in the table, then Save.
+- Submit is blocked while any row is still parked.
+- **My ↔ Parked** is a view filter only — it does not Save, flush a recovery draft, or rebuild the My grid. Parked rows are still your entries, just hidden while their truck is wrong.
+- **Clear parked** moves every parked row to **Trash** (not My). From Trash you can **Restore** (parked rows return on the Parked tab) or **Delete permanently**.
+- Restoring any saved / submitted / parked row from Trash still needs the cycle on that reconciled date: Fix (if parked) → My → Save → Submit → Approve.
+- Parked never shows “Draft restored”; leftover My rows stay on the My grid (or reappear from local recovery after a cold reopen).
 
 ## Tips
 

@@ -78,6 +78,8 @@ class QbTxnToolbar(QFrame):
     font_smaller_clicked = Signal()
     wrap_clicked = Signal()
     filter_clicked = Signal()
+    fix_parked_trucks_clicked = Signal()
+    clear_parked_clicked = Signal()
 
     def __init__(
         self,
@@ -269,9 +271,13 @@ class QbTxnToolbar(QFrame):
 
         self._btn_export: Optional[QToolButton] = None
         self._btn_import: Optional[QToolButton] = None
+        self._btn_fix_parked: Optional[QToolButton] = None
+        self._btn_clear_parked: Optional[QToolButton] = None
         self._btn_today: Optional[QToolButton] = None
         self._btn_edit: Optional[QToolButton] = None
         self._btn_submit: Optional[QToolButton] = None
+        self._parked_mode = False
+        self._parked_count = 0
 
         if register_actions:
             self._btn_export = self._tool_btn(
@@ -318,6 +324,26 @@ class QbTxnToolbar(QFrame):
             )
             self._btn_day_issues.clicked.connect(self.day_issues_clicked.emit)
             lay.addWidget(self._btn_day_issues)
+
+            self._btn_fix_parked = self._tool_btn(
+                "mdi.truck-check-outline",
+                "Fix trucks",
+                "Parked tab — open truck correction for parked rows",
+            )
+            self._btn_fix_parked.clicked.connect(
+                self.fix_parked_trucks_clicked.emit
+            )
+            lay.addWidget(self._btn_fix_parked)
+
+            self._btn_clear_parked = self._tool_btn(
+                "mdi.parking",
+                "Clear parked",
+                "Parked tab — move all parked rows to Trash "
+                "(Restore or Delete permanently; does not send to My)",
+            )
+            self._btn_clear_parked.clicked.connect(self.clear_parked_clicked.emit)
+            lay.addWidget(self._btn_clear_parked)
+            self._refresh_parked_actions()
 
             self._btn_today = self._tool_btn(
                 "mdi.calendar-today", "Today", "Jump to today"
@@ -437,6 +463,21 @@ class QbTxnToolbar(QFrame):
             self._vat_cb.setToolTip("Tax-inclusive amounts — coming in a later phase")
         self.setFixedHeight(40 if compact else 56)
 
+    def _colored_icon(self, color: str, *names: str) -> Optional[QIcon]:
+        """First qtawesome name that resolves in ``color`` (or None)."""
+        seen: set[str] = set()
+        for name in names:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            try:
+                icon = qta.icon(name, color=color)
+                if icon is not None and not icon.isNull():
+                    return icon
+            except Exception:
+                continue
+        return None
+
     def _load_icon(self, *names: str):
         """Return the first qtawesome icon that resolves; try common aliases."""
         candidates: list[str] = []
@@ -449,18 +490,14 @@ class QbTxnToolbar(QFrame):
                 candidates.extend(["mdi.download", "fa5s.file-download", "mdi.file-download-outline"])
             elif "upload" in name:
                 candidates.extend(["mdi.upload", "fa5s.file-upload", "mdi.file-upload-outline"])
-        seen: set[str] = set()
-        for name in candidates:
-            if name in seen:
-                continue
-            seen.add(name)
-            try:
-                icon = qta.icon(name, color=_BLUE)
-                if icon is not None and not icon.isNull():
-                    return icon
-            except Exception:
-                continue
-        return None
+            elif "truck" in name.lower():
+                candidates.extend([
+                    "mdi.truck-check-outline",
+                    "mdi.truck-outline",
+                    "mdi.truck",
+                    "fa5s.truck",
+                ])
+        return self._colored_icon(_BLUE, *candidates)
 
     def set_attachment_count(self, count: int) -> None:
         if count > 0:
@@ -565,3 +602,44 @@ class QbTxnToolbar(QFrame):
                 self._btn_undo.setEnabled(False)
             if self._btn_redo is not None:
                 self._btn_redo.setEnabled(False)
+            if self._btn_fix_parked is not None:
+                self._btn_fix_parked.setEnabled(False)
+            if self._btn_clear_parked is not None:
+                self._btn_clear_parked.setEnabled(False)
+        else:
+            self._refresh_parked_actions()
+
+    def set_parked_mode(self, mode: str) -> None:
+        """Enable Parked tools only while the Parked tab is active."""
+        if isinstance(mode, bool):
+            mode = "merged" if mode else "my"
+        self._parked_mode = mode == "parked"
+        self._refresh_parked_actions()
+
+    def set_parked_count(self, count: int) -> None:
+        self._parked_count = max(0, int(count or 0))
+        self._refresh_parked_actions()
+
+    def _refresh_parked_actions(self) -> None:
+        if self._btn_fix_parked is None or self._btn_clear_parked is None:
+            return
+        on = bool(self._parked_mode)
+        self._btn_fix_parked.setEnabled(on)
+        self._btn_clear_parked.setEnabled(on and self._parked_count > 0)
+        # Dim icons off the Parked tab (same blue family as the rest of the strip).
+        fix_color = _BLUE if on else _MUTED
+        clear_color = "#B91C1C" if on and self._parked_count > 0 else _MUTED
+        fix_icon = self._colored_icon(
+            fix_color,
+            "mdi.truck-check-outline",
+            "mdi.truck-outline",
+            "mdi.truck",
+            "fa5s.truck",
+        )
+        if fix_icon is not None:
+            self._btn_fix_parked.setIcon(fix_icon)
+        clear_icon = self._colored_icon(
+            clear_color, "mdi.parking", "fa5s.parking"
+        )
+        if clear_icon is not None:
+            self._btn_clear_parked.setIcon(clear_icon)

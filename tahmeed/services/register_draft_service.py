@@ -19,7 +19,9 @@ from bson import ObjectId
 
 from tahmeed.config import APP_NAME
 
-SCHEMA_VERSION = 3
+# v4: ``parked_rows`` — incorrect-truck rows parked locally (never sent to the
+# server until the cashier fixes the truck and Saves them from Parked).
+SCHEMA_VERSION = 4
 
 # Per-row outbox sync state (stored in pending_meta / draft new_rows).
 SYNC_PENDING = "PENDING"
@@ -67,10 +69,25 @@ def entry_client_row_id(entry: dict | None) -> str:
 
 
 def ensure_draft_client_row_ids(payload: dict | None) -> dict | None:
-    """Stamp missing ``client_row_id`` + normalize sync_status on draft new_rows."""
+    """Stamp missing ``client_row_id`` + normalize sync_status on draft rows.
+
+    Covers both ``new_rows`` (My entries) and ``parked_rows`` (local Parked).
+    """
     if not isinstance(payload, dict):
         return payload
-    new_rows = list(payload.get("new_rows") or [])
+    changed = False
+    new_rows, changed_new = _stamp_draft_rows(payload.get("new_rows"))
+    parked_rows, changed_parked = _stamp_draft_rows(payload.get("parked_rows"))
+    changed = changed_new or changed_parked
+    if changed or int(payload.get("schema_version") or 1) < SCHEMA_VERSION:
+        payload["new_rows"] = new_rows
+        payload["parked_rows"] = parked_rows
+        payload["schema_version"] = SCHEMA_VERSION
+    return payload
+
+
+def _stamp_draft_rows(rows: Any) -> tuple[list, bool]:
+    new_rows = list(rows or [])
     changed = False
     for entry in new_rows:
         if not isinstance(entry, dict):
@@ -106,10 +123,7 @@ def ensure_draft_client_row_ids(payload: dict | None) -> dict | None:
             # Leave ordinary unsaved rows without sync_status (manual Save).
             meta.pop("sync_status", None)
             entry.pop("sync_status", None)
-    if changed or int(payload.get("schema_version") or 1) < SCHEMA_VERSION:
-        payload["new_rows"] = new_rows
-        payload["schema_version"] = SCHEMA_VERSION
-    return payload
+    return new_rows, changed
 
 
 def drafts_root() -> Path:
@@ -253,6 +267,7 @@ def build_draft_payload(
     edit_mode: bool,
     dirty_saved: list[dict],
     new_rows: list[dict],
+    parked_rows: Optional[list[dict]] = None,
 ) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -264,13 +279,34 @@ def build_draft_payload(
         "edit_mode": bool(edit_mode),
         "dirty_saved": dirty_saved,
         "new_rows": new_rows,
+        # Local Parked bucket (My file only): rows whose truck is still wrong.
+        "parked_rows": list(parked_rows or []),
     }
 
 
 def draft_is_empty(payload: dict | None) -> bool:
     if not payload:
         return True
-    return not payload.get("dirty_saved") and not payload.get("new_rows")
+    return (
+        not payload.get("dirty_saved")
+        and not payload.get("new_rows")
+        and not payload.get("parked_rows")
+    )
+
+
+def draft_parked_rows(payload: dict | None) -> list[dict]:
+    """Locally parked (incorrect-truck) rows stored in a My draft file."""
+    if not isinstance(payload, dict):
+        return []
+    return [e for e in (payload.get("parked_rows") or []) if isinstance(e, dict)]
+
+
+def entry_is_parked(entry: dict | None) -> bool:
+    """True when a draft ``new_rows`` entry carries the parked follow-up flag."""
+    if not isinstance(entry, dict):
+        return False
+    meta = entry.get("pending_meta")
+    return bool(isinstance(meta, dict) and meta.get("parked"))
 
 
 def apply_mapping_to_draft_payload(

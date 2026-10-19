@@ -79,6 +79,32 @@ def test_similar_open_rows_match_same_pasted_value(qapp) -> None:
     dlg.close()
 
 
+def test_allow_park_false_hides_park_actions(qapp) -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    from tahmeed.ui.dialogs.truck_correction_dialog import (
+        TruckCorrectionDialog,
+        TruckIssue,
+    )
+
+    dlg = TruckCorrectionDialog(
+        [TruckIssue(row=0, original="BAD", kind="not_in_registry")],
+        fleet=set(),
+        allow_park=False,
+    )
+    labels = {
+        (b.text() or "").replace("&", "")
+        for b in dlg.findChildren(QPushButton)
+        if b.isVisibleTo(dlg)
+    }
+    assert "Park all" not in labels
+    assert "Park remaining" not in labels
+    assert "Park" not in labels
+    assert "Cancel" in labels
+    assert "Done" in labels
+    dlg.close()
+
+
 def test_register_mode_shows_allow_park_and_add_buttons(qapp) -> None:
     issues = [
         TruckIssue(row=0, original="T128 EFP", kind="not_in_registry"),
@@ -160,6 +186,20 @@ def test_allow_anyway_accept_resolves_override(qapp, monkeypatch) -> None:
     assert len(dlg.issues) == 1
     assert dlg.issues[0].allow_anyway is True
     assert dlg.issues[0].corrected == "T999 ZZZ"
+    assert dlg.issues[0].parked is False
+    dlg.close()
+
+
+def test_allow_clears_stale_parked_flag(qapp, monkeypatch) -> None:
+    """Allow/Apply must never leave ``parked=True`` (would auto-park after dialog)."""
+    issue = TruckIssue(row=0, original="T999 ZZZ", kind="not_in_registry")
+    issue.parked = True
+    dlg = TruckCorrectionDialog([issue], fleet=set())
+    monkeypatch.setattr(dlg, "_confirm_allow", lambda **_kw: True)
+    monkeypatch.setattr(dlg, "_confirm_apply_similar", lambda *_a, **_k: [])
+    dlg._allow_anyway_row(dlg._rows[0])
+    assert dlg.issues[0].parked is False
+    assert dlg.issues[0].allow_anyway is True
     dlg.close()
 
 
@@ -191,6 +231,59 @@ def test_allow_all_confirm_resolves_all(qapp, monkeypatch) -> None:
     assert dlg._rows == []
     assert len(dlg.issues) == 2
     assert all(i.allow_anyway for i in dlg.issues)
+    dlg.close()
+
+
+def test_park_all_shows_branded_busy_overlay(qapp, monkeypatch) -> None:
+    dlg = TruckCorrectionDialog(
+        [
+            TruckIssue(row=i, original=f"T{i:03d} AAA", kind="not_in_registry")
+            for i in range(3)
+        ],
+        fleet=set(),
+    )
+    shown: list[str] = []
+    real_run = dlg._run_bulk_busy
+
+    def tracking_run(message: str, work):
+        shown.append(message)
+        return real_run(message, work)
+
+    monkeypatch.setattr(dlg, "_run_bulk_busy", tracking_run)
+    dlg._park_all_remaining()
+    assert shown and "Parking" in shown[0]
+    assert dlg._rows == []
+    assert len(dlg.issues) == 3
+    assert all(i.parked for i in dlg.issues)
+    assert dlg._busy_overlay is not None
+    assert dlg._busy_overlay.isHidden()
+    dlg.close()
+
+
+def test_allow_all_shows_branded_busy_overlay(qapp, monkeypatch) -> None:
+    dlg = TruckCorrectionDialog(
+        [
+            TruckIssue(row=0, original="T111 AAA", kind="not_in_registry"),
+            TruckIssue(row=1, original="T222 BBB", kind="not_in_registry"),
+        ],
+        fleet=set(),
+    )
+    monkeypatch.setattr(dlg, "_confirm_allow", lambda **_kw: True)
+    shown: list[str] = []
+    real_run = dlg._run_bulk_busy
+
+    def tracking_run(message: str, work):
+        shown.append(message)
+        overlay = dlg._ensure_busy_overlay()
+        assert overlay is not None
+        return real_run(message, work)
+
+    monkeypatch.setattr(dlg, "_run_bulk_busy", tracking_run)
+    dlg._allow_all_remaining()
+    assert shown and "Allowing" in shown[0]
+    assert dlg._rows == []
+    assert dlg._busy_overlay is not None
+    assert dlg._busy_overlay.isHidden()
     dlg.close()
 
 

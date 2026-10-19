@@ -16,6 +16,10 @@ class LoadingOverlay(QFrame):
     def __init__(self, parent: QWidget, message: str = "Loading…") -> None:
         super().__init__(parent)
         self.setObjectName("loadingOverlay")
+        # Must remain an embedded child — never a top-level HWND flash.
+        self.setWindowFlags(Qt.Widget)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WA_NativeWindow, False)
         self.setStyleSheet(
             "QFrame#loadingOverlay {"
             "  background: rgba(255, 255, 255, 0.55);"
@@ -28,7 +32,8 @@ class LoadingOverlay(QFrame):
         layout.setAlignment(Qt.AlignCenter)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self._panel = BrandLoaderPanel(self, message, mark_width=160, show_progress=True)
+        # Horse + message only — no progress bar on tab/page overlays.
+        self._panel = BrandLoaderPanel(self, message, mark_width=160, show_progress=False)
         layout.addWidget(self._panel, alignment=Qt.AlignCenter)
 
         parent.installEventFilter(self)

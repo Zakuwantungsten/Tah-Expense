@@ -143,6 +143,8 @@ class CashierTrashWidget(QWidget):
     """Cashier trash — Accountant Trash layout with role-correct actions."""
 
     count_changed = Signal(int)
+    # After restore: open register on (date, view_mode) — "parked" or "my".
+    open_register_after_restore = Signal(object, str)
 
     def __init__(self, user: User, parent=None) -> None:
         super().__init__(parent)
@@ -166,7 +168,8 @@ class CashierTrashWidget(QWidget):
         title_box.setSpacing(2)
         title_box.addWidget(_lbl("Trash", size=18, weight=700))
         self._subtitle = _lbl(
-            "Own soft-deleted drafts/submitted: restore or purge. "
+            "Own soft-deleted drafts / submitted / parked: restore or purge. "
+            "Restored saved rows still need Fix → My → Save → Submit → Approve. "
             "Approved deletions: request restore via accountant.",
             size=12, color=_T2,
         )
@@ -380,10 +383,15 @@ class CashierTrashWidget(QWidget):
             t.setItem(r, _COL_CHK, check)
 
             own = _is_own_soft_trash(tx)
+            reg = (getattr(tx, "register_status", "") or "draft").lower()
             if tx.restore_requested:
                 status, status_color = "Restore pending", _AMBER
+            elif own and reg == "parked":
+                status, status_color = "Parked (own)", _AMBER
+            elif own and reg == "submitted":
+                status, status_color = "Submitted (own)", _BLUE
             elif own:
-                status, status_color = "Own trash", _BLUE
+                status, status_color = "Draft (own)", _BLUE
             else:
                 status, status_color = "In trash", _T1
 
@@ -416,16 +424,35 @@ class CashierTrashWidget(QWidget):
         t.blockSignals(False)
 
     def _on_restore_own(self) -> None:
-        ids = self._selected_ids(own_soft=True)
+        selected = [
+            tx for tx in self._selected_txs() if _is_own_soft_trash(tx)
+        ]
+        ids = [tx._id for tx in selected if tx._id]
         if not ids:
             return
+        parked_n = sum(
+            1
+            for tx in selected
+            if (getattr(tx, "register_status", "") or "") == "parked"
+        )
+        body = f"Restore {len(ids)} expense(s) from Trash back to the register?"
+        body += (
+            "\n\nThese were already saved on a reconciled date. After "
+            "restore, finish the cycle:\n"
+            "Fix (if needed) → My entries → Save → Submit → Approve."
+        )
+        if parked_n:
+            body += (
+                f"\n\n{parked_n} parked truck row"
+                f"{'s' if parked_n != 1 else ''} will return on the Parked tab."
+            )
         if QMessageBox.question(
             self, "Restore",
-            f"Restore {len(ids)} expense(s) from Trash back to the register?",
+            body,
             QMessageBox.Yes | QMessageBox.No,
         ) != QMessageBox.Yes:
             return
-        schedule_coro(self._do_restore_own(ids))
+        schedule_coro(self._do_restore_own(ids, selected))
 
     def _on_purge_own(self) -> None:
         ids = self._selected_ids(own_soft=True)
@@ -466,15 +493,53 @@ class CashierTrashWidget(QWidget):
             return
         schedule_coro(self._do_cancel(ids))
 
-    async def _do_restore_own(self, ids: List[ObjectId]) -> None:
+    async def _do_restore_own(
+        self,
+        ids: List[ObjectId],
+        selected: Optional[List[Transaction]] = None,
+    ) -> None:
         from tahmeed.services.cashier_service import bulk_restore_own_trash
         self._busy = True
         try:
             n = await bulk_restore_own_trash(ids)
-            QMessageBox.information(
-                self, "Restored",
-                f"Restored {n} expense(s) from Trash.",
-            )
+            rows = list(selected or [])
+            parked = [
+                tx for tx in rows
+                if (getattr(tx, "register_status", "") or "") == "parked"
+            ]
+            cycle = [
+                tx for tx in rows
+                if (getattr(tx, "register_status", "") or "draft")
+                in ("draft", "submitted", "parked")
+            ]
+            if cycle:
+                detail = (
+                    f"Restored {n} expense(s) from Trash.\n\n"
+                    "They still need the register cycle on their reconciled "
+                    "date:\n"
+                    "• Fix trucks if parked → My entries\n"
+                    "• Save → Submit → Approve\n"
+                    "so they append to that day."
+                )
+                if parked:
+                    detail += (
+                        "\n\nOpening the Parked tab for parked truck rows."
+                    )
+                QMessageBox.information(
+                    self, "Restored — finish the cycle", detail
+                )
+            else:
+                QMessageBox.information(
+                    self, "Restored",
+                    f"Restored {n} expense(s) from Trash.",
+                )
+            focus = parked[0] if parked else (rows[0] if rows else None)
+            if focus is not None and getattr(focus, "date", None):
+                day = focus.date
+                if isinstance(day, datetime):
+                    day = day.date()
+                mode = "parked" if parked else "my"
+                self.open_register_after_restore.emit(day, mode)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Restore failed:\n{exc}")
         finally:

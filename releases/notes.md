@@ -1,3 +1,8 @@
+- 4.7.17: Daily Register — delete/discard invalidates My immediately (no ghost rows until Merged flip); Table tab retries when day cache is stale
+- 4.7.16: Daily Register — Allow / Allow all never parks; Fix on Parked hides Park all and promotes to My (no duplicate Parked rows)
+- 4.7.15: Daily Register — Clear parked moves rows to Trash (Restore / Delete permanently); Trash restore alerts the Save→Submit→Approve cycle and opens Parked for parked truck rows
+- 4.7.14: Daily Register — Fix trucks on Parked: Allow / Allow all moves accepted trucks to My entries immediately (off Parked)
+- 4.7.13: Daily Register — Park all / Park remaining now silently parks only incorrect-truck rows to the Parked tab (skips Off-date / duplicate Save prompts; leaves other unsaved My entries alone)
 - 4.7.12: Sidebar item tabs (Items → show in sidebar) — auto-fit table column widths on first open so ITEM / DESCRIPTION etc. are readable without manual resize each session
 - 4.7.11: Daily Register Save — faster + safer: fix post-save “Failed to load” (`_FocusRingHost` event-filter crash left the grid stale while Saved showed the real count); bulk create uses true `insert_many` + batched soft-dup; chunk size 100; online Save queues to the durable outbox and promotes on ACK (no blocking “Draft saved” dialog / full reload on clean success); Submit still awaits sync create
 - 4.7.10: Daily Register Table — Excel-style Filter toolbar toggle to show/hide column ▾ filters and clear them in one click (cashier + accountant)

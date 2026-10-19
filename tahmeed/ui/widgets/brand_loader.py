@@ -10,7 +10,6 @@ from typing import Optional
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QGraphicsOpacityEffect,
     QLabel,
     QProgressBar,
     QSizePolicy,
@@ -117,7 +116,14 @@ def load_gallop_frames(mark_width: int = LOGIN_HORSE_WIDTH) -> list[QPixmap]:
 
 
 class BrandLoaderPanel(QWidget):
-    """Login horse fade pulse + context message with ``.`` →``..`` →``...`` dots."""
+    """Login horse fade pulse + context message with ``.`` →``..`` →``...`` dots.
+
+    Never uses ``WA_TranslucentBackground`` or ``QGraphicsOpacityEffect`` — on
+    Windows those force a native HWND and briefly flash a tiny top-level window
+    titled like the app (``meedexpe``) whenever tab loaders show. Fade is done
+    by re-compositing the horse pixmap. Overlays keep progress hidden; dialogs
+    pass ``show_progress=True`` and ``opaque=True`` for UploadBusy.
+    """
 
     def __init__(
         self,
@@ -126,17 +132,29 @@ class BrandLoaderPanel(QWidget):
         *,
         mark_size: int = LOGIN_HORSE_WIDTH,
         mark_width: Optional[int] = None,
-        show_progress: bool = True,
+        show_progress: bool = False,
+        opaque: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("brandLoaderPanel")
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setStyleSheet(
-            "QWidget#brandLoaderPanel { background: transparent; border: none; }"
-        )
+        self._opaque = bool(opaque)
+        # Stay a child widget — never a native / top-level window.
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WA_NativeWindow, False)
+        if self._opaque:
+            self.setStyleSheet(
+                "QWidget#brandLoaderPanel {"
+                "  background: #FFFFFF; border: none;"
+                "}"
+            )
+        else:
+            self.setStyleSheet(
+                "QWidget#brandLoaderPanel { background: transparent; border: none; }"
+            )
         self._base_message = strip_loader_ellipsis(message)
         self._dot_index = 0
         self._fade_phase = 0.0
+        self._fade_opacity = 0.45
         self._running = False
         width = int(mark_width if mark_width is not None else mark_size)
 
@@ -145,16 +163,17 @@ class BrandLoaderPanel(QWidget):
         layout.setSpacing(10)
         layout.setAlignment(Qt.AlignCenter)
 
-        mark = load_mark_pixmap(width)
+        self._mark = load_mark_pixmap(width)
         self._horse = QLabel()
         self._horse.setAlignment(Qt.AlignCenter)
-        self._horse.setFixedSize(mark.size())
-        self._horse.setPixmap(mark)
-        self._horse.setAttribute(Qt.WA_TranslucentBackground, True)
-        self._horse.setStyleSheet("background: transparent; border: none;")
-        self._opacity = QGraphicsOpacityEffect(self._horse)
-        self._opacity.setOpacity(0.45)
-        self._horse.setGraphicsEffect(self._opacity)
+        self._horse.setFixedSize(self._mark.size())
+        self._horse.setAttribute(Qt.WA_TranslucentBackground, False)
+        self._horse.setAttribute(Qt.WA_NativeWindow, False)
+        if self._opaque:
+            self._horse.setStyleSheet("background: #FFFFFF; border: none;")
+        else:
+            self._horse.setStyleSheet("background: transparent; border: none;")
+        self._apply_fade()
         layout.addWidget(self._horse, alignment=Qt.AlignCenter)
 
         self._label = QLabel(self._compose_text())
@@ -273,17 +292,31 @@ class BrandLoaderPanel(QWidget):
             self._dot_timer.start()
         self._apply_fade()
 
+    def fade_opacity(self) -> float:
+        """Current horse fade opacity (for tests)."""
+        return float(self._fade_opacity)
+
     def stop(self) -> None:
         self._running = False
         self._fade_timer.stop()
         self._dot_timer.stop()
-        self._opacity.setOpacity(1.0)
+        self._fade_opacity = 1.0
+        self._horse.setPixmap(self._mark)
 
     def _apply_fade(self) -> None:
         # Smooth sine pulse: ~0.35 (faded) ↔ 1.0 (full color).
+        # Re-composite the pixmap — never QGraphicsOpacityEffect (native HWND flash).
         wave = 0.5 + 0.5 * math.sin(self._fade_phase)
         opacity = 0.35 + 0.65 * wave
-        self._opacity.setOpacity(opacity)
+        self._fade_opacity = opacity
+        faded = QPixmap(self._mark.size())
+        faded.fill(Qt.transparent)
+        painter = QPainter(faded)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setOpacity(opacity)
+        painter.drawPixmap(0, 0, self._mark)
+        painter.end()
+        self._horse.setPixmap(faded)
 
     def _tick_fade(self) -> None:
         step = (2.0 * math.pi) * (_FADE_MS / _FADE_PERIOD_MS)

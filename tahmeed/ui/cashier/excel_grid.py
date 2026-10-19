@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QAbstractItemDelegate, QStyledItemDelegate, QStyleOptionViewItem, QMenu, QFileDialog,
     QMessageBox, QAbstractItemView, QHeaderView, QDateEdit, QLineEdit,
     QStyle, QComboBox, QDialog, QFrame, QListWidget, QListWidgetItem, QPushButton,
-    QTableWidgetSelectionRange,
+    QTableWidgetSelectionRange, QStackedWidget,
 )
 from PySide6.QtCore import (
     Qt, Signal, QDate, QEvent, QRect, QSize, QObject, QTimer, QEventLoop,
@@ -78,9 +78,10 @@ from tahmeed.services.register_draft_service import (
     cells_from_json,
     claim_fingerprint,
     clear_register_draft,
-    clear_register_drafts_for_date,
     draft_is_empty,
+    draft_parked_rows,
     entry_client_row_id,
+    entry_is_parked,
     expense_content_fingerprint,
     fingerprint_is_meaningful,
     hydrate_pending_meta,
@@ -1069,6 +1070,13 @@ class DailyRegister(QWidget):
         self._merged_mode: bool = False    # Shared/Merged day (all cashiers)
         self._parked_mode: bool = False    # Parked incorrect-truck follow-up
         self._parked_day_count: int = 0
+        # Server rows already saved with register_status=parked (legacy flow).
+        self._server_parked_count: int = 0
+        # Local Parked bucket: incorrect-truck rows set aside *without* saving.
+        # Serialized draft entries ({client_row_id, cells, pending_meta}); the
+        # My draft file (``parked_rows``) is the durable copy. Rows return to
+        # My entries once the truck is fixed and the cashier Saves from Parked.
+        self._local_parked: list = []
         self._current_date: Optional[date] = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
@@ -1083,6 +1091,21 @@ class DailyRegister(QWidget):
         self._load_upload_id: str = ""     # one-shot: load this Excel batch instead of a day
         # When True, skip local draft restore (used while staging a daily import).
         self._skip_draft_restore: bool = False
+        # Cold My load → "notify"; intentional My↔Parked/Merged flip → "silent";
+        # Parked/Merged surfaces always behave as "off".
+        self._draft_restore_policy: str = "notify"  # notify | silent | off
+        # Same-day My↔Parked: reuse last fetch and filter in memory (no network).
+        self._day_tx_cache: list | None = None
+        self._day_tx_cache_key: tuple | None = None
+        # True after delete/discard until a successful ``_load_date`` finishes.
+        # Table-tab entry and My view flips reload when this is set.
+        self._day_tx_stale: bool = False
+        # My↔Parked keep-alive: My grid stays mounted; session maps stashed while
+        # Parked is showing so the flip never flush/wipe/restores My rows.
+        self._my_session: dict | None = None
+        self._my_table: _ExcelTableWidget | None = None
+        self._parked_table: _ExcelTableWidget | None = None
+        self._table_stack: QStackedWidget | None = None
         # Day-level Cheque stamp (header field → all data rows)
         self._header_cheque: str = ""
         # row_index -> import metadata stamped onto Transaction at save time
@@ -1174,90 +1197,104 @@ class DailyRegister(QWidget):
     # UI construction
     # ------------------------------------------------------------------
 
+    def _make_register_table(self) -> _ExcelTableWidget:
+        """Build one Excel-style register grid (My or Parked surface)."""
+        table = _ExcelTableWidget(DEFAULT_EDITABLE_ROWS, len(HEADERS))
+        table._grid_owner = self
+        _fhv = _FilterHeaderView(table)
+        _fhv.set_value_provider(self._filter_menu_values)
+        _fhv.filter_changed.connect(self._on_col_filter_changed)
+        _fhv.hide_columns_requested.connect(self._hide_columns)
+        _fhv.unhide_columns_requested.connect(self._unhide_columns)
+        table.setHorizontalHeader(_fhv)
+        table.setHorizontalHeaderLabels(HEADERS)
+        sno_hdr = table.horizontalHeaderItem(COL_SNO)
+        if sno_hdr is not None:
+            sno_hdr.setTextAlignment(Qt.AlignCenter)
+        hh = table.horizontalHeader()
+        hh.setSectionsMovable(False)
+        hh.setStretchLastSection(False)
+        hh.setMinimumSectionSize(50)
+        for col in range(len(HEADERS)):
+            hh.setSectionResizeMode(col, QHeaderView.Interactive)
+        hh.setSectionResizeMode(COL_SNO, QHeaderView.Fixed)
+        hh.setSectionResizeMode(COL_DESC, QHeaderView.Stretch)
+        hh.sectionResized.connect(lambda *_: self._schedule_wrap_height_refresh())
+
+        for col, width in _COL_PREFERRED.items():
+            table.setColumnWidth(col, width)
+
+        table.setSelectionMode(QAbstractItemView.ContiguousSelection)
+        table.setVerticalHeader(ExcelRowHeaderView(table, owner=self))
+        table.setTabKeyNavigation(False)
+        sm = table.selectionModel()
+        sm.selectionChanged.connect(lambda *_: table.viewport().update())
+        sm.currentChanged.connect(lambda *_: table.viewport().update())
+
+        table.setItemDelegate(_ExcelCellDelegate(table))
+        table.setItemDelegateForColumn(
+            COL_ITEM,
+            _ItemDelegate(lambda: [c.name for c in self._categories], table),
+        )
+        table.setItemDelegateForColumn(
+            COL_DESC,
+            _DescriptionDelegate(
+                cat_getter=lambda name: self._cat_by_name.get(name.lower()),
+                subs_getter=lambda name: self._locked_subitems.get(name.lower(), []),
+                parent=table,
+            ),
+        )
+        table.setItemDelegateForColumn(
+            COL_TRUCK,
+            _TruckDelegate(lambda: sorted(self._fleet_numbers), table),
+        )
+        table.setItemDelegateForColumn(
+            COL_DATE, _DateDelegate(lambda: self._current_date, table)
+        )
+        table.setItemDelegateForColumn(COL_REF, _RefFloatDelegate(table))
+        table.setItemDelegateForColumn(COL_TZS, _TZSDelegate(table))
+        table.setItemDelegateForColumn(COL_USD, _TZSDelegate(table))
+        table.setItemDelegateForColumn(COL_RECEIPT, _ReceiptDelegate(table))
+        people_del = _ItemDelegate(lambda: list(self._people_names), table)
+        table.setItemDelegateForColumn(COL_OWN, people_del)
+        table.setItemDelegateForColumn(COL_APR, people_del)
+        table.setItemDelegateForColumn(
+            COL_PAYEE,
+            _ItemDelegate(lambda: list(self._payee_names), table),
+        )
+
+        table.itemChanged.connect(self._on_item_changed)
+        table.model().dataChanged.connect(self._on_model_data_changed)
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+        table.customContextMenuRequested.connect(self._show_context_menu)
+        table.itemSelectionChanged.connect(self._emit_attachment_badge)
+        table.currentCellChanged.connect(lambda *_: self._emit_active_cheque())
+        table.currentCellChanged.connect(self._on_current_cell_changed)
+        return table
+
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Table ──────────────────────────────────────────────────────
-        self._table = _ExcelTableWidget(DEFAULT_EDITABLE_ROWS, len(HEADERS))
-        self._table._grid_owner = self
-        _fhv = _FilterHeaderView(self._table)
-        _fhv.set_value_provider(self._filter_menu_values)
-        _fhv.filter_changed.connect(self._on_col_filter_changed)
-        _fhv.hide_columns_requested.connect(self._hide_columns)
-        _fhv.unhide_columns_requested.connect(self._unhide_columns)
-        self._table.setHorizontalHeader(_fhv)
-        self._table.setHorizontalHeaderLabels(HEADERS)
-        sno_hdr = self._table.horizontalHeaderItem(COL_SNO)
-        if sno_hdr is not None:
-            sno_hdr.setTextAlignment(Qt.AlignCenter)
-        hh = self._table.horizontalHeader()
-        hh.setSectionsMovable(False)
-        hh.setStretchLastSection(False)
-        hh.setMinimumSectionSize(50)
-        # Interactive columns; S/NO fixed; Description stretches to fill the viewport.
-        for col in range(len(HEADERS)):
-            hh.setSectionResizeMode(col, QHeaderView.Interactive)
-        hh.setSectionResizeMode(COL_SNO,  QHeaderView.Fixed)
-        hh.setSectionResizeMode(COL_DESC, QHeaderView.Stretch)
-        hh.sectionResized.connect(lambda *_: self._schedule_wrap_height_refresh())
+        # ── Tables: My stays alive; Parked is a separate small surface ──
+        self._my_table = self._make_register_table()
+        self._parked_table = self._make_register_table()
+        self._table = self._my_table
+        self._table_stack = QStackedWidget(self)
+        self._table_stack.addWidget(self._my_table)
+        self._table_stack.addWidget(self._parked_table)
+        self._table_stack.setCurrentWidget(self._my_table)
 
-        for col, width in _COL_PREFERRED.items():
-            self._table.setColumnWidth(col, width)
         QTimer.singleShot(0, self._fit_table_columns)
-        self._apply_column_visibility(show_cashier=False)
-
-        self._table.setSelectionMode(QAbstractItemView.ContiguousSelection)
-        self._table.setVerticalHeader(ExcelRowHeaderView(self._table, owner=self))
         self._apply_table_font_size(persist=False, emit=False)
-        self._table.setTabKeyNavigation(False)
-        sm = self._table.selectionModel()
-        sm.selectionChanged.connect(lambda *_: self._table.viewport().update())
-        sm.currentChanged.connect(lambda *_: self._table.viewport().update())
-
-        # Excel selection model on every column; per-column delegates override as needed
-        self._table.setItemDelegate(_ExcelCellDelegate(self._table))
-        self._table.setItemDelegateForColumn(COL_ITEM,     _ItemDelegate(lambda: [c.name for c in self._categories], self._table))
-        self._table.setItemDelegateForColumn(COL_DESC,     _DescriptionDelegate(
-            cat_getter=lambda name: self._cat_by_name.get(name.lower()),
-            subs_getter=lambda name: self._locked_subitems.get(name.lower(), []),
-            parent=self._table,
-        ))
-        self._table.setItemDelegateForColumn(COL_TRUCK,    _TruckDelegate(
-            lambda: sorted(self._fleet_numbers), self._table
-        ))
-        date_del = _DateDelegate(lambda: self._current_date, self._table)
-        self._table.setItemDelegateForColumn(COL_DATE,     date_del)
-        self._table.setItemDelegateForColumn(COL_REF,      _RefFloatDelegate(self._table))
-        self._table.setItemDelegateForColumn(COL_TZS,      _TZSDelegate(self._table))
-        self._table.setItemDelegateForColumn(COL_USD,      _TZSDelegate(self._table))
-        self._table.setItemDelegateForColumn(COL_RECEIPT,  _ReceiptDelegate(self._table))
-        # Ownership + APR BY — same Item-style autocomplete/preview; free text always allowed.
-        people_del = _ItemDelegate(lambda: list(self._people_names), self._table)
-        self._table.setItemDelegateForColumn(COL_OWN, people_del)
-        self._table.setItemDelegateForColumn(COL_APR, people_del)
-        # Payee — catalog suggestions from Manage → Payees (IIF); free text allowed.
-        self._table.setItemDelegateForColumn(
-            COL_PAYEE,
-            _ItemDelegate(lambda: list(self._payee_names), self._table),
-        )
-
-        self._table.itemChanged.connect(self._on_item_changed)
-        self._table.model().dataChanged.connect(self._on_model_data_changed)
-        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._table.customContextMenuRequested.connect(self._show_context_menu)
-        self._table.itemSelectionChanged.connect(self._emit_attachment_badge)
-        self._table.currentCellChanged.connect(
-            lambda *_: self._emit_active_cheque()
-        )
-        self._table.currentCellChanged.connect(self._on_current_cell_changed)
+        self._apply_column_visibility(show_cashier=False)
 
         self._table_host = QWidget(self)
         host_lay = QVBoxLayout(self._table_host)
         host_lay.setContentsMargins(0, 0, 0, 0)
         host_lay.setSpacing(0)
-        host_lay.addWidget(self._table)
+        host_lay.addWidget(self._table_stack)
         root.addWidget(self._table_host, 1)
         self._loading = LoadingOverlay(self._table_host, "Loading…")
 
@@ -1315,22 +1352,56 @@ class DailyRegister(QWidget):
                 widths[col] -= cut
                 deficit -= cut
 
-        hh = self._table.horizontalHeader()
-        # Apply concrete widths, then let Description absorb any leftover slack.
-        hh.setSectionResizeMode(COL_DESC, QHeaderView.Interactive)
-        for col, width in widths.items():
-            self._table.setColumnWidth(col, width)
-        hh.setSectionResizeMode(COL_SNO,  QHeaderView.Fixed)
-        hh.setSectionResizeMode(COL_DESC, QHeaderView.Stretch)
+        tables = [
+            t for t in (self._my_table, self._parked_table, self._table)
+            if t is not None
+        ]
+        seen: set[int] = set()
+        for table in tables:
+            key = id(table)
+            if key in seen:
+                continue
+            seen.add(key)
+            hh = table.horizontalHeader()
+            hh.setSectionResizeMode(COL_DESC, QHeaderView.Interactive)
+            for col, width in widths.items():
+                table.setColumnWidth(col, width)
+            hh.setSectionResizeMode(COL_SNO, QHeaderView.Fixed)
+            hh.setSectionResizeMode(COL_DESC, QHeaderView.Stretch)
+
+    def _apply_navigate_view_mode(self, view_mode: str | None) -> None:
+        """Bind My/Parked/Merged flags + surface before a date load."""
+        if view_mode not in ("my", "parked", "merged"):
+            return
+        self._view_mode = view_mode
+        self._merged_mode = view_mode == "merged"
+        self._parked_mode = view_mode == "parked"
+        self.mode_changed.emit(view_mode)
+        if view_mode == "parked" and self._parked_table is not None:
+            self._clear_my_session()
+            self._activate_table_surface(self._parked_table)
+            self._reset_parked_surface_maps()
+            self._draft_restore_policy = "off"
+        elif self._my_table is not None:
+            self._ensure_my_surface_active()
+            if view_mode == "my":
+                self._draft_restore_policy = "silent"
 
     def navigate_to_date(
-        self, d: date, highlight_term: str = "", *, merged: bool | None = None
+        self,
+        d: date,
+        highlight_term: str = "",
+        *,
+        merged: bool | None = None,
+        view_mode: str | None = None,
     ) -> bool:
         """Called by dashboard when TransactionBrowser 'Go To' is used.
 
         highlight_term — if provided, the register scrolls to the first row
         containing this text after the date loads and briefly flashes it.
         merged=True shows every cashier's rows (Browse is a merged view).
+        view_mode — optional ``my`` / ``parked`` / ``merged`` applied before load
+        (e.g. Trash restore of parked rows).
         """
         if isinstance(d, datetime):
             d = d.date()
@@ -1341,11 +1412,10 @@ class DailyRegister(QWidget):
         if self._current_date is None:
             self._pending_highlight = highlight_term
             self._commit_open_editor()
-            if merged is True and self._view_mode != "merged":
-                self._view_mode = "merged"
-                self._merged_mode = True
-                self._parked_mode = False
-                self.mode_changed.emit("merged")
+            if merged is True:
+                self._apply_navigate_view_mode("merged")
+            elif view_mode in ("my", "parked", "merged"):
+                self._apply_navigate_view_mode(view_mode)
             if self.has_unsaved_work():
                 # Keep typed rows; stamp them onto the chosen day.
                 self._current_date = d
@@ -1364,15 +1434,20 @@ class DailyRegister(QWidget):
             and not highlight_term
             and not getattr(self, "_load_upload_id", "")
             and merged is not True
+            and view_mode is None
         ):
+            return True
+        if (
+            d == self._current_date
+            and view_mode in ("my", "parked", "merged")
+            and not highlight_term
+            and not getattr(self, "_load_upload_id", "")
+        ):
+            # Same day, just flip the surface (Trash restore on open day).
+            self.set_view_mode(view_mode)
             return True
         self._pending_highlight = highlight_term
         self._commit_open_editor()
-        if merged is True and self._view_mode != "merged":
-            self._view_mode = "merged"
-            self._merged_mode = True
-            self._parked_mode = False
-            self.mode_changed.emit("merged")
         if self.has_unsaved_work():
             self._flush_local_draft()
             choice = self._prompt_unsaved_work(
@@ -1389,6 +1464,10 @@ class DailyRegister(QWidget):
             # Discard → clear local recovery draft for this date, then leave.
             self._clear_local_draft()
         self._reset_edit_state()
+        if merged is True:
+            self._apply_navigate_view_mode("merged")
+        elif view_mode in ("my", "parked", "merged"):
+            self._apply_navigate_view_mode(view_mode)
         self._current_date = d
         if self._load_upload_id:
             self._show_register_loading("Loading upload…")
@@ -1443,6 +1522,568 @@ class DailyRegister(QWidget):
         if overlay is not None:
             overlay.hide_loading()
 
+    def _invalidate_day_tx_cache(self) -> None:
+        self._day_tx_cache = None
+        self._day_tx_cache_key = None
+        self._day_tx_stale = True
+        # Day data changed — My keep-alive session is no longer trustworthy.
+        self._clear_my_session()
+
+    def _make_day_cache_key(
+        self,
+        d: date,
+        *,
+        merged: bool,
+        upload_id: str = "",
+    ) -> tuple:
+        if upload_id:
+            return ("upload", str(upload_id))
+        if merged:
+            return ("merged", d.isoformat())
+        return ("cashier", d.isoformat(), str(self._user._id))
+
+    def _snapshot_grid_session(self) -> dict:
+        """Capture row maps bound to the active table (for My keep-alive)."""
+        return {
+            "saved_count": self._saved_count,
+            "saved_ids": dict(self._saved_ids),
+            "saved_txs": dict(self._saved_txs),
+            "pending_row_meta": dict(self._pending_row_meta),
+            "dirty_rows": set(self._dirty_rows),
+            "edit_mode": bool(self._edit_mode),
+            "truck_allow_anyway": dict(self._truck_allow_anyway),
+            "pending_truck_issues": dict(self._pending_truck_issues),
+            "undo_stack": list(self._undo_stack),
+            "redo_stack": list(self._redo_stack),
+            "cut_cells": set(self._cut_cells),
+            "cut_payload": dict(self._cut_payload),
+            "cut_is_rows": bool(self._cut_is_rows),
+        }
+
+    def _restore_grid_session(self, session: dict) -> None:
+        self._saved_count = int(session.get("saved_count") or 0)
+        self._saved_ids = dict(session.get("saved_ids") or {})
+        self._saved_txs = dict(session.get("saved_txs") or {})
+        self._pending_row_meta = dict(session.get("pending_row_meta") or {})
+        self._dirty_rows = set(session.get("dirty_rows") or ())
+        self._edit_mode = bool(session.get("edit_mode"))
+        self._truck_allow_anyway = dict(session.get("truck_allow_anyway") or {})
+        self._pending_truck_issues = dict(session.get("pending_truck_issues") or {})
+        self._undo_stack = list(session.get("undo_stack") or [])
+        self._redo_stack = list(session.get("redo_stack") or [])
+        self._cut_cells = set(session.get("cut_cells") or ())
+        self._cut_payload = dict(session.get("cut_payload") or {})
+        self._cut_is_rows = bool(session.get("cut_is_rows"))
+
+    def _clear_my_session(self) -> None:
+        self._my_session = None
+
+    def _activate_table_surface(self, table: _ExcelTableWidget) -> None:
+        """Point ``self._table`` + stack at My or Parked without wiping cells."""
+        if table is None or table is self._table:
+            if (
+                self._table_stack is not None
+                and table is not None
+                and self._table_stack.currentWidget() is not table
+            ):
+                self._table_stack.setCurrentWidget(table)
+            return
+        self._table = table
+        if self._table_stack is not None:
+            self._table_stack.setCurrentWidget(table)
+
+    def _reset_parked_surface_maps(self) -> None:
+        """Fresh maps for the Parked table before a small populate."""
+        self._saved_count = 0
+        self._saved_ids = {}
+        self._saved_txs = {}
+        self._pending_row_meta = {}
+        self._dirty_rows = set()
+        self._edit_mode = False
+        self._truck_allow_anyway = {}
+        self._pending_truck_issues = {}
+        self._undo_stack = []
+        self._redo_stack = []
+        self._cut_cells = set()
+        self._cut_payload = {}
+        self._cut_is_rows = False
+        self.edit_state_changed.emit(False, 0)
+        self._emit_undo_redo_state()
+
+    def _ensure_my_surface_active(self) -> None:
+        """Leave Parked keep-alive (if any) and bind the My table for loads."""
+        if self._parked_mode and self._my_table is not None:
+            if self._table is self._parked_table:
+                self._local_parked = self._table_parked_entries()
+            self._clear_my_session()
+            self._activate_table_surface(self._my_table)
+        elif self._my_table is not None and self._table is not self._my_table:
+            self._activate_table_surface(self._my_table)
+
+    def _flip_to_parked_keep_my(self) -> bool:
+        """My → Parked without flush/wipe/restore. Returns False if unavailable."""
+        if self._my_table is None or self._parked_table is None:
+            return False
+        if self._current_date is None:
+            return False
+        # Don't stash a My grid that still shows deleted server rows.
+        if self._day_tx_stale:
+            return False
+        self._draft_timer.stop()
+        self._commit_open_editor()
+        self._my_session = self._snapshot_grid_session()
+        self._activate_table_surface(self._parked_table)
+        self._reset_parked_surface_maps()
+        self._view_mode = "parked"
+        self._merged_mode = False
+        self._parked_mode = True
+        self.mode_changed.emit("parked")
+        self._draft_restore_policy = "off"
+        if self._day_tx_cache is not None:
+            self._apply_txs_to_view(
+                list(self._day_tx_cache),
+                upload_id="",
+                reload_local_parked=False,
+            )
+        else:
+            # Local parked immediately; server parked arrives when load returns.
+            self._apply_txs_to_view(
+                [], upload_id="", reload_local_parked=False
+            )
+            self._show_register_loading("Loading…")
+            asyncio.ensure_future(self._load_date(self._current_date))
+        self._schedule_outbox_drain(delay_ms=800)
+        return True
+
+    def _flip_to_my_keep_alive(self) -> bool:
+        """Parked → My using the preserved My table. Returns False to slow-path."""
+        if self._my_table is None or self._my_session is None:
+            return False
+        # Delete/discard while away — force a real My reload, not the stash.
+        if self._day_tx_stale:
+            return False
+        self._draft_timer.stop()
+        self._commit_open_editor()
+        prev_parked = list(self._local_parked)
+        self._local_parked = self._table_parked_entries()
+        self._activate_table_surface(self._my_table)
+        self._restore_grid_session(self._my_session)
+        self._clear_my_session()
+        self._view_mode = "my"
+        self._merged_mode = False
+        self._parked_mode = False
+        self.mode_changed.emit("my")
+        self._draft_restore_policy = "notify"
+        self._emit_parked_count()
+        self._update_footer()
+        self.edit_state_changed.emit(
+            bool(self._edit_mode), len(self._dirty_rows)
+        )
+        self._emit_undo_redo_state()
+        self._emit_active_cheque()
+        if prev_parked != self._local_parked:
+            self._flush_day_issues_source_changed(force=True)
+        self._schedule_outbox_drain(delay_ms=800)
+        return True
+
+    def _apply_txs_to_view(
+        self,
+        txs: list,
+        *,
+        upload_id: str = "",
+        reload_local_parked: bool = True,
+    ) -> None:
+        """Update parked badge, filter for My/Parked/Merged, populate the grid."""
+        parked_all = [
+            tx for tx in txs
+            if (getattr(tx, "register_status", "") or "") == "parked"
+        ]
+        if not upload_id and reload_local_parked:
+            # Disk is the durable copy of the local Parked bucket (My file).
+            self._load_local_parked_from_disk()
+        if not self._merged_mode:
+            own_parked = [
+                tx for tx in parked_all
+                if tx.cashier_id == self._user._id
+                or str(tx.cashier_id) == str(self._user._id)
+            ]
+            self._server_parked_count = len(own_parked)
+            self._emit_parked_count()
+        if self._parked_mode:
+            view_txs = [
+                tx for tx in txs
+                if (getattr(tx, "register_status", "") or "") == "parked"
+            ]
+        else:
+            view_txs = [
+                tx for tx in txs
+                if (getattr(tx, "register_status", "") or "") != "parked"
+            ]
+        self._pending_row_meta.clear()
+        self._populate(view_txs)
+        if self._parked_mode and not upload_id:
+            self._append_local_parked_rows()
+        show_cashier = self._merged_mode or bool(upload_id)
+        self._apply_column_visibility(show_cashier=show_cashier)
+
+    # ------------------------------------------------------------------
+    # Local Parked bucket (incorrect trucks set aside without saving)
+    # ------------------------------------------------------------------
+
+    def _emit_parked_count(self) -> None:
+        self._parked_day_count = int(self._server_parked_count) + len(
+            self._local_parked
+        )
+        self.parked_count_changed.emit(self._parked_day_count)
+
+    def _load_local_parked_from_disk(self) -> None:
+        """Refresh ``_local_parked`` from the My draft file for the open day."""
+        if self._current_date is None:
+            self._local_parked = []
+            return
+        try:
+            draft = load_register_draft(
+                self._user._id, self._current_date, merged=False
+            )
+        except Exception:
+            draft = None
+        self._local_parked = draft_parked_rows(draft)
+
+    def _table_parked_entries(self) -> list:
+        """Serialize unsaved rows marked parked that are on the grid right now."""
+        out: list = []
+        for row in range(self._saved_count, self._table.rowCount()):
+            if not self._row_has_data(row) or not self._row_marked_parked(row):
+                continue
+            rid = self._ensure_row_client_id(row)
+            meta = dict(self._pending_row_meta.get(row) or {})
+            meta["parked"] = True
+            meta["client_row_id"] = rid
+            # Parked rows are never queued for the server.
+            meta.pop("sync_status", None)
+            out.append({
+                "client_row_id": rid,
+                "cells": cells_for_json(self._row_value_map(row)),
+                "pending_meta": serialize_pending_meta(meta),
+            })
+        return out
+
+    def _append_local_parked_rows(self) -> None:
+        """Parked view: show locally parked rows as editable unsaved rows."""
+        entries = list(self._local_parked)
+        if not entries:
+            return
+        self._bulk_mutating = True
+        self._restoring_draft = True
+        prev = self._table.blockSignals(True)
+        try:
+            start = self._table.rowCount()
+            self._table.setRowCount(start + len(entries))
+            self._init_editable_rows(start, start + len(entries))
+            for offset, entry in enumerate(entries):
+                row = start + offset
+                values = cells_from_json(entry.get("cells"))
+                self._write_row_values(row, values)
+                meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+                meta["parked"] = True
+                meta.pop("sync_status", None)
+                rid = entry_client_row_id(entry) or meta.get("client_row_id")
+                meta["client_row_id"] = rid or new_client_row_id()
+                self._pending_row_meta[row] = meta
+                self._activate_row(row)
+                self._sync_row_date(row)
+        finally:
+            self._table.blockSignals(prev)
+            self._restoring_draft = False
+            self._bulk_mutating = False
+        self._renumber()
+        for row in range(start, self._table.rowCount()):
+            self._update_truck_required_highlight(row)
+        self._update_footer()
+        self._flush_day_issues_source_changed(force=True)
+
+    def _append_entries_onto_my_surface(self, entries: list) -> int:
+        """Write promoted parked entries onto the keep-alive My table + session."""
+        if not entries or self._my_table is None:
+            return 0
+        parked_snap = self._snapshot_grid_session()
+        parked_table = self._table
+        parked_mode = self._parked_mode
+        try:
+            self._table = self._my_table
+            self._parked_mode = False
+            if self._my_session is not None:
+                self._restore_grid_session(self._my_session)
+            start = self._first_empty_editable_row()
+            needed = start + len(entries) - self._table.rowCount()
+            if needed > 0:
+                self._append_editable_rows(needed + 5)
+            truck_cells: list = []
+            prev = self._table.blockSignals(True)
+            self._bulk_mutating = True
+            self._restoring_draft = True
+            suppress = self._suppress_truck_dialog
+            self._suppress_truck_dialog = True
+            try:
+                for offset, entry in enumerate(entries):
+                    row = start + offset
+                    values = cells_from_json(entry.get("cells"))
+                    allow = (entry.get("allow_anyway") or "").strip()
+                    if allow:
+                        self._truck_allow_anyway[row] = allow
+                    truck_cells.extend(self._write_row_values(row, values))
+                    meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+                    meta.pop("parked", None)
+                    meta.pop("sync_status", None)
+                    rid = (
+                        entry_client_row_id(entry)
+                        or meta.get("client_row_id")
+                        or new_client_row_id()
+                    )
+                    meta["client_row_id"] = rid
+                    self._pending_row_meta[row] = meta
+                    self._activate_row(row)
+                    self._sync_row_date(row)
+                self._finalize_truck_cells(truck_cells)
+            finally:
+                self._suppress_truck_dialog = suppress
+                self._table.blockSignals(prev)
+                self._bulk_mutating = False
+                self._restoring_draft = False
+            self._renumber()
+            self._update_footer()
+            self._my_session = self._snapshot_grid_session()
+            return len(entries)
+        finally:
+            self._parked_mode = parked_mode
+            self._table = parked_table
+            self._restore_grid_session(parked_snap)
+
+    def _promote_accepted_parked_rows_to_my(self) -> int:
+        """Move Parked rows with an accepted truck onto My entries immediately.
+
+        Used after Fix parked trucks (Allow / Allow all / Apply). Local parked
+        rows are appended to the keep-alive My grid; saved ``register_status=
+        parked`` leftovers are unparked to draft on the server.
+        """
+        if not self._parked_mode:
+            return 0
+        self._commit_open_editor()
+        local_rows: list[int] = []
+        saved_ids: list = []
+        for row in range(self._table.rowCount()):
+            if row >= self._saved_count and not self._row_has_data(row):
+                continue
+            it = self._table.item(row, COL_TRUCK)
+            raw = (it.text().strip() if it else "")
+            if not raw:
+                continue
+            if not self._row_truck_is_valid(row):
+                continue
+            if row in self._saved_ids:
+                saved_ids.append(self._saved_ids[row])
+            elif row >= self._saved_count:
+                local_rows.append(row)
+
+        if not local_rows and not saved_ids:
+            return 0
+
+        entries: list = []
+        for row in sorted(local_rows):
+            rid = self._ensure_row_client_id(row)
+            meta = dict(self._pending_row_meta.get(row) or {})
+            meta.pop("parked", None)
+            meta.pop("sync_status", None)
+            meta["client_row_id"] = rid
+            allow = self._truck_allow_anyway.get(row)
+            entry = {
+                "client_row_id": rid,
+                "cells": cells_for_json(self._row_value_map(row)),
+                "pending_meta": serialize_pending_meta(meta),
+            }
+            if allow:
+                entry["allow_anyway"] = allow
+            entries.append(entry)
+
+        if entries:
+            self._append_entries_onto_my_surface(entries)
+
+        if local_rows:
+            prev = self._table.blockSignals(True)
+            self._bulk_mutating = True
+            try:
+                for row in reversed(sorted(local_rows)):
+                    self._shift_row_maps_on_remove(row)
+                    self._table.removeRow(row)
+            finally:
+                self._bulk_mutating = False
+                self._table.blockSignals(prev)
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self._emit_undo_redo_state()
+            self._renumber()
+
+        self._local_parked = self._table_parked_entries()
+        self._flush_local_draft()
+        self._emit_parked_count()
+        self._update_footer()
+        self._flush_day_issues_source_changed(force=True)
+
+        n_local = len(entries)
+        n_saved = len(saved_ids)
+        total = n_local + n_saved
+        if saved_ids:
+            asyncio.ensure_future(
+                self._unpark_saved_rows(
+                    saved_ids,
+                    loading_message=(
+                        f"Moving {n_saved} accepted "
+                        f"row{'s' if n_saved != 1 else ''} to My…"
+                    ),
+                    status_message=(
+                        f"Moved {total} accepted "
+                        f"row{'s' if total != 1 else ''} to My entries"
+                    ),
+                )
+            )
+            return total
+
+        if self._my_session is not None:
+            self._flip_to_my_keep_alive()
+        else:
+            self.set_view_mode("my")
+        self.transient_status.emit(
+            f"Moved {n_local} accepted "
+            f"row{'s' if n_local != 1 else ''} to My entries"
+        )
+        return total
+
+    def _merge_local_parked_entries(self, entries: list) -> int:
+        """Append parked entries without duplicating the same client_row_id.
+
+        Returns how many *new* entries were added to ``_local_parked``.
+        """
+        if not entries:
+            return 0
+        existing_ids = {
+            entry_client_row_id(e)
+            for e in self._local_parked
+            if entry_client_row_id(e)
+        }
+        added = 0
+        for entry in entries:
+            rid = entry_client_row_id(entry)
+            if rid and rid in existing_ids:
+                continue
+            self._local_parked.append(entry)
+            if rid:
+                existing_ids.add(rid)
+            added += 1
+        return added
+
+    def _park_rows_locally(self) -> int:
+        """Move unsaved rows marked parked off My into the local Parked bucket.
+
+        Nothing is sent to the server: correct rows stay on My entries ready
+        for Save; parked rows wait in Parked until their truck is fixed.
+        Returns the number of rows parked.
+        """
+        self._commit_open_editor()
+        if self._parked_mode:
+            # Already on the Parked surface — never re-append; just persist.
+            self._local_parked = self._table_parked_entries()
+            self._flush_local_draft()
+            self._emit_parked_count()
+            return 0
+        rows = sorted(
+            row
+            for row in range(self._saved_count, self._table.rowCount())
+            if self._row_has_data(row) and self._row_marked_parked(row)
+        )
+        if not rows:
+            return 0
+        entries = self._table_parked_entries()
+        self._draft_timer.stop()
+        prev = self._table.blockSignals(True)
+        self._bulk_mutating = True
+        try:
+            for row in reversed(rows):
+                self._shift_row_maps_on_remove(row)
+                self._pending_truck_issues = {
+                    (r - 1 if r > row else r): issue
+                    for r, issue in self._pending_truck_issues.items()
+                    if r != row
+                }
+                self._table.removeRow(row)
+            min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+            if self._table.rowCount() < min_rows:
+                start = self._table.rowCount()
+                self._table.setRowCount(min_rows)
+                self._init_editable_rows(start, min_rows)
+        finally:
+            self._bulk_mutating = False
+            self._table.blockSignals(prev)
+        # Row indices changed under any recorded undo ops — drop history.
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._emit_undo_redo_state()
+        self._renumber()
+        n = self._merge_local_parked_entries(entries)
+        self._flush_local_draft()
+        self._update_footer()
+        self._emit_parked_count()
+        self._flush_day_issues_source_changed(force=True)
+        if n:
+            self.transient_status.emit(
+                f"{n} row{'s' if n != 1 else ''} parked for truck follow-up — "
+                "not saved. Fix them under Parked."
+            )
+        return n
+
+    def _row_truck_is_valid(self, row: int) -> bool:
+        """True when the truck cell resolves to a fleet / allowed value."""
+        it = self._table.item(row, COL_TRUCK)
+        raw = it.text().strip() if it else ""
+        if not raw:
+            return False
+        status, _value = self._resolve_truck_text(raw, row=row)
+        return status == "ok"
+
+    def _maybe_restore_draft_after_populate(self) -> None:
+        """Apply local draft per policy. Parked/Merged never restore."""
+        policy = "off" if self._skip_draft_restore else self._draft_restore_policy
+        if self._parked_mode or self._merged_mode:
+            policy = "off"
+        try:
+            if policy == "off":
+                return
+            restored = self._restore_local_draft()
+            if restored and policy == "notify":
+                self._show_draft_restored_notice(*restored)
+        finally:
+            # Next cold day open should warn again unless set_view_mode overrides.
+            self._draft_restore_policy = "notify"
+
+    def _try_apply_cached_view(self) -> bool:
+        """Same-day My↔Parked (or Merged cache hit): filter in memory, no network."""
+        if (
+            self._day_tx_cache is None
+            or self._day_tx_cache_key is None
+            or self._current_date is None
+        ):
+            return False
+        key = self._make_day_cache_key(
+            self._current_date,
+            merged=self._merged_mode,
+            upload_id="",
+        )
+        if self._day_tx_cache_key != key:
+            return False
+        self._apply_txs_to_view(list(self._day_tx_cache), upload_id="")
+        self._maybe_restore_draft_after_populate()
+        self._schedule_outbox_drain(delay_ms=800)
+        return True
+
     async def _load_date(self, d: date) -> None:
         from tahmeed.ui.async_utils import pause_background_polls
 
@@ -1474,31 +2115,22 @@ class DailyRegister(QWidget):
                 txs = await get_transactions_by_date(d, cashier_id=self._user._id)
             if seq != self._load_gen:
                 return
-            # Split parked truck follow-up rows from the normal register surfaces.
-            parked_all = [
-                tx for tx in txs
-                if (getattr(tx, "register_status", "") or "") == "parked"
-            ]
-            if not self._merged_mode:
-                # Parked count is per cashier (own rows), even while viewing My.
-                own_parked = [
-                    tx for tx in parked_all
-                    if tx.cashier_id == self._user._id
-                    or str(tx.cashier_id) == str(self._user._id)
-                ]
-                self._parked_day_count = len(own_parked)
-                self.parked_count_changed.emit(self._parked_day_count)
+            # Cache full day (incl. parked) for fast My↔Parked flips.
+            self._day_tx_cache = list(txs)
+            self._day_tx_cache_key = self._make_day_cache_key(
+                d, merged=self._merged_mode, upload_id=upload_id or ""
+            )
             if self._parked_mode:
-                txs = [
+                view_for_names = [
                     tx for tx in txs
                     if (getattr(tx, "register_status", "") or "") == "parked"
                 ]
             else:
-                txs = [
+                view_for_names = [
                     tx for tx in txs
                     if (getattr(tx, "register_status", "") or "") != "parked"
                 ]
-            ids = [tx.cashier_id for tx in txs if tx.cashier_id]
+            ids = [tx.cashier_id for tx in view_for_names if tx.cashier_id]
             cashier_names = {}
             if ids:
                 from tahmeed.services.accountant_service import get_cashier_names
@@ -1506,18 +2138,20 @@ class DailyRegister(QWidget):
             if seq != self._load_gen:
                 return
             self._cashier_names = cashier_names
-            self._pending_row_meta.clear()
-            self._populate(txs)
-            show_cashier = self._merged_mode or bool(upload_id)
-            self._apply_column_visibility(show_cashier=show_cashier)
-            if not self._skip_draft_restore:
-                restored = self._restore_local_draft()
-                if restored:
-                    self._show_draft_restored_notice(*restored)
+            # Keep in-memory Parked bucket when My is stashed (My↔Parked flip).
+            self._apply_txs_to_view(
+                txs,
+                upload_id=upload_id or "",
+                reload_local_parked=(self._my_session is None),
+            )
+            self._maybe_restore_draft_after_populate()
+            # Successful paint — Table / My no longer need a forced refresh.
+            self._day_tx_stale = False
             # Reconnect / open-day: push any PENDING/FAILED outbox rows.
             self._schedule_outbox_drain(delay_ms=800)
         except Exception as exc:
             if seq == self._load_gen:
+                # Keep ``_day_tx_stale`` so the next Table/My entry retries.
                 QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
         finally:
             if seq == self._load_gen:
@@ -1529,20 +2163,36 @@ class DailyRegister(QWidget):
         self.set_view_mode("merged" if merged else "my")
 
     def set_view_mode(self, mode: str) -> None:
-        """Switch My entries / Parked / Merged (scope reload — no save prompt).
+        """Switch My entries / Parked / Merged.
 
-        Unsaved My work is stashed to the My local draft file before the flip;
-        returning to My restores it. Merged is a day browser, not an entry form.
-        Parked shows saved rows with ``register_status=parked`` for truck follow-up.
+        My ↔ Parked is an in-memory view flip: the My grid stays mounted, Parked
+        uses a separate small surface, and the flip never flushes drafts, saves
+        to the server, or wipe/restores My rows. Merged still reloads the day
+        browser (flush + cache/network) because it is a different scope.
         """
         mode = mode if mode in ("my", "parked", "merged") else "my"
         if mode == self._view_mode:
             return
+        prev = self._view_mode
+
+        # Fast path: My ↔ Parked keep-alive (no save / no My rebuild).
+        if prev == "my" and mode == "parked":
+            if self._flip_to_parked_keep_my():
+                return
+        if prev == "parked" and mode == "my":
+            if self._flip_to_my_keep_alive():
+                return
+
         self._draft_timer.stop()
         self._commit_open_editor()
-        # Stash current-mode recovery file before flipping the merged key.
-        if self.has_unsaved_work():
-            self._flush_local_draft()
+        # Leaving Parked without a keep-alive session: sync bucket, then use My.
+        if self._parked_mode and self._table is self._parked_table:
+            self._local_parked = self._table_parked_entries()
+        if prev == "parked" or mode == "merged" or prev == "merged":
+            # Merged (or slow Parked→My) still needs a durable draft snapshot.
+            if self.has_unsaved_work() or self._parked_mode or self._local_parked:
+                self._flush_local_draft()
+        self._ensure_my_surface_active()
         self._view_mode = mode
         self._merged_mode = mode == "merged"
         self._parked_mode = mode == "parked"
@@ -1550,6 +2200,19 @@ class DailyRegister(QWidget):
         self.mode_changed.emit(self._view_mode)
         if self._current_date is None:
             self._populate([])
+            return
+        if mode in ("parked", "merged"):
+            self._draft_restore_policy = "off"
+        elif mode == "my" and prev in ("parked", "merged"):
+            self._draft_restore_policy = "silent"
+        else:
+            self._draft_restore_policy = "notify"
+        # Slow Parked (no My session): bind parked surface before populate.
+        if mode == "parked" and self._parked_table is not None:
+            self._activate_table_surface(self._parked_table)
+            self._reset_parked_surface_maps()
+        # After delete/discard, never reuse a stale in-memory day cache.
+        if not self._day_tx_stale and self._try_apply_cached_view():
             return
         self._show_register_loading("Loading…")
         asyncio.ensure_future(self._load_date(self._current_date))
@@ -1617,20 +2280,23 @@ class DailyRegister(QWidget):
 
     async def _confirm_parked_trucks_for_submit(self, d: date) -> bool:
         """Block submit while parked incorrect-truck rows remain for this cashier."""
+        if self._parked_mode:
+            # Grid is the live copy of the local bucket while Parked is open.
+            self._local_parked = self._table_parked_entries()
         count = int(getattr(self, "_parked_day_count", 0) or 0)
         if count <= 0 and self._current_date == d:
             # Refresh count from server if we have not loaded Parked yet.
             try:
                 txs = await get_transactions_by_date(d, cashier_id=self._user._id)
-                count = sum(
+                self._server_parked_count = sum(
                     1
                     for tx in txs
                     if (getattr(tx, "register_status", "") or "") == "parked"
                 )
-                self._parked_day_count = count
-                self.parked_count_changed.emit(count)
+                self._emit_parked_count()
+                count = self._parked_day_count
             except Exception:
-                count = 0
+                count = len(self._local_parked)
         if count <= 0:
             return True
         label = d.strftime("%d %b %Y")
@@ -1717,14 +2383,55 @@ class DailyRegister(QWidget):
                 # Keep only unsaved editable / dirty cells for restore after reload.
                 self._flush_local_draft()
             else:
-                clear_register_drafts_for_date(self._user._id, day)
+                # Server drafts changed — local Parked rows were never on the
+                # server, so they stay.
+                self._clear_day_draft_keep_parked(day, clear_merged=True)
         except Exception:
             pass
         if not open_here:
             return
         self._draft_timer.stop()
         self._dirty_rows.clear()
+        self._invalidate_day_tx_cache()
+        # Discard removed server rows — don't reinject them from local recovery.
+        if not self.has_unsaved_work():
+            self._draft_restore_policy = "off"
+        else:
+            self._draft_restore_policy = "silent"
         asyncio.ensure_future(self._load_date(day))
+
+    def ensure_fresh_day_view(self) -> None:
+        """Reload the open day when delete/discard left the grid / cache stale.
+
+        Called when entering the Table tab so My entries cannot keep showing
+        rows that already left the server until a Merged flip.
+        """
+        if self._current_date is None:
+            return
+        if not self._day_tx_stale and self._day_tx_cache is not None:
+            return
+        if self._load_in_flight:
+            return
+        asyncio.ensure_future(self._load_date(self._current_date))
+
+    async def _reload_after_server_row_change(self) -> None:
+        """Invalidate + reload the open day after Table delete / trash."""
+        day = self._current_date
+        if not isinstance(day, date):
+            return
+        keep_typed = self.has_unsaved_work()
+        try:
+            if keep_typed:
+                self._flush_local_draft()
+            else:
+                self._clear_day_draft_keep_parked(day, clear_merged=True)
+        except Exception:
+            pass
+        self._draft_timer.stop()
+        self._dirty_rows.clear()
+        self._invalidate_day_tx_cache()
+        self._draft_restore_policy = "silent" if keep_typed else "off"
+        await self._load_date(day)
 
     def reload_settings(self) -> None:
         """Re-read the restrict toggles, locked sub-items and fleet list without
@@ -1738,6 +2445,7 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._load_payee_names())
         asyncio.ensure_future(self._load_description_cache())
         asyncio.ensure_future(self._load_description_mapping_cache())
+        self.ensure_fresh_day_view()
 
     def update_people(self, names: list) -> None:
         """Refresh Ownership / APR BY suggestion list (free text still allowed)."""
@@ -1831,6 +2539,12 @@ class DailyRegister(QWidget):
         if status == "draft":
             bg = QBrush(DRAFT_BG)
             status_tip = "Draft — saved but not submitted to Verify"
+        elif status == "parked":
+            bg = QBrush(DRAFT_BG)
+            status_tip = (
+                "Parked — fix the truck (table or Fix trucks), then Save "
+                "to return to My entries"
+            )
         else:
             bg = QBrush(SAVED_BG)
             status_tip = "Submitted — awaiting accountant Verify"
@@ -2944,7 +3658,8 @@ class DailyRegister(QWidget):
             self._deactivate_row(row)
 
     def _append_editable_rows(self, n: int = 10) -> None:
-        if self._merged_mode:
+        # Parked / Merged are follow-up browsers — never grow an entry pad there.
+        if self._merged_mode or self._parked_mode:
             return
         start = self._table.rowCount()
         self._table.setRowCount(start + n)
@@ -4693,7 +5408,12 @@ class DailyRegister(QWidget):
                 QMessageBox.information(self, title, "\n\n".join(parts))
             if trashed or requested or deleted:
                 self.trash_changed.emit()
-            await self._load_date(self._current_date)
+                # Same invalidate + reload as Drafts discard so My cannot keep
+                # painting deleted rows until a Merged flip.
+                await self._reload_after_server_row_change()
+            elif missing:
+                # Already gone on server — still refresh if the grid is stale.
+                await self._reload_after_server_row_change()
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to delete:\n{exc}")
 
@@ -4747,13 +5467,10 @@ class DailyRegister(QWidget):
                 return
 
         # Drop any crash-recovery draft for the target day so load cannot re-inject
-        # old rows under the fresh import.
-        try:
-            clear_register_draft(
-                self._user._id, primary, merged=self._merged_mode
-            )
-        except Exception:
-            pass
+        # old rows under the fresh import. The local Parked bucket survives,
+        # except rows parked from an earlier import of this same file.
+        self._clear_day_draft_keep_parked(primary, source=preview.source_filename)
+        self._invalidate_day_tx_cache()
 
         self._skip_draft_restore = True
         try:
@@ -4765,9 +5482,11 @@ class DailyRegister(QWidget):
                     "Opening import date…",
                     title="Importing Daily Register",
                 ) as busy:
+                    await busy.tick()
                     busy.update("Opening import date…", value=20, maximum=100)
                     await self._load_date(primary)
                     busy.update("Import date ready", value=100, maximum=100)
+                    await busy.tick()
             else:
                 # Same day: wipe leftover unsaved editable rows before staging.
                 self._wipe_unsaved_editable_rows()
@@ -4786,25 +5505,34 @@ class DailyRegister(QWidget):
                 f"Loading {len(payloads):,} row(s) into table…",
                 title="Importing Daily Register",
             ) as busy:
+                # This coroutine runs inside an asyncio Task, where
+                # processEvents is a no-op — only real awaits let the dialog
+                # paint. Tick once so the horse / bar show before the loop.
+                await busy.tick()
                 busy.update(
                     f"Loading 0 / {len(payloads):,} row(s)…",
                     value=0,
                     maximum=total,
                 )
+                await busy.tick()
 
-                def _on_load_progress(done: int, count: int) -> None:
+                async def _on_load_progress(done: int, count: int) -> None:
                     busy.update(
                         f"Loading {done:,} / {count:,} row(s)…",
                         value=done,
                         maximum=max(1, count),
                     )
+                    await busy.tick()
 
-                self._load_staged_import_rows(payloads, on_progress=_on_load_progress)
+                await self._load_staged_import_rows_async(
+                    payloads, on_progress=_on_load_progress
+                )
                 busy.update(
                     f"Loaded {len(payloads):,} row(s)",
                     value=total,
                     maximum=total,
                 )
+                await busy.tick()
             QMessageBox.information(
                 self,
                 "Import ready",
@@ -4868,127 +5596,229 @@ class DailyRegister(QWidget):
 
         schedule_coro(self._auto_fill_rows_from_mappings(row_list))
 
-    def _load_staged_import_rows(self, payloads: list, *, on_progress=None) -> None:
-        if not payloads:
-            return
-        self._bulk_mutating = True
-        start = self._first_empty_editable_row()
-        prev = self._table.blockSignals(True)
-        truck_cells: list = []
-        loaded_rows: set = set()
-        total = len(payloads)
+    def _clear_day_draft_keep_parked(
+        self,
+        primary: date,
+        *,
+        source: str = "",
+        clear_merged: bool | None = None,
+    ) -> None:
+        """Clear typed / recovered draft rows for *primary*, keep local Parked.
+
+        ``source``: rows parked from an earlier import of that same file are
+        dropped so a re-import does not double them up under Parked.
+        ``clear_merged``: also drop the Merged recovery file (default: only when
+        Merged is the current view).
+        """
+        if clear_merged is None:
+            clear_merged = self._merged_mode
         try:
-            for r, data in enumerate(payloads):
-                target = start + r
-                if target >= self._table.rowCount():
-                    self._append_editable_rows(max(20, len(payloads) - r + 5))
-                if target < self._saved_count:
-                    if on_progress is not None and (
-                        r == 0 or r + 1 == total or (r + 1) % 25 == 0
-                    ):
-                        on_progress(r + 1, total)
-                    continue
-                loaded_rows.add(target)
-                self._pending_row_meta[target] = {
-                    "client_row_id": new_client_row_id(),
-                    "daily_import_id": data.get("daily_import_id"),
-                    "daily_import_source": data.get("daily_import_source"),
-                    "date_discrepancy": data.get("date_discrepancy"),
-                    "import_primary_date": data.get("import_primary_date"),
-                    "category_id": data.get("category_id"),
-                    "currency": data.get("currency") or "TZS",
-                    "lpo_do": (data.get("lpo_do") or "").upper(),
-                    "do_number": (data.get("do_number") or "").upper(),
-                }
-
-                dt = data.get("date")
-                date_str = format_register_date(dt) if dt else ""
-                self._table.setItem(target, COL_DATE, QTableWidgetItem(date_str))
-
-                item_name = data.get("item") or data.get("category_name") or ""
-                if item_name:
-                    self._table.setItem(
-                        target, COL_ITEM, QTableWidgetItem(_upper_text(COL_ITEM, item_name))
+            draft = load_register_draft(self._user._id, primary, merged=False)
+            parked = draft_parked_rows(draft)
+            if source:
+                key = (source or "").strip().lower()
+                parked = [
+                    e for e in parked
+                    if (
+                        (hydrate_pending_meta(e.get("pending_meta")) or {}).get(
+                            "daily_import_source"
+                        )
+                        or ""
+                    ).strip().lower()
+                    != key
+                ]
+            if parked:
+                save_register_draft(
+                    build_draft_payload(
+                        user_id=self._user._id,
+                        username=getattr(self._user, "username", "") or "",
+                        register_date=primary,
+                        merged=False,
+                        edit_mode=False,
+                        dirty_saved=[],
+                        new_rows=[],
+                        parked_rows=parked,
                     )
-
-                payee_name = data.get("payee") or ""
-                if payee_name:
-                    self._table.setItem(
-                        target,
-                        COL_PAYEE,
-                        QTableWidgetItem(_upper_text(COL_PAYEE, payee_name)),
-                    )
-
-                desc = data.get("description") or ""
-                self._table.setItem(
-                    target, COL_DESC, QTableWidgetItem(_upper_text(COL_DESC, desc))
                 )
+            else:
+                clear_register_draft(self._user._id, primary, merged=False)
+            if clear_merged:
+                clear_register_draft(self._user._id, primary, merged=True)
+            if primary == self._current_date:
+                self._local_parked = parked
+                self._emit_parked_count()
+        except Exception:
+            pass
 
-                truck = data.get("truck_number") or ""
-                if truck:
-                    self._table.setItem(target, COL_TRUCK, QTableWidgetItem(truck.upper()))
-                    truck_cells.append((target, truck))
+    @staticmethod
+    def _import_progress_due(r: int, total: int) -> bool:
+        return r == 0 or r + 1 == total or (r + 1) % 25 == 0
 
-                memo = data.get("memo") or ""
-                if memo:
-                    self._table.setItem(
-                        target, COL_MEMO, QTableWidgetItem(_upper_text(COL_MEMO, memo))
-                    )
+    def _begin_staged_import(self, payloads: list) -> dict:
+        """Lock the grid for a bulk import; returns loop state for ``_stage_import_row``."""
+        self._draft_timer.stop()
+        self._bulk_mutating = True
+        return {
+            "start": self._first_empty_editable_row(),
+            "prev_block": self._table.blockSignals(True),
+            "truck_cells": [],
+            "loaded_rows": set(),
+            "total": len(payloads),
+        }
 
-                ref = data.get("ref_float") or ""
-                if ref:
-                    self._table.setItem(
-                        target, COL_REF, QTableWidgetItem(_upper_text(COL_REF, ref))
-                    )
+    def _stage_import_row(self, state: dict, r: int, data: dict) -> None:
+        """Write one staged import payload onto row ``start + r``."""
+        target = state["start"] + r
+        if target >= self._table.rowCount():
+            self._append_editable_rows(max(20, state["total"] - r + 5))
+        if target < self._saved_count:
+            return
+        state["loaded_rows"].add(target)
+        self._pending_row_meta[target] = {
+            "client_row_id": new_client_row_id(),
+            "daily_import_id": data.get("daily_import_id"),
+            "daily_import_source": data.get("daily_import_source"),
+            "date_discrepancy": data.get("date_discrepancy"),
+            "import_primary_date": data.get("import_primary_date"),
+            "category_id": data.get("category_id"),
+            "currency": data.get("currency") or "TZS",
+            "lpo_do": (data.get("lpo_do") or "").upper(),
+            "do_number": (data.get("do_number") or "").upper(),
+        }
 
-                # Split amount into TZS / USD columns (legacy USD-only rows land in USD).
-                staged = Transaction(
-                    date=data.get("date") or datetime.utcnow(),
-                    description=data.get("description") or "",
-                    truck_number=data.get("truck_number") or "",
-                    amount=float(data.get("amount") or 0),
-                    currency=data.get("currency") or "TZS",
-                    amount_usd=(
-                        float(data["amount_usd"])
-                        if data.get("amount_usd") is not None
-                        else None
-                    ),
-                )
-                tzs_txt, usd_txt = _display_money_cells(staged)
-                self._table.setItem(target, COL_TZS, _money_item(tzs_txt))
-                self._table.setItem(target, COL_USD, _money_item(usd_txt))
+        dt = data.get("date")
+        date_str = format_register_date(dt) if dt else ""
+        self._table.setItem(target, COL_DATE, QTableWidgetItem(date_str))
 
-                rcpt = data.get("receipt_status") or ""
-                rcpt_it = QTableWidgetItem(str(rcpt))
-                rcpt_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-                self._table.setItem(target, COL_RECEIPT, rcpt_it)
+        item_name = data.get("item") or data.get("category_name") or ""
+        if item_name:
+            self._table.setItem(
+                target, COL_ITEM, QTableWidgetItem(_upper_text(COL_ITEM, item_name))
+            )
 
-                own = data.get("ownership") or ""
-                if own:
-                    self._table.setItem(
-                        target, COL_OWN, QTableWidgetItem(_upper_text(COL_OWN, own))
-                    )
-                apr = data.get("approver") or ""
-                if apr:
-                    self._table.setItem(
-                        target, COL_APR, QTableWidgetItem(_upper_text(COL_APR, apr))
-                    )
+        payee_name = data.get("payee") or ""
+        if payee_name:
+            self._table.setItem(
+                target,
+                COL_PAYEE,
+                QTableWidgetItem(_upper_text(COL_PAYEE, payee_name)),
+            )
 
-                if on_progress is not None and (
-                    r == 0 or r + 1 == total or (r + 1) % 25 == 0
-                ):
-                    on_progress(r + 1, total)
+        desc = data.get("description") or ""
+        self._table.setItem(
+            target, COL_DESC, QTableWidgetItem(_upper_text(COL_DESC, desc))
+        )
 
-            for row in loaded_rows:
+        truck = data.get("truck_number") or ""
+        if truck:
+            self._table.setItem(target, COL_TRUCK, QTableWidgetItem(truck.upper()))
+            state["truck_cells"].append((target, truck))
+
+        memo = data.get("memo") or ""
+        if memo:
+            self._table.setItem(
+                target, COL_MEMO, QTableWidgetItem(_upper_text(COL_MEMO, memo))
+            )
+
+        ref = data.get("ref_float") or ""
+        if ref:
+            self._table.setItem(
+                target, COL_REF, QTableWidgetItem(_upper_text(COL_REF, ref))
+            )
+
+        # Split amount into TZS / USD columns (legacy USD-only rows land in USD).
+        staged = Transaction(
+            date=data.get("date") or datetime.utcnow(),
+            description=data.get("description") or "",
+            truck_number=data.get("truck_number") or "",
+            amount=float(data.get("amount") or 0),
+            currency=data.get("currency") or "TZS",
+            amount_usd=(
+                float(data["amount_usd"])
+                if data.get("amount_usd") is not None
+                else None
+            ),
+        )
+        tzs_txt, usd_txt = _display_money_cells(staged)
+        self._table.setItem(target, COL_TZS, _money_item(tzs_txt))
+        self._table.setItem(target, COL_USD, _money_item(usd_txt))
+
+        rcpt = data.get("receipt_status") or ""
+        rcpt_it = QTableWidgetItem(str(rcpt))
+        rcpt_it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+        self._table.setItem(target, COL_RECEIPT, rcpt_it)
+
+        own = data.get("ownership") or ""
+        if own:
+            self._table.setItem(
+                target, COL_OWN, QTableWidgetItem(_upper_text(COL_OWN, own))
+            )
+        apr = data.get("approver") or ""
+        if apr:
+            self._table.setItem(
+                target, COL_APR, QTableWidgetItem(_upper_text(COL_APR, apr))
+            )
+
+    def _finish_staged_import(self, state: dict) -> None:
+        """Unlock the grid after a bulk import and queue truck validation."""
+        try:
+            for row in state["loaded_rows"]:
                 self._sync_row_date(row)
         finally:
-            self._table.blockSignals(prev)
+            self._table.blockSignals(state["prev_block"])
             self._bulk_mutating = False
         self._renumber()
-        self._finalize_truck_cells(truck_cells)
+        self._finalize_truck_cells(state["truck_cells"])
         self._update_footer()
         self._schedule_draft_autosave()
         self._flush_day_issues_source_changed(force=True)
+
+    def _load_staged_import_rows(self, payloads: list, *, on_progress=None) -> None:
+        """Synchronous staging (tests / small batches)."""
+        if not payloads:
+            return
+        state = self._begin_staged_import(payloads)
+        try:
+            for r, data in enumerate(payloads):
+                self._stage_import_row(state, r, data)
+                if on_progress is not None and self._import_progress_due(
+                    r, state["total"]
+                ):
+                    on_progress(r + 1, state["total"])
+        finally:
+            self._finish_staged_import(state)
+
+    async def _load_staged_import_rows_async(
+        self, payloads: list, *, on_progress=None
+    ) -> None:
+        """Stage rows in slices, yielding to Qt between them.
+
+        The import runs inside an asyncio Task where ``processEvents`` is a
+        no-op (Python 3.14 / qasync), so a blocking loop leaves the busy dialog
+        blank. ``on_progress`` is awaited so it can ``tick`` the event loop and
+        paint the horse + percentage bar.
+        """
+        if not payloads:
+            return
+        from tahmeed.ui.async_utils import pause_background_polls
+
+        # Yielding lets timers fire — hold off the outbox drain (it reads the
+        # half-staged grid) exactly like a date load does.
+        prev_load_flag = self._load_in_flight
+        self._load_in_flight = True
+        with pause_background_polls(self):
+            state = self._begin_staged_import(payloads)
+            try:
+                for r, data in enumerate(payloads):
+                    self._stage_import_row(state, r, data)
+                    if self._import_progress_due(r, state["total"]):
+                        if on_progress is not None:
+                            await on_progress(r + 1, state["total"])
+                        else:
+                            await asyncio.sleep(0)
+            finally:
+                self._finish_staged_import(state)
+                self._load_in_flight = prev_load_flag
 
     def _load_rows(self, file_rows: List[List]) -> None:
         """Legacy positional loader kept for CSV paste-compat helpers."""
@@ -5188,19 +6018,28 @@ class DailyRegister(QWidget):
         pt = self._table_font_pt
         font = QFont("Calibri")
         font.setPointSize(pt)
-        self._table.setFont(font)
-        self._table.setStyleSheet(self._table_stylesheet(pt))
-
-        vh = self._table.verticalHeader()
-        if isinstance(vh, ExcelRowHeaderView):
-            vh.set_font_pt(pt)
         row_h = self._row_height_for_font(pt)
-        vh.setDefaultSectionSize(row_h)
-        if self._wrapped_cols:
-            self._refresh_wrapped_row_heights()
-        else:
-            for row in range(self._table.rowCount()):
-                self._table.setRowHeight(row, row_h)
+        tables = [
+            t for t in (self._my_table, self._parked_table, self._table)
+            if t is not None
+        ]
+        seen: set[int] = set()
+        for table in tables:
+            key = id(table)
+            if key in seen:
+                continue
+            seen.add(key)
+            table.setFont(font)
+            table.setStyleSheet(self._table_stylesheet(pt))
+            vh = table.verticalHeader()
+            if isinstance(vh, ExcelRowHeaderView):
+                vh.set_font_pt(pt)
+            vh.setDefaultSectionSize(row_h)
+            if table is self._table and self._wrapped_cols:
+                self._refresh_wrapped_row_heights()
+            else:
+                for row in range(table.rowCount()):
+                    table.setRowHeight(row, row_h)
 
         if persist:
             _save_table_font_pt(pt)
@@ -5382,15 +6221,20 @@ class DailyRegister(QWidget):
         """Empty editable grid with unset reconciled date (New table)."""
         self._draft_timer.stop()
         if isinstance(self._current_date, date):
-            try:
-                clear_register_draft(
-                    self._user._id, self._current_date, merged=self._merged_mode
-                )
-            except Exception:
-                pass
+            # Drops typed rows; the local Parked bucket for that day survives.
+            self._clear_local_draft()
+        # Leave Parked surface without re-importing its rows into the bucket.
+        self._clear_my_session()
+        if self._my_table is not None:
+            self._activate_table_surface(self._my_table)
+        self._local_parked = []
+        self._server_parked_count = 0
+        self._emit_parked_count()
         self._load_gen += 1  # cancel any in-flight date load
         self._load_upload_id = ""
         self._skip_draft_restore = False
+        self._draft_restore_policy = "notify"
+        self._invalidate_day_tx_cache()
         self._reset_edit_state()
         self._pending_row_meta.clear()
         self._truck_allow_anyway.clear()
@@ -5403,6 +6247,13 @@ class DailyRegister(QWidget):
             self._merged_mode = False
             self._parked_mode = False
             self.mode_changed.emit("my")
+        if self._parked_table is not None and self._parked_table is not self._table:
+            prev = self._table
+            self._table = self._parked_table
+            try:
+                self._populate([])
+            finally:
+                self._table = prev
         self._populate([])
         self._apply_column_visibility(show_cashier=False)
         self._hide_register_loading()
@@ -5842,14 +6693,54 @@ class DailyRegister(QWidget):
     def _emit_attachment_badge(self) -> None:
         self.attachment_count_changed.emit(self.selected_attachment_count())
 
-    def has_unsaved_work(self) -> bool:
-        """True when edit-mode dirty rows or typed-but-unsaved new rows exist."""
+    def has_unsaved_work(self, *, include_stashed_my: bool = True) -> bool:
+        """True when edit-mode dirty rows or typed-but-unsaved new rows exist.
+
+        Locally parked rows whose truck is still wrong are not "unsaved work":
+        they are persisted in the local draft by design and only leave Parked
+        when the cashier fixes the truck and Saves. A parked row whose truck
+        has been fixed *is* unsaved work (Save moves it to My entries).
+
+        While Parked is showing, also inspect the keep-alive My table/session so
+        navigation prompts still see leftover My entries. Pass
+        ``include_stashed_my=False`` for Parked-surface Save outcomes that must
+        ignore the hidden My grid.
+        """
         if self._dirty_rows:
             return True
         for row in range(self._saved_count, self._table.rowCount()):
-            if self._row_has_data(row):
+            if not self._row_has_data(row):
+                continue
+            if self._parked_mode and self._row_stays_parked(row):
+                continue
+            return True
+        if (
+            include_stashed_my
+            and self._parked_mode
+            and self._my_session is not None
+            and self._my_table is not None
+        ):
+            if self._my_session.get("dirty_rows"):
                 return True
+            saved = int(self._my_session.get("saved_count") or 0)
+            for row in range(saved, self._my_table.rowCount()):
+                # Minimal data check without rebinding maps: Description/amount.
+                desc = self._my_table.item(row, COL_DESC)
+                tzs = self._my_table.item(row, COL_TZS)
+                usd = self._my_table.item(row, COL_USD)
+                if (desc and desc.text().strip()) or (
+                    tzs and tzs.text().strip()
+                ) or (usd and usd.text().strip()):
+                    return True
         return False
+
+    def _row_stays_parked(self, row: int) -> bool:
+        """Unsaved row marked parked whose truck is still not a valid fleet value."""
+        return (
+            row >= self._saved_count
+            and self._row_marked_parked(row)
+            and not self._row_truck_is_valid(row)
+        )
 
     def _notify_day_issues_source_changed(self) -> None:
         """Mark Day Issues dirty / refresh badge.
@@ -6375,6 +7266,9 @@ class DailyRegister(QWidget):
         for row in range(self._saved_count, self._table.rowCount()):
             if not self._row_has_data(row):
                 continue
+            if self._row_stays_parked(row):
+                # Local Parked bucket — never queued for the server.
+                continue
             self._set_row_sync_status(row, SYNC_PENDING)
         self._flush_local_draft()
 
@@ -6411,6 +7305,12 @@ class DailyRegister(QWidget):
             try:
                 to_save: list[tuple[int, Transaction]] = []
                 for row in rows:
+                    if self._row_stays_parked(row):
+                        # Stale PENDING on a parked wrong-truck row — stays local.
+                        row_meta = dict(self._pending_row_meta.get(row) or {})
+                        row_meta.pop("sync_status", None)
+                        self._pending_row_meta[row] = row_meta
+                        continue
                     try:
                         tx = self._build_transaction_from_row(row)
                     except ValueError:
@@ -6510,11 +7410,13 @@ class DailyRegister(QWidget):
                 # cleared cells but lack transaction payloads to rebuild them.
                 if acked_txs:
                     self._append_saved_transactions(acked_txs)
+                    self._invalidate_day_tx_cache()
                 need_reload = bool(
                     synced and len(acked_txs) < synced and self._current_date is not None
                 )
                 if need_reload:
                     self._reload_after_drain = True
+                    self._invalidate_day_tx_cache()
 
                 if cancelled:
                     left = len(self._outbox_pending_rows())
@@ -6597,20 +7499,41 @@ class DailyRegister(QWidget):
             pass
 
     def _clear_local_draft(self, *, both_modes: bool = False) -> None:
+        """Drop typed / dirty recovery rows. The local Parked bucket survives."""
         self._draft_timer.stop()
         if self._current_date is None:
             return
         try:
-            if both_modes:
-                clear_register_drafts_for_date(self._user._id, self._current_date)
-            else:
+            if self._parked_mode:
+                self._local_parked = self._table_parked_entries()
+            parked = list(self._local_parked)
+            if both_modes or self._merged_mode:
                 clear_register_draft(
-                    self._user._id, self._current_date, merged=self._merged_mode
+                    self._user._id, self._current_date, merged=True
                 )
+            if both_modes or not self._merged_mode:
+                if parked:
+                    save_register_draft(
+                        build_draft_payload(
+                            user_id=self._user._id,
+                            username=getattr(self._user, "username", "") or "",
+                            register_date=self._current_date,
+                            merged=False,
+                            edit_mode=False,
+                            dirty_saved=[],
+                            new_rows=[],
+                            parked_rows=parked,
+                        )
+                    )
+                else:
+                    clear_register_draft(
+                        self._user._id, self._current_date, merged=False
+                    )
         except Exception:
             pass
 
-    def _capture_local_draft(self, *, include_dirty: bool = True) -> dict:
+    def _capture_rows_from_bound_table(self, *, include_dirty: bool) -> tuple:
+        """Capture dirty_saved / new_rows / edit_mode from the active table maps."""
         dirty_saved: list = []
         if include_dirty:
             for row in sorted(self._dirty_rows):
@@ -6623,8 +7546,6 @@ class DailyRegister(QWidget):
                     "cashier_id": str(tx.cashier_id) if tx and tx.cashier_id else None,
                     "cells": cells_for_json(self._row_value_map(row)),
                 })
-
-        # Merged never persists typed "new" rows — entry belongs in My.
         new_rows: list = []
         if not self._merged_mode:
             for row in range(self._saved_count, self._table.rowCount()):
@@ -6637,15 +7558,83 @@ class DailyRegister(QWidget):
                     "cells": cells_for_json(self._row_value_map(row)),
                     "pending_meta": serialize_pending_meta(pending),
                 })
+        edit_mode_flag = self._edit_mode and include_dirty and bool(dirty_saved)
+        return dirty_saved, new_rows, edit_mode_flag
+
+    def _capture_local_draft(self, *, include_dirty: bool = True) -> dict:
+        # Merged never persists typed "new" rows — entry belongs in My.
+        new_rows: list = []
+        parked_rows: list = []
+        dirty_saved: list = []
+        edit_mode_flag = False
+        if self._parked_mode:
+            # Parked surface is the live bucket; My rows come from the keep-alive
+            # My table (preferred) or the on-disk stash (slow path / cold).
+            self._local_parked = self._table_parked_entries()
+            parked_rows = list(self._local_parked)
+            parked_dirty, _parked_new, parked_edit = self._capture_rows_from_bound_table(
+                include_dirty=include_dirty
+            )
+            if self._my_session is not None and self._my_table is not None:
+                parked_maps = self._snapshot_grid_session()
+                parked_table = self._table
+                try:
+                    self._table = self._my_table
+                    self._restore_grid_session(self._my_session)
+                    dirty_saved, new_rows, edit_mode_flag = (
+                        self._capture_rows_from_bound_table(include_dirty=include_dirty)
+                    )
+                    # Keep session in sync if client_row_ids were minted.
+                    self._my_session = self._snapshot_grid_session()
+                finally:
+                    self._table = parked_table
+                    self._restore_grid_session(parked_maps)
+            else:
+                try:
+                    on_disk = load_register_draft(
+                        self._user._id, self._current_date, merged=False
+                    )
+                except Exception:
+                    on_disk = None
+                if on_disk:
+                    new_rows = [
+                        e for e in (on_disk.get("new_rows") or [])
+                        if isinstance(e, dict)
+                    ]
+                    live_ids = {str(e.get("tx_id")) for e in parked_dirty}
+                    view_ids = {str(tx_id) for tx_id in self._saved_ids.values()}
+                    stashed_dirty = [
+                        e for e in (on_disk.get("dirty_saved") or [])
+                        if isinstance(e, dict)
+                        and str(e.get("tx_id")) not in live_ids
+                        and str(e.get("tx_id")) not in view_ids
+                    ]
+                    if stashed_dirty:
+                        edit_mode_flag = bool(on_disk.get("edit_mode", True))
+                    dirty_saved = stashed_dirty
+            # Parked edits to server-parked rows append after My dirty stash.
+            dirty_saved = list(dirty_saved) + list(parked_dirty)
+            if parked_edit and parked_dirty:
+                edit_mode_flag = True
+        elif not self._merged_mode:
+            dirty_saved, new_rows, edit_mode_flag = self._capture_rows_from_bound_table(
+                include_dirty=include_dirty
+            )
+            parked_rows = list(self._local_parked)
+        else:
+            dirty_saved, new_rows, edit_mode_flag = self._capture_rows_from_bound_table(
+                include_dirty=include_dirty
+            )
 
         return build_draft_payload(
             user_id=self._user._id,
             username=getattr(self._user, "username", "") or "",
             register_date=self._current_date,
             merged=self._merged_mode,
-            edit_mode=self._edit_mode and include_dirty and bool(dirty_saved),
+            edit_mode=edit_mode_flag,
             dirty_saved=dirty_saved,
             new_rows=new_rows,
+            parked_rows=parked_rows,
         )
 
     def _restore_local_draft(self) -> Optional[tuple]:
@@ -6663,7 +7652,21 @@ class DailyRegister(QWidget):
 
         dirty_entries = list(draft.get("dirty_saved") or [])
         new_entries = list(draft.get("new_rows") or [])
+        # Legacy drafts kept parked-flagged rows among new_rows (they used to be
+        # saved as register_status=parked). Migrate them into the local bucket
+        # so My never shows — or saves — incorrect-truck rows.
+        migrated_parked = [e for e in new_entries if entry_is_parked(e)]
+        if migrated_parked and not self._merged_mode:
+            new_entries = [e for e in new_entries if not entry_is_parked(e)]
+            known = {entry_client_row_id(e) for e in self._local_parked}
+            for entry in migrated_parked:
+                if entry_client_row_id(entry) in known:
+                    continue
+                self._local_parked.append(entry)
+            self._emit_parked_count()
         if not dirty_entries and not new_entries:
+            if migrated_parked and not self._merged_mode and not self._parked_mode:
+                self._flush_local_draft()
             return None
 
         self._restoring_draft = True
@@ -6702,10 +7705,10 @@ class DailyRegister(QWidget):
                         it.setBackground(QBrush(DIRTY_BG))
                 dirty_applied += 1
 
-            # Never restore typed new rows onto Merged (entry is My-only).
+            # Never restore typed new rows onto Merged / Parked (entry is My-only).
             # Prefer client_row_id match (Phase 1); fall back to content fingerprint
             # (Phase 0) so legacy drafts without ids still cannot inflate totals.
-            if new_entries and not self._merged_mode:
+            if new_entries and not self._merged_mode and not self._parked_mode:
                 known_ids = self._saved_client_row_ids()
                 saved_fps = self._saved_expense_fingerprint_counts()
                 to_restore: list = []
@@ -6770,7 +7773,8 @@ class DailyRegister(QWidget):
         self._update_footer()
         # Rewrite disk draft from the live grid so fingerprint-skipped rows
         # (already on the server) are not re-offered on the next load.
-        if new_entries and not self._merged_mode:
+        # Never flush from Parked — that would overwrite the My stash file.
+        if new_entries and not self._merged_mode and not self._parked_mode:
             self._flush_local_draft()
         if dirty_applied or new_applied:
             self._flush_day_issues_source_changed(force=True)
@@ -6958,6 +7962,7 @@ class DailyRegister(QWidget):
         """Inner save implementation (caller holds `_save_in_flight`)."""
         saved, updated, errors = 0, 0, []
         already_exists = 0
+        kept_parked = 0
         deferred_dups: set[int] = set()
         self._commit_open_editor()
 
@@ -7008,6 +8013,8 @@ class DailyRegister(QWidget):
                 for row in range(self._saved_count, self._table.rowCount()):
                     if not self._row_has_data(row) or not self._row_marked_parked(row):
                         continue
+                    if self._row_stays_parked(row):
+                        continue  # wrong truck → stays in the local bucket
                     self._set_row_sync_status(row, SYNC_PENDING)
                 self._flush_local_draft()
             else:
@@ -7114,7 +8121,7 @@ class DailyRegister(QWidget):
                 register_label = self._current_date.strftime("%d %b %Y")
                 _off_date = 0
                 for _s in range(self._saved_count, self._table.rowCount()):
-                    if not self._row_has_data(_s):
+                    if not self._row_has_data(_s) or self._row_stays_parked(_s):
                         continue
                     _it = self._table.item(_s, COL_DATE)
                     _ds = _it.text().strip() if _it else ""
@@ -7152,6 +8159,11 @@ class DailyRegister(QWidget):
                 if not self._row_has_data(row):
                     continue
                 if parked_only and not self._row_marked_parked(row):
+                    continue
+                if self._row_stays_parked(row):
+                    # Local Parked bucket: never sent to the server while the
+                    # truck is still wrong. Fix it under Parked, then Save.
+                    kept_parked += 1
                     continue
                 try:
                     tx = self._build_transaction_from_row(row)
@@ -7249,10 +8261,13 @@ class DailyRegister(QWidget):
             # Phase C — online Save queues inserts and drains in the background
             # (same durable outbox as offline). Submit still awaits the create
             # so Verify never races a pending queue.
+            # Parked saves fixed rows synchronously so the reload below moves
+            # them to My entries right away (no PENDING rows lingering on Parked).
             use_async_outbox = (
                 bool(to_save)
                 and not self._submit_in_flight
                 and not self._merged_mode
+                and not self._parked_mode
             )
             if use_async_outbox:
                 queued = self._enqueue_inserts_for_outbox(to_save)
@@ -7316,8 +8331,13 @@ class DailyRegister(QWidget):
             meta["queued"] = queued
             meta["errors"] = len(errors)
             meta["deferred_dups"] = len(deferred_dups)
+            meta["kept_parked"] = kept_parked
             if parked_only:
                 meta["parked_only"] = True
+
+        if saved or updated or queued:
+            # Server / outbox changed — My↔Parked must not reuse stale day cache.
+            self._invalidate_day_tx_cache()
 
         if errors:
             QMessageBox.warning(
@@ -7355,7 +8375,22 @@ class DailyRegister(QWidget):
             if parked_only:
                 # Other unsaved (non-parked) rows may remain — do not warn.
                 return True
-            if self.has_unsaved_work():
+            if kept_parked and not self.has_unsaved_work(include_stashed_my=False):
+                # Parked view: every row still has a wrong truck — nothing to
+                # send yet, and that is expected (not an error). Ignore keep-alive
+                # My leftovers; those are not part of this Parked Save.
+                self._flush_local_draft()
+                plural = "s" if kept_parked != 1 else ""
+                QMessageBox.information(
+                    self,
+                    "Still parked",
+                    f"{kept_parked} parked row{plural} still need a correct fleet "
+                    "truck number.\n\n"
+                    "Fix the Truck cell on each row, then click Save — fixed rows "
+                    "move to My entries as drafts.",
+                )
+                return True
+            if self.has_unsaved_work(include_stashed_my=False):
                 # Typed rows that could not become transactions (e.g. no
                 # description) — keep local recovery; do not claim success.
                 QMessageBox.warning(
@@ -8065,6 +9100,8 @@ class DailyRegister(QWidget):
             dlg.add_issues(live)
             return
 
+        # Parked surface: never offer Park again — Accept/Allow promote to My.
+        fixing_parked = bool(self._parked_mode)
         dlg = TruckCorrectionDialog(
             live,
             self._fleet_numbers,
@@ -8072,6 +9109,14 @@ class DailyRegister(QWidget):
             allowed_labels=self._allowed_truck_labels,
             on_resolved=self._on_truck_issue_resolved_live,
             fleet_kinds=getattr(self, "_fleet_kinds", None) or {},
+            heading="Fix parked trucks" if fixing_parked else "",
+            intro=(
+                "These rows are already parked. Correct or Allow each truck — "
+                "accepted rows move to My entries right away."
+                if fixing_parked
+                else ""
+            ),
+            allow_park=not fixing_parked,
             parent=self,
         )
         self._open_truck_dialog = dlg
@@ -8086,6 +9131,16 @@ class DailyRegister(QWidget):
         if getattr(dlg, "new_labels", None):
             asyncio.ensure_future(self._remember_truck_labels(dlg.new_labels))
         asyncio.ensure_future(self._load_fleet_numbers())
+        if fixing_parked:
+            # Accept/Allow already wrote cells; promote off Parked — never re-park.
+            promoted = self._promote_accepted_parked_rows_to_my()
+            if not promoted:
+                self._local_parked = self._table_parked_entries()
+                self._emit_parked_count()
+                self._update_footer()
+                self._flush_day_issues_source_changed(force=True)
+                self._schedule_draft_autosave()
+            return
         parked_any = any(getattr(i, "parked", False) for i in dlg.issues)
         if result != QDialog.Accepted:
             resolved_rows = {i.row for i in dlg.issues}
@@ -8093,10 +9148,317 @@ class DailyRegister(QWidget):
                 if issue.row not in resolved_rows:
                     self._set_truck_cell(issue.row, "")
         if parked_any:
+            self._after_truck_dialog_parked()
+
+    def _after_truck_dialog_parked(self) -> None:
+        """Park all / Park remaining / Park row outcome.
+
+        Unsaved rows (typed or imported) move into the local Parked bucket
+        without touching the server — correct rows stay on My ready for Save.
+        Only rows that are *already saved* on the server still need a server
+        update to carry ``register_status=parked`` (legacy follow-up path).
+
+        Never re-park from the Parked surface — promote accepted trucks instead.
+        """
+        if self._parked_mode:
+            self._promote_accepted_parked_rows_to_my()
+            return
+        self._park_rows_locally()
+        saved_parked = [
+            row for row, meta in self._pending_row_meta.items()
+            if isinstance(meta, dict)
+            and meta.get("parked")
+            and row in self._saved_ids
+            and (
+                getattr(self._saved_txs.get(row), "register_status", "") or ""
+            ) != "parked"
+        ]
+        if saved_parked:
             asyncio.ensure_future(self._persist_parked_after_dialog())
 
+    def open_parked_truck_correction(self) -> None:
+        """Open truck correction for rows currently on the Parked surface.
+
+        Park actions are hidden — these rows are already parked. Cashiers can
+        still type truck fixes directly in the table instead of using the dialog.
+        """
+        if not self._parked_mode:
+            self.set_view_mode("parked")
+        self._commit_open_editor()
+        issues: list[TruckIssue] = []
+        for row in range(self._table.rowCount()):
+            if row >= self._saved_count and not self._row_has_data(row):
+                continue
+            it = self._table.item(row, COL_TRUCK)
+            raw = (it.text().strip() if it else "")
+            if not raw:
+                continue
+            if self._row_truck_is_valid(row):
+                continue
+            status, value = self._resolve_truck_text(raw, row=row)
+            if status == "ok":
+                continue
+            kind = (
+                "invalid_format" if status == "invalid_format" else "not_in_registry"
+            )
+            issues.append(
+                TruckIssue(
+                    row=row,
+                    original=value or raw,
+                    kind=kind,
+                    row_details=self._truck_issue_row_details(row),
+                )
+            )
+        if not issues:
+            QMessageBox.information(
+                self,
+                "No truck fixes needed",
+                "Every parked row already has a valid fleet truck "
+                "(or is empty).\n\n"
+                "Type a truck in the table, or Clear parked to discard rows.",
+            )
+            return
+        dlg = TruckCorrectionDialog(
+            issues,
+            self._fleet_numbers,
+            can_add=self._can_add_fleet(),
+            allowed_labels=self._allowed_truck_labels,
+            on_resolved=self._on_truck_issue_resolved_live,
+            fleet_kinds=getattr(self, "_fleet_kinds", None) or {},
+            heading="Fix parked trucks",
+            intro=(
+                "These rows are already parked. Correct or Allow each truck — "
+                "accepted rows move to My entries right away."
+            ),
+            allow_park=False,
+            parent=self,
+        )
+        self._open_truck_dialog = dlg
+        result = dlg.exec()
+        self._open_truck_dialog = None
+        pending_adds = list(getattr(dlg, "pending_registry_adds", None) or [])
+        if pending_adds:
+            asyncio.ensure_future(self._persist_truck_registry_adds(pending_adds))
+        if getattr(dlg, "new_labels", None):
+            asyncio.ensure_future(self._remember_truck_labels(dlg.new_labels))
+        asyncio.ensure_future(self._load_fleet_numbers())
+        # Cancel must not wipe unresolved parked trucks; live Allow/Apply already
+        # wrote accepted values — promote those off Parked onto My immediately.
+        _ = result
+        promoted = self._promote_accepted_parked_rows_to_my()
+        if not promoted:
+            self._local_parked = self._table_parked_entries()
+            self._emit_parked_count()
+            self._update_footer()
+            self._flush_day_issues_source_changed(force=True)
+            self._schedule_draft_autosave()
+
+    def clear_parked_bucket(self) -> None:
+        """Clear Parked: move every parked row to Cashier Trash (not My).
+
+        Local parked rows are saved as ``register_status=parked`` then
+        soft-trashed so Restore / Delete permanently work. Legacy server
+        parked rows are soft-trashed in place (status stays ``parked``).
+        """
+        from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
+
+        if not self._parked_mode:
+            self.set_view_mode("parked")
+        self._commit_open_editor()
+        if self._parked_mode:
+            self._local_parked = self._table_parked_entries()
+        local_n = len(self._local_parked)
+        server_ids = [
+            self._saved_ids[row]
+            for row in sorted(self._saved_ids)
+            if (
+                getattr(self._saved_txs.get(row), "register_status", "") or ""
+            ) == "parked"
+        ]
+        server_n = len(server_ids)
+        if local_n <= 0 and server_n <= 0:
+            self.transient_status.emit("Nothing parked to clear")
+            return
+
+        total = local_n + server_n
+        if not ask_confirm(
+            self,
+            title="Clear parked?",
+            heading="Move Parked rows to Trash?",
+            body=(
+                f"{total} parked row{'s' if total != 1 else ''} will leave "
+                "this tab and go to Trash.\n\n"
+                "• Restore later (back to Parked) or Delete permanently\n"
+                "• Does not move rows to My entries"
+            ),
+            note="Use Fix trucks → Allow to keep accepted trucks on My instead.",
+            accept_label="Move to Trash",
+            cancel_label="Keep",
+            destructive=True,
+        ):
+            return
+
+        asyncio.ensure_future(
+            self._clear_parked_to_trash(list(server_ids))
+        )
+
+    async def _clear_parked_to_trash(self, server_ids: list) -> None:
+        """Persist any local parked rows, soft-trash all, empty the Parked tab."""
+        from tahmeed.services.cashier_service import bulk_save_transactions
+
+        if not self._parked_mode:
+            self.set_view_mode("parked")
+        self._commit_open_editor()
+
+        local_txs: list = []
+        for row in range(self._saved_count, self._table.rowCount()):
+            if not self._row_has_data(row):
+                continue
+            try:
+                tx = self._build_transaction_from_row(row)
+            except ValueError:
+                tx = None
+            if tx is None:
+                continue
+            # Always trash as parked so Restore lands back on Parked.
+            tx.register_status = "parked"
+            if not tx.client_row_id:
+                tx.client_row_id = self._ensure_row_client_id(row)
+            local_txs.append(tx)
+
+        total = len(server_ids) + len(local_txs)
+        self._show_register_loading(
+            f"Moving {total or len(server_ids)} parked "
+            f"row{'s' if (total or len(server_ids)) != 1 else ''} to Trash…"
+        )
+        trash_ids: list = [tid for tid in server_ids if tid]
+        try:
+            if local_txs:
+                outcomes = await bulk_save_transactions(local_txs)
+                for status, saved, _err in outcomes:
+                    if (
+                        status in ("created", "already_exists")
+                        and saved is not None
+                        and getattr(saved, "_id", None)
+                    ):
+                        trash_ids.append(saved._id)
+
+            trashed = 0
+            errors: list[str] = []
+            for tid in trash_ids:
+                try:
+                    result = await request_or_delete_transaction(
+                        tid, self._user._id
+                    )
+                except Exception as exc:
+                    errors.append(str(exc))
+                    continue
+                if result in ("trashed", "already_trashed"):
+                    trashed += 1
+                elif result not in ("not_found",):
+                    errors.append(f"{tid}: {result}")
+
+            # Drop local bucket + remove parked (and just-trashed) from day cache.
+            self._local_parked = []
+            trash_id_set = {str(tid) for tid in trash_ids}
+            if self._day_tx_cache is not None:
+                self._day_tx_cache = [
+                    tx
+                    for tx in self._day_tx_cache
+                    if (getattr(tx, "register_status", "") or "") != "parked"
+                    and str(getattr(tx, "_id", "")) not in trash_id_set
+                ]
+            if self._parked_mode:
+                self._apply_txs_to_view(
+                    list(self._day_tx_cache or []),
+                    upload_id="",
+                    reload_local_parked=False,
+                )
+            self._flush_local_draft()
+            self._emit_parked_count()
+            self._flush_day_issues_source_changed(force=True)
+            self.trash_changed.emit()
+
+            if errors and not trashed:
+                QMessageBox.critical(
+                    self,
+                    "Clear parked",
+                    "Could not move parked rows to Trash:\n"
+                    + "\n".join(errors[:5]),
+                )
+                return
+            msg = (
+                f"Moved {trashed} parked "
+                f"row{'s' if trashed != 1 else ''} to Trash"
+            )
+            if errors:
+                msg += f" ({len(errors)} failed)"
+            self.transient_status.emit(msg)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Clear parked",
+                f"Could not move parked rows to Trash:\n{exc}",
+            )
+        finally:
+            self._hide_register_loading()
+
+    async def _unpark_saved_rows(
+        self,
+        tx_ids: list,
+        *,
+        loading_message: str | None = None,
+        status_message: str | None = None,
+        error_title: str = "Clear parked",
+    ) -> None:
+        """Return saved ``register_status=parked`` rows to draft on My."""
+        from tahmeed.services.cashier_service import bulk_update_transactions
+
+        ids = [tx_id for tx_id in tx_ids if tx_id]
+        if not ids or self._current_date is None:
+            return
+        n = len(ids)
+        self._show_register_loading(
+            loading_message
+            or f"Clearing {n} parked row{'s' if n != 1 else ''}…"
+        )
+        try:
+            updated = await bulk_update_transactions(
+                [(tx_id, {"register_status": "draft"}) for tx_id in ids]
+            )
+            # Drop keep-alive — My must reload so unparked rows appear.
+            self._clear_my_session()
+            self._ensure_my_surface_active()
+            self._view_mode = "my"
+            self._merged_mode = False
+            self._parked_mode = False
+            self.mode_changed.emit("my")
+            self._draft_restore_policy = "silent"
+            self._invalidate_day_tx_cache()
+            await self._load_date(self._current_date)
+            count = updated or n
+            self.transient_status.emit(
+                status_message
+                or (
+                    f"Returned {count} parked "
+                    f"row{'s' if count != 1 else ''} to My entries"
+                )
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                error_title,
+                f"Could not clear saved parked rows:\n{exc}",
+            )
+        finally:
+            self._hide_register_loading()
+
     async def _persist_parked_after_dialog(self) -> None:
-        """Persist only parked truck rows (silent) and open the Parked tab."""
+        """Legacy: persist parked flags on already-saved rows, open Parked.
+
+        Never used for unsaved rows any more — those are parked locally by
+        ``_park_rows_locally`` with no server write.
+        """
         parked_rows = [
             row for row, meta in self._pending_row_meta.items()
             if isinstance(meta, dict) and meta.get("parked")
@@ -8114,6 +9476,8 @@ class DailyRegister(QWidget):
             # views so Parked load cannot race drain / Draft-restore leftovers.
             await self._await_outbox_idle(timeout_s=180, require_empty=True)
             self.transient_status.emit("Parked for truck follow-up")
+            # Parked never restores My draft; policy is set again inside set_view_mode.
+            self._draft_restore_policy = "off"
             if self._view_mode != "parked":
                 self.set_view_mode("parked")
             elif self._current_date is not None:
@@ -8136,6 +9500,12 @@ class DailyRegister(QWidget):
     def _on_truck_issue_resolved_live(self, issue: TruckIssue) -> None:
         """Apply one resolved truck to the grid as soon as it leaves the dialog list."""
         if getattr(issue, "parked", False):
+            # Re-park is meaningless on the Parked surface — keep the truck text only.
+            if self._parked_mode:
+                truck = (issue.corrected or issue.original or "").strip()
+                self._set_truck_cell(issue.row, truck)
+                self._pending_truck_issues.pop(issue.row, None)
+                return
             truck = (issue.corrected or issue.original or "").strip()
             self._set_truck_cell(issue.row, truck)
             meta = dict(self._pending_row_meta.get(issue.row) or {})
@@ -8159,8 +9529,16 @@ class DailyRegister(QWidget):
             self._truck_allow_anyway.pop(issue.row, None)
             self._fleet_numbers.add(issue.corrected)
         self._set_truck_cell(issue.row, issue.corrected)
-        # Fixed while on Parked → will save as draft and leave Parked on reload.
-        if self._parked_mode and issue.row in self._saved_ids:
+        self._pending_truck_issues.pop(issue.row, None)
+        # Allow / Apply must never leave a parked mark on My — otherwise a later
+        # Park-remaining sweep (or mixed dialog) would move allowed rows away.
+        if not self._parked_mode:
+            meta = dict(self._pending_row_meta.get(issue.row) or {})
+            if meta.pop("parked", None) is not None:
+                self._pending_row_meta[issue.row] = meta
+        # Saved parked leftovers: mark dirty so promote / Save can leave Parked.
+        # Local parked keep their flag until ``_promote_accepted_parked_rows_to_my``.
+        elif issue.row in self._saved_ids:
             meta = dict(self._pending_row_meta.get(issue.row) or {})
             meta.pop("parked", None)
             self._pending_row_meta[issue.row] = meta

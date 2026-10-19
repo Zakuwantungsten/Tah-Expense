@@ -90,14 +90,15 @@ def test_brand_loader_fade_pulse_changes_opacity() -> None:
     _app()
     panel = BrandLoaderPanel(None, "Loading…")
     panel.start()
-    before = panel._opacity.opacity()
+    before = panel.fade_opacity()
     for _ in range(12):
         panel._tick_fade()
-    after = panel._opacity.opacity()
+    after = panel.fade_opacity()
     assert 0.34 <= after <= 1.0
     assert before != after or abs(after - 0.35) < 0.02 or abs(after - 1.0) < 0.02
     panel.stop()
-    assert panel._opacity.opacity() == pytest.approx(1.0)
+    assert panel.fade_opacity() == pytest.approx(1.0)
+    assert panel._horse.graphicsEffect() is None
 
 
 def test_loading_overlay_uses_brand_panel() -> None:
@@ -108,6 +109,55 @@ def test_loading_overlay_uses_brand_panel() -> None:
     overlay.show_loading("Loading payees…")
     assert overlay._panel.base_message() == "Loading payees"
     assert overlay.isVisible()
+    # Overlay path: horse + message only — no progress chrome.
+    assert overlay._panel._bar.isHidden()
+    assert overlay._panel._pct.isHidden()
     overlay.hide_loading()
     assert not overlay.isVisible()
+    host.close()
+
+
+def test_brand_loader_opaque_for_dialogs() -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QDialog, QVBoxLayout
+
+    _app()
+    dlg = QDialog()
+    dlg.setWindowTitle("Importing Daily Register")
+    lay = QVBoxLayout(dlg)
+    panel = BrandLoaderPanel(
+        dlg, "Opening import date…", show_progress=True, opaque=True
+    )
+    lay.addWidget(panel)
+    panel.set_progress(value=20, maximum=100)
+    dlg.show()
+    assert panel._opaque is True
+    assert not panel.testAttribute(Qt.WA_TranslucentBackground)
+    assert not panel._horse.pixmap().isNull()
+    assert not panel._bar.isHidden()
+    assert panel.percent_text() == "20%"
+    assert "Opening import date" in panel.display_text()
+    dlg.close()
+
+
+def test_brand_loader_and_overlay_never_use_translucent_hwnd() -> None:
+    """Regression: translucent / opacity-effect flashed a tiny meedexpe window."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QWidget
+
+    _app()
+    host = QWidget()
+    host.resize(400, 300)
+    host.show()
+    overlay = LoadingOverlay(host, "Loading overview…")
+    overlay.show_loading("Loading overview…")
+    assert not overlay.isWindow()
+    assert not overlay._panel.isWindow()
+    assert not overlay.testAttribute(Qt.WA_TranslucentBackground)
+    assert not overlay._panel.testAttribute(Qt.WA_TranslucentBackground)
+    assert not overlay._panel._horse.testAttribute(Qt.WA_TranslucentBackground)
+    assert overlay._panel._horse.graphicsEffect() is None
+    assert overlay._panel._bar.isHidden()
+    assert overlay.parentWidget() is host
+    overlay.hide_loading()
     host.close()

@@ -502,7 +502,8 @@ class _ActionBar(QFrame):
         self._parked_btn.clicked.connect(lambda: self._set_mode("parked"))
         self._merged_btn.clicked.connect(lambda: self._set_mode("merged"))
         self._parked_btn.setToolTip(
-            "Incorrect truck rows parked for follow-up — fix here, then they return to My entries"
+            "Incorrect truck rows parked for follow-up (not saved) — "
+            "fix the truck here, then Save to move them to My entries"
         )
         self._parked_count = 0
         tg.addWidget(self._my_btn)
@@ -752,6 +753,12 @@ class _TablePage(QWidget):
             )
         )
         register.parked_count_changed.connect(self._action_bar.set_parked_count)
+        register.parked_count_changed.connect(self._qb_toolbar.set_parked_count)
+        register.mode_changed.connect(self._qb_toolbar.set_parked_mode)
+        self._qb_toolbar.fix_parked_trucks_clicked.connect(
+            register.open_parked_truck_correction
+        )
+        self._qb_toolbar.clear_parked_clicked.connect(register.clear_parked_bucket)
         register.active_cheque_changed.connect(self._action_bar.set_cheque_value)
         register.stats_updated.connect(self._sync_reconciled_date)
         self._action_bar.set_reconciled_date(register.current_date())
@@ -913,6 +920,9 @@ class CashierDashboard(QWidget):
         # index 8 — Trash (own soft-trash + accountant-confirmed)
         self._trash_view = CashierTrashWidget(user=self._user)
         self._trash_view.count_changed.connect(self._on_trash_badge)
+        self._trash_view.open_register_after_restore.connect(
+            self._on_trash_open_register
+        )
         self._stack.addWidget(self._trash_view)
 
         self._stack.setCurrentIndex(0)
@@ -1072,6 +1082,8 @@ class CashierDashboard(QWidget):
             self._overview.refresh()
         elif key == "table":
             self._stack.setCurrentIndex(1)
+            # reload_settings also ensure_fresh_day_view — picks up deletes /
+            # Drafts discard that left My painting stale rows.
             self._register.reload_settings()
         elif key == "form":
             self._stack.setCurrentIndex(2)
@@ -1175,12 +1187,18 @@ class CashierDashboard(QWidget):
             count = 0
         self._on_trash_badge(count)
 
+    def _on_trash_open_register(self, d, mode: str = "my") -> None:
+        """After Trash restore: open Daily Register on the reconciled date."""
+        self._on_nav("table")
+        view = "parked" if mode == "parked" else "my"
+        self._register.navigate_to_date(d, merged=False, view_mode=view)
+
     def _on_register_trash_changed(self) -> None:
         from tahmeed.ui.async_utils import schedule_coro
 
         schedule_coro(self._refresh_trash_badge())
-        # Refresh trash page if it's currently visible (stack index 7).
-        if self._stack.currentIndex() == 7:
+        # Refresh trash page if it's currently visible (stack index 8).
+        if self._stack.currentIndex() == 8:
             self._trash_view.refresh()
 
     def _day_issues_page_visible(self) -> bool:

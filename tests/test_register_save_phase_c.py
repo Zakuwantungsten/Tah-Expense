@@ -266,8 +266,7 @@ async def test_do_save_schedules_drain_after_release(register, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_parked_only_skips_off_date_and_non_parked_rows(register, monkeypatch):
-    """Park all: only parked rows queue; Off-date / dup dialogs stay silent."""
-    from tahmeed.services.register_draft_service import SYNC_PENDING
+    """Park all: parked bad-truck rows never reach the server; dialogs stay silent."""
     from tahmeed.ui.cashier.register_delegates import (
         COL_DATE,
         COL_DESC,
@@ -301,10 +300,18 @@ async def test_parked_only_skips_off_date_and_non_parked_rows(register, monkeypa
         raise AssertionError("parked_only must not run duplicate review")
 
     async def boom_bulk(*_a, **_k):
-        raise AssertionError("online parked_only must enqueue, not bulk-create")
+        raise AssertionError("parked rows with a wrong truck must not be saved")
 
     def boom_mbox(*_a, **_k):
         raise AssertionError("parked_only must not show Off-date / save dialogs")
+
+    monkeypatch.setattr(
+        register,
+        "_enqueue_inserts_for_outbox",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("parked rows with a wrong truck must not be queued")
+        ),
+    )
 
     monkeypatch.setattr(
         "tahmeed.ui.cashier.excel_grid.next_day_order",
@@ -331,8 +338,12 @@ async def test_parked_only_skips_off_date_and_non_parked_rows(register, monkeypa
     ok = await register._do_save_body(meta, parked_only=True)
     assert ok is True
     assert meta.get("parked_only") is True
-    assert meta.get("async_outbox") is True
-    assert meta.get("queued") == 1
-    assert register._row_sync_status(0) == SYNC_PENDING
+    # Wrong-truck parked row is kept locally — nothing queued or created.
+    assert meta.get("kept_parked") == 1
+    assert not meta.get("queued")
+    assert not meta.get("async_outbox")
+    assert not (register._pending_row_meta.get(0) or {}).get("sync_status")
+    assert register._row_has_data(0)
     # Non-parked row stays ordinary unsaved (no sync_status).
     assert not (register._pending_row_meta.get(1) or {}).get("sync_status")
+    assert register._row_has_data(1)

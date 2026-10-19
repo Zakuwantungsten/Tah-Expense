@@ -24,7 +24,7 @@ _FALLBACK = """# Daily Register — Save, Recovered, and Offline
 
 - Local recovery brings rows back if the app closed mid-sync or while offline.
 - **Sync pending** = rows still queued for the server (sky tint); they retry when online.
-- **Draft restored** = ordinary unsaved typing; click Save to store it.
+- **Draft restored** = cold My recovery only (not My↔Parked tab flips); click Save to store it.
 - Matching rows already on the server are skipped (no double-count).
 
 ## Offline / slow network
@@ -41,7 +41,8 @@ _FALLBACK = """# Daily Register — Save, Recovered, and Offline
 
 ## Parked trucks
 
-- Parking incorrect trucks finishes sync before opening the Parked tab.
+- **Park all** / **Park remaining** saves nothing: correct rows stay on My entries; wrong-truck rows wait under Parked.
+- Open Parked, fix the Truck cell, then Save — fixed rows become drafts on My entries.
 """
 
 

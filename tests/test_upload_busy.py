@@ -18,6 +18,8 @@ def _app() -> QApplication:
 
 
 def test_upload_busy_default_has_no_cancel() -> None:
+    from PySide6.QtCore import Qt
+
     _app()
     with UploadBusy(None, "Reading Excel file…") as busy:
         buttons = [b for b in busy._dlg.findChildren(QPushButton) if b.isVisible()]
@@ -26,6 +28,10 @@ def test_upload_busy_default_has_no_cancel() -> None:
         # Determinate bar starts visible at 0% so the dialog is never blank.
         assert not busy._dlg._panel._bar.isHidden()
         assert busy._dlg._panel.percent_text() == "0%"
+        # Opaque panel so Windows QDialog does not paint a blank body.
+        assert busy._dlg._panel._opaque is True
+        assert not busy._dlg._panel.testAttribute(Qt.WA_TranslucentBackground)
+        assert not busy._dlg._panel._horse.pixmap().isNull()
 
 
 def test_upload_busy_shows_percent_progress() -> None:
@@ -55,6 +61,43 @@ def test_upload_busy_cancellable_sets_flag() -> None:
         assert "Cancelling" in busy._dlg.labelText()
         with pytest.raises(UploadCancelled):
             busy.raise_if_cancelled()
+
+
+@pytest.mark.asyncio
+async def test_update_inside_task_repaints_instead_of_processing_events() -> None:
+    """Inside an asyncio Task processEvents is skipped; update() must still
+    push the label / percentage to the dialog and request a synchronous paint
+    so the import dialog is never a blank window."""
+    _app()
+    calls = {"process": 0, "repaint": 0}
+
+    import tahmeed.ui.async_utils as au
+
+    orig_spe = au.safe_process_events
+
+    def counting_spe():
+        calls["process"] += 1
+        orig_spe()
+
+    au.safe_process_events = counting_spe
+    try:
+        with UploadBusy(None, "Loading rows…", title="Importing Daily Register") as busy:
+            orig_repaint = busy._dlg.repaint
+
+            def counting_repaint(*a, **k):
+                calls["repaint"] += 1
+                return orig_repaint(*a, **k)
+
+            busy._dlg.repaint = counting_repaint
+            busy.update("Loading 25 / 100 row(s)…", value=25, maximum=100)
+            assert busy._dlg._panel.percent_text() == "25%"
+            assert "Loading 25 / 100 row(s)" in busy._dlg.labelText()
+            assert calls["repaint"] >= 1
+            # tick() yields to the loop so the real paint / animation runs.
+            await busy.tick()
+    finally:
+        au.safe_process_events = orig_spe
+    assert calls["process"] == 0
 
 
 @pytest.mark.asyncio

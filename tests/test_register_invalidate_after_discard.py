@@ -191,3 +191,87 @@ def test_invalidate_preserves_unsaved_via_flush(register, monkeypatch):
     assert draft is not None
     assert len(draft["new_rows"]) == 1
     assert len(scheduled) == 1
+
+
+def test_invalidate_marks_day_stale_and_skips_draft_restore(register, monkeypatch):
+    scheduled = []
+
+    def capture(coro, *a, **k):
+        scheduled.append(coro)
+        if hasattr(coro, "close"):
+            coro.close()
+        return None
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.asyncio.ensure_future",
+        capture,
+    )
+
+    register._day_tx_cache = [object()]
+    register._day_tx_cache_key = ("cashier", "2026-08-08", "x")
+    register._day_tx_stale = False
+
+    register.invalidate_after_server_draft_change(register._current_date)
+
+    assert register._day_tx_stale is True
+    assert register._day_tx_cache is None
+    assert register._draft_restore_policy == "off"
+    assert len(scheduled) == 1
+
+
+def test_ensure_fresh_day_view_reloads_when_stale(register, monkeypatch):
+    scheduled = []
+
+    def capture(coro, *a, **k):
+        scheduled.append(coro)
+        if hasattr(coro, "close"):
+            coro.close()
+        return None
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.asyncio.ensure_future",
+        capture,
+    )
+
+    register._day_tx_stale = True
+    register._day_tx_cache = None
+    register._load_in_flight = False
+    register.ensure_fresh_day_view()
+    assert len(scheduled) == 1
+
+    scheduled.clear()
+    register._day_tx_stale = False
+    register._day_tx_cache = [object()]
+    register.ensure_fresh_day_view()
+    assert scheduled == []
+
+
+def test_keep_alive_flips_refuse_when_day_stale(register):
+    register._day_tx_stale = True
+    register._my_session = {"saved_count": 0}
+    assert register._flip_to_my_keep_alive() is False
+    assert register._flip_to_parked_keep_my() is False
+
+
+@pytest.mark.asyncio
+async def test_reload_after_server_row_change_invalidates_and_loads(
+    register, monkeypatch
+):
+    loads = []
+
+    async def fake_load(d):
+        loads.append(d)
+        register._day_tx_stale = False
+        register._day_tx_cache = []
+        register._day_tx_cache_key = ("cashier", d.isoformat(), "x")
+
+    monkeypatch.setattr(register, "_load_date", fake_load)
+    register._day_tx_cache = [object()]
+    register._day_tx_stale = False
+
+    await register._reload_after_server_row_change()
+
+    assert register._day_tx_cache == [] or loads == [register._current_date]
+    assert loads == [register._current_date]
+    # fake_load cleared stale; invalidate ran before load.
+    assert register._draft_restore_policy == "off"

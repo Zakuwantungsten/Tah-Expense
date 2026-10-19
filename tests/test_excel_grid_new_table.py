@@ -115,6 +115,44 @@ def test_wipe_unsaved_before_import_does_not_stack(register):
     assert register._first_empty_editable_row() == 2
 
 
+@pytest.mark.asyncio
+async def test_async_import_staging_yields_progress_between_slices(register):
+    """Import runs inside an asyncio Task — progress must be awaited so the
+    busy dialog can paint (processEvents is a no-op in a Task)."""
+    import asyncio
+
+    payloads = [
+        {
+            "date": datetime(2026, 8, 8),
+            "item": "PARKING",
+            "description": f"IMPORT {i}",
+            "amount": 100.0 + i,
+            "currency": "TZS",
+            "daily_import_id": "batch",
+            "daily_import_source": "file.xlsx",
+        }
+        for i in range(60)
+    ]
+    progress: list[tuple[int, int]] = []
+
+    async def on_progress(done, total):
+        progress.append((done, total))
+        assert asyncio.current_task() is not None
+        await asyncio.sleep(0)
+
+    await register._load_staged_import_rows_async(payloads, on_progress=on_progress)
+
+    assert register._table.item(0, register._COL_DESC).text() == "IMPORT 0"
+    assert register._table.item(59, register._COL_DESC).text() == "IMPORT 59"
+    assert register._first_empty_editable_row() == 60
+    # First row, every 25th, and the last row report progress.
+    assert progress[0] == (1, 60)
+    assert (25, 60) in progress and (50, 60) in progress
+    assert progress[-1] == (60, 60)
+    assert register._bulk_mutating is False
+    assert not register._table.signalsBlocked()
+
+
 def test_skip_draft_restore_flag_prevents_restore(register, monkeypatch):
     calls = {"n": 0}
 

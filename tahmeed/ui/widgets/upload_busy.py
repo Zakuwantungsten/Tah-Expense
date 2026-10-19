@@ -60,7 +60,10 @@ class _BusyDialog(QDialog):
         root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(10)
 
-        self._panel = BrandLoaderPanel(self, message, mark_width=140, show_progress=True)
+        # opaque=True: translucent panels paint blank inside Windows QDialogs.
+        self._panel = BrandLoaderPanel(
+            self, message, mark_width=140, show_progress=True, opaque=True
+        )
         # Start in determinate 0% so the bar + percentage are never blank.
         self._panel.set_progress(value=0, maximum=100)
         root.addWidget(self._panel)
@@ -217,10 +220,29 @@ class UploadBusy:
                 task.cancel()
             raise
 
+    def _pump(self) -> None:
+        """Let the dialog paint.
+
+        Outside an asyncio Task this processes Qt events. Inside a Task
+        ``processEvents`` is skipped (it would step other tasks under Python
+        3.14 / qasync), so fall back to a synchronous ``repaint`` — the caller
+        should also ``await tick()`` between chunks of blocking work so the
+        animation and percentage actually advance.
+        """
+        from tahmeed.ui.async_utils import in_running_task, safe_process_events
+
+        if in_running_task():
+            try:
+                if self._dlg.isVisible():
+                    self._dlg.repaint()
+            except RuntimeError:
+                pass
+            return
+        safe_process_events()
+
     def __enter__(self) -> "UploadBusy":
         self._dlg.show()
-        from tahmeed.ui.async_utils import safe_process_events
-        safe_process_events()
+        self._pump()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -240,8 +262,7 @@ class UploadBusy:
         if value is not None:
             self._dlg.setValue(max(0, value))
         self._dlg.setLabelText(message)
-        from tahmeed.ui.async_utils import safe_process_events
-        safe_process_events()
+        self._pump()
 
     def close(self) -> None:
         self._closing = True

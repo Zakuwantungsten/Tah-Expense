@@ -11,12 +11,14 @@ pasted value (e.g. many ``T760 DN`` → ``T760 HDN``).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from typing import Dict, List, Literal, Optional, Set
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QDialog,
     QFrame,
     QFormLayout,
@@ -267,6 +269,7 @@ class TruckCorrectionDialog(QDialog):
         fleet_kinds: Optional[Dict[str, str]] = None,
         heading: str = "",
         intro: str = "",
+        allow_park: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -281,6 +284,8 @@ class TruckCorrectionDialog(QDialog):
         _ = can_add
         self._can_add = True
         self._import_mode = import_mode
+        # False when fixing rows already on the Parked tab (no re-park actions).
+        self._allow_park = bool(allow_park)
         self._heading = heading or "Correct truck numbers"
         self._intro = intro
         self._on_resolved = on_resolved  # optional callback(TruckIssue) per resolved row
@@ -306,6 +311,8 @@ class TruckCorrectionDialog(QDialog):
         self._details_all_btn: Optional[QPushButton] = None
         self._details_focus_row: Optional[int] = None  # issue.row currently peeped
         self._details_mode: str = "all"  # "selected" | "all"
+        self._busy_overlay = None  # LoadingOverlay — horse during Park/Allow all
+        self._bulk_busy = False
         self._build_ui()
         self.add_issues(issues)
 
@@ -393,16 +400,21 @@ class TruckCorrectionDialog(QDialog):
         footer = QHBoxLayout(footer_bar)
         footer.setContentsMargins(10, 8, 10, 8)
         footer.setSpacing(6)
-        park_all = QPushButton("Park all")
-        park_all.setCursor(Qt.PointingHandCursor)
-        park_all.setFixedHeight(_CTRL_H)
-        park_all.setStyleSheet(_BTN_GHOST)
-        park_all.setToolTip(
-            "Park every remaining row for follow-up "
-            + ("(Skipped feed tab)" if self._import_mode else "(Parked table tab)")
-        )
-        park_all.clicked.connect(self._park_all_remaining)
-        footer.addWidget(park_all)
+        if self._allow_park:
+            park_all = QPushButton("Park all")
+            park_all.setCursor(Qt.PointingHandCursor)
+            park_all.setFixedHeight(_CTRL_H)
+            park_all.setStyleSheet(_BTN_GHOST)
+            park_all.setToolTip(
+                "Park every remaining row for follow-up "
+                + (
+                    "(Skipped feed tab)"
+                    if self._import_mode
+                    else "(Parked table tab — nothing is saved; correct rows stay on My entries)"
+                )
+            )
+            park_all.clicked.connect(self._park_all_remaining)
+            footer.addWidget(park_all)
         allow_all = QPushButton("Allow all")
         allow_all.setCursor(Qt.PointingHandCursor)
         allow_all.setFixedHeight(_CTRL_H)
@@ -411,11 +423,18 @@ class TruckCorrectionDialog(QDialog):
         allow_all.clicked.connect(self._allow_all_remaining)
         footer.addWidget(allow_all)
         footer.addStretch()
-        cancel_btn = QPushButton("Park remaining")
+        cancel_btn = QPushButton("Park remaining" if self._allow_park else "Cancel")
         cancel_btn.setCursor(Qt.PointingHandCursor)
         cancel_btn.setFixedHeight(_CTRL_H)
         cancel_btn.setStyleSheet(_BTN_SECONDARY)
-        cancel_btn.clicked.connect(self._on_cancel)
+        if self._allow_park:
+            cancel_btn.setToolTip(
+                "Park every still-open row for follow-up and close"
+            )
+            cancel_btn.clicked.connect(self._on_cancel)
+        else:
+            cancel_btn.setToolTip("Close without changing remaining trucks")
+            cancel_btn.clicked.connect(self.reject)
         footer.addWidget(cancel_btn)
         done_btn = QPushButton("Done")
         done_btn.setDefault(True)
@@ -900,6 +919,8 @@ class TruckCorrectionDialog(QDialog):
         issue.omit_row = omit_row
         issue.allow_anyway = allow_anyway
         issue.is_place_label = is_place_label
+        # Apply / Allow / Clear never park — only ``_park_row`` sets this.
+        issue.parked = False
         return issue
 
     # ── Add / remove rows ─────────────────────────────────────────────────
@@ -1003,18 +1024,20 @@ class TruckCorrectionDialog(QDialog):
         allow_btn.setCursor(Qt.PointingHandCursor)
         allow_btn.setFixedHeight(_CTRL_H)
         allow_btn.setStyleSheet(_BTN_ORANGE)
-        skip_row_btn = QPushButton("Park")
-        skip_row_btn.setToolTip(
-            "Park this row for follow-up "
-            + (
-                "— other rows still import (Skipped feed tab)"
-                if self._import_mode
-                else "— moves to the Parked table tab"
+        skip_row_btn = None
+        if self._allow_park:
+            skip_row_btn = QPushButton("Park")
+            skip_row_btn.setToolTip(
+                "Park this row for follow-up "
+                + (
+                    "— other rows still import (Skipped feed tab)"
+                    if self._import_mode
+                    else "— moves to the Parked table tab"
+                )
             )
-        )
-        skip_row_btn.setCursor(Qt.PointingHandCursor)
-        skip_row_btn.setFixedHeight(_CTRL_H)
-        skip_row_btn.setStyleSheet(_BTN_GHOST)
+            skip_row_btn.setCursor(Qt.PointingHandCursor)
+            skip_row_btn.setFixedHeight(_CTRL_H)
+            skip_row_btn.setStyleSheet(_BTN_GHOST)
 
         def _add_row_actions(row: QHBoxLayout) -> None:
             row.addWidget(apply_btn)
@@ -1522,9 +1545,62 @@ class TruckCorrectionDialog(QDialog):
     def _skip_all_remaining(self) -> None:
         self._park_all_remaining()
 
+    def _ensure_busy_overlay(self):
+        from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+
+        if self._busy_overlay is None:
+            self._busy_overlay = LoadingOverlay(self, "Working…")
+        return self._busy_overlay
+
+    def _pump_busy(self) -> None:
+        """Let the horse overlay paint during bulk Park/Allow all."""
+        overlay = self._busy_overlay
+        if overlay is not None and overlay.isVisible():
+            try:
+                overlay.raise_()
+                panel = getattr(overlay, "_panel", None)
+                if panel is not None:
+                    panel.repaint()
+                overlay.repaint()
+            except RuntimeError:
+                pass
+        QApplication.processEvents()
+
+    def _run_bulk_busy(self, message: str, work: Callable[[], None]) -> None:
+        """Show branded horse loader while bulk Park/Allow all applies rows."""
+        if self._bulk_busy:
+            work()
+            return
+        overlay = self._ensure_busy_overlay()
+        self._bulk_busy = True
+        try:
+            overlay.show_loading(message)
+            overlay.raise_()
+            self._pump_busy()
+            work()
+        finally:
+            self._bulk_busy = False
+            try:
+                if self._busy_overlay is not None:
+                    self._busy_overlay.hide_loading()
+            except RuntimeError:
+                pass
+
     def _park_all_remaining(self) -> None:
-        for rw in list(self._rows):
-            self._park_row(rw)
+        rows = list(self._rows)
+        if not rows:
+            return
+        n = len(rows)
+        plural = "s" if n != 1 else ""
+
+        def _work() -> None:
+            for i, rw in enumerate(rows):
+                if rw in self._rows:
+                    self._park_row(rw)
+                if i == 0 or (i + 1) % 8 == 0 or i + 1 == n:
+                    self._pump_busy()
+
+        self._run_bulk_busy(f"Parking {n} truck{plural}…", _work)
 
     def _allow_all_remaining(self) -> None:
         """Allow every open row after one Fluent confirmation."""
@@ -1550,9 +1626,16 @@ class TruckCorrectionDialog(QDialog):
         ):
             return
 
-        for rw in list(open_rows):
-            if rw in self._rows:
-                self._allow_anyway_row(rw, ask_similar=False)
+        plural = "s" if n != 1 else ""
+
+        def _work() -> None:
+            for i, rw in enumerate(list(open_rows)):
+                if rw in self._rows:
+                    self._allow_anyway_row(rw, ask_similar=False)
+                if i == 0 or (i + 1) % 8 == 0 or i + 1 == n:
+                    self._pump_busy()
+
+        self._run_bulk_busy(f"Allowing {n} truck{plural}…", _work)
 
     def _accept_label_row(self, rw: _RowWidgets) -> None:
         text = normalize_place_label(rw.edit.text())
@@ -1868,7 +1951,7 @@ class TruckCorrectionDialog(QDialog):
 
     def _on_cancel(self) -> None:
         """Park every still-open issue and close."""
-        for rw in list(self._rows):
-            self._park_row(rw)
+        self._park_all_remaining()
         self._update_count()
-        self.accept()
+        if self.isVisible():
+            self.accept()
