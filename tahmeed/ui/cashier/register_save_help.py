@@ -16,27 +16,32 @@ _FALLBACK = """# Daily Register — Save, Recovered, and Offline
 
 ## When to click Save
 
-- After typing new expenses (or editing saved drafts), click **Save** so they become server drafts.
-- You can keep typing after Save; Save again when you have more rows.
+- After typing new expenses (or editing saved drafts), click **Save**.
+- Save stores work on this computer first, then syncs in the background — you can keep typing.
 - Open **Drafts** and submit for Verify when the day is ready — Save alone does not submit.
 
-## What “Draft restored” / Recovered means
+## What “Draft restored” / “Sync pending” means
 
-- If the app closed before Save finished (or while offline), local recovery brings those rows back.
-- Recovered rows are **not** double-counted against rows already on the server — matching rows are skipped.
-- Click **Save** after recovery so anything still local is stored on the server.
+- Local recovery brings rows back if the app closed mid-sync or while offline.
+- **Sync pending** = rows still queued for the server (sky tint); they retry when online.
+- **Draft restored** = ordinary unsaved typing; click Save to store it.
+- Matching rows already on the server are skipped (no double-count).
 
 ## Offline / slow network
 
-- If you appear offline, Save stores work **on this computer** and shows “Saved locally — will sync.”
-- When the connection returns, pending rows sync automatically. Sky/red tint means waiting or failed sync.
-- Do **not** re-type the same expenses “just in case” — retries are safe and will not create duplicates.
+- Offline Save keeps work on this computer and syncs when the connection returns.
+- Sky/red tint means waiting or failed sync. Background sync does not lock the table.
+- Large syncs show `Syncing 1–100 of N…` in the status bar. Press **Esc** to cancel the rest (already-synced rows stay saved).
+- Do not re-type the same expenses — retries are safe.
 
-## Duplicate check (“Save anyway”)
+## Possible duplicates
 
-- The soft duplicate warning compares similar past expenses (advisory).
-- Prefer fixing a mistaken re-entry over clicking **Save anyway**.
-- Use Save anyway only when you are sure the new row is a real separate expense.
+- **Save checked** saves only ticked rows; **Keep for later** leaves them on the table.
+- Soft-dup is advisory — only save duplicates when you are sure they are separate expenses.
+
+## Parked trucks
+
+- Parking incorrect trucks finishes sync before opening the Parked tab.
 """
 
 

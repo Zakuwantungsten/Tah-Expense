@@ -293,6 +293,29 @@ def test_combo_card_shows_truck_only(qapp) -> None:
     dlg.close()
 
 
+def test_details_table_uses_master_expense_stripes(qapp) -> None:
+    """Row details See-all table mirrors Master Expenses zebra colors."""
+    from PySide6.QtGui import QColor
+
+    from tahmeed.ui.dialogs.truck_correction_dialog import _ROW_EVEN, _ROW_ODD
+
+    issues = [
+        TruckIssue(row=0, original="T111 AAA", kind="not_in_registry"),
+        TruckIssue(row=1, original="T222 BBB", kind="not_in_registry"),
+        TruckIssue(row=2, original="T333 CCC", kind="not_in_registry"),
+    ]
+    dlg = TruckCorrectionDialog(issues, fleet=set())
+    dlg._set_details_mode("all")
+    table = dlg._details_table
+    assert table is not None
+    assert table.rowCount() == 3
+    assert not table.alternatingRowColors()
+    assert table.item(0, 0).background().color() == QColor(_ROW_EVEN)
+    assert table.item(1, 0).background().color() == QColor(_ROW_ODD)
+    assert table.item(2, 0).background().color() == QColor(_ROW_EVEN)
+    dlg.close()
+
+
 def test_combo_card_two_trailers_keeps_suffix(qapp) -> None:
     issues = [
         TruckIssue(

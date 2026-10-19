@@ -23,6 +23,22 @@ def test_upload_busy_default_has_no_cancel() -> None:
         buttons = [b for b in busy._dlg.findChildren(QPushButton) if b.isVisible()]
         assert not busy.should_cancel()
         assert all("Cancel" not in (b.text() or "").replace("&", "") for b in buttons)
+        # Determinate bar starts visible at 0% so the dialog is never blank.
+        assert not busy._dlg._panel._bar.isHidden()
+        assert busy._dlg._panel.percent_text() == "0%"
+
+
+def test_upload_busy_shows_percent_progress() -> None:
+    _app()
+    with UploadBusy(
+        None, "Importing…", title="Importing Daily Register"
+    ) as busy:
+        assert busy._dlg.windowTitle() == "Importing Daily Register"
+        busy.update("Loading rows…", value=25, maximum=100)
+        assert busy._dlg._panel.percent_text() == "25%"
+        assert not busy._dlg._panel._bar.isHidden()
+        busy.update("Almost done…", value=100, maximum=100)
+        assert busy._dlg._panel.percent_text() == "100%"
 
 
 def test_upload_busy_cancellable_sets_flag() -> None:

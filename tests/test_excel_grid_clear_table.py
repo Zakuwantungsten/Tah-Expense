@@ -126,3 +126,72 @@ def test_clear_table_undo_restores_unsaved_row(register):
     register._undo()
     assert register._table.item(0, register._COL_DESC).text() == "DIESEL"
     assert register._table.item(0, register._COL_TZS).text() == "1,000.00"
+
+
+def test_unsaved_parked_clear_count_ignores_saved_prefix(register):
+    register._saved_count = 2
+    register._pending_row_meta = {
+        0: {"parked": True},   # already in saved prefix — keep
+        2: {"parked": True},   # unsaved — would be wiped
+        3: {"parked": True},
+        4: {"client_row_id": "x"},
+    }
+    assert register._unsaved_parked_clear_count() == 2
+
+
+def test_clear_table_warns_when_unsaved_parked_would_be_cleared(register, monkeypatch):
+    captured = {}
+
+    def _capture_confirm(*_a, **kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        "tahmeed.ui.dialogs.confirm_dialog.ask_confirm",
+        _capture_confirm,
+    )
+
+    register._table.setRowCount(12)
+    register._saved_count = 0
+    register._put(0, register._COL_DESC, "IMPORT A")
+    register._put(1, register._COL_DESC, "IMPORT B")
+    register._pending_row_meta = {
+        0: {"parked": True, "client_row_id": "a"},
+        1: {"parked": True, "client_row_id": "b"},
+    }
+
+    register.toolbar_clear_table()
+
+    assert "parked truck row" in (captured.get("body") or "")
+    assert "Parked tab" in (captured.get("body") or "")
+    assert "saved parked trucks" in (captured.get("note") or "").lower()
+    assert not register._row_has_data(0)
+    assert not register._row_has_data(1)
+
+
+def test_clear_table_default_copy_without_parked(register, monkeypatch):
+    captured = {}
+
+    def _capture_confirm(*_a, **kwargs):
+        captured.update(kwargs)
+        return False
+
+    monkeypatch.setattr(
+        "tahmeed.ui.dialogs.confirm_dialog.ask_confirm",
+        _capture_confirm,
+    )
+
+    register._table.setRowCount(12)
+    register._saved_count = 0
+    register._put(0, register._COL_DESC, "UNSAVED")
+    register._pending_row_meta = {0: {"client_row_id": "only"}}
+
+    register.toolbar_clear_table()
+
+    assert captured.get("body") == "All unsaved rows and typed data will be removed."
+    assert "parked" not in (captured.get("body") or "").lower()
+    assert captured.get("note") == (
+        "Saved entries on this register will not be affected."
+    )
+    # Cancelled confirm — row stays
+    assert register._row_has_data(0)

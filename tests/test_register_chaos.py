@@ -126,7 +126,7 @@ async def test_network_drop_mid_drain_marks_failed(register, monkeypatch):
     register._set_row_sync_status(0, SYNC_PENDING)
     monkeypatch.setattr(register, "_api_is_online", lambda: True)
 
-    async def boom(_txs):
+    async def boom(_txs, *, on_progress=None, should_cancel=None):
         raise ConnectionError("ACK lost")
 
     monkeypatch.setattr(

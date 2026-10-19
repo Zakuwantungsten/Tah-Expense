@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Set
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -64,9 +65,15 @@ _BG = "#F4F6F8"
 _T1 = "#111827"
 _T2 = "#6B7280"
 _BLUE = "#0077C5"
+_BLUE_L = "#E8F4FD"
 _ORANGE = "#E85D04"
 _GREEN = "#16A34A"
 _RED = "#B91C1C"
+# Master Expenses–style zebra stripes (manual, not Qt alternate palette)
+_ROW_EVEN = "#FFFFFF"
+_ROW_ODD = "#F1F5F9"
+_ROW_H = 24
+_HDR_H = 22
 
 _INPUT_SS = (
     f"QLineEdit {{ background: {_WHITE}; border: 1px solid #d1d5db; border-radius: 4px;"
@@ -510,7 +517,7 @@ class TruckCorrectionDialog(QDialog):
         selected_lay.addWidget(form_scroll, 1)
         self._details_stack.addWidget(selected)
 
-        # See-all table
+        # See-all table — Master Expenses zebra stripes (white / slate-100)
         self._details_table = QTableWidget(0, 4)
         self._details_table.setHorizontalHeaderLabels(
             ("Row", "Truck", "Issue", "Summary")
@@ -518,18 +525,20 @@ class TruckCorrectionDialog(QDialog):
         self._details_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._details_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._details_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self._details_table.setAlternatingRowColors(True)
+        self._details_table.setAlternatingRowColors(False)
         self._details_table.verticalHeader().setVisible(False)
-        self._details_table.verticalHeader().setDefaultSectionSize(28)
+        self._details_table.verticalHeader().setDefaultSectionSize(_ROW_H)
         self._details_table.setShowGrid(False)
         self._details_table.setStyleSheet(
             f"QTableWidget {{ background: {_WHITE}; border: 1px solid {_BORDER};"
-            f" border-radius: 6px; gridline-color: {_BORDER}; font-size: 11px; }}"
-            f"QHeaderView::section {{ background: {_BG}; color: {_T2};"
+            f" border-radius: 6px; gridline-color: {_BORDER};"
+            f" font-size: 10pt; font-family: 'Segoe UI'; }}"
+            f"QHeaderView::section {{ background: {_ROW_ODD}; color: {_T2};"
             f" border: none; border-bottom: 1px solid {_BORDER};"
-            " padding: 4px 8px; font-size: 10px; font-weight: 700; }}"
-            f"QTableWidget::item {{ padding: 2px 8px; }}"
-            f"QTableWidget::item:selected {{ background: #E8F4FD; color: {_T1}; }}"
+            f" padding: 0 6px; height: {_HDR_H}px;"
+            " font-size: 9px; font-weight: 600; font-family: 'Segoe UI'; }}"
+            f"QTableWidget::item {{ padding: 1px 6px; color: {_T1}; }}"
+            f"QTableWidget::item:selected {{ background: {_BLUE_L}; color: {_T1}; }}"
         )
         hh = self._details_table.horizontalHeader()
         hh.setStretchLastSection(True)
@@ -686,12 +695,16 @@ class TruckCorrectionDialog(QDialog):
             truck_it = QTableWidgetItem(issue.original or "—")
             kind_it = QTableWidgetItem(self._issue_kind_text(issue))
             summary_it = QTableWidgetItem(self._summary_for(issue))
+            stripe = QColor(_ROW_ODD if i % 2 else _ROW_EVEN)
             for it in (row_it, truck_it, kind_it, summary_it):
                 it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                it.setBackground(stripe)
+                it.setForeground(QColor(_T1))
             self._details_table.setItem(i, 0, row_it)
             self._details_table.setItem(i, 1, truck_it)
             self._details_table.setItem(i, 2, kind_it)
             self._details_table.setItem(i, 3, summary_it)
+            self._details_table.setRowHeight(i, _ROW_H)
             if focus is not None and issue.row == focus.row:
                 self._details_table.selectRow(i)
 

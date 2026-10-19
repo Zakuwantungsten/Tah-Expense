@@ -68,6 +68,24 @@ def test_brand_loader_cycles_dots() -> None:
     panel.stop()
 
 
+def test_brand_loader_progress_shows_percent() -> None:
+    _app()
+    panel = BrandLoaderPanel(None, "Importing…", show_progress=True)
+    # isHidden() is reliable before the widget is shown; isVisible() is not.
+    assert not panel._bar.isHidden()
+    panel.set_progress(value=0, maximum=100)
+    assert panel.percent_text() == "0%"
+    panel.set_progress(value=42, maximum=100)
+    assert panel.percent_text() == "42%"
+    panel.set_progress(value=3, maximum=4)
+    assert panel.percent_text() == "75%"
+    panel.reset_progress()
+    # Reset keeps the bar visible (never blank) but clears the percent label.
+    assert not panel._bar.isHidden()
+    assert panel.percent_text() == ""
+    panel.stop()
+
+
 def test_brand_loader_fade_pulse_changes_opacity() -> None:
     _app()
     panel = BrandLoaderPanel(None, "Loading…")

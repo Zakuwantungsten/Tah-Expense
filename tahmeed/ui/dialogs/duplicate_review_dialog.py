@@ -91,6 +91,7 @@ class DuplicateReviewDialog(QDialog):
             else len(self._items)
         )
         self._save_anyway_rows: Set[int] = set()
+        self._keep_for_later = False
         self.setWindowTitle("Possible duplicates")
         self.setMinimumSize(740, 300)
         self.resize(820, 360)
@@ -99,6 +100,15 @@ class DuplicateReviewDialog(QDialog):
 
     def save_anyway_rows(self) -> Set[int]:
         return set(self._save_anyway_rows)
+
+    def deferred_duplicate_rows(self) -> Set[int]:
+        """Dup rows intentionally left on the table (not saved in this pass)."""
+        all_dup = {item.row for item in self._items}
+        return all_dup - set(self._save_anyway_rows)
+
+    def kept_for_later(self) -> bool:
+        """True when the cashier chose Keep for later (defer all dups)."""
+        return bool(self._keep_for_later)
 
     def _looks_like_reimport(self) -> bool:
         n = len(self._items)
@@ -142,14 +152,16 @@ class DuplicateReviewDialog(QDialog):
             subtitle = QLabel(
                 "Most of these rows already match expenses in the system — "
                 "often from re-importing the same Excel file. Prefer "
-                "Skip all unless you are sure each new row is a separate expense. "
-                "Each pair shows the new row (red) above the existing expense (cream)."
+                "Keep for later unless you are sure each new row is a separate "
+                "expense. Each pair shows the new row (red) above the existing "
+                "expense (cream)."
             )
         else:
             subtitle = QLabel(
                 "Each pair shows the new row (red) above the existing expense (cream). "
                 "Tick Save to keep the new row anyway — it will be flagged for "
-                "Verify → Issues. Unchecked pairs are skipped."
+                "Verify → Issues. Unchecked pairs stay on the table for later "
+                "(or use Keep for later)."
             )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(
@@ -219,7 +231,11 @@ class DuplicateReviewDialog(QDialog):
 
         buttons = QDialogButtonBox()
         save_btn = buttons.addButton("Save checked", QDialogButtonBox.AcceptRole)
-        skip_btn = buttons.addButton("Skip all", QDialogButtonBox.ActionRole)
+        keep_btn = buttons.addButton("Keep for later", QDialogButtonBox.ActionRole)
+        keep_btn.setToolTip(
+            "Leave these possible duplicates on the table without saving them. "
+            "Click Save again when you are ready."
+        )
         cancel_btn = buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
         for btn, style in (
             (
@@ -229,7 +245,7 @@ class DuplicateReviewDialog(QDialog):
                 "QPushButton:hover{background:#005EA3;}",
             ),
             (
-                skip_btn,
+                keep_btn,
                 f"QPushButton{{background:transparent;color:{_T1};border:1px solid {_BORDER};"
                 "border-radius:4px;padding:6px 14px;font-family:'Segoe UI';font-size:12px;}"
                 f"QPushButton:hover{{background:{_BG};}}",
@@ -243,7 +259,7 @@ class DuplicateReviewDialog(QDialog):
         ):
             btn.setStyleSheet(style)
         save_btn.clicked.connect(self._accept_checked)
-        skip_btn.clicked.connect(self._accept_skip_all)
+        keep_btn.clicked.connect(self._accept_keep_for_later)
         cancel_btn.clicked.connect(self.reject)
         root.addWidget(buttons)
 
@@ -310,9 +326,16 @@ class DuplicateReviewDialog(QDialog):
             cb.setChecked(False)
 
     def _accept_checked(self) -> None:
+        self._keep_for_later = False
         self._save_anyway_rows = self._checked_rows()
         self.accept()
 
-    def _accept_skip_all(self) -> None:
+    def _accept_keep_for_later(self) -> None:
+        """Defer all duplicate rows — leave them on the table for a later Save."""
+        self._keep_for_later = True
         self._save_anyway_rows = set()
         self.accept()
+
+    # Back-compat alias for older callers / tests.
+    def _accept_skip_all(self) -> None:
+        self._accept_keep_for_later()

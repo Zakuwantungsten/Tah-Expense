@@ -161,27 +161,37 @@ class BrandLoaderPanel(QWidget):
         self._label.setAlignment(Qt.AlignCenter)
         self._label.setWordWrap(True)
         self._label.setStyleSheet(
-            f"color: #374151; font-size: 13px; font-weight: 600;"
+            f"color: #111827; font-size: 13px; font-weight: 600;"
             f" font-family:'Segoe UI'; background: transparent; border: none;"
         )
-        self._label.setMinimumWidth(220)
+        self._label.setMinimumWidth(280)
         layout.addWidget(self._label, alignment=Qt.AlignCenter)
 
+        self._pct = QLabel("")
+        self._pct.setAlignment(Qt.AlignCenter)
+        self._pct.setStyleSheet(
+            f"color: {_BLUE}; font-size: 20px; font-weight: 700;"
+            f" font-family:'Segoe UI'; background: transparent; border: none;"
+        )
+        self._pct.setMinimumWidth(280)
+        self._pct.hide()
+        layout.addWidget(self._pct, alignment=Qt.AlignCenter)
+
         self._bar = QProgressBar()
-        self._bar.setFixedWidth(220)
-        self._bar.setFixedHeight(8)
+        self._bar.setFixedWidth(280)
+        self._bar.setFixedHeight(12)
         self._bar.setTextVisible(False)
         self._bar.setRange(0, 0)
-        self._bar.setVisible(False)
         self._bar.setStyleSheet(
             "QProgressBar {"
-            "  background: #E5E7EB; border: none; border-radius: 4px;"
+            "  background: #E5E7EB; border: none; border-radius: 6px;"
             "}"
             "QProgressBar::chunk {"
-            f"  background: {_BLUE}; border-radius: 4px;"
+            f"  background: {_BLUE}; border-radius: 6px;"
             "}"
         )
         self._show_progress = show_progress
+        self._bar.setVisible(bool(show_progress))
         layout.addWidget(self._bar, alignment=Qt.AlignCenter)
 
         self._fade_timer = QTimer(self)
@@ -216,21 +226,41 @@ class BrandLoaderPanel(QWidget):
     ) -> None:
         if not self._show_progress:
             self._bar.hide()
+            self._pct.hide()
             return
+        self._bar.show()
         if maximum is not None and maximum > 0:
+            maximum = int(maximum)
+            current = max(0, min(maximum, int(value or 0)))
             self._bar.setRange(0, maximum)
-            self._bar.setValue(max(0, min(maximum, value or 0)))
-            self._bar.show()
+            self._bar.setValue(current)
+            pct = int(round(100.0 * current / maximum)) if maximum else 0
+            self._pct.setText(f"{pct}%")
+            self._pct.show()
         elif value is not None and self._bar.maximum() > 0:
-            self._bar.setValue(max(0, min(self._bar.maximum(), value)))
-            self._bar.show()
+            maximum = self._bar.maximum()
+            current = max(0, min(maximum, int(value)))
+            self._bar.setValue(current)
+            pct = int(round(100.0 * current / maximum)) if maximum else 0
+            self._pct.setText(f"{pct}%")
+            self._pct.show()
         elif maximum is not None:
+            # Indeterminate busy — keep the bar visible so the dialog is never empty.
             self._bar.setRange(0, 0)
-            self._bar.hide()
+            self._pct.setText("")
+            self._pct.hide()
 
     def reset_progress(self) -> None:
         self._bar.setRange(0, 0)
-        self._bar.hide()
+        self._pct.setText("")
+        self._pct.hide()
+        if self._show_progress:
+            self._bar.show()
+        else:
+            self._bar.hide()
+
+    def percent_text(self) -> str:
+        return (self._pct.text() or "").strip()
 
     def start(self) -> None:
         if self._running:

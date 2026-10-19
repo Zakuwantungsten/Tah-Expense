@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 from tahmeed.ui.widgets.brand_loader import BrandLoaderPanel
 
 _T = TypeVar("_T")
+_BLUE = "#0077C5"
 
 
 class UploadCancelled(Exception):
@@ -41,7 +42,8 @@ class _BusyDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setWindowModality(Qt.WindowModal)
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(420)
+        self.setMinimumHeight(220)
         self.setStyleSheet(
             "QDialog { background: #FFFFFF; color: #111827; }"
             "QPushButton {"
@@ -50,13 +52,17 @@ class _BusyDialog(QDialog):
             "  min-height: 28px; font-size: 13px;"
             "}"
             "QPushButton:hover { background: #F3F4F6; }"
+            f"QPushButton#busyCancel {{ border-color: {_BLUE}; color: {_BLUE}; }}"
+            f"QPushButton#busyCancel:hover {{ background: #E8F4FC; }}"
         )
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 8, 12, 12)
-        root.setSpacing(8)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(10)
 
-        self._panel = BrandLoaderPanel(self, message, mark_width=160, show_progress=True)
+        self._panel = BrandLoaderPanel(self, message, mark_width=140, show_progress=True)
+        # Start in determinate 0% so the bar + percentage are never blank.
+        self._panel.set_progress(value=0, maximum=100)
         root.addWidget(self._panel)
 
         self._cancel_btn: Optional[QPushButton] = None
@@ -64,12 +70,13 @@ class _BusyDialog(QDialog):
             row = QHBoxLayout()
             row.addStretch(1)
             self._cancel_btn = QPushButton("Cancel", self)
+            self._cancel_btn.setObjectName("busyCancel")
             self._cancel_btn.clicked.connect(self.canceled.emit)
             row.addWidget(self._cancel_btn)
             root.addLayout(row)
 
         self._was_canceled = False
-        self._maximum = 0
+        self._maximum = 100
         self._value = 0
 
     def labelText(self) -> str:
@@ -89,6 +96,8 @@ class _BusyDialog(QDialog):
         self._value = max(0, int(value))
         if self._maximum > 0:
             self._panel.set_progress(value=self._value, maximum=self._maximum)
+        else:
+            self._panel.set_progress(value=self._value, maximum=0)
 
     def wasCanceled(self) -> bool:
         return self._was_canceled
@@ -107,8 +116,9 @@ class _BusyDialog(QDialog):
 
     def reset(self) -> None:
         self._value = 0
-        self._maximum = 0
+        self._maximum = 100
         self._panel.reset_progress()
+        self._panel.set_progress(value=0, maximum=100)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -128,6 +138,9 @@ class UploadBusy:
     Pass ``cancellable=True`` for a Cancel button. ``should_cancel`` is safe
     to call from a worker thread; ``raise_if_cancelled`` / ``await_or_cancel``
     belong on the UI / asyncio thread.
+
+    Call ``update(message, value=…, maximum=…)`` to drive the percentage bar
+    (sidebar blue ``#0077C5``).
     """
 
     def __init__(
@@ -213,12 +226,18 @@ class UploadBusy:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def update(self, message: str, *, value: Optional[int] = None, maximum: Optional[int] = None) -> None:
+    def update(
+        self,
+        message: str,
+        *,
+        value: Optional[int] = None,
+        maximum: Optional[int] = None,
+    ) -> None:
         if self.should_cancel():
             return
         if maximum is not None:
             self._dlg.setMaximum(max(0, maximum))
-        if value is not None and self._dlg.maximum() > 0:
+        if value is not None:
             self._dlg.setValue(max(0, value))
         self._dlg.setLabelText(message)
         from tahmeed.ui.async_utils import safe_process_events

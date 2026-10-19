@@ -92,7 +92,7 @@ async def test_online_save_enqueues_outbox_without_reload(register, monkeypatch)
     async def fake_dup_bulk(candidates, *_a, **_k):
         return [[] for _ in candidates]
 
-    async def boom_bulk(_txs):
+    async def boom_bulk(_txs, *, on_progress=None, should_cancel=None):
         raise AssertionError("online Save must not bulk-create inline")
 
     load_calls: list = []
@@ -125,7 +125,7 @@ async def test_online_save_enqueues_outbox_without_reload(register, monkeypatch)
     assert register._kick_outbox_after_save is True
     assert register._row_sync_status(0) == SYNC_PENDING
     assert load_calls == []
-    assert messages and messages[0].startswith("Syncing")
+    assert messages and messages[0].startswith("Saved locally")
     draft = load_register_draft(
         register._user._id, register._current_date, merged=False
     )
@@ -158,7 +158,7 @@ async def test_submit_save_still_awaits_bulk_create(register, monkeypatch):
 
     bulk_calls = {"n": 0}
 
-    async def fake_bulk(txs):
+    async def fake_bulk(txs, *, on_progress=None, should_cancel=None):
         bulk_calls["n"] += 1
         for tx in txs:
             tx._id = ObjectId()
@@ -207,7 +207,7 @@ async def test_drain_promotes_without_full_reload(register, monkeypatch):
 
     saved_id = ObjectId()
 
-    async def fake_bulk(txs):
+    async def fake_bulk(txs, *, on_progress=None, should_cancel=None):
         assert len(txs) == 1
         txs[0]._id = saved_id
         txs[0].register_status = "draft"
@@ -234,7 +234,8 @@ async def test_drain_promotes_without_full_reload(register, monkeypatch):
     assert register._saved_count == 1
     assert register._saved_ids[0] == saved_id
     assert register._outbox_pending_rows() == []
-    assert messages and messages[0].startswith("Draft saved:")
+    # Phase 2: drain emits Syncing… then Draft saved: (status only, no overlay).
+    assert any(m.startswith("Draft saved:") for m in messages)
 
 
 @pytest.mark.asyncio
@@ -242,11 +243,12 @@ async def test_do_save_schedules_drain_after_release(register, monkeypatch):
     """Drain is scheduled only after ``_save_in_flight`` clears."""
     scheduled: list[int] = []
 
-    async def body(meta=None):
+    async def body(meta=None, *, parked_only=False):
         register._kick_outbox_after_save = True
         if meta is not None:
             meta["queued"] = 1
             meta["async_outbox"] = True
+            meta["parked_only"] = parked_only
         return True
 
     monkeypatch.setattr(register, "_do_save_body", body)
@@ -260,3 +262,77 @@ async def test_do_save_schedules_drain_after_release(register, monkeypatch):
     assert ok is True
     assert register._save_in_flight is False
     assert scheduled == [0]
+
+
+@pytest.mark.asyncio
+async def test_parked_only_skips_off_date_and_non_parked_rows(register, monkeypatch):
+    """Park all: only parked rows queue; Off-date / dup dialogs stay silent."""
+    from tahmeed.services.register_draft_service import SYNC_PENDING
+    from tahmeed.ui.cashier.register_delegates import (
+        COL_DATE,
+        COL_DESC,
+        COL_TRUCK,
+        COL_TZS,
+    )
+
+    register._table.blockSignals(True)
+    try:
+        # Parked incorrect-truck row (off-date) — should persist.
+        register._put(0, COL_DESC, "DIESEL")
+        register._put(0, COL_TZS, "1,000.00")
+        register._put(0, COL_TRUCK, "BAD TRUCK")
+        register._put(0, COL_DATE, "01/10/2026")
+        register._pending_row_meta[0] = {"parked": True, "client_row_id": "p0"}
+        # Good-truck off-date row — must remain unsaved on My.
+        register._put(1, COL_DESC, "DIESEL")
+        register._put(1, COL_TZS, "2,000.00")
+        register._put(1, COL_TRUCK, "YARD")
+        register._put(1, COL_DATE, "02/10/2026")
+    finally:
+        register._table.blockSignals(False)
+
+    monkeypatch.setattr(register, "_api_is_online", lambda: True)
+    monkeypatch.setattr(register, "_rows_missing_required_truck", lambda: [])
+
+    async def fake_next_day_order(_d):
+        return 1
+
+    async def boom_dup(*_a, **_k):
+        raise AssertionError("parked_only must not run duplicate review")
+
+    async def boom_bulk(*_a, **_k):
+        raise AssertionError("online parked_only must enqueue, not bulk-create")
+
+    def boom_mbox(*_a, **_k):
+        raise AssertionError("parked_only must not show Off-date / save dialogs")
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.next_day_order",
+        fake_next_day_order,
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.check_for_duplicates_bulk",
+        boom_dup,
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.bulk_save_transactions",
+        boom_bulk,
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.QMessageBox.warning",
+        boom_mbox,
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.QMessageBox.information",
+        boom_mbox,
+    )
+
+    meta: dict = {}
+    ok = await register._do_save_body(meta, parked_only=True)
+    assert ok is True
+    assert meta.get("parked_only") is True
+    assert meta.get("async_outbox") is True
+    assert meta.get("queued") == 1
+    assert register._row_sync_status(0) == SYNC_PENDING
+    # Non-parked row stays ordinary unsaved (no sync_status).
+    assert not (register._pending_row_meta.get(1) or {}).get("sync_status")

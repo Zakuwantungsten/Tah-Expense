@@ -124,7 +124,7 @@ async def test_drain_outbox_marks_saved_on_success(register, monkeypatch):
         register._table.blockSignals(False)
     register._set_row_sync_status(0, SYNC_PENDING)
 
-    async def fake_bulk(txs):
+    async def fake_bulk(txs, *, on_progress=None, should_cancel=None):
         assert len(txs) == 1
         txs[0]._id = ObjectId()
         return [("created", txs[0], None)]

@@ -19,6 +19,8 @@ from tahmeed.ui.dialogs.date_outlier_dialog import resolve_import_date_policy
 from tahmeed.ui.dialogs.import_problem_rows_dialog import prompt_import_problems
 from tahmeed.ui.widgets.upload_busy import UploadBusy, UploadCancelled
 
+_IMPORT_TITLE = "Importing Daily Register"
+
 
 async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]:
     """Pick a file, resolve mappings + dates, confirm preview (or None)."""
@@ -33,21 +35,27 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
 
     try:
         with UploadBusy(
-            parent, "Reading Excel file…", title="Import", cancellable=True
+            parent,
+            "Opening Excel file…",
+            title=_IMPORT_TITLE,
+            cancellable=True,
         ) as busy:
             await busy.tick()
-            busy.update("Reading Excel file…")
+            busy.update("Reading Excel file…", value=10, maximum=100)
             preview = await busy.await_or_cancel(
                 preview_daily_import(path, should_cancel=busy.should_cancel)
             )
             busy.update(
-                f"Matched descriptions · {len(preview.rows):,} row(s) found…"
-                + (
-                    f" · {len(preview.problem_rows):,} need dates"
-                    if preview.problem_rows
-                    else ""
-                )
+                "Matching descriptions…",
+                value=70,
+                maximum=100,
             )
+            await busy.tick()
+            detail = f"{len(preview.rows):,} row(s) ready"
+            if preview.problem_rows:
+                detail += f" · {len(preview.problem_rows):,} need dates"
+            busy.update(detail, value=100, maximum=100)
+            await busy.tick()
     except (UploadCancelled, DailyImportCancelled):
         return None
     except Exception as exc:
@@ -93,12 +101,18 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
     # ── Reimport gate — same filename / exact content already uploaded ───
     try:
         with UploadBusy(
-            parent, "Checking prior imports…", title="Import", cancellable=True
+            parent,
+            "Checking prior imports…",
+            title=_IMPORT_TITLE,
+            cancellable=True,
         ) as busy:
             await busy.tick()
+            busy.update("Checking prior imports…", value=35, maximum=100)
             prior = await busy.await_or_cancel(
                 find_prior_daily_imports(preview)
             )
+            busy.update("Prior imports checked", value=100, maximum=100)
+            await busy.tick()
     except (UploadCancelled, DailyImportCancelled):
         return None
     except Exception:

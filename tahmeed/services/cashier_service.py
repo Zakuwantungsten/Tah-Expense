@@ -1,8 +1,11 @@
 import asyncio
 from datetime import datetime, date
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 from bson import ObjectId
 import httpx
+
+# (done_through, total) after each bulk-create chunk — sync or async callback.
+BulkCreateProgress = Callable[[int, int], Union[None, Awaitable[None]]]
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.api_client import ApiConnectionError, ApiError, api_client
@@ -1353,20 +1356,43 @@ async def check_for_duplicates_bulk(
 
 async def bulk_save_transactions(
     txs: Sequence[Transaction],
+    *,
+    on_progress: Optional[BulkCreateProgress] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> List[Tuple[str, Optional[Transaction], Optional[str]]]:
     """Create many drafts via ``/bulk-create`` (chunked).
 
     Returns one ``(status, transaction|None, error|None)`` per input tx, where
     status is ``created``, ``already_exists``, or ``error``.
+
+    ``on_progress(done_through, total)`` is invoked after each chunk (and once
+    at the start with ``done_through=0``) so UIs can show ``1–100 of 360``.
+
+    ``should_cancel()`` is checked before each chunk; when True, remaining
+    items stay ``("error", None, "cancelled")`` so callers can re-queue them.
     """
     if not txs:
         return []
 
+    total = len(txs)
     outcomes: List[Tuple[str, Optional[Transaction], Optional[str]]] = [
         ("error", None, "not processed") for _ in txs
     ]
 
-    for offset in range(0, len(txs), BULK_CREATE_CHUNK):
+    async def _emit(done: int) -> None:
+        if on_progress is None:
+            return
+        result = on_progress(done, total)
+        if asyncio.iscoroutine(result):
+            await result
+
+    await _emit(0)
+
+    for offset in range(0, total, BULK_CREATE_CHUNK):
+        if should_cancel is not None and should_cancel():
+            for i in range(offset, total):
+                outcomes[i] = ("error", None, "cancelled")
+            break
         chunk = list(txs[offset : offset + BULK_CREATE_CHUNK])
         body = {"items": [_tx_create_body(tx) for tx in chunk]}
 
@@ -1390,14 +1416,17 @@ async def bulk_save_transactions(
                 except Exception as exc2:
                     for i, _tx in enumerate(chunk):
                         outcomes[offset + i] = ("error", None, str(exc2))
+                    await _emit(min(total, offset + len(chunk)))
                     continue
             else:
                 for i, _tx in enumerate(chunk):
                     outcomes[offset + i] = ("error", None, str(exc))
+                await _emit(min(total, offset + len(chunk)))
                 continue
         except Exception as exc:
             for i, _tx in enumerate(chunk):
                 outcomes[offset + i] = ("error", None, str(exc))
+            await _emit(min(total, offset + len(chunk)))
             continue
 
         for row in payload.get("results") or []:
@@ -1417,6 +1446,8 @@ async def bulk_save_transactions(
                 if saved.client_row_id and not txs[absolute].client_row_id:
                     txs[absolute].client_row_id = saved.client_row_id
             outcomes[absolute] = (status_key, saved, str(err) if err else None)
+
+        await _emit(min(total, offset + len(chunk)))
 
     return outcomes
 

@@ -1124,6 +1124,9 @@ class DailyRegister(QWidget):
         self._submit_in_flight = False
         # Phase 4/C — local outbox drain (reconnect + async online Save).
         self._outbox_drain_in_flight = False
+        self._outbox_cancel_requested = False
+        self._load_in_flight = False
+        self._reload_after_drain = False
         self._outbox_backoff_attempt = 0
         self._kick_outbox_after_save = False
         self._outbox_drain_timer = QTimer(self)
@@ -1447,8 +1450,13 @@ class DailyRegister(QWidget):
             await self._load_date_body(d)
 
     async def _load_date_body(self, d: date) -> None:
+        # Settle in-flight drain before wiping the grid (do not block on FAILED leftovers).
+        if self._outbox_drain_in_flight or self._outbox_pending_rows():
+            await self._await_outbox_idle(timeout_s=180, require_empty=False)
+
         self._load_gen += 1
         seq = self._load_gen
+        self._load_in_flight = True
         upload_id = self._load_upload_id
         if upload_id:
             self._show_register_loading("Loading upload…")
@@ -1513,6 +1521,7 @@ class DailyRegister(QWidget):
                 QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
         finally:
             if seq == self._load_gen:
+                self._load_in_flight = False
                 self._hide_register_loading()
 
     def set_merged_mode(self, merged: bool) -> None:
@@ -2952,6 +2961,10 @@ class DailyRegister(QWidget):
     def _table_key_press(self, event: QKeyEvent) -> None:
         mod = event.modifiers()
         key = event.key()
+
+        if key == Qt.Key_Escape and self._outbox_drain_in_flight:
+            if self.cancel_outbox_sync():
+                return
 
         if mod == Qt.ControlModifier:
             if key == Qt.Key_C:    self._copy();                               return
@@ -4747,8 +4760,14 @@ class DailyRegister(QWidget):
             if primary != self._current_date:
                 self._reset_edit_state()
                 self._current_date = primary
-                with UploadBusy(self, "Opening import date…", title="Import"):
+                with UploadBusy(
+                    self,
+                    "Opening import date…",
+                    title="Importing Daily Register",
+                ) as busy:
+                    busy.update("Opening import date…", value=20, maximum=100)
                     await self._load_date(primary)
+                    busy.update("Import date ready", value=100, maximum=100)
             else:
                 # Same day: wipe leftover unsaved editable rows before staging.
                 self._wipe_unsaved_editable_rows()
@@ -4761,13 +4780,31 @@ class DailyRegister(QWidget):
         # under Python 3.14 / qasync.
         self._suppress_truck_dialog = True
         try:
+            total = max(1, len(payloads))
             with UploadBusy(
                 self,
                 f"Loading {len(payloads):,} row(s) into table…",
-                title="Import",
+                title="Importing Daily Register",
             ) as busy:
-                busy.update(f"Loading {len(payloads):,} row(s) into table…")
-                self._load_staged_import_rows(payloads)
+                busy.update(
+                    f"Loading 0 / {len(payloads):,} row(s)…",
+                    value=0,
+                    maximum=total,
+                )
+
+                def _on_load_progress(done: int, count: int) -> None:
+                    busy.update(
+                        f"Loading {done:,} / {count:,} row(s)…",
+                        value=done,
+                        maximum=max(1, count),
+                    )
+
+                self._load_staged_import_rows(payloads, on_progress=_on_load_progress)
+                busy.update(
+                    f"Loaded {len(payloads):,} row(s)",
+                    value=total,
+                    maximum=total,
+                )
             QMessageBox.information(
                 self,
                 "Import ready",
@@ -4831,7 +4868,7 @@ class DailyRegister(QWidget):
 
         schedule_coro(self._auto_fill_rows_from_mappings(row_list))
 
-    def _load_staged_import_rows(self, payloads: list) -> None:
+    def _load_staged_import_rows(self, payloads: list, *, on_progress=None) -> None:
         if not payloads:
             return
         self._bulk_mutating = True
@@ -4839,12 +4876,17 @@ class DailyRegister(QWidget):
         prev = self._table.blockSignals(True)
         truck_cells: list = []
         loaded_rows: set = set()
+        total = len(payloads)
         try:
             for r, data in enumerate(payloads):
                 target = start + r
                 if target >= self._table.rowCount():
                     self._append_editable_rows(max(20, len(payloads) - r + 5))
                 if target < self._saved_count:
+                    if on_progress is not None and (
+                        r == 0 or r + 1 == total or (r + 1) % 25 == 0
+                    ):
+                        on_progress(r + 1, total)
                     continue
                 loaded_rows.add(target)
                 self._pending_row_meta[target] = {
@@ -4931,6 +4973,11 @@ class DailyRegister(QWidget):
                     self._table.setItem(
                         target, COL_APR, QTableWidgetItem(_upper_text(COL_APR, apr))
                     )
+
+                if on_progress is not None and (
+                    r == 0 or r + 1 == total or (r + 1) % 25 == 0
+                ):
+                    on_progress(r + 1, total)
 
             for row in loaded_rows:
                 self._sync_row_date(row)
@@ -5379,6 +5426,16 @@ class DailyRegister(QWidget):
             return
         self._delete_rows()
 
+    def _unsaved_parked_clear_count(self) -> int:
+        """Parked truck rows still only in the grid that Clear Table would wipe."""
+        count = 0
+        for row, meta in self._pending_row_meta.items():
+            if not isinstance(meta, dict) or not meta.get("parked"):
+                continue
+            if row >= self._saved_count:
+                count += 1
+        return count
+
     def toolbar_clear_table(self) -> None:
         """Clear every unsaved new row and revert unsaved edits on saved rows."""
         if not self.has_unsaved_work():
@@ -5390,12 +5447,29 @@ class DailyRegister(QWidget):
             return
         from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
 
+        parked_n = self._unsaved_parked_clear_count()
+        if parked_n:
+            plural = "s" if parked_n != 1 else ""
+            body = (
+                "All unsaved rows and typed data will be removed.\n\n"
+                f"This also clears {parked_n} parked truck row{plural} that "
+                "have not finished saving — they will leave the Parked tab "
+                "as well."
+            )
+            note = (
+                "Already-saved entries (including saved parked trucks) "
+                "will not be affected."
+            )
+        else:
+            body = "All unsaved rows and typed data will be removed."
+            note = "Saved entries on this register will not be affected."
+
         if not ask_confirm(
             self,
             title="Clear Table",
             heading="Clear this table?",
-            body="All unsaved rows and typed data will be removed.",
-            note="Saved entries on this register will not be affected.",
+            body=body,
+            note=note,
             accept_label="Clear table",
             cancel_label="Cancel",
             destructive=True,
@@ -6130,7 +6204,7 @@ class DailyRegister(QWidget):
     def _schedule_outbox_drain(self, delay_ms: int = 500) -> None:
         if self._merged_mode or self._current_date is None:
             return
-        if self._save_in_flight or self._outbox_drain_in_flight:
+        if self._save_in_flight or self._outbox_drain_in_flight or self._load_in_flight:
             return
         if not self._api_is_online():
             return
@@ -6139,9 +6213,95 @@ class DailyRegister(QWidget):
         self._outbox_drain_timer.start(max(0, int(delay_ms)))
 
     def _kick_outbox_drain(self) -> None:
-        if self._outbox_drain_in_flight or self._save_in_flight:
+        if self._outbox_drain_in_flight or self._save_in_flight or self._load_in_flight:
+            return
+        if self._outbox_cancel_requested:
             return
         asyncio.ensure_future(self._drain_register_outbox())
+
+    def cancel_outbox_sync(self) -> bool:
+        """Request cancel of the in-flight outbox drain (Esc).
+
+        Already-ACK'd chunks stay saved; remaining rows return to PENDING
+        (sky tint) for a later Save / auto-retry. Returns True if a cancel
+        was armed or a pending timer was stopped.
+        """
+        stopped_timer = False
+        if self._outbox_drain_timer.isActive():
+            self._outbox_drain_timer.stop()
+            stopped_timer = True
+        if not self._outbox_drain_in_flight and not stopped_timer:
+            return False
+        self._outbox_cancel_requested = True
+        if self._outbox_drain_in_flight:
+            self.transient_status.emit("Cancelling sync…")
+        elif stopped_timer:
+            self._outbox_cancel_requested = False
+            self.transient_status.emit("Sync cancelled")
+        return True
+
+    async def _await_outbox_idle(
+        self, *, timeout_s: float = 180, require_empty: bool = True
+    ) -> bool:
+        """Wait for outbox drain to settle.
+
+        ``require_empty=True`` (Parked after Save): wait until no PENDING /
+        FAILED / IN_FLIGHT rows remain (or timeout).
+        ``require_empty=False`` (before ``_load_date``): wait only until the
+        current drain flight finishes so the grid wipe cannot race row indices.
+
+        Returns True when the wait condition is met; False on timeout / offline.
+        """
+        if self._merged_mode or self._current_date is None:
+            return True
+        if not self._outbox_pending_rows() and not self._outbox_drain_in_flight:
+            return True
+
+        nested_busy = (
+            self._save_in_flight
+            or self._submit_in_flight
+            or self._outbox_drain_in_flight
+        )
+        showed_overlay = False
+        if not nested_busy:
+            self._show_register_loading("Finishing sync…")
+            showed_overlay = True
+
+        # Kick a drain if rows are waiting and nothing is in flight.
+        if (
+            require_empty
+            and self._outbox_pending_rows()
+            and not self._outbox_drain_in_flight
+            and not self._save_in_flight
+            and not self._load_in_flight
+            and self._api_is_online()
+        ):
+            self._outbox_drain_timer.stop()
+            asyncio.ensure_future(self._drain_register_outbox())
+
+        deadline = time.monotonic() + max(1.0, float(timeout_s))
+        try:
+            while time.monotonic() < deadline:
+                draining = self._outbox_drain_in_flight
+                pending = bool(self._outbox_pending_rows())
+                if require_empty:
+                    if not draining and not pending:
+                        return True
+                    if not self._api_is_online() and not draining:
+                        return False
+                else:
+                    if not draining:
+                        return True
+                await asyncio.sleep(0.05)
+            if require_empty:
+                return (
+                    not self._outbox_drain_in_flight
+                    and not self._outbox_pending_rows()
+                )
+            return not self._outbox_drain_in_flight
+        finally:
+            if showed_overlay and not self._outbox_drain_in_flight:
+                self._hide_register_loading()
 
     def _outbox_pending_rows(self) -> list[int]:
         """Editable rows explicitly queued for sync (offline / failed / in-flight)."""
@@ -6224,6 +6384,7 @@ class DailyRegister(QWidget):
             self._outbox_drain_in_flight
             or self._save_in_flight
             or self._submit_in_flight
+            or self._load_in_flight
             or self._merged_mode
             or self._current_date is None
         ):
@@ -6234,7 +6395,13 @@ class DailyRegister(QWidget):
         if not rows:
             return
 
+        if self._outbox_cancel_requested:
+            self._outbox_cancel_requested = False
+            return
+
         self._outbox_drain_in_flight = True
+        self._reload_after_drain = False
+        self._outbox_cancel_requested = False
         nested_busy = self._save_in_flight or self._submit_in_flight
         with timed_op(
             "outbox_drain",
@@ -6242,12 +6409,6 @@ class DailyRegister(QWidget):
             pending=len(rows),
         ) as meta:
             try:
-                if not nested_busy:
-                    self.save_busy_changed.emit(True)
-                self._show_register_loading(
-                    f"Syncing {len(rows)} pending entr{'y' if len(rows) == 1 else 'ies'}…"
-                )
-
                 to_save: list[tuple[int, Transaction]] = []
                 for row in rows:
                     try:
@@ -6264,9 +6425,33 @@ class DailyRegister(QWidget):
                     meta["synced"] = 0
                     return
 
+                total = len(to_save)
+
+                def _progress(done: int, tot: int) -> None:
+                    # Phase 2/3 — status only (no overlay / toolbar lock).
+                    if nested_busy or tot <= 0:
+                        return
+                    esc = " · Esc to cancel" if tot > 1 else ""
+                    if tot <= BULK_CREATE_CHUNK:
+                        self.transient_status.emit(
+                            f"Syncing {tot} pending "
+                            f"entr{'y' if tot == 1 else 'ies'}…{esc}"
+                        )
+                        return
+                    if done <= 0:
+                        lo, hi = 1, min(BULK_CREATE_CHUNK, tot)
+                    else:
+                        hi = min(done, tot)
+                        lo = ((hi - 1) // BULK_CREATE_CHUNK) * BULK_CREATE_CHUNK + 1
+                    self.transient_status.emit(
+                        f"Syncing {lo}–{hi} of {tot}…{esc}"
+                    )
+
                 try:
                     outcomes = await bulk_save_transactions(
-                        [tx for _r, tx in to_save]
+                        [tx for _r, tx in to_save],
+                        on_progress=_progress,
+                        should_cancel=lambda: self._outbox_cancel_requested,
                     )
                 except Exception as exc:
                     for row, _tx in to_save:
@@ -6276,59 +6461,105 @@ class DailyRegister(QWidget):
                     self._schedule_outbox_backoff()
                     meta["ok"] = False
                     meta["error"] = f"{type(exc).__name__}: {exc}"
+                    if not nested_busy:
+                        self.transient_status.emit(
+                            "Sync failed — will retry when online"
+                        )
                     return
 
+                cancelled = False
                 any_fail = False
                 synced = 0
                 already_exists = 0
                 acked_txs: list = []
-                for (row, _tx), (status_key, saved_tx, _err) in zip(to_save, outcomes):
+                success_idxs: list[int] = []
+                for i, ((row, _tx), (status_key, saved_tx, err)) in enumerate(
+                    zip(to_save, outcomes)
+                ):
                     if status_key in ("created", "already_exists"):
                         synced += 1
                         if status_key == "already_exists":
                             already_exists += 1
                         if saved_tx is not None:
                             acked_txs.append(saved_tx)
-                        self._mark_new_row_saved(row, flush=False)
+                        success_idxs.append(i)
+                    elif err in ("cancelled", "not processed"):
+                        cancelled = True
+                        self._set_row_sync_status(row, SYNC_PENDING)
                     else:
                         any_fail = True
                         self._set_row_sync_status(row, SYNC_FAILED)
 
+                for i in sorted(success_idxs, reverse=True):
+                    row, _tx = to_save[i]
+                    self._mark_new_row_saved(row, flush=False)
+
                 meta["synced"] = synced
                 meta["already_exists"] = already_exists
                 meta["failed"] = int(any_fail)
+                meta["cancelled"] = int(cancelled)
+                meta["total"] = total
                 self._flush_local_draft()
                 if synced:
                     self.drafts_changed.emit()
                     self.rows_saved.emit(synced)
-                    self._outbox_backoff_attempt = 0
-                if any_fail:
+                    if not any_fail and not cancelled:
+                        self._outbox_backoff_attempt = 0
+
+                # Phase 3 — promote ACK'd rows in place; reload only when we
+                # cleared cells but lack transaction payloads to rebuild them.
+                if acked_txs:
+                    self._append_saved_transactions(acked_txs)
+                need_reload = bool(
+                    synced and len(acked_txs) < synced and self._current_date is not None
+                )
+                if need_reload:
+                    self._reload_after_drain = True
+
+                if cancelled:
+                    left = len(self._outbox_pending_rows())
+                    if not nested_busy:
+                        parts = []
+                        if synced:
+                            parts.append(f"{synced} saved")
+                        parts.append(f"{left} still pending")
+                        self.transient_status.emit(
+                            "Sync cancelled · " + " · ".join(parts)
+                        )
+                elif any_fail:
                     self._outbox_backoff_attempt += 1
                     self._schedule_outbox_backoff()
-                    # Partial success: full reload so saved prefix matches Mongo
-                    # while FAILED leftovers remain in the local draft restore.
-                    if synced and self._current_date is not None:
-                        await self._load_date(self._current_date)
-                elif synced:
-                    # Phase C — promote ACK'd rows; skip full day reload.
-                    if acked_txs and len(acked_txs) == synced:
-                        self._append_saved_transactions(acked_txs)
-                        if not nested_busy and not self._submit_in_flight:
-                            self.transient_status.emit(
-                                f"Draft saved: {synced} added · "
-                                "Open Drafts to submit for Verify"
-                            )
-                    elif self._current_date is not None:
-                        await self._load_date(self._current_date)
+                    if not nested_busy and not need_reload:
+                        left = len(self._outbox_pending_rows())
+                        self.transient_status.emit(
+                            f"Synced {synced} · {left} left to retry"
+                        )
+                elif synced and not need_reload and not nested_busy and not self._submit_in_flight:
+                    self.transient_status.emit(
+                        f"Draft saved: {synced} added · "
+                        "Open Drafts to submit for Verify"
+                    )
             finally:
                 self._outbox_drain_in_flight = False
-                if (
-                    not nested_busy
+                self._outbox_cancel_requested = False
+                reload_day = (
+                    self._current_date
+                    if self._reload_after_drain and self._current_date is not None
+                    else None
+                )
+                self._reload_after_drain = False
+                if reload_day is not None:
+                    await self._load_date(reload_day)
+                # Rows enqueued while this drain ran (another Save) — kick again.
+                # Do not auto-resume immediately after an explicit cancel.
+                elif (
+                    self._outbox_pending_rows()
+                    and not self._load_in_flight
                     and not self._save_in_flight
                     and not self._submit_in_flight
+                    and not meta.get("cancelled")
                 ):
-                    self.save_busy_changed.emit(False)
-                    self._hide_register_loading()
+                    self._schedule_outbox_drain(delay_ms=100)
 
     def _schedule_outbox_backoff(self) -> None:
         """Exponential backoff with jitter after a failed drain."""
@@ -6563,6 +6794,23 @@ class DailyRegister(QWidget):
                 f"{new_count} new entr{'ies' if new_count != 1 else 'y'}"
             )
         detail = " and ".join(parts) if parts else "unsaved work"
+        sync_left = 0
+        for row in range(self._saved_count, self._table.rowCount()):
+            meta = self._pending_row_meta.get(row) or {}
+            if meta.get("sync_status"):
+                sync_left += 1
+        if sync_left:
+            # Phase 2 — mid-sync leftovers (not necessarily an app crash).
+            plural = "" if sync_left == 1 else "s"
+            QMessageBox.information(
+                self,
+                "Sync pending",
+                f"Recovered {detail}.\n\n"
+                f"{sync_left} row{plural} were still waiting to reach the server "
+                "(sky tint). They sync automatically when online, or click "
+                "Save to retry.",
+            )
+            return
         QMessageBox.information(
             self,
             "Draft restored",
@@ -6660,8 +6908,17 @@ class DailyRegister(QWidget):
         # Save as draft; if the user cancels mid-save (duplicates / off-date), stay.
         return await self._do_save()
 
-    async def _do_save(self) -> bool:
-        """Persist dirty + new rows. Returns False if cancelled or leftovers remain."""
+    def _row_marked_parked(self, row: int) -> bool:
+        """True when the row is tagged for the Parked truck follow-up tab."""
+        meta = self._pending_row_meta.get(row) or {}
+        return bool(isinstance(meta, dict) and meta.get("parked"))
+
+    async def _do_save(self, *, parked_only: bool = False) -> bool:
+        """Persist dirty + new rows. Returns False if cancelled or leftovers remain.
+
+        ``parked_only=True`` (Park all / Park remaining): persist only rows marked
+        parked, skip Off-date / duplicate confirms, leave other unsaved rows alone.
+        """
         if self._save_in_flight:
             log_register_event("save_ignored", reason="already_in_flight")
             return False
@@ -6671,14 +6928,17 @@ class DailyRegister(QWidget):
         nested_under_submit = self._submit_in_flight
         if not nested_under_submit:
             self.save_busy_changed.emit(True)
-            self._show_register_loading("Saving draft…")
+            self._show_register_loading(
+                "Parking for follow-up…" if parked_only else "Saving draft…"
+            )
         try:
             with timed_op(
                 "register_save",
                 day=str(self._current_date or ""),
                 merged=bool(self._merged_mode),
+                parked_only=bool(parked_only),
             ) as meta:
-                ok = await self._do_save_body(meta)
+                ok = await self._do_save_body(meta, parked_only=parked_only)
                 meta["ok"] = bool(ok)
                 return ok
         finally:
@@ -6692,10 +6952,13 @@ class DailyRegister(QWidget):
             if kick:
                 self._schedule_outbox_drain(delay_ms=0)
 
-    async def _do_save_body(self, meta: dict | None = None) -> bool:
+    async def _do_save_body(
+        self, meta: dict | None = None, *, parked_only: bool = False
+    ) -> bool:
         """Inner save implementation (caller holds `_save_in_flight`)."""
         saved, updated, errors = 0, 0, []
         already_exists = 0
+        deferred_dups: set[int] = set()
         self._commit_open_editor()
 
         if self._current_date is None:
@@ -6711,7 +6974,7 @@ class DailyRegister(QWidget):
             if not (self._pending_row_meta.get(row) or {}).get("parked")
             and not self._parked_mode
         ]
-        if missing_truck_rows:
+        if missing_truck_rows and not parked_only:
             detail_lines = []
             for row in missing_truck_rows[:12]:
                 item_label = self._cell_text(row, COL_ITEM) or "—"
@@ -6733,16 +6996,33 @@ class DailyRegister(QWidget):
             return False
 
         # Phase 4 — offline: queue locally; drain when connectivity returns.
-        if not self._api_is_online() and self.has_unsaved_work():
-            self._enqueue_offline_outbox()
+        if not self._api_is_online() and (
+            self.has_unsaved_work()
+            if not parked_only
+            else any(
+                self._row_marked_parked(r) and self._row_has_data(r)
+                for r in range(self._saved_count, self._table.rowCount())
+            )
+        ):
+            if parked_only:
+                for row in range(self._saved_count, self._table.rowCount()):
+                    if not self._row_has_data(row) or not self._row_marked_parked(row):
+                        continue
+                    self._set_row_sync_status(row, SYNC_PENDING)
+                self._flush_local_draft()
+            else:
+                self._enqueue_offline_outbox()
             if meta is not None:
                 meta["offline_queued"] = True
+                if parked_only:
+                    meta["parked_only"] = True
             log_register_event(
                 "outbox_enqueue",
                 day=str(self._current_date or ""),
                 rows=len(self._outbox_pending_rows()),
+                parked_only=bool(parked_only),
             )
-            if not self._submit_in_flight:
+            if not self._submit_in_flight and not parked_only:
                 self._hide_register_loading()
                 QMessageBox.information(
                     self,
@@ -6760,6 +7040,8 @@ class DailyRegister(QWidget):
         inplace_updates: list[tuple[int, object, dict]] = []
         pending_edit_rows: list[tuple[int, object, dict]] = []
         for row in sorted(self._dirty_rows):
+            if parked_only and not self._row_marked_parked(row):
+                continue
             tx_id = self._saved_ids.get(row)
             if tx_id is None:
                 continue
@@ -6826,36 +7108,38 @@ class DailyRegister(QWidget):
         if not self._merged_mode:
             dup_days = int(getattr(self, "_duplicate_check_days", 5) or 5)
 
-            # Pre-scan: warn once if any new rows carry a date other than the open day
-            register_label = self._current_date.strftime("%d %b %Y")
-            _off_date = 0
-            for _s in range(self._saved_count, self._table.rowCount()):
-                if not self._row_has_data(_s):
-                    continue
-                _it = self._table.item(_s, COL_DATE)
-                _ds = _it.text().strip() if _it else ""
-                _parsed = _parse_optional_date(
-                    _ds, default_year=self._current_date.year
-                )
-                if _parsed is not None:
-                    _td = _parsed.date()
-                else:
-                    _td = self._current_date
-                if _td != self._current_date:
-                    _off_date += 1
-            if _off_date:
-                _plural = "s" if _off_date != 1 else ""
-                _are = "are" if _off_date != 1 else "is"
-                if QMessageBox.warning(
-                    self, "Off-date Entries",
-                    f"{_off_date} row{_plural} {_are} not dated {register_label}.\n\n"
-                    "They will stay on this register day (visible after Save) but "
-                    "will be flagged in the accountant's Verify inbox.\n\n"
-                    "Proceed with save?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                ) == QMessageBox.No:
-                    return False
+            # Pre-scan: warn once if any new rows carry a date other than the open day.
+            # Parked-only persist skips this — parking is silent follow-up, not a full Save.
+            if not parked_only:
+                register_label = self._current_date.strftime("%d %b %Y")
+                _off_date = 0
+                for _s in range(self._saved_count, self._table.rowCount()):
+                    if not self._row_has_data(_s):
+                        continue
+                    _it = self._table.item(_s, COL_DATE)
+                    _ds = _it.text().strip() if _it else ""
+                    _parsed = _parse_optional_date(
+                        _ds, default_year=self._current_date.year
+                    )
+                    if _parsed is not None:
+                        _td = _parsed.date()
+                    else:
+                        _td = self._current_date
+                    if _td != self._current_date:
+                        _off_date += 1
+                if _off_date:
+                    _plural = "s" if _off_date != 1 else ""
+                    _are = "are" if _off_date != 1 else "is"
+                    if QMessageBox.warning(
+                        self, "Off-date Entries",
+                        f"{_off_date} row{_plural} {_are} not dated {register_label}.\n\n"
+                        "They will stay on this register day (visible after Save) but "
+                        "will be flagged in the accountant's Verify inbox.\n\n"
+                        "Proceed with save?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No,
+                    ) == QMessageBox.No:
+                        return False
 
             duplicate_items: list[DuplicateReviewItem] = []
             append_order = None
@@ -6866,6 +7150,8 @@ class DailyRegister(QWidget):
 
             for row in range(self._saved_count, self._table.rowCount()):
                 if not self._row_has_data(row):
+                    continue
+                if parked_only and not self._row_marked_parked(row):
                     continue
                 try:
                     tx = self._build_transaction_from_row(row)
@@ -6883,8 +7169,9 @@ class DailyRegister(QWidget):
                 pending_inserts.append((row, tx))
 
             # Soft-dup scan in one RTT (falls back to empty on network errors).
+            # Parked-only: skip confirm UI so Park all stays silent.
             dup_hits: list = [[] for _ in pending_inserts]
-            if pending_inserts:
+            if pending_inserts and not parked_only:
                 try:
                     self._show_register_loading(
                         f"Checking duplicates ({len(pending_inserts)})…"
@@ -6920,7 +7207,7 @@ class DailyRegister(QWidget):
                     ))
 
             save_anyway: set[int] = set()
-            if duplicate_items:
+            if duplicate_items and not parked_only:
                 dlg = DuplicateReviewDialog(
                     duplicate_items,
                     dup_days=dup_days,
@@ -6931,6 +7218,7 @@ class DailyRegister(QWidget):
                     self._flush_local_draft()
                     return False
                 save_anyway = dlg.save_anyway_rows()
+                deferred_dups = dlg.deferred_duplicate_rows()
 
             duplicate_rows = {item.row for item in duplicate_items}
             match_by_row = {
@@ -6951,6 +7239,12 @@ class DailyRegister(QWidget):
                 else:
                     tx.duplicate_of_id = None
                 to_save.append((row, tx))
+            # Ensure deferred dups are ordinary unsaved rows (no sync_status).
+            for row in deferred_dups:
+                row_meta = dict(self._pending_row_meta.get(row) or {})
+                if "sync_status" in row_meta:
+                    row_meta.pop("sync_status", None)
+                    self._pending_row_meta[row] = row_meta
 
             # Phase C — online Save queues inserts and drains in the background
             # (same durable outbox as offline). Submit still awaits the create
@@ -7021,6 +7315,9 @@ class DailyRegister(QWidget):
             meta["already_exists"] = already_exists
             meta["queued"] = queued
             meta["errors"] = len(errors)
+            meta["deferred_dups"] = len(deferred_dups)
+            if parked_only:
+                meta["parked_only"] = True
 
         if errors:
             QMessageBox.warning(
@@ -7039,6 +7336,25 @@ class DailyRegister(QWidget):
             return False
 
         if saved == 0 and updated == 0 and queued == 0:
+            # Cashier deferred possible duplicates — leave them on the table.
+            live_deferred = [
+                row for row in deferred_dups
+                if row >= self._saved_count and self._row_has_data(row)
+            ]
+            if live_deferred:
+                self._flush_local_draft()
+                n = len(live_deferred)
+                plural = "" if n == 1 else "s"
+                self.transient_status.emit(
+                    f"Kept {n} possible duplicate{plural} on the table — "
+                    "Save when ready"
+                )
+                if meta is not None:
+                    meta["deferred_only"] = True
+                return True
+            if parked_only:
+                # Other unsaved (non-parked) rows may remain — do not warn.
+                return True
             if self.has_unsaved_work():
                 # Typed rows that could not become transactions (e.g. no
                 # description) — keep local recovery; do not claim success.
@@ -7056,15 +7372,54 @@ class DailyRegister(QWidget):
 
         # Async outbox path: keep PENDING rows on disk; drain promotes them.
         if queued and not saved:
-            self._reset_edit_state()
+            if parked_only:
+                # Leave non-parked dirty/new rows editable on My.
+                self._dirty_rows = {
+                    r for r in self._dirty_rows if not self._row_marked_parked(r)
+                }
+                if self._dirty_rows:
+                    self.edit_state_changed.emit(True, len(self._dirty_rows))
+                else:
+                    self._edit_mode = False
+                    self.edit_state_changed.emit(False, 0)
+                self._emit_active_cheque()
+            else:
+                self._reset_edit_state()
             if updated:
                 self.drafts_changed.emit()
-            if not self._submit_in_flight:
+            if not self._submit_in_flight and not parked_only:
                 plural = "" if queued == 1 else "s"
-                parts = [f"Syncing {queued} draft{plural}"]
+                # Phase 2 — local Save is done; sync continues in the background.
+                parts = [f"Saved locally · syncing {queued} draft{plural}"]
                 if updated:
                     parts.append(f"{updated} updated")
+                if deferred_dups:
+                    n_def = len([
+                        r for r in deferred_dups
+                        if r >= self._saved_count and self._row_has_data(r)
+                    ])
+                    if n_def:
+                        parts.append(
+                            f"{n_def} duplicate{'s' if n_def != 1 else ''} kept"
+                        )
                 self.transient_status.emit(" · ".join(parts) + "…")
+            return True
+
+        if parked_only:
+            # Do not wipe remaining non-parked unsaved work / local draft.
+            self._dirty_rows = {
+                r for r in self._dirty_rows if not self._row_marked_parked(r)
+            }
+            if self._dirty_rows:
+                self.edit_state_changed.emit(True, len(self._dirty_rows))
+            else:
+                self._edit_mode = False
+                self.edit_state_changed.emit(False, 0)
+            self._emit_active_cheque()
+            self._flush_local_draft()
+            if saved or updated:
+                self.rows_saved.emit(saved)
+                self.drafts_changed.emit()
             return True
 
         self._clear_local_draft(both_modes=True)
@@ -7741,7 +8096,7 @@ class DailyRegister(QWidget):
             asyncio.ensure_future(self._persist_parked_after_dialog())
 
     async def _persist_parked_after_dialog(self) -> None:
-        """Save rows marked parked and open the Parked tab."""
+        """Persist only parked truck rows (silent) and open the Parked tab."""
         parked_rows = [
             row for row, meta in self._pending_row_meta.items()
             if isinstance(meta, dict) and meta.get("parked")
@@ -7753,8 +8108,11 @@ class DailyRegister(QWidget):
             r in self._saved_ids for r in parked_rows
         ):
             self._enter_edit_mode()
-        ok = await self._do_save()
+        ok = await self._do_save(parked_only=True)
         if ok:
+            # Save may have queued the outbox; settle sync before switching
+            # views so Parked load cannot race drain / Draft-restore leftovers.
+            await self._await_outbox_idle(timeout_s=180, require_empty=True)
             self.transient_status.emit("Parked for truck follow-up")
             if self._view_mode != "parked":
                 self.set_view_mode("parked")
