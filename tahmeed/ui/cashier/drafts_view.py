@@ -35,15 +35,17 @@ from tahmeed.ui.widgets.column_persistence import (
 )
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
-# Date | Entries | Total | Cashiers — Cashiers stretch
-_DAYS_COL_DEFAULTS = [110, 72, 120, 160]
-_DAYS_COL_CASHIERS = 3
+# Date | Saved | Parked | Total | Cashiers — Cashiers stretch
+_DAYS_COL_DEFAULTS = [110, 64, 64, 120, 160]
+_DAYS_COL_SAVED = 1
+_DAYS_COL_PARKED = 2
+_DAYS_COL_CASHIERS = 4
 # Description | Item | Truck | Amount | Cashier | Dup? — Description stretches
 _ROWS_COL_DEFAULTS = [220, 110, 100, 140, 100, 52]
 _ROWS_COL_DESC = 0
 _ROWS_COL_TRUCK = 2
 _ROWS_COL_AMOUNT = 3
-_DAYS_COL_KEY = "drafts_days_table_v2"
+_DAYS_COL_KEY = "drafts_days_table_v3"
 _ROWS_COL_KEY = "drafts_rows_table_v3"
 
 _WHITE = "#FFFFFF"
@@ -194,7 +196,7 @@ class DraftsView(QWidget):
         title_vl.addWidget(_lbl("Drafts", size=18, weight=700, color="#1B2B4B"))
         scope = "all cashiers" if self._show_all else "your entries"
         title_vl.addWidget(_lbl(
-            f"Saved but not submitted to Verify ({scope})",
+            f"Saved drafts and parked truck rows — not yet submitted ({scope})",
             size=11, color=_T2,
         ))
         hl.addLayout(title_vl, 1)
@@ -222,10 +224,12 @@ class DraftsView(QWidget):
         left_vl = QVBoxLayout(left)
         left_vl.setContentsMargins(12, 12, 12, 12)
         left_vl.setSpacing(8)
-        left_vl.addWidget(_lbl("Days with drafts", size=12, weight=600, color=_T2))
+        left_vl.addWidget(_lbl("Days with drafts / parked", size=12, weight=600, color=_T2))
 
-        self._days_table = QTableWidget(0, 4)
-        self._days_table.setHorizontalHeaderLabels(["Date", "Entries", "Total TZS", "Cashiers"])
+        self._days_table = QTableWidget(0, 5)
+        self._days_table.setHorizontalHeaderLabels(
+            ["Date", "Saved", "Parked", "Total TZS", "Cashiers"]
+        )
         self._days_table.verticalHeader().setVisible(False)
         self._days_table.verticalHeader().setDefaultSectionSize(_ROW_H)
         self._days_table.setStyleSheet(_table_style())
@@ -342,6 +346,7 @@ class DraftsView(QWidget):
         for i, d in enumerate(self._days):
             day: date = d["date"]
             n = int(d.get("entries_count") or 0)
+            parked_n = int(d.get("parked_count") or 0)
             tzs = float(d.get("total_tzs") or 0.0)
             cids = d.get("cashier_ids") or []
             if self._show_all:
@@ -353,9 +358,14 @@ class DraftsView(QWidget):
             else:
                 cashiers = "You"
             self._days_table.setItem(i, 0, _cell(day.strftime("%d %b %Y")))
-            self._days_table.setItem(i, 1, _cell(str(n), align=Qt.AlignCenter))
-            self._days_table.setItem(i, 2, _cell(f"TZS {tzs:,.0f}" if tzs else "—"))
-            self._days_table.setItem(i, 3, _cell(cashiers))
+            self._days_table.setItem(
+                i, _DAYS_COL_SAVED, _cell(str(n), align=Qt.AlignCenter)
+            )
+            self._days_table.setItem(
+                i, _DAYS_COL_PARKED, _cell(str(parked_n), align=Qt.AlignCenter)
+            )
+            self._days_table.setItem(i, 3, _cell(f"TZS {tzs:,.0f}" if tzs else "—"))
+            self._days_table.setItem(i, _DAYS_COL_CASHIERS, _cell(cashiers))
             self._days_table.item(i, 0).setData(Qt.UserRole, day)
             _finish_table_row(self._days_table, i, _stripe_bg(i))
 
@@ -513,7 +523,13 @@ class DraftsView(QWidget):
         asyncio.ensure_future(self._do_submit_day(self._selected_day))
 
     async def _do_submit_day(self, day: date) -> None:
-        n = await submit_draft_day_with_gates(self, day)
+        cashier_id = None if self._show_all else self._user._id
+        n = await submit_draft_day_with_gates(
+            self,
+            day,
+            cashier_id=cashier_id,
+            user_id=self._user._id,
+        )
         if n is None:
             return
         QMessageBox.information(
@@ -573,7 +589,8 @@ class DraftsView(QWidget):
             n = len(day_ids) or int(
                 next(
                     (
-                        d.get("entries_count") or 0
+                        int(d.get("entries_count") or 0)
+                        + int(d.get("parked_count") or 0)
                         for d in self._days
                         if d.get("date") == self._selected_day
                     ),

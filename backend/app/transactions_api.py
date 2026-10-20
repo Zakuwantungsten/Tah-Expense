@@ -44,6 +44,7 @@ from .import_ops import (
 from .mongo_async import aggregate_list
 from .transaction_ops import (
     DRAFT_BASE_MATCH,
+    DRAFT_OR_PARKED_MATCH,
     OPEN_REGISTER_MATCH,
     REGISTER_DAY_EXPR,
     browse_match,
@@ -1076,7 +1077,8 @@ async def count_draft_transactions(
     cashier_id: str | None = None,
     all_cashiers: bool = False,
 ) -> dict:
-    query: dict[str, Any] = dict(DRAFT_BASE_MATCH)
+    """Badge total: open drafts + parked truck follow-up rows."""
+    query: dict[str, Any] = dict(DRAFT_OR_PARKED_MATCH)
     if not all_cashiers:
         query["cashier_id"] = _actor_cashier_id(actor, cashier_id)
     total = await _database(request).transactions.count_documents(query)
@@ -1091,7 +1093,8 @@ async def draft_day_summaries(
     all_cashiers: bool = False,
     limit: int = Query(120, ge=1, le=500),
 ) -> dict:
-    match: dict[str, Any] = dict(DRAFT_BASE_MATCH)
+    """Calendar days with drafts and/or parked rows, newest first."""
+    match: dict[str, Any] = dict(DRAFT_OR_PARKED_MATCH)
     if not all_cashiers:
         match["cashier_id"] = _actor_cashier_id(actor, cashier_id)
     pipeline = [
@@ -1104,7 +1107,24 @@ async def draft_day_summaries(
                     "month": {"$month": "$register_day"},
                     "day": {"$dayOfMonth": "$register_day"},
                 },
-                "entries_count": {"$sum": 1},
+                "entries_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$register_status", "draft"]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "parked_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$register_status", "parked"]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
                 "total_tzs": {"$sum": "$amount"},
                 "cashier_ids": {"$addToSet": "$cashier_id"},
             }
@@ -1123,6 +1143,7 @@ async def draft_day_summaries(
             {
                 "date": date(group["year"], group["month"], group["day"]).isoformat(),
                 "entries_count": int(doc.get("entries_count") or 0),
+                "parked_count": int(doc.get("parked_count") or 0),
                 "total_tzs": float(doc.get("total_tzs") or 0.0),
                 "cashier_ids": cashier_ids,
             }

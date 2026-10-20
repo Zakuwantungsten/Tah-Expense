@@ -33,7 +33,8 @@ Short guide for cashiers.
 ## Parked trucks
 
 - Incorrect trucks can be **Parked** for follow-up (**Park all** / **Park remaining**).
-- Parking **saves nothing**: rows with a correct truck stay on My entries ready for Save; rows with a wrong truck move to the **Parked** tab (kept on this computer only).
+- Parking itself **saves nothing**: correct-truck rows stay on My entries; wrong-truck rows move to the **Parked** tab (local until Save).
+- **Save** persists My drafts **and** parked rows (parked rows store as `register_status=parked`). They remain filtered on Parked until the truck is fixed.
 - On Parked, use **Fix trucks** → Correct / **Allow** / **Allow all** — accepted rows move to **My entries** immediately (no longer parked). You can also type a truck fix in the table, then Save.
 - Submit is blocked while any row is still parked.
 - **My ↔ Parked** is a view filter only — it does not Save, flush a recovery draft, or rebuild the My grid. Parked rows are still your entries, just hidden while their truck is wrong.

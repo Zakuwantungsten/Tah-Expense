@@ -303,6 +303,11 @@ def _category_report_path(category: str, suffix: str) -> str:
     return f"v1/accountant/reports/category/{name}/{suffix}"
 
 
+def _payee_report_path(payee: str, suffix: str) -> str:
+    name = quote((payee or "").strip(), safe="")
+    return f"v1/accountant/reports/payee/{name}/{suffix}"
+
+
 def _category_report_params(
     *,
     description: str = "",
@@ -2784,6 +2789,161 @@ async def get_categories_usage_totals(
             "usd": float((row or {}).get("usd") or 0.0),
         }
     return out
+
+
+async def get_payees_usage_totals(payee_names: Sequence[str]) -> Dict[str, dict]:
+    """Lifetime totals for many payees (Manage Payees Amount column).
+
+    Keys are lower-cased payee names. Values: ``{count, tzs, usd}``.
+    """
+    names = sorted({(n or "").strip() for n in payee_names if (n or "").strip()})
+    if not names:
+        return {}
+    payload = await api_client.request(
+        "POST",
+        "v1/accountant/reports/payees/usage-totals",
+        json={"names": names},
+    )
+    totals = payload.get("totals") or {}
+    out: Dict[str, dict] = {}
+    for key, row in totals.items():
+        name = str(key or "").strip().lower()
+        if not name:
+            continue
+        out[name] = {
+            "count": int((row or {}).get("count") or 0),
+            "tzs": float((row or {}).get("tzs") or 0.0),
+            "usd": float((row or {}).get("usd") or 0.0),
+        }
+    return out
+
+
+async def get_payee_lifetime_usage(payee: str) -> dict:
+    """Verified master usage for one payee across all years."""
+    name = (payee or "").strip()
+    if not name:
+        return {"count": 0, "tzs": 0.0, "usd": 0.0}
+    payload = await api_client.request(
+        "GET", _payee_report_path(name, "lifetime")
+    )
+    return _totals_from_payload(payload)
+
+
+async def get_payee_report_totals(
+    payee: str,
+    *,
+    description: str = "",
+    descriptions: Optional[List[str]] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+) -> dict:
+    """Aggregate count / TZS / USD for a payee report (all years by default)."""
+    name = (payee or "").strip()
+    if not name:
+        return {"count": 0, "tzs": 0.0, "usd": 0.0}
+    params = _category_report_params(
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+    )
+    payload = await api_client.request(
+        "GET", _payee_report_path(name, "totals"), params=params
+    )
+    return _totals_from_payload(payload)
+
+
+async def get_payee_report_transactions(
+    payee: str,
+    *,
+    description: str = "",
+    descriptions: Optional[List[str]] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+    sort_field: str = "date",
+    sort_asc: bool = True,
+    limit: int = 100,
+    skip: int = 0,
+) -> List[Transaction]:
+    """Paginated verified master rows for a payee QuickReport."""
+    name = (payee or "").strip()
+    if not name:
+        return []
+    params = _category_report_params(
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+        sort_field=sort_field,
+        sort_asc=sort_asc,
+        limit=limit,
+        skip=skip,
+    )
+    payload = await api_client.request(
+        "GET",
+        _payee_report_path(name, "transactions"),
+        params=params,
+    )
+    return [_tx_from_api(doc) for doc in payload.get("items") or []]
+
+
+async def get_payee_report_descriptions(
+    payee: str,
+    *,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+) -> List[str]:
+    """Distinct transaction descriptions for a payee QuickReport toolbar filter."""
+    name = (payee or "").strip()
+    if not name:
+        return []
+    params = _category_report_params(date_from=date_from, date_to=date_to)
+    payload = await api_client.request(
+        "GET",
+        _payee_report_path(name, "descriptions"),
+        params=params,
+    )
+    return [str(v) for v in (payload.get("items") or []) if v]
+
+
+async def get_payee_report_column_values(
+    field: str,
+    payee: str,
+    *,
+    description: str = "",
+    descriptions: Optional[List[str]] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    column_filters: Optional[Dict[str, Sequence[str]]] = None,
+) -> List[str]:
+    """Distinct Excel ▾ values for *field* on a payee QuickReport."""
+    if field not in _MASTER_COL_FIELDS:
+        return []
+    name = (payee or "").strip()
+    if not name:
+        return []
+    filters = {
+        k: v for k, v in (column_filters or {}).items()
+        if k != field and k in _MASTER_COL_FIELDS
+    }
+    params = _category_report_params(
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=filters or None,
+        field=field,
+    )
+    payload = await api_client.request(
+        "GET",
+        _payee_report_path(name, "column-values"),
+        params=params,
+    )
+    return [str(v) for v in (payload.get("items") or []) if v]
 
 
 async def get_supplier_payments_totals(year: int) -> dict:

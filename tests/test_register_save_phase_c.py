@@ -265,8 +265,11 @@ async def test_do_save_schedules_drain_after_release(register, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_parked_only_skips_off_date_and_non_parked_rows(register, monkeypatch):
-    """Park all: parked bad-truck rows never reach the server; dialogs stay silent."""
+async def test_parked_only_saves_parked_skips_off_date_and_non_parked(
+    register, monkeypatch
+):
+    """parked_only: persist parked rows as parked; leave other My rows alone."""
+    from tahmeed.models.transaction import Transaction
     from tahmeed.ui.cashier.register_delegates import (
         COL_DATE,
         COL_DESC,
@@ -276,7 +279,7 @@ async def test_parked_only_skips_off_date_and_non_parked_rows(register, monkeypa
 
     register._table.blockSignals(True)
     try:
-        # Parked incorrect-truck row (off-date) — should persist.
+        # Parked incorrect-truck row (off-date) — saved as register_status=parked.
         register._put(0, COL_DESC, "DIESEL")
         register._put(0, COL_TZS, "1,000.00")
         register._put(0, COL_TRUCK, "BAD TRUCK")
@@ -299,8 +302,13 @@ async def test_parked_only_skips_off_date_and_non_parked_rows(register, monkeypa
     async def boom_dup(*_a, **_k):
         raise AssertionError("parked_only must not run duplicate review")
 
-    async def boom_bulk(*_a, **_k):
-        raise AssertionError("parked rows with a wrong truck must not be saved")
+    sent: list = []
+
+    async def fake_bulk(txs, *, on_progress=None, should_cancel=None):
+        for tx in txs:
+            tx._id = ObjectId()
+            sent.append(tx)
+        return [("created", tx, None) for tx in txs]
 
     def boom_mbox(*_a, **_k):
         raise AssertionError("parked_only must not show Off-date / save dialogs")
@@ -309,7 +317,7 @@ async def test_parked_only_skips_off_date_and_non_parked_rows(register, monkeypa
         register,
         "_enqueue_inserts_for_outbox",
         lambda *_a, **_k: (_ for _ in ()).throw(
-            AssertionError("parked rows with a wrong truck must not be queued")
+            AssertionError("parked_only must sync-create, not async-queue")
         ),
     )
 
@@ -323,7 +331,7 @@ async def test_parked_only_skips_off_date_and_non_parked_rows(register, monkeypa
     )
     monkeypatch.setattr(
         "tahmeed.ui.cashier.excel_grid.bulk_save_transactions",
-        boom_bulk,
+        fake_bulk,
     )
     monkeypatch.setattr(
         "tahmeed.ui.cashier.excel_grid.QMessageBox.warning",
@@ -338,12 +346,11 @@ async def test_parked_only_skips_off_date_and_non_parked_rows(register, monkeypa
     ok = await register._do_save_body(meta, parked_only=True)
     assert ok is True
     assert meta.get("parked_only") is True
-    # Wrong-truck parked row is kept locally — nothing queued or created.
-    assert meta.get("kept_parked") == 1
+    assert len(sent) == 1
+    assert sent[0].register_status == "parked"
+    assert isinstance(sent[0], Transaction)
     assert not meta.get("queued")
     assert not meta.get("async_outbox")
-    assert not (register._pending_row_meta.get(0) or {}).get("sync_status")
-    assert register._row_has_data(0)
     # Non-parked row stays ordinary unsaved (no sync_status).
     assert not (register._pending_row_meta.get(1) or {}).get("sync_status")
     assert register._row_has_data(1)

@@ -212,6 +212,7 @@ class FakeTransactions:
                                     "day": key[2],
                                 },
                                 "entries_count": 0,
+                                "parked_count": 0,
                                 "total_tzs": 0.0,
                                 "total_refund": 0.0,
                                 "cashier_ids": [],
@@ -219,8 +220,15 @@ class FakeTransactions:
                                 "submitted_count": 0,
                             },
                         )
-                        bucket["entries_count"] += 1
+                        status = doc.get("register_status") or "draft"
+                        if status == "parked":
+                            bucket["parked_count"] += 1
+                        else:
+                            bucket["entries_count"] += 1
                         bucket["total_tzs"] += float(doc.get("amount") or 0)
+                        cid = doc.get("cashier_id")
+                        if cid is not None and cid not in bucket["cashier_ids"]:
+                            bucket["cashier_ids"].append(cid)
                     docs = list(buckets.values())
                 elif group.get("_id") == {"$year": "$date"} or (
                     isinstance(group.get("_id"), dict) and "$year" in str(group.get("_id"))

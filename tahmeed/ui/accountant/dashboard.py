@@ -660,7 +660,10 @@ class AccountantDashboard(QWidget):
             self._stack.setCurrentIndex(self._page_indices["table"])
             assert self._register is not None
             self._register.reload_settings()
-            self._register.navigate_to_date(d, merged=True)
+            # Accountant Drafts open Merged; parked still land in day cache / badge.
+            self._register.navigate_to_date(
+                d, merged=True, announce_parked=True
+            )
 
         if in_running_task() and "table" not in self._pages:
             schedule_call(_go)

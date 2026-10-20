@@ -20,6 +20,7 @@ from .accountant_master_ops import (
 )
 from .accountant_reports_ops import (
     build_category_report_query,
+    build_payee_report_query,
     category_report_primary_sort,
     category_report_reference_year,
     category_report_sort_clauses,
@@ -31,6 +32,11 @@ from .schemas import CategoriesUsageTotalsRequest
 from .serialization import json_safe, object_id
 from .transaction_ops import normalize_multi_filter
 from .mongo_async import aggregate_list
+
+_BUILDERS = {
+    "category_name": build_category_report_query,
+    "payee": build_payee_report_query,
+}
 
 reports = APIRouter(prefix="/reports", tags=["accountant"])
 
@@ -100,23 +106,25 @@ def _parse_descriptions(descriptions: str) -> list[str] | None:
     return vals or None
 
 
-async def _category_query(
+async def _named_report_query(
     request: Request,
-    category: str,
+    name: str,
     *,
+    match_field: str,
     description: str = "",
     descriptions: str = "",
     date_from: datetime | None = None,
     date_to: datetime | None = None,
     column_filters: str = "",
 ) -> dict[str, Any]:
+    builder = _BUILDERS[match_field]
     filters = parse_column_filters_json(column_filters)
     cashier_names = list(filters.pop("cashier", []) or [])
     desc_list = _parse_descriptions(descriptions)
     df = _parse_optional_dt(date_from)
     dt = _parse_optional_dt(date_to)
-    base = build_category_report_query(
-        category,
+    base = builder(
+        name,
         description=description,
         descriptions=desc_list,
         date_from=df,
@@ -129,14 +137,58 @@ async def _category_query(
     ids = await _resolve_cashier_ids(db, cashier_names, base)
     if not ids:
         return {**base, "cashier_id": {"$in": []}}
-    return build_category_report_query(
-        category,
+    return builder(
+        name,
         description=description,
         descriptions=desc_list,
         date_from=df,
         date_to=dt,
         column_filters=filters or None,
         cashier_ids=ids,
+    )
+
+
+async def _category_query(
+    request: Request,
+    category: str,
+    *,
+    description: str = "",
+    descriptions: str = "",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: str = "",
+) -> dict[str, Any]:
+    return await _named_report_query(
+        request,
+        category,
+        match_field="category_name",
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+    )
+
+
+async def _payee_query(
+    request: Request,
+    payee: str,
+    *,
+    description: str = "",
+    descriptions: str = "",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: str = "",
+) -> dict[str, Any]:
+    return await _named_report_query(
+        request,
+        payee,
+        match_field="payee",
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
     )
 
 
@@ -158,40 +210,43 @@ async def _aggregate_currency_totals(db: Any, query: dict[str, Any]) -> dict[str
     }
 
 
-@reports.post("/categories/usage-totals")
-async def categories_usage_totals(
+async def _usage_totals_for_field(
     request: Request,
-    body: CategoriesUsageTotalsRequest,
-    _manager: Manager,
-) -> dict:
-    names = sorted({(n or "").strip() for n in body.names if (n or "").strip()})
-    if not names:
-        return {"totals": {}}
-    lowered = [n.lower() for n in names]
-    result = await aggregate_list(_database(request).transactions, 
+    *,
+    match_field: str,
+    names: list[str],
+) -> dict[str, dict[str, Any]]:
+    cleaned = sorted({(n or "").strip() for n in names if (n or "").strip()})
+    if not cleaned:
+        return {}
+    lowered = [n.lower() for n in cleaned]
+    alias = "_cat_l" if match_field == "category_name" else "_payee_l"
+    result = await aggregate_list(
+        _database(request).transactions,
         [
             {
                 "$match": {
                     "verified": True,
                     "deletion_requested": {"$ne": True},
                     "trashed": {"$ne": True},
-                    "category_name": {"$type": "string", "$ne": ""},
+                    match_field: {"$type": "string", "$ne": ""},
                 }
             },
             {
                 "$addFields": {
-                    "_cat_l": {"$toLower": {"$ifNull": ["$category_name", ""]}}
+                    alias: {"$toLower": {"$ifNull": [f"${match_field}", ""]}}
                 }
             },
-            {"$match": {"_cat_l": {"$in": lowered}}},
+            {"$match": {alias: {"$in": lowered}}},
             {
                 "$group": {
                     **{k: v for k, v in currency_totals_group().items() if k != "_id"},
-                    "_id": "$_cat_l",
+                    "_id": f"${alias}",
                 }
             },
-        ]
-    , length=None)
+        ],
+        length=None,
+    )
     out: dict[str, dict[str, Any]] = {}
     for row in result:
         key = (row.get("_id") or "").strip().lower()
@@ -202,7 +257,33 @@ async def categories_usage_totals(
             "tzs": float(row.get("tzs_total") or 0.0),
             "usd": float(row.get("usd_total") or 0.0),
         }
-    return {"totals": out}
+    return out
+
+
+@reports.post("/categories/usage-totals")
+async def categories_usage_totals(
+    request: Request,
+    body: CategoriesUsageTotalsRequest,
+    _manager: Manager,
+) -> dict:
+    return {
+        "totals": await _usage_totals_for_field(
+            request, match_field="category_name", names=list(body.names or [])
+        )
+    }
+
+
+@reports.post("/payees/usage-totals")
+async def payees_usage_totals(
+    request: Request,
+    body: CategoriesUsageTotalsRequest,
+    _manager: Manager,
+) -> dict:
+    return {
+        "totals": await _usage_totals_for_field(
+            request, match_field="payee", names=list(body.names or [])
+        )
+    }
 
 
 @reports.get("/supplier-payments/totals")
@@ -430,38 +511,14 @@ async def category_descriptions(
     return {"items": sorted((v for v in vals if v), key=str.lower)}
 
 
-@reports.get("/category/{name}/column-values")
-async def category_column_values(
+async def _report_column_values(
     request: Request,
-    name: str,
-    _manager: Manager,
-    field: str = Query(..., min_length=1),
-    description: str = "",
-    descriptions: str = "",
+    query: dict[str, Any],
+    *,
+    field: str,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
-    column_filters: str = "",
 ) -> dict:
-    if field not in MASTER_COL_FIELDS:
-        raise ApiError(422, "invalid_field", f"Unknown column field '{field}'")
-
-    cat = (name or "").strip()
-    if not cat:
-        return {"items": []}
-
-    filters = parse_column_filters_json(column_filters)
-    filters = {
-        k: v for k, v in filters.items() if k != field and k in MASTER_COL_FIELDS
-    }
-    query = await _category_query(
-        request,
-        cat,
-        description=description,
-        descriptions=descriptions,
-        date_from=date_from,
-        date_to=date_to,
-        column_filters=json.dumps(filters) if filters else "",
-    )
     db = _database(request)
     df = _parse_optional_dt(date_from)
     dt = _parse_optional_dt(date_to)
@@ -519,14 +576,16 @@ async def category_column_values(
             else {"$eq": [{"$toUpper": "$currency"}, "USD"]}
         )
         decimals = 0 if field == "tzs" else 2
-        docs = await aggregate_list(db.transactions, 
+        docs = await aggregate_list(
+            db.transactions,
             [
                 {"$match": query},
                 {"$match": {"$expr": cur_match}},
                 {"$group": {"_id": "$amount"}},
                 {"$limit": 5000},
-            ]
-        , 5000)
+            ],
+            5000,
+        )
         return {
             "items": sorted(
                 {
@@ -576,3 +635,258 @@ async def category_column_values(
         return {"items": []}
     vals = await db.transactions.distinct(db_field, query)
     return {"items": sorted((v for v in vals if v), key=str.lower)}
+
+
+@reports.get("/category/{name}/column-values")
+async def category_column_values(
+    request: Request,
+    name: str,
+    _manager: Manager,
+    field: str = Query(..., min_length=1),
+    description: str = "",
+    descriptions: str = "",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: str = "",
+) -> dict:
+    if field not in MASTER_COL_FIELDS:
+        raise ApiError(422, "invalid_field", f"Unknown column field '{field}'")
+
+    cat = (name or "").strip()
+    if not cat:
+        return {"items": []}
+
+    filters = parse_column_filters_json(column_filters)
+    filters = {
+        k: v for k, v in filters.items() if k != field and k in MASTER_COL_FIELDS
+    }
+    query = await _category_query(
+        request,
+        cat,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=json.dumps(filters) if filters else "",
+    )
+    return await _report_column_values(
+        request,
+        query,
+        field=field,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+
+@reports.get("/payee/{name}/lifetime")
+async def payee_lifetime(
+    request: Request,
+    name: str,
+    _manager: Manager,
+) -> dict:
+    payee = (name or "").strip()
+    if not payee:
+        return _empty_totals()
+    query = await _payee_query(request, payee)
+    return await _aggregate_currency_totals(_database(request), query)
+
+
+@reports.get("/payee/{name}/totals")
+async def payee_totals(
+    request: Request,
+    name: str,
+    _manager: Manager,
+    description: str = "",
+    descriptions: str = "",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: str = "",
+) -> dict:
+    payee = (name or "").strip()
+    if not payee:
+        return _empty_totals()
+    query = await _payee_query(
+        request,
+        payee,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+    )
+    return await _aggregate_currency_totals(_database(request), query)
+
+
+@reports.get("/payee/{name}/transactions")
+async def payee_transactions(
+    request: Request,
+    name: str,
+    _manager: Manager,
+    description: str = "",
+    descriptions: str = "",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: str = "",
+    sort_field: str = "date",
+    sort_asc: bool = True,
+    limit: int = Query(100, ge=1, le=500),
+    skip: int = Query(0, ge=0),
+) -> dict:
+    payee = (name or "").strip()
+    if not payee:
+        return {"items": []}
+    query = await _payee_query(
+        request,
+        payee,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+    )
+    sort = category_report_sort_clauses(sort_field, sort_asc)
+    docs = (
+        await _database(request)
+        .transactions.find(query)
+        .sort(sort)
+        .skip(skip)
+        .limit(limit)
+        .to_list(length=limit)
+    )
+    return {"items": json_safe(docs)}
+
+
+@reports.get("/payee/{name}/opening-balance")
+async def payee_opening_balance(
+    request: Request,
+    name: str,
+    _manager: Manager,
+    description: str = "",
+    descriptions: str = "",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: str = "",
+    sort_field: str = "date",
+    sort_asc: bool = True,
+    skip: int = Query(0, ge=0),
+) -> dict:
+    if skip <= 0:
+        return {"tzs": 0.0, "usd": 0.0}
+    payee = (name or "").strip()
+    if not payee:
+        return {"tzs": 0.0, "usd": 0.0}
+    query = await _payee_query(
+        request,
+        payee,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+    )
+    field, direction = category_report_primary_sort(sort_field, sort_asc)
+    result = await aggregate_list(
+        _database(request).transactions,
+        [
+            {"$match": query},
+            {"$sort": {field: direction, "created_at": direction}},
+            {"$limit": int(skip)},
+            {
+                "$group": {
+                    "_id": None,
+                    "tzs_total": {
+                        "$sum": {
+                            "$cond": [
+                                {
+                                    "$in": [
+                                        {"$toUpper": "$currency"},
+                                        ["TZS", "TSH", "TZ"],
+                                    ]
+                                },
+                                "$amount",
+                                0,
+                            ]
+                        }
+                    },
+                    "usd_total": {
+                        "$sum": {
+                            "$cond": [
+                                {"$eq": [{"$toUpper": "$currency"}, "USD"]},
+                                "$amount",
+                                0,
+                            ]
+                        }
+                    },
+                }
+            },
+        ],
+        1,
+    )
+    if not result:
+        return {"tzs": 0.0, "usd": 0.0}
+    row = result[0]
+    return {
+        "tzs": float(row.get("tzs_total") or 0.0),
+        "usd": float(row.get("usd_total") or 0.0),
+    }
+
+
+@reports.get("/payee/{name}/descriptions")
+async def payee_descriptions(
+    request: Request,
+    name: str,
+    _manager: Manager,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> dict:
+    payee = (name or "").strip()
+    if not payee:
+        return {"items": []}
+    query = build_payee_report_query(
+        payee,
+        date_from=_parse_optional_dt(date_from),
+        date_to=_parse_optional_dt(date_to),
+    )
+    vals = await _database(request).transactions.distinct("description", query)
+    return {"items": sorted((v for v in vals if v), key=str.lower)}
+
+
+@reports.get("/payee/{name}/column-values")
+async def payee_column_values(
+    request: Request,
+    name: str,
+    _manager: Manager,
+    field: str = Query(..., min_length=1),
+    description: str = "",
+    descriptions: str = "",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: str = "",
+) -> dict:
+    if field not in MASTER_COL_FIELDS:
+        raise ApiError(422, "invalid_field", f"Unknown column field '{field}'")
+
+    payee = (name or "").strip()
+    if not payee:
+        return {"items": []}
+
+    filters = parse_column_filters_json(column_filters)
+    filters = {
+        k: v for k, v in filters.items() if k != field and k in MASTER_COL_FIELDS
+    }
+    query = await _payee_query(
+        request,
+        payee,
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=json.dumps(filters) if filters else "",
+    )
+    return await _report_column_values(
+        request,
+        query,
+        field=field,
+        date_from=date_from,
+        date_to=date_to,
+    )

@@ -210,14 +210,12 @@ def _upper_text(col: int, text: str) -> str:
 
 class _ExcelCellDelegate(QStyledItemDelegate):
     """
-    Base delegate implementing Excel's selection visual model:
-      - current + selected  → white background + 2 px QB-blue border
-      - selected (not current) → #cde0f5 fill
+    Base delegate implementing the register selection visual model:
+      - selected            → #cde0f5 fill (uniform, including current cell)
       - normal              → item's own background (saved warm, new white)
       - cut marquee         → dashed QB-blue border (Excel cut)
     All specialised delegates inherit from this.
     """
-    _ACTIVE_PEN  = QColor("#0077C5")
     _SELECT_FILL = QColor("#cde0f5")
     _CUT_PEN     = QColor("#0077C5")
     _FILL_EXT_BG = QColor("#EAF4E4")
@@ -240,11 +238,7 @@ class _ExcelCellDelegate(QStyledItemDelegate):
 
     def _paint_bg(self, painter: QPainter, option, index) -> None:
         """Fill cell background only — no border."""
-        is_sel = bool(option.state & QStyle.State_Selected)
-        is_cur = self._is_current(index)
-        if is_cur and is_sel:
-            painter.fillRect(option.rect, QColor("#ffffff"))
-        elif is_sel:
+        if bool(option.state & QStyle.State_Selected):
             painter.fillRect(option.rect, self._SELECT_FILL)
         else:
             bg = option.backgroundBrush
@@ -253,19 +247,15 @@ class _ExcelCellDelegate(QStyledItemDelegate):
             # else: table stylesheet background (#ffffff) shows through
 
     def _draw_active_border(self, painter: QPainter, option, index) -> None:
-        """Draw thick current-cell border and/or Excel cut marquee."""
+        """Draw Excel cut marquee when this cell is in the cut set."""
+        if not self._is_cut_cell(index):
+            return
         painter.save()
-        if self._is_cut_cell(index):
-            pen = QPen(self._CUT_PEN, 1.5, Qt.DashLine)
-            pen.setJoinStyle(Qt.MiterJoin)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(option.rect.adjusted(1, 1, -2, -2))
-        elif self._is_current(index) and bool(option.state & QStyle.State_Selected):
-            pen = QPen(self._ACTIVE_PEN, 2)
-            pen.setJoinStyle(Qt.MiterJoin)
-            painter.setPen(pen)
-            painter.drawRect(option.rect.adjusted(1, 1, -2, -2))
+        pen = QPen(self._CUT_PEN, 1.5, Qt.DashLine)
+        pen.setJoinStyle(Qt.MiterJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(option.rect.adjusted(1, 1, -2, -2))
         painter.restore()
 
     def _stripped_option(self, option) -> QStyleOptionViewItem:

@@ -2,11 +2,15 @@
 
 Supports add / activate / deactivate / delete and seeding from a QuickBooks
 OTHERNAME IIF export (same list used by Expense Automation).
+
+Each row shows lifetime verified spend (Amount). Double-click opens a
+Payee QuickReport breakdown (same pattern as Manage Items / Suppliers).
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import date as _date, datetime as _dt
 from typing import List, Optional
 
 import qtawesome as qta
@@ -15,16 +19,19 @@ from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
-    QPushButton, QTableWidget, QTableWidgetItem,
+    QPushButton, QSizePolicy, QStackedWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
+from tahmeed.services.settings_service import get_setting, set_setting
+from tahmeed.ui.accountant.item_quick_report import ItemQuickReportView
 from tahmeed.ui.accountant.master_ledger_table import _TABLE_SS as _MASTER_TABLE_SS
 from tahmeed.ui.accountant.separate_expenses import (
     _finish_table_row, _make_table, _stripe_bg, _table_cell_font,
 )
 from tahmeed.ui.async_utils import pause_background_polls, schedule_call, schedule_coro
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.widgets.combo_styles import with_combo_popup
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 _WHITE   = "#FFFFFF"
@@ -32,16 +39,29 @@ _BG      = "#F4F6F8"
 _BORDER  = "#E5E7EB"
 _BLUE    = "#0077C5"
 _BLUE_L  = "#E8F4FD"
+_NAVY    = "#1B2B4B"
 _GREEN   = "#16A34A"
 _GREEN_L = "#DCFCE7"
 _RED     = "#DC2626"
-_RED_L   = "#FEE2E2"
 _T1      = "#111827"
 _T2      = "#6B7280"
 _TM      = "#9CA3AF"
 
-_COL_DEFAULTS = [52, 280, 90, 100]
+# Stretch Name so Currency / Status / Amount stay readable (Amount = lifetime total).
+_COL_DEFAULTS = [52, 0, 80, 72, 160]
+_COL_NAME = 1
+_COL_STATUS = 3
+_COL_AMOUNT = 4
 _PAGE_SIZE = 100
+
+
+def _money(tzs: float, usd: float) -> str:
+    parts = []
+    if tzs:
+        parts.append(f"TZS {abs(tzs):,.0f}")
+    if usd:
+        parts.append(f"USD {abs(usd):,.2f}")
+    return "  ·  ".join(parts) if parts else "—"
 
 
 def _lbl(text: str = "", size: int = 13, weight: int = 400,
@@ -95,24 +115,6 @@ def _cell(text: str, align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
     return item
 
 
-def _status_chip(active: bool) -> QLabel:
-    lbl = QLabel("Active" if active else "Inactive")
-    lbl.setAlignment(Qt.AlignCenter)
-    lbl.setFixedHeight(18)
-    lbl.setMinimumWidth(60)
-    if active:
-        lbl.setStyleSheet(
-            f"background:{_GREEN_L};color:{_GREEN};font-size:10px;font-weight:700;"
-            "border-radius:11px;padding:0 8px;font-family:'Segoe UI';"
-        )
-    else:
-        lbl.setStyleSheet(
-            f"background:{_RED_L};color:{_RED};font-size:10px;font-weight:700;"
-            "border-radius:11px;padding:0 8px;font-family:'Segoe UI';"
-        )
-    return lbl
-
-
 class _AddPayeeDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -120,6 +122,7 @@ class _AddPayeeDialog(QDialog):
         self.setMinimumWidth(360)
         self.setStyleSheet("background:#FFFFFF;")
         self.result_name: Optional[str] = None
+        self.result_currency: str = "TZS"
 
         vl = QVBoxLayout(self)
         vl.setContentsMargins(24, 24, 24, 24)
@@ -144,6 +147,20 @@ class _AddPayeeDialog(QDialog):
         self._inp.returnPressed.connect(self._accept)
         vl.addWidget(self._inp)
 
+        vl.addWidget(_lbl("Currency", size=12, color=_T2))
+        self._currency = QComboBox()
+        self._currency.addItems(["TZS", "USD"])
+        self._currency.setCurrentText("TZS")
+        self._currency.setFixedHeight(34)
+        self._currency.setStyleSheet(with_combo_popup(
+            f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
+            f"background:{_WHITE};color:{_T1};font-size:13px;"
+            "font-family:'Segoe UI';padding:0 8px;}"
+            f"QComboBox:focus{{border-color:{_BLUE};}}"
+            "QComboBox::drop-down{border:none;width:22px;}"
+        ))
+        vl.addWidget(self._currency)
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel = _btn("Cancel", primary=False, height=32)
@@ -160,19 +177,22 @@ class _AddPayeeDialog(QDialog):
             QMessageBox.warning(self, "Validation", "Name is required.")
             return
         self.result_name = val
+        self.result_currency = (self._currency.currentText() or "TZS").strip().upper()
         self._inp.setText(val)
         self.accept()
 
 
 class ManagePayeesWidget(QWidget):
-    """Manage QuickBooks payee names (CRUD + IIF seed)."""
+    """Manage QuickBooks payee names (CRUD + IIF seed + verified totals)."""
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._rows: List[dict] = []
-        self._page = 0
         self._total = 0
         self._loading = False
+        self._scroll_loading = False
+        self._usage_by_name: dict = {}
+        self._report_payee: Optional[str] = None
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(350)
@@ -181,6 +201,20 @@ class ManagePayeesWidget(QWidget):
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_catalog_page())
+        self._stack.addWidget(self._build_report_shell())
+        root.addWidget(self._stack, 1)
+
+        self._loading_overlay = LoadingOverlay(self, "Loading…")
+
+    def _build_catalog_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet(f"background: {_BG};")
+        root = QVBoxLayout(page)
         root.setContentsMargins(24, 20, 24, 20)
         root.setSpacing(16)
 
@@ -238,7 +272,6 @@ class ManagePayeesWidget(QWidget):
         self._filter_cb = QComboBox()
         self._filter_cb.addItems(["All", "Active only", "Inactive only"])
         self._filter_cb.setFixedHeight(32)
-        from tahmeed.ui.widgets.combo_styles import with_combo_popup
         self._filter_cb.setStyleSheet(with_combo_popup(
             f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
             f"background:{_WHITE};color:{_T1};font-size:12px;"
@@ -248,6 +281,33 @@ class ManagePayeesWidget(QWidget):
         ))
         self._filter_cb.currentIndexChanged.connect(self._on_filter_changed)
         toolbar.addWidget(self._filter_cb)
+
+        toolbar.addStretch()
+
+        self._restrict_btn = QPushButton("  Restrict payees: Off")
+        self._restrict_btn.setFixedHeight(32)
+        self._restrict_btn.setCheckable(True)
+        self._restrict_btn.setCursor(Qt.PointingHandCursor)
+        self._restrict_btn.setToolTip(
+            "When on, typing a Payee that is not in the list opens a QuickBooks-style\n"
+            "dialog: Cancel (clear the cell) or Add Payee (create it).\n"
+            "Saving still requires a known payee."
+        )
+        try:
+            self._restrict_btn.setIcon(qta.icon("mdi.lock-outline", color=_T2))
+            self._restrict_btn.setIconSize(QSize(15, 15))
+        except Exception:
+            pass
+        self._restrict_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T2};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
+            f"QPushButton:checked {{ background: {_GREEN_L}; color: {_GREEN};"
+            f" border-color: {_GREEN}; }}"
+            f"QPushButton:hover:!checked {{ background: {_BG}; }}"
+        )
+        self._restrict_btn.toggled.connect(self._on_restrict_toggled)
+        toolbar.addWidget(self._restrict_btn)
         root.addLayout(toolbar)
 
         self._table_host = QFrame()
@@ -256,53 +316,177 @@ class ManagePayeesWidget(QWidget):
         table_vl.setContentsMargins(0, 0, 0, 0)
         table_vl.setSpacing(0)
 
-        self._table = _make_table(["#", "Name", "Currency", "Status"])
+        self._table = _make_table(["#", "Name", "Currency", "Status", "Amount"])
         self._table.setStyleSheet(_MASTER_TABLE_SS)
         self._table.setShowGrid(True)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._context_menu)
+        self._table.cellDoubleClicked.connect(self._on_row_double_clicked)
+        self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
         hdr_view = self._table.horizontalHeader()
         hdr_view.setSectionsMovable(False)
-        hdr_view.setStretchLastSection(True)
+        hdr_view.setStretchLastSection(False)
+        hdr_view.setMinimumSectionSize(48)
         for i, width in enumerate(_COL_DEFAULTS):
-            self._table.setColumnWidth(i, width)
-            hdr_view.setSectionResizeMode(i, QHeaderView.Interactive)
-        bind_column_width_persistence(self._table, "manage_payees", _COL_DEFAULTS)
+            if width:
+                self._table.setColumnWidth(i, width)
+            if i == _COL_NAME:
+                hdr_view.setSectionResizeMode(i, QHeaderView.Stretch)
+            else:
+                hdr_view.setSectionResizeMode(i, QHeaderView.Interactive)
+        # Stretch Name; autofit once so Amount (total) is not crushed by Status/Currency.
+        bind_column_width_persistence(
+            self._table,
+            "manage_payees_stretch_name",
+            _COL_DEFAULTS,
+            stretch_columns=(_COL_NAME,),
+            auto_fit_if_unset=True,
+        )
         table_vl.addWidget(self._table)
         root.addWidget(self._table_host, 1)
 
-        self._loading_overlay = LoadingOverlay(self._table_host, "Loading…")
-
-        pager = QFrame()
-        pager.setFixedHeight(44)
-        pager.setStyleSheet(
+        # Status bar — scroll-load chrome (same as Description Maps / Items).
+        status_bar = QFrame()
+        status_bar.setFixedHeight(44)
+        status_bar.setStyleSheet(
             f"QFrame{{background:{_WHITE};border:1px solid {_BORDER};border-radius:6px;}}"
         )
-        pl = QHBoxLayout(pager)
-        pl.setContentsMargins(12, 0, 12, 0)
-        pl.setSpacing(10)
+        sl = QHBoxLayout(status_bar)
+        sl.setContentsMargins(12, 0, 12, 0)
+        sl.setSpacing(10)
         self._page_info = _lbl("—", size=12, color=_T2)
-        pl.addWidget(self._page_info)
-        pl.addStretch()
-        self._prev_btn = _btn("← Prev", primary=False, height=30)
-        self._prev_btn.setFixedWidth(88)
-        self._prev_btn.clicked.connect(self._on_prev_page)
-        pl.addWidget(self._prev_btn)
-        self._next_btn = _btn("Next →", primary=False, height=30)
-        self._next_btn.setFixedWidth(88)
-        self._next_btn.clicked.connect(self._on_next_page)
-        pl.addWidget(self._next_btn)
-        root.addWidget(pager)
-
-        self._footer = _lbl(
-            "Import a QuickBooks Payee List (.IIF) to seed names used in Day Issues.",
+        sl.addWidget(self._page_info, 1)
+        tip = _lbl(
+            "Double-click for verified spend  ·  Import IIF to seed names",
             size=11, color=_TM,
         )
-        root.addWidget(self._footer)
+        sl.addWidget(tip)
+        root.addWidget(status_bar)
+        return page
+
+    def _build_report_shell(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet(f"background: {_BG};")
+        vl = QVBoxLayout(page)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
+
+        nav = QFrame()
+        nav.setFixedHeight(52)
+        nav.setStyleSheet(
+            f"QFrame {{ background: {_WHITE}; border-bottom: 1px solid {_BORDER}; }}"
+        )
+        nl = QHBoxLayout(nav)
+        nl.setContentsMargins(16, 0, 16, 0)
+        nl.setSpacing(12)
+
+        back_btn = QPushButton("← Payees")
+        back_btn.setFixedHeight(30)
+        back_btn.setCursor(Qt.PointingHandCursor)
+        back_btn.setStyleSheet(
+            f"QPushButton {{ background: {_WHITE}; color: {_T1};"
+            f" border: 1px solid {_BORDER}; border-radius: 5px;"
+            " font-size: 12px; font-family:'Segoe UI'; padding: 0 12px; }"
+            f"QPushButton:hover {{ background: {_BG}; }}"
+        )
+        back_btn.clicked.connect(self._close_report)
+        nl.addWidget(back_btn)
+
+        self._report_nav_lbl = _lbl("", size=13, weight=600, color=_NAVY)
+        nl.addWidget(self._report_nav_lbl)
+        nl.addStretch()
+        vl.addWidget(nav)
+
+        body = QFrame()
+        body.setStyleSheet(f"QFrame {{ background: {_WHITE}; border: none; }}")
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(24, 20, 24, 16)
+        bl.setSpacing(4)
+
+        self._report_meta_lbl = QLabel("")
+        self._report_meta_lbl.setStyleSheet(
+            f"color: {_T2}; font-size: 11px;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        bl.addWidget(self._report_meta_lbl)
+
+        self._report_company_lbl = QLabel("TAHMEED COACH TZ LTD")
+        self._report_company_lbl.setAlignment(Qt.AlignCenter)
+        self._report_company_lbl.setStyleSheet(
+            f"color: {_T1}; font-size: 15px; font-weight: 700;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        bl.addWidget(self._report_company_lbl)
+
+        self._report_kind_lbl = QLabel("Payee QuickReport")
+        self._report_kind_lbl.setAlignment(Qt.AlignCenter)
+        self._report_kind_lbl.setStyleSheet(
+            f"color: {_T1}; font-size: 13px; font-weight: 600;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        bl.addWidget(self._report_kind_lbl)
+
+        self._report_scope_lbl = QLabel("All Transactions")
+        self._report_scope_lbl.setAlignment(Qt.AlignCenter)
+        self._report_scope_lbl.setStyleSheet(
+            f"color: {_T2}; font-size: 12px;"
+            " font-family:'Segoe UI'; background: transparent;"
+        )
+        bl.addWidget(self._report_scope_lbl)
+
+        self._report_item_lbl = QLabel("")
+        self._report_item_lbl.setAlignment(Qt.AlignCenter)
+        self._report_item_lbl.setStyleSheet(
+            f"color: {_NAVY}; font-size: 14px; font-weight: 700;"
+            " font-family:'Segoe UI'; background: transparent;"
+            " margin-top: 8px;"
+        )
+        bl.addWidget(self._report_item_lbl)
+
+        content = QFrame()
+        content.setObjectName("payeeReportContent")
+        content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        content.setStyleSheet(
+            f"#payeeReportContent {{ background: {_WHITE}; border: none; }}"
+        )
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(0, 16, 0, 0)
+        cl.setSpacing(0)
+        self._report_table = ItemQuickReportView(entity="payee")
+        self._report_table.header_context_changed.connect(self._on_report_header_context)
+        cl.addWidget(self._report_table, 1)
+        bl.addWidget(content, 1)
+
+        vl.addWidget(body, 1)
+        return page
 
     def refresh(self) -> None:
         schedule_coro(self._load())
+
+    def _on_restrict_toggled(self, on: bool) -> None:
+        self._restrict_btn.setText(
+            "  Restrict payees: On" if on else "  Restrict payees: Off"
+        )
+        schedule_coro(self._save_restrict_setting(on))
+
+    async def _load_restrict_setting(self) -> None:
+        try:
+            restrict_on = bool(await get_setting("restrict_payees"))
+        except Exception:
+            restrict_on = False
+        self._restrict_btn.blockSignals(True)
+        self._restrict_btn.setChecked(restrict_on)
+        self._restrict_btn.setText(
+            "  Restrict payees: On" if restrict_on else "  Restrict payees: Off"
+        )
+        self._restrict_btn.blockSignals(False)
+
+    async def _save_restrict_setting(self, on: bool) -> None:
+        try:
+            await set_setting("restrict_payees", on)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
 
     def _active_filter(self) -> str:
         idx = self._filter_cb.currentIndex()
@@ -316,71 +500,74 @@ class ManagePayeesWidget(QWidget):
         self._search_debounce.start()
 
     def _on_search_commit(self) -> None:
-        self._page = 0
         schedule_coro(self._load())
 
     def _on_filter_changed(self) -> None:
-        self._page = 0
         schedule_coro(self._load())
 
-    def _on_prev_page(self) -> None:
-        if self._page > 0:
-            self._page -= 1
-            schedule_coro(self._load())
+    def _on_scroll(self, value: int) -> None:
+        bar = self._table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if value >= bar.maximum() - 24:
+            schedule_coro(self._load_more())
 
-    def _on_next_page(self) -> None:
-        max_pg = max(0, (self._total - 1) // _PAGE_SIZE) if self._total else 0
-        if self._page < max_pg:
-            self._page += 1
-            schedule_coro(self._load())
+    def _fill_if_needed(self) -> None:
+        bar = self._table.verticalScrollBar()
+        if (
+            not self._loading
+            and not self._scroll_loading
+            and len(self._rows) < self._total
+            and bar.maximum() <= 0
+        ):
+            schedule_coro(self._load_more())
 
-    def _update_pager(self) -> None:
+    def _update_scroll_footer(self) -> None:
+        loaded = len(self._rows)
         total = self._total
-        size = _PAGE_SIZE
-        page = self._page
-        max_pg = max(0, (total - 1) // size) if total else 0
-        start = page * size + 1 if total else 0
-        end = min((page + 1) * size, total)
-        self._page_info.setText(
-            f"Showing {start:,}–{end:,} of {total:,}  ·  Page {page + 1} of {max_pg + 1}"
+        if self._loading or self._scroll_loading:
+            suffix = "  ·  Loading…"
+        elif loaded >= total and total:
+            suffix = ""
+        elif total:
+            suffix = "  ·  Scroll for more"
+        else:
+            suffix = ""
+        self._page_info.setText(f"Showing {loaded:,} of {total:,}{suffix}")
+        self._count_chip.setText(
+            f"{total:,} payee{'s' if total != 1 else ''}"
+            + (f"  ·  {loaded} loaded" if total > loaded else "")
         )
-        self._prev_btn.setEnabled(page > 0)
-        self._next_btn.setEnabled(page < max_pg)
 
     async def _load(self) -> None:
+        """Full refresh from the top (search / filter / mutate / import)."""
         if self._loading:
             return
         self._loading = True
         self._loading_overlay.show_loading("Loading payees…")
+        self._update_scroll_footer()
         try:
             from tahmeed.services.payee_service import list_payees, count_payees
 
             search = self._search.text().strip()
             active_filter = self._active_filter()
-            skip = self._page * _PAGE_SIZE
             rows, total = await asyncio.gather(
                 list_payees(
                     search=search,
                     active_filter=active_filter,
                     limit=_PAGE_SIZE,
-                    skip=skip,
+                    skip=0,
                 ),
                 count_payees(search=search, active_filter=active_filter),
             )
-            max_pg = max(0, (total - 1) // _PAGE_SIZE) if total else 0
-            if self._page > max_pg:
-                self._page = max_pg
-                skip = self._page * _PAGE_SIZE
-                rows = await list_payees(
-                    search=search,
-                    active_filter=active_filter,
-                    limit=_PAGE_SIZE,
-                    skip=skip,
-                )
             self._rows = rows
             self._total = total
-            self._populate_table()
-            self._update_pager()
+            self._usage_by_name = {}
+            await self._fetch_usage_for(rows)
+            self._populate_table(reset=True)
+            self._update_scroll_footer()
+            self._fill_if_needed()
+            await self._load_restrict_setting()
         except Exception as exc:
             # Defer modal so badge polls cannot wake into this task (Py 3.14).
             schedule_call(
@@ -391,40 +578,134 @@ class ManagePayeesWidget(QWidget):
         finally:
             self._loading = False
             self._loading_overlay.hide_loading()
+            self._update_scroll_footer()
 
-    def _populate_table(self) -> None:
-        rows = self._rows
-        skip = self._page * _PAGE_SIZE
-        self._table.setRowCount(0)
-        self._count_chip.setText(f"{self._total:,} payees")
+    async def _load_more(self) -> None:
+        if self._scroll_loading or self._loading:
+            return
+        if len(self._rows) >= self._total:
+            return
+        self._scroll_loading = True
+        self._update_scroll_footer()
+        try:
+            from tahmeed.services.payee_service import list_payees
+
+            search = self._search.text().strip()
+            active_filter = self._active_filter()
+            skip = len(self._rows)
+            rows = await list_payees(
+                search=search,
+                active_filter=active_filter,
+                limit=_PAGE_SIZE,
+                skip=skip,
+            )
+            if not rows:
+                return
+            self._rows.extend(rows)
+            await self._fetch_usage_for(rows)
+            self._populate_table(reset=False, new_rows=rows, start_row=skip)
+            self._fill_if_needed()
+        except Exception as exc:
+            schedule_call(
+                lambda e=exc: QMessageBox.critical(
+                    self, "Error", f"Could not load more payees:\n{e}",
+                )
+            )
+        finally:
+            self._scroll_loading = False
+            self._update_scroll_footer()
+
+    async def _fetch_usage_for(self, rows: List[dict]) -> None:
+        names = [str(r.get("name") or "").strip() for r in rows if r.get("name")]
+        if not names:
+            return
+        from tahmeed.services.accountant_service import get_payees_usage_totals
+
+        try:
+            usage = await get_payees_usage_totals(names)
+        except Exception:
+            return
+        self._usage_by_name.update(usage)
+
+    def _populate_table(
+        self,
+        *,
+        reset: bool = True,
+        new_rows: Optional[List[dict]] = None,
+        start_row: int = 0,
+    ) -> None:
+        if reset:
+            rows = self._rows
+            start_row = 0
+            self._table.setRowCount(0)
+        else:
+            rows = new_rows or []
 
         for i, row in enumerate(rows):
-            self._table.insertRow(i)
-            active = row.get("active", True)
-            row_bg = _stripe_bg(i)
+            idx = start_row + i
+            self._table.insertRow(idx)
+            active = bool(row.get("active", True))
+            row_bg = _stripe_bg(idx)
+            name = str(row.get("name") or "")
+            usage = self._usage_by_name.get(name.strip().lower(), {})
             self._table.setItem(
-                i, 0,
-                _cell(str(skip + i + 1), Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
+                idx, 0,
+                _cell(str(idx + 1), Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
             )
-            self._table.setItem(i, 1, _cell(row.get("name", ""), bg=row_bg))
+            self._table.setItem(idx, _COL_NAME, _cell(name, bg=row_bg))
             self._table.setItem(
-                i, 2,
-                _cell(row.get("currency", "") or "—", Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
+                idx, 2,
+                _cell(
+                    row.get("currency", "") or "—",
+                    Qt.AlignCenter | Qt.AlignVCenter,
+                    bg=row_bg,
+                ),
             )
-            chip = _status_chip(active)
-            chip_container = QWidget()
-            chip_container.setStyleSheet(f"background: {row_bg};")
-            cl = QHBoxLayout(chip_container)
-            cl.setContentsMargins(6, 1, 6, 1)
-            cl.addWidget(chip)
-            cl.addStretch()
-            self._table.setCellWidget(i, 3, chip_container)
-            _finish_table_row(self._table, i, row_bg)
+            self._table.setItem(
+                idx, _COL_STATUS,
+                _cell(
+                    "Active" if active else "Inactive",
+                    Qt.AlignCenter | Qt.AlignVCenter,
+                    bg=row_bg,
+                ),
+            )
+            amount = _money(float(usage.get("tzs") or 0), float(usage.get("usd") or 0))
+            self._table.setItem(
+                idx, _COL_AMOUNT,
+                _cell(amount, Qt.AlignRight | Qt.AlignVCenter, bg=row_bg),
+            )
+            _finish_table_row(self._table, idx, row_bg)
 
-        shown = len(rows)
-        self._footer.setText(
-            f"{shown} on this page  ·  {self._total:,} total matching"
+    def _on_row_double_clicked(self, row: int, _col: int) -> None:
+        if row < 0 or row >= len(self._rows):
+            return
+        name = str(self._rows[row].get("name") or "").strip()
+        if name:
+            self._open_report(name)
+
+    def _open_report(self, payee_name: str) -> None:
+        name = (payee_name or "").strip()
+        if not name:
+            return
+        self._report_payee = name
+        self._report_nav_lbl.setText(f"Payee QuickReport  ·  {name}")
+        self._report_item_lbl.setText(name)
+        now = _dt.now()
+        self._report_meta_lbl.setText(
+            f"{now.strftime('%I:%M %p').lstrip('0')}  {now.strftime('%d-%m-%y')}"
         )
+        self._on_report_header_context(str(_date.today().year), "All Transactions")
+        self._stack.setCurrentIndex(1)
+        self._report_table.load(name)
+
+    def _on_report_header_context(self, year_label: str, scope_label: str) -> None:
+        self._report_company_lbl.setText(f"TAHMEED COACH TZ LTD - {year_label}")
+        self._report_scope_lbl.setText(scope_label)
+
+    def _close_report(self) -> None:
+        self._report_payee = None
+        self._report_table.clear()
+        self._stack.setCurrentIndex(0)
 
     def _context_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
@@ -433,8 +714,11 @@ class ManagePayeesWidget(QWidget):
         entry = self._rows[row]
         active = entry.get("active", True)
         name = entry.get("name", "")
+        currency = entry.get("currency") or "TZS"
 
         menu = QMenu(self)
+        open_act = menu.addAction("Open report")
+        menu.addSeparator()
         toggle_act = menu.addAction("Deactivate" if active else "Activate")
         menu.addSeparator()
         delete_act = menu.addAction("Delete")
@@ -444,16 +728,20 @@ class ManagePayeesWidget(QWidget):
             pass
 
         chosen = menu.exec(self._table.viewport().mapToGlobal(pos))
-        if chosen == toggle_act:
-            schedule_coro(self._toggle_active(name, not active))
+        if chosen == open_act:
+            self._open_report(name)
+        elif chosen == toggle_act:
+            schedule_coro(self._toggle_active(name, not active, currency=currency))
         elif chosen == delete_act:
             self._confirm_delete(name)
 
-    async def _toggle_active(self, name: str, active: bool) -> None:
+    async def _toggle_active(
+        self, name: str, active: bool, *, currency: str = "TZS",
+    ) -> None:
         from tahmeed.services.payee_service import set_payee_active
 
         try:
-            await set_payee_active(name, active)
+            await set_payee_active(name, active, currency=currency)
         except Exception as exc:
             schedule_call(
                 lambda e=exc: QMessageBox.critical(self, "Error", str(e))
@@ -484,13 +772,13 @@ class ManagePayeesWidget(QWidget):
     def _add_payee(self) -> None:
         dlg = _AddPayeeDialog(parent=self)
         if dlg.exec() == QDialog.Accepted and dlg.result_name:
-            schedule_coro(self._do_add(dlg.result_name))
+            schedule_coro(self._do_add(dlg.result_name, dlg.result_currency))
 
-    async def _do_add(self, name: str) -> None:
+    async def _do_add(self, name: str, currency: str = "TZS") -> None:
         from tahmeed.services.payee_service import add_payee
 
         try:
-            await add_payee(name)
+            await add_payee(name, currency=currency or "TZS")
         except Exception as exc:
             schedule_call(
                 lambda e=exc: QMessageBox.critical(self, "Error", str(e))
@@ -564,5 +852,4 @@ class ManagePayeesWidget(QWidget):
                     self, "Payees Imported", m,
                 )
             )
-            self._page = 0
             await self._load()

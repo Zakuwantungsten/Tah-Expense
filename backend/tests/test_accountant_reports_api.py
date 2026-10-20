@@ -109,6 +109,9 @@ class FakeTransactions:
                 if "_cat_l" in fields:
                     for d in docs:
                         d["_cat_l"] = str(d.get("category_name") or "").lower()
+                if "_payee_l" in fields:
+                    for d in docs:
+                        d["_payee_l"] = str(d.get("payee") or "").lower()
             elif "$limit" in stage:
                 docs = docs[: int(stage["$limit"])]
             elif "$sort" in stage:
@@ -135,10 +138,15 @@ class FakeTransactions:
                             "usd_total": usd,
                         }
                     ]
-                elif gid == "$_cat_l":
+                elif gid in ("$_cat_l", "$_payee_l"):
+                    source = (
+                        ("_payee_l", "payee")
+                        if gid == "$_payee_l"
+                        else ("_cat_l", "category_name")
+                    )
                     buckets: dict[str, dict] = {}
                     for d in docs:
-                        key = str(d.get("_cat_l") or d.get("category_name") or "").lower()
+                        key = str(d.get(source[0]) or d.get(source[1]) or "").lower()
                         if not key:
                             continue
                         bucket = buckets.setdefault(
@@ -336,3 +344,45 @@ def test_reports_require_manager() -> None:
         response = client.get("/v1/accountant/reports/category/Fuel/lifetime")
 
     assert response.status_code == 403
+
+
+def test_payee_report_lifetime_totals_transactions_and_usage() -> None:
+    docs = [
+        _verified(payee="SPARE PARTS", amount=150.0, currency="TZS"),
+        _verified(
+            payee="SPARE PARTS",
+            amount=20.0,
+            currency="USD",
+            description="Bolt kit",
+            date=datetime(2025, 2, 1),
+        ),
+        _verified(payee="PARKING DAR", amount=50.0, currency="TZS"),
+        _verified(payee="SPARE PARTS", verified=False, description="Draft"),
+        _verified(category_name="Fuel", payee="", amount=99.0),
+    ]
+    app = _app(FakeTransactions(docs))
+    app.dependency_overrides[current_user] = lambda: _manager()
+
+    with TestClient(app) as client:
+        lifetime = client.get("/v1/accountant/reports/payee/SPARE%20PARTS/lifetime")
+        totals = client.get("/v1/accountant/reports/payee/SPARE%20PARTS/totals")
+        txs = client.get("/v1/accountant/reports/payee/SPARE%20PARTS/transactions")
+        descs = client.get("/v1/accountant/reports/payee/SPARE%20PARTS/descriptions")
+        usage = client.post(
+            "/v1/accountant/reports/payees/usage-totals",
+            json={"names": ["SPARE PARTS", "PARKING DAR", "Missing"]},
+        )
+
+    assert lifetime.status_code == 200
+    assert lifetime.json()["count"] == 2
+    assert lifetime.json()["tzs"] == 150.0
+    assert lifetime.json()["usd"] == 20.0
+    assert totals.json()["count"] == 2
+    assert len(txs.json()["items"]) == 2
+    assert "Bolt kit" in descs.json()["items"]
+    assert usage.status_code == 200
+    totals_map = usage.json()["totals"]
+    assert totals_map["spare parts"]["tzs"] == 150.0
+    assert totals_map["spare parts"]["usd"] == 20.0
+    assert totals_map["parking dar"]["tzs"] == 50.0
+    assert "missing" not in totals_map

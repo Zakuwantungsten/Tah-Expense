@@ -96,3 +96,19 @@ def test_cashier_visibility_preserved_when_hiding(register):
     register._hide_columns([COL_MEMO])
     assert not register._table.isColumnHidden(COL_CASHIER)
     assert register._table.isColumnHidden(COL_MEMO)
+
+
+def test_tab_skips_hidden_columns(register):
+    from tahmeed.ui.cashier.register_delegates import (
+        CHECK_COLS, COL_MEMO, COL_REF, COL_TRUCK, READONLY_COLS,
+    )
+
+    register._hide_columns([COL_MEMO])
+
+    register._table.setCurrentCell(0, COL_TRUCK)
+    register._tab_forward()
+    assert register._table.currentColumn() == COL_REF
+
+    register._table.setCurrentCell(0, COL_REF)
+    register._step(0, -1, skip=CHECK_COLS | READONLY_COLS)
+    assert register._table.currentColumn() == COL_TRUCK

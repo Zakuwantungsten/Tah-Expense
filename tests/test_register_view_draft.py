@@ -362,11 +362,10 @@ def test_parked_view_shows_local_parked_rows_and_my_restores_silently(
 
 
 @pytest.mark.asyncio
-async def test_parked_save_sends_only_rows_with_fixed_truck(register, monkeypatch):
-    from tahmeed.services.register_draft_service import (
-        cells_from_json,
-        load_register_draft,
-    )
+async def test_parked_save_persists_fixed_as_draft_and_still_parked_as_parked(
+    register, monkeypatch
+):
+    from tahmeed.services.register_draft_service import load_register_draft
     from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_TRUCK, COL_TZS
 
     _stage_import_like_rows(register)
@@ -438,22 +437,21 @@ async def test_parked_save_sends_only_rows_with_fixed_truck(register, monkeypatc
     meta: dict = {}
     ok = await register._do_save_body(meta)
     assert ok is True
-    assert [tx.description for tx in sent] == ["OIL"]
-    assert sent[0].register_status == "draft"
-    assert sent[0].truck_number == "YARD"
-    assert meta.get("kept_parked") == 1
+    by_desc = {tx.description: tx for tx in sent}
+    assert set(by_desc) == {"OIL", "TYRES"}
+    assert by_desc["OIL"].register_status == "draft"
+    assert by_desc["OIL"].truck_number == "YARD"
+    assert by_desc["TYRES"].register_status == "parked"
     assert load_calls == [register._current_date]
-
-    # The still-wrong row stays in the local bucket; the fixed one left it.
+    assert register._local_parked == []
     draft = load_register_draft(register._user._id, register._current_date, merged=False)
-    assert draft is not None
-    assert [cells_from_json(e["cells"])[COL_DESC] for e in draft["parked_rows"]] == [
-        "TYRES"
-    ]
+    assert draft is None or draft.get("parked_rows") in (None, [])
 
 
 @pytest.mark.asyncio
-async def test_parked_save_with_nothing_fixed_is_silent_success(register, monkeypatch):
+async def test_parked_save_persists_unfixed_rows_as_parked(register, monkeypatch):
+    from tahmeed.services.register_draft_service import load_register_draft
+
     _stage_import_like_rows(register)
     monkeypatch.setattr(register, "_persist_parked_after_dialog", _boom_save)
     register._after_truck_dialog_parked()
@@ -468,27 +466,104 @@ async def test_parked_save_with_nothing_fixed_is_silent_success(register, monkey
     async def fake_next_day_order(_d):
         return 1
 
-    async def boom_bulk(*_a, **_k):
-        raise AssertionError("nothing may be saved while every truck is wrong")
+    sent: list = []
 
-    infos: list = []
+    async def fake_bulk(txs, *, on_progress=None, should_cancel=None):
+        for tx in txs:
+            tx._id = ObjectId()
+            sent.append(tx)
+        return [("created", tx, None) for tx in txs]
+
+    async def fake_load(_d):
+        return None
+
     monkeypatch.setattr("tahmeed.ui.cashier.excel_grid.next_day_order", fake_next_day_order)
-    monkeypatch.setattr("tahmeed.ui.cashier.excel_grid.bulk_save_transactions", boom_bulk)
+    monkeypatch.setattr("tahmeed.ui.cashier.excel_grid.bulk_save_transactions", fake_bulk)
     monkeypatch.setattr(
         "tahmeed.ui.cashier.excel_grid.QMessageBox.information",
-        lambda *a, **k: infos.append(a),
+        lambda *a, **k: None,
     )
     monkeypatch.setattr(
         "tahmeed.ui.cashier.excel_grid.QMessageBox.warning",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no warning expected")),
     )
+    monkeypatch.setattr(register, "_load_date", fake_load)
 
     meta: dict = {}
     ok = await register._do_save_body(meta)
     assert ok is True
-    assert meta.get("kept_parked") == 1
-    assert infos and "Still parked" in infos[0][1]
+    assert len(sent) == 1
+    assert sent[0].description == "OIL"
+    assert sent[0].register_status == "parked"
+    assert register._local_parked == []
+    draft = load_register_draft(register._user._id, register._current_date, merged=False)
+    assert draft is None or draft.get("parked_rows") in (None, [])
+
+
+@pytest.mark.asyncio
+async def test_my_save_after_park_persists_draft_and_parked(register, monkeypatch):
+    """Park then Save from My: good rows → draft, parked bucket → parked."""
+    from tahmeed.services.register_draft_service import load_register_draft
+    from tahmeed.ui.cashier.register_delegates import COL_DESC
+
+    _stage_import_like_rows(register)
+    monkeypatch.setattr(register, "_persist_parked_after_dialog", _boom_save)
+    register._after_truck_dialog_parked()
+    assert "DIESEL" in [
+        (register._table.item(r, COL_DESC).text() if register._table.item(r, COL_DESC) else "")
+        for r in range(register._table.rowCount())
+    ]
     assert len(register._local_parked) == 1
+    assert register.has_unsaved_work()
+
+    monkeypatch.setattr(register, "_api_is_online", lambda: True)
+    # Force sync create for drafts too so the test sees both statuses without drain.
+    monkeypatch.setattr(register, "_submit_in_flight", True)
+
+    async def fake_next_day_order(_d):
+        return 1
+
+    async def fake_dup_bulk(candidates, *_a, **_k):
+        return [[] for _ in candidates]
+
+    sent: list = []
+
+    async def fake_bulk(txs, *, on_progress=None, should_cancel=None):
+        for tx in txs:
+            tx._id = ObjectId()
+            sent.append(tx)
+        return [("created", tx, None) for tx in txs]
+
+    async def fake_load(_d):
+        return None
+
+    monkeypatch.setattr("tahmeed.ui.cashier.excel_grid.next_day_order", fake_next_day_order)
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.check_for_duplicates_bulk", fake_dup_bulk
+    )
+    monkeypatch.setattr("tahmeed.ui.cashier.excel_grid.bulk_save_transactions", fake_bulk)
+    monkeypatch.setattr(register, "_load_date", fake_load)
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.QMessageBox.warning",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError(a)),
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.QMessageBox.information",
+        lambda *a, **k: None,
+    )
+
+    meta: dict = {}
+    ok = await register._do_save_body(meta)
+    assert ok is True
+    by_desc = {tx.description: tx for tx in sent}
+    assert set(by_desc) == {"DIESEL", "OIL"}
+    assert by_desc["DIESEL"].register_status == "draft"
+    assert by_desc["OIL"].register_status == "parked"
+    assert register._local_parked == []
+    draft = load_register_draft(register._user._id, register._current_date, merged=False)
+    assert draft is None or (
+        not draft.get("parked_rows") and not draft.get("new_rows")
+    )
 
 
 def test_reimport_same_file_replaces_its_parked_rows_only(register, monkeypatch):
@@ -841,6 +916,61 @@ def test_park_rows_locally_does_not_duplicate_client_row_id(register, monkeypatc
     register._after_truck_dialog_parked()
     assert len(register._local_parked) == 1
     assert entry_client_row_id(register._local_parked[0]) == rid
+
+
+@pytest.mark.asyncio
+async def test_promote_saved_parked_correct_persists_truck(register, monkeypatch):
+    """Fix trucks → Correct on server-saved parked must PATCH truck + draft."""
+    from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_TRUCK
+
+    parked = _tx(register, parked=True, desc="OIL")
+    parked.truck_number = "BAD TRUCK"
+    register._day_tx_cache = [parked]
+    register._day_tx_cache_key = register._make_day_cache_key(
+        register._current_date, merged=False, upload_id=""
+    )
+    register.set_view_mode("parked")
+    assert register._saved_count == 1
+    assert register._table.item(0, COL_DESC).text() == "OIL"
+
+    # Simulate Fix trucks → Correct writing a valid fleet/place truck.
+    register._fleet_numbers.add("T688 EAF")
+    register._table.blockSignals(True)
+    try:
+        register._table.item(0, COL_TRUCK).setText("T688 EAF")
+    finally:
+        register._table.blockSignals(False)
+    register._pending_row_meta[0] = dict(register._pending_row_meta.get(0) or {})
+    register._pending_row_meta[0].pop("parked", None)
+    register._dirty_rows.add(0)
+    assert register._row_truck_is_valid(0)
+
+    patches: list = []
+
+    async def capture_unpark(items, **_k):
+        patches.extend(list(items))
+
+    pending: list = []
+
+    def capture_future(coro, *_a, **_k):
+        pending.append(coro)
+        return None
+
+    monkeypatch.setattr(register, "_unpark_saved_rows", capture_unpark)
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.asyncio.ensure_future", capture_future
+    )
+
+    n = register._promote_accepted_parked_rows_to_my()
+    assert n == 1
+    assert pending
+    await pending[0]
+    assert len(patches) == 1
+    tx_id, updates = patches[0]
+    assert tx_id == parked._id
+    assert updates.get("register_status") == "draft"
+    assert updates.get("truck_number") == "T688 EAF"
+    assert "edited_after_verification" not in updates
 
 
 def test_parked_allow_all_promotes_rows_to_my(register, monkeypatch):

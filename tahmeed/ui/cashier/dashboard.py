@@ -115,13 +115,80 @@ _BTN_STYLES = {
 
 # ── QuickBooks-style document header ─────────────────────────────────────────────
 
+_STACK_ROW_KEYS = ("totals", "parked", "combined")
+_STACK_ROW_LABELS = {
+    "totals": "Totals",
+    "parked": "P. totals",
+    "combined": "Combined",
+}
+
+
+def _fmt_tzs(amount: float) -> str:
+    return f"TZS {amount:,.0f}" if amount else "—"
+
+
+def _fmt_usd(amount: float) -> str:
+    return f"USD {amount:,.2f}" if amount else "—"
+
+
+def _money_stack_labels(
+    accent: str = "#111827",
+) -> tuple[QWidget, dict[str, QLabel]]:
+    """Three labeled value rows: Totals / P. totals / Combined (compact)."""
+    wrap = QWidget()
+    wrap.setStyleSheet("background: transparent;")
+    vl = QVBoxLayout(wrap)
+    vl.setContentsMargins(0, 0, 0, 0)
+    vl.setSpacing(0)
+    out: dict[str, QLabel] = {}
+    for key in _STACK_ROW_KEYS:
+        row = QWidget()
+        row.setStyleSheet("background: transparent;")
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(4)
+        k_color = (
+            "#B45309" if key == "parked"
+            else "#0077C5" if key == "combined"
+            else "#6B7280"
+        )
+        v_color = (
+            "#B45309" if key == "parked"
+            else accent if key != "combined"
+            else "#111827"
+        )
+        k_lbl = QLabel(_STACK_ROW_LABELS[key])
+        k_lbl.setStyleSheet(
+            f"font-size: 8px; color: {k_color}; font-weight: 600;"
+            " letter-spacing: 0.2px; font-family: 'Segoe UI', sans-serif;"
+            " background: transparent; padding: 0;"
+        )
+        v_lbl = QLabel("—")
+        v_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        fw = "700" if key == "combined" else "600"
+        # Figures only — keep label size and tile box width/height unchanged.
+        v_lbl.setStyleSheet(
+            f"font-size: 11px; color: {v_color}; font-weight: {fw};"
+            " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            " padding: 0;"
+        )
+        hl.addWidget(k_lbl, 0, Qt.AlignVCenter)
+        hl.addWidget(v_lbl, 1, Qt.AlignVCenter)
+        vl.addWidget(row)
+        out[key] = v_lbl
+    return wrap, out
+
+
 class _QBDocHeader(QFrame):
-    """Document summary header: title + Merged badge + 4 KPI tiles."""
+    """Document summary header: title + Merged badge + KPI tiles.
+
+    Money tiles (Refund / Total USD / Total) stack My, Parked, and Combined.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("qbDocHeader")
-        self.setFixedHeight(72)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.setStyleSheet(
             "QFrame#qbDocHeader {"
             "  background: #ffffff;"
@@ -131,32 +198,34 @@ class _QBDocHeader(QFrame):
         self._view_date: Optional[date] = date.today()
 
         hl = QHBoxLayout(self)
-        hl.setContentsMargins(0, 0, 16, 0)
+        hl.setContentsMargins(0, 2, 10, 2)
         hl.setSpacing(0)
 
         accent = QFrame()
-        accent.setFixedWidth(5)
+        accent.setFixedWidth(4)
         accent.setStyleSheet("background: #0077C5; border: none;")
         hl.addWidget(accent)
-        hl.addSpacing(14)
+        hl.addSpacing(8)
 
         # Title block + optional Merged badge
         title_row = QHBoxLayout()
-        title_row.setSpacing(10)
+        title_row.setSpacing(8)
         title_row.setContentsMargins(0, 0, 0, 0)
 
         title_vl = QVBoxLayout()
-        title_vl.setSpacing(2)
-        title_vl.setContentsMargins(0, 10, 0, 10)
+        title_vl.setSpacing(0)
+        title_vl.setContentsMargins(0, 0, 0, 0)
         title_lbl = QLabel("Daily Register")
         title_lbl.setStyleSheet(
-            f"font-size: 18px; font-weight: 700; color: {_NAVY};"
+            f"font-size: 13px; font-weight: 700; color: {_NAVY};"
             " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            " padding: 0;"
         )
         sub_lbl = QLabel("Cashier  ·  Expense Entry")
         sub_lbl.setStyleSheet(
-            "font-size: 10px; color: #9CA3AF;"
+            "font-size: 9px; color: #9CA3AF;"
             " font-family: 'Segoe UI', sans-serif; background: transparent;"
+            " padding: 0;"
         )
         title_vl.addWidget(title_lbl)
         title_vl.addWidget(sub_lbl)
@@ -165,22 +234,22 @@ class _QBDocHeader(QFrame):
 
         self._merged_badge = QLabel("MERGED VIEW")
         self._merged_badge.setAlignment(Qt.AlignCenter)
-        self._merged_badge.setFixedHeight(22)
+        self._merged_badge.setFixedHeight(18)
         self._merged_badge.setStyleSheet(
-            f"QLabel{{background:transparent;color:{_GOLD};border:1.5px solid {_GOLD};"
-            f"border-radius:11px;padding:0 10px;font-size:10px;font-weight:700;"
-            f"letter-spacing:0.6px;font-family:'Segoe UI',sans-serif;}}"
+            f"QLabel{{background:transparent;color:{_GOLD};border:1px solid {_GOLD};"
+            f"border-radius:9px;padding:0 8px;font-size:9px;font-weight:700;"
+            f"letter-spacing:0.4px;font-family:'Segoe UI',sans-serif;}}"
         )
         self._merged_badge.hide()
         title_row.addWidget(self._merged_badge, 0, Qt.AlignVCenter)
 
         self._draft_status = QLabel("")
         self._draft_status.setAlignment(Qt.AlignCenter)
-        self._draft_status.setFixedHeight(22)
+        self._draft_status.setFixedHeight(18)
         self._draft_status.setStyleSheet(
-            "QLabel{background:transparent;color:#B45309;border:1.5px solid #FCD34D;"
-            "border-radius:11px;padding:0 10px;font-size:10px;font-weight:700;"
-            "letter-spacing:0.4px;font-family:'Segoe UI',sans-serif;}"
+            "QLabel{background:transparent;color:#B45309;border:1px solid #FCD34D;"
+            "border-radius:9px;padding:0 8px;font-size:9px;font-weight:700;"
+            "letter-spacing:0.3px;font-family:'Segoe UI',sans-serif;}"
         )
         self._draft_status.hide()
         title_row.addWidget(self._draft_status, 0, Qt.AlignVCenter)
@@ -194,17 +263,15 @@ class _QBDocHeader(QFrame):
         sep0.setStyleSheet("color: #E5E7EB;")
         hl.addWidget(sep0)
 
-        # 5 KPI tiles — TOTAL USD sits immediately before TOTAL (TZS)
-        tiles_cfg = [
-            ("ENTRIES",         "—",                              "#6B7280", "bold"),
-            ("TODAY",           date.today().strftime("%d %b %Y"), "#6B7280", "bold"),
-            ("REFUND TO FLOAT", "—",                              "#EA580C", "normal"),
-            ("TOTAL USD",       "—",                              "#6B7280", "bold"),
-            ("TOTAL",           "—",                              "#6B7280", "bold"),
+        # ENTRIES + TODAY stay single-value; money tiles stack My / Parked / Combined.
+        simple_cfg = [
+            ("ENTRIES", "—", "#6B7280"),
+            ("TODAY", date.today().strftime("%d %b %Y"), "#6B7280"),
         ]
         self._lbl_date = None
-        val_labels = []
-        for i, (label, init_val, lbl_color, weight) in enumerate(tiles_cfg):
+        self._val_entries: QLabel
+        self._val_today: QLabel
+        for i, (label, init_val, lbl_color) in enumerate(simple_cfg):
             if i > 0:
                 sep = QFrame()
                 sep.setFrameShape(QFrame.VLine)
@@ -212,38 +279,67 @@ class _QBDocHeader(QFrame):
                 hl.addWidget(sep)
 
             tile = QWidget()
-            tile.setFixedWidth(148)
+            tile.setFixedWidth(100)
             tile_vl = QVBoxLayout(tile)
-            tile_vl.setContentsMargins(14, 10, 14, 10)
-            tile_vl.setSpacing(3)
+            tile_vl.setContentsMargins(8, 2, 8, 2)
+            tile_vl.setSpacing(0)
 
             lbl = QLabel(label)
             lbl.setStyleSheet(
-                f"font-size: 9px; color: {lbl_color}; font-weight: 600;"
-                " letter-spacing: 0.6px; font-family: 'Segoe UI', sans-serif;"
-                " background: transparent;"
+                f"font-size: 8px; color: {lbl_color}; font-weight: 600;"
+                " letter-spacing: 0.4px; font-family: 'Segoe UI', sans-serif;"
+                " background: transparent; padding: 0;"
             )
             val = QLabel(init_val)
-            fw = "700" if weight == "bold" else "500"
-            val_color = "#EA580C" if label == "REFUND TO FLOAT" else "#111827"
             val.setStyleSheet(
-                f"font-size: 13px; color: {val_color}; font-weight: {fw};"
+                "font-size: 11px; color: #111827; font-weight: 700;"
                 " font-family: 'Segoe UI', sans-serif; background: transparent;"
+                " padding: 0;"
             )
             tile_vl.addWidget(lbl)
             tile_vl.addWidget(val)
             if label == "TODAY":
                 self._lbl_date = lbl
-            val_labels.append(val)
-            hl.addWidget(tile)
+            if label == "ENTRIES":
+                self._val_entries = val
+            else:
+                self._val_today = val
+            hl.addWidget(tile, 0, Qt.AlignVCenter)
 
-        (
-            self._val_entries,
-            self._val_today,
-            self._val_refund,
-            self._val_total_usd,
-            self._val_total,
-        ) = val_labels
+        money_cfg = [
+            ("REFUND TO FLOAT", "#EA580C", "#EA580C"),
+            ("TOTAL USD", "#6B7280", "#111827"),
+            ("TOTAL", "#6B7280", "#111827"),
+        ]
+        self._stack_refund: dict[str, QLabel]
+        self._stack_usd: dict[str, QLabel]
+        self._stack_tzs: dict[str, QLabel]
+        stacks: list[dict[str, QLabel]] = []
+        for label, lbl_color, accent in money_cfg:
+            sep = QFrame()
+            sep.setFrameShape(QFrame.VLine)
+            sep.setStyleSheet("color: #E5E7EB;")
+            hl.addWidget(sep)
+
+            tile = QWidget()
+            tile.setFixedWidth(150)
+            tile_vl = QVBoxLayout(tile)
+            tile_vl.setContentsMargins(8, 2, 8, 2)
+            tile_vl.setSpacing(1)
+
+            lbl = QLabel(label)
+            lbl.setStyleSheet(
+                f"font-size: 8px; color: {lbl_color}; font-weight: 600;"
+                " letter-spacing: 0.4px; font-family: 'Segoe UI', sans-serif;"
+                " background: transparent; padding: 0;"
+            )
+            wrap, stack = _money_stack_labels(accent=accent)
+            tile_vl.addWidget(lbl)
+            tile_vl.addWidget(wrap)
+            stacks.append(stack)
+            hl.addWidget(tile, 0, Qt.AlignVCenter)
+
+        self._stack_refund, self._stack_usd, self._stack_tzs = stacks
 
     def set_merged(self, merged: bool) -> None:
         self._merged_badge.setVisible(bool(merged))
@@ -267,15 +363,46 @@ class _QBDocHeader(QFrame):
         total_usd: float,
         refund_total: float,
         register_date=None,
+        parked_tzs: float = 0.0,
+        parked_usd: float = 0.0,
+        parked_refund: float = 0.0,
     ) -> None:
         self._val_entries.setText(f"{n_entries} entr{'y' if n_entries == 1 else 'ies'}")
-        self._val_total_usd.setText(f"USD {total_usd:,.2f}" if total_usd else "—")
-        self._val_total.setText(f"TZS {total_tzs:,.0f}" if total_tzs else "—")
-        self._val_refund.setText(f"TZS {refund_total:,.0f}" if refund_total else "—")
+        self._set_stack(
+            self._stack_tzs,
+            total_tzs,
+            parked_tzs,
+            fmt=_fmt_tzs,
+        )
+        self._set_stack(
+            self._stack_usd,
+            total_usd,
+            parked_usd,
+            fmt=_fmt_usd,
+        )
+        self._set_stack(
+            self._stack_refund,
+            refund_total,
+            parked_refund,
+            fmt=_fmt_tzs,
+        )
         if register_date is None:
             self.clear_view_date()
         else:
             self.set_view_date(register_date)
+
+    @staticmethod
+    def _set_stack(
+        stack: dict[str, QLabel],
+        my_amount: float,
+        parked_amount: float,
+        *,
+        fmt,
+    ) -> None:
+        combined = float(my_amount or 0.0) + float(parked_amount or 0.0)
+        stack["totals"].setText(fmt(float(my_amount or 0.0)))
+        stack["parked"].setText(fmt(float(parked_amount or 0.0)))
+        stack["combined"].setText(fmt(combined))
 
     def clear_view_date(self) -> None:
         """Blank New table — no reconciled day yet."""
@@ -1140,8 +1267,11 @@ class CashierDashboard(QWidget):
         self._register.navigate_to_upload(upload_id, primary_date)
 
     def _on_drafts_open_register(self, d: date) -> None:
+        """Open My for the day; day cache also holds parked for the Parked tab."""
         self._on_nav("table")
-        self._register.navigate_to_date(d, merged=False)
+        self._register.navigate_to_date(
+            d, merged=False, view_mode="my", announce_parked=True
+        )
 
     def _on_saved_open_merged(self, d: date) -> None:
         self._on_nav("table")

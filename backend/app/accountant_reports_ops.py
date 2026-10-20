@@ -26,9 +26,10 @@ def category_report_reference_year(
     return date.today().year
 
 
-def build_category_report_query(
-    category: str,
+def build_named_report_query(
+    name: str,
     *,
+    match_field: str,
     description: str = "",
     descriptions: str | Sequence[str] | None = None,
     date_from: datetime | None = None,
@@ -36,15 +37,16 @@ def build_category_report_query(
     column_filters: dict[str, Sequence[str]] | None = None,
     cashier_ids: Sequence[ObjectId] | None = None,
 ) -> dict[str, Any]:
+    """Verified / not-trashed master rows matching one catalog name field."""
     import re
 
-    name = (category or "").strip()
+    value = (name or "").strip()
     query: dict[str, Any] = {
         "verified": True,
         "deletion_requested": {"$ne": True},
         "trashed": {"$ne": True},
-        "category_name": {
-            "$regex": f"^{re.escape(name)}$",
+        match_field: {
+            "$regex": f"^{re.escape(value)}$",
             "$options": "i",
         },
     }
@@ -71,6 +73,50 @@ def build_category_report_query(
         cashier_ids=cashier_ids,
     )
     return merge_and_clauses(query, and_clauses)
+
+
+def build_category_report_query(
+    category: str,
+    *,
+    description: str = "",
+    descriptions: str | Sequence[str] | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: dict[str, Sequence[str]] | None = None,
+    cashier_ids: Sequence[ObjectId] | None = None,
+) -> dict[str, Any]:
+    return build_named_report_query(
+        category,
+        match_field="category_name",
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+        cashier_ids=cashier_ids,
+    )
+
+
+def build_payee_report_query(
+    payee: str,
+    *,
+    description: str = "",
+    descriptions: str | Sequence[str] | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    column_filters: dict[str, Sequence[str]] | None = None,
+    cashier_ids: Sequence[ObjectId] | None = None,
+) -> dict[str, Any]:
+    return build_named_report_query(
+        payee,
+        match_field="payee",
+        description=description,
+        descriptions=descriptions,
+        date_from=date_from,
+        date_to=date_to,
+        column_filters=column_filters,
+        cashier_ids=cashier_ids,
+    )
 
 
 def category_report_sort_clauses(

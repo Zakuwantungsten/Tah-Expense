@@ -18,6 +18,25 @@ DRAFT_BASE_MATCH: dict[str, Any] = {
     "trashed": {"$ne": True},
 }
 
+# Draft inbox day list / badge: drafts plus parked truck follow-up rows.
+DRAFT_OR_PARKED_MATCH: dict[str, Any] = {
+    "register_status": {"$in": ["draft", "parked"]},
+    "verified": {"$ne": True},
+    "rejected": {"$ne": True},
+    "discarded": {"$ne": True},
+    "deletion_requested": {"$ne": True},
+    "trashed": {"$ne": True},
+}
+
+PARKED_BASE_MATCH: dict[str, Any] = {
+    "register_status": "parked",
+    "verified": {"$ne": True},
+    "rejected": {"$ne": True},
+    "discarded": {"$ne": True},
+    "deletion_requested": {"$ne": True},
+    "trashed": {"$ne": True},
+}
+
 # Open register rows for Day Issues (draft + submitted, not yet verified).
 OPEN_REGISTER_MATCH: dict[str, Any] = {
     "verified": {"$ne": True},

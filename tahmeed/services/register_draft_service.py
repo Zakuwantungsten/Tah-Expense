@@ -19,8 +19,8 @@ from bson import ObjectId
 
 from tahmeed.config import APP_NAME
 
-# v4: ``parked_rows`` — incorrect-truck rows parked locally (never sent to the
-# server until the cashier fixes the truck and Saves them from Parked).
+# v4: ``parked_rows`` — incorrect-truck rows parked locally until Save persists
+# them as ``register_status=parked`` (or Clear parked moves them to Trash).
 SCHEMA_VERSION = 4
 
 # Per-row outbox sync state (stored in pending_meta / draft new_rows).

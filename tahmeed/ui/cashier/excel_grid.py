@@ -1019,7 +1019,10 @@ class DailyRegister(QWidget):
     """Unified daily expense register (replaces ExcelGrid + TransactionsTable)."""
 
     rows_saved        = Signal(int)
-    stats_updated     = Signal(int, float, float, float, object)  # n, tzs, usd, refund, date
+    # n, my_tzs, my_usd, my_refund, date, parked_tzs, parked_usd, parked_refund
+    stats_updated     = Signal(
+        int, float, float, float, object, float, float, float
+    )
     register_status_updated = Signal(int, int)  # draft_count, submitted_count on saved rows
     drafts_changed        = Signal()
     day_issues_requested  = Signal(object)  # date | None — open Day Issues for this day
@@ -1054,6 +1057,7 @@ class DailyRegister(QWidget):
         self._cat_by_name: dict = {c.name.lower(): c for c in categories}
         self._locked_subitems: dict = {}   # item name (lower) -> [sub-item names]
         self._restrict_items: bool = False
+        self._restrict_payees: bool = False
         self._export_restrict_surfaces: set = set()
         self._defer_item_to_verify: bool = False
         # When True, typed/pasted descriptions fill blank Item/Payee from maps.
@@ -1064,18 +1068,20 @@ class DailyRegister(QWidget):
         self._fleet_kinds: dict = {}       # number → "truck" | "trailer" | "motor_vehicle"
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
         self._people_names: list = []      # Ownership / APR BY suggestions (unrestricted)
-        self._payee_names: list = []       # Payee catalog suggestions (unrestricted)
+        self._payee_names: list = []       # Payee catalog suggestions
+        # Guards QuickBooks-style not-in-list prompts (row, col) while modal is open.
+        self._not_in_list_prompting: set = set()
         self._cashier_names: dict = {}     # ObjectId -> display name
         self._view_mode: str = "my"        # "my" | "parked" | "merged"
         self._merged_mode: bool = False    # Shared/Merged day (all cashiers)
         self._parked_mode: bool = False    # Parked incorrect-truck follow-up
         self._parked_day_count: int = 0
-        # Server rows already saved with register_status=parked (legacy flow).
+        # Server rows already saved with register_status=parked.
         self._server_parked_count: int = 0
-        # Local Parked bucket: incorrect-truck rows set aside *without* saving.
+        # Local Parked bucket until Save persists them as register_status=parked.
         # Serialized draft entries ({client_row_id, cells, pending_meta}); the
-        # My draft file (``parked_rows``) is the durable copy. Rows return to
-        # My entries once the truck is fixed and the cashier Saves from Parked.
+        # My draft file (``parked_rows``) holds them between Park and Save.
+        self._announce_parked_on_load: bool = False
         self._local_parked: list = []
         self._current_date: Optional[date] = date.today()
         self._saved_count: int   = 0
@@ -1394,6 +1400,7 @@ class DailyRegister(QWidget):
         *,
         merged: bool | None = None,
         view_mode: str | None = None,
+        announce_parked: bool = False,
     ) -> bool:
         """Called by dashboard when TransactionBrowser 'Go To' is used.
 
@@ -1402,11 +1409,15 @@ class DailyRegister(QWidget):
         merged=True shows every cashier's rows (Browse is a merged view).
         view_mode — optional ``my`` / ``parked`` / ``merged`` applied before load
         (e.g. Trash restore of parked rows).
+        announce_parked — after load, toast if parked truck rows remain for the day
+        (Drafts → Open in Register).
         """
         if isinstance(d, datetime):
             d = d.date()
         if not isinstance(d, date):
             return False
+
+        self._announce_parked_on_load = bool(announce_parked)
 
         # Blank New table → user picked a Reconciled Date.
         if self._current_date is None:
@@ -1727,7 +1738,7 @@ class DailyRegister(QWidget):
         self._apply_column_visibility(show_cashier=show_cashier)
 
     # ------------------------------------------------------------------
-    # Local Parked bucket (incorrect trucks set aside without saving)
+    # Local Parked bucket (incorrect trucks awaiting Save → server parked)
     # ------------------------------------------------------------------
 
     def _emit_parked_count(self) -> None:
@@ -1759,14 +1770,77 @@ class DailyRegister(QWidget):
             meta = dict(self._pending_row_meta.get(row) or {})
             meta["parked"] = True
             meta["client_row_id"] = rid
-            # Parked rows are never queued for the server.
-            meta.pop("sync_status", None)
+            # Keep outbox sync_status when queued; drop stale empty values.
+            if not meta.get("sync_status"):
+                meta.pop("sync_status", None)
             out.append({
                 "client_row_id": rid,
                 "cells": cells_for_json(self._row_value_map(row)),
                 "pending_meta": serialize_pending_meta(meta),
             })
         return out
+
+    def _materialize_local_parked_for_save(self) -> list[int]:
+        """Append ``_local_parked`` onto the current grid for the Save insert pass.
+
+        Used when Save runs from My: parked rows already left the My table into
+        the local bucket. Returns the row indices that were added.
+        """
+        if self._parked_mode or self._merged_mode or not self._local_parked:
+            return []
+        existing: set[str] = set()
+        for row in range(self._saved_count, self._table.rowCount()):
+            if self._row_has_data(row) and self._row_marked_parked(row):
+                rid = entry_client_row_id(
+                    {"client_row_id": (self._pending_row_meta.get(row) or {}).get(
+                        "client_row_id"
+                    )}
+                ) or self._ensure_row_client_id(row)
+                if rid:
+                    existing.add(rid)
+        to_add = [
+            e for e in self._local_parked
+            if isinstance(e, dict) and entry_client_row_id(e) not in existing
+        ]
+        if not to_add:
+            return []
+        start = self._table.rowCount()
+        self._bulk_mutating = True
+        self._restoring_draft = True
+        prev = self._table.blockSignals(True)
+        try:
+            self._table.setRowCount(start + len(to_add))
+            self._init_editable_rows(start, start + len(to_add))
+            for offset, entry in enumerate(to_add):
+                row = start + offset
+                values = cells_from_json(entry.get("cells"))
+                self._write_row_values(row, values)
+                meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+                meta["parked"] = True
+                rid = entry_client_row_id(entry) or meta.get("client_row_id")
+                meta["client_row_id"] = rid or new_client_row_id()
+                # Preserve PENDING when offline-queued; otherwise clear.
+                if not meta.get("sync_status"):
+                    meta.pop("sync_status", None)
+                self._pending_row_meta[row] = meta
+                self._activate_row(row)
+                self._sync_row_date(row)
+        finally:
+            self._table.blockSignals(prev)
+            self._restoring_draft = False
+            self._bulk_mutating = False
+        self._renumber()
+        return list(range(start, start + len(to_add)))
+
+    def _drop_local_parked_by_client_ids(self, client_ids: set[str]) -> None:
+        """Remove local parked entries that were ACKed by the server."""
+        if not client_ids:
+            return
+        self._local_parked = [
+            e for e in self._local_parked
+            if entry_client_row_id(e) not in client_ids
+        ]
+        self._emit_parked_count()
 
     def _append_local_parked_rows(self) -> None:
         """Parked view: show locally parked rows as editable unsaved rows."""
@@ -1864,13 +1938,14 @@ class DailyRegister(QWidget):
 
         Used after Fix parked trucks (Allow / Allow all / Apply). Local parked
         rows are appended to the keep-alive My grid; saved ``register_status=
-        parked`` leftovers are unparked to draft on the server.
+        parked`` leftovers are unparked to draft on the server (truck + status).
         """
         if not self._parked_mode:
             return 0
         self._commit_open_editor()
         local_rows: list[int] = []
-        saved_ids: list = []
+        # (tx_id, updates) so Correct persists the new truck with the status flip.
+        saved_patches: list[tuple] = []
         for row in range(self._table.rowCount()):
             if row >= self._saved_count and not self._row_has_data(row):
                 continue
@@ -1881,11 +1956,19 @@ class DailyRegister(QWidget):
             if not self._row_truck_is_valid(row):
                 continue
             if row in self._saved_ids:
-                saved_ids.append(self._saved_ids[row])
+                tx_id = self._saved_ids[row]
+                try:
+                    updates = self._updates_from_row(row) or {}
+                except ValueError:
+                    updates = {}
+                updates = dict(updates)
+                updates["register_status"] = "draft"
+                saved_patches.append((tx_id, updates))
+                self._dirty_rows.discard(row)
             elif row >= self._saved_count:
                 local_rows.append(row)
 
-        if not local_rows and not saved_ids:
+        if not local_rows and not saved_patches:
             return 0
 
         entries: list = []
@@ -1930,12 +2013,12 @@ class DailyRegister(QWidget):
         self._flush_day_issues_source_changed(force=True)
 
         n_local = len(entries)
-        n_saved = len(saved_ids)
+        n_saved = len(saved_patches)
         total = n_local + n_saved
-        if saved_ids:
+        if saved_patches:
             asyncio.ensure_future(
                 self._unpark_saved_rows(
-                    saved_ids,
+                    saved_patches,
                     loading_message=(
                         f"Moving {n_saved} accepted "
                         f"row{'s' if n_saved != 1 else ''} to My…"
@@ -2036,7 +2119,7 @@ class DailyRegister(QWidget):
         if n:
             self.transient_status.emit(
                 f"{n} row{'s' if n != 1 else ''} parked for truck follow-up — "
-                "not saved. Fix them under Parked."
+                "click Save to store them. Fix trucks under Parked anytime."
             )
         return n
 
@@ -2081,8 +2164,23 @@ class DailyRegister(QWidget):
             return False
         self._apply_txs_to_view(list(self._day_tx_cache), upload_id="")
         self._maybe_restore_draft_after_populate()
+        self._maybe_announce_parked_after_load()
         self._schedule_outbox_drain(delay_ms=800)
         return True
+
+    def _maybe_announce_parked_after_load(self) -> None:
+        """Toast parked follow-up count after Drafts → Open in Register."""
+        if not self._announce_parked_on_load:
+            return
+        self._announce_parked_on_load = False
+        n = int(self._parked_day_count or 0)
+        if n <= 0:
+            return
+        plural = "s" if n != 1 else ""
+        self.transient_status.emit(
+            f"{n} parked truck row{plural} on this day — "
+            "open Parked to fix before submit"
+        )
 
     async def _load_date(self, d: date) -> None:
         from tahmeed.ui.async_utils import pause_background_polls
@@ -2145,6 +2243,7 @@ class DailyRegister(QWidget):
                 reload_local_parked=(self._my_session is None),
             )
             self._maybe_restore_draft_after_populate()
+            self._maybe_announce_parked_after_load()
             # Successful paint — Table / My no longer need a forced refresh.
             self._day_tx_stale = False
             # Reconnect / open-day: push any PENDING/FAILED outbox rows.
@@ -2616,54 +2715,258 @@ class DailyRegister(QWidget):
     # Footer
     # ------------------------------------------------------------------
 
-    def _update_footer(self) -> None:
-        """Recompute entries / TZS / USD / refund from the live grid."""
-        n, tzs, usd, refund = 0, 0.0, 0.0, 0.0
+    @staticmethod
+    def _blank_money_bucket() -> dict:
+        return {"n": 0, "tzs": 0.0, "usd": 0.0, "refund": 0.0}
+
+    @staticmethod
+    def _add_money_buckets(a: dict, b: dict) -> dict:
+        return {
+            "n": int(a.get("n") or 0) + int(b.get("n") or 0),
+            "tzs": float(a.get("tzs") or 0.0) + float(b.get("tzs") or 0.0),
+            "usd": float(a.get("usd") or 0.0) + float(b.get("usd") or 0.0),
+            "refund": float(a.get("refund") or 0.0) + float(b.get("refund") or 0.0),
+        }
+
+    def _accumulate_raw_money(
+        self,
+        bucket: dict,
+        raw_tzs: str,
+        raw_usd: str,
+        raw_ref: str,
+    ) -> bool:
+        """Add one money line into *bucket*. Returns False when the line is skipped."""
+        raw_tzs = (raw_tzs or "").strip()
+        raw_usd = (raw_usd or "").strip()
+        if not raw_tzs and not raw_usd:
+            return False
+        tzs_amt = _parse_amount_text(raw_tzs) if raw_tzs else 0.0
+        usd_amt = _parse_amount_text(raw_usd) if raw_usd else 0.0
+        # Skip non-numeric leftovers that parse as 0
+        if (
+            raw_tzs
+            and tzs_amt == 0.0
+            and not any(ch.isdigit() for ch in raw_tzs)
+            and not raw_usd
+        ):
+            return False
+        if (
+            raw_usd
+            and usd_amt == 0.0
+            and not any(ch.isdigit() for ch in raw_usd)
+            and not raw_tzs
+        ):
+            return False
+        bucket["n"] = int(bucket.get("n") or 0) + 1
+        bucket["tzs"] = float(bucket.get("tzs") or 0.0) + tzs_amt
+        bucket["usd"] = float(bucket.get("usd") or 0.0) + usd_amt
+        if _is_refund_float(raw_ref or ""):
+            # Refund-to-float stays TZS-only.
+            bucket["refund"] = float(bucket.get("refund") or 0.0) + tzs_amt
+        return True
+
+    def _money_bucket_from_table(
+        self,
+        table,
+        *,
+        saved_count: int,
+        saved_txs: dict | None = None,
+        current_date=None,
+    ) -> dict:
+        """Sum entries / TZS / USD / refund from one register table surface."""
+        bucket = self._blank_money_bucket()
+        if table is None:
+            return bucket
+        saved_txs = saved_txs if saved_txs is not None else {}
         # Multiset of saved-row fingerprints so editable copies of already-saved
         # expenses (partial-save / bad restore) do not inflate money totals.
-        saved_fps = self._saved_expense_fingerprint_counts()
-        for row in range(self._table.rowCount()):
-            tzs_it = self._table.item(row, COL_TZS)
-            usd_it = self._table.item(row, COL_USD)
+        saved_fps: dict = {}
+        for row in range(int(saved_count or 0)):
+            tx = saved_txs.get(row)
+            if tx is not None:
+                fp = self._expense_fingerprint_for_tx(tx)
+            else:
+                fp = self._expense_fingerprint_for_table_row(
+                    table, row, current_date=current_date
+                )
+            if not fingerprint_is_meaningful(fp):
+                continue
+            saved_fps[fp] = saved_fps.get(fp, 0) + 1
+        for row in range(table.rowCount()):
+            tzs_it = table.item(row, COL_TZS)
+            usd_it = table.item(row, COL_USD)
             raw_tzs = tzs_it.text().strip() if tzs_it else ""
             raw_usd = usd_it.text().strip() if usd_it else ""
-            if not raw_tzs and not raw_usd:
-                continue
-            tzs_amt = _parse_amount_text(raw_tzs) if raw_tzs else 0.0
-            usd_amt = _parse_amount_text(raw_usd) if raw_usd else 0.0
-            # Skip non-numeric leftovers that parse as 0
-            if (
-                raw_tzs
-                and tzs_amt == 0.0
-                and not any(ch.isdigit() for ch in raw_tzs)
-                and not raw_usd
-            ):
-                continue
-            if (
-                raw_usd
-                and usd_amt == 0.0
-                and not any(ch.isdigit() for ch in raw_usd)
-                and not raw_tzs
-            ):
-                continue
-            if row >= self._saved_count:
-                fp = self._expense_fingerprint_for_row(row)
+            if row >= int(saved_count or 0):
+                fp = self._expense_fingerprint_for_table_row(
+                    table, row, current_date=current_date
+                )
                 if claim_fingerprint(saved_fps, fp):
                     continue
-            n += 1
-            tzs += tzs_amt
-            usd += usd_amt
-            ref_it = self._table.item(row, COL_REF)
-            if ref_it and _is_refund_float(ref_it.text()):
-                refund += tzs_amt  # refund-to-float stays TZS-only
+            ref_it = table.item(row, COL_REF)
+            raw_ref = ref_it.text() if ref_it else ""
+            self._accumulate_raw_money(bucket, raw_tzs, raw_usd, raw_ref)
+        return bucket
 
-        amount_str = f"TZS {tzs:,.0f}" if tzs else "—"
-        usd_str = f"USD {usd:,.2f}" if usd else "—"
-        self._totals_label.setText(
-            f"{n} entr{'y' if n == 1 else 'ies'}   ·   {usd_str}   ·   {amount_str}"
+    def _expense_fingerprint_for_table_row(
+        self, table, row: int, *, current_date=None
+    ):
+        """Content fingerprint for a row on any register table surface."""
+        def txt(col: int) -> str:
+            it = table.item(row, col)
+            return it.text().strip() if it else ""
+
+        day = current_date if current_date is not None else self._current_date
+        year = day.year if day else date.today().year
+        raw_date = txt(COL_DATE)
+        parsed = _parse_optional_date(raw_date, default_year=year) if raw_date else None
+        if parsed is not None:
+            row_date = parsed.date().isoformat()
+        elif day is not None:
+            row_date = day.isoformat()
+        else:
+            row_date = ""
+        tzs_raw = txt(COL_TZS)
+        usd_raw = txt(COL_USD)
+        return expense_content_fingerprint(
+            description=txt(COL_DESC),
+            truck_number=txt(COL_TRUCK),
+            item=txt(COL_ITEM),
+            tzs=_parse_amount_text(tzs_raw) if tzs_raw else 0.0,
+            usd=_parse_amount_text(usd_raw) if usd_raw else 0.0,
+            row_date_iso=row_date,
         )
-        self.stats_updated.emit(n, tzs, usd, refund, self._current_date)
+
+    def _money_bucket_from_txs(self, txs) -> dict:
+        bucket = self._blank_money_bucket()
+        for tx in txs or []:
+            try:
+                tzs_amt, usd_amt = tx.money_parts()
+            except Exception:
+                tzs_amt = float(getattr(tx, "amount", 0) or 0)
+                usd_amt = float(getattr(tx, "amount_usd", 0) or 0)
+            if not tzs_amt and not usd_amt:
+                continue
+            bucket["n"] = int(bucket["n"]) + 1
+            bucket["tzs"] = float(bucket["tzs"]) + float(tzs_amt or 0.0)
+            bucket["usd"] = float(bucket["usd"]) + float(usd_amt or 0.0)
+            ref = getattr(tx, "ref_float", None) or ""
+            if _is_refund_float(ref) or bool(getattr(tx, "notes_flag", False)):
+                bucket["refund"] = float(bucket["refund"]) + float(tzs_amt or 0.0)
+        return bucket
+
+    def _money_bucket_from_local_parked(self, entries) -> dict:
+        bucket = self._blank_money_bucket()
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            values = cells_from_json(entry.get("cells"))
+            raw_tzs = (values.get(COL_TZS) or "").strip()
+            raw_usd = (values.get(COL_USD) or "").strip()
+            raw_ref = (values.get(COL_REF) or "").strip()
+            self._accumulate_raw_money(bucket, raw_tzs, raw_usd, raw_ref)
+        return bucket
+
+    def _server_parked_txs_for_totals(self) -> list:
+        """Parked server txs for the open day (own cashier unless Merged)."""
+        txs = list(self._day_tx_cache or [])
+        parked = [
+            tx for tx in txs
+            if (getattr(tx, "register_status", "") or "") == "parked"
+        ]
+        if self._merged_mode:
+            return parked
+        uid = self._user._id
+        return [
+            tx for tx in parked
+            if tx.cashier_id == uid or str(tx.cashier_id) == str(uid)
+        ]
+
+    def _my_money_bucket(self) -> dict:
+        """Totals for non-parked My entries (live My table or keep-alive session)."""
+        if self._parked_mode and self._my_table is not None and self._my_session:
+            session = self._my_session
+            return self._money_bucket_from_table(
+                self._my_table,
+                saved_count=int(session.get("saved_count") or 0),
+                saved_txs=session.get("saved_txs") or {},
+                current_date=self._current_date,
+            )
+        if self._parked_mode:
+            # Parked open without a keep-alive My session — use day cache drafts.
+            txs = [
+                tx for tx in (self._day_tx_cache or [])
+                if (getattr(tx, "register_status", "") or "") != "parked"
+            ]
+            if not self._merged_mode:
+                uid = self._user._id
+                txs = [
+                    tx for tx in txs
+                    if tx.cashier_id == uid or str(tx.cashier_id) == str(uid)
+                ]
+            return self._money_bucket_from_txs(txs)
+        # Active surface is My (or Merged): live grid is the source of truth.
+        return self._money_bucket_from_table(
+            self._table,
+            saved_count=self._saved_count,
+            saved_txs=self._saved_txs,
+            current_date=self._current_date,
+        )
+
+    def _parked_money_bucket(self) -> dict:
+        """Totals for parked follow-up rows (server + local bucket / Parked grid)."""
+        if self._parked_mode:
+            return self._money_bucket_from_table(
+                self._table,
+                saved_count=self._saved_count,
+                saved_txs=self._saved_txs,
+                current_date=self._current_date,
+            )
+        # Prefer the mounted Parked table when it already holds rows (edits stay live).
+        parked_table = self._parked_table
+        if parked_table is not None and parked_table.rowCount() > 0:
+            # Maps were reset when leaving Parked; scan cells without fingerprint skip.
+            live = self._money_bucket_from_table(
+                parked_table,
+                saved_count=0,
+                saved_txs={},
+                current_date=self._current_date,
+            )
+            if live["n"]:
+                return live
+        server = self._money_bucket_from_txs(self._server_parked_txs_for_totals())
+        local = self._money_bucket_from_local_parked(self._local_parked)
+        return self._add_money_buckets(server, local)
+
+    def _update_footer(self) -> None:
+        """Recompute My / Parked / Combined money KPIs and the grid footer strip."""
+        my = self._my_money_bucket()
+        parked = self._parked_money_bucket()
+        combined = self._add_money_buckets(my, parked)
+
+        # Footer strip stays scoped to the visible surface (current tab).
+        if self._parked_mode:
+            view = parked
+        else:
+            view = my
+        amount_str = f"TZS {view['tzs']:,.0f}" if view["tzs"] else "—"
+        usd_str = f"USD {view['usd']:,.2f}" if view["usd"] else "—"
+        self._totals_label.setText(
+            f"{view['n']} entr{'y' if view['n'] == 1 else 'ies'}"
+            f"   ·   {usd_str}   ·   {amount_str}"
+        )
+        self.stats_updated.emit(
+            int(combined["n"]),
+            float(my["tzs"]),
+            float(my["usd"]),
+            float(my["refund"]),
+            self._current_date,
+            float(parked["tzs"]),
+            float(parked["usd"]),
+            float(parked["refund"]),
+        )
         draft_n = submitted_n = 0
+        # Draft badge counts saved rows on the active surface.
         for row in range(self._saved_count):
             tx = self._saved_txs.get(row)
             if tx is None:
@@ -2718,6 +3021,21 @@ class DailyRegister(QWidget):
             raise ValueError(f'"{item_name}" is not a known item.')
         elif item_name:
             item_name = item_name.upper()
+
+        payee_name = txt(COL_PAYEE).strip()
+        if payee_name and self._restrict_payees:
+            known_payee = next(
+                (p for p in self._payee_names if p.upper() == payee_name.upper()),
+                None,
+            )
+            if known_payee is None and self._payee_names:
+                raise ValueError(f'"{payee_name}" is not a known payee.')
+            if known_payee is not None:
+                payee_name = known_payee.upper()
+            else:
+                payee_name = payee_name.upper()
+        else:
+            payee_name = payee_name.upper()
 
         if cat is not None and getattr(cat, "lock_description", False):
             allowed = self._locked_subitems.get(item_name.lower(), [])
@@ -2834,7 +3152,7 @@ class DailyRegister(QWidget):
             notes_flag=_is_refund_float(ref_text),
             ownership=txt(COL_OWN).upper(),
             approver=txt(COL_APR).upper(),
-            payee=txt(COL_PAYEE).upper(),
+            payee=payee_name,
             cheque=txt(COL_CHEQUE).upper(),
             cashier_id=self._user._id,
             day_order=_meta_day_order,
@@ -3480,6 +3798,8 @@ class DailyRegister(QWidget):
             self._mark_dirty(row)
             if col == COL_ITEM:
                 self._validate_item_cell(row, item)
+            elif col == COL_PAYEE:
+                self._validate_payee_cell(row, item)
             elif col == COL_DESC and item.text().strip():
                 self._validate_locked_description(row, item)
             elif col == COL_TRUCK and item.text().strip():
@@ -3512,9 +3832,11 @@ class DailyRegister(QWidget):
             self._sync_row_date(row)
             self._table.blockSignals(False)
 
-        # Item / Description / Truck validation (canonicalise, restrict, locked lists)
+        # Item / Payee / Description / Truck validation (canonicalise, restrict, locked)
         if col == COL_ITEM:
             self._validate_item_cell(row, item)
+        elif col == COL_PAYEE:
+            self._validate_payee_cell(row, item)
         elif col == COL_DESC and item.text().strip():
             from tahmeed.services.cashier_service import remember_description
             remember_description(item.text())
@@ -3748,19 +4070,23 @@ class DailyRegister(QWidget):
 
         QTableWidget.keyPressEvent(self._table, event)
 
+    def _tab_skips_col(self, col: int, skip: set) -> bool:
+        """True if Tab/Backtab should not land on this column."""
+        return col in skip or self._table.isColumnHidden(col)
+
     def _tab_forward(self) -> None:
-        """Advance Tab: skip readonly cols, wrap to next row at last column."""
+        """Advance Tab: skip readonly/hidden cols, wrap to next row at last column."""
         row, col = self._table.currentRow(), self._table.currentColumn()
         skip = READONLY_COLS
         next_col = col + 1
-        while next_col < self._table.columnCount() and next_col in skip:
+        while next_col < self._table.columnCount() and self._tab_skips_col(next_col, skip):
             next_col += 1
         if next_col >= self._table.columnCount():
             next_row = row + 1
             if next_row >= self._table.rowCount():
                 self._append_editable_rows(10)
             first_col = 0
-            while first_col < self._table.columnCount() and first_col in skip:
+            while first_col < self._table.columnCount() and self._tab_skips_col(first_col, skip):
                 first_col += 1
             self._activate_row(next_row)
             self._table.setCurrentCell(next_row, first_col)
@@ -3809,7 +4135,7 @@ class DailyRegister(QWidget):
         new_col, new_row = col + dc, row + dr
         if skip and dc != 0:
             while 0 <= new_col < self._table.columnCount():
-                if new_col not in skip:
+                if not self._tab_skips_col(new_col, skip):
                     break
                 new_col += dc
         new_row = max(0, min(new_row, self._table.rowCount() - 1))
@@ -6696,10 +7022,8 @@ class DailyRegister(QWidget):
     def has_unsaved_work(self, *, include_stashed_my: bool = True) -> bool:
         """True when edit-mode dirty rows or typed-but-unsaved new rows exist.
 
-        Locally parked rows whose truck is still wrong are not "unsaved work":
-        they are persisted in the local draft by design and only leave Parked
-        when the cashier fixes the truck and Saves. A parked row whose truck
-        has been fixed *is* unsaved work (Save moves it to My entries).
+        Unsaved parked rows (local bucket or still on the Parked grid) count as
+        unsaved work — Save persists them as ``register_status=parked``.
 
         While Parked is showing, also inspect the keep-alive My table/session so
         navigation prompts still see leftover My entries. Pass
@@ -6708,10 +7032,11 @@ class DailyRegister(QWidget):
         """
         if self._dirty_rows:
             return True
+        # Local Parked bucket waiting on My for the next Save → server.
+        if self._local_parked and not self._parked_mode and not self._merged_mode:
+            return True
         for row in range(self._saved_count, self._table.rowCount()):
             if not self._row_has_data(row):
-                continue
-            if self._parked_mode and self._row_stays_parked(row):
                 continue
             return True
         if (
@@ -7263,13 +7588,14 @@ class DailyRegister(QWidget):
 
     def _enqueue_offline_outbox(self) -> None:
         """Persist unsaved work as PENDING outbox entries (no network)."""
+        if not self._parked_mode and self._local_parked:
+            self._materialize_local_parked_for_save()
         for row in range(self._saved_count, self._table.rowCount()):
             if not self._row_has_data(row):
                 continue
-            if self._row_stays_parked(row):
-                # Local Parked bucket — never queued for the server.
-                continue
             self._set_row_sync_status(row, SYNC_PENDING)
+        if self._parked_mode:
+            self._local_parked = self._table_parked_entries()
         self._flush_local_draft()
 
     async def _drain_register_outbox(self) -> None:
@@ -7305,12 +7631,6 @@ class DailyRegister(QWidget):
             try:
                 to_save: list[tuple[int, Transaction]] = []
                 for row in rows:
-                    if self._row_stays_parked(row):
-                        # Stale PENDING on a parked wrong-truck row — stays local.
-                        row_meta = dict(self._pending_row_meta.get(row) or {})
-                        row_meta.pop("sync_status", None)
-                        self._pending_row_meta[row] = row_meta
-                        continue
                     try:
                         tx = self._build_transaction_from_row(row)
                     except ValueError:
@@ -7390,9 +7710,21 @@ class DailyRegister(QWidget):
                         any_fail = True
                         self._set_row_sync_status(row, SYNC_FAILED)
 
+                drained_parked_ids: set[str] = set()
                 for i in sorted(success_idxs, reverse=True):
-                    row, _tx = to_save[i]
+                    row, tx = to_save[i]
+                    if (getattr(tx, "register_status", "") or "") == "parked":
+                        rid = (
+                            getattr(tx, "client_row_id", None)
+                            or (self._pending_row_meta.get(row) or {}).get(
+                                "client_row_id"
+                            )
+                        )
+                        if rid:
+                            drained_parked_ids.add(str(rid))
                     self._mark_new_row_saved(row, flush=False)
+                if drained_parked_ids:
+                    self._drop_local_parked_by_client_ids(drained_parked_ids)
 
                 meta["synced"] = synced
                 meta["already_exists"] = already_exists
@@ -7963,6 +8295,7 @@ class DailyRegister(QWidget):
         saved, updated, errors = 0, 0, []
         already_exists = 0
         kept_parked = 0
+        parked_saved_ids: set[str] = set()
         deferred_dups: set[int] = set()
         self._commit_open_editor()
 
@@ -8010,12 +8343,14 @@ class DailyRegister(QWidget):
             )
         ):
             if parked_only:
+                if not self._parked_mode and self._local_parked:
+                    self._materialize_local_parked_for_save()
                 for row in range(self._saved_count, self._table.rowCount()):
                     if not self._row_has_data(row) or not self._row_marked_parked(row):
                         continue
-                    if self._row_stays_parked(row):
-                        continue  # wrong truck → stays in the local bucket
                     self._set_row_sync_status(row, SYNC_PENDING)
+                if self._parked_mode:
+                    self._local_parked = self._table_parked_entries()
                 self._flush_local_draft()
             else:
                 self._enqueue_offline_outbox()
@@ -8069,6 +8404,9 @@ class DailyRegister(QWidget):
                 pending_edit_rows.append((row, tx_id, updates))
             elif orig is not None and (getattr(orig, "register_status", "") or "") == "draft":
                 inplace_updates.append((row, tx_id, updates))
+            elif orig is not None and (getattr(orig, "register_status", "") or "") == "parked":
+                # Parked truck follow-up → draft (Fix trucks / typed truck + Save).
+                inplace_updates.append((row, tx_id, updates))
             elif orig is not None:
                 updates["edited_after_verification"] = True
                 if getattr(orig, "rejected", False):
@@ -8109,14 +8447,18 @@ class DailyRegister(QWidget):
             except Exception as exc:
                 errors.append(f"Row {row + 1}: {exc}")
 
-        # ── Pass 2: insert brand-new rows (INSERT) — My entries only ───
+        # ── Pass 2: insert brand-new rows (INSERT) — My + parked ───
         pending_inserts: list[tuple[int, Transaction]] = []
         queued = 0
         if not self._merged_mode:
             dup_days = int(getattr(self, "_duplicate_check_days", 5) or 5)
 
-            # Pre-scan: warn once if any new rows carry a date other than the open day.
-            # Parked-only persist skips this — parking is silent follow-up, not a full Save.
+            # My Save: bring local Parked bucket onto the grid so inserts cover them.
+            if not self._parked_mode and self._local_parked:
+                self._materialize_local_parked_for_save()
+
+            # Pre-scan: warn once if any new draft rows carry a date other than the open day.
+            # Parked follow-up rows skip this dialog.
             if not parked_only:
                 register_label = self._current_date.strftime("%d %b %Y")
                 _off_date = 0
@@ -8160,11 +8502,6 @@ class DailyRegister(QWidget):
                     continue
                 if parked_only and not self._row_marked_parked(row):
                     continue
-                if self._row_stays_parked(row):
-                    # Local Parked bucket: never sent to the server while the
-                    # truck is still wrong. Fix it under Parked, then Save.
-                    kept_parked += 1
-                    continue
                 try:
                     tx = self._build_transaction_from_row(row)
                 except ValueError as exc:
@@ -8180,13 +8517,16 @@ class DailyRegister(QWidget):
                     tx.day_order = row
                 pending_inserts.append((row, tx))
 
-            # Soft-dup scan in one RTT (falls back to empty on network errors).
-            # Parked-only: skip confirm UI so Park all stays silent.
-            dup_hits: list = [[] for _ in pending_inserts]
-            if pending_inserts and not parked_only:
+            # Soft-dup scan for draft rows only (parked follow-up skips confirm UI).
+            draft_inserts = [
+                (row, tx) for row, tx in pending_inserts
+                if (getattr(tx, "register_status", "") or "") != "parked"
+            ]
+            dup_hits: list = [[] for _ in draft_inserts]
+            if draft_inserts and not parked_only:
                 try:
                     self._show_register_loading(
-                        f"Checking duplicates ({len(pending_inserts)})…"
+                        f"Checking duplicates ({len(draft_inserts)})…"
                     )
                     dup_hits = await check_for_duplicates_bulk(
                         [
@@ -8196,14 +8536,14 @@ class DailyRegister(QWidget):
                                 "item": tx.item or "",
                                 "description": tx.description or "",
                             }
-                            for _row, tx in pending_inserts
+                            for _row, tx in draft_inserts
                         ],
                         dup_days,
                     )
                 except Exception:
-                    dup_hits = [[] for _ in pending_inserts]
+                    dup_hits = [[] for _ in draft_inserts]
 
-            for i, (row, tx) in enumerate(pending_inserts):
+            for i, (row, tx) in enumerate(draft_inserts):
                 dupes = dup_hits[i] if i < len(dup_hits) else []
                 if dupes:
                     duplicate_items.append(DuplicateReviewItem(
@@ -8224,7 +8564,7 @@ class DailyRegister(QWidget):
                     duplicate_items,
                     dup_days=dup_days,
                     parent=self,
-                    pending_total=len(pending_inserts),
+                    pending_total=len(draft_inserts),
                 )
                 if dlg.exec() != QDialog.Accepted:
                     self._flush_local_draft()
@@ -8258,19 +8598,80 @@ class DailyRegister(QWidget):
                     row_meta.pop("sync_status", None)
                     self._pending_row_meta[row] = row_meta
 
-            # Phase C — online Save queues inserts and drains in the background
-            # (same durable outbox as offline). Submit still awaits the create
-            # so Verify never races a pending queue.
-            # Parked saves fixed rows synchronously so the reload below moves
-            # them to My entries right away (no PENDING rows lingering on Parked).
+            # Parked inserts always sync so they leave the local bucket immediately.
+            # Draft inserts on My may use the async outbox (unchanged).
+            parked_to_save = [
+                (row, tx) for row, tx in to_save
+                if (getattr(tx, "register_status", "") or "") == "parked"
+            ]
+            draft_to_save = [
+                (row, tx) for row, tx in to_save
+                if (getattr(tx, "register_status", "") or "") != "parked"
+            ]
+
+            async def _sync_create_chunked(
+                rows_txs: list[tuple[int, Transaction]],
+                *,
+                label: str,
+            ) -> None:
+                nonlocal saved, already_exists
+                total_to_save = len(rows_txs)
+                chunk_size = BULK_CREATE_CHUNK
+                for chunk_start in range(0, total_to_save, chunk_size):
+                    chunk = rows_txs[chunk_start : chunk_start + chunk_size]
+                    lo = chunk_start + 1
+                    hi = chunk_start + len(chunk)
+                    self._show_register_loading(
+                        f"{label}… {lo}–{hi} of {total_to_save}"
+                        if total_to_save > chunk_size
+                        else f"{label}… ({total_to_save})"
+                    )
+                    try:
+                        outcomes = await bulk_save_transactions(
+                            [tx for _r, tx in chunk]
+                        )
+                    except Exception as exc:
+                        for row, _tx in chunk:
+                            errors.append(f"Row {row + 1}: {exc}")
+                        continue
+                    for (row, tx), (status_key, _saved, err) in zip(
+                        chunk, outcomes
+                    ):
+                        if status_key in ("created", "already_exists"):
+                            saved += 1
+                            if status_key == "already_exists":
+                                already_exists += 1
+                            rid = (
+                                getattr(tx, "client_row_id", None)
+                                or self._ensure_row_client_id(row)
+                            )
+                            if rid and (
+                                getattr(tx, "register_status", "") or ""
+                            ) == "parked":
+                                parked_saved_ids.add(str(rid))
+                            self._mark_new_row_saved(row, flush=False)
+                        else:
+                            errors.append(
+                                f"Row {row + 1}: "
+                                f"{err or status_key or 'save failed'}"
+                            )
+                    self._flush_local_draft()
+
+            if parked_to_save:
+                await _sync_create_chunked(
+                    parked_to_save, label="Saving parked"
+                )
+                if parked_saved_ids:
+                    self._drop_local_parked_by_client_ids(parked_saved_ids)
+
             use_async_outbox = (
-                bool(to_save)
+                bool(draft_to_save)
                 and not self._submit_in_flight
                 and not self._merged_mode
                 and not self._parked_mode
             )
             if use_async_outbox:
-                queued = self._enqueue_inserts_for_outbox(to_save)
+                queued = self._enqueue_inserts_for_outbox(draft_to_save)
                 self._kick_outbox_after_save = True
                 if meta is not None:
                     meta["queued"] = queued
@@ -8281,42 +8682,10 @@ class DailyRegister(QWidget):
                     rows=queued,
                     online=True,
                 )
-            else:
-                # Sync create (Submit path / Merged) — chunked bulk-create.
-                total_to_save = len(to_save)
-                chunk_size = BULK_CREATE_CHUNK
-                for chunk_start in range(0, total_to_save, chunk_size):
-                    chunk = to_save[chunk_start : chunk_start + chunk_size]
-                    lo = chunk_start + 1
-                    hi = chunk_start + len(chunk)
-                    self._show_register_loading(
-                        f"Saving draft… {lo}–{hi} of {total_to_save}"
-                        if total_to_save > chunk_size
-                        else f"Saving draft… ({total_to_save})"
-                    )
-                    try:
-                        outcomes = await bulk_save_transactions(
-                            [tx for _r, tx in chunk]
-                        )
-                    except Exception as exc:
-                        for row, _tx in chunk:
-                            errors.append(f"Row {row + 1}: {exc}")
-                        continue
-                    for (row, _tx), (status_key, _saved, err) in zip(
-                        chunk, outcomes
-                    ):
-                        if status_key in ("created", "already_exists"):
-                            saved += 1
-                            if status_key == "already_exists":
-                                already_exists += 1
-                            self._mark_new_row_saved(row, flush=False)
-                        else:
-                            errors.append(
-                                f"Row {row + 1}: "
-                                f"{err or status_key or 'save failed'}"
-                            )
-                    # One draft prune per chunk (not per row) — crash-safe.
-                    self._flush_local_draft()
+            elif draft_to_save:
+                await _sync_create_chunked(
+                    draft_to_save, label="Saving draft"
+                )
 
         if self._merged_mode and (saved or updated):
             try:
@@ -8375,21 +8744,6 @@ class DailyRegister(QWidget):
             if parked_only:
                 # Other unsaved (non-parked) rows may remain — do not warn.
                 return True
-            if kept_parked and not self.has_unsaved_work(include_stashed_my=False):
-                # Parked view: every row still has a wrong truck — nothing to
-                # send yet, and that is expected (not an error). Ignore keep-alive
-                # My leftovers; those are not part of this Parked Save.
-                self._flush_local_draft()
-                plural = "s" if kept_parked != 1 else ""
-                QMessageBox.information(
-                    self,
-                    "Still parked",
-                    f"{kept_parked} parked row{plural} still need a correct fleet "
-                    "truck number.\n\n"
-                    "Fix the Truck cell on each row, then click Save — fixed rows "
-                    "move to My entries as drafts.",
-                )
-                return True
             if self.has_unsaved_work(include_stashed_my=False):
                 # Typed rows that could not become transactions (e.g. no
                 # description) — keep local recovery; do not claim success.
@@ -8405,8 +8759,9 @@ class DailyRegister(QWidget):
             self._clear_local_draft(both_modes=True)
             return True
 
-        # Async outbox path: keep PENDING rows on disk; drain promotes them.
-        if queued and not saved:
+        # Async outbox path: keep PENDING draft rows on disk; drain promotes them.
+        # Also used when parked rows synced immediately and drafts are still queued.
+        if queued:
             if parked_only:
                 # Leave non-parked dirty/new rows editable on My.
                 self._dirty_rows = {
@@ -8420,12 +8775,17 @@ class DailyRegister(QWidget):
                 self._emit_active_cheque()
             else:
                 self._reset_edit_state()
-            if updated:
+            if saved or updated:
+                self.rows_saved.emit(saved)
                 self.drafts_changed.emit()
+                self._invalidate_day_tx_cache()
             if not self._submit_in_flight and not parked_only:
                 plural = "" if queued == 1 else "s"
-                # Phase 2 — local Save is done; sync continues in the background.
                 parts = [f"Saved locally · syncing {queued} draft{plural}"]
+                if parked_saved_ids:
+                    parts.insert(
+                        0, f"{len(parked_saved_ids)} parked saved"
+                    )
                 if updated:
                     parts.append(f"{updated} updated")
                 if deferred_dups:
@@ -8463,13 +8823,16 @@ class DailyRegister(QWidget):
         self.drafts_changed.emit()
         # Updates-only: cells already match — skip full reload.
         # Sync insert path (Submit): reload so Verify sees server state.
-        # Parked: always reload so fixed trucks leave Parked → My entries.
+        # Parked: always reload so saved parked / fixed trucks refresh the views.
         if self._current_date is not None and (saved or self._parked_mode):
             await self._load_date(self._current_date)
         if not self._submit_in_flight:
             parts = []
-            if saved:
-                parts.append(f"{saved} added")
+            if parked_saved_ids:
+                parts.append(f"{len(parked_saved_ids)} parked")
+            draft_n = max(0, saved - len(parked_saved_ids))
+            if draft_n:
+                parts.append(f"{draft_n} draft")
             if updated:
                 parts.append(f"{updated} updated")
             summary = ", ".join(parts) if parts else "saved"
@@ -8479,7 +8842,7 @@ class DailyRegister(QWidget):
                 )
             else:
                 self.transient_status.emit(
-                    f"Draft saved: {summary} · Open Drafts to submit for Verify"
+                    f"Saved: {summary} · Open Drafts to submit for Verify"
                 )
         return True
 
@@ -8547,6 +8910,10 @@ class DailyRegister(QWidget):
             self._restrict_items = bool(await get_setting("restrict_items"))
         except Exception:
             self._restrict_items = False
+        try:
+            self._restrict_payees = bool(await get_setting("restrict_payees"))
+        except Exception:
+            self._restrict_payees = False
         try:
             self._defer_item_to_verify = bool(await get_setting("defer_item_to_verify"))
         except Exception:
@@ -8800,22 +9167,49 @@ class DailyRegister(QWidget):
         return QBrush(NEW_BG)
 
     def _flag_unknown_item(self, item: QTableWidgetItem, text: str) -> None:
-        """Mark an unknown Item cell (restrict on) — keep text, no add dialog."""
+        """Mark an unknown Item cell (restrict on) until resolved via prompt."""
         item.setForeground(QBrush(NEG_COLOR))
         item.setToolTip(
-            f'"{text}" is not a known item. Pick an existing item from the list, '
-            "or ask the accountant to add it in Manage Items."
+            f'"{text}" is not in the Item list. Cancel to clear, or Add Item.'
         )
 
-    def _clear_item_flag(self, row: int, item: QTableWidgetItem) -> None:
+    def _flag_unknown_payee(self, item: QTableWidgetItem, text: str) -> None:
+        item.setForeground(QBrush(NEG_COLOR))
+        item.setToolTip(
+            f'"{text}" is not in the Payee list. Cancel to clear, or Add Payee.'
+        )
+
+    def _clear_catalog_flag(self, row: int, item: QTableWidgetItem) -> None:
         tip = item.toolTip() or ""
-        if "is not a known item" not in tip:
-            return
+        if "is not in the Item list" not in tip and "is not in the Payee list" not in tip:
+            # Legacy flag wording from older builds.
+            if "is not a known item" not in tip and "is not a known payee" not in tip:
+                return
         item.setToolTip("")
         item.setForeground(QBrush())
-        # Restore row background in case an older build painted DUP_BG.
         if item.background().color() == DUP_BG:
             item.setBackground(self._item_row_background(row))
+
+    def _clear_item_flag(self, row: int, item: QTableWidgetItem) -> None:
+        self._clear_catalog_flag(row, item)
+
+    def _set_catalog_cell_text(self, row: int, col: int, text: str) -> None:
+        it = self._table.item(row, col)
+        if it is None:
+            it = QTableWidgetItem(text)
+            self._table.blockSignals(True)
+            self._table.setItem(row, col, it)
+            self._table.blockSignals(False)
+        else:
+            self._table.blockSignals(True)
+            it.setText(text)
+            self._table.blockSignals(False)
+        self._clear_catalog_flag(row, it)
+
+    def _clear_catalog_cell(self, row: int, col: int) -> None:
+        self._set_catalog_cell_text(row, col, "")
+        if col == COL_ITEM:
+            self._update_truck_required_highlight(row)
 
     def _validate_item_cell(self, row: int, item: QTableWidgetItem) -> None:
         text = item.text().strip()
@@ -8825,7 +9219,6 @@ class DailyRegister(QWidget):
             return
         cat = self._cat_by_name.get(text.lower())
         if cat is not None:
-            # Known item — snap to uppercase (table-view convention).
             canonical = cat.name.upper()
             if item.text() != canonical:
                 self._table.blockSignals(True)
@@ -8842,10 +9235,146 @@ class DailyRegister(QWidget):
         # known names red and makes Restrict look broken.
         if not self._categories:
             return
-        # Unknown item with restriction on — keep the typed text and flag the cell.
-        # Do not prompt to add; save still rejects unknown items.
         self._flag_unknown_item(item, text)
         self._update_truck_required_highlight(row)
+        if self._bulk_mutating:
+            return
+        QTimer.singleShot(
+            0, lambda r=row, t=text: self._offer_add_unknown_item(r, t)
+        )
+
+    def _validate_payee_cell(self, row: int, item: QTableWidgetItem) -> None:
+        text = item.text().strip()
+        if not text:
+            self._clear_catalog_flag(row, item)
+            return
+        known = next(
+            (p for p in self._payee_names if p.upper() == text.upper()),
+            None,
+        )
+        if known is not None:
+            canonical = known.upper()
+            if item.text() != canonical:
+                self._table.blockSignals(True)
+                item.setText(canonical)
+                self._table.blockSignals(False)
+            self._clear_catalog_flag(row, item)
+            return
+        if not self._restrict_payees:
+            self._clear_catalog_flag(row, item)
+            return
+        if not self._payee_names:
+            return
+        self._flag_unknown_payee(item, text)
+        if self._bulk_mutating:
+            return
+        QTimer.singleShot(
+            0, lambda r=row, t=text: self._offer_add_unknown_payee(r, t)
+        )
+
+    def _offer_add_unknown_item(self, row: int, text: str) -> None:
+        key = (row, COL_ITEM, text)
+        if key in self._not_in_list_prompting:
+            return
+        it = self._table.item(row, COL_ITEM)
+        if it is None or it.text().strip() != text:
+            return
+        if self._cat_by_name.get(text.lower()) is not None:
+            return
+        if not self._restrict_items or self._bulk_mutating:
+            return
+        self._not_in_list_prompting.add(key)
+        try:
+            from tahmeed.ui.dialogs.not_in_list_dialog import (
+                ask_not_in_list,
+                run_add_item_dialog,
+            )
+
+            if not ask_not_in_list(self, entity="Item", name=text):
+                self._clear_catalog_cell(row, COL_ITEM)
+                return
+            data = run_add_item_dialog(self, prefill_name=text)
+            if not data:
+                self._clear_catalog_cell(row, COL_ITEM)
+                return
+            asyncio.ensure_future(self._finish_add_item_from_prompt(row, data))
+        finally:
+            self._not_in_list_prompting.discard(key)
+
+    def _offer_add_unknown_payee(self, row: int, text: str) -> None:
+        key = (row, COL_PAYEE, text)
+        if key in self._not_in_list_prompting:
+            return
+        it = self._table.item(row, COL_PAYEE)
+        if it is None or it.text().strip() != text:
+            return
+        if any(p.upper() == text.upper() for p in self._payee_names):
+            return
+        if not self._restrict_payees or self._bulk_mutating:
+            return
+        self._not_in_list_prompting.add(key)
+        try:
+            from tahmeed.ui.dialogs.not_in_list_dialog import (
+                ask_not_in_list,
+                run_add_payee_dialog,
+            )
+
+            if not ask_not_in_list(self, entity="Payee", name=text):
+                self._clear_catalog_cell(row, COL_PAYEE)
+                return
+            created = run_add_payee_dialog(self, prefill=text)
+            if not created:
+                self._clear_catalog_cell(row, COL_PAYEE)
+                return
+            name, currency = created
+            asyncio.ensure_future(
+                self._finish_add_payee_from_prompt(row, name, currency=currency)
+            )
+        finally:
+            self._not_in_list_prompting.discard(key)
+
+    async def _finish_add_item_from_prompt(self, row: int, data: dict) -> None:
+        from tahmeed.services.mapping_assignment_service import create_item_for_mapping
+
+        try:
+            cat = await create_item_for_mapping(data.get("name") or "", data)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to create item:\n{exc}")
+            self._clear_catalog_cell(row, COL_ITEM)
+            return
+        # Refresh local catalog so completer + save validation see the new item.
+        existing = self._cat_by_name.get(cat.name.lower())
+        if existing is None:
+            self._categories.append(cat)
+        else:
+            idx = next(
+                (i for i, c in enumerate(self._categories) if c.name.lower() == cat.name.lower()),
+                -1,
+            )
+            if idx >= 0:
+                self._categories[idx] = cat
+        self._cat_by_name[cat.name.lower()] = cat
+        self._set_catalog_cell_text(row, COL_ITEM, cat.name.upper())
+        self._update_truck_required_highlight(row)
+        self._notify_day_issues_source_changed()
+
+    async def _finish_add_payee_from_prompt(
+        self, row: int, name: str, *, currency: str = "TZS",
+    ) -> None:
+        from tahmeed.services.payee_service import add_payee
+
+        try:
+            await add_payee(name, currency=currency or "TZS")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to create payee:\n{exc}")
+            self._clear_catalog_cell(row, COL_PAYEE)
+            return
+        normalized = " ".join(name.upper().split())
+        if not any(p.upper() == normalized for p in self._payee_names):
+            self._payee_names.append(normalized)
+            self._payee_names.sort()
+        self._set_catalog_cell_text(row, COL_PAYEE, normalized)
+        self._notify_day_issues_source_changed()
     # ------------------------------------------------------------------
     # Truck-column validation (format + restrict to fleet registry)
     # ------------------------------------------------------------------
@@ -9405,27 +9934,42 @@ class DailyRegister(QWidget):
 
     async def _unpark_saved_rows(
         self,
-        tx_ids: list,
+        patches: list,
         *,
         loading_message: str | None = None,
         status_message: str | None = None,
         error_title: str = "Clear parked",
     ) -> None:
-        """Return saved ``register_status=parked`` rows to draft on My."""
+        """Return saved parked rows to draft on My, persisting truck fixes.
+
+        ``patches`` is a list of ``tx_id`` or ``(tx_id, updates)``. Updates should
+        include the corrected ``truck_number`` when Fix trucks → Correct ran;
+        ``register_status`` is always forced to ``draft``.
+        """
         from tahmeed.services.cashier_service import bulk_update_transactions
 
-        ids = [tx_id for tx_id in tx_ids if tx_id]
-        if not ids or self._current_date is None:
+        pairs: list[tuple] = []
+        for item in patches or []:
+            if isinstance(item, tuple) and len(item) == 2:
+                tx_id, updates = item
+                body = dict(updates or {})
+            else:
+                tx_id, body = item, {}
+            if not tx_id:
+                continue
+            body["register_status"] = "draft"
+            # Parked → draft is not an after-verify edit.
+            body.pop("edited_after_verification", None)
+            pairs.append((tx_id, body))
+        if not pairs or self._current_date is None:
             return
-        n = len(ids)
+        n = len(pairs)
         self._show_register_loading(
             loading_message
             or f"Clearing {n} parked row{'s' if n != 1 else ''}…"
         )
         try:
-            updated = await bulk_update_transactions(
-                [(tx_id, {"register_status": "draft"}) for tx_id in ids]
-            )
+            updated = await bulk_update_transactions(pairs)
             # Drop keep-alive — My must reload so unparked rows appear.
             self._clear_my_session()
             self._ensure_my_surface_active()

@@ -67,6 +67,7 @@ def test_get_all_settings_merges_defaults_and_stored() -> None:
     body = response.json()
     assert body["default_currency"] == "TZS"
     assert body["restrict_items"] is True
+    assert body["restrict_payees"] is False
     assert body["restrict_trucks"] is True
     assert body["custom_flag"] == 3
 

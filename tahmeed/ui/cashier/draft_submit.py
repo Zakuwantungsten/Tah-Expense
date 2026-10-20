@@ -7,18 +7,62 @@ from typing import Optional
 
 from PySide6.QtWidgets import QMessageBox, QWidget
 
-from tahmeed.services.cashier_service import submit_day_for_verify
+from tahmeed.services.cashier_service import (
+    get_transactions_by_date,
+    submit_day_for_verify,
+)
 
 
-async def submit_draft_day_with_gates(parent: QWidget, day: date) -> Optional[int]:
-    """Submit all drafts for *day* to Verify, after Day Issues gates.
+async def submit_draft_day_with_gates(
+    parent: QWidget,
+    day: date,
+    *,
+    cashier_id=None,
+    user_id=None,
+) -> Optional[int]:
+    """Submit all drafts for *day* to Verify, after parked + Day Issues gates.
 
     Returns the updated count, or ``None`` when blocked / cancelled / failed
     (caller should not refresh on ``None`` when the user cancelled; failed
     paths already show a dialog).
     """
     from tahmeed.services.day_issues_service import collect_day_issues
+    from tahmeed.services.register_draft_service import (
+        draft_parked_rows,
+        load_register_draft,
+    )
     from tahmeed.services.settings_service import get_setting
+
+    label = day.strftime("%d %b %Y")
+
+    # Parked truck follow-up must be resolved before Submit (Register + Drafts).
+    parked_n = 0
+    try:
+        txs = await get_transactions_by_date(day, cashier_id=cashier_id)
+        parked_n = sum(
+            1
+            for tx in txs
+            if (getattr(tx, "register_status", "") or "") == "parked"
+        )
+    except Exception:
+        parked_n = 0
+    if user_id is not None:
+        try:
+            local = load_register_draft(user_id, day, merged=False)
+            parked_n += len(draft_parked_rows(local))
+        except Exception:
+            pass
+    if parked_n > 0:
+        plural = "s" if parked_n != 1 else ""
+        QMessageBox.warning(
+            parent,
+            "Parked trucks block submit",
+            f"{parked_n} parked truck row{plural} on {label} still need a "
+            "correct fleet number.\n\n"
+            "Open the day in Register → Parked, fix the truck(s), then submit "
+            "again.",
+        )
+        return None
 
     try:
         snap = await collect_day_issues(day)
@@ -30,7 +74,6 @@ async def submit_draft_day_with_gates(parent: QWidget, day: date) -> Optional[in
             allow = bool(await get_setting("allow_submit_with_day_issues"))
         except Exception:
             allow = False
-        label = day.strftime("%d %b %Y")
         summary = (
             f"{snap.total} Day Issue(s) on {label}:\n"
             f"  · {snap.unmapped_count} unmapped\n"

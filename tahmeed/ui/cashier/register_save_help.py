@@ -41,7 +41,8 @@ _FALLBACK = """# Daily Register — Save, Recovered, and Offline
 
 ## Parked trucks
 
-- **Park all** / **Park remaining** saves nothing: correct rows stay on My entries; wrong-truck rows wait under Parked.
+- **Park all** / **Park remaining** saves nothing yet: correct rows stay on My; wrong-truck rows wait under Parked.
+- **Save** stores My drafts and parked rows (parked stay filtered until the truck is fixed).
 - Open Parked, fix the Truck cell, then Save — fixed rows become drafts on My entries.
 """
 

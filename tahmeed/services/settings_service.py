@@ -6,9 +6,12 @@ from tahmeed.services.api_client import ApiError, api_client
 DEFAULTS = {
     "default_currency": "TZS",
     "confidence_threshold": 75,  # percent — below this goes to review queue
-    # When True the cashier register's Item column flags unknown entries
-    # (text is kept; save still requires a known item). When False free text is allowed.
+    # When True, typing an unknown Item opens a QuickBooks-style "not in list"
+    # dialog (Cancel or Add Item). Save still requires a known item.
+    # When False, free text is allowed without a prompt.
     "restrict_items": False,
+    # Same QuickBooks-style prompt for the Payee column (Cancel or Add Payee).
+    "restrict_payees": False,
     # When True cashiers may save table rows with description only (no item).
     # The accountant assigns items on verify; mappings are remembered.
     "defer_item_to_verify": False,

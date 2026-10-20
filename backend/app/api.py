@@ -116,6 +116,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "default_currency": "TZS",
     "confidence_threshold": 75,
     "restrict_items": False,
+    "restrict_payees": False,
     "defer_item_to_verify": False,
     # When True, cashiers may Submit for Verify even if Day Issues remain.
     "allow_submit_with_day_issues": False,

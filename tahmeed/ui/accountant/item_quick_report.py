@@ -216,12 +216,21 @@ def _fmt_report_date(dt, *, all_years: bool) -> str:
 
 
 class ItemQuickReportView(QWidget):
-    """Read-only master-column table for one item's verified transactions."""
+    """Read-only master-column table for one item's or payee's verified transactions.
+
+    ``entity`` is ``"category"`` (Manage Items / Suppliers) or ``"payee"``.
+    """
 
     header_context_changed = Signal(str, str)
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        entity: str = "category",
+    ) -> None:
         super().__init__(parent)
+        self._entity = "payee" if entity == "payee" else "category"
         self._category = ""
         self._page = 0
         self._total = 0
@@ -240,6 +249,30 @@ class ItemQuickReportView(QWidget):
         self._filter_debounce.setInterval(300)
         self._filter_debounce.timeout.connect(self._on_filter_commit)
         self._build()
+
+    def _entity_label(self) -> str:
+        return "payee" if self._entity == "payee" else "item"
+
+    def _persistence_key(self) -> str:
+        return "payee_quick_report" if self._entity == "payee" else "item_quick_report"
+
+    def _report_apis(self):
+        """Return (descriptions, transactions, totals, column_values) callables."""
+        from tahmeed.services import accountant_service as svc
+
+        if self._entity == "payee":
+            return (
+                svc.get_payee_report_descriptions,
+                svc.get_payee_report_transactions,
+                svc.get_payee_report_totals,
+                svc.get_payee_report_column_values,
+            )
+        return (
+            svc.get_category_report_descriptions,
+            svc.get_category_report_transactions,
+            svc.get_category_report_totals,
+            svc.get_category_report_column_values,
+        )
 
     def _build(self) -> None:
         self.setStyleSheet(f"background: {_WHITE};")
@@ -295,7 +328,7 @@ class ItemQuickReportView(QWidget):
             self._table.setColumnWidth(i, width)
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
         bind_column_width_persistence(
-            self._table, "item_quick_report", _COL_DEFAULTS,
+            self._table, self._persistence_key(), _COL_DEFAULTS,
         )
         hdr.sectionClicked.connect(self._on_header_click)
         self._update_sort_indicator()
@@ -365,6 +398,7 @@ class ItemQuickReportView(QWidget):
 
         hl.addStretch()
 
+        label = self._entity_label()
         self._export_btn = make_export_menu_btn(
             self._on_export_filtered,
             self._on_export_all,
@@ -372,10 +406,13 @@ class ItemQuickReportView(QWidget):
             height=30,
             btn_tip=(
                 "Export Filtered — current dates, descriptions, column filters, and sort.\n"
-                "Use the ▾ menu for Export All (full item report, no extra filters)."
+                f"Use the ▾ menu for Export All (full {label} report, no extra filters)."
             ),
             filtered_tip="Export rows matching the current filters and sort order.",
-            all_tip="Export every verified record for this item (ignores toolbar and column filters).",
+            all_tip=(
+                f"Export every verified record for this {label} "
+                "(ignores toolbar and column filters)."
+            ),
         )
         hl.addWidget(self._export_btn)
 
@@ -463,17 +500,15 @@ class ItemQuickReportView(QWidget):
         if not self._category:
             return
         try:
-            from tahmeed.services.accountant_service import (
-                get_category_report_descriptions,
-                get_master_available_years,
-            )
+            from tahmeed.services.accountant_service import get_master_available_years
 
+            get_descriptions, _, _, _ = self._report_apis()
             date_from, date_to = read_from_to(
                 self._from_date, self._to_date, optional=True,
             )
             years, descs = await asyncio.gather(
                 get_master_available_years(),
-                get_category_report_descriptions(
+                get_descriptions(
                     self._category, date_from=date_from, date_to=date_to,
                 ),
             )
@@ -488,12 +523,11 @@ class ItemQuickReportView(QWidget):
         if not self._category:
             return
         try:
-            from tahmeed.services.accountant_service import get_category_report_descriptions
-
+            get_descriptions, _, _, _ = self._report_apis()
             date_from, date_to = read_from_to(
                 self._from_date, self._to_date, optional=True,
             )
-            descs = await get_category_report_descriptions(
+            descs = await get_descriptions(
                 self._category, date_from=date_from, date_to=date_to,
             )
             self._desc_cb.set_options(descs, keep_selected=True, emit=False)
@@ -767,19 +801,16 @@ class ItemQuickReportView(QWidget):
             self._clear_column_filters_ui()
         self._loading_overlay.show_loading("Loading report…")
         try:
-            from tahmeed.services.accountant_service import (
-                get_category_report_transactions,
-                get_category_report_totals,
-                get_cashier_names,
-            )
+            from tahmeed.services.accountant_service import get_cashier_names
 
+            _, get_transactions, get_totals, _ = self._report_apis()
             kw = self._query_kwargs()
             year_lbl, scope_lbl = self._header_context()
             self.header_context_changed.emit(year_lbl, scope_lbl)
             self._account_bar_lbl.setText(self._category)
 
             txs, totals = await asyncio.gather(
-                get_category_report_transactions(
+                get_transactions(
                     self._category,
                     descriptions=kw["descriptions"],
                     date_from=kw["date_from"],
@@ -790,7 +821,7 @@ class ItemQuickReportView(QWidget):
                     limit=_PAGE_SIZE,
                     skip=0,
                 ),
-                get_category_report_totals(
+                get_totals(
                     self._category,
                     descriptions=kw["descriptions"],
                     date_from=kw["date_from"],
@@ -820,8 +851,7 @@ class ItemQuickReportView(QWidget):
 
     async def _load_column_values(self, generation: int, kw: dict) -> None:
         try:
-            from tahmeed.services.accountant_service import get_category_report_column_values
-
+            _, _, _, get_column_values = self._report_apis()
             base_kw = {
                 k: v for k, v in kw.items()
                 if k not in ("column_filters", "sort_field", "sort_asc")
@@ -829,7 +859,7 @@ class ItemQuickReportView(QWidget):
             col_filters = kw.get("column_filters") or {}
             fields = sorted(set(_COL_FIELD.values()))
             results = await asyncio.gather(*[
-                get_category_report_column_values(
+                get_column_values(
                     field,
                     self._category,
                     descriptions=base_kw.get("descriptions"),
@@ -858,14 +888,12 @@ class ItemQuickReportView(QWidget):
         self._scroll_loading = True
         self._update_footer_status()
         try:
-            from tahmeed.services.accountant_service import (
-                get_category_report_transactions,
-                get_cashier_names,
-            )
+            from tahmeed.services.accountant_service import get_cashier_names
 
+            _, get_transactions, _, _ = self._report_apis()
             kw = self._query_kwargs()
             skip = self._loaded
-            txs = await get_category_report_transactions(
+            txs = await get_transactions(
                 self._category,
                 descriptions=kw["descriptions"],
                 date_from=kw["date_from"],
@@ -978,9 +1006,8 @@ class ItemQuickReportView(QWidget):
         asyncio.ensure_future(self._do_export(all_records=True))
 
     async def _fetch_export_page(self, kw: dict, *, limit: int, skip: int) -> List[Transaction]:
-        from tahmeed.services.accountant_service import get_category_report_transactions
-
-        return await get_category_report_transactions(
+        _, get_transactions, _, _ = self._report_apis()
+        return await get_transactions(
             self._category,
             descriptions=kw.get("descriptions"),
             date_from=kw.get("date_from"),

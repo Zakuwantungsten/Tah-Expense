@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QDateEdit,
 )
 
+from tahmeed.ui.widgets.combo_styles import with_combo_popup
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
 
 from tahmeed.models.category import Category
@@ -381,6 +382,7 @@ class _NewPayeeDialog(QDialog):
         self.setMinimumWidth(360)
         self.setStyleSheet(f"QDialog{{background:{_WHITE};color:{_T1};}}")
         self.result_name: str = ""
+        self.result_currency: str = "TZS"
 
         vl = QVBoxLayout(self)
         vl.setContentsMargins(24, 24, 24, 24)
@@ -404,6 +406,20 @@ class _NewPayeeDialog(QDialog):
         self._inp.returnPressed.connect(self._accept)
         vl.addWidget(self._inp)
 
+        vl.addWidget(_lbl("Currency", size=12, color=_T2))
+        self._currency = QComboBox()
+        self._currency.addItems(["TZS", "USD"])
+        self._currency.setCurrentText("TZS")
+        self._currency.setFixedHeight(34)
+        self._currency.setStyleSheet(with_combo_popup(
+            f"QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
+            f"background:{_WHITE};color:{_T1};font-size:13px;"
+            "font-family:'Segoe UI';padding:0 8px;}"
+            f"QComboBox:focus{{border-color:{_BLUE};}}"
+            "QComboBox::drop-down{border:none;width:22px;}"
+        ))
+        vl.addWidget(self._currency)
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel = _btn("Cancel", primary=False)
@@ -422,6 +438,7 @@ class _NewPayeeDialog(QDialog):
             QMessageBox.warning(self, "Validation", "Payee name is required.")
             return
         self.result_name = name
+        self.result_currency = (self._currency.currentText() or "TZS").strip().upper()
         self.accept()
 
 
@@ -444,7 +461,9 @@ class MapDescriptionsDialog(QDialog):
         self._payees = [str(p).strip().upper() for p in payees if str(p).strip()]
         self._known_payees_at_open: Set[str] = set(self._payees)
         self._pending_new_payees: Set[str] = set()
+        self._payee_currencies: dict[str, str] = {}
         self.result_payee: str = ""
+        self.result_currency: str = "TZS"
         self.result_category: Optional[Category] = None
         self.result_assignment: Optional[MappingAssignment] = None
         self.result_create_payee: bool = False
@@ -551,6 +570,7 @@ class MapDescriptionsDialog(QDialog):
         dlg = _NewPayeeDialog(parent=self, prefill=prefill)
         if dlg.exec() != QDialog.Accepted or not dlg.result_name:
             return
+        self._payee_currencies[dlg.result_name] = dlg.result_currency or "TZS"
         self._select_payee(dlg.result_name, mark_create=True)
 
     def _on_new_item(self) -> None:
@@ -582,6 +602,9 @@ class MapDescriptionsDialog(QDialog):
             return
         self.result_create_payee = payee_needs_create(
             self.result_payee, self._known_payees_at_open
+        )
+        self.result_currency = self._payee_currencies.get(
+            self.result_payee, "TZS",
         )
         self.accept()
 
@@ -626,6 +649,7 @@ class MapDescriptionsDialog(QDialog):
             return
         self.result_payee = payee
         self.result_create_payee = create_payee
+        self.result_currency = self._payee_currencies.get(payee, "TZS")
         self.result_category = cat
         self.result_assignment = MappingAssignment(
             action="assign",
@@ -844,6 +868,9 @@ class DayIssuesWidget(QWidget):
         self._days_scanned: List[date] = []
         self._categories: List[Category] = []
         self._payees: List[str] = []
+        self._restrict_items: bool = False
+        self._restrict_payees: bool = False
+        self._not_in_list_prompting: set = set()
         # description_key -> {"payee": str, "item": str} inline drafts (Phase 6)
         self._mapping_drafts: dict = {}
         self._checked_keys: set = set()
@@ -1155,6 +1182,14 @@ class DayIssuesWidget(QWidget):
         self._auto_fill_maps_chk.setChecked(on)
         self._auto_fill_maps_chk.blockSignals(False)
         self.auto_fill_maps_changed.emit(on)
+        try:
+            self._restrict_items = bool(await get_setting("restrict_items"))
+        except Exception:
+            self._restrict_items = False
+        try:
+            self._restrict_payees = bool(await get_setting("restrict_payees"))
+        except Exception:
+            self._restrict_payees = False
 
     def _on_auto_fill_maps_toggled(self, on: bool) -> None:
         from tahmeed.ui.async_utils import schedule_coro
@@ -1614,6 +1649,121 @@ class DayIssuesWidget(QWidget):
         item_name = (item_it.text() if item_it else "").strip()
         self._store_draft(issue.description, payee, item_name)
         self._update_save_filled_enabled()
+        if item.column() == _COL_ITEM and item_name:
+            QTimer.singleShot(
+                0, lambda r=row, t=item_name: self._offer_add_unknown_item(r, t)
+            )
+        elif item.column() == _COL_PAYEE and payee:
+            QTimer.singleShot(
+                0, lambda r=row, t=payee: self._offer_add_unknown_payee(r, t)
+            )
+
+    def _set_issue_cell(self, row: int, col: int, text: str) -> None:
+        it = self._table.item(row, col)
+        if it is None:
+            return
+        self._table.blockSignals(True)
+        it.setText(text)
+        self._table.blockSignals(False)
+        if 0 <= row < len(self._issues):
+            issue = self._issues[row]
+            payee_it = self._table.item(row, _COL_PAYEE)
+            item_it = self._table.item(row, _COL_ITEM)
+            self._store_draft(
+                issue.description,
+                (payee_it.text() if payee_it else "").strip(),
+                (item_it.text() if item_it else "").strip(),
+            )
+            self._update_save_filled_enabled()
+
+    def _offer_add_unknown_item(self, row: int, text: str) -> None:
+        if not self._restrict_items or self._populating or not self._categories:
+            return
+        key = (row, _COL_ITEM, text)
+        if key in self._not_in_list_prompting:
+            return
+        it = self._table.item(row, _COL_ITEM)
+        if it is None or it.text().strip() != text:
+            return
+        if any(c.name.strip().lower() == text.strip().lower() for c in self._categories):
+            return
+        self._not_in_list_prompting.add(key)
+        try:
+            from tahmeed.ui.dialogs.not_in_list_dialog import (
+                ask_not_in_list,
+                run_add_item_dialog,
+            )
+
+            if not ask_not_in_list(self, entity="Item", name=text):
+                self._set_issue_cell(row, _COL_ITEM, "")
+                return
+            data = run_add_item_dialog(self, prefill_name=text)
+            if not data:
+                self._set_issue_cell(row, _COL_ITEM, "")
+                return
+            from tahmeed.ui.async_utils import schedule_coro
+            schedule_coro(self._finish_add_item(row, data))
+        finally:
+            self._not_in_list_prompting.discard(key)
+
+    def _offer_add_unknown_payee(self, row: int, text: str) -> None:
+        if not self._restrict_payees or self._populating or not self._payees:
+            return
+        key = (row, _COL_PAYEE, text)
+        if key in self._not_in_list_prompting:
+            return
+        it = self._table.item(row, _COL_PAYEE)
+        if it is None or it.text().strip() != text:
+            return
+        if not payee_needs_create(text, self._payees):
+            return
+        self._not_in_list_prompting.add(key)
+        try:
+            from tahmeed.ui.dialogs.not_in_list_dialog import (
+                ask_not_in_list,
+                run_add_payee_dialog,
+            )
+
+            if not ask_not_in_list(self, entity="Payee", name=text):
+                self._set_issue_cell(row, _COL_PAYEE, "")
+                return
+            created = run_add_payee_dialog(self, prefill=text)
+            if not created:
+                self._set_issue_cell(row, _COL_PAYEE, "")
+                return
+            name, currency = created
+            from tahmeed.ui.async_utils import schedule_coro
+            schedule_coro(self._finish_add_payee(row, name, currency=currency))
+        finally:
+            self._not_in_list_prompting.discard(key)
+
+    async def _finish_add_item(self, row: int, data: dict) -> None:
+        from tahmeed.services.mapping_assignment_service import create_item_for_mapping
+
+        try:
+            cat = await create_item_for_mapping(data.get("name") or "", data)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to create item:\n{exc}")
+            self._set_issue_cell(row, _COL_ITEM, "")
+            return
+        if not any(c.name.lower() == cat.name.lower() for c in self._categories):
+            self._categories.append(cat)
+            self._categories = sort_payment_targets(self._categories)
+        self._set_issue_cell(row, _COL_ITEM, cat.name.upper())
+
+    async def _finish_add_payee(
+        self, row: int, name: str, *, currency: str = "TZS",
+    ) -> None:
+        try:
+            await add_payee(name, currency=currency or "TZS")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to create payee:\n{exc}")
+            self._set_issue_cell(row, _COL_PAYEE, "")
+            return
+        normalized = " ".join(name.upper().split())
+        if payee_needs_create(normalized, self._payees):
+            self._payees.append(normalized)
+        self._set_issue_cell(row, _COL_PAYEE, normalized)
 
     def _end_inline_edit(self) -> None:
         """Close any open cell editor before the table is rebuilt."""
@@ -1944,7 +2094,7 @@ class DayIssuesWidget(QWidget):
 
         if dlg.result_create_payee or payee_needs_create(payee, self._payees):
             try:
-                await add_payee(payee)
+                await add_payee(payee, currency=dlg.result_currency or "TZS")
             except Exception as exc:
                 QMessageBox.warning(self, "Could Not Create Payee", str(exc))
                 return

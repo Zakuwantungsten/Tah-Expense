@@ -211,7 +211,7 @@ Suggested ship order: **1 → 2 → 3 → 4 → 5**.
 
 ## Out of scope (later)
 
-- `restrict_payees` hard validation (catalog-only payees)
+- ~~`restrict_payees` hard validation (catalog-only payees)~~ — implemented (QuickBooks-style Cancel / Add Payee when Restrict payees is on)
 - Seeding description maps from QuickBooks `description_memory.json` (Payee + Account → Payee + Item)
 - Ignoring descriptions (explicitly excluded earlier)
 - Changing CoA / Item import behaviour

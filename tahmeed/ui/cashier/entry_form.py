@@ -213,6 +213,7 @@ class EntryForm(QWidget):
         self._rcpt_delegate = _ReceiptDelegate()
         self._day_txs: List[Transaction] = []
         self._submit_in_flight = False
+        self._not_in_list_prompting = False
 
         self._build_ui()
 
@@ -233,6 +234,7 @@ class EntryForm(QWidget):
                 await get_setting("confidence_threshold") or 75
             )
             self._categories = await get_payment_target_categories()
+            self._cat_by_name = {c.name.lower(): c for c in self._categories}
         except Exception:
             pass
         try:
@@ -476,6 +478,7 @@ class EntryForm(QWidget):
         self._item = QLineEdit()
         self._item.setPlaceholderText("e.g., Fuel, Parts, Tolls")
         self._item.setStyleSheet(_INPUT)
+        self._item.editingFinished.connect(self._on_item_editing_finished)
         lay.addWidget(self._item)
 
         lay.addSpacing(10)
@@ -724,6 +727,55 @@ class EntryForm(QWidget):
             if typed_lower in cat.name.lower():
                 return cat.name, cat._id
         return None
+
+    def _on_item_editing_finished(self) -> None:
+        if not self._restrict_items or self._not_in_list_prompting:
+            return
+        text = self._item.text().strip()
+        if not text or self._cat_by_name.get(text.lower()) is not None:
+            return
+        if not self._categories:
+            return
+        QTimer.singleShot(0, lambda t=text: self._offer_add_unknown_item(t))
+
+    def _offer_add_unknown_item(self, text: str) -> None:
+        if self._not_in_list_prompting:
+            return
+        if self._item.text().strip() != text:
+            return
+        if self._cat_by_name.get(text.lower()) is not None:
+            return
+        self._not_in_list_prompting = True
+        try:
+            from tahmeed.ui.dialogs.not_in_list_dialog import (
+                ask_not_in_list,
+                run_add_item_dialog,
+            )
+
+            if not ask_not_in_list(self, entity="Item", name=text):
+                self._item.clear()
+                return
+            data = run_add_item_dialog(self, prefill_name=text)
+            if not data:
+                self._item.clear()
+                return
+            asyncio.ensure_future(self._finish_add_item(data))
+        finally:
+            self._not_in_list_prompting = False
+
+    async def _finish_add_item(self, data: dict) -> None:
+        from tahmeed.services.mapping_assignment_service import create_item_for_mapping
+
+        try:
+            cat = await create_item_for_mapping(data.get("name") or "", data)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to create item:\n{exc}")
+            self._item.clear()
+            return
+        self._cat_by_name[cat.name.lower()] = cat
+        if not any(c.name.lower() == cat.name.lower() for c in self._categories):
+            self._categories.append(cat)
+        self._item.setText(cat.name.upper())
 
     def _resolve_item_for_submit(self) -> tuple[str, Optional[object]]:
         """Resolve item/category like the register table (shared rules)."""

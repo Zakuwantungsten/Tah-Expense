@@ -976,8 +976,9 @@ class ManageItemsWidget(QWidget):
         self._restrict_btn.setCheckable(True)
         self._restrict_btn.setCursor(Qt.PointingHandCursor)
         self._restrict_btn.setToolTip(
-            "When on, the cashier's Item column flags unknown entries.\n"
-            "Unknown text is kept but marked; saving still requires a known item."
+            "When on, typing an Item that is not in the list opens a QuickBooks-style\n"
+            "dialog: Cancel (clear the cell) or Add Item (create it).\n"
+            "Saving still requires a known item."
         )
         try:
             self._restrict_btn.setIcon(qta.icon("mdi.lock-outline", color=_T2))

@@ -184,12 +184,20 @@ async def remove_payee(name: str) -> None:
     invalidate_payee_cache()
 
 
-async def set_payee_active(name: str, active: bool) -> None:
+async def set_payee_active(
+    name: str,
+    active: bool,
+    *,
+    currency: str | None = None,
+) -> None:
     normalized = _normalize_name(name)
+    payload: dict = {"name": normalized, "active": active}
+    if currency is not None:
+        payload["currency"] = _normalize_name(currency) or "TZS"
     await api_client.request(
         "PUT",
         f"v1/payees/{_path_name(normalized)}",
-        json={"name": normalized, "active": active},
+        json=payload,
     )
     invalidate_payee_cache()
 

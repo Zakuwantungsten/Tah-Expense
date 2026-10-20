@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QApplication, QMenu, QMessageBox,
 )
-from PySide6.QtCore import Qt, QObject, QEvent, QSize
+from PySide6.QtCore import Qt, QObject, QEvent, QSize, QTimer
 from PySide6.QtGui import QColor, QBrush, QKeyEvent
 
 from tahmeed.models.transaction import Transaction, pack_money
@@ -138,7 +138,9 @@ class RejectedView(QWidget):
         self._people_names: list = []
         self._payee_names: list = []
         self._restrict_items = False
+        self._restrict_payees = False
         self._defer_item_to_verify = False
+        self._not_in_list_prompting: set = set()
 
         self._build()
         asyncio.ensure_future(self._load_lookups())
@@ -407,6 +409,10 @@ class RejectedView(QWidget):
         except Exception:
             self._restrict_items = False
         try:
+            self._restrict_payees = bool(await get_setting("restrict_payees"))
+        except Exception:
+            self._restrict_payees = False
+        try:
             self._defer_item_to_verify = bool(await get_setting("defer_item_to_verify"))
         except Exception:
             self._defer_item_to_verify = False
@@ -636,6 +642,123 @@ class RejectedView(QWidget):
                     if amt < 0:
                         item.setForeground(NEG_COLOR)
                     self._table.blockSignals(False)
+        self._mark_dirty(row)
+        if col == COL_ITEM:
+            self._maybe_prompt_unknown_item(row, item)
+        elif col == COL_PAYEE:
+            self._maybe_prompt_unknown_payee(row, item)
+
+    def _set_cell_text(self, row: int, col: int, text: str) -> None:
+        it = self._table.item(row, col)
+        if it is None:
+            return
+        self._table.blockSignals(True)
+        it.setText(text)
+        it.setForeground(QBrush())
+        it.setToolTip("")
+        self._table.blockSignals(False)
+
+    def _maybe_prompt_unknown_item(self, row: int, item: QTableWidgetItem) -> None:
+        if not self._restrict_items or self._bulk_mutating or not self._categories:
+            return
+        text = item.text().strip()
+        if not text or self._cat_by_name.get(text.lower()) is not None:
+            return
+        QTimer.singleShot(0, lambda r=row, t=text: self._offer_add_unknown_item(r, t))
+
+    def _maybe_prompt_unknown_payee(self, row: int, item: QTableWidgetItem) -> None:
+        if not self._restrict_payees or self._bulk_mutating or not self._payee_names:
+            return
+        text = item.text().strip()
+        if not text or any(p.upper() == text.upper() for p in self._payee_names):
+            return
+        QTimer.singleShot(0, lambda r=row, t=text: self._offer_add_unknown_payee(r, t))
+
+    def _offer_add_unknown_item(self, row: int, text: str) -> None:
+        key = (row, COL_ITEM, text)
+        if key in self._not_in_list_prompting:
+            return
+        it = self._table.item(row, COL_ITEM)
+        if it is None or it.text().strip() != text:
+            return
+        if self._cat_by_name.get(text.lower()) is not None:
+            return
+        self._not_in_list_prompting.add(key)
+        try:
+            from tahmeed.ui.dialogs.not_in_list_dialog import (
+                ask_not_in_list,
+                run_add_item_dialog,
+            )
+
+            if not ask_not_in_list(self, entity="Item", name=text):
+                self._set_cell_text(row, COL_ITEM, "")
+                return
+            data = run_add_item_dialog(self, prefill_name=text)
+            if not data:
+                self._set_cell_text(row, COL_ITEM, "")
+                return
+            asyncio.ensure_future(self._finish_add_item(row, data))
+        finally:
+            self._not_in_list_prompting.discard(key)
+
+    def _offer_add_unknown_payee(self, row: int, text: str) -> None:
+        key = (row, COL_PAYEE, text)
+        if key in self._not_in_list_prompting:
+            return
+        it = self._table.item(row, COL_PAYEE)
+        if it is None or it.text().strip() != text:
+            return
+        if any(p.upper() == text.upper() for p in self._payee_names):
+            return
+        self._not_in_list_prompting.add(key)
+        try:
+            from tahmeed.ui.dialogs.not_in_list_dialog import (
+                ask_not_in_list,
+                run_add_payee_dialog,
+            )
+
+            if not ask_not_in_list(self, entity="Payee", name=text):
+                self._set_cell_text(row, COL_PAYEE, "")
+                return
+            created = run_add_payee_dialog(self, prefill=text)
+            if not created:
+                self._set_cell_text(row, COL_PAYEE, "")
+                return
+            name, currency = created
+            asyncio.ensure_future(self._finish_add_payee(row, name, currency=currency))
+        finally:
+            self._not_in_list_prompting.discard(key)
+
+    async def _finish_add_item(self, row: int, data: dict) -> None:
+        from tahmeed.services.mapping_assignment_service import create_item_for_mapping
+
+        try:
+            cat = await create_item_for_mapping(data.get("name") or "", data)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to create item:\n{exc}")
+            self._set_cell_text(row, COL_ITEM, "")
+            return
+        self._cat_by_name[cat.name.lower()] = cat
+        if not any(c.name.lower() == cat.name.lower() for c in self._categories):
+            self._categories.append(cat)
+        self._set_cell_text(row, COL_ITEM, cat.name.upper())
+        self._mark_dirty(row)
+
+    async def _finish_add_payee(
+        self, row: int, name: str, *, currency: str = "TZS",
+    ) -> None:
+        from tahmeed.services.payee_service import add_payee
+
+        try:
+            await add_payee(name, currency=currency or "TZS")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to create payee:\n{exc}")
+            self._set_cell_text(row, COL_PAYEE, "")
+            return
+        normalized = " ".join(name.upper().split())
+        if not any(p.upper() == normalized for p in self._payee_names):
+            self._payee_names.append(normalized)
+        self._set_cell_text(row, COL_PAYEE, normalized)
         self._mark_dirty(row)
 
     def _row_is_editable(self, row: int) -> bool:
@@ -910,6 +1033,21 @@ class RejectedView(QWidget):
         elif item_name and self._restrict_items:
             raise ValueError(f'"{item_name}" is not a known item.')
 
+        payee_name = self._txt(row, COL_PAYEE).strip()
+        if payee_name and self._restrict_payees:
+            known_payee = next(
+                (p for p in self._payee_names if p.upper() == payee_name.upper()),
+                None,
+            )
+            if known_payee is None and self._payee_names:
+                raise ValueError(f'"{payee_name}" is not a known payee.')
+            if known_payee is not None:
+                payee_name = known_payee.upper()
+            else:
+                payee_name = payee_name.upper()
+        else:
+            payee_name = payee_name.upper()
+
         if cat is not None and getattr(cat, "lock_description", False):
             allowed = self._locked_subitems.get(item_name.lower(), [])
             if allowed:
@@ -958,7 +1096,7 @@ class RejectedView(QWidget):
             "notes_flag": ref == "REFUND TO FLOAT",
             "ownership": self._txt(row, COL_OWN),
             "approver": self._txt(row, COL_APR),
-            "payee": self._txt(row, COL_PAYEE),
+            "payee": payee_name,
             "cheque": self._txt(row, COL_CHEQUE),
         }
         if tx_date is not None:
