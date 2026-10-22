@@ -1281,3 +1281,56 @@ def test_my_parked_flip_keeps_my_rows_without_draft_restore(register, monkeypatc
     assert restore_calls == []
     assert flush_calls == []
     assert load_calls == []
+
+
+def test_merged_round_trip_keeps_my_grid_and_skips_reload(register, monkeypatch):
+    """My → Merged → My shows the mounted My grid. Merged is every cashier."""
+    from tahmeed.ui.cashier.register_delegates import COL_CASHIER, COL_DESC
+
+    loads: list = []
+
+    async def _load(d):
+        loads.append(d)
+
+    monkeypatch.setattr(register, "_load_date", _load)
+    register._table.blockSignals(True)
+    try:
+        register._put(0, COL_DESC, "MINE")
+    finally:
+        register._table.blockSignals(False)
+
+    mine = _tx(register, desc="MINE-SAVED")
+    theirs = _tx(register, desc="THEIRS")
+    theirs.cashier_id = ObjectId()
+    register._merged_tx_cache = [mine, theirs]
+    register._merged_tx_cache_key = register._make_day_cache_key(
+        register._current_date, merged=True
+    )
+
+    register.set_view_mode("merged")
+    assert loads == []
+    assert register._table is register._merged_table
+    assert register._merged_table.isColumnHidden(COL_CASHIER) is False
+    painted = {
+        register._merged_table.item(row, COL_DESC).text()
+        for row in range(register._merged_table.rowCount())
+        if register._merged_table.item(row, COL_DESC) is not None
+        and register._merged_table.item(row, COL_DESC).text()
+    }
+    assert painted == {"MINE-SAVED", "THEIRS"}
+
+    register.set_view_mode("my")
+    assert loads == []
+    assert register._table is register._my_table
+    assert register._my_table.item(0, COL_DESC).text() == "MINE"
+    assert register._my_table.isColumnHidden(COL_CASHIER) is True
+
+    register.set_view_mode("merged")
+    assert loads == []
+    assert register._table is register._merged_table
+    assert "THEIRS" in {
+        register._merged_table.item(row, COL_DESC).text()
+        for row in range(register._merged_table.rowCount())
+        if register._merged_table.item(row, COL_DESC) is not None
+        and register._merged_table.item(row, COL_DESC).text()
+    }

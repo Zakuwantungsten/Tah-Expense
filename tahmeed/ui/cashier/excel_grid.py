@@ -1102,8 +1102,12 @@ class DailyRegister(QWidget):
         # Parked/Merged surfaces always behave as "off".
         self._draft_restore_policy: str = "notify"  # notify | silent | off
         # Same-day My↔Parked: reuse last fetch and filter in memory (no network).
+        # Merged keeps its own copy so opening Merged does not throw away My.
         self._day_tx_cache: list | None = None
         self._day_tx_cache_key: tuple | None = None
+        self._merged_tx_cache: list | None = None
+        self._merged_tx_cache_key: tuple | None = None
+        self._merged_painted_key: tuple | None = None
         # True after delete/discard until a successful ``_load_date`` finishes.
         # Table-tab entry and My view flips reload when this is set.
         self._day_tx_stale: bool = False
@@ -1112,6 +1116,7 @@ class DailyRegister(QWidget):
         self._my_session: dict | None = None
         self._my_table: _ExcelTableWidget | None = None
         self._parked_table: _ExcelTableWidget | None = None
+        self._merged_table: _ExcelTableWidget | None = None
         self._table_stack: QStackedWidget | None = None
         # Day-level Cheque stamp (header field → all data rows)
         self._header_cheque: str = ""
@@ -1279,13 +1284,15 @@ class DailyRegister(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Tables: My stays alive; Parked is a separate small surface ──
+        # ── Tables: My stays alive; Parked and Merged are separate surfaces ──
         self._my_table = self._make_register_table()
         self._parked_table = self._make_register_table()
+        self._merged_table = self._make_register_table()
         self._table = self._my_table
         self._table_stack = QStackedWidget(self)
         self._table_stack.addWidget(self._my_table)
         self._table_stack.addWidget(self._parked_table)
+        self._table_stack.addWidget(self._merged_table)
         self._table_stack.setCurrentWidget(self._my_table)
 
         QTimer.singleShot(0, self._fit_table_columns)
@@ -1355,7 +1362,13 @@ class DailyRegister(QWidget):
                 deficit -= cut
 
         tables = [
-            t for t in (self._my_table, self._parked_table, self._table)
+            t
+            for t in (
+                self._my_table,
+                self._parked_table,
+                self._merged_table,
+                self._table,
+            )
             if t is not None
         ]
         seen: set[int] = set()
@@ -1383,6 +1396,9 @@ class DailyRegister(QWidget):
             self._clear_my_session()
             self._activate_table_surface(self._parked_table)
             self._reset_parked_surface_maps()
+            self._draft_restore_policy = "off"
+        elif view_mode == "merged" and self._merged_table is not None:
+            self._activate_table_surface(self._merged_table)
             self._draft_restore_policy = "off"
         elif self._my_table is not None:
             self._ensure_my_surface_active()
@@ -1471,6 +1487,11 @@ class DailyRegister(QWidget):
             # Discard → clear local recovery draft for this date, then leave.
             self._clear_local_draft()
         self._reset_edit_state()
+        if d != self._current_date:
+            self._clear_my_session()
+            self._merged_tx_cache = None
+            self._merged_tx_cache_key = None
+            self._merged_painted_key = None
         if merged is True:
             self._apply_navigate_view_mode("merged")
         elif view_mode in ("my", "parked", "merged"):
@@ -1532,6 +1553,9 @@ class DailyRegister(QWidget):
     def _invalidate_day_tx_cache(self) -> None:
         self._day_tx_cache = None
         self._day_tx_cache_key = None
+        self._merged_tx_cache = None
+        self._merged_tx_cache_key = None
+        self._merged_painted_key = None
         self._day_tx_stale = True
         # Day data changed — My keep-alive session is no longer trustworthy.
         self._clear_my_session()
@@ -1691,6 +1715,77 @@ class DailyRegister(QWidget):
         if prev_parked != self._local_parked:
             self._flush_day_issues_source_changed(force=True)
         self._schedule_outbox_drain(delay_ms=800)
+        return True
+
+    def _merged_cache_key_for_open_day(self) -> tuple | None:
+        if self._current_date is None:
+            return None
+        return self._make_day_cache_key(self._current_date, merged=True)
+
+    def _show_cached_merged_rows(self) -> bool:
+        """Paint Merged from the all-cashiers cache. False when that day is missing."""
+        key = self._merged_cache_key_for_open_day()
+        if (
+            key is None
+            or self._merged_tx_cache is None
+            or self._merged_tx_cache_key != key
+        ):
+            return False
+        if self._merged_painted_key != key:
+            self._apply_txs_to_view(
+                list(self._merged_tx_cache),
+                upload_id="",
+                reload_local_parked=False,
+            )
+            self._merged_painted_key = key
+        self._apply_column_visibility(show_cashier=True)
+        return True
+
+    def _flip_to_merged_keep_my(self) -> bool:
+        """My → Merged without wiping My. Returns False if My must reload."""
+        if self._my_table is None or self._merged_table is None:
+            return False
+        if self._current_date is None or self._day_tx_stale:
+            return False
+        self._draft_timer.stop()
+        self._commit_open_editor()
+        self._my_session = self._snapshot_grid_session()
+        self._activate_table_surface(self._merged_table)
+        self._view_mode = "merged"
+        self._merged_mode = True
+        self._parked_mode = False
+        self.mode_changed.emit("merged")
+        self._draft_restore_policy = "off"
+        if self._show_cached_merged_rows():
+            return True
+        self._show_register_loading("Loading…")
+        asyncio.ensure_future(self._load_date(self._current_date))
+        return True
+
+    def _flip_to_my_from_merged(self) -> bool:
+        """Merged → My using the preserved My table. Returns False to reload."""
+        if self._my_table is None or self._my_session is None:
+            return False
+        if self._day_tx_stale:
+            return False
+        self._draft_timer.stop()
+        self._commit_open_editor()
+        self._activate_table_surface(self._my_table)
+        self._restore_grid_session(self._my_session)
+        self._clear_my_session()
+        self._view_mode = "my"
+        self._merged_mode = False
+        self._parked_mode = False
+        self.mode_changed.emit("my")
+        self._draft_restore_policy = "silent"
+        self._apply_column_visibility(show_cashier=False)
+        self._update_footer()
+        self.edit_state_changed.emit(
+            bool(self._edit_mode), len(self._dirty_rows)
+        )
+        self._emit_undo_redo_state()
+        self._emit_active_cheque()
+        self._emit_parked_count()
         return True
 
     def _apply_txs_to_view(
@@ -2149,15 +2244,18 @@ class DailyRegister(QWidget):
 
     def _try_apply_cached_view(self) -> bool:
         """Same-day My↔Parked (or Merged cache hit): filter in memory, no network."""
-        if (
-            self._day_tx_cache is None
-            or self._day_tx_cache_key is None
-            or self._current_date is None
-        ):
+        if self._current_date is None:
+            return False
+        if self._merged_mode:
+            shown = self._show_cached_merged_rows()
+            if shown:
+                self._maybe_announce_parked_after_load()
+            return shown
+        if self._day_tx_cache is None or self._day_tx_cache_key is None:
             return False
         key = self._make_day_cache_key(
             self._current_date,
-            merged=self._merged_mode,
+            merged=False,
             upload_id="",
         )
         if self._day_tx_cache_key != key:
@@ -2219,11 +2317,18 @@ class DailyRegister(QWidget):
                 txs = await get_transactions_by_date(d, cashier_id=self._user._id)
             if seq != self._load_gen:
                 return
-            # Cache full day (incl. parked) for fast My↔Parked flips.
-            self._day_tx_cache = list(txs)
-            self._day_tx_cache_key = self._make_day_cache_key(
-                d, merged=self._merged_mode, upload_id=upload_id or ""
-            )
+            # My and Merged keep separate copies. A merged fetch must not
+            # replace the cashier day the My grid already showed.
+            if self._merged_mode and not upload_id:
+                self._merged_tx_cache = list(txs)
+                self._merged_tx_cache_key = self._make_day_cache_key(
+                    d, merged=True
+                )
+            else:
+                self._day_tx_cache = list(txs)
+                self._day_tx_cache_key = self._make_day_cache_key(
+                    d, merged=False, upload_id=upload_id or ""
+                )
             if self._parked_mode:
                 view_for_names = [
                     tx for tx in txs
@@ -2248,6 +2353,8 @@ class DailyRegister(QWidget):
                 upload_id=upload_id or "",
                 reload_local_parked=(self._my_session is None),
             )
+            if self._merged_mode and not upload_id:
+                self._merged_painted_key = self._merged_tx_cache_key
             self._maybe_restore_draft_after_populate()
             self._maybe_announce_parked_after_load()
             # Successful paint — Table / My no longer need a forced refresh.
@@ -2270,22 +2377,26 @@ class DailyRegister(QWidget):
     def set_view_mode(self, mode: str) -> None:
         """Switch My entries / Parked / Merged.
 
-        My ↔ Parked is an in-memory view flip: the My grid stays mounted, Parked
-        uses a separate small surface, and the flip never flushes drafts, saves
-        to the server, or wipe/restores My rows. Merged still reloads the day
-        browser (flush + cache/network) because it is a different scope.
+        My stays mounted. Parked and Merged are separate grids. Merged loads
+        every cashier once, then flips back to the My grid already on screen.
         """
         mode = mode if mode in ("my", "parked", "merged") else "my"
         if mode == self._view_mode:
             return
         prev = self._view_mode
 
-        # Fast path: My ↔ Parked keep-alive (no save / no My rebuild).
+        # Fast path: My ↔ Parked / My ↔ Merged keep My mounted.
         if prev == "my" and mode == "parked":
             if self._flip_to_parked_keep_my():
                 return
         if prev == "parked" and mode == "my":
             if self._flip_to_my_keep_alive():
+                return
+        if prev == "my" and mode == "merged":
+            if self._flip_to_merged_keep_my():
+                return
+        if prev == "merged" and mode == "my":
+            if self._flip_to_my_from_merged():
                 return
 
         self._draft_timer.stop()
@@ -2888,7 +2999,10 @@ class DailyRegister(QWidget):
 
     def _server_parked_txs_for_totals(self) -> list:
         """Parked server txs for the open day (own cashier unless Merged)."""
-        txs = list(self._day_tx_cache or [])
+        if self._merged_mode:
+            txs = list(self._merged_tx_cache or [])
+        else:
+            txs = list(self._day_tx_cache or [])
         parked = [
             tx for tx in txs
             if (getattr(tx, "register_status", "") or "") == "parked"
@@ -6371,7 +6485,13 @@ class DailyRegister(QWidget):
         font.setPointSize(pt)
         row_h = self._row_height_for_font(pt)
         tables = [
-            t for t in (self._my_table, self._parked_table, self._table)
+            t
+            for t in (
+                self._my_table,
+                self._parked_table,
+                self._merged_table,
+                self._table,
+            )
             if t is not None
         ]
         seen: set[int] = set()
