@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request
 
+from .badge_counters import apply_remembered, load_badge_docs
 from .accountant_ops import (
     TRASH_SORT,
     VERIFIED_SORT,
@@ -158,8 +159,15 @@ async def bulk_restore_from_trash(
     ids = _parse_ids(body.ids)
     if not ids:
         return {"updated": 0}
-    result = await _database(request).transactions.update_many(
-        {"_id": {"$in": ids}, "trashed": True},
+    db = _database(request)
+    restore_filter = {"_id": {"$in": ids}, "trashed": True}
+    before = await load_badge_docs(db, restore_filter)
+    cleared = {
+        "trashed": False,
+        "restore_requested": False,
+    }
+    result = await db.transactions.update_many(
+        restore_filter,
         {
             "$set": {
                 "trashed": False,
@@ -171,7 +179,9 @@ async def bulk_restore_from_trash(
             }
         },
     )
-    return {"updated": int(result.modified_count)}
+    changed = int(result.modified_count)
+    await apply_remembered(db, before, cleared, changed)
+    return {"updated": changed}
 
 
 @trash.post("/trash/bulk-delete")
@@ -181,9 +191,11 @@ async def bulk_permanently_delete_trashed(
     ids = _parse_ids(body.ids)
     if not ids:
         return {"deleted": 0}
-    result = await _database(request).transactions.delete_many(
-        {"_id": {"$in": ids}, "trashed": True}
-    )
+    db = _database(request)
+    purge_filter = {"_id": {"$in": ids}, "trashed": True}
+    before = await load_badge_docs(db, purge_filter)
+    result = await db.transactions.delete_many(purge_filter)
+    await apply_remembered(db, before, None, int(result.deleted_count))
     n = int(result.deleted_count)
     if n:
         await _audit(
@@ -199,8 +211,11 @@ async def bulk_permanently_delete_trashed(
 @trash.post("/trash/{tx_id}/restore")
 async def restore_from_trash(tx_id: str, request: Request, _manager: Manager) -> dict:
     oid = _valid_id(tx_id)
-    result = await _database(request).transactions.update_one(
-        {"_id": oid, "trashed": True},
+    db = _database(request)
+    restore_filter = {"_id": oid, "trashed": True}
+    before = await load_badge_docs(db, restore_filter)
+    result = await db.transactions.update_one(
+        restore_filter,
         {
             "$set": {
                 "trashed": False,
@@ -212,6 +227,12 @@ async def restore_from_trash(tx_id: str, request: Request, _manager: Manager) ->
             }
         },
     )
+    await apply_remembered(
+        db,
+        before,
+        {"trashed": False, "restore_requested": False},
+        int(result.modified_count),
+    )
     return {"ok": result.modified_count == 1}
 
 
@@ -220,9 +241,11 @@ async def permanently_delete_trashed(
     tx_id: str, request: Request, manager: Manager
 ) -> dict:
     oid = _valid_id(tx_id)
-    result = await _database(request).transactions.delete_one(
-        {"_id": oid, "trashed": True}
-    )
+    db = _database(request)
+    purge_filter = {"_id": oid, "trashed": True}
+    before = await load_badge_docs(db, purge_filter)
+    result = await db.transactions.delete_one(purge_filter)
+    await apply_remembered(db, before, None, int(result.deleted_count))
     ok = result.deleted_count == 1
     if ok:
         await _audit(

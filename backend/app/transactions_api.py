@@ -13,6 +13,16 @@ from pymongo import UpdateOne
 from pymongo.errors import BulkWriteError, DuplicateKeyError
 
 from .audit_ops import record_operation_event
+from .badge_counters import (
+    BADGE_TOUCH_FIELDS,
+    adjust_badges,
+    apply_remembered,
+    drafts_badge_total,
+    load_badge_docs,
+    note_many,
+    note_transition,
+    read_badges,
+)
 from .dependencies import Authenticated, require_roles
 from .errors import ApiError
 from .schemas import (
@@ -279,10 +289,12 @@ async def transactions_by_date(
             query["cashier_id"] = _valid_id(cashier_id)
         else:
             query["cashier_id"] = actor["_id"]
+    # cashier_id + date bounds match the register_by_day index when it exists.
+    # The index is created by migrate, not on this request.
     cursor = (
         _database(request)
         .transactions.find(query)
-        .sort([("day_order", 1), ("created_at", 1)])
+        .sort([("day_order", 1), ("_id", 1)])
     )
     docs = await cursor.to_list(length=None)
     docs = filter_pending_edit_clones(docs)
@@ -1077,11 +1089,10 @@ async def count_draft_transactions(
     cashier_id: str | None = None,
     all_cashiers: bool = False,
 ) -> dict:
-    """Badge total: open drafts + parked truck follow-up rows."""
-    query: dict[str, Any] = dict(DRAFT_OR_PARKED_MATCH)
-    if not all_cashiers:
-        query["cashier_id"] = _actor_cashier_id(actor, cashier_id)
-    total = await _database(request).transactions.count_documents(query)
+    """Badge total from the stored counter: drafts + parked."""
+    db = _database(request)
+    cashier = None if all_cashiers else _actor_cashier_id(actor, cashier_id)
+    total = drafts_badge_total(await read_badges(db), cashier_id=cashier)
     return {"count": int(total)}
 
 
@@ -1234,7 +1245,9 @@ async def discard_draft_transactions(
     if not body.allow_any_cashier:
         query["cashier_id"] = _actor_cashier_id(actor, body.cashier_id)
     db = _database(request)
+    before = await load_badge_docs(db, query)
     result = await db.transactions.delete_many(query)
+    await apply_remembered(db, before, None, int(result.deleted_count))
     await record_operation_event(
         db,
         action="txn.draft_discard",
@@ -1259,8 +1272,10 @@ async def discard_draft_day(
     if not body.allow_any_cashier:
         query["cashier_id"] = _actor_cashier_id(actor, body.cashier_id)
     db = _database(request)
+    before = await load_badge_docs(db, query)
     result = await db.transactions.delete_many(query)
     deleted = int(result.deleted_count)
+    await apply_remembered(db, before, None, deleted)
     await record_operation_event(
         db,
         action="txn.draft_discard_day",
@@ -1278,22 +1293,33 @@ async def submit_day_for_verify(
     body: SubmitDayRequest, request: Request, actor: RegisterActor
 ) -> dict:
     db = _database(request)
+    submit_filter = {
+        "$and": [
+            register_day_clause(body.date),
+            {"verified": {"$ne": True}},
+            {"rejected": {"$ne": True}},
+            {"discarded": {"$ne": True}},
+            {
+                "$or": [
+                    {"register_status": "draft"},
+                    {"register_status": {"$exists": False}},
+                ]
+            },
+        ],
+    }
     result = await db.transactions.update_many(
-        {
-            "$and": [
-                register_day_clause(body.date),
-                {"verified": {"$ne": True}},
-                {"rejected": {"$ne": True}},
-                {"discarded": {"$ne": True}},
-                {
-                    "$or": [
-                        {"register_status": "draft"},
-                        {"register_status": {"$exists": False}},
-                    ]
-                },
-            ],
-        },
+        submit_filter,
         {"$set": {"register_status": "submitted"}},
+    )
+    updated = int(result.modified_count)
+    cashier_deltas = None
+    actor_id = actor.get("_id")
+    if updated and actor_id is not None and actor.get("role") == "cashier":
+        cashier_deltas = {str(actor_id): {"drafts": -updated, "parked": 0}}
+    await adjust_badges(
+        db,
+        {"drafts": -updated, "verify": updated},
+        cashier_deltas=cashier_deltas,
     )
     await record_operation_event(
         db,
@@ -1302,9 +1328,9 @@ async def submit_day_for_verify(
         request=request,
         entity_type="register_day",
         entity_ids=[str(body.date)],
-        details={"updated": int(result.modified_count)},
+        details={"updated": updated},
     )
-    return {"updated": int(result.modified_count)}
+    return {"updated": updated}
 
 
 @transactions.post("/day-order", status_code=status.HTTP_204_NO_CONTENT)
@@ -1536,6 +1562,7 @@ async def _create_one_transaction_doc(
         raise
 
     doc["_id"] = result.inserted_id
+    await note_transition(db, None, doc)
     if record_event:
         await record_operation_event(
             db,
@@ -1655,11 +1682,13 @@ async def bulk_create_transactions(
             "error": "duplicate_key_without_existing_row",
         }
 
+    created_docs: list[dict[str, Any]] = []
     if to_insert:
         docs_only = [doc for _i, doc in to_insert]
         try:
             await db.transactions.insert_many(docs_only, ordered=False)
             for index, doc in to_insert:
+                created_docs.append(doc)
                 slots[index] = {
                     "index": index,
                     "status": "created",
@@ -1676,6 +1705,7 @@ async def bulk_create_transactions(
             for batch_i, (index, doc) in enumerate(to_insert):
                 err = err_by_index.get(batch_i)
                 if err is None:
+                    created_docs.append(doc)
                     slots[index] = {
                         "index": index,
                         "status": "created",
@@ -1724,6 +1754,9 @@ async def bulk_create_transactions(
         and isinstance(r.get("transaction"), dict)
         and r["transaction"].get("_id")
     ]
+
+    if created_docs:
+        await note_many(db, [(None, doc) for doc in created_docs])
 
     if created_ids:
         await record_operation_event(
@@ -1851,13 +1884,16 @@ async def bulk_restore_own_unverified_trash(
     if not ids:
         return {"updated": 0}
     cashier_id = actor.get("_id")
-    result = await _database(request).transactions.update_many(
-        {
-            "_id": {"$in": ids},
-            "trashed": True,
-            "verified": {"$ne": True},
-            "cashier_id": cashier_id,
-        },
+    db = _database(request)
+    restore_filter = {
+        "_id": {"$in": ids},
+        "trashed": True,
+        "verified": {"$ne": True},
+        "cashier_id": cashier_id,
+    }
+    before = await load_badge_docs(db, restore_filter)
+    result = await db.transactions.update_many(
+        restore_filter,
         {
             "$set": {
                 "trashed": False,
@@ -1870,6 +1906,15 @@ async def bulk_restore_own_unverified_trash(
         },
     )
     n = int(result.modified_count)
+    await apply_remembered(
+        db,
+        before,
+        {
+            "trashed": False,
+            "restore_requested": False,
+        },
+        n,
+    )
     if n:
         await record_operation_event(
             _database(request),
@@ -1895,15 +1940,16 @@ async def bulk_purge_own_unverified_trash(
         return {"deleted": 0}
     cashier_id = actor.get("_id")
     db = _database(request)
-    result = await db.transactions.delete_many(
-        {
-            "_id": {"$in": ids},
-            "trashed": True,
-            "verified": {"$ne": True},
-            "cashier_id": cashier_id,
-        }
-    )
+    purge_filter = {
+        "_id": {"$in": ids},
+        "trashed": True,
+        "verified": {"$ne": True},
+        "cashier_id": cashier_id,
+    }
+    before = await load_badge_docs(db, purge_filter)
+    result = await db.transactions.delete_many(purge_filter)
     n = int(result.deleted_count)
+    await apply_remembered(db, before, None, n)
     if n:
         await record_operation_event(
             db,
@@ -1934,6 +1980,7 @@ async def bulk_patch_transactions(
     """
     ops: list[UpdateOne] = []
     ids: list[ObjectId] = []
+    badge_patches: list[tuple[ObjectId, dict[str, Any]]] = []
     for item in body.items:
         oid = _valid_id(item.id)
         values = _coerce_write_fields(dict(item.values or {}))
@@ -1941,13 +1988,31 @@ async def bulk_patch_transactions(
             continue
         ops.append(UpdateOne({"_id": oid}, {"$set": values}))
         ids.append(oid)
+        if BADGE_TOUCH_FIELDS.intersection(values):
+            badge_patches.append((oid, values))
     if not ops:
         return {"updated": 0, "matched": 0, "requested": len(body.items)}
 
     db = _database(request)
+    before_by_id: dict[Any, dict[str, Any]] = {}
+    if badge_patches:
+        loaded = await load_badge_docs(
+            db, {"_id": {"$in": [oid for oid, _values in badge_patches]}}
+        )
+        before_by_id = {doc.get("_id"): doc for doc in loaded or []}
     result = await db.transactions.bulk_write(ops, ordered=False)
     updated = int(getattr(result, "modified_count", 0) or 0)
     matched = int(getattr(result, "matched_count", 0) or 0)
+    if matched and before_by_id:
+        pairs: list[tuple[dict[str, Any] | None, dict[str, Any] | None]] = []
+        for oid, values in badge_patches:
+            before = before_by_id.get(oid)
+            if before is None:
+                continue
+            after = dict(before)
+            after.update(values)
+            pairs.append((before, after))
+        await note_many(db, pairs)
     await record_operation_event(
         db,
         action="txn.bulk_update",
@@ -2110,7 +2175,9 @@ async def delete_transaction(
 ) -> Response:
     oid = _valid_id(tx_id)
     db = _database(request)
+    before = await load_badge_docs(db, {"_id": oid})
     result = await db.transactions.delete_one({"_id": oid})
+    await apply_remembered(db, before, None, int(result.deleted_count))
     if result.deleted_count == 0:
         raise ApiError(404, "not_found", "Transaction not found")
     await record_operation_event(
@@ -2153,7 +2220,9 @@ async def request_or_delete_transaction(
     # Pending-edit clones are disposable — hard-delete the clone only.
     is_pending_edit = bool(doc.get("original_transaction_id")) and not doc.get("verified")
     if is_pending_edit:
+        before = dict(doc)
         await db.transactions.delete_one({"_id": oid})
+        await note_transition(db, before, None)
         await record_operation_event(
             db,
             action="txn.delete",
@@ -2175,6 +2244,7 @@ async def request_or_delete_transaction(
     if not doc.get("verified"):
         if doc.get("trashed"):
             return {"result": "already_trashed"}
+        before = dict(doc)
         await db.transactions.update_one(
             {"_id": oid},
             {
@@ -2189,6 +2259,16 @@ async def request_or_delete_transaction(
                     "restore_requested_at": None,
                     "restore_requested_by": None,
                 }
+            },
+        )
+        await note_transition(
+            db,
+            before,
+            {
+                **before,
+                "trashed": True,
+                "deletion_requested": False,
+                "restore_requested": False,
             },
         )
         await record_operation_event(
@@ -2207,6 +2287,7 @@ async def request_or_delete_transaction(
         return {"result": "trashed"}
 
     # Verified → accountant must confirm (Verify → Deleted), then Trash.
+    before = dict(doc)
     await db.transactions.update_one(
         {"_id": oid},
         {
@@ -2217,6 +2298,7 @@ async def request_or_delete_transaction(
             }
         },
     )
+    await note_transition(db, before, {**before, "deletion_requested": True})
     await record_operation_event(
         db,
         action="txn.request_delete",
@@ -2253,6 +2335,7 @@ async def request_restore_from_trash(
         return {"result": "not_found"}
     if doc.get("restore_requested"):
         return {"result": "already_requested"}
+    before = dict(doc)
     await db.transactions.update_one(
         {
             "_id": oid,
@@ -2268,6 +2351,7 @@ async def request_restore_from_trash(
             }
         },
     )
+    await note_transition(db, before, {**before, "restore_requested": True})
     await record_operation_event(
         db,
         action="txn.request_restore",
@@ -2287,13 +2371,16 @@ async def cancel_restore_request(
 ) -> dict:
     """Cashier withdraws a pending restore request (row stays in trash)."""
     oid = _valid_id(tx_id)
-    result = await _database(request).transactions.update_one(
-        {
-            "_id": oid,
-            "trashed": True,
-            "cashier_id": actor.get("_id"),
-            "restore_requested": True,
-        },
+    db = _database(request)
+    cancel_filter = {
+        "_id": oid,
+        "trashed": True,
+        "cashier_id": actor.get("_id"),
+        "restore_requested": True,
+    }
+    before = await load_badge_docs(db, cancel_filter)
+    result = await db.transactions.update_one(
+        cancel_filter,
         {
             "$set": {
                 "restore_requested": False,
@@ -2303,6 +2390,7 @@ async def cancel_restore_request(
         },
     )
     ok = result.modified_count == 1
+    await apply_remembered(db, before, {"restore_requested": False}, int(ok))
     if ok:
         await record_operation_event(
             _database(request),
@@ -2357,7 +2445,11 @@ async def insert_pending_edit(
     if existing:
         patch = dict(updates)
         patch.update(meta)
+        before = dict(existing)
         await db.transactions.update_one({"_id": existing["_id"]}, {"$set": patch})
+        after = dict(before)
+        after.update(patch)
+        await note_transition(db, before, after)
         doc = await db.transactions.find_one({"_id": existing["_id"]})
         await record_operation_event(
             db,
@@ -2387,6 +2479,7 @@ async def insert_pending_edit(
     pending["created_at"] = now
     result = await db.transactions.insert_one(pending)
     pending["_id"] = result.inserted_id
+    await note_transition(db, None, pending)
     await record_operation_event(
         db,
         action="txn.pending_edit",

@@ -38,6 +38,32 @@ def test_scan_normalizes_and_matches_fleet() -> None:
     assert len(result.issues) == 2
 
 
+def test_yielding_scan_keeps_file_row_numbers() -> None:
+    import asyncio
+
+    from tahmeed.services.import_truck_check import scan_import_trucks_yielding
+
+    rows = [{"truck_no": f"T{index} ZZZ"} for index in range(5)]
+    seen: list[tuple[int, int]] = []
+
+    async def run() -> None:
+        def progress(done: int, total: int) -> None:
+            seen.append((done, total))
+
+        result = await scan_import_trucks_yielding(
+            rows,
+            "truck_no",
+            set(),
+            progress=progress,
+            chunk_size=2,
+        )
+        assert [issue.row for issue in result.issues] == [0, 1, 2, 3, 4]
+        assert result.issues[3].row_label == "File row 4"
+
+    asyncio.run(run())
+    assert seen == [(2, 5), (4, 5), (5, 5)]
+
+
 def test_scan_matches_freeform_fleet_plates() -> None:
     """Motorcycle/car plates in the fleet must not be flagged invalid_format."""
     rows = [

@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request
 
+from .badge_counters import apply_remembered, load_badge_docs
 from .accountant_ops import (
     RESTORE_BASE_MATCH,
     RESTORE_SORT,
@@ -245,11 +246,15 @@ async def bulk_confirm_restores(
     ids = _parse_ids(body.ids)
     if not ids:
         return {"updated": 0}
-    result = await _database(request).transactions.update_many(
-        {"_id": {"$in": ids}, **RESTORE_BASE_MATCH},
+    db = _database(request)
+    confirm_filter = {"_id": {"$in": ids}, **RESTORE_BASE_MATCH}
+    before = await load_badge_docs(db, confirm_filter)
+    result = await db.transactions.update_many(
+        confirm_filter,
         {"$set": dict(_CLEAR_TRASH)},
     )
     n = int(result.modified_count)
+    await apply_remembered(db, before, dict(_CLEAR_TRASH), n)
     if n:
         await _audit(
             request,
@@ -268,11 +273,15 @@ async def bulk_reject_restores(
     ids = _parse_ids(body.ids)
     if not ids:
         return {"updated": 0}
-    result = await _database(request).transactions.update_many(
-        {"_id": {"$in": ids}, **RESTORE_BASE_MATCH},
+    db = _database(request)
+    reject_filter = {"_id": {"$in": ids}, **RESTORE_BASE_MATCH}
+    before = await load_badge_docs(db, reject_filter)
+    result = await db.transactions.update_many(
+        reject_filter,
         {"$set": dict(_CLEAR_RESTORE)},
     )
     n = int(result.modified_count)
+    await apply_remembered(db, before, dict(_CLEAR_RESTORE), n)
     if n:
         await _audit(
             request,
@@ -289,11 +298,15 @@ async def confirm_restore(
     tx_id: str, request: Request, manager: Manager
 ) -> dict:
     oid = _valid_id(tx_id)
-    result = await _database(request).transactions.update_one(
-        {"_id": oid, **RESTORE_BASE_MATCH},
+    db = _database(request)
+    confirm_filter = {"_id": oid, **RESTORE_BASE_MATCH}
+    before = await load_badge_docs(db, confirm_filter)
+    result = await db.transactions.update_one(
+        confirm_filter,
         {"$set": dict(_CLEAR_TRASH)},
     )
     ok = result.modified_count == 1
+    await apply_remembered(db, before, dict(_CLEAR_TRASH), int(ok))
     if ok:
         await _audit(
             request,
@@ -309,11 +322,15 @@ async def reject_restore(
     tx_id: str, request: Request, manager: Manager
 ) -> dict:
     oid = _valid_id(tx_id)
-    result = await _database(request).transactions.update_one(
-        {"_id": oid, **RESTORE_BASE_MATCH},
+    db = _database(request)
+    reject_filter = {"_id": oid, **RESTORE_BASE_MATCH}
+    before = await load_badge_docs(db, reject_filter)
+    result = await db.transactions.update_one(
+        reject_filter,
         {"$set": dict(_CLEAR_RESTORE)},
     )
     ok = result.modified_count == 1
+    await apply_remembered(db, before, dict(_CLEAR_RESTORE), int(ok))
     if ok:
         await _audit(
             request,

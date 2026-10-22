@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QWidget
 
 from tahmeed.services.import_truck_check import (
     apply_truck_resolutions,
-    scan_import_trucks,
+    scan_import_trucks_yielding,
     skipped_docs_from_pairs,
     truck_field_for,
 )
@@ -117,15 +117,20 @@ async def _run_import_truck_gate_inner(
             maximum=max(1, len(rows)),
         )
 
-        def _on_progress(done: int, total: int) -> None:
+        async def _on_progress(done: int, total: int) -> None:
             busy.update(
-                f"Checking trucks… {done:,} / {total:,}",
+                f"Checked {done:,} of {total:,}",
                 value=done,
                 maximum=max(1, total),
             )
+            await busy.tick()
 
-        scan = scan_import_trucks(
-            rows, field, fleet, allowed_labels=labels, progress=_on_progress
+        scan = await scan_import_trucks_yielding(
+            rows,
+            field,
+            fleet,
+            allowed_labels=labels,
+            progress=_on_progress,
         )
     safe_process_events()
 

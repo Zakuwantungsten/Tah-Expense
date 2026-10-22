@@ -1444,7 +1444,7 @@ def test_rejected_discarded_and_drafts() -> None:
     assert discarded.status_code == 200 and discarded.json()["total"] == 1
     assert discard.json()["updated"] == 1
     assert restore.json()["updated"] == 1
-    assert drafts_count.json()["count"] == 1
+    assert drafts_count.json()["count"] == 0
     assert drafts.json()["total"] == 1
     assert draft_days.status_code == 200
     assert drop_drafts.json()["deleted"] == 1

@@ -107,8 +107,16 @@ async def _ensure_payee_cache() -> List[str]:
     async with _cache_lock:
         if _payee_list is not None:
             return _payee_list
-        docs = await _list(active=True)
-        names = sorted({_normalize_name(d["name"]) for d in docs if d.get("name")})
+        from tahmeed.services.catalog_service import fetch_catalog_snapshot
+
+        snapshot = await fetch_catalog_snapshot()
+        names = sorted(
+            {
+                _normalize_name(str(document.get("name") or ""))
+                for document in snapshot.get("payees") or []
+                if isinstance(document, dict) and document.get("name")
+            }
+        )
         _payee_set = set(names)
         _payee_list = names
         return _payee_list
@@ -177,11 +185,17 @@ async def add_payee(name: str, *, currency: str = "TZS", ref_num: str = "") -> N
         },
     )
     invalidate_payee_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
 
 
 async def remove_payee(name: str) -> None:
     await api_client.request("DELETE", f"v1/payees/{_path_name(name)}")
     invalidate_payee_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
 
 
 async def set_payee_active(
@@ -200,6 +214,9 @@ async def set_payee_active(
         json=payload,
     )
     invalidate_payee_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
 
 
 async def import_payee_list(
@@ -222,6 +239,9 @@ async def import_payee_list(
         },
     )
     invalidate_payee_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
     result = dict(payload or {})
     result.setdefault("imported", 0)
     result.setdefault("removed", 0)

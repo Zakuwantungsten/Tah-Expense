@@ -59,6 +59,16 @@ _LAZY_PAGE_KEYS = frozenset({
     "browse",
 })
 
+# Opening the register after one of these pages repeats the catalog snapshot.
+_CATALOG_EDITORS = frozenset({
+    "manage_categories",
+    "manage_suppliers",
+    "manage_trucks",
+    "manage_trailers",
+    "manage_motor_vehicles",
+    "manage_payees",
+})
+
 
 class AccountantDashboard(QWidget):
     logout_requested = Signal()
@@ -76,17 +86,18 @@ class AccountantDashboard(QWidget):
         self._pending_payees: list | None = None
         self._day_issues_badge_timer = QTimer(self)
         self._day_issues_badge_timer.setSingleShot(True)
-        self._day_issues_badge_timer.setInterval(350)
+        self._day_issues_badge_timer.setInterval(2_000)
         self._day_issues_badge_timer.timeout.connect(self._run_debounced_day_issues_badge)
         self._build()
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._load_categories())
         self._notification_timer = QTimer(self)
-        self._notification_timer.setInterval(2_000)
+        self._notification_timer.setInterval(15_000)
         self._notification_timer.timeout.connect(self._poll_notification_counts)
         self._notification_poll_task: asyncio.Task | None = None
         self._notification_timer.start()
         self._poll_notification_counts()
+        schedule_coro(self._refresh_day_issues_badge())
         # Preload the heavy separate-expenses module after the UI is up so the
         # first sidebar click into those tabs does not stall on cold import.
         QTimer.singleShot(0, self._warm_import_separate_expenses)
@@ -211,6 +222,7 @@ class AccountantDashboard(QWidget):
             from tahmeed.ui.accountant.verify_inbox import VerifyInboxWidget
             widget = VerifyInboxWidget(user=self._user)
             widget.badge_updated.connect(self._on_badge_updated)
+            widget.verify_delta.connect(self._on_verify_delta)
             widget.open_day_issues.connect(self._on_open_day_issues)
             return widget
 
@@ -218,6 +230,7 @@ class AccountantDashboard(QWidget):
             from tahmeed.ui.cashier.drafts_view import DraftsView
             widget = DraftsView(user=self._user, show_all_cashiers=True)
             widget.open_register_date.connect(self._on_drafts_open_register)
+            widget.drafts_submitted.connect(self._note_submitted_drafts)
             widget.drafts_changed.connect(self._on_drafts_data_changed)
             return widget
 
@@ -225,6 +238,7 @@ class AccountantDashboard(QWidget):
             from tahmeed.ui.cashier.saved_view import SavedView
             widget = SavedView(user=self._user, show_all_cashiers=True)
             widget.open_merged_date.connect(self._on_saved_open_merged)
+            widget.drafts_submitted.connect(self._note_submitted_drafts)
             widget.drafts_changed.connect(self._on_drafts_data_changed)
             return widget
 
@@ -372,9 +386,8 @@ class AccountantDashboard(QWidget):
             self._register.rows_saved.connect(
                 lambda _: asyncio.ensure_future(self._refresh_drafts_badge())
             )
-            self._register.drafts_changed.connect(
-                lambda: asyncio.ensure_future(self._refresh_drafts_badge())
-            )
+            self._register.drafts_submitted.connect(self._note_submitted_drafts)
+            self._register.drafts_changed.connect(self._on_register_drafts_changed)
             self._register.rows_saved.connect(lambda _: self._refresh_saved_page())
             self._register.drafts_changed.connect(self._refresh_saved_page)
             self._register.day_issues_requested.connect(self._on_open_day_issues)
@@ -507,6 +520,25 @@ class AccountantDashboard(QWidget):
     def _on_badge_updated(self, count: int) -> None:
         self._sidebar.set_verify_badge(count)
 
+    def _on_verify_delta(self, delta: int) -> None:
+        current = self._sidebar.verify_badge() if hasattr(self._sidebar, "verify_badge") else 0
+        self._sidebar.set_verify_badge(max(0, current + int(delta or 0)))
+
+    def _note_submitted_drafts(self, updated: int) -> None:
+        """Submit already returned the count. Move the drafts badge by that amount."""
+        self._skip_draft_recount = True
+        current = self._sidebar.drafts_badge() if hasattr(self._sidebar, "drafts_badge") else 0
+        nxt = max(0, current - int(updated or 0))
+        self._sidebar.set_drafts_badge(nxt)
+        if hasattr(self._sidebar, "set_saved_badge"):
+            self._sidebar.set_saved_badge(nxt)
+
+    def _on_register_drafts_changed(self) -> None:
+        if getattr(self, "_skip_draft_recount", False):
+            self._skip_draft_recount = False
+            return
+        asyncio.ensure_future(self._refresh_drafts_badge())
+
     async def _refresh_drafts_badge(self) -> None:
         from tahmeed.ui.cashier.drafts_view import fetch_draft_badge_count
         try:
@@ -524,7 +556,10 @@ class AccountantDashboard(QWidget):
 
     def _on_drafts_data_changed(self) -> None:
         """Keep Drafts + Saved + badges aligned after discard/submit."""
-        asyncio.ensure_future(self._refresh_drafts_badge())
+        if getattr(self, "_skip_draft_recount", False):
+            self._skip_draft_recount = False
+        else:
+            asyncio.ensure_future(self._refresh_drafts_badge())
         drafts = self._pages.get("drafts")
         saved = self._pages.get("saved")
         current = self._stack.currentWidget()
@@ -745,9 +780,10 @@ class AccountantDashboard(QWidget):
             )
 
             count = await get_verify_notification_count()
+            if count is None:
+                return
             self._sidebar.set_verify_badge(count)
             await self._refresh_drafts_badge()
-            await self._refresh_day_issues_badge()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -758,6 +794,15 @@ class AccountantDashboard(QWidget):
 
     def _on_nav(self, key: str) -> None:
         from tahmeed.ui.async_utils import schedule_call
+
+        previous = getattr(self, "_nav_key", None)
+        self._nav_key = key
+        if (
+            key == "table"
+            and previous in _CATALOG_EDITORS
+            and self._register is not None
+        ):
+            self._register.note_catalog_return()
 
         if key == "overview":
             self._stack.setCurrentIndex(self._page_indices["overview"])

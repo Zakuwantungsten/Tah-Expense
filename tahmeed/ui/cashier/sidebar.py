@@ -591,6 +591,10 @@ class CashierSidebarWidget(QFrame):
                 QToolButton:hover {{ background: {_ACTIVE_BG}; color: {_WHITE}; }}
             """)
 
+    def drafts_badge(self) -> int:
+        item = self._items.get("drafts")
+        return int(getattr(item, "_badge_count", 0) or 0) if item is not None else 0
+
     def set_drafts_badge(self, count: int) -> None:
         if "drafts" in self._items:
             self._items["drafts"].set_badge(count)

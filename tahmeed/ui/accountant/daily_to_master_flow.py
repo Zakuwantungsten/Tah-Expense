@@ -14,6 +14,7 @@ from tahmeed.services.daily_import_service import (
     preview_rows_as_truck_dicts,
 )
 from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
+from tahmeed.ui.async_utils import pause_background_polls
 from tahmeed.ui.dialog_theme import show_critical, show_info, show_warning
 from tahmeed.ui.dialogs.daily_import_preview_dialog import DailyImportPreviewDialog
 from tahmeed.ui.dialogs.date_outlier_dialog import resolve_import_date_policy
@@ -149,11 +150,17 @@ async def run_daily_to_master_flow(
         return None
 
     try:
-        with UploadBusy(parent, "Saving to Master Expenses…", title="Import Daily") as busy:
-            busy.update(f"Inserting {len(gate.rows):,} verified row(s)…")
-            result = await commit_daily_to_master(
-                gate.rows, verified_by=verified_by
-            )
+        with pause_background_polls(parent):
+            with UploadBusy(parent, "Saving to Master Expenses…", title="Import Daily") as busy:
+                async def _on_batch(index: int, total: int) -> None:
+                    busy.update(f"Importing batch {index} of {total}")
+                    await busy.tick()
+
+                result = await commit_daily_to_master(
+                    gate.rows,
+                    verified_by=verified_by,
+                    on_batch=_on_batch,
+                )
     except Exception as exc:
         show_critical(
             parent,

@@ -9,6 +9,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, Request
 
 from .accountant_ops import RE_APPROVE_CASCADE_FIELDS
+from .badge_counters import apply_remembered, load_badge_docs, note_transition
 from .dependencies import require_roles
 from .errors import ApiError
 from .schemas import (
@@ -122,8 +123,11 @@ async def bulk_approve(
     await _reject_if_missing_item_or_payee(request, ids)
     actor_id = _actor_oid(manager)
     now = utcnow().replace(tzinfo=None)
-    result = await _database(request).transactions.update_many(
-        {"_id": {"$in": ids}, "verified": False},
+    db = _database(request)
+    approve_filter = {"_id": {"$in": ids}, "verified": False}
+    before = await load_badge_docs(db, approve_filter)
+    result = await db.transactions.update_many(
+        approve_filter,
         {
             "$set": {
                 "verified": True,
@@ -137,6 +141,7 @@ async def bulk_approve(
         },
     )
     n = int(result.modified_count)
+    await apply_remembered(db, before, {"verified": True}, n)
     if n:
         await _audit(
             request,
@@ -156,8 +161,11 @@ async def bulk_reject(
     if not ids:
         return {"updated": 0}
     reason = body.reason or ""
-    result = await _database(request).transactions.update_many(
-        {"_id": {"$in": ids}},
+    db = _database(request)
+    reject_filter = {"_id": {"$in": ids}}
+    before = await load_badge_docs(db, reject_filter)
+    result = await db.transactions.update_many(
+        reject_filter,
         {
             "$set": {
                 "verified": False,
@@ -168,6 +176,12 @@ async def bulk_reject(
         },
     )
     n = int(result.modified_count)
+    await apply_remembered(
+        db,
+        before,
+        {"verified": False, "rejected": True, "discarded": False},
+        n,
+    )
     if n:
         await _audit(
             request,
@@ -203,8 +217,10 @@ async def bulk_re_approve(
 
     if simple_ids:
         now = utcnow().replace(tzinfo=None)
+        simple_filter = {"_id": {"$in": simple_ids}, "verified": False}
+        before = await load_badge_docs(db, simple_filter)
         result = await db.transactions.update_many(
-            {"_id": {"$in": simple_ids}, "verified": False},
+            simple_filter,
             {
                 "$set": {
                     "verified": True,
@@ -216,7 +232,11 @@ async def bulk_re_approve(
                 }
             },
         )
-        count += int(result.modified_count)
+        changed = int(result.modified_count)
+        await apply_remembered(
+            db, before, {"verified": True, "rejected": False}, changed
+        )
+        count += changed
     return {"updated": int(count)}
 
 
@@ -250,8 +270,11 @@ async def approve_transaction(
     await _reject_if_missing_item_or_payee(request, [oid])
     actor_id = _actor_oid(manager)
     now = utcnow().replace(tzinfo=None)
-    result = await _database(request).transactions.update_one(
-        {"_id": oid, "verified": False},
+    db = _database(request)
+    approve_filter = {"_id": oid, "verified": False}
+    before = await load_badge_docs(db, approve_filter)
+    result = await db.transactions.update_one(
+        approve_filter,
         {
             "$set": {
                 "verified": True,
@@ -265,6 +288,7 @@ async def approve_transaction(
         },
     )
     ok = result.modified_count == 1
+    await apply_remembered(db, before, {"verified": True}, int(ok))
     if ok:
         await _audit(
             request,
@@ -281,7 +305,9 @@ async def reject_transaction(
 ) -> dict:
     oid = _valid_id(tx_id)
     reason = body.reason or ""
-    result = await _database(request).transactions.update_one(
+    db = _database(request)
+    before = await load_badge_docs(db, {"_id": oid})
+    result = await db.transactions.update_one(
         {"_id": oid},
         {
             "$set": {
@@ -293,6 +319,12 @@ async def reject_transaction(
         },
     )
     ok = result.modified_count == 1
+    await apply_remembered(
+        db,
+        before,
+        {"verified": False, "rejected": True, "discarded": False},
+        int(ok),
+    )
     if ok:
         await _audit(
             request,
@@ -318,7 +350,9 @@ async def _re_approve_one(
     original_id = pending_doc.get("original_transaction_id")
     now = utcnow().replace(tzinfo=None)
 
+    original = None
     if original_id:
+        original = await db.transactions.find_one({"_id": original_id})
         updates = {
             k: pending_doc[k] for k in RE_APPROVE_CASCADE_FIELDS if k in pending_doc
         }
@@ -339,7 +373,12 @@ async def _re_approve_one(
         )
         if result.modified_count != 1:
             return False
+        if original is not None:
+            after = dict(original)
+            after.update(updates)
+            await note_transition(db, dict(original), after)
         await db.transactions.delete_one({"_id": tx_id})
+        await note_transition(db, dict(pending_doc), None)
         await _audit(
             request,
             action="txn.re_approve",
@@ -364,6 +403,11 @@ async def _re_approve_one(
     )
     ok = result.modified_count == 1
     if ok:
+        await note_transition(
+            db,
+            dict(pending_doc),
+            {**dict(pending_doc), "verified": True, "rejected": False},
+        )
         await _audit(
             request,
             action="txn.re_approve",
@@ -386,9 +430,18 @@ async def re_approve_transaction(
 @actions.post("/{tx_id}/return-to-inbox")
 async def return_to_inbox(tx_id: str, request: Request, _manager: Manager) -> dict:
     oid = _valid_id(tx_id)
-    result = await _database(request).transactions.update_one(
-        {"_id": oid, "rejected": True},
+    db = _database(request)
+    inbox_filter = {"_id": oid, "rejected": True}
+    before = await load_badge_docs(db, inbox_filter)
+    result = await db.transactions.update_one(
+        inbox_filter,
         {"$set": {"rejected": False, "rejection_reason": None, "discarded": False}},
+    )
+    await apply_remembered(
+        db,
+        before,
+        {"rejected": False, "discarded": False},
+        int(result.modified_count),
     )
     return {"ok": result.modified_count == 1}
 

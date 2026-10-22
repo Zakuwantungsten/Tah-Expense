@@ -156,41 +156,48 @@ async def _ensure_fleet_cache() -> List[str]:
     async with _cache_lock:
         if _fleet_list is not None:
             return _fleet_list
-        # trucks are required; trailers / motor_vehicles may be absent on older
-        # API deploys (404) without blocking the import fleet check.
-        trucks = await _list("trucks", active=True)
-        trailers = await _list_optional("trailers", active=True)
-        motor_vehicles = await _list_optional("motor_vehicles", active=True)
-        truck_numbers = [
-            document["number"].upper()
-            for document in trucks
-            if document.get("number")
-        ]
-        trailer_numbers = [
-            document["number"].upper()
-            for document in trailers
-            if document.get("number")
-        ]
-        motor_numbers = [
-            document["number"].upper()
-            for document in motor_vehicles
-            if document.get("number")
-        ]
-        seen: set[str] = set()
-        combined: list[str] = []
-        kinds: Dict[str, str] = {}
-        # Prefer truck > trailer > motor_vehicle if a number appears in more than one.
-        _append_kind(truck_numbers, kinds, seen, combined, "truck")
-        _append_kind(trailer_numbers, kinds, seen, combined, "trailer")
-        _append_kind(motor_numbers, kinds, seen, combined, "motor_vehicle")
-        combined.sort()
-        _trucks_list = sorted(set(truck_numbers))
-        _trailers_list = sorted(set(trailer_numbers))
-        _motor_vehicles_list = sorted(set(motor_numbers))
-        _fleet_kinds = kinds
-        _fleet_set = seen
-        _fleet_list = combined
-        return _fleet_list
+        from tahmeed.services.catalog_service import fetch_catalog_snapshot
+
+        snapshot = await fetch_catalog_snapshot()
+        return _store_fleet_lists(
+            _numbers(snapshot.get("trucks")),
+            _numbers(snapshot.get("trailers")),
+            _numbers(snapshot.get("motor_vehicles")),
+        )
+
+
+def _numbers(documents: object) -> List[str]:
+    if not isinstance(documents, list):
+        return []
+    return [
+        str(document.get("number") or "").upper()
+        for document in documents
+        if isinstance(document, dict) and document.get("number")
+    ]
+
+
+def _store_fleet_lists(
+    truck_numbers: List[str],
+    trailer_numbers: List[str],
+    motor_numbers: List[str],
+) -> List[str]:
+    global _fleet_list, _fleet_set, _trucks_list, _trailers_list
+    global _motor_vehicles_list, _fleet_kinds
+    seen: set[str] = set()
+    combined: list[str] = []
+    kinds: Dict[str, str] = {}
+    # Prefer truck > trailer > motor_vehicle if a number appears in more than one.
+    _append_kind(truck_numbers, kinds, seen, combined, "truck")
+    _append_kind(trailer_numbers, kinds, seen, combined, "trailer")
+    _append_kind(motor_numbers, kinds, seen, combined, "motor_vehicle")
+    combined.sort()
+    _trucks_list = sorted(set(truck_numbers))
+    _trailers_list = sorted(set(trailer_numbers))
+    _motor_vehicles_list = sorted(set(motor_numbers))
+    _fleet_kinds = kinds
+    _fleet_set = seen
+    _fleet_list = combined
+    return _fleet_list
 
 
 def _prefix_filter(numbers: List[str], prefix: str, limit: int) -> List[str]:
@@ -319,6 +326,9 @@ async def _put(kind: str, number: str, active: bool = True) -> None:
         json={"number": normalized, "active": active},
     )
     invalidate_fleet_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
 
 
 async def add_truck(number: str) -> None:
@@ -328,6 +338,9 @@ async def add_truck(number: str) -> None:
 async def remove_truck(number: str) -> None:
     await api_client.request("DELETE", f"v1/trucks/{number.strip().upper()}")
     invalidate_fleet_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
 
 
 async def set_truck_active(number: str, active: bool) -> None:
@@ -339,6 +352,9 @@ async def bulk_add_trucks(numbers: List[str]) -> int:
     existing = {document["number"] for document in await _list("trucks")}
     await asyncio.gather(*(_put("trucks", number) for number in normalized))
     invalidate_fleet_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
     return len(normalized - existing)
 
 
@@ -374,6 +390,9 @@ async def add_trailer(number: str) -> None:
 async def remove_trailer(number: str) -> None:
     await api_client.request("DELETE", f"v1/trailers/{number.strip().upper()}")
     invalidate_fleet_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
 
 
 async def set_trailer_active(number: str, active: bool) -> None:
@@ -385,6 +404,9 @@ async def bulk_add_trailers(numbers: List[str]) -> int:
     existing = {document["number"] for document in await _list("trailers")}
     await asyncio.gather(*(_put("trailers", number) for number in normalized))
     invalidate_fleet_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
     return len(normalized - existing)
 
 
@@ -420,6 +442,9 @@ async def add_motor_vehicle(number: str) -> None:
 async def remove_motor_vehicle(number: str) -> None:
     await api_client.request("DELETE", f"v1/motor_vehicles/{number.strip().upper()}")
     invalidate_fleet_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
 
 
 async def set_motor_vehicle_active(number: str, active: bool) -> None:
@@ -431,4 +456,7 @@ async def bulk_add_motor_vehicles(numbers: List[str]) -> int:
     existing = {document["number"] for document in await _list("motor_vehicles")}
     await asyncio.gather(*(_put("motor_vehicles", number) for number in normalized))
     invalidate_fleet_cache()
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
     return len(normalized - existing)

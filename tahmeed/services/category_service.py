@@ -45,8 +45,16 @@ async def get_payment_target_categories(
     include_inactive: bool = False,
 ) -> List[Category]:
     """All selectable payment targets for the table Item column and description maps."""
-    categories = await get_all_categories(include_inactive=include_inactive)
-    return sort_payment_targets(categories)
+    if include_inactive:
+        categories = await get_all_categories(include_inactive=True)
+        return sort_payment_targets(categories)
+    from tahmeed.services.catalog_service import (
+        categories_from_snapshot,
+        fetch_catalog_snapshot,
+    )
+
+    snapshot = await fetch_catalog_snapshot()
+    return sort_payment_targets(categories_from_snapshot(snapshot))
 
 
 async def get_all_categories(
@@ -123,17 +131,37 @@ def _sorted_sidebar(categories: List[Category]) -> List[Category]:
 
 async def get_sidebar_categories() -> List[Category]:
     """Items shown in the accountant ITEMS sidebar (excludes suppliers)."""
-    categories = await get_all_categories(is_supplier=False)
+    from tahmeed.services.catalog_service import (
+        categories_from_snapshot,
+        fetch_catalog_snapshot,
+    )
+
+    snapshot = await fetch_catalog_snapshot()
+    categories = categories_from_snapshot(snapshot)
     return _sorted_sidebar(
-        [category for category in categories if category.show_in_sidebar]
+        [
+            category
+            for category in categories
+            if not category.is_supplier and category.show_in_sidebar
+        ]
     )
 
 
 async def get_cashier_sidebar_categories() -> List[Category]:
     """Items shown in the cashier ITEMS sidebar (excludes suppliers)."""
-    categories = await get_all_categories(is_supplier=False)
+    from tahmeed.services.catalog_service import (
+        categories_from_snapshot,
+        fetch_catalog_snapshot,
+    )
+
+    snapshot = await fetch_catalog_snapshot()
+    categories = categories_from_snapshot(snapshot)
     return _sorted_sidebar(
-        [category for category in categories if category.show_in_cashier_sidebar]
+        [
+            category
+            for category in categories
+            if not category.is_supplier and category.show_in_cashier_sidebar
+        ]
     )
 
 
@@ -174,6 +202,9 @@ async def _create_category(
             "is_supplier": is_supplier,
         },
     )
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
     return _category(document)
 
 
@@ -245,6 +276,9 @@ async def update_category(cat_id: ObjectId, **fields) -> None:
     await api_client.request(
         "PATCH", f"v1/categories/{cat_id}", json={"values": fields}
     )
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
 
 
 async def toggle_category(cat_id: ObjectId, active: bool) -> None:
@@ -253,3 +287,6 @@ async def toggle_category(cat_id: ObjectId, active: bool) -> None:
 
 async def delete_category(cat_id: ObjectId) -> None:
     await api_client.request("DELETE", f"v1/categories/{cat_id}")
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()

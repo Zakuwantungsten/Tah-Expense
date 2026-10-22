@@ -1,4 +1,8 @@
-"""Live reachability probe for the desktop app (API /health/ready only)."""
+"""Live reachability probe for the desktop app (API /health/live only).
+
+``/health/ready`` still pings Mongo for operators. The status light must not
+use it: a slow import on the same process would look like a lost connection.
+"""
 
 from __future__ import annotations
 
@@ -27,14 +31,16 @@ class ConnectivityStatus:
 
     @property
     def degraded(self) -> bool:
-        # API-only: no partial “API up / DB down” split on the desktop.
-        return False
+        """Amber while a batch is still running and a probe only timed out."""
+        return self.api_detail == "busy"
 
     def short_label(self) -> str:
         if self.online:
             return "Connected"
         if self.api_detail == "database_unavailable":
             return "Server unavailable"
+        if self.api_detail == "busy":
+            return "Working"
         return "Offline"
 
     def banner_message(self) -> str:
@@ -45,6 +51,12 @@ class ConnectivityStatus:
                 "The server is up but the database is not ready. "
                 "Try again in a moment."
             )
+        if self.api_detail == "busy":
+            return "The app is still working. Connection was not lost."
+        if _loopback_api():
+            if self.api_detail == "timeout":
+                return "The Tahmeed API did not answer in time."
+            return "The Tahmeed API is not running."
         return (
             "Cannot reach the Tahmeed API. "
             "Check your internet connection and try again."
@@ -64,14 +76,35 @@ class ConnectivityStatus:
     def dot_color(self) -> str:
         if self.online:
             return "#16A34A"
+        if self.api_detail == "busy":
+            return "#B45309"
         return "#DC2626"
 
 
-_PROBE_TIMEOUT_S = 5.0
+_PROBE_TIMEOUT_S = 2.0
+
+
+def _loopback_api() -> bool:
+    """True when the desktop is aimed at this machine, not a remote host."""
+    from tahmeed.config import API_BASE_URL
+
+    host = (API_BASE_URL or "").lower()
+    return "127.0.0.1" in host or "localhost" in host or "[::1]" in host
+
+
+def _status_while_busy(status: ConnectivityStatus, busy: bool) -> ConnectivityStatus:
+    """A timeout during save/import/verify means the worker is busy."""
+    if busy and not status.api_ok and status.api_detail == "timeout":
+        return ConnectivityStatus(
+            api_ok=False,
+            checked_at=status.checked_at,
+            api_detail="busy",
+        )
+    return status
 
 
 async def probe_connectivity(*, timeout: float = _PROBE_TIMEOUT_S) -> ConnectivityStatus:
-    """Ping API /health/ready; never raises."""
+    """Ping API /health/live; never raises. Does not touch Mongo."""
     api_ok, api_detail = await _probe_api(timeout)
     return ConnectivityStatus(
         api_ok=api_ok,
@@ -85,14 +118,16 @@ async def _probe_api(timeout: float) -> tuple[bool, str]:
         from tahmeed.services.api_client import ApiConnectionError, ApiError, api_client
 
         await asyncio.wait_for(
-            api_client.request("GET", "health/ready", auth=False),
+            api_client.request("GET", "health/live", auth=False),
             timeout=timeout,
         )
         return True, ""
     except asyncio.TimeoutError:
         return False, "timeout"
     except ApiConnectionError as exc:
-        return False, str(exc) or "connection_error"
+        if exc.code == "timeout":
+            return False, "timeout"
+        return False, "connection_error"
     except ApiError as exc:
         # Desktop cannot work without the DB behind the API.
         if exc.status_code == 503 and exc.code == "database_unavailable":
@@ -115,6 +150,7 @@ class ConnectivityMonitor(QObject):
         self._in_flight = False
         self._task: asyncio.Task | None = None
         self._paused = False
+        self._busy_depth = 0
         self._status: ConnectivityStatus | None = None
         self._started = False
 
@@ -126,6 +162,9 @@ class ConnectivityMonitor(QObject):
         if self._started:
             return
         self._started = True
+        if self._busy_depth > 0:
+            self._paused = True
+            return
         self._paused = False
         self._timer.start()
         self._on_tick()
@@ -140,7 +179,12 @@ class ConnectivityMonitor(QObject):
         self._in_flight = False
 
     def pause(self) -> None:
-        """Stop probes during nested Qt dialogs / long UI tasks (Py3.14)."""
+        """Stop probes for a dialog or a save/import/verify batch.
+
+        Nested callers each pair pause with resume. Cancelling the in-flight
+        probe does not publish a new status, so the light stays Connected.
+        """
+        self._busy_depth += 1
         self._paused = True
         self._timer.stop()
         task = self._task
@@ -150,6 +194,10 @@ class ConnectivityMonitor(QObject):
         self._in_flight = False
 
     def resume(self) -> None:
+        if self._busy_depth > 0:
+            self._busy_depth -= 1
+        if self._busy_depth > 0:
+            return
         if not self._started:
             return
         self._paused = False
@@ -174,7 +222,12 @@ class ConnectivityMonitor(QObject):
             return
         self._in_flight = True
         try:
-            status = await probe_connectivity()
+            status = _status_while_busy(
+                await probe_connectivity(),
+                self._busy_depth > 0,
+            )
+            if self._paused and status.api_ok:
+                return
             prev = self._status
             self._status = status
             if (

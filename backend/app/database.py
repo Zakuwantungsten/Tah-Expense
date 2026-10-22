@@ -9,9 +9,11 @@ from .config import Settings
 
 class Database:
     def __init__(self, settings: Settings) -> None:
+        # One client per process. Office mode runs 2 workers, so the cap is 40.
         self.client: AsyncMongoClient[dict[str, Any]] = AsyncMongoClient(
             settings.mongodb_uri,
             appname="tahmeed-api",
+            maxPoolSize=20,
             serverSelectionTimeoutMS=5000,
             tz_aware=True,
         )

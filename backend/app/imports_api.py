@@ -437,6 +437,9 @@ async def chart_of_accounts_import(
         actor=manager,
         details=details,
     )
+    from .catalog_snapshot import bump_catalog_version
+
+    await bump_catalog_version(request)
     return json_safe(details)
 
 
@@ -466,6 +469,9 @@ async def payees_import(
         actor=manager,
         details=details,
     )
+    from .catalog_snapshot import bump_catalog_version
+
+    await bump_catalog_version(request)
     return json_safe(details)
 
 

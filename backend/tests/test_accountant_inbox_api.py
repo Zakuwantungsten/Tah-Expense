@@ -152,6 +152,27 @@ def _submitted(**kwargs) -> dict:
     return doc
 
 
+def test_inbox_first_page_does_not_count_documents() -> None:
+    collection = FakeTransactions([_submitted(description="On the page")])
+    calls = {"n": 0}
+    original = collection.count_documents
+
+    async def _counting(query: dict) -> int:
+        calls["n"] += 1
+        return await original(query)
+
+    collection.count_documents = _counting  # type: ignore[method-assign]
+    app = _app(collection)
+    app.dependency_overrides[current_user] = _manager
+
+    with TestClient(app) as client:
+        response = client.get("/v1/accountant/inbox", params={"limit": 25, "skip": 0})
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert calls["n"] == 0
+
+
 def test_inbox_lists_submitted_and_excludes_drafts() -> None:
     cashier = ObjectId()
     docs = [

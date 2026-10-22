@@ -921,7 +921,7 @@ class CashierDashboard(QWidget):
         self._category_indices: dict[str, int] = {}
         self._day_issues_badge_timer = QTimer(self)
         self._day_issues_badge_timer.setSingleShot(True)
-        self._day_issues_badge_timer.setInterval(350)
+        self._day_issues_badge_timer.setInterval(2_000)
         self._day_issues_badge_timer.timeout.connect(self._run_debounced_day_issues_badge)
         self._build_ui()
         from tahmeed.ui.async_utils import schedule_coro
@@ -1068,17 +1068,18 @@ class CashierDashboard(QWidget):
         self._form.transaction_saved.connect(lambda _: self._register.refresh())
         self._form.trash_changed.connect(self._on_register_trash_changed)
         self._drafts_view.open_register_date.connect(self._on_drafts_open_register)
+        self._drafts_view.drafts_submitted.connect(self._note_submitted_drafts)
         self._drafts_view.drafts_changed.connect(self._on_drafts_data_changed)
         self._saved_view.open_merged_date.connect(self._on_saved_open_merged)
+        self._saved_view.drafts_submitted.connect(self._note_submitted_drafts)
         self._saved_view.drafts_changed.connect(self._on_drafts_data_changed)
         from tahmeed.ui.async_utils import schedule_coro
 
         self._register.rows_saved.connect(
             lambda _: schedule_coro(self._refresh_draft_badge())
         )
-        self._register.drafts_changed.connect(
-            lambda: schedule_coro(self._refresh_draft_badge())
-        )
+        self._register.drafts_submitted.connect(self._note_submitted_drafts)
+        self._register.drafts_changed.connect(self._on_register_drafts_changed)
         self._register.rows_saved.connect(lambda _: self._saved_view.refresh())
         self._register.drafts_changed.connect(self._saved_view.refresh)
         self._register.day_issues_requested.connect(self._on_open_day_issues)
@@ -1277,11 +1278,32 @@ class CashierDashboard(QWidget):
         self._on_nav("table")
         self._register.navigate_to_date(d, merged=True)
 
+    def _note_submitted_drafts(self, updated: int) -> None:
+        """Submit already returned the count. Move the badge by that amount."""
+        self._skip_draft_recount = True
+        current = self._sidebar.drafts_badge() if hasattr(self._sidebar, "drafts_badge") else 0
+        nxt = max(0, current - int(updated or 0))
+        if hasattr(self._sidebar, "set_drafts_badge"):
+            self._sidebar.set_drafts_badge(nxt)
+        if hasattr(self._sidebar, "set_saved_badge"):
+            self._sidebar.set_saved_badge(nxt)
+
+    def _on_register_drafts_changed(self) -> None:
+        if getattr(self, "_skip_draft_recount", False):
+            self._skip_draft_recount = False
+            return
+        from tahmeed.ui.async_utils import schedule_coro
+
+        schedule_coro(self._refresh_draft_badge())
+
     def _on_drafts_data_changed(self, day=None) -> None:
         """Keep Drafts + Saved + badges + open register aligned after discard/submit."""
         from tahmeed.ui.async_utils import schedule_coro
 
-        schedule_coro(self._refresh_draft_badge())
+        if getattr(self, "_skip_draft_recount", False):
+            self._skip_draft_recount = False
+        else:
+            schedule_coro(self._refresh_draft_badge())
         # Drop ghost rows on the Daily Register when that day was discarded/submitted.
         self._register.invalidate_after_server_draft_change(day)
         # Refresh the sibling inbox so discard/submit stays in sync.

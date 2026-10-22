@@ -72,6 +72,9 @@ async def get_setting(key: str) -> Any:
 
 async def set_setting(key: str, value: Any) -> None:
     await api_client.request("PUT", f"v1/settings/{key}", json={"value": value})
+    from tahmeed.services.catalog_service import mark_catalog_stale
+
+    mark_catalog_stale()
 
 
 async def get_all_settings() -> dict:

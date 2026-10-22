@@ -18,6 +18,7 @@ from pymongo.errors import BulkWriteError
 
 from .accountant_master_ops import stamp_truck_sort_key
 from .accountant_ops import append_text_filters
+from .batch_lock import serialized_batch
 
 _MONTH_LABELS = [
     "",
@@ -595,6 +596,7 @@ def new_upload_id() -> str:
     return str(uuid.uuid4())
 
 
+@serialized_batch
 async def commit_daily_to_master(
     db: Any,
     payloads: Sequence[dict[str, Any]],
@@ -669,6 +671,7 @@ async def commit_daily_to_master(
     }
 
 
+@serialized_batch
 async def commit_master_import(
     db: Any,
     rows: Sequence[dict[str, Any]],

@@ -1,5 +1,10 @@
+import asyncio
+
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
+from app.batch_lock import batch_lock
 from app.config import Settings
 from app.main import create_app
 
@@ -21,8 +26,32 @@ def test_health_endpoints_without_mongodb() -> None:
     )
     with TestClient(create_app(settings=settings, database=database)) as client:
         live = client.get("/health/live")
+        assert live.json() == {"status": "ok"}
+        assert database.pings == 0
         ready = client.get("/health/ready")
-    assert live.json() == {"status": "ok"}
     assert ready.json() == {"status": "ready"}
     assert ready.headers["x-request-id"]
     assert database.pings == 1
+
+
+@pytest.mark.asyncio
+async def test_live_answers_while_import_lock_is_held() -> None:
+    lock = batch_lock()
+    await lock.acquire()
+    try:
+        database = FakeDatabase()
+        settings = Settings(
+            mongodb_uri="mongodb://localhost:27017",
+            jwt_secret="a-test-secret-that-is-definitely-32-characters",
+        )
+        app = create_app(settings=settings, database=database)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            response = await asyncio.wait_for(client.get("/health/live"), timeout=1)
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        assert database.pings == 0
+    finally:
+        lock.release()

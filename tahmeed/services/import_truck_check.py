@@ -303,6 +303,61 @@ def mark_parking_congo_deposit(row: dict, truck_field: str = "vehicle_no") -> No
             row[key] = ""
 
 
+SCAN_CHUNK = 2000
+
+
+async def scan_import_trucks_yielding(
+    rows: List[dict],
+    truck_field: str,
+    fleet: Set[str],
+    *,
+    allowed_labels: Optional[Iterable[str]] = None,
+    progress: Optional[Callable[[int, int], object]] = None,
+    chunk_size: int = SCAN_CHUNK,
+) -> ImportTruckScanResult:
+    """Scan off the UI thread, one chunk at a time, so the window can paint.
+
+    ``progress`` is called on the caller's task after each chunk with
+    ``(done, total)``. It may be a coroutine.
+    """
+    import asyncio
+    import inspect
+
+    result = ImportTruckScanResult()
+    total = len(rows)
+    if total <= 0:
+        return result
+    size = chunk_size if chunk_size > 0 else SCAN_CHUNK
+    labels = list(allowed_labels) if allowed_labels is not None else None
+    for start in range(0, total, size):
+        end = min(start + size, total)
+        chunk = rows[start:end]
+
+        def _scan(chunk: List[dict] = chunk, start: int = start) -> ImportTruckScanResult:
+            part = scan_import_trucks(
+                chunk,
+                truck_field,
+                fleet,
+                allowed_labels=labels,
+            )
+            for issue in part.issues:
+                issue.row += start
+                issue.row_label = f"File row {issue.row + 1}"
+            return part
+
+        part = await asyncio.to_thread(_scan)
+        result.issues.extend(part.issues)
+        result.ok_count += part.ok_count
+        result.empty_count += part.empty_count
+        result.deposit_count += part.deposit_count
+        if progress is not None:
+            update = progress(end, total)
+            if inspect.isawaitable(update):
+                await update
+        await asyncio.sleep(0)
+    return result
+
+
 def scan_import_trucks(
     rows: List[dict],
     truck_field: str,

@@ -53,6 +53,19 @@ def pending_jobs() -> List[MappingApplyJob]:
     return [job for job in list(_jobs) if job.status in {"pending", "in_flight", "failed"}]
 
 
+def applying_description_keys() -> set[str]:
+    """Keys whose register-row update is still queued or in flight.
+
+    A slow network must not show these as unmapped again while the saved map
+    waits to be written onto the rows.
+    """
+    keys: set[str] = set()
+    for job in _jobs:
+        if job.status in {"pending", "in_flight"}:
+            keys.update(job.description_keys)
+    return keys
+
+
 def cancel_pending_jobs_for_keys(description_keys: Sequence[str]) -> int:
     """Cancel pending/failed apply jobs that touch any of *description_keys*.
 

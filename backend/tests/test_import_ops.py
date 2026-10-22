@@ -203,3 +203,70 @@ async def test_insert_many_idempotent_reraises_other_errors() -> None:
 
 def test_reset_import_index_cache() -> None:
     reset_import_index_cache()
+
+
+class _KeyedTransactions:
+    def __init__(self) -> None:
+        self.documents: list[dict] = []
+        self.keys: set[tuple] = set()
+
+    async def create_index(self, *_args, **_kwargs) -> None:
+        return None
+
+    async def insert_many(self, docs, ordered: bool = False):
+        inserted_ids = []
+        errors = []
+        for index, doc in enumerate(docs):
+            key = (doc.get("daily_import_id"), doc.get("import_row_key"))
+            if key in self.keys:
+                errors.append({"index": index, "code": 11000})
+                continue
+            self.keys.add(key)
+            self.documents.append(doc)
+            inserted_ids.append(index)
+        if errors:
+            raise BulkWriteError(
+                {"nInserted": len(inserted_ids), "writeErrors": errors}
+            )
+        return type("Result", (), {"inserted_ids": inserted_ids})()
+
+
+class _IndexOnly:
+    async def create_index(self, *_args, **_kwargs) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_commit_one_thousand_then_same_keys_insert_zero() -> None:
+    from types import SimpleNamespace
+
+    from app.import_ops import commit_daily_to_master
+
+    reset_import_index_cache()
+    transactions = _KeyedTransactions()
+    db = SimpleNamespace(
+        transactions=transactions,
+        imported_feeds=_IndexOnly(),
+        separate_expenses=_IndexOnly(),
+    )
+    rows = [
+        {
+            "date": "2026-03-01T00:00:00",
+            "description": f"Fuel {index}",
+            "truck_number": "T1 AA",
+            "amount": 10 + index,
+            "category_name": "DIESEL",
+            "daily_import_id": "up-1000",
+            "daily_import_source": "daily.xlsx",
+        }
+        for index in range(1000)
+    ]
+    first = await commit_daily_to_master(db, rows)
+    second = await commit_daily_to_master(db, rows)
+
+    assert first["inserted"] == 1000
+    assert first["duplicates_skipped"] == 0
+    assert second["inserted"] == 0
+    assert second["duplicates_skipped"] == 1000
+    assert len(transactions.documents) == 1000
+    assert first["upload_id"] == "up-1000"

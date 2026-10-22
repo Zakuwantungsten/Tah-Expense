@@ -323,7 +323,7 @@ class TransactionBulkCreateRequest(StrictModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    items: list[TransactionCreate] = Field(default_factory=list, max_length=100)
+    items: list[TransactionCreate] = Field(default_factory=list, max_length=500)
 
 
 class PendingEditRequest(StrictModel):

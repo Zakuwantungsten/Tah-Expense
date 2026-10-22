@@ -66,7 +66,7 @@ from tahmeed.services.cashier_service import (
     submit_day_for_verify, recount_day_order,
     next_day_order,
 )
-from tahmeed.services.category_service import get_payment_target_categories, item_key
+from tahmeed.services.category_service import item_key
 from tahmeed.services.subtable_service import get_subtables
 from tahmeed.services.settings_service import get_setting, set_setting
 from tahmeed.services.register_draft_service import (
@@ -1025,6 +1025,7 @@ class DailyRegister(QWidget):
     )
     register_status_updated = Signal(int, int)  # draft_count, submitted_count on saved rows
     drafts_changed        = Signal()
+    drafts_submitted      = Signal(int)  # response updated; local badge delta
     day_issues_requested  = Signal(object)  # date | None — open Day Issues for this day
     # Item / Payee / Description / import staging changed — refresh Day Issues.
     day_issues_source_changed = Signal()
@@ -1190,13 +1191,8 @@ class DailyRegister(QWidget):
         except Exception:
             pass
         asyncio.ensure_future(self._load_date(self._current_date))
-        asyncio.ensure_future(self._load_categories())
-        asyncio.ensure_future(self._load_cashier_settings())
-        asyncio.ensure_future(self._load_locked_subitems())
-        asyncio.ensure_future(self._load_fleet_numbers())
+        asyncio.ensure_future(self._load_register_catalog())
         asyncio.ensure_future(self._load_people_names())
-        asyncio.ensure_future(self._load_payee_names())
-        asyncio.ensure_future(self._load_description_cache())
         asyncio.ensure_future(self._load_description_mapping_cache())
 
     # ------------------------------------------------------------------
@@ -1916,6 +1912,9 @@ class DailyRegister(QWidget):
                     )
                     meta["client_row_id"] = rid
                     self._pending_row_meta[row] = meta
+                    tx_id = entry.get("tx_id")
+                    if tx_id:
+                        self._saved_ids[row] = tx_id
                     self._activate_row(row)
                     self._sync_row_date(row)
                 self._finalize_truck_cells(truck_cells)
@@ -1951,9 +1950,10 @@ class DailyRegister(QWidget):
                 continue
             it = self._table.item(row, COL_TRUCK)
             raw = (it.text().strip() if it else "")
-            if not raw:
+            accept_empty = self._row_accepts_empty_truck(row)
+            if not raw and not accept_empty:
                 continue
-            if not self._row_truck_is_valid(row):
+            if raw and not self._row_truck_is_valid(row):
                 continue
             if row in self._saved_ids:
                 tx_id = self._saved_ids[row]
@@ -2196,6 +2196,12 @@ class DailyRegister(QWidget):
         self._load_gen += 1
         seq = self._load_gen
         self._load_in_flight = True
+        if getattr(self, "_description_cache_day", None) != d:
+            from tahmeed.services.cashier_service import invalidate_description_cache
+
+            invalidate_description_cache()
+            self._description_cache_day = d
+            await self._load_description_cache()
         upload_id = self._load_upload_id
         if upload_id:
             self._show_register_loading("Loading upload…")
@@ -2327,55 +2333,62 @@ class DailyRegister(QWidget):
             return
         self._submit_in_flight = True
         self.save_busy_changed.emit(True)
+        from tahmeed.ui.async_utils import pause_background_polls
+
         try:
-            self._commit_open_editor()
-            if self._current_date is None:
-                QMessageBox.warning(
-                    self,
-                    "Reconciled Date required",
-                    "Set Reconciled Date before submitting for verify.",
-                )
-                return
-            if self.has_unsaved_work():
-                resp = QMessageBox.question(
-                    self, "Unsaved changes",
-                    "Save changes before submitting this day for verify?",
-                    QMessageBox.Yes | QMessageBox.Cancel,
-                    QMessageBox.Yes,
-                )
-                if resp != QMessageBox.Yes:
-                    return
-                if not await self._do_save():
-                    return
-            d = self._current_date
-            label = d.strftime("%d %b %Y")
-            if not await self._confirm_parked_trucks_for_submit(d):
-                return
-            if not await self._confirm_day_issues_for_submit(d):
-                return
-            resp = QMessageBox.question(
-                self, "Submit for Verify",
-                f"Submit all draft entries for {label} to the Verify inbox?\n\n"
-                "This sends the whole day's transactions (all cashiers).",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
-            )
-            if resp != QMessageBox.Yes:
-                return
-            try:
-                n = await submit_day_for_verify(d)
-                QMessageBox.information(
-                    self, "Submitted",
-                    f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for {label}.",
-                )
-                self.drafts_changed.emit()
-                await self._load_date(d)
-            except Exception as exc:
-                QMessageBox.critical(self, "Submit Failed", str(exc))
+            with pause_background_polls(self):
+                await self._submit_for_verify_body()
         finally:
             self._submit_in_flight = False
             if not self._save_in_flight:
                 self.save_busy_changed.emit(False)
+
+    async def _submit_for_verify_body(self) -> None:
+        self._commit_open_editor()
+        if self._current_date is None:
+            QMessageBox.warning(
+                self,
+                "Reconciled Date required",
+                "Set Reconciled Date before submitting for verify.",
+            )
+            return
+        if self.has_unsaved_work():
+            resp = QMessageBox.question(
+                self, "Unsaved changes",
+                "Save changes before submitting this day for verify?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if resp != QMessageBox.Yes:
+                return
+            if not await self._do_save():
+                return
+        d = self._current_date
+        label = d.strftime("%d %b %Y")
+        if not await self._confirm_parked_trucks_for_submit(d):
+            return
+        if not await self._confirm_day_issues_for_submit(d):
+            return
+        resp = QMessageBox.question(
+            self, "Submit for Verify",
+            f"Submit all draft entries for {label} to the Verify inbox?\n\n"
+            "This sends the whole day's transactions (all cashiers).",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if resp != QMessageBox.Yes:
+            return
+        try:
+            n = await submit_day_for_verify(d)
+            QMessageBox.information(
+                self, "Submitted",
+                f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for {label}.",
+            )
+            self.drafts_submitted.emit(int(n or 0))
+            self.drafts_changed.emit()
+            await self._load_date(d)
+        except Exception as exc:
+            QMessageBox.critical(self, "Submit Failed", str(exc))
 
     async def _confirm_parked_trucks_for_submit(self, d: date) -> bool:
         """Block submit while parked incorrect-truck rows remain for this cashier."""
@@ -2465,7 +2478,10 @@ class DailyRegister(QWidget):
             self._populate([])
         else:
             asyncio.ensure_future(self._load_date(self._current_date))
-        asyncio.ensure_future(self._load_cashier_settings())
+        from tahmeed.services.catalog_service import catalog_is_stale
+
+        if catalog_is_stale():
+            asyncio.ensure_future(self._load_register_catalog(refresh=True))
 
     def invalidate_after_server_draft_change(self, day: Optional[date] = None) -> None:
         """Drafts/Saved discarded or submitted — drop stale grid / local recovery.
@@ -2532,18 +2548,21 @@ class DailyRegister(QWidget):
         self._draft_restore_policy = "silent" if keep_typed else "off"
         await self._load_date(day)
 
+    def note_catalog_return(self) -> None:
+        """The user is coming back from Manage Items or fleet."""
+        self._catalog_return = True
+
     def reload_settings(self) -> None:
-        """Re-read the restrict toggles, locked sub-items and fleet list without
-        touching the grid rows (so unsaved entries survive). Called on entering
-        the table tab."""
-        asyncio.ensure_future(self._load_categories())
-        asyncio.ensure_future(self._load_cashier_settings())
-        asyncio.ensure_future(self._load_locked_subitems())
-        asyncio.ensure_future(self._load_fleet_numbers())
-        asyncio.ensure_future(self._load_people_names())
-        asyncio.ensure_future(self._load_payee_names())
-        asyncio.ensure_future(self._load_description_cache())
-        asyncio.ensure_future(self._load_description_mapping_cache())
+        """Re-read the register catalog after a catalog write or a return from
+        Manage Items / fleet. Day rows still refresh so deletes stay current.
+        Description history reloads only when the open day changes.
+        """
+        from tahmeed.services.catalog_service import catalog_is_stale
+
+        refresh = bool(getattr(self, "_catalog_return", False) or catalog_is_stale())
+        self._catalog_return = False
+        if refresh or not getattr(self, "_catalog_applied", False):
+            asyncio.ensure_future(self._load_register_catalog(refresh=refresh))
         self.ensure_fresh_day_view()
 
     def update_people(self, names: list) -> None:
@@ -3055,11 +3074,13 @@ class DailyRegister(QWidget):
 
         truck_raw = txt(COL_TRUCK)
         parking = bool(meta.get("parked")) or self._parked_mode
+        accept_empty = bool(meta.get("accept_empty_truck"))
         if (
             cat is not None
             and getattr(cat, "requires_truck", True)
             and not truck_raw
             and not parking
+            and not accept_empty
         ):
             raise ValueError(
                 f'Truck number is required for item "{item_name}".'
@@ -3114,11 +3135,11 @@ class DailyRegister(QWidget):
             reg_status = "parked"
         elif self._parked_mode and not truck_ok:
             reg_status = "parked"
-        elif meta.get("parked") and not truck_raw:
+        elif meta.get("parked") and not truck_raw and not accept_empty:
             reg_status = "parked"
         else:
             reg_status = "draft"
-            if meta.get("parked") and truck_ok:
+            if meta.get("parked") and (truck_ok or accept_empty):
                 meta.pop("parked", None)
                 self._pending_row_meta[row] = meta
 
@@ -5760,16 +5781,20 @@ class DailyRegister(QWidget):
         asyncio.ensure_future(self._run_daily_import())
 
     async def _run_daily_import(self) -> None:
+        from tahmeed.ui.async_utils import pause_background_polls
         from tahmeed.ui.cashier.daily_import_flow import run_daily_import_flow
 
-        try:
-            preview = await run_daily_import_flow(self)
-        except Exception as exc:
-            QMessageBox.critical(self, "Import Error", f"Could not import this file:\n\n{exc}")
-            return
-        if preview is None:
-            return
-        await self.apply_daily_import_preview(preview)
+        with pause_background_polls(self):
+            try:
+                preview = await run_daily_import_flow(self)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Import Error", f"Could not import this file:\n\n{exc}"
+                )
+                return
+            if preview is None:
+                return
+            await self.apply_daily_import_preview(preview)
 
     async def apply_daily_import_preview(self, preview) -> None:
         """Navigate to the Excel main date and stage rows for the user to Save."""
@@ -8249,6 +8274,11 @@ class DailyRegister(QWidget):
         meta = self._pending_row_meta.get(row) or {}
         return bool(isinstance(meta, dict) and meta.get("parked"))
 
+    def _row_accepts_empty_truck(self, row: int) -> bool:
+        """True when Fix trucks → No truck waived a truck for this row."""
+        meta = self._pending_row_meta.get(row) or {}
+        return bool(isinstance(meta, dict) and meta.get("accept_empty_truck"))
+
     async def _do_save(self, *, parked_only: bool = False) -> bool:
         """Persist dirty + new rows. Returns False if cancelled or leftovers remain.
 
@@ -8267,16 +8297,19 @@ class DailyRegister(QWidget):
             self._show_register_loading(
                 "Parking for follow-up…" if parked_only else "Saving draft…"
             )
+        from tahmeed.ui.async_utils import pause_background_polls
+
         try:
-            with timed_op(
-                "register_save",
-                day=str(self._current_date or ""),
-                merged=bool(self._merged_mode),
-                parked_only=bool(parked_only),
-            ) as meta:
-                ok = await self._do_save_body(meta, parked_only=parked_only)
-                meta["ok"] = bool(ok)
-                return ok
+            with pause_background_polls(self):
+                with timed_op(
+                    "register_save",
+                    day=str(self._current_date or ""),
+                    merged=bool(self._merged_mode),
+                    parked_only=bool(parked_only),
+                ) as meta:
+                    ok = await self._do_save_body(meta, parked_only=parked_only)
+                    meta["ok"] = bool(ok)
+                    return ok
         finally:
             self._save_in_flight = False
             kick = bool(self._kick_outbox_after_save)
@@ -8613,10 +8646,11 @@ class DailyRegister(QWidget):
                 rows_txs: list[tuple[int, Transaction]],
                 *,
                 label: str,
+                one_request: bool = False,
             ) -> None:
                 nonlocal saved, already_exists
                 total_to_save = len(rows_txs)
-                chunk_size = BULK_CREATE_CHUNK
+                chunk_size = total_to_save if one_request else BULK_CREATE_CHUNK
                 for chunk_start in range(0, total_to_save, chunk_size):
                     chunk = rows_txs[chunk_start : chunk_start + chunk_size]
                     lo = chunk_start + 1
@@ -8627,9 +8661,15 @@ class DailyRegister(QWidget):
                         else f"{label}… ({total_to_save})"
                     )
                     try:
-                        outcomes = await bulk_save_transactions(
-                            [tx for _r, tx in chunk]
-                        )
+                        txs = [tx for _r, tx in chunk]
+                        if one_request:
+                            from tahmeed.services.cashier_service import (
+                                bulk_save_one_request,
+                            )
+                            with bulk_save_one_request():
+                                outcomes = await bulk_save_transactions(txs)
+                        else:
+                            outcomes = await bulk_save_transactions(txs)
                     except Exception as exc:
                         for row, _tx in chunk:
                             errors.append(f"Row {row + 1}: {exc}")
@@ -8659,7 +8699,7 @@ class DailyRegister(QWidget):
 
             if parked_to_save:
                 await _sync_create_chunked(
-                    parked_to_save, label="Saving parked"
+                    parked_to_save, label="Saving parked", one_request=True,
                 )
                 if parked_saved_ids:
                     self._drop_local_parked_by_client_ids(parked_saved_ids)
@@ -8883,13 +8923,78 @@ class DailyRegister(QWidget):
 
     async def _load_categories(self) -> None:
         """Ensure the Item column lists expense items and suppliers."""
+        await self._load_register_catalog()
+
+    async def _load_register_catalog(self, *, refresh: bool = False) -> None:
+        """One catalog snapshot for items, payees, fleet, and cashier settings."""
+        from tahmeed.services.catalog_service import (
+            categories_from_snapshot,
+            fetch_catalog_snapshot,
+            setting_from_snapshot,
+        )
+        from tahmeed.services.category_service import sort_payment_targets
+        from tahmeed.services.export_restriction_service import normalize_export_surfaces
+        from tahmeed.services.truck_service import get_fleet_kinds, get_fleet_numbers
+
         try:
-            cats = await get_payment_target_categories()
+            snapshot = await fetch_catalog_snapshot(refresh=refresh)
         except Exception:
             return
+        self._catalog_applied = True
+        cats = sort_payment_targets(categories_from_snapshot(snapshot))
         if cats:
             self.update_categories(cats)
             self._revalidate_visible_item_cells()
+        self._apply_catalog_settings(snapshot, setting_from_snapshot, normalize_export_surfaces)
+        try:
+            self._fleet_numbers = await get_fleet_numbers()
+            self._fleet_kinds = await get_fleet_kinds()
+        except Exception:
+            self._fleet_numbers = set()
+            self._fleet_kinds = {}
+        names = [
+            str(document.get("name") or "").strip().upper()
+            for document in snapshot.get("payees") or []
+            if isinstance(document, dict) and str(document.get("name") or "").strip()
+        ]
+        self.update_payees(names)
+
+    def _apply_catalog_settings(self, snapshot, setting_from_snapshot, normalize_export_surfaces) -> None:
+        self._restrict_items = bool(setting_from_snapshot(snapshot, "restrict_items", False))
+        self._restrict_payees = bool(setting_from_snapshot(snapshot, "restrict_payees", False))
+        self._defer_item_to_verify = bool(
+            setting_from_snapshot(snapshot, "defer_item_to_verify", False)
+        )
+        auto_fill = setting_from_snapshot(snapshot, "auto_fill_from_description_maps", True)
+        self._auto_fill_from_maps = True if auto_fill is None else bool(auto_fill)
+        try:
+            self._duplicate_check_days = int(
+                setting_from_snapshot(snapshot, "duplicate_check_days", 5) or 5
+            )
+        except (TypeError, ValueError):
+            self._duplicate_check_days = 5
+        self._restrict_trucks = True
+        surfaces = setting_from_snapshot(snapshot, "export_restrict_surfaces", None)
+        self._export_restrict_surfaces = set(normalize_export_surfaces(surfaces))
+        raw = snapshot.get("allowed_truck_labels")
+        if not isinstance(raw, list) or not raw:
+            raw = setting_from_snapshot(snapshot, "allowed_truck_labels", None)
+        if isinstance(raw, list) and raw:
+            self._allowed_truck_labels = merge_allowed_labels(raw, DEFAULT_PLACE_LABELS)
+        else:
+            self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
+        current = setting_from_snapshot(snapshot, "restrict_trucks", True)
+        if current is not True:
+            asyncio.ensure_future(self._force_restrict_trucks())
+
+    async def _force_restrict_trucks(self) -> None:
+        try:
+            await set_setting("restrict_trucks", True)
+        except Exception:
+            self._restrict_trucks = True
+
+    async def _load_cashier_settings(self) -> None:
+        await self._load_register_catalog()
 
     def _revalidate_visible_item_cells(self) -> None:
         """Re-run Item validation after the catalog loads (clears false flags)."""
@@ -8904,48 +9009,6 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
     # Settings / locked sub-item cache
     # ------------------------------------------------------------------
-
-    async def _load_cashier_settings(self) -> None:
-        try:
-            self._restrict_items = bool(await get_setting("restrict_items"))
-        except Exception:
-            self._restrict_items = False
-        try:
-            self._restrict_payees = bool(await get_setting("restrict_payees"))
-        except Exception:
-            self._restrict_payees = False
-        try:
-            self._defer_item_to_verify = bool(await get_setting("defer_item_to_verify"))
-        except Exception:
-            self._defer_item_to_verify = False
-        try:
-            self._auto_fill_from_maps = bool(
-                await get_setting("auto_fill_from_description_maps")
-            )
-        except Exception:
-            self._auto_fill_from_maps = True
-        try:
-            self._duplicate_check_days = int(
-                await get_setting("duplicate_check_days") or 5
-            )
-        except Exception:
-            self._duplicate_check_days = 5
-        try:
-            self._restrict_trucks = True
-            # Persist intended default so accountant UI / other clients stay in sync.
-            current = await get_setting("restrict_trucks")
-            if current is not True:
-                await set_setting("restrict_trucks", True)
-        except Exception:
-            self._restrict_trucks = True
-        try:
-            from tahmeed.services.export_restriction_service import (
-                get_enabled_export_surfaces,
-            )
-
-            self._export_restrict_surfaces = await get_enabled_export_surfaces()
-        except Exception:
-            self._export_restrict_surfaces = set()
 
     def _apply_mapping_fields_to_row(
         self, row: int, cat_name: str, payee: str
@@ -9093,23 +9156,9 @@ class DailyRegister(QWidget):
             self._flush_day_issues_source_changed(force=True)
 
     async def _load_fleet_numbers(self) -> None:
-        from tahmeed.services.truck_service import get_fleet_kinds, get_fleet_numbers
-        try:
-            self._fleet_numbers = await get_fleet_numbers()
-        except Exception:
-            self._fleet_numbers = set()
-        try:
-            self._fleet_kinds = await get_fleet_kinds()
-        except Exception:
-            self._fleet_kinds = {}
-        try:
-            raw = await get_setting("allowed_truck_labels")
-            if isinstance(raw, list) and raw:
-                self._allowed_truck_labels = merge_allowed_labels(raw, DEFAULT_PLACE_LABELS)
-            else:
-                self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
-        except Exception:
-            self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
+        from tahmeed.services.catalog_service import catalog_is_stale
+
+        await self._load_register_catalog(refresh=catalog_is_stale())
 
     async def _load_description_cache(self) -> None:
         """Warm system-wide description history for Excel-style autocomplete."""
@@ -9394,6 +9443,8 @@ class DailyRegister(QWidget):
     def _row_missing_required_truck(self, row: int) -> bool:
         if not self._cell_text(row, COL_DESC):
             return False
+        if self._row_accepts_empty_truck(row):
+            return False
         item_name = self._cell_text(row, COL_ITEM)
         if not self._item_requires_truck(item_name):
             return False
@@ -9640,7 +9691,7 @@ class DailyRegister(QWidget):
             fleet_kinds=getattr(self, "_fleet_kinds", None) or {},
             heading="Fix parked trucks" if fixing_parked else "",
             intro=(
-                "These rows are already parked. Correct or Allow each truck — "
+                "These rows are already parked. Correct, Allow, or choose No truck — "
                 "accepted rows move to My entries right away."
                 if fixing_parked
                 else ""
@@ -9721,6 +9772,14 @@ class DailyRegister(QWidget):
             it = self._table.item(row, COL_TRUCK)
             raw = (it.text().strip() if it else "")
             if not raw:
+                issues.append(
+                    TruckIssue(
+                        row=row,
+                        original="",
+                        kind="not_in_registry",
+                        row_details=self._truck_issue_row_details(row),
+                    )
+                )
                 continue
             if self._row_truck_is_valid(row):
                 continue
@@ -9742,8 +9801,7 @@ class DailyRegister(QWidget):
             QMessageBox.information(
                 self,
                 "No truck fixes needed",
-                "Every parked row already has a valid fleet truck "
-                "(or is empty).\n\n"
+                "Every parked row already has a valid fleet truck.\n\n"
                 "Type a truck in the table, or Clear parked to discard rows.",
             )
             return
@@ -9756,7 +9814,7 @@ class DailyRegister(QWidget):
             fleet_kinds=getattr(self, "_fleet_kinds", None) or {},
             heading="Fix parked trucks",
             intro=(
-                "These rows are already parked. Correct or Allow each truck — "
+                "These rows are already parked. Correct, Allow, or choose No truck — "
                 "accepted rows move to My entries right away."
             ),
             allow_park=False,
@@ -9932,6 +9990,58 @@ class DailyRegister(QWidget):
         finally:
             self._hide_register_loading()
 
+    def _release_saved_parked_rows(self, pairs: list) -> None:
+        """Remove a saved parked set from the Parked surface. The day stays loaded."""
+        wanted = {str(tx_id) for tx_id, _body in pairs if tx_id}
+        rows = sorted(
+            row for row, tx in self._saved_ids.items() if str(tx) in wanted
+        )
+        entries: list = []
+        for row in rows:
+            rid = self._ensure_row_client_id(row)
+            meta = dict(self._pending_row_meta.get(row) or {})
+            meta.pop("parked", None)
+            meta.pop("sync_status", None)
+            meta["client_row_id"] = rid
+            entry = {
+                "client_row_id": rid,
+                "cells": cells_for_json(self._row_value_map(row)),
+                "pending_meta": serialize_pending_meta(meta),
+                "tx_id": self._saved_ids.get(row),
+            }
+            allow = self._truck_allow_anyway.get(row)
+            if allow:
+                entry["allow_anyway"] = allow
+            entries.append(entry)
+        if entries:
+            self._append_entries_onto_my_surface(entries)
+        if rows:
+            prev = self._table.blockSignals(True)
+            self._bulk_mutating = True
+            try:
+                for row in reversed(rows):
+                    self._shift_row_maps_on_remove(row)
+                    self._table.removeRow(row)
+            finally:
+                self._bulk_mutating = False
+                self._table.blockSignals(prev)
+            self._renumber()
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self._emit_undo_redo_state()
+        if self._parked_mode:
+            self._local_parked = self._table_parked_entries()
+            self._flush_local_draft()
+            self._emit_parked_count()
+            self._update_footer()
+        if self._flip_to_my_keep_alive():
+            return
+        self._ensure_my_surface_active()
+        self._view_mode = "my"
+        self._merged_mode = False
+        self._parked_mode = False
+        self.mode_changed.emit("my")
+
     async def _unpark_saved_rows(
         self,
         patches: list,
@@ -9970,16 +10080,7 @@ class DailyRegister(QWidget):
         )
         try:
             updated = await bulk_update_transactions(pairs)
-            # Drop keep-alive — My must reload so unparked rows appear.
-            self._clear_my_session()
-            self._ensure_my_surface_active()
-            self._view_mode = "my"
-            self._merged_mode = False
-            self._parked_mode = False
-            self.mode_changed.emit("my")
-            self._draft_restore_policy = "silent"
-            self._invalidate_day_tx_cache()
-            await self._load_date(self._current_date)
+            self._release_saved_parked_rows(pairs)
             count = updated or n
             self.transient_status.emit(
                 status_message
@@ -10043,6 +10144,21 @@ class DailyRegister(QWidget):
 
     def _on_truck_issue_resolved_live(self, issue: TruckIssue) -> None:
         """Apply one resolved truck to the grid as soon as it leaves the dialog list."""
+        if getattr(issue, "accept_empty", False):
+            self._truck_allow_anyway.pop(issue.row, None)
+            self._set_truck_cell(issue.row, "")
+            self._pending_truck_issues.pop(issue.row, None)
+            meta = dict(self._pending_row_meta.get(issue.row) or {})
+            meta["accept_empty_truck"] = True
+            # Saved parked rows leave Parked immediately, same as Allow.
+            # Local rows keep their parked flag until promote copies them to My.
+            if issue.row in self._saved_ids:
+                meta.pop("parked", None)
+                self._dirty_rows.add(issue.row)
+            elif not self._parked_mode:
+                meta.pop("parked", None)
+            self._pending_row_meta[issue.row] = meta
+            return
         if getattr(issue, "parked", False):
             # Re-park is meaningless on the Parked surface — keep the truck text only.
             if self._parked_mode:

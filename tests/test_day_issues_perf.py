@@ -327,6 +327,61 @@ def test_drop_issue_keys_updates_list_and_badge_signal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_finish_mapping_ui_drops_row_without_rescan() -> None:
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    issue = _issue("DIESEL 30 LTRS")
+    widget._loaded = True
+    widget._dirty = False
+    widget._issues_all = [issue]
+    widget._issue_dates = {issue.description_key: [date(2026, 3, 15)]}
+    widget._day_snap_cache[date(2026, 3, 15)] = DayIssuesSnapshot(
+        target_date=date(2026, 3, 15),
+        issues=[issue],
+        issue_dates={issue.description_key: [date(2026, 3, 15)]},
+    )
+    calls: list[str] = []
+
+    async def refresh(*, quiet: bool = False) -> None:
+        calls.append("refresh")
+
+    widget.refresh = refresh  # type: ignore[method-assign]
+    await widget._finish_mapping_ui(["DIESEL 30 LTRS"])
+
+    assert calls == []
+    assert widget._issues_all == []
+    assert widget._dirty is False
+    cached = widget._day_snap_cache[date(2026, 3, 15)]
+    assert cached.issues == []
+
+
+def test_hide_applying_issues_keeps_pending_maps_off_the_list(monkeypatch) -> None:
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    pending = _issue("DIESEL 30 LTRS")
+    ready = _issue("LATRA FEE")
+    snap = DayIssuesSnapshot(
+        target_date=date(2026, 3, 15),
+        issues=[pending, ready],
+        issue_dates={
+            pending.description_key: [date(2026, 3, 15)],
+            ready.description_key: [date(2026, 3, 15)],
+        },
+    )
+    monkeypatch.setattr(
+        "tahmeed.services.mapping_apply_outbox.applying_description_keys",
+        lambda: {pending.description_key},
+    )
+
+    widget._hide_applying_issues(snap)
+
+    assert [issue.description for issue in snap.issues] == ["LATRA FEE"]
+    assert pending.description_key not in snap.issue_dates
+
+
+@pytest.mark.asyncio
 async def test_reload_catalogs_replaces_lists_without_touching_scan(monkeypatch) -> None:
     from tahmeed.models.category import Category
 
@@ -390,6 +445,41 @@ async def test_do_map_opens_dialog_with_reloaded_catalogs(monkeypatch) -> None:
     assert seen["descriptions"] == ["LATRA FEE"]
     assert seen["cats"] == ["Custom Bonds"]
     assert seen["payees"] == ["NEW PAYEE"]
+
+
+@pytest.mark.asyncio
+async def test_do_map_skips_catalog_reload_when_lists_are_warm(monkeypatch) -> None:
+    from PySide6.QtWidgets import QDialog
+
+    from tahmeed.models.category import Category
+
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    widget._lookups_loaded = True
+    widget._categories = [Category(name="Parking")]
+    widget._payees = ["CITY COUNCIL"]
+    calls: list[str] = []
+
+    async def reload() -> None:
+        calls.append("reload")
+
+    widget._reload_catalogs = reload  # type: ignore[method-assign]
+
+    class FakeDlg:
+        def __init__(self, descriptions, categories, payees, parent=None, **kwargs):
+            calls.append("dialog")
+
+        def exec(self) -> int:
+            return QDialog.Rejected
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.MapDescriptionsDialog",
+        FakeDlg,
+    )
+    await widget._do_map(["LATRA FEE"], [_issue("LATRA FEE")])
+
+    assert calls == ["dialog"]
 
 
 @pytest.mark.asyncio

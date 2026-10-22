@@ -102,6 +102,71 @@ def test_allow_park_false_hides_park_actions(qapp) -> None:
     assert "Park" not in labels
     assert "Cancel" in labels
     assert "Done" in labels
+    assert "No truck" not in labels
+    dlg.close()
+
+
+def test_fixing_parked_blank_row_offers_no_truck(qapp) -> None:
+    from PySide6.QtWidgets import QDialog
+
+    from tahmeed.ui.dialogs.truck_correction_dialog import (
+        TruckCorrectionDialog,
+        TruckIssue,
+    )
+
+    dlg = TruckCorrectionDialog(
+        [TruckIssue(row=0, original="", kind="not_in_registry")],
+        fleet=set(),
+        allow_park=False,
+        heading="Fix parked trucks",
+    )
+    rw = dlg._rows[0]
+    assert rw.no_truck_btn is not None
+    assert not rw.no_truck_btn.isHidden()
+    assert rw.kind_label.text() == "No truck on this row"
+    dlg._apply_row(rw)
+    assert dlg.issues[0].accept_empty is True
+    assert dlg.issues[0].skip is False
+    assert dlg.issues[0].corrected == ""
+    assert dlg.result() == QDialog.Accepted
+    dlg.close()
+
+
+def test_fixing_parked_hides_no_truck_while_a_plate_is_typed(qapp) -> None:
+    from tahmeed.ui.dialogs.truck_correction_dialog import (
+        TruckCorrectionDialog,
+        TruckIssue,
+    )
+
+    dlg = TruckCorrectionDialog(
+        [TruckIssue(row=0, original="BAD TRUCK", kind="not_in_registry")],
+        fleet=set(),
+        allow_park=False,
+    )
+    rw = dlg._rows[0]
+    assert rw.no_truck_btn is not None
+    assert rw.no_truck_btn.isHidden()
+    rw.edit.setText("")
+    assert not rw.no_truck_btn.isHidden()
+    dlg.close()
+
+
+def test_import_mode_does_not_offer_no_truck(qapp) -> None:
+    from tahmeed.ui.dialogs.truck_correction_dialog import (
+        TruckCorrectionDialog,
+        TruckIssue,
+    )
+
+    dlg = TruckCorrectionDialog(
+        [TruckIssue(row=0, original="", kind="not_in_registry")],
+        fleet=set(),
+        allow_park=False,
+        import_mode=True,
+    )
+    assert dlg._rows[0].no_truck_btn is None
+    dlg._apply_row(dlg._rows[0])
+    assert dlg.issues[0].accept_empty is False
+    assert dlg.issues[0].omit_row is True
     dlg.close()
 
 
@@ -361,24 +426,10 @@ def test_combo_card_shows_truck_only(qapp) -> None:
     assert rw.part_edits == []
     assert rw.edit.text() == "T843 EKT"
     assert "trailer" not in rw.kind_label.text().lower()
-    assert rw.allow_btn is not None and rw.skip_row_btn is not None
-    row_widgets = []
-    for i in range(rw.card.layout().count()):
-        item = rw.card.layout().itemAt(i)
-        lay = item.layout() if item is not None else None
-        if lay is None:
-            continue
-        widgets = [
-            lay.itemAt(j).widget()
-            for j in range(lay.count())
-            if lay.itemAt(j) is not None and lay.itemAt(j).widget() is not None
-        ]
-        if rw.edit in widgets:
-            row_widgets = widgets
-            break
-    assert rw.edit in row_widgets
-    assert rw.allow_btn in row_widgets
-    assert rw.skip_row_btn in row_widgets
+    assert rw.allow_btn is not None and rw.allow_btn.text() == "Allow"
+    assert rw.skip_row_btn is not None and rw.skip_row_btn.text() == "Park"
+    assert rw.card.objectName() == "truckIssueCard"
+    assert rw.add_btn is not None and rw.add_btn.text() == "Add to registry"
     rw.edit.setText("T880 CUL")
     dlg._fleet.add("T880 CUL")
     cell = dlg._with_combo_suffix(rw.issue, "T880 CUL")
@@ -432,4 +483,30 @@ def test_combo_card_two_trailers_keeps_suffix(qapp) -> None:
     assert "allow" in rw.kind_label.text().lower()
     assert "park" in rw.kind_label.text().lower()
     assert dlg._with_combo_suffix(rw.issue, "T724 CPQ") == "T724 CPQ/T631DZX/T632DZX"
+    dlg.close()
+
+
+def test_dialog_shows_one_page_of_cards(qapp) -> None:
+    from PySide6.QtWidgets import QFrame
+
+    count = 120
+    issues = [
+        TruckIssue(row=index, original=f"T{index} ZZZ", kind="not_in_registry")
+        for index in range(count)
+    ]
+    dlg = TruckCorrectionDialog(issues, fleet=set(), import_mode=True)
+    assert dlg._issue_table is None
+    assert len(dlg._rows) == dlg._issue_page
+    assert len(dlg._held_issues) == count - dlg._issue_page
+    cards = [
+        frame
+        for frame in dlg.findChildren(QFrame)
+        if frame.objectName() == "truckIssueCard"
+    ]
+    assert len(cards) == dlg._issue_page
+    rw = dlg._rows[0]
+    assert rw.add_btn is not None and rw.add_btn.text() == "Add to registry"
+    assert rw.allow_btn is not None and rw.allow_btn.text() == "Allow"
+    assert rw.skip_row_btn is not None and rw.skip_row_btn.text() == "Park"
+    assert rw.status_badge.text()
     dlg.close()

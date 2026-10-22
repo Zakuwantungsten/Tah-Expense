@@ -32,8 +32,33 @@ async def submit_draft_day_with_gates(
         load_register_draft,
     )
     from tahmeed.services.settings_service import get_setting
+    from tahmeed.ui.async_utils import pause_background_polls
 
     label = day.strftime("%d %b %Y")
+    with pause_background_polls(parent):
+        return await _submit_draft_day_body(
+            parent,
+            day,
+            label=label,
+            cashier_id=cashier_id,
+            user_id=user_id,
+        )
+
+
+async def _submit_draft_day_body(
+    parent: QWidget,
+    day: date,
+    *,
+    label: str,
+    cashier_id=None,
+    user_id=None,
+) -> Optional[int]:
+    from tahmeed.services.day_issues_service import collect_day_issues
+    from tahmeed.services.register_draft_service import (
+        draft_parked_rows,
+        load_register_draft,
+    )
+    from tahmeed.services.settings_service import get_setting
 
     # Parked truck follow-up must be resolved before Submit (Register + Drafts).
     parked_n = 0

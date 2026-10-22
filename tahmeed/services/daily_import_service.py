@@ -874,23 +874,114 @@ def _tx_from_api(document: dict) -> Transaction:
     return Transaction.from_doc(desktop_document(document))
 
 
+# One HTTP call is one server insert_many. Matches backend IMPORT_BATCH_SIZE.
+COMMIT_BATCH_SIZE = 500
+
+
+class CommitBatchError(Exception):
+    """A commit call failed. Earlier batches in this run are already stored."""
+
+    def __init__(self, batch_index: int, total: int, partial: dict) -> None:
+        self.batch_index = batch_index
+        self.total = total
+        self.partial = partial
+        super().__init__(f"Import batch {batch_index + 1} of {total} failed")
+
+
+def commit_batches(rows: list, size: int = COMMIT_BATCH_SIZE) -> list[list]:
+    step = size if size > 0 else COMMIT_BATCH_SIZE
+    return [list(rows[index : index + step]) for index in range(0, len(rows), step)]
+
+
+def _stamp_upload_id(rows: list[dict]) -> str:
+    upload_id = ""
+    for row in rows:
+        upload_id = str(row.get("daily_import_id") or "").strip()
+        if upload_id:
+            break
+    if not upload_id:
+        upload_id = str(uuid.uuid4())
+    for row in rows:
+        row["daily_import_id"] = upload_id
+    return upload_id
+
+
+def _merge_bound(current, candidate, *, latest: bool):
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+    if latest:
+        return candidate if candidate > current else current
+    return candidate if candidate < current else current
+
+
 async def commit_daily_to_master(
     payloads: List[dict],
     *,
     verified_by: Optional[ObjectId] = None,
+    on_batch=None,
+    start_batch: int = 0,
 ) -> dict:
     """Insert daily-import rows as verified Master Expenses via API.
 
-    ``verified_by`` is attributed server-side from the authenticated manager;
-    the argument is kept for call-site compatibility.
+    Sends one batch of ``COMMIT_BATCH_SIZE`` per request. ``start_batch``
+    retries from a failed batch and leaves earlier batches unsent.
+    ``verified_by`` is attributed server-side from the authenticated manager.
     """
-    del verified_by  # actor comes from API auth
-    payload = await api_client.request(
-        "POST",
-        "v1/imports/daily/commit",
-        json={"rows": [jsonable_document(row) for row in payloads]},
-    )
-    return desktop_document(payload)
+    del verified_by
+    import inspect
+
+    rows = [dict(row) for row in payloads]
+    upload_id = _stamp_upload_id(rows) if rows else ""
+    batches = commit_batches(rows)
+    combined = {
+        "inserted": 0,
+        "duplicates_skipped": 0,
+        "skipped_no_item": 0,
+        "upload_id": upload_id,
+        "source": "",
+        "min_date": None,
+        "max_date": None,
+    }
+    if not batches:
+        return combined
+    begin = max(0, int(start_batch))
+    total = len(batches)
+    while True:
+        try:
+            for index in range(begin, total):
+                if on_batch is not None:
+                    update = on_batch(index + 1, total)
+                    if inspect.isawaitable(update):
+                        await update
+                try:
+                    payload = await api_client.request(
+                        "POST",
+                        "v1/imports/daily/commit",
+                        json={"rows": [jsonable_document(row) for row in batches[index]]},
+                    )
+                except Exception as exc:
+                    raise CommitBatchError(index, total, dict(combined)) from exc
+                result = desktop_document(payload or {})
+                combined["inserted"] += int(result.get("inserted") or 0)
+                combined["duplicates_skipped"] += int(result.get("duplicates_skipped") or 0)
+                combined["skipped_no_item"] += int(result.get("skipped_no_item") or 0)
+                combined["upload_id"] = str(result.get("upload_id") or combined["upload_id"])
+                if result.get("source"):
+                    combined["source"] = result["source"]
+                combined["min_date"] = _merge_bound(
+                    combined["min_date"], result.get("min_date"), latest=False
+                )
+                combined["max_date"] = _merge_bound(
+                    combined["max_date"], result.get("max_date"), latest=True
+                )
+            return combined
+        except CommitBatchError as exc:
+            if begin == exc.batch_index:
+                raise
+            begin = exc.batch_index
+            combined = dict(exc.partial)
 
 
 async def cleanup_null_daily_import_ids() -> int:

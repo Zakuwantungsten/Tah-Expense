@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 from datetime import datetime, date
 from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 from bson import ObjectId
@@ -11,7 +12,7 @@ from tahmeed.models.transaction import Transaction
 from tahmeed.services.api_client import ApiConnectionError, ApiError, api_client
 from tahmeed.services.api_models import desktop_document, jsonable_document
 
-# Bulk register create — match API ``TransactionBulkCreateRequest`` max_length=100.
+# Draft saves stay in groups of 100. A parked save sends the whole set (API max 500).
 BULK_CREATE_CHUNK = 100
 _BULK_CREATE_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 _BULK_DUP_TIMEOUT = httpx.Timeout(45.0, connect=5.0)
@@ -1354,6 +1355,23 @@ async def check_for_duplicates_bulk(
     return results
 
 
+_bulk_save_one_request: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "bulk_save_one_request",
+    default=False,
+)
+
+
+class bulk_save_one_request:
+    """Send the whole parked set in one bulk-create request."""
+
+    def __enter__(self):
+        self._token = _bulk_save_one_request.set(True)
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        _bulk_save_one_request.reset(self._token)
+
+
 async def bulk_save_transactions(
     txs: Sequence[Transaction],
     *,
@@ -1388,12 +1406,16 @@ async def bulk_save_transactions(
 
     await _emit(0)
 
-    for offset in range(0, total, BULK_CREATE_CHUNK):
+    # Parked save is one bulk-create. The route accepts 500 items.
+    size = min(len(txs), 500) if _bulk_save_one_request.get() else BULK_CREATE_CHUNK
+    if size <= 0:
+        size = BULK_CREATE_CHUNK
+    for offset in range(0, total, size):
         if should_cancel is not None and should_cancel():
             for i in range(offset, total):
                 outcomes[i] = ("error", None, "cancelled")
             break
-        chunk = list(txs[offset : offset + BULK_CREATE_CHUNK])
+        chunk = list(txs[offset : offset + size])
         body = {"items": [_tx_create_body(tx) for tx in chunk]}
 
         async def _post_once() -> dict:

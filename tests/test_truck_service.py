@@ -87,67 +87,75 @@ def test_fleet_facade_preserves_page_and_count_contracts() -> None:
     asyncio.run(scenario())
 
 
-def test_fleet_cache_tolerates_missing_optional_routes() -> None:
-    """Older APIs without motor_vehicles must still load trucks/trailers."""
-    from tahmeed.services.api_client import ApiError
-
+def test_fleet_cache_reads_the_catalog_snapshot() -> None:
     async def scenario() -> None:
+        from tahmeed.services import catalog_service
+
         truck_service.invalidate_fleet_cache()
+        catalog_service._body = None
+        catalog_service._etag = None
+        catalog_service._stale = False
+        calls: list[str] = []
 
-        async def request(_method: str, path: str, *, params: dict) -> dict:
-            if path == "v1/motor_vehicles":
-                raise ApiError("missing", status_code=404)
-            if path == "v1/trailers":
-                return {
-                    "items": [{"number": "T999 TRL", "active": True}],
-                    "total": 1,
-                    "limit": 500,
-                    "offset": 0,
-                }
-            assert path == "v1/trucks"
-            return {
-                "items": [{"number": "T688 EAF", "active": True}],
-                "total": 1,
-                "limit": 500,
-                "offset": 0,
-            }
+        async def request_response(_method: str, path: str, **_kwargs):
+            calls.append(path)
 
-        original = truck_service.api_client.request
-        truck_service.api_client.request = request
+            class Response:
+                status_code = 200
+                headers = {"etag": '"0"'}
+                content = b"{}"
+
+                def json(self):
+                    return {
+                        "trucks": [{"number": "T688 EAF", "active": True}],
+                        "trailers": [{"number": "T999 TRL", "active": True}],
+                        "motor_vehicles": [],
+                    }
+
+            return Response()
+
+        original = catalog_service.api_client.request_response
+        catalog_service.api_client.request_response = request_response
         try:
             fleet = await truck_service.get_fleet_numbers()
             kinds = await truck_service.get_fleet_kinds()
         finally:
-            truck_service.api_client.request = original
+            catalog_service.api_client.request_response = original
             truck_service.invalidate_fleet_cache()
+            catalog_service._body = None
 
         assert fleet == {"T688 EAF", "T999 TRL"}
         assert kinds["T688 EAF"] == "truck"
         assert kinds["T999 TRL"] == "trailer"
+        assert calls == ["v1/catalog/snapshot"]
 
     asyncio.run(scenario())
 
 
-def test_fleet_cache_requires_trucks_route() -> None:
+def test_fleet_cache_requires_catalog_snapshot() -> None:
+    from tahmeed.services import catalog_service
     from tahmeed.services.api_client import ApiError
 
     async def scenario() -> None:
         truck_service.invalidate_fleet_cache()
+        catalog_service._body = None
+        catalog_service._etag = None
+        catalog_service._stale = False
 
-        async def request(_method: str, path: str, *, params: dict) -> dict:
+        async def request_response(_method: str, path: str, **_kwargs):
             raise ApiError("missing", status_code=404)
 
-        original = truck_service.api_client.request
-        truck_service.api_client.request = request
+        original = catalog_service.api_client.request_response
+        catalog_service.api_client.request_response = request_response
         try:
             try:
                 await truck_service.get_fleet_numbers()
                 assert False, "expected ApiError"
             except ApiError as exc:
                 assert exc.status_code == 404
-                assert "v1/trucks" in str(exc)
         finally:
-            truck_service.api_client.request = original
+            catalog_service.api_client.request_response = original
             truck_service.invalidate_fleet_cache()
+            catalog_service._body = None
 
     asyncio.run(scenario())

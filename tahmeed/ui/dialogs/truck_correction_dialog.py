@@ -231,6 +231,7 @@ class TruckIssue:
     omit_row: bool = False   # import mode: park row for later (Skipped feed tab)
     parked: bool = False     # register: park row on the Parked table tab
     allow_anyway: bool = False  # import mode: save even if not in fleet
+    accept_empty: bool = False  # parked fix: blank truck is the resolution
     row_label: str = ""      # optional UI title (e.g. "File row 2442")
     combo_parts: List[str] = field(default_factory=list)  # unused when combo_suffix is set
     combo_suffix: str = ""  # ``/T691ELK`` kept while the user edits the truck only
@@ -248,6 +249,7 @@ class _RowWidgets:
     add_btn: Optional[QPushButton] = None
     accept_label_btn: Optional[QPushButton] = None
     allow_btn: Optional[QPushButton] = None
+    no_truck_btn: Optional[QPushButton] = None
     skip_row_btn: Optional[QPushButton] = None
     details_btn: Optional[QPushButton] = None
     part_edits: List[QLineEdit] = field(default_factory=list)
@@ -274,9 +276,9 @@ class TruckCorrectionDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle(heading or "Correct truck numbers")
-        self.setMinimumWidth(760 if import_mode else 640)
-        self.setMinimumHeight(360)
-        self.resize(840 if import_mode else 720, 460)
+        self.setMinimumWidth(760)
+        self.setMinimumHeight(420)
+        self.resize(820, 520)
         self.setModal(True)
         self._fleet = set(fleet)
         self._fleet_kinds: Dict[str, str] = dict(fleet_kinds or {})
@@ -298,7 +300,16 @@ class TruckCorrectionDialog(QDialog):
         self.pending_registry_adds: List[tuple[str, str]] = []
         self.issues: List[TruckIssue] = []  # resolved results (updated as rows clear)
         self._rows: List[_RowWidgets] = []
+        self._held_issues: List[TruckIssue] = []
+        self._defer_page = False
+        self._issue_page = 100
         self._body_lay: Optional[QVBoxLayout] = None
+        self._issue_table: Optional[QTableWidget] = None
+        self._table_sync = False
+        self._edit_notify = False
+        self._apply_btn: Optional[QPushButton] = None
+        self._allow_btn: Optional[QPushButton] = None
+        self._no_truck_btn: Optional[QPushButton] = None
         self._count_label: Optional[QLabel] = None
         self._tabs: Optional[QTabWidget] = None
         self._details_stack: Optional[QStackedWidget] = None
@@ -449,23 +460,38 @@ class TruckCorrectionDialog(QDialog):
         wrap = QWidget()
         lay = QVBoxLayout(wrap)
         lay.setContentsMargins(0, 4, 0, 0)
-        lay.setSpacing(0)
+        lay.setSpacing(6)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea{border:none; background:transparent;}")
-
-        body = QWidget()
-        body.setStyleSheet("background:transparent; border:none;")
-        self._body_lay = QVBoxLayout(body)
-        self._body_lay.setSpacing(6)
-        self._body_lay.setContentsMargins(0, 0, 2, 0)
-        self._body_lay.addStretch()
-        scroll.setWidget(body)
+        scroll.setStyleSheet(
+            f"QScrollArea {{ border: none; background: {_BG}; }}"
+            f"QScrollArea > QWidget > QWidget {{ background: {_BG}; }}"
+        )
+        host = QWidget()
+        host.setObjectName("truckIssueHost")
+        host.setStyleSheet(f"QWidget#truckIssueHost {{ background: {_BG}; }}")
+        body = QVBoxLayout(host)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addStretch(1)
+        self._body_lay = body
+        scroll.setWidget(host)
         lay.addWidget(scroll, 1)
         return wrap
+
+    def exec(self) -> int:  # type: ignore[override]
+        """Pause the connection light while this dialog is open.
+
+        Park all and Allow all pump Qt events. A probe started in that window
+        expires as soon as the screen is busy and looks like a lost API.
+        """
+        from tahmeed.ui.async_utils import pause_background_polls
+
+        with pause_background_polls(self):
+            return super().exec()
 
     def _build_details_tab(self) -> QWidget:
         wrap = QWidget()
@@ -574,10 +600,14 @@ class TruckCorrectionDialog(QDialog):
 
     def _update_count(self) -> None:
         n = len(self._rows)
+        extra = len(self._held_issues)
         if self._count_label is not None:
-            self._count_label.setText(
-                f"{n} remaining" if n else "All resolved"
-            )
+            if extra:
+                self._count_label.setText(f"{n} open · {extra:,} remain")
+            else:
+                self._count_label.setText(
+                    f"{n} remaining" if n else "All resolved"
+                )
         self._refresh_details_tab()
 
     def _set_details_mode(self, mode: str) -> None:
@@ -919,20 +949,39 @@ class TruckCorrectionDialog(QDialog):
         issue.omit_row = omit_row
         issue.allow_anyway = allow_anyway
         issue.is_place_label = is_place_label
+        issue.accept_empty = False
         # Apply / Allow / Clear never park — only ``_park_row`` sets this.
         issue.parked = False
         return issue
 
+    def _fixing_parked_trucks(self) -> bool:
+        """Parked-tab Fix trucks: blank truck can be accepted and moved to My."""
+        return not self._allow_park and not self._import_mode
+
+    def _sync_no_truck_button(self, rw: _RowWidgets) -> None:
+        btn = rw.no_truck_btn
+        if btn is None:
+            return
+        if rw.part_edits:
+            blank = not any(edit.text().strip() for edit in rw.part_edits)
+        else:
+            blank = not (rw.edit.text() or "").strip()
+        btn.setVisible(blank)
+
     # ── Add / remove rows ─────────────────────────────────────────────────
 
     def add_issues(self, issues: List[TruckIssue]) -> None:
-        """Append issues (dedupe by grid row — latest wins)."""
+        """Append issues (dedupe by grid row — latest wins).
+
+        Only one page of cards is built. The rest wait in ``_held_issues``
+        so a few hundred rows do not freeze the window.
+        """
         if not issues or self._body_lay is None:
             return
         existing = {rw.issue.row: rw for rw in self._rows}
+        fresh: List[TruckIssue] = []
         for issue in issues:
             if issue.row in existing:
-                # Refresh the open card instead of stacking duplicates
                 rw = existing[issue.row]
                 rw.issue.original = issue.original
                 rw.issue.kind = issue.kind
@@ -954,23 +1003,32 @@ class TruckCorrectionDialog(QDialog):
                     pasted.setText(f'· "{issue.original}"')
                 self._refresh_kind_label(rw)
                 self._refresh_status_badge(rw)
+                self._sync_no_truck_button(rw)
                 continue
+            fresh.append(issue)
+        room = max(0, self._issue_page - len(self._rows))
+        for issue in fresh[:room]:
             card = self._make_card(issue)
-            # Insert before the trailing stretch
             self._body_lay.insertWidget(self._body_lay.count() - 1, card)
+        if len(fresh) > room:
+            self._held_issues.extend(fresh[room:])
         self._update_count()
 
     def _make_card(self, issue: TruckIssue) -> QFrame:
+        """One card: pasted value, registry status, and the row actions."""
         card = QFrame()
         card.setObjectName("truckIssueCard")
+        card.setFrameShape(QFrame.NoFrame)
+        card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        stripe = _ROW_EVEN if len(self._rows) % 2 == 0 else _ROW_ODD
         card.setStyleSheet(
             f"QFrame#truckIssueCard {{"
-            f" background-color: {_WHITE}; border: 1px solid {_BORDER};"
-            " border-radius: 6px; }"
+            f" background-color: {stripe}; border: none;"
+            f" border-bottom: 1px solid {_BORDER}; }}"
         )
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(10, 8, 10, 8)
-        lay.setSpacing(6)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(2)
 
         header = QHBoxLayout()
         header.setSpacing(6)
@@ -1000,7 +1058,6 @@ class TruckCorrectionDialog(QDialog):
         header.addWidget(details_btn)
         lay.addLayout(header)
 
-        # Import combos keep trailers on ``combo_suffix`` and edit the truck only.
         combo = [] if issue.combo_suffix else list(issue.combo_parts or [])
         part_edits: List[QLineEdit] = []
         part_badges: List[QLabel] = []
@@ -1024,6 +1081,18 @@ class TruckCorrectionDialog(QDialog):
         allow_btn.setCursor(Qt.PointingHandCursor)
         allow_btn.setFixedHeight(_CTRL_H)
         allow_btn.setStyleSheet(_BTN_ORANGE)
+
+        no_truck_btn = None
+        if self._fixing_parked_trucks():
+            no_truck_btn = QPushButton("No truck")
+            no_truck_btn.setToolTip(
+                "This row has no truck. Mark it fixed and move it to My entries."
+            )
+            no_truck_btn.setCursor(Qt.PointingHandCursor)
+            no_truck_btn.setFixedHeight(_CTRL_H)
+            no_truck_btn.setStyleSheet(_BTN_SECONDARY)
+            no_truck_btn.setVisible(False)
+
         skip_row_btn = None
         if self._allow_park:
             skip_row_btn = QPushButton("Park")
@@ -1040,9 +1109,10 @@ class TruckCorrectionDialog(QDialog):
             skip_row_btn.setStyleSheet(_BTN_GHOST)
 
         def _add_row_actions(row: QHBoxLayout) -> None:
+            if no_truck_btn is not None:
+                row.addWidget(no_truck_btn)
             row.addWidget(apply_btn)
-            if allow_btn is not None:
-                row.addWidget(allow_btn)
+            row.addWidget(allow_btn)
             if skip_row_btn is not None:
                 row.addWidget(skip_row_btn)
 
@@ -1063,11 +1133,7 @@ class TruckCorrectionDialog(QDialog):
                 edit.setMinimumWidth(100)
                 edit.setMaximumWidth(_TRUCK_EDIT_W)
                 edit.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-                norm = normalize_truck_number(part, allowed_labels=self._allowed_labels)
-                if norm.status in ("ok", "normalized", "place_label"):
-                    edit.setText(norm.value)
-                else:
-                    edit.setText(norm.value or str(part).upper())
+                self._fill_truck_edit(edit, part)
                 edit.setPlaceholderText("T688 EAF")
                 edit.setStyleSheet(_INPUT_SS)
                 edit.editingFinished.connect(lambda e=edit: self._autonorm_edit(e))
@@ -1077,7 +1143,9 @@ class TruckCorrectionDialog(QDialog):
                 badge.setMinimumWidth(_BADGE_W)
                 prow.addWidget(badge)
                 part_add = QPushButton("Add")
-                part_add.setToolTip(f"Add this {labels[idx].lower()} to the fleet registry")
+                part_add.setToolTip(
+                    f"Add this {labels[idx].lower()} to the fleet registry"
+                )
                 part_add.setCursor(Qt.PointingHandCursor)
                 part_add.setFixedHeight(_CTRL_H)
                 part_add.setStyleSheet(_BTN_BLUE)
@@ -1121,7 +1189,9 @@ class TruckCorrectionDialog(QDialog):
             add_btn.setStyleSheet(_BTN_BLUE)
             edit_row.addWidget(add_btn)
             accept_btn = QPushButton("Label")
-            accept_btn.setToolTip("Accept as place label (YARD / GARAGE) and remove from list")
+            accept_btn.setToolTip(
+                "Accept as place label (YARD / GARAGE) and remove from list"
+            )
             accept_btn.setCursor(Qt.PointingHandCursor)
             accept_btn.setFixedHeight(_CTRL_H)
             accept_btn.setStyleSheet(_BTN_BLUE)
@@ -1140,12 +1210,14 @@ class TruckCorrectionDialog(QDialog):
             add_btn=add_btn,
             accept_label_btn=accept_btn,
             allow_btn=allow_btn,
+            no_truck_btn=no_truck_btn,
             skip_row_btn=skip_row_btn,
             details_btn=details_btn,
             part_edits=part_edits,
             part_badges=part_badges,
         )
         rw_holder = rw
+        self._rows.append(rw)
         self._refresh_kind_label(rw)
         self._refresh_status_badge(rw)
         if accept_btn is not None:
@@ -1153,23 +1225,20 @@ class TruckCorrectionDialog(QDialog):
                 is_place_label_candidate(primary_edit.text())
                 or is_allowed_place_label(primary_edit.text(), self._allowed_labels)
             )
-
-        for edit in (part_edits or [primary_edit]):
+        self._sync_no_truck_button(rw)
+        for edit in part_edits or [primary_edit]:
             edit.textChanged.connect(lambda _t, r=rw: self._on_edit_changed(r))
         apply_btn.clicked.connect(lambda _=False, r=rw: self._apply_row(r))
         if accept_btn is not None:
             accept_btn.clicked.connect(lambda _=False, r=rw: self._accept_label_row(r))
-        if allow_btn is not None:
-            allow_btn.clicked.connect(lambda _=False, r=rw: self._allow_anyway_row(r))
+        allow_btn.clicked.connect(lambda _=False, r=rw: self._allow_anyway_row(r))
+        if no_truck_btn is not None:
+            no_truck_btn.clicked.connect(lambda _=False, r=rw: self._accept_empty_row(r))
         if skip_row_btn is not None:
             skip_row_btn.clicked.connect(lambda _=False, r=rw: self._park_row(r))
         if add_btn is not None:
-            add_btn.clicked.connect(
-                lambda _=False, r=rw: self._add_to_registry_row(r)
-            )
+            add_btn.clicked.connect(lambda _=False, r=rw: self._add_to_registry_row(r))
         details_btn.clicked.connect(lambda _=False, r=rw: self._peep_row(r))
-
-        self._rows.append(rw)
         return card
 
     def _refresh_kind_label(self, rw: _RowWidgets) -> None:
@@ -1192,6 +1261,9 @@ class TruckCorrectionDialog(QDialog):
                 text, color = "Two trailers — Allow or Park", "#b45309"
             else:
                 text, color = "Two trailers — truck needs attention", "#b91c1c"
+        elif self._fixing_parked_trucks() and not (rw.edit.text() or "").strip() and not rw.part_edits:
+            text = "No truck on this row"
+            color = "#b45309"
         elif rw.issue.kind == "invalid_format":
             text = "Invalid format — use T + digits + space + suffix (e.g. T688 EAF)"
             color = "#b45309"
@@ -1233,6 +1305,7 @@ class TruckCorrectionDialog(QDialog):
             )
         self._refresh_status_badge(rw)
         self._refresh_kind_label(rw)
+        self._sync_no_truck_button(rw)
 
     def _autonorm_edit(self, edit: QLineEdit) -> None:
         text = edit.text().strip()
@@ -1317,8 +1390,9 @@ class TruckCorrectionDialog(QDialog):
 
     def _remove_row(self, rw: _RowWidgets, resolved: TruckIssue) -> None:
         self.issues.append(resolved)
-        if rw in self._rows:
-            self._rows.remove(rw)
+        index = self._rows.index(rw) if rw in self._rows else -1
+        if index >= 0:
+            self._rows.pop(index)
         rw.card.setParent(None)
         rw.card.deleteLater()
         self._update_count()
@@ -1327,8 +1401,41 @@ class TruckCorrectionDialog(QDialog):
                 self._on_resolved(resolved)
             except Exception:
                 pass
-        if not self._rows:
-            self.accept()
+        if self._rows or self._defer_page:
+            return
+        if self._show_next_issue_page():
+            return
+        self.accept()
+
+    def _show_next_issue_page(self) -> bool:
+        """Build the next page of cards. At most ``_issue_page`` cards exist."""
+        if self._rows or not self._held_issues or self._body_lay is None:
+            return False
+        page = self._held_issues[: self._issue_page]
+        del self._held_issues[: self._issue_page]
+        for issue in page:
+            card = self._make_card(issue)
+            self._body_lay.insertWidget(self._body_lay.count() - 1, card)
+        self._update_count()
+        return True
+
+    def _park_held_issues(self) -> None:
+        """Resolve issues that were never given a card, using the same park flags."""
+        for issue in list(self._held_issues):
+            issue.corrected = (issue.corrected or issue.original or "").strip()
+            issue.skip = False
+            issue.allow_anyway = False
+            issue.is_place_label = False
+            issue.accept_empty = False
+            if self._import_mode:
+                issue.omit_row = True
+                issue.parked = False
+            else:
+                issue.omit_row = False
+                issue.parked = True
+            self.issues.append(issue)
+            self._notify_resolved(issue)
+        self._held_issues.clear()
 
     def _finish_resolved(
         self,
@@ -1380,6 +1487,19 @@ class TruckCorrectionDialog(QDialog):
         issue.parked = False
         issue.allow_anyway = False
         issue.is_place_label = False
+        issue.accept_empty = False
+        self._remove_row(rw, issue)
+
+    def _accept_empty_row(self, rw: _RowWidgets) -> None:
+        """Parked fix: a blank truck is the resolution and moves the row to My."""
+        issue = rw.issue
+        issue.corrected = ""
+        issue.skip = False
+        issue.omit_row = False
+        issue.parked = False
+        issue.allow_anyway = False
+        issue.is_place_label = False
+        issue.accept_empty = True
         self._remove_row(rw, issue)
 
     def _omit_row(self, rw: _RowWidgets) -> None:
@@ -1392,6 +1512,7 @@ class TruckCorrectionDialog(QDialog):
         issue.parked = False
         issue.allow_anyway = False
         issue.is_place_label = False
+        issue.accept_empty = False
         self._remove_row(rw, issue)
 
     def _park_row(self, rw: _RowWidgets) -> None:
@@ -1407,6 +1528,7 @@ class TruckCorrectionDialog(QDialog):
         issue.parked = True
         issue.allow_anyway = False
         issue.is_place_label = False
+        issue.accept_empty = False
         self._remove_row(rw, issue)
 
     def _allow_anyway_row(self, rw: _RowWidgets, *, ask_similar: bool = True) -> None:
@@ -1419,6 +1541,11 @@ class TruckCorrectionDialog(QDialog):
         """
         text = self._truck_edit_value(rw)
         if not text:
+            if not ask_similar and self._fixing_parked_trucks():
+                self._accept_empty_row(rw)
+                return
+            if not ask_similar:
+                return
             show_warning(self, "Allow", "Enter a truck value first.")
             return
 
@@ -1588,32 +1715,103 @@ class TruckCorrectionDialog(QDialog):
 
     def _park_all_remaining(self) -> None:
         rows = list(self._rows)
-        if not rows:
+        held = len(self._held_issues)
+        if not rows and not held:
             return
-        n = len(rows)
+        n = len(rows) + held
         plural = "s" if n != 1 else ""
 
         def _work() -> None:
-            for i, rw in enumerate(rows):
-                if rw in self._rows:
-                    self._park_row(rw)
-                if i == 0 or (i + 1) % 8 == 0 or i + 1 == n:
-                    self._pump_busy()
+            self._defer_page = True
+            try:
+                for i, rw in enumerate(rows):
+                    if rw in self._rows:
+                        self._park_row(rw)
+                    if i == 0 or (i + 1) % 8 == 0 or i + 1 == n:
+                        self._pump_busy()
+            finally:
+                self._defer_page = False
+            self._park_held_issues()
+            self._update_count()
+            if not self._rows and self.isVisible():
+                self.accept()
 
         self._run_bulk_busy(f"Parking {n} truck{plural}…", _work)
+
+    def _allow_held_issues(self) -> None:
+        """Allow rows that were never given a card, using the pasted value."""
+        for issue in list(self._held_issues):
+            text = (issue.original or "").strip()
+            if not text:
+                if self._fixing_parked_trucks():
+                    issue.corrected = ""
+                    issue.skip = False
+                    issue.omit_row = False
+                    issue.parked = False
+                    issue.allow_anyway = False
+                    issue.is_place_label = False
+                    issue.accept_empty = True
+                    self.issues.append(issue)
+                    self._notify_resolved(issue)
+                elif self._import_mode:
+                    issue.corrected = ""
+                    issue.omit_row = True
+                    issue.parked = False
+                    issue.allow_anyway = False
+                    issue.accept_empty = False
+                    self.issues.append(issue)
+                    self._notify_resolved(issue)
+                continue
+            norm = normalize_truck_number(text, allowed_labels=self._allowed_labels)
+            if norm.status in ("ok", "normalized", "place_label"):
+                value = norm.value
+            else:
+                value = " ".join(text.upper().split())
+            is_place = norm.status == "place_label" or is_allowed_place_label(
+                value, self._allowed_labels
+            )
+            matched = None if is_place else try_match_fleet(value, self._fleet)
+            if is_place:
+                self._resolve_issue(
+                    issue,
+                    corrected=normalize_place_label(value),
+                    is_place_label=True,
+                )
+            elif matched is not None and not self._is_two_trailer_issue(issue):
+                self._resolve_issue(issue, corrected=matched)
+            else:
+                self._resolve_issue(
+                    issue,
+                    corrected=matched or value,
+                    allow_anyway=True,
+                )
+            self.issues.append(issue)
+            self._notify_resolved(issue)
+        self._held_issues.clear()
+
+    def _notify_resolved(self, issue: TruckIssue) -> None:
+        if not callable(self._on_resolved):
+            return
+        try:
+            self._on_resolved(issue)
+        except Exception:
+            pass
 
     def _allow_all_remaining(self) -> None:
         """Allow every open row after one Fluent confirmation."""
         open_rows = list(self._rows)
-        if not open_rows:
+        held = len(self._held_issues)
+        if not open_rows and not held:
             return
 
-        n = len(open_rows)
+        n = len(open_rows) + held
         samples = [
             (self._truck_edit_value(rw) or "").strip() or "—"
             for rw in open_rows[:5]
         ]
-        extra = f"\n…and {n - 5} more" if n > 5 else ""
+        if held and len(samples) < 5:
+            samples.append(f"{held:,} more not on this page")
+        extra = f"\n…and {n - len(samples)} more" if n > len(samples) else ""
         body = "\n".join(f"  • {s}" for s in samples) + extra
         if not self._confirm_allow(
             title="Allow all",
@@ -1629,11 +1827,19 @@ class TruckCorrectionDialog(QDialog):
         plural = "s" if n != 1 else ""
 
         def _work() -> None:
-            for i, rw in enumerate(list(open_rows)):
-                if rw in self._rows:
-                    self._allow_anyway_row(rw, ask_similar=False)
-                if i == 0 or (i + 1) % 8 == 0 or i + 1 == n:
-                    self._pump_busy()
+            self._defer_page = True
+            try:
+                for i, rw in enumerate(list(open_rows)):
+                    if rw in self._rows:
+                        self._allow_anyway_row(rw, ask_similar=False)
+                    if i == 0 or (i + 1) % 8 == 0 or i + 1 == n:
+                        self._pump_busy()
+            finally:
+                self._defer_page = False
+            self._allow_held_issues()
+            self._update_count()
+            if not self._rows and not self._held_issues and self.isVisible():
+                self.accept()
 
         self._run_bulk_busy(f"Allowing {n} truck{plural}…", _work)
 
@@ -1664,6 +1870,11 @@ class TruckCorrectionDialog(QDialog):
         )
 
     def _apply_combo_row(self, rw: _RowWidgets) -> None:
+        if self._fixing_parked_trucks() and not any(
+            edit.text().strip() for edit in rw.part_edits
+        ):
+            self._accept_empty_row(rw)
+            return
         parts, err = self._combo_resolved_parts(rw)
         if err is not None:
             if self._import_mode and not any(e.text().strip() for e in rw.part_edits):
@@ -1683,6 +1894,8 @@ class TruckCorrectionDialog(QDialog):
         if not text:
             if self._import_mode:
                 self._omit_row(rw)
+            elif self._fixing_parked_trucks():
+                self._accept_empty_row(rw)
             else:
                 self._clear_row(rw)
             return
@@ -1889,6 +2102,11 @@ class TruckCorrectionDialog(QDialog):
         """Auto-apply every remaining row that can be resolved; warn if any remain."""
         for rw in list(self._rows):
             if rw.part_edits:
+                if self._fixing_parked_trucks() and not any(
+                    edit.text().strip() for edit in rw.part_edits
+                ):
+                    self._accept_empty_row(rw)
+                    continue
                 parts, err = self._combo_resolved_parts(rw)
                 if err is None and parts:
                     issue = rw.issue
@@ -1899,7 +2117,10 @@ class TruckCorrectionDialog(QDialog):
                 continue
             text = rw.edit.text().strip()
             if not text:
-                self._clear_row(rw)
+                if self._fixing_parked_trucks():
+                    self._accept_empty_row(rw)
+                else:
+                    self._clear_row(rw)
                 continue
             if is_allowed_place_label(text, self._allowed_labels) or is_place_label_candidate(text):
                 # Only auto-accept if already remembered; candidates need explicit click

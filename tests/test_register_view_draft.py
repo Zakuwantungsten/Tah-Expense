@@ -1057,6 +1057,145 @@ def test_parked_allow_all_promotes_rows_to_my(register, monkeypatch):
     assert statuses and "My entries" in statuses[-1]
 
 
+def test_open_parked_truck_correction_includes_empty_truck(register, monkeypatch):
+    """A parked row whose truck was cleared still opens in Fix trucks."""
+    from tahmeed.ui.cashier.register_delegates import COL_TRUCK
+
+    _stage_import_like_rows(register)
+    monkeypatch.setattr(register, "_persist_parked_after_dialog", _boom_save)
+    register._after_truck_dialog_parked()
+    register._day_tx_cache = []
+    register._day_tx_cache_key = register._make_day_cache_key(
+        register._current_date, merged=False, upload_id=""
+    )
+    register.set_view_mode("parked")
+    register._table.blockSignals(True)
+    try:
+        register._table.item(0, COL_TRUCK).setText("")
+    finally:
+        register._table.blockSignals(False)
+
+    seen: list = []
+
+    class _FakeDlg:
+        def __init__(self, issues, fleet, **kwargs):
+            seen.append((issues, kwargs))
+            self.issues = []
+            self.pending_registry_adds = []
+            self.new_labels = []
+
+        def exec(self):
+            from PySide6.QtWidgets import QDialog
+
+            return QDialog.Rejected
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.TruckCorrectionDialog", _FakeDlg
+    )
+
+    async def _noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(register, "_load_fleet_numbers", _noop)
+    register.open_parked_truck_correction()
+
+    assert len(seen) == 1
+    issues, kwargs = seen[0]
+    assert len(issues) == 1
+    assert issues[0].original == ""
+    assert kwargs.get("allow_park") is False
+
+
+def test_no_truck_promotes_empty_parked_row_to_my(register, monkeypatch):
+    """No truck on a blank parked row moves it to My with an empty truck cell."""
+    from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_TRUCK
+
+    _stage_import_like_rows(register)
+    monkeypatch.setattr(register, "_persist_parked_after_dialog", _boom_save)
+    register._after_truck_dialog_parked()
+    register._day_tx_cache = []
+    register._day_tx_cache_key = register._make_day_cache_key(
+        register._current_date, merged=False, upload_id=""
+    )
+    register.set_view_mode("parked")
+    register._table.blockSignals(True)
+    try:
+        register._table.item(0, COL_TRUCK).setText("")
+    finally:
+        register._table.blockSignals(False)
+
+    class _FakeDlg:
+        def __init__(self, issues, fleet, **kwargs):
+            self.issues = list(issues)
+            self.pending_registry_adds = []
+            self.new_labels = []
+            self._on_resolved = kwargs.get("on_resolved")
+
+        def exec(self):
+            from PySide6.QtWidgets import QDialog
+
+            for issue in list(self.issues):
+                issue.corrected = ""
+                issue.skip = False
+                issue.accept_empty = True
+                issue.parked = False
+                if self._on_resolved:
+                    self._on_resolved(issue)
+            return QDialog.Accepted
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.TruckCorrectionDialog", _FakeDlg
+    )
+
+    async def _noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(register, "_load_fleet_numbers", _noop)
+    register.open_parked_truck_correction()
+
+    assert register._view_mode == "my"
+    assert register._local_parked == []
+    oil_row = next(
+        r
+        for r in range(register._table.rowCount())
+        if register._table.item(r, COL_DESC)
+        and register._table.item(r, COL_DESC).text() == "OIL"
+    )
+    truck = register._table.item(oil_row, COL_TRUCK)
+    assert (truck.text() if truck else "") == ""
+    assert register._row_accepts_empty_truck(oil_row)
+    assert not register._row_marked_parked(oil_row)
+
+
+def test_accept_empty_truck_waives_required_truck_only_for_that_row(register):
+    """No truck waives the save gate for that row; other empty rows still block."""
+    from tahmeed.models.category import Category
+    from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_ITEM, COL_TZS
+
+    fuel = Category(name="Fuel", requires_truck=True)
+    register._categories = [fuel]
+    register._cat_by_name = {fuel.name.lower(): fuel}
+    register._table.blockSignals(True)
+    try:
+        register._put(0, COL_ITEM, "Fuel")
+        register._put(0, COL_DESC, "OIL")
+        register._put(0, COL_TZS, "1,000.00")
+        register._put(1, COL_ITEM, "Fuel")
+        register._put(1, COL_DESC, "DIESEL")
+        register._put(1, COL_TZS, "2,000.00")
+    finally:
+        register._table.blockSignals(False)
+    register._pending_row_meta[0] = {"accept_empty_truck": True}
+
+    assert register._rows_missing_required_truck() == [1]
+    waived = register._build_transaction_from_row(0)
+    assert waived is not None
+    assert waived.truck_number == ""
+    assert waived.register_status == "draft"
+    with pytest.raises(ValueError, match="Truck number is required"):
+        register._build_transaction_from_row(1)
+
+
 def test_toolbar_parked_tools_live_on_parked_tab(qapp):
     from tahmeed.ui.widgets.qb_txn_toolbar import QbTxnToolbar
 

@@ -1184,15 +1184,19 @@ class DayIssuesWidget(QWidget):
         self._wire_mapping_apply_outbox()
 
     def _wire_mapping_apply_outbox(self) -> None:
-        """Background apply failures: soft toast only (maps + live UI already ok)."""
+        """Background apply exhausted: the saved map stays, the row comes back."""
         from tahmeed.services.mapping_apply_outbox import set_failure_handler
 
         def _on_failed(job, exc: BaseException) -> None:
             try:
                 self._footer.setText(
-                    f"Background row update delayed ({len(job.description_keys)} map(s)). "
-                    f"Will retry when Day Issues refreshes."
+                    f"Saved map is in place, but {len(job.description_keys)} "
+                    "description(s) could not be written onto register rows. "
+                    "They are back on this list."
                 )
+                # Retries are exhausted. Show the description again.
+                self.mark_dirty(days=list(job.dates) or None)
+                self._schedule_refresh()
             except Exception:
                 pass
             _ = exc
@@ -1418,6 +1422,7 @@ class DayIssuesWidget(QWidget):
             self._issue_dates.pop(key, None)
             self._checked_keys.discard(key)
             self._mapping_drafts.pop(key, None)
+        self._strip_cached_issue_keys(keys)
         if self._value_filter is not None:
             kept = self._value_filter - keys
             self._value_filter = kept or None
@@ -1425,6 +1430,39 @@ class DayIssuesWidget(QWidget):
         self._apply_filters(repaint=False)
         self._populate()
         self.issues_changed.emit(len(self._issues_all))
+
+    def _strip_cached_issue_keys(self, keys: set) -> None:
+        """Keep All-days cache from painting a just-mapped description again."""
+        if not keys:
+            return
+        for snap in self._day_snap_cache.values():
+            issues = getattr(snap, "issues", None)
+            if not issues:
+                continue
+            kept = [issue for issue in issues if issue.description_key not in keys]
+            if len(kept) == len(issues):
+                continue
+            snap.issues = kept
+            dates = getattr(snap, "issue_dates", None)
+            if isinstance(dates, dict):
+                for key in keys:
+                    dates.pop(key, None)
+
+    def _hide_applying_issues(self, snap) -> None:
+        """Drop descriptions whose row update has not reached the register yet."""
+        from tahmeed.services.mapping_apply_outbox import applying_description_keys
+
+        pending = applying_description_keys()
+        if not pending or snap is None:
+            return
+        issues = getattr(snap, "issues", None)
+        if not issues:
+            return
+        snap.issues = [issue for issue in issues if issue.description_key not in pending]
+        dates = getattr(snap, "issue_dates", None)
+        if isinstance(dates, dict):
+            for key in pending:
+                dates.pop(key, None)
 
     async def refresh(self, *, quiet: bool = False) -> None:
         if self._loading:
@@ -1463,6 +1501,7 @@ class DayIssuesWidget(QWidget):
                     cashier_id=self._cashier_scope_id,
                     payee_names=self._payees,
                 )
+            self._hide_applying_issues(snap)
             self._issues_all = list(snap.issues)
             self._issue_dates = dict(getattr(snap, "issue_dates", None) or {})
             self._days_scanned = list(getattr(snap, "days_scanned", None) or [])
@@ -2098,10 +2137,13 @@ class DayIssuesWidget(QWidget):
         if len(items) == 1:
             prefill_item = next(iter(items))
 
-        try:
-            await self._reload_catalogs()
-        except Exception:
-            pass
+        # Lists are already on the page. Do not block the dialog on a catalog
+        # download; a slow network made Map Selected feel dead.
+        if not self._lookups_loaded or not self._categories or not self._payees:
+            try:
+                await self._reload_catalogs()
+            except Exception:
+                pass
 
         dlg = MapDescriptionsDialog(
             descriptions,
@@ -2197,13 +2239,14 @@ class DayIssuesWidget(QWidget):
             await self._undo_last_mapping()
 
     async def _finish_mapping_ui(self, descriptions: Sequence[str]) -> None:
-        """Drop mapped rows instantly, then one quiet resync (no cascade scans)."""
+        """Drop mapped rows and leave them off until the row update finishes.
+
+        A quiet rescan here reads register rows that are still blank on a slow
+        network and puts the description back as unmapped.
+        """
         keys = {normalize_description(d) for d in descriptions if normalize_description(d)}
-        touched = self._dates_for_descriptions(descriptions)
         self._drop_issue_keys(keys)
-        self.mark_dirty(days=touched)
         self.mappings_applied.emit()
-        await self.refresh(quiet=True)
 
     async def _snapshot_prior_maps(self, descriptions: Sequence[str]) -> dict:
         """Capture existing Description Maps before an upsert (for Undo restore)."""

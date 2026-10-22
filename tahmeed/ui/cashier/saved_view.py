@@ -271,6 +271,7 @@ class SavedView(QWidget):
     open_merged_date = Signal(object)  # date
     # date when a specific day changed; None = unknown / refresh lists only
     drafts_changed = Signal(object)
+    drafts_submitted = Signal(int)
 
     def __init__(self, user: User, *, show_all_cashiers: bool = False, parent=None) -> None:
         super().__init__(parent)
@@ -628,6 +629,7 @@ class SavedView(QWidget):
                 f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for "
                 f"{day.strftime('%d %b %Y')}.",
             )
+            self.drafts_submitted.emit(int(n or 0))
             self.drafts_changed.emit(day)
             await self._load_rows()
         finally:

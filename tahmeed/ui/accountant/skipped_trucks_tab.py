@@ -701,7 +701,7 @@ class SkippedTrucksTab(QWidget):
     async def _do_reupload(self, docs: List[dict]) -> None:
         """Re-check every selected truck against the fleet, then re-upload passers."""
         from tahmeed.services import accountant_service as svc
-        from tahmeed.services.import_truck_check import scan_import_trucks
+        from tahmeed.services.import_truck_check import scan_import_trucks_yielding
         from tahmeed.services.truck_service import get_fleet_numbers, add_fleet_by_collection
         from tahmeed.services.truck_format import merge_allowed_labels
         from tahmeed.services import settings_service
@@ -738,7 +738,7 @@ class SkippedTrucksTab(QWidget):
                 rec[field] = rec[row_field]
             work_rows.append(rec)
 
-        scan = scan_import_trucks(
+        scan = await scan_import_trucks_yielding(
             work_rows, field, fleet, allowed_labels=labels,
         )
 

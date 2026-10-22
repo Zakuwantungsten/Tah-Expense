@@ -209,6 +209,17 @@ class ApiClient:
             raise self._error(response)
         return response
 
+    async def request_response(
+        self,
+        method: str,
+        path: str,
+        *,
+        auth: bool = True,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Like ``request``, but the caller needs the status and headers (304)."""
+        return await self._send(method, path, auth=auth, **kwargs)
+
     async def request(
         self,
         method: str,

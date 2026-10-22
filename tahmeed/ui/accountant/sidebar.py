@@ -716,9 +716,17 @@ class SidebarWidget(QFrame):
             self._collapse_btn.setIcon(_qta("mdi.chevron-left", color=_MUTED))
             self._collapse_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
+    def verify_badge(self) -> int:
+        item = self._items.get("verify")
+        return int(getattr(item, "_badge_count", 0) or 0) if item is not None else 0
+
     def set_verify_badge(self, count: int) -> None:
         if "verify" in self._items:
             self._items["verify"].set_badge(count)
+
+    def drafts_badge(self) -> int:
+        item = self._items.get("drafts")
+        return int(getattr(item, "_badge_count", 0) or 0) if item is not None else 0
 
     def set_drafts_badge(self, count: int) -> None:
         if "drafts" in self._items:

@@ -59,10 +59,34 @@ def settings() -> Settings:
     )
 
 
+class FakeBadges:
+    def __init__(self, document: dict | None) -> None:
+        self.document = document
+        self.queries: list[dict] = []
+
+    async def find_one(self, query: dict) -> dict | None:
+        self.queries.append(query)
+        if self.document is None:
+            return None
+        if query.get("_id") != self.document.get("_id"):
+            return None
+        return dict(self.document)
+
+
 @pytest.mark.parametrize("role", ["admin", "accountant"])
-def test_notification_counts_uses_pending_inbox_predicate(role: str) -> None:
+def test_notification_counts_reads_stored_badges(role: str) -> None:
     transactions = FakeTransactions(count=7, deletion_count=3)
-    database = SimpleNamespace(db=SimpleNamespace(transactions=transactions))
+    badges = FakeBadges(
+        {
+            "_id": "badges",
+            "verify": 7,
+            "deletion_requests": 3,
+            "restore_requests": 0,
+        }
+    )
+    database = SimpleNamespace(
+        db=SimpleNamespace(transactions=transactions, system_counters=badges)
+    )
     app = create_app(settings=settings(), database=database)
     app.dependency_overrides[current_user] = lambda: {"role": role}
 
@@ -71,18 +95,18 @@ def test_notification_counts_uses_pending_inbox_predicate(role: str) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"verify": 10}
-    assert transactions.queries == [
-        {
-            "verified": False,
-            "rejected": {"$ne": True},
-            "$or": [
-                {"register_status": "submitted"},
-                {"register_status": {"$exists": False}},
-            ],
-        },
-        {"deletion_requested": True, "trashed": {"$ne": True}},
-        {"trashed": True, "restore_requested": True},
-    ]
+    assert response.headers["etag"] == '"0"'
+    assert transactions.queries == []
+    assert badges.queries == [{"_id": "badges"}]
+
+    with TestClient(app) as client:
+        same = client.get(
+            "/v1/accountant/notification-counts",
+            headers={"If-None-Match": '"0"'},
+        )
+    assert same.status_code == 304
+    assert same.content == b""
+    assert len(badges.queries) == 2
 
 def test_notification_counts_rejects_cashier() -> None:
     transactions = FakeTransactions(count=7)
@@ -103,9 +127,7 @@ async def test_migration_indexes_pending_verification_predicate() -> None:
 
     await create_indexes(database)
 
-    assert database.transactions.indexes == [
-        (
-            [("verified", 1), ("rejected", 1)],
-            {"name": "pending_verification"},
-        )
-    ]
+    assert (
+        [("verified", 1), ("rejected", 1)],
+        {"name": "pending_verification"},
+    ) in database.transactions.indexes

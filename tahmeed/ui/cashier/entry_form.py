@@ -21,7 +21,6 @@ from tahmeed.services.truck_format import (
     is_allowed_place_label, DEFAULT_PLACE_LABELS, merge_allowed_labels,
 )
 from tahmeed.services.rule_service import test_description
-from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.services.settings_service import get_setting, set_setting
 from tahmeed.services.cashier_service import (
     save_transaction, get_transactions_by_date, check_for_duplicates,
@@ -229,22 +228,35 @@ class EntryForm(QWidget):
     # ──────────────────────────────────────────────────────────────────
 
     async def _load_config(self) -> None:
+        from tahmeed.services.catalog_service import (
+            fetch_catalog_snapshot,
+            setting_from_snapshot,
+        )
+        from tahmeed.services.category_service import get_payment_target_categories
+
         try:
             self._confidence_threshold = int(
                 await get_setting("confidence_threshold") or 75
             )
-            self._categories = await get_payment_target_categories()
-            self._cat_by_name = {c.name.lower(): c for c in self._categories}
         except Exception:
             pass
         try:
-            self._restrict_items = bool(await get_setting("restrict_items"))
+            snapshot = await fetch_catalog_snapshot()
+            self._categories = await get_payment_target_categories()
+            self._cat_by_name = {c.name.lower(): c for c in self._categories}
+            self._restrict_items = bool(
+                setting_from_snapshot(snapshot, "restrict_items", False)
+            )
+            self._defer_item_to_verify = bool(
+                setting_from_snapshot(snapshot, "defer_item_to_verify", False)
+            )
+            raw = snapshot.get("allowed_truck_labels")
+            if isinstance(raw, list) and raw:
+                self._allowed_truck_labels = merge_allowed_labels(raw, DEFAULT_PLACE_LABELS)
+            else:
+                self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
         except Exception:
-            self._restrict_items = False
-        try:
-            self._defer_item_to_verify = bool(await get_setting("defer_item_to_verify"))
-        except Exception:
-            self._defer_item_to_verify = False
+            pass
         self._refresh_item_optional_hint()
         try:
             from tahmeed.services.people_service import get_people_names
@@ -258,14 +270,6 @@ class EntryForm(QWidget):
         except Exception:
             self._fleet_numbers = set()
             self._fleet_kinds = {}
-        try:
-            raw = await get_setting("allowed_truck_labels")
-            if isinstance(raw, list) and raw:
-                self._allowed_truck_labels = merge_allowed_labels(raw, DEFAULT_PLACE_LABELS)
-            else:
-                self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
-        except Exception:
-            self._allowed_truck_labels = set(DEFAULT_PLACE_LABELS)
         await self._refresh_table()
 
     def update_categories(self, cats: List[Category]) -> None:

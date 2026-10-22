@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request
 
+from .badge_counters import apply_remembered, load_badge_docs, note_transition
 from .accountant_ops import (
     DELETION_BASE_MATCH,
     DELETION_SORT,
@@ -314,9 +315,14 @@ async def confirm_deletion(
     )
     if not doc:
         return {"ok": False}
+    before = dict(doc)
     actor_id = _actor_oid(manager)
     now = utcnow().replace(tzinfo=None)
-    await db.transactions.delete_many({"original_transaction_id": oid})
+    clones = await load_badge_docs(db, {"original_transaction_id": oid})
+    clone_result = await db.transactions.delete_many({"original_transaction_id": oid})
+    await apply_remembered(
+        db, clones, None, int(getattr(clone_result, "deleted_count", 0) or 0)
+    )
     result = await db.transactions.update_one(
         {
             "_id": oid,
@@ -336,6 +342,15 @@ async def confirm_deletion(
     )
     ok = result.modified_count == 1
     if ok:
+        await note_transition(
+            db,
+            before,
+            {
+                **before,
+                "trashed": True,
+                "deletion_requested": False,
+            },
+        )
         await _audit(
             request,
             action="txn.trash",
@@ -348,12 +363,15 @@ async def confirm_deletion(
 @deletions.post("/deletions/{tx_id}/restore")
 async def restore_deletion(tx_id: str, request: Request, _manager: Manager) -> dict:
     oid = _valid_id(tx_id)
-    result = await _database(request).transactions.update_one(
-        {
-            "_id": oid,
-            "deletion_requested": True,
-            "trashed": {"$ne": True},
-        },
+    db = _database(request)
+    restore_filter = {
+        "_id": oid,
+        "deletion_requested": True,
+        "trashed": {"$ne": True},
+    }
+    before = await load_badge_docs(db, restore_filter)
+    result = await db.transactions.update_one(
+        restore_filter,
         {
             "$set": {
                 "deletion_requested": False,
@@ -361,5 +379,8 @@ async def restore_deletion(tx_id: str, request: Request, _manager: Manager) -> d
                 "deletion_requested_by": None,
             }
         },
+    )
+    await apply_remembered(
+        db, before, {"deletion_requested": False}, int(result.modified_count)
     )
     return {"ok": result.modified_count == 1}

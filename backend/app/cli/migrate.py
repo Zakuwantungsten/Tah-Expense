@@ -147,6 +147,25 @@ async def create_indexes(db: Any) -> None:
             "cashier_id": {"$exists": True},
         },
     )
+    # List indexes. Partial filters are equality only so the planner can use them.
+    # register_status is backfilled before these are built (see migrate()).
+    await db.transactions.create_index(
+        [("date", DESCENDING), ("day_order", ASCENDING), ("_id", ASCENDING)],
+        name="inbox_submitted",
+        partialFilterExpression={
+            "verified": False,
+            "register_status": "submitted",
+        },
+    )
+    await db.transactions.create_index(
+        [("cashier_id", ASCENDING), ("date", ASCENDING), ("day_order", ASCENDING)],
+        name="register_by_day",
+    )
+    await db.transactions.create_index(
+        [("register_status", ASCENDING), ("date", ASCENDING)],
+        name="drafts_by_status",
+        partialFilterExpression={"register_status": {"$in": ["draft", "parked"]}},
+    )
     await db.imported_feeds.create_index(
         [("skipped_row_id", ASCENDING)],
         name="uniq_feed_skipped_row_id",
@@ -175,6 +194,23 @@ async def create_indexes(db: Any) -> None:
     )
 
 
+async def backfill_register_status(db: Any) -> int:
+    """Legacy rows with no register_status were treated as the verify inbox.
+
+    Drafts and parked rows already store that status. Missing means submitted,
+    so the row lands in the inbox and not in the drafts list.
+    """
+    missing = {"register_status": {"$exists": False}}
+    found = int(await db.transactions.count_documents(missing))
+    if found:
+        await db.transactions.update_many(
+            missing,
+            {"$set": {"register_status": "submitted"}},
+        )
+    print(f"Transactions missing register_status: {found}. Backfilled to submitted.")
+    return found
+
+
 async def migrate(check_only: bool) -> int:
     settings = get_settings()
     client = AsyncMongoClient(settings.mongodb_uri, appname="tahmeed-migrate")
@@ -189,7 +225,11 @@ async def migrate(check_only: bool) -> int:
         if check_only:
             print("No conflicts found; check-only mode made no changes.")
             return 0
+        await backfill_register_status(db)
         await create_indexes(db)
+        from ..badge_counters import repair_badge_counters
+
+        await repair_badge_counters(db)
         await db.schema_migrations.update_one(
             {"_id": "0003_operation_events_indexes"},
             {

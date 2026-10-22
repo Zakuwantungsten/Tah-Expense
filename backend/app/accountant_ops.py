@@ -11,7 +11,7 @@ from bson import ObjectId
 
 from .transaction_ops import normalize_multi_filter
 
-UNVERIFIED_INBOX_SORT = [("date", -1), ("day_order", 1), ("created_at", 1)]
+UNVERIFIED_INBOX_SORT = [("date", -1), ("day_order", 1), ("_id", 1)]
 EDITED_INBOX_SORT = [("last_edited_at", -1), ("date", -1)]
 
 
@@ -53,13 +53,10 @@ def inbox_base_query(*, rejected: bool = False) -> dict[str, Any]:
         }
     return {
         "verified": False,
+        "register_status": "submitted",
         "rejected": {"$ne": True},
         "trashed": {"$ne": True},
         "deletion_requested": {"$ne": True},
-        "$or": [
-            {"register_status": "submitted"},
-            {"register_status": {"$exists": False}},
-        ],
     }
 
 

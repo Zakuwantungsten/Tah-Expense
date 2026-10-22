@@ -24,6 +24,14 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         owned = database is None
         app.state.database = database or Database(configured)
         try:
+            from .badge_counters import repair_badge_counters
+
+            await repair_badge_counters(app.state.database.db)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("badge counter seed failed")
+        try:
             yield
         finally:
             if owned:

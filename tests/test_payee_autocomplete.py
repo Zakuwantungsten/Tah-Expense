@@ -29,16 +29,21 @@ def test_update_payees_normalizes_names() -> None:
 
 @pytest.mark.asyncio
 async def test_get_payee_names_uses_cache(monkeypatch) -> None:
+    from tahmeed.services import catalog_service
+
     ps.invalidate_payee_cache()
+    catalog_service._body = None
+    catalog_service._stale = False
     calls = {"n": 0}
 
-    async def fake_list(active=None):
+    async def fake_snapshot(*, refresh: bool = False):
         calls["n"] += 1
-        return [{"name": "FINE", "active": True}]
+        return {"payees": [{"name": "FINE", "active": True}]}
 
-    monkeypatch.setattr(ps, "_list", fake_list)
+    monkeypatch.setattr(catalog_service, "fetch_catalog_snapshot", fake_snapshot)
     names = await ps.get_payee_names()
     assert names == ["FINE"]
     assert await ps.get_payee_names() == ["FINE"]
     assert calls["n"] == 1
     ps.invalidate_payee_cache()
+    catalog_service._body = None

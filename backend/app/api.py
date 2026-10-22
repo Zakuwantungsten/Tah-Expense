@@ -9,10 +9,16 @@ from typing import Annotated, Any
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi.responses import JSONResponse
 from pymongo import ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError
 
 from .audit_ops import parse_audit_filters, record_operation_event
+from .catalog_snapshot import (
+    bump_catalog_version,
+    catalog_snapshot_body,
+    etag_for,
+)
 from .dependencies import Admin, Authenticated, Cashier, Manager, require_roles
 from .errors import ApiError
 from .security_policy import (
@@ -65,7 +71,6 @@ from .accountant_deletions_api import deletions as accountant_deletions_router
 from .accountant_inbox_api import inbox as accountant_inbox_router
 from .accountant_diesel_api import diesel_cash as accountant_diesel_router
 from .accountant_master_api import master as accountant_master_router
-from .accountant_ops import pending_inbox_count_query
 from .accountant_overview_api import overview as accountant_overview_router
 from .accountant_rejected_api import rejected as accountant_rejected_router
 from .accountant_reports_api import reports as accountant_reports_router
@@ -107,6 +112,7 @@ accountant.include_router(accountant_overview_router)
 accountant.include_router(accountant_truck_overview_router)
 accountant.include_router(accountant_fuel_overview_router)
 settings_api = APIRouter(prefix="/settings", tags=["settings"])
+catalog_api = APIRouter(prefix="/catalog", tags=["catalog"])
 audit_api = APIRouter(prefix="/audit", tags=["audit"])
 
 _OPERATION_LOCK_SECONDS = 60
@@ -491,16 +497,27 @@ async def accountant_notification_counts(
     request: Request,
     _manager: Annotated[dict, Depends(require_roles("admin", "accountant"))],
 ) -> dict[str, int]:
-    """Badge total — same formula as ``GET /v1/accountant/counts/pending``."""
-    db = database(request)
-    pending = await db.transactions.count_documents(pending_inbox_count_query())
-    deletions = await db.transactions.count_documents(
-        {"deletion_requested": True, "trashed": {"$ne": True}}
+    """Badge total from the stored counter, not a collection scan.
+
+    ``If-None-Match`` of the badge ``updated_at`` returns 304. The client
+    keeps the badges it already has.
+    """
+    from .badge_counters import (
+        badge_etag,
+        badge_etag_matches,
+        read_badges,
+        verify_badge_total,
     )
-    restores = await db.transactions.count_documents(
-        {"trashed": True, "restore_requested": True}
+
+    doc = await read_badges(database(request))
+    etag = badge_etag(doc)
+    headers = {"ETag": etag}
+    if badge_etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(
+        {"verify": verify_badge_total(doc)},
+        headers=headers,
     )
-    return {"verify": int(pending) + int(deletions) + int(restores)}
 
 
 @settings_api.get("")
@@ -566,6 +583,7 @@ async def put_setting(
         entity_ids=[key],
         details={"key": key},
     )
+    await bump_catalog_version(request)
     return json_safe({"key": key, "value": value})
 
 
@@ -1054,6 +1072,7 @@ async def insert_category(
             entity_ids=[str(doc["_id"])],
             details={"name": doc.get("name")},
         )
+    await bump_catalog_version(request)
     return json_safe(doc)
 
 
@@ -1088,6 +1107,7 @@ async def patch_category(item_id: str, body: PatchDocument, request: Request, ma
         entity_ids=[item_id],
         details={"fields": sorted(values.keys())[:40]},
     )
+    await bump_catalog_version(request)
     return json_safe(doc)
 
 
@@ -1105,6 +1125,7 @@ async def delete_category(item_id: str, request: Request, manager: Manager) -> R
         entity_type="category",
         entity_ids=[item_id],
     )
+    await bump_catalog_version(request)
     return Response(status_code=204)
 
 
@@ -1470,6 +1491,7 @@ async def put_fleet(
             entity_ids=[body.number],
             details={"kind": kind, "active": body.active},
         )
+    await bump_catalog_version(request)
     return json_safe(doc)
 
 
@@ -1489,6 +1511,7 @@ async def delete_fleet(
             entity_ids=[normalized],
             details={"kind": kind},
         )
+    await bump_catalog_version(request)
     return Response(status_code=204)
 
 
@@ -1710,6 +1733,7 @@ async def upsert_payee(name: str, body: PayeeWrite, request: Request, manager: M
         entity_ids=[body.name],
         details={"active": body.active},
     )
+    await bump_catalog_version(request)
     return json_safe(doc)
 
 
@@ -1726,7 +1750,20 @@ async def delete_payee(name: str, request: Request, manager: Manager) -> Respons
         entity_type="payee",
         entity_ids=[normalized],
     )
+    await bump_catalog_version(request)
     return Response(status_code=204)
+
+
+@catalog_api.get("/snapshot")
+async def get_catalog_snapshot(
+    request: Request, response: Response, _user: Authenticated
+):
+    version, body, not_modified = await catalog_snapshot_body(request)
+    tag = etag_for(version)
+    if not_modified:
+        return Response(status_code=304, headers={"ETag": tag})
+    response.headers["ETag"] = tag
+    return body
 
 
 @backups.get("")
@@ -1864,6 +1901,7 @@ for router in (
     backups,
     accountant,
     settings_api,
+    catalog_api,
     audit_api,
     sessions_router,
     transactions_router,

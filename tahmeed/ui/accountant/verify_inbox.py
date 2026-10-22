@@ -1063,6 +1063,7 @@ class _SubTabBar(QFrame):
 
 class VerifyInboxWidget(QWidget):
     badge_updated = Signal(int)
+    verify_delta = Signal(int)
     # date | None — open Day Issues (Phase 4: map before approve)
     open_day_issues = Signal(object)
 
@@ -1347,6 +1348,32 @@ class VerifyInboxWidget(QWidget):
                 QMessageBox.information(self, info_title, info)
 
         self._schedule_ui(_run)
+
+    def _drop_page_ids(self, tx_ids: List[ObjectId]) -> None:
+        """Remove verified or rejected rows from the open page."""
+        drop = {str(tx_id) for tx_id in tx_ids}
+        kept = [
+            tx for tx in self._transactions
+            if str(getattr(tx, "_id", "")) not in drop
+        ]
+        gone = len(self._transactions) - len(kept)
+        if not gone:
+            return
+        self._fill_table(kept, dict(self._cashier_names), 0, append=False)
+        self._loaded = len(kept)
+        self._total = max(0, int(self._total) - gone)
+        if self._current_tab == 0:
+            label = f"New ({self._loaded})" if not getattr(self, "_page_has_count", True) else None
+            if label:
+                self._subtabs._buttons[0].setText(label)
+        self.verify_delta.emit(-gone)
+        try:
+            current = int(self._pending_badge.text())
+        except ValueError:
+            current = None
+        if current is not None:
+            self._pending_badge.setText(str(max(0, current - gone)))
+        self._update_status()
 
     def _update_status(self) -> None:
         if self._loading and self._loaded == 0:
@@ -1809,32 +1836,49 @@ class VerifyInboxWidget(QWidget):
             page_task = safe_task(
                 self._fetch_page(skip=0, limit=_SCROLL_CHUNK, kw=kw),
             )
-            counts_task = safe_task(self._fetch_counts(kw))
+            # The New page is the index scan. Opening Verify does not count the queue.
+            counts_task = None if tab == 0 else safe_task(self._fetch_counts(kw))
             filters_task = (
                 safe_task(self._load_filter_options(tab))
                 if need_filters else None
             )
 
-            txs, counts = await asyncio.gather(page_task, counts_task)
+            txs = await page_task
             if generation != self._reload_generation:
                 return
-
-            (
-                new_count, edited_count, rejected_count,
-                issues_count, deleted_count, restore_count, pending,
-            ) = counts
-            if tab == 2:
-                total = rejected_count
-            elif tab == 1:
-                total = edited_count
-            elif tab == 3:
-                total = issues_count
-            elif tab == 4:
-                total = deleted_count
-            elif tab == 5:
-                total = restore_count
+            if counts_task is None:
+                page_len = len(txs)
+                total = page_len if page_len < _SCROLL_CHUNK else page_len + 1
+                self._page_has_count = False
+                self._subtabs._buttons[0].setText(
+                    f"New ({page_len})" if page_len < _SCROLL_CHUNK else "New"
+                )
+                pending = None
             else:
-                total = new_count
+                counts = await counts_task
+                if generation != self._reload_generation:
+                    return
+                (
+                    new_count, edited_count, rejected_count,
+                    issues_count, deleted_count, restore_count, pending,
+                ) = counts
+                self._page_has_count = True
+                if tab == 2:
+                    total = rejected_count
+                elif tab == 1:
+                    total = edited_count
+                elif tab == 3:
+                    total = issues_count
+                elif tab == 4:
+                    total = deleted_count
+                elif tab == 5:
+                    total = restore_count
+                else:
+                    total = new_count
+                self._subtabs.set_counts(
+                    new_count, edited_count, rejected_count,
+                    issues_count, deleted_count, restore_count,
+                )
 
             # Paint rows immediately; filter dropdown names can arrive right after.
             cname_map: Dict = dict(self._cashier_names)
@@ -1852,17 +1896,14 @@ class VerifyInboxWidget(QWidget):
 
             self._cashier_names = cname_map
             self._total = total
-            self._subtabs.set_counts(
-                new_count, edited_count, rejected_count,
-                issues_count, deleted_count, restore_count,
-            )
             if tab == 3:
                 self._duplicate_matches = {}
                 await self._merge_duplicate_matches(txs)
             self._fill_table(txs, cname_map, 0, append=False)
             self._loaded = len(txs)
-            self._pending_badge.setText(str(pending))
-            self.badge_updated.emit(pending)
+            if pending is not None:
+                self._pending_badge.setText(str(pending))
+                self.badge_updated.emit(pending)
             self._loading = False
             self._loading_overlay.hide_loading()
             self._update_status()
@@ -1924,6 +1965,15 @@ class VerifyInboxWidget(QWidget):
                     await self._merge_duplicate_matches(txs)
                 self._fill_table(txs, cname_map, self._loaded, append=True)
                 self._loaded += len(txs)
+                if not getattr(self, "_page_has_count", True):
+                    if len(txs) < _SCROLL_CHUNK:
+                        self._total = self._loaded
+                        if self._current_tab == 0:
+                            self._subtabs._buttons[0].setText(
+                                f"New ({self._loaded})"
+                            )
+                    else:
+                        self._total = self._loaded + 1
         except Exception:
             pass
         finally:
@@ -2631,7 +2681,7 @@ class VerifyInboxWidget(QWidget):
 
     async def _do_approve(self, tx_id: ObjectId, category_override: str = "") -> None:
         from tahmeed.services.accountant_service import (
-            approve_transaction, re_approve_transaction, get_pending_count,
+            approve_transaction, re_approve_transaction,
             get_transactions_by_ids,
         )
         self._set_busy("Preparing approval…")
@@ -2652,19 +2702,17 @@ class VerifyInboxWidget(QWidget):
                 await re_approve_transaction(tx_id, self._user._id)
             else:
                 await approve_transaction(tx_id, self._user._id)
-            count = await get_pending_count()
-            self.badge_updated.emit(count)
-            self._finish_mutation(hide_panel=True, reload=True)
+            self._drop_page_ids([tx_id])
+            self._finish_mutation(hide_panel=True)
         except Exception as exc:
             self._finish_mutation(error=f"Failed to approve: {exc}")
 
     async def _do_reject(self, tx_id: ObjectId, reason: str) -> None:
-        from tahmeed.services.accountant_service import reject_transaction, get_pending_count
+        from tahmeed.services.accountant_service import reject_transaction
         try:
             await reject_transaction(tx_id, reason, actor_id=self._user._id)
-            count = await get_pending_count()
-            self.badge_updated.emit(count)
-            self._finish_mutation(hide_panel=True, reload=True)
+            self._drop_page_ids([tx_id])
+            self._finish_mutation(hide_panel=True)
         except Exception as exc:
             self._finish_mutation(error=f"Failed to reject: {exc}")
 
@@ -2676,25 +2724,24 @@ class VerifyInboxWidget(QWidget):
             pass
 
     async def _do_bulk_reject(self, tx_ids: List[ObjectId], reason: str) -> None:
-        from tahmeed.services.accountant_service import bulk_reject_transactions, get_pending_count
+        from tahmeed.services.accountant_service import bulk_reject_transactions
 
         self._set_busy(f"Rejecting {len(tx_ids):,} transaction(s)…")
         try:
             n = await bulk_reject_transactions(
                 tx_ids, reason, actor_id=self._user._id
             )
-            count = await get_pending_count()
-            self.badge_updated.emit(count)
+            if n:
+                self._drop_page_ids(tx_ids)
             self._finish_mutation(
                 info=f"Rejected {n} transaction(s).",
-                reload=True,
             )
         except Exception as exc:
             self._finish_mutation(error=f"Bulk reject failed: {exc}")
 
     async def _do_bulk_approve(self, tx_ids: List[ObjectId]) -> None:
         from tahmeed.services.accountant_service import (
-            bulk_approve_transactions, bulk_re_approve_transactions, get_pending_count,
+            bulk_approve_transactions, bulk_re_approve_transactions,
             get_transactions_by_ids,
         )
         self._set_busy(f"Preparing {len(tx_ids):,} approval(s)…")
@@ -2709,11 +2756,10 @@ class VerifyInboxWidget(QWidget):
                 n = await bulk_re_approve_transactions(tx_ids, self._user._id)
             else:
                 n = await bulk_approve_transactions(tx_ids, self._user._id)
-            count = await get_pending_count()
-            self.badge_updated.emit(count)
+            if n:
+                self._drop_page_ids(tx_ids)
             self._finish_mutation(
                 info=f"Approved {n} transaction(s) successfully.",
-                reload=True,
             )
         except Exception as exc:
             self._finish_mutation(error=f"Bulk approve failed: {exc}")
