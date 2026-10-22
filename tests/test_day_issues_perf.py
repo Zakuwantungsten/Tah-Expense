@@ -166,6 +166,25 @@ def test_on_page_shown_preserves_verify_handoff() -> None:
     assert calls == []  # clean + loaded → no re-scan
 
 
+def test_on_page_shown_reloads_catalogs_without_rescan() -> None:
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    refresh_calls: list[str] = []
+    catalog_calls: list[str] = []
+    widget._schedule_refresh = lambda: refresh_calls.append("refresh")  # type: ignore[method-assign]
+    widget._schedule_catalog_reload = lambda: catalog_calls.append("catalogs")  # type: ignore[method-assign]
+    widget._loaded = True
+    widget._dirty = False
+    widget._lookups_loaded = True
+
+    widget.on_page_shown(date(2026, 4, 2))
+
+    assert refresh_calls == []
+    assert catalog_calls == ["catalogs"]
+    assert widget._lookups_loaded is False
+
+
 def test_on_page_shown_first_visit_opens_for_date() -> None:
     _app()
     user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
@@ -307,6 +326,76 @@ def test_drop_issue_keys_updates_list_and_badge_signal() -> None:
     widget._drop_issue_keys({a.description_key})
     assert [i.description for i in widget._issues_all] == ["DIESEL"]
     assert counts == [1]
+
+
+@pytest.mark.asyncio
+async def test_reload_catalogs_drops_payee_cache_and_replaces_lists(monkeypatch) -> None:
+    from tahmeed.models.category import Category
+
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    widget._categories = [Category(name="Old Item")]
+    widget._payees = ["OLD PAYEE"]
+    widget._lookups_loaded = True
+    invalidated: list[bool] = []
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.invalidate_payee_cache",
+        lambda: invalidated.append(True),
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.get_payment_target_categories",
+        AsyncMock(return_value=[Category(name="Custom Bonds")]),
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.get_payee_names",
+        AsyncMock(return_value=["NEW PAYEE"]),
+    )
+
+    await widget._reload_catalogs()
+
+    assert invalidated == [True]
+    assert [c.name for c in widget._categories] == ["Custom Bonds"]
+    assert widget._payees == ["NEW PAYEE"]
+    assert widget._lookups_loaded is True
+
+
+@pytest.mark.asyncio
+async def test_do_map_opens_dialog_with_reloaded_catalogs(monkeypatch) -> None:
+    from PySide6.QtWidgets import QDialog
+
+    from tahmeed.models.category import Category
+
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    seen: dict = {}
+
+    async def reload() -> None:
+        widget._categories = [Category(name="Custom Bonds")]
+        widget._payees = ["NEW PAYEE"]
+
+    widget._reload_catalogs = reload  # type: ignore[method-assign]
+
+    class FakeDlg:
+        def __init__(self, descriptions, categories, payees, parent=None, **kwargs):
+            seen["descriptions"] = list(descriptions)
+            seen["cats"] = [c.name for c in categories]
+            seen["payees"] = list(payees)
+
+        def exec(self) -> int:
+            return QDialog.Rejected
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.MapDescriptionsDialog",
+        FakeDlg,
+    )
+    await widget._do_map(["LATRA FEE"], [_issue("LATRA FEE")])
+
+    assert seen["descriptions"] == ["LATRA FEE"]
+    assert seen["cats"] == ["Custom Bonds"]
+    assert seen["payees"] == ["NEW PAYEE"]
 
 
 @pytest.mark.asyncio

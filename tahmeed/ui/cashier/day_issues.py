@@ -44,7 +44,11 @@ from tahmeed.services.mapping_assignment_service import (
     materialize_mapping_assignment,
     remember_category,
 )
-from tahmeed.services.payee_service import add_payee, get_payee_names
+from tahmeed.services.payee_service import (
+    add_payee,
+    get_payee_names,
+    invalidate_payee_cache,
+)
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
     _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
@@ -461,6 +465,7 @@ class MapDescriptionsDialog(QDialog):
         self._payees = [str(p).strip().upper() for p in payees if str(p).strip()]
         self._known_payees_at_open: Set[str] = set(self._payees)
         self._pending_new_payees: Set[str] = set()
+        self._pending_new_items: dict[str, dict] = {}
         self._payee_currencies: dict[str, str] = {}
         self.result_payee: str = ""
         self.result_currency: str = "TZS"
@@ -564,6 +569,32 @@ class MapDescriptionsDialog(QDialog):
         self._payee.setText(payee)
         self._payee._typed = payee
 
+    def _select_item(
+        self,
+        name: str,
+        *,
+        fields: Optional[dict] = None,
+        mark_create: bool = False,
+    ) -> None:
+        """Put an item on the suggestion list and into the field immediately."""
+        item_name = " ".join((name or "").split())
+        if not item_name:
+            return
+        existing = next(
+            (c for c in self._categories if c.name.strip().lower() == item_name.lower()),
+            None,
+        )
+        if existing is None:
+            self._categories.append(Category(name=item_name))
+            self._categories = sort_payment_targets(self._categories)
+        if mark_create and (existing is None or existing._id is None):
+            self._pending_new_items[item_name.lower()] = dict(fields or {})
+        names = [c.name for c in self._categories]
+        self._item._values = list(names)
+        self._item._model.setStringList(names)
+        self._item.setText(item_name)
+        self._item._typed = item_name
+
     def _on_new_payee(self) -> None:
         typed = " ".join(self._payee.text().upper().split())
         prefill = typed if payee_needs_create(typed, self._known_payees_at_open) else ""
@@ -574,39 +605,38 @@ class MapDescriptionsDialog(QDialog):
         self._select_payee(dlg.result_name, mark_create=True)
 
     def _on_new_item(self) -> None:
-        prefill = self._descriptions[0] if len(self._descriptions) == 1 else ""
+        typed = self._item.text().strip()
+        known_saved = any(
+            c.name.strip().lower() == typed.lower() and c._id is not None
+            for c in self._categories
+        )
+        if typed and not known_saved:
+            prefill = typed
+        elif len(self._descriptions) == 1:
+            prefill = self._descriptions[0]
+        else:
+            prefill = ""
         dlg = ItemDialog(parent=self, prefill_name=prefill)
         if dlg.exec() != QDialog.Accepted:
             return
         data = dict(dlg.result_data or {})
-        name = (data.get("name") or "").strip()
+        name = " ".join((data.get("name") or "").split())
         if not name:
             QMessageBox.warning(self, "New Item", "Item name is required.")
             return
         existing = next(
-            (c for c in self._categories if c.name.strip().lower() == name.lower()),
+            (
+                c for c in self._categories
+                if c.name.strip().lower() == name.lower() and c._id is not None
+            ),
             None,
         )
-        self.result_payee = " ".join(self._payee.text().upper().split())
-        self.result_category = existing or Category(name=name)
-        self.result_assignment = MappingAssignment(
-            action="assign",
-            description=self._descriptions[0] if self._descriptions else name,
-            category=self.result_category,
-            create_new=existing is None,
-            new_item_name=name,
-            new_item_fields=data,
-        )
-        if not self.result_payee:
-            QMessageBox.warning(self, "Validation", "Payee is required.")
+        if existing is not None:
+            self._pending_new_items.pop(name.lower(), None)
+            self._select_item(existing.name, mark_create=False)
             return
-        self.result_create_payee = payee_needs_create(
-            self.result_payee, self._known_payees_at_open
-        )
-        self.result_currency = self._payee_currencies.get(
-            self.result_payee, "TZS",
-        )
-        self.accept()
+        # Stay open so the new name is a suggestion. Payee is required on Save.
+        self._select_item(name, fields=data, mark_create=True)
 
     def _accept(self) -> None:
         payee = " ".join(self._payee.text().upper().split())
@@ -640,7 +670,8 @@ class MapDescriptionsDialog(QDialog):
             (c for c in self._categories if c.name.strip().lower() == item_name.lower()),
             None,
         )
-        if cat is None:
+        pending_fields = self._pending_new_items.get(item_name.lower())
+        if pending_fields is None and (cat is None or cat._id is None):
             QMessageBox.warning(
                 self,
                 "Select Item",
@@ -650,14 +681,25 @@ class MapDescriptionsDialog(QDialog):
         self.result_payee = payee
         self.result_create_payee = create_payee
         self.result_currency = self._payee_currencies.get(payee, "TZS")
-        self.result_category = cat
-        self.result_assignment = MappingAssignment(
-            action="assign",
-            description=self._descriptions[0],
-            category=cat,
-            create_new=False,
-            new_item_name="",
-        )
+        if pending_fields is not None:
+            self.result_category = cat or Category(name=item_name)
+            self.result_assignment = MappingAssignment(
+                action="assign",
+                description=self._descriptions[0],
+                category=self.result_category,
+                create_new=True,
+                new_item_name=item_name,
+                new_item_fields=dict(pending_fields),
+            )
+        else:
+            self.result_category = cat
+            self.result_assignment = MappingAssignment(
+                action="assign",
+                description=self._descriptions[0],
+                category=cat,
+                create_new=False,
+                new_item_name="",
+            )
         self.accept()
 
 
@@ -1290,11 +1332,31 @@ class DayIssuesWidget(QWidget):
             or bool(self._checked_keys)
         )
         if preserve:
+            # Items/Payees tabs can change catalogs while this page is hidden.
+            # Re-read them without throwing away a clean issue scan.
+            self._lookups_loaded = False
             if self._dirty or not self._loaded:
                 self._schedule_refresh()
+            else:
+                self._schedule_catalog_reload()
             return
         day = fallback_date or self._target or date.today()
         self.open_for_date(day)
+
+    def _schedule_catalog_reload(self) -> None:
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._reload_catalogs())
+
+    async def _reload_catalogs(self) -> None:
+        """Drop the payee memory cache and re-read Item + Payee suggestion lists."""
+        invalidate_payee_cache()
+        cats, payees = await asyncio.gather(
+            get_payment_target_categories(),
+            get_payee_names(active_only=True),
+        )
+        self._categories = sort_payment_targets(list(cats))
+        self._payees = list(payees)
+        self._lookups_loaded = True
 
     def open_from_verify(
         self,
@@ -1383,6 +1445,8 @@ class DayIssuesWidget(QWidget):
         try:
             replace_txs, extra_txs = self._row_source_args()
             need_lookups = not self._lookups_loaded or not self._categories or not self._payees
+            if need_lookups:
+                invalidate_payee_cache()
             if self._scope == "all":
                 if need_lookups:
                     cats, payees, snap = await asyncio.gather(
@@ -2067,6 +2131,11 @@ class DayIssuesWidget(QWidget):
             prefill_payee = next(iter(payees))
         if len(items) == 1:
             prefill_item = next(iter(items))
+
+        try:
+            await self._reload_catalogs()
+        except Exception:
+            pass
 
         dlg = MapDescriptionsDialog(
             descriptions,

@@ -82,3 +82,43 @@ def test_map_dialog_tab_accepts_first_suggestion(qapp) -> None:
     qapp.processEvents()
     assert item.text() == "Parking Fee"
     dlg.close()
+
+
+def test_new_item_joins_suggestions_before_payee_is_filled(qapp) -> None:
+    """New Item stays in the open dialog and is offered while typing."""
+    dlg = MapDescriptionsDialog(
+        ["LATRA FEE"],
+        [Category(name="Parking")],
+        ["CITY COUNCIL"],
+    )
+    dlg._select_item(
+        "Custom Bonds",
+        fields={"name": "Custom Bonds", "color": "#112233"},
+        mark_create=True,
+    )
+    assert dlg._payee.text() == ""
+    assert dlg.result_assignment is None
+    assert "Custom Bonds" in dlg._item._values
+    assert dlg._item.text() == "Custom Bonds"
+    assert "custom bonds" in dlg._pending_new_items
+
+    dlg._item.setText("cust")
+    dlg._item._typed = "cust"
+    dlg._item._on_text_edited("cust")
+    ranked = dlg._item._model.stringList()
+    assert ranked[0] == "Custom Bonds"
+    dlg._select_item(
+        "Custom Bonds",
+        fields={"name": "Custom Bonds", "color": "#112233"},
+        mark_create=True,
+    )
+
+    dlg._select_payee("BONDS DESK", mark_create=True)
+    dlg._accept()
+    assignment = dlg.result_assignment
+    assert assignment is not None
+    assert assignment.create_new is True
+    assert assignment.new_item_name == "Custom Bonds"
+    assert assignment.new_item_fields["color"] == "#112233"
+    assert dlg.result_payee == "BONDS DESK"
+    dlg.close()
