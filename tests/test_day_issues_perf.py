@@ -166,14 +166,12 @@ def test_on_page_shown_preserves_verify_handoff() -> None:
     assert calls == []  # clean + loaded → no re-scan
 
 
-def test_on_page_shown_reloads_catalogs_without_rescan() -> None:
+def test_on_page_shown_clean_return_does_not_scan() -> None:
     _app()
     user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
     widget = DayIssuesWidget(user)
     refresh_calls: list[str] = []
-    catalog_calls: list[str] = []
     widget._schedule_refresh = lambda: refresh_calls.append("refresh")  # type: ignore[method-assign]
-    widget._schedule_catalog_reload = lambda: catalog_calls.append("catalogs")  # type: ignore[method-assign]
     widget._loaded = True
     widget._dirty = False
     widget._lookups_loaded = True
@@ -181,8 +179,8 @@ def test_on_page_shown_reloads_catalogs_without_rescan() -> None:
     widget.on_page_shown(date(2026, 4, 2))
 
     assert refresh_calls == []
-    assert catalog_calls == ["catalogs"]
-    assert widget._lookups_loaded is False
+    assert widget._lookups_loaded is True
+    assert widget._dirty is False
 
 
 def test_on_page_shown_first_visit_opens_for_date() -> None:
@@ -329,7 +327,7 @@ def test_drop_issue_keys_updates_list_and_badge_signal() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reload_catalogs_drops_payee_cache_and_replaces_lists(monkeypatch) -> None:
+async def test_reload_catalogs_replaces_lists_without_touching_scan(monkeypatch) -> None:
     from tahmeed.models.category import Category
 
     _app()
@@ -338,12 +336,8 @@ async def test_reload_catalogs_drops_payee_cache_and_replaces_lists(monkeypatch)
     widget._categories = [Category(name="Old Item")]
     widget._payees = ["OLD PAYEE"]
     widget._lookups_loaded = True
-    invalidated: list[bool] = []
+    widget._dirty = False
 
-    monkeypatch.setattr(
-        "tahmeed.ui.cashier.day_issues.invalidate_payee_cache",
-        lambda: invalidated.append(True),
-    )
     monkeypatch.setattr(
         "tahmeed.ui.cashier.day_issues.get_payment_target_categories",
         AsyncMock(return_value=[Category(name="Custom Bonds")]),
@@ -355,7 +349,7 @@ async def test_reload_catalogs_drops_payee_cache_and_replaces_lists(monkeypatch)
 
     await widget._reload_catalogs()
 
-    assert invalidated == [True]
+    assert widget._dirty is False
     assert [c.name for c in widget._categories] == ["Custom Bonds"]
     assert widget._payees == ["NEW PAYEE"]
     assert widget._lookups_loaded is True

@@ -1,1 +1,1 @@
-- 4.7.19: Day Issues suggestions include items and payees added on the Items and Payees tabs as soon as you return or open Map; New Item in the map dialog stays on the suggestion list before a payee is filled
+- 4.7.20: Day Issues stays on screen when you leave and come back, and only rescans a day that actually changed; opening the tab no longer waits on a full item and payee download

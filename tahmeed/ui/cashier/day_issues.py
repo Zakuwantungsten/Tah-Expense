@@ -44,11 +44,7 @@ from tahmeed.services.mapping_assignment_service import (
     materialize_mapping_assignment,
     remember_category,
 )
-from tahmeed.services.payee_service import (
-    add_payee,
-    get_payee_names,
-    invalidate_payee_cache,
-)
+from tahmeed.services.payee_service import add_payee, get_payee_names
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
     _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
@@ -1332,24 +1328,19 @@ class DayIssuesWidget(QWidget):
             or bool(self._checked_keys)
         )
         if preserve:
-            # Items/Payees tabs can change catalogs while this page is hidden.
-            # Re-read them without throwing away a clean issue scan.
-            self._lookups_loaded = False
+            # Already loaded and clean: keep the list on screen. No scan.
             if self._dirty or not self._loaded:
                 self._schedule_refresh()
-            else:
-                self._schedule_catalog_reload()
             return
         day = fallback_date or self._target or date.today()
         self.open_for_date(day)
 
-    def _schedule_catalog_reload(self) -> None:
-        from tahmeed.ui.async_utils import schedule_coro
-        schedule_coro(self._reload_catalogs())
-
     async def _reload_catalogs(self) -> None:
-        """Drop the payee memory cache and re-read Item + Payee suggestion lists."""
-        invalidate_payee_cache()
+        """Re-read Item + Payee suggestion lists without scanning issues.
+
+        Does not clear the payee cache. ``add_payee`` already drops it, so a
+        warm cache stays a memory read and a new payee is fetched once.
+        """
         cats, payees = await asyncio.gather(
             get_payment_target_categories(),
             get_payee_names(active_only=True),
@@ -1446,57 +1437,32 @@ class DayIssuesWidget(QWidget):
             replace_txs, extra_txs = self._row_source_args()
             need_lookups = not self._lookups_loaded or not self._categories or not self._payees
             if need_lookups:
-                invalidate_payee_cache()
+                cats, payees = await asyncio.gather(
+                    get_payment_target_categories(),
+                    get_payee_names(active_only=True),
+                )
+                self._categories = sort_payment_targets(list(cats))
+                self._payees = list(payees)
+                self._lookups_loaded = True
+            # Pass the payee list in so the scan does not download it again.
             if self._scope == "all":
-                if need_lookups:
-                    cats, payees, snap = await asyncio.gather(
-                        get_payment_target_categories(),
-                        get_payee_names(active_only=True),
-                        collect_day_issues_all_days(
-                            cashier_id=self._cashier_scope_id,
-                            anchor_date=self._target,
-                            live_target=self._target,
-                            live_transactions=replace_txs,
-                            live_extras=extra_txs,
-                            day_cache=self._day_snap_cache,
-                        ),
-                    )
-                    self._categories = sort_payment_targets(cats)
-                    self._payees = list(payees)
-                    self._lookups_loaded = True
-                else:
-                    snap = await collect_day_issues_all_days(
-                        cashier_id=self._cashier_scope_id,
-                        anchor_date=self._target,
-                        live_target=self._target,
-                        live_transactions=replace_txs,
-                        live_extras=extra_txs,
-                        day_cache=self._day_snap_cache,
-                        payee_names=self._payees,
-                    )
+                snap = await collect_day_issues_all_days(
+                    cashier_id=self._cashier_scope_id,
+                    anchor_date=self._target,
+                    live_target=self._target,
+                    live_transactions=replace_txs,
+                    live_extras=extra_txs,
+                    day_cache=self._day_snap_cache,
+                    payee_names=self._payees,
+                )
             else:
-                if need_lookups:
-                    cats, payees, snap = await asyncio.gather(
-                        get_payment_target_categories(),
-                        get_payee_names(active_only=True),
-                        collect_day_issues(
-                            self._target,
-                            transactions=replace_txs,
-                            extra_transactions=extra_txs,
-                            cashier_id=self._cashier_scope_id,
-                        ),
-                    )
-                    self._categories = sort_payment_targets(cats)
-                    self._payees = list(payees)
-                    self._lookups_loaded = True
-                else:
-                    snap = await collect_day_issues(
-                        self._target,
-                        transactions=replace_txs,
-                        extra_transactions=extra_txs,
-                        cashier_id=self._cashier_scope_id,
-                        payee_names=self._payees,
-                    )
+                snap = await collect_day_issues(
+                    self._target,
+                    transactions=replace_txs,
+                    extra_transactions=extra_txs,
+                    cashier_id=self._cashier_scope_id,
+                    payee_names=self._payees,
+                )
             self._issues_all = list(snap.issues)
             self._issue_dates = dict(getattr(snap, "issue_dates", None) or {})
             self._days_scanned = list(getattr(snap, "days_scanned", None) or [])

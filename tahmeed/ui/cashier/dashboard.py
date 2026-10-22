@@ -1332,7 +1332,9 @@ class CashierDashboard(QWidget):
             self._trash_view.refresh()
 
     def _day_issues_page_visible(self) -> bool:
-        return self._stack.currentIndex() == 4
+        # Saved sits at index 4; Day Issues is the next page. Compare the
+        # widget so a saved-page insert cannot make every tab return rescan.
+        return self._stack.currentWidget() is self._day_issues
 
     def _schedule_day_issues_badge_refresh(self) -> None:
         self._day_issues_badge_timer.start()

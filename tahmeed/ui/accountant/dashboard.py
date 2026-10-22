@@ -567,7 +567,16 @@ class AccountantDashboard(QWidget):
             if visible:
                 widget.on_register_source_changed(visible=True)
             else:
-                widget.mark_dirty()
+                # Drop only the open register day. mark_dirty() with no days
+                # wipes the All-days cache and the next visit rescans every day.
+                from datetime import date as _date
+
+                day = _date.today()
+                if self._register is not None and getattr(
+                    self._register, "_current_date", None
+                ):
+                    day = self._register._current_date
+                widget.mark_dirty(days=[day])
                 self._schedule_day_issues_badge_refresh()
         else:
             self._schedule_day_issues_badge_refresh()
