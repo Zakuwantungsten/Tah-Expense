@@ -1,1 +1,1 @@
-- 4.7.20: Day Issues stays on screen when you leave and come back, and only rescans a day that actually changed; opening the tab no longer waits on a full item and payee download
+- 4.7.21: The app no longer shows offline while an import, save, or verify is running; sidebar badges update instantly without rescanning; the register loads items, payees, and fleet in one quick download; large imports show truck-check progress instead of freezing; Fix trucks opens as one fast table; submit and verify update the badges right away

@@ -201,7 +201,9 @@ class CompleterLineEdit(QLineEdit):
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self._completer.popup() and event.type() == QEvent.KeyPress:
-            if event.key() in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter):
+            if event.key() in (
+                Qt.Key_Tab, Qt.Key_Backtab, Qt.Key_Return, Qt.Key_Enter,
+            ):
                 QApplication.sendEvent(
                     self, QKeyEvent(event.type(), event.key(), event.modifiers())
                 )

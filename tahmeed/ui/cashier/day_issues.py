@@ -15,18 +15,24 @@ from typing import Callable, List, Optional, Sequence, Set, Tuple
 
 import qtawesome as qta
 from bson import ObjectId
-from PySide6.QtCore import QDate, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QDate, QEvent, QPersistentModelIndex, QRectF, Qt, QTimer, Signal,
+)
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-    QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QStyledItemDelegate,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
-    QDateEdit,
+    QAbstractItemDelegate, QAbstractItemView, QApplication, QCheckBox,
+    QComboBox, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QStyle,
+    QStyledItemDelegate, QStyleOptionViewItem, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget, QDateEdit,
 )
 
 from tahmeed.ui.widgets.combo_styles import with_combo_popup
-from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
+from tahmeed.ui.widgets.completer_line_edit import (
+    CompleterLineEdit,
+    accept_completion,
+    hide_completion_popup,
+)
 
 from tahmeed.models.category import Category
 from tahmeed.models.user import User
@@ -47,7 +53,7 @@ from tahmeed.services.mapping_assignment_service import (
 from tahmeed.services.payee_service import add_payee, get_payee_names
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
-    _finish_table_row, _stripe_bg, _table_cell_font, _table_style, _ROW_H,
+    _finish_table_row, _table_cell_font, _table_style, _ROW_H,
 )
 from tahmeed.ui.dialogs.item_dialog import ItemDialog
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
@@ -337,13 +343,72 @@ def _editable_cell(text: str, *, bg: str = "") -> QTableWidgetItem:
     return item
 
 
-class _IssuesCompleterDelegate(QStyledItemDelegate):
-    """Inline Payee / Item editor with contains completer."""
+# QuickBooks register look: white / pale-blue stripes; the row being edited
+# turns white with thin grey cell outlines on Payee / Item.
+_QB_STRIPE = "#E6EFFC"
+_QB_CELL_BORDER = "#A3A3A3"
+_BOX_INSET = 1
 
-    def __init__(self, suggestions_getter, parent=None, *, uppercase: bool = False):
+
+def _issues_stripe_bg(row_idx: int) -> str:
+    return _QB_STRIPE if row_idx % 2 else _WHITE
+
+
+def inline_edit_target(row: int, col: int, move: str) -> Tuple[int, int]:
+    """Next Payee / Item cell for Tab ("next"), Shift+Tab ("prev") or Enter ("down")."""
+    if move == "down":
+        return row + 1, col
+    if move == "prev":
+        if col > _COL_ITEM:
+            return row, _COL_ITEM
+        if col == _COL_ITEM:
+            return row, _COL_PAYEE
+        return row - 1, _COL_ITEM
+    if col < _COL_PAYEE:
+        return row, _COL_PAYEE
+    if col == _COL_PAYEE:
+        return row, _COL_ITEM
+    return row + 1, _COL_PAYEE
+
+
+def _is_active_edit_row(view, row: int) -> bool:
+    return (
+        isinstance(view, QAbstractItemView)
+        and view.state() == QAbstractItemView.EditingState
+        and view.currentIndex().row() == row
+    )
+
+
+class _IssuesRowDelegate(QStyledItemDelegate):
+    """Paints the row being edited plain white instead of the selection blue."""
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        if _is_active_edit_row(self.parent(), index.row()):
+            option.backgroundBrush = QBrush(QColor(_WHITE))
+            option.state &= ~QStyle.State_Selected
+
+
+class _IssuesCompleterDelegate(_IssuesRowDelegate):
+    """Inline Payee / Item editor with contains completer.
+
+    Tab / Shift+Tab / Enter accept the highlighted suggestion, commit, and
+    hand ``(row, col, move)`` to ``navigate`` so the next box opens without
+    a click.
+    """
+
+    def __init__(
+        self,
+        suggestions_getter,
+        parent=None,
+        *,
+        uppercase: bool = False,
+        navigate: Optional[Callable[[int, int, str], None]] = None,
+    ):
         super().__init__(parent)
         self._suggestions_getter = suggestions_getter
         self._uppercase = uppercase
+        self._navigate = navigate
 
     def createEditor(self, parent, option, index):
         ed = CompleterLineEdit(
@@ -351,8 +416,78 @@ class _IssuesCompleterDelegate(QStyledItemDelegate):
             parent=parent,
             ranked_contains=True,
         )
-        ed.setStyleSheet("QLineEdit { color: #111827; background: #ffffff; }")
+        ed.setStyleSheet(
+            f"QLineEdit {{ color: {_T1}; background: {_WHITE};"
+            f" border: 1px solid {_QB_CELL_BORDER}; border-radius: 0px;"
+            " padding: 0 3px; }"
+        )
+        ed._issues_index = QPersistentModelIndex(index)  # type: ignore[attr-defined]
+        self._repaint_view()
         return ed
+
+    def destroyEditor(self, editor, index):
+        super().destroyEditor(editor, index)
+        self._repaint_view()
+
+    def _repaint_view(self) -> None:
+        view = self.parent()
+        if isinstance(view, QAbstractItemView):
+            view.viewport().update()
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.KeyPress and isinstance(obj, CompleterLineEdit):
+            key = event.key()
+            shift = bool(event.modifiers() & Qt.ShiftModifier)
+            move = None
+            if key == Qt.Key_Backtab or (key == Qt.Key_Tab and shift):
+                move = "prev"
+            elif key == Qt.Key_Tab:
+                move = "next"
+            elif key in (Qt.Key_Return, Qt.Key_Enter):
+                move = "down"
+            if move is not None:
+                completer = getattr(obj, "_completer", None)
+                if completer is not None:
+                    accept_completion(obj, completer)
+                    hide_completion_popup(completer)
+                idx = getattr(obj, "_issues_index", None)
+                self.commitData.emit(obj)
+                self.closeEditor.emit(obj, QAbstractItemDelegate.NoHint)
+                if self._navigate is not None and idx is not None and idx.isValid():
+                    row, col = idx.row(), idx.column()
+                    QTimer.singleShot(
+                        0, lambda r=row, c=col, m=move: self._navigate(r, c, m)
+                    )
+                return True
+        return super().eventFilter(obj, event)
+
+    def paint(self, painter, option, index):
+        if not _is_active_edit_row(self.parent(), index.row()):
+            super().paint(painter, option, index)
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+
+        box = option.rect.adjusted(_BOX_INSET, _BOX_INSET, -_BOX_INSET, -_BOX_INSET)
+        painter.save()
+        painter.setPen(QPen(QColor(_QB_CELL_BORDER), 1))
+        painter.setBrush(QBrush(QColor(_WHITE)))
+        painter.drawRect(QRectF(box).adjusted(0.5, 0.5, -0.5, -0.5))
+        if text:
+            text_rect = box.adjusted(4, 0, -3, 0)
+            painter.setPen(QColor(_T1))
+            painter.setFont(opt.font)
+            painter.drawText(
+                text_rect,
+                Qt.AlignLeft | Qt.AlignVCenter,
+                opt.fontMetrics.elidedText(text, Qt.ElideRight, text_rect.width()),
+            )
+        painter.restore()
 
     def setEditorData(self, editor, index):
         editor.setText(index.data() or "")
@@ -365,7 +500,9 @@ class _IssuesCompleterDelegate(QStyledItemDelegate):
         model.setData(index, text)
 
     def updateEditorGeometry(self, editor, option, index):
-        editor.setGeometry(option.rect)
+        editor.setGeometry(
+            option.rect.adjusted(_BOX_INSET, _BOX_INSET, -_BOX_INSET, -_BOX_INSET)
+        )
 
 
 class _NewPayeeDialog(QDialog):
@@ -909,6 +1046,7 @@ class DayIssuesWidget(QWidget):
         self._restrict_items: bool = False
         self._restrict_payees: bool = False
         self._not_in_list_prompting: set = set()
+        self._pending_inline_edit: Optional[Tuple[int, int]] = None
         # description_key -> {"payee": str, "item": str} inline drafts (Phase 6)
         self._mapping_drafts: dict = {}
         self._checked_keys: set = set()
@@ -1130,10 +1268,15 @@ class DayIssuesWidget(QWidget):
             + _table_checkbox_indicator_qss()
             + f"QTableWidget::item:selected{{background:{_SEL_BG};color:{_SEL_FG};}}"
         )
+        self._table.setItemDelegate(_IssuesRowDelegate(self._table))
+        self._table.installEventFilter(self)
         self._table.setItemDelegateForColumn(
             _COL_PAYEE,
             _IssuesCompleterDelegate(
-                lambda: list(self._payees), self._table, uppercase=True
+                lambda: list(self._payees),
+                self._table,
+                uppercase=True,
+                navigate=self._advance_inline_edit,
             ),
         )
         self._table.setItemDelegateForColumn(
@@ -1142,9 +1285,11 @@ class DayIssuesWidget(QWidget):
                 lambda: [c.name for c in self._categories],
                 self._table,
                 uppercase=False,
+                navigate=self._advance_inline_edit,
             ),
         )
         self._table.itemChanged.connect(self._on_issue_cell_changed)
+        self._table.clicked.connect(self._on_issue_cell_clicked)
 
         filter_hdr = ExcelFilterHeaderView(
             self._table,
@@ -1774,6 +1919,7 @@ class DayIssuesWidget(QWidget):
             schedule_coro(self._finish_add_item(row, data))
         finally:
             self._not_in_list_prompting.discard(key)
+            self._flush_pending_inline_edit()
 
     def _offer_add_unknown_payee(self, row: int, text: str) -> None:
         if not self._restrict_payees or self._populating or not self._payees:
@@ -1805,6 +1951,7 @@ class DayIssuesWidget(QWidget):
             schedule_coro(self._finish_add_payee(row, name, currency=currency))
         finally:
             self._not_in_list_prompting.discard(key)
+            self._flush_pending_inline_edit()
 
     async def _finish_add_item(self, row: int, data: dict) -> None:
         from tahmeed.services.mapping_assignment_service import create_item_for_mapping
@@ -1834,6 +1981,58 @@ class DayIssuesWidget(QWidget):
             self._payees.append(normalized)
         self._set_issue_cell(row, _COL_PAYEE, normalized)
 
+    def _on_issue_cell_clicked(self, index) -> None:
+        if not index.isValid() or index.column() not in (_COL_PAYEE, _COL_ITEM):
+            return
+        if QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.ShiftModifier):
+            return
+        self._table.edit(index)
+
+    def eventFilter(self, obj, event) -> bool:
+        # With no box open, Tab would walk every column (# / Type / Description…).
+        # Keep it on the Payee / Item boxes instead.
+        if (
+            obj is self._table
+            and event.type() == QEvent.KeyPress
+            and event.key() in (Qt.Key_Tab, Qt.Key_Backtab)
+            and self._table.state() != QAbstractItemView.EditingState
+        ):
+            if self._table.rowCount():
+                back = event.key() == Qt.Key_Backtab or bool(
+                    event.modifiers() & Qt.ShiftModifier
+                )
+                cur = self._table.currentIndex()
+                if cur.isValid():
+                    self._advance_inline_edit(
+                        cur.row(), cur.column(), "prev" if back else "next"
+                    )
+                else:
+                    self._open_inline_edit(0, _COL_PAYEE)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _advance_inline_edit(self, row: int, col: int, move: str) -> None:
+        """Open the next Payee / Item box after Tab, Shift+Tab or Enter."""
+        target = inline_edit_target(row, col, move)
+        if self._not_in_list_prompting:
+            self._pending_inline_edit = target
+            return
+        self._open_inline_edit(*target)
+
+    def _open_inline_edit(self, row: int, col: int) -> None:
+        if self._populating or not 0 <= row < self._table.rowCount():
+            return
+        index = self._table.model().index(row, col)
+        self._table.setCurrentIndex(index)
+        self._table.scrollTo(index)
+        self._table.edit(index)
+
+    def _flush_pending_inline_edit(self) -> None:
+        if self._not_in_list_prompting or self._pending_inline_edit is None:
+            return
+        target, self._pending_inline_edit = self._pending_inline_edit, None
+        QTimer.singleShot(0, lambda: self._open_inline_edit(*target))
+
     def _end_inline_edit(self) -> None:
         """Close any open cell editor before the table is rebuilt."""
         idx = self._table.currentIndex()
@@ -1846,6 +2045,7 @@ class DayIssuesWidget(QWidget):
     def _populate(self) -> None:
         issues = self._issues
         self._populating = True
+        self._pending_inline_edit = None
         self._end_inline_edit()
         self._table.blockSignals(True)
         try:
@@ -1888,7 +2088,7 @@ class DayIssuesWidget(QWidget):
 
             for i, issue in enumerate(issues):
                 self._table.insertRow(i)
-                bg = _stripe_bg(i)
+                bg = _issues_stripe_bg(i)
                 kind_bg = _AMBER_L if issue.kind == "Unmapped" else _RED_L
                 draft = self._mapping_drafts.get(issue.description_key) or {}
                 payee = (draft.get("payee") or issue.payee or "").strip()

@@ -26,6 +26,7 @@ Save:
 """
 
 import asyncio
+import copy
 import csv
 import time
 from datetime import datetime, date
@@ -1156,6 +1157,10 @@ class DailyRegister(QWidget):
         self._edit_finalize_timer.timeout.connect(self._finalize_pending_row_edit)
         # Re-entrancy guards — prevent double-click duplicate inserts.
         self._save_in_flight = False
+        # Parked-tab Save spans two saves and a My↔Parked flip.
+        self._save_all_in_flight = False
+        # Load scheduled by the last view flip (awaited by Parked-tab Save).
+        self._view_load_task: asyncio.Future | None = None
         self._submit_in_flight = False
         # Phase 4/C — local outbox drain (reconnect + async online Save).
         self._outbox_drain_in_flight = False
@@ -1396,6 +1401,8 @@ class DailyRegister(QWidget):
             self._clear_my_session()
             self._activate_table_surface(self._parked_table)
             self._reset_parked_surface_maps()
+            # Never show the last day's parked rows while the new day loads.
+            self._populate([])
             self._draft_restore_policy = "off"
         elif view_mode == "merged" and self._merged_table is not None:
             self._activate_table_surface(self._merged_table)
@@ -1439,6 +1446,9 @@ class DailyRegister(QWidget):
                 self._apply_navigate_view_mode("merged")
             elif view_mode in ("my", "parked", "merged"):
                 self._apply_navigate_view_mode(view_mode)
+            elif self._view_mode != "my":
+                # Typed blank-table rows live on My — bring them back first.
+                self.set_view_mode("my")
             if self.has_unsaved_work():
                 # Keep typed rows; stamp them onto the chosen day.
                 self._current_date = d
@@ -1487,16 +1497,17 @@ class DailyRegister(QWidget):
             # Discard → clear local recovery draft for this date, then leave.
             self._clear_local_draft()
         self._reset_edit_state()
-        if d != self._current_date:
-            self._clear_my_session()
-            self._merged_tx_cache = None
-            self._merged_tx_cache_key = None
-            self._merged_painted_key = None
+        day_changed = d != self._current_date
+        self._leave_open_day(
+            d, keep_view=merged is True or view_mode in ("my", "parked", "merged")
+        )
         if merged is True:
             self._apply_navigate_view_mode("merged")
         elif view_mode in ("my", "parked", "merged"):
             self._apply_navigate_view_mode(view_mode)
         self._current_date = d
+        if day_changed:
+            self._reset_parked_for_open_day()
         if self._load_upload_id:
             self._show_register_loading("Loading upload…")
         else:
@@ -1523,13 +1534,38 @@ class DailyRegister(QWidget):
             d = date.today()
         self.navigate_to_date(d, merged=True)
 
+    def _leave_open_day(self, d: date, *, keep_view: bool) -> None:
+        """Drop the open day's My stash + Merged cache before loading another day.
+
+        A new day opens on My (its entries + that day's Parked badge) unless the
+        caller asked for a specific surface.
+        """
+        if d == self._current_date:
+            return
+        self._clear_my_session()
+        self._merged_tx_cache = None
+        self._merged_tx_cache_key = None
+        self._merged_painted_key = None
+        if not keep_view and self._view_mode == "parked":
+            self._apply_navigate_view_mode("my")
+
+    def _reset_parked_for_open_day(self) -> None:
+        """Badge + local Parked bucket belong to ``_current_date`` only."""
+        self._server_parked_count = 0
+        self._load_local_parked_from_disk()
+        self._emit_parked_count()
+
     async def _save_then_navigate(self, d: date) -> None:
         ok = await self._do_save()
         if not ok or self.has_unsaved_work():
             self._pending_highlight = ""
             self._load_upload_id = ""
             return
+        day_changed = d != self._current_date
+        self._leave_open_day(d, keep_view=False)
         self._current_date = d
+        if day_changed:
+            self._reset_parked_for_open_day()
         if self._load_upload_id:
             self._show_register_loading("Loading upload…")
         else:
@@ -1655,10 +1691,10 @@ class DailyRegister(QWidget):
         """My → Parked without flush/wipe/restore. Returns False if unavailable."""
         if self._my_table is None or self._parked_table is None:
             return False
-        if self._current_date is None:
-            return False
-        # Don't stash a My grid that still shows deleted server rows.
-        if self._day_tx_stale:
+        blank = self._current_date is None
+        # Don't stash a My grid that still shows deleted server rows, or one
+        # still painting the previous day mid-load.
+        if not blank and (self._day_tx_stale or self._load_in_flight):
             return False
         self._draft_timer.stop()
         self._commit_open_editor()
@@ -1670,7 +1706,14 @@ class DailyRegister(QWidget):
         self._parked_mode = True
         self.mode_changed.emit("parked")
         self._draft_restore_policy = "off"
-        if self._day_tx_cache is not None:
+        if blank:
+            # New table has no day — Parked is empty, nothing to load.
+            self._apply_txs_to_view([], upload_id="", reload_local_parked=False)
+            return True
+        day_key = self._make_day_cache_key(
+            self._current_date, merged=False, upload_id=""
+        )
+        if self._day_tx_cache is not None and self._day_tx_cache_key == day_key:
             self._apply_txs_to_view(
                 list(self._day_tx_cache),
                 upload_id="",
@@ -1682,7 +1725,9 @@ class DailyRegister(QWidget):
                 [], upload_id="", reload_local_parked=False
             )
             self._show_register_loading("Loading…")
-            asyncio.ensure_future(self._load_date(self._current_date))
+            self._view_load_task = asyncio.ensure_future(
+                self._load_date(self._current_date)
+            )
         self._schedule_outbox_drain(delay_ms=800)
         return True
 
@@ -1691,7 +1736,8 @@ class DailyRegister(QWidget):
         if self._my_table is None or self._my_session is None:
             return False
         # Delete/discard while away — force a real My reload, not the stash.
-        if self._day_tx_stale:
+        # A blank New table has no server day, so its stash is always current.
+        if self._day_tx_stale and self._current_date is not None:
             return False
         self._draft_timer.stop()
         self._commit_open_editor()
@@ -1745,7 +1791,8 @@ class DailyRegister(QWidget):
         """My → Merged without wiping My. Returns False if My must reload."""
         if self._my_table is None or self._merged_table is None:
             return False
-        if self._current_date is None or self._day_tx_stale:
+        blank = self._current_date is None
+        if not blank and (self._day_tx_stale or self._load_in_flight):
             return False
         self._draft_timer.stop()
         self._commit_open_editor()
@@ -1756,6 +1803,11 @@ class DailyRegister(QWidget):
         self._parked_mode = False
         self.mode_changed.emit("merged")
         self._draft_restore_policy = "off"
+        if blank:
+            self._merged_painted_key = None
+            self._populate([])
+            self._apply_column_visibility(show_cashier=True)
+            return True
         if self._show_cached_merged_rows():
             return True
         self._show_register_loading("Loading…")
@@ -1766,7 +1818,7 @@ class DailyRegister(QWidget):
         """Merged → My using the preserved My table. Returns False to reload."""
         if self._my_table is None or self._my_session is None:
             return False
-        if self._day_tx_stale:
+        if self._day_tx_stale and self._current_date is not None:
             return False
         self._draft_timer.stop()
         self._commit_open_editor()
@@ -1971,6 +2023,9 @@ class DailyRegister(QWidget):
         """Write promoted parked entries onto the keep-alive My table + session."""
         if not entries or self._my_table is None:
             return 0
+        if self._my_session is None:
+            # No stashed My maps — the Parked maps must never bind to the My table.
+            return self._stash_entries_in_my_draft(entries)
         parked_snap = self._snapshot_grid_session()
         parked_table = self._table
         parked_mode = self._parked_mode
@@ -2026,6 +2081,81 @@ class DailyRegister(QWidget):
             self._parked_mode = parked_mode
             self._table = parked_table
             self._restore_grid_session(parked_snap)
+
+    def _stash_entries_in_my_draft(self, entries: list) -> int:
+        """Queue promoted unsaved rows in the My draft file; My restores them on load."""
+        if not entries or self._current_date is None:
+            return 0
+        try:
+            draft = load_register_draft(
+                self._user._id, self._current_date, merged=False
+            )
+        except Exception:
+            draft = None
+        if not draft:
+            draft = build_draft_payload(
+                user_id=self._user._id,
+                username=getattr(self._user, "username", "") or "",
+                register_date=self._current_date,
+                merged=False,
+                edit_mode=False,
+                dirty_saved=[],
+                new_rows=[],
+                parked_rows=list(self._local_parked),
+            )
+        new_rows = [e for e in (draft.get("new_rows") or []) if isinstance(e, dict)]
+        have = {entry_client_row_id(e) for e in new_rows} - {None, ""}
+        added = 0
+        for entry in entries:
+            rid = entry_client_row_id(entry)
+            if rid and rid in have:
+                continue
+            clean = dict(entry)
+            clean.pop("tx_id", None)
+            new_rows.append(clean)
+            added += 1
+        draft["new_rows"] = new_rows
+        try:
+            save_register_draft(draft)
+        except Exception:
+            return 0
+        return added
+
+    def _append_saved_txs_onto_my_surface(self, txs: list) -> int:
+        """Grow the keep-alive My saved prefix with rows that just left Parked."""
+        if not txs or self._my_table is None or self._my_session is None:
+            return 0
+        parked_snap = self._snapshot_grid_session()
+        parked_table = self._table
+        parked_mode = self._parked_mode
+        try:
+            self._table = self._my_table
+            self._parked_mode = False
+            self._restore_grid_session(self._my_session)
+            self._append_saved_transactions(txs)
+            self._my_session = self._snapshot_grid_session()
+            return len(txs)
+        finally:
+            self._parked_mode = parked_mode
+            self._table = parked_table
+            self._restore_grid_session(parked_snap)
+
+    def _apply_unparked_to_day_cache(self, txs: list) -> None:
+        """Server flipped these rows parked → draft; keep day cache + badge in step."""
+        if not txs:
+            return
+        by_id = {str(tx._id): tx for tx in txs}
+        if self._day_tx_cache is not None:
+            self._day_tx_cache = [
+                by_id.get(str(getattr(tx, "_id", "")), tx)
+                for tx in self._day_tx_cache
+            ]
+        self._server_parked_count = max(
+            0, int(self._server_parked_count) - len(txs)
+        )
+        self._merged_tx_cache = None
+        self._merged_tx_cache_key = None
+        self._merged_painted_key = None
 
     def _promote_accepted_parked_rows_to_my(self) -> int:
         """Move Parked rows with an accepted truck onto My entries immediately.
@@ -2427,11 +2557,24 @@ class DailyRegister(QWidget):
         if mode == "parked" and self._parked_table is not None:
             self._activate_table_surface(self._parked_table)
             self._reset_parked_surface_maps()
+            # Clear the last painted Parked day before the cache/load fills it.
+            self._populate([])
         # After delete/discard, never reuse a stale in-memory day cache.
         if not self._day_tx_stale and self._try_apply_cached_view():
             return
         self._show_register_loading("Loading…")
-        asyncio.ensure_future(self._load_date(self._current_date))
+        self._view_load_task = asyncio.ensure_future(
+            self._load_date(self._current_date)
+        )
+
+    async def _set_view_mode_and_wait(self, mode: str) -> bool:
+        """``set_view_mode`` plus any load it scheduled. True if *mode* is showing."""
+        self._view_load_task = None
+        self.set_view_mode(mode)
+        task, self._view_load_task = self._view_load_task, None
+        if task is not None:
+            await task
+        return self._view_mode == mode
 
     def submit_for_verify(self) -> None:
         """Submit every draft row for the current calendar day to Verify."""
@@ -6394,9 +6537,98 @@ class DailyRegister(QWidget):
                 "Merged is for browsing everyone’s saved rows for this day.",
             )
             return
-        if self._save_in_flight or self._submit_in_flight:
+        if self._save_in_flight or self._submit_in_flight or self._save_all_in_flight:
             return
-        asyncio.ensure_future(self._do_save())
+        asyncio.ensure_future(self._save_whole_day())
+
+    async def _save_whole_day(self, *, return_to_parked: bool = True) -> bool:
+        """Save everything for the day. From Parked that is the Parked grid AND
+        the unsaved My entries (keep-alive table or on-disk stash)."""
+        if not self._parked_mode or self._current_date is None:
+            return await self._do_save()
+        if not self._my_entries_unsaved():
+            return await self._do_save()
+        if self._save_all_in_flight:
+            return False
+        self._save_all_in_flight = True
+        try:
+            if self.has_unsaved_work(include_stashed_my=False):
+                # Parked Save rewrites the day draft without My rows; with no
+                # keep-alive My table that file is their only copy.
+                my_disk = (
+                    self._my_draft_rows_on_disk() if self._my_session is None else None
+                )
+                ok = await self._do_save()
+                if my_disk:
+                    self._restore_my_draft_rows_on_disk(my_disk)
+                if not ok:
+                    return False
+            if not await self._set_view_mode_and_wait("my"):
+                return False
+            ok = await self._do_save()
+            if return_to_parked and self._current_date is not None:
+                await self._set_view_mode_and_wait("parked")
+            return ok
+        finally:
+            self._save_all_in_flight = False
+
+    def _my_entries_unsaved(self) -> bool:
+        """Parked showing: My entries still hold dirty or typed-but-unsaved rows."""
+        if not self._parked_mode or self._current_date is None:
+            return False
+        if self._my_session is not None and self._my_table is not None:
+            return self._stashed_my_has_work()
+        return bool(self._my_draft_rows_on_disk())
+
+    def _my_draft_rows_on_disk(self) -> dict | None:
+        """My new / dirty rows from the day draft file (Parked edits excluded)."""
+        try:
+            draft = load_register_draft(
+                self._user._id, self._current_date, merged=False
+            )
+        except Exception:
+            return None
+        if not draft:
+            return None
+        parked_ids = (
+            {str(tx_id) for tx_id in self._saved_ids.values()}
+            if self._parked_mode else set()
+        )
+        new_rows = [e for e in (draft.get("new_rows") or []) if isinstance(e, dict)]
+        dirty = [
+            e for e in (draft.get("dirty_saved") or [])
+            if isinstance(e, dict) and str(e.get("tx_id")) not in parked_ids
+        ]
+        if not new_rows and not dirty:
+            return None
+        return {
+            "new_rows": new_rows,
+            "dirty_saved": dirty,
+            "edit_mode": bool(draft.get("edit_mode")) and bool(dirty),
+        }
+
+    def _restore_my_draft_rows_on_disk(self, stash: dict) -> None:
+        """Put My rows back into the day draft after a Parked Save rewrote it."""
+        if self._current_date is None:
+            return
+        try:
+            current = load_register_draft(
+                self._user._id, self._current_date, merged=False
+            ) or {}
+            save_register_draft(
+                build_draft_payload(
+                    user_id=self._user._id,
+                    username=getattr(self._user, "username", "") or "",
+                    register_date=self._current_date,
+                    merged=False,
+                    edit_mode=bool(stash.get("edit_mode")),
+                    dirty_saved=list(stash.get("dirty_saved") or []),
+                    new_rows=list(stash.get("new_rows") or []),
+                    parked_rows=list(current.get("parked_rows") or []),
+                )
+            )
+        except Exception as exc:
+            log_register_event("my_draft_restore_failed", error=str(exc))
 
     # ------------------------------------------------------------------
     # QuickBooks-style toolbar actions
@@ -6680,7 +6912,7 @@ class DailyRegister(QWidget):
                 if choice == "cancel":
                     return
                 if choice == "save":
-                    if not await self._do_save():
+                    if not await self._save_whole_day(return_to_parked=False):
                         return
                 else:
                     self._clear_local_draft()
@@ -7184,24 +7416,26 @@ class DailyRegister(QWidget):
             if not self._row_has_data(row):
                 continue
             return True
-        if (
-            include_stashed_my
-            and self._parked_mode
-            and self._my_session is not None
-            and self._my_table is not None
-        ):
-            if self._my_session.get("dirty_rows"):
+        if include_stashed_my and self._parked_mode:
+            return self._stashed_my_has_work()
+        return False
+
+    def _stashed_my_has_work(self) -> bool:
+        """Keep-alive My table (hidden behind Parked) has dirty or typed rows."""
+        if self._my_session is None or self._my_table is None:
+            return False
+        if self._my_session.get("dirty_rows"):
+            return True
+        saved = int(self._my_session.get("saved_count") or 0)
+        for row in range(saved, self._my_table.rowCount()):
+            # Minimal data check without rebinding maps: Description/amount.
+            desc = self._my_table.item(row, COL_DESC)
+            tzs = self._my_table.item(row, COL_TZS)
+            usd = self._my_table.item(row, COL_USD)
+            if (desc and desc.text().strip()) or (
+                tzs and tzs.text().strip()
+            ) or (usd and usd.text().strip()):
                 return True
-            saved = int(self._my_session.get("saved_count") or 0)
-            for row in range(saved, self._my_table.rowCount()):
-                # Minimal data check without rebinding maps: Description/amount.
-                desc = self._my_table.item(row, COL_DESC)
-                tzs = self._my_table.item(row, COL_TZS)
-                usd = self._my_table.item(row, COL_USD)
-                if (desc and desc.text().strip()) or (
-                    tzs and tzs.text().strip()
-                ) or (usd and usd.text().strip()):
-                    return True
         return False
 
     def _row_stays_parked(self, row: int) -> bool:
@@ -10111,30 +10345,29 @@ class DailyRegister(QWidget):
             self._hide_register_loading()
 
     def _release_saved_parked_rows(self, pairs: list) -> None:
-        """Remove a saved parked set from the Parked surface. The day stays loaded."""
-        wanted = {str(tx_id) for tx_id, _body in pairs if tx_id}
+        """Remove a saved parked set from the Parked surface. The day stays loaded.
+
+        The rows are already drafts on the server, so they join My's saved
+        prefix (never the unsaved entry pad) and the day cache drops their
+        parked status so Parked and the badge do not show them again.
+        """
+        bodies = {str(tx_id): dict(body or {}) for tx_id, body in pairs if tx_id}
         rows = sorted(
-            row for row, tx in self._saved_ids.items() if str(tx) in wanted
+            row for row, tx in self._saved_ids.items() if str(tx) in bodies
         )
-        entries: list = []
+        released: list = []
         for row in rows:
-            rid = self._ensure_row_client_id(row)
-            meta = dict(self._pending_row_meta.get(row) or {})
-            meta.pop("parked", None)
-            meta.pop("sync_status", None)
-            meta["client_row_id"] = rid
-            entry = {
-                "client_row_id": rid,
-                "cells": cells_for_json(self._row_value_map(row)),
-                "pending_meta": serialize_pending_meta(meta),
-                "tx_id": self._saved_ids.get(row),
-            }
-            allow = self._truck_allow_anyway.get(row)
-            if allow:
-                entry["allow_anyway"] = allow
-            entries.append(entry)
-        if entries:
-            self._append_entries_onto_my_surface(entries)
+            tx = self._saved_txs.get(row)
+            if tx is None:
+                continue
+            tx = copy.copy(tx)
+            for key, value in bodies[str(self._saved_ids[row])].items():
+                if not key.startswith("_") and hasattr(tx, key):
+                    setattr(tx, key, value)
+            tx.register_status = "draft"
+            released.append(tx)
+        self._apply_unparked_to_day_cache(released)
+        self._append_saved_txs_onto_my_surface(released)
         if rows:
             prev = self._table.blockSignals(True)
             self._bulk_mutating = True
@@ -10156,11 +10389,10 @@ class DailyRegister(QWidget):
             self._update_footer()
         if self._flip_to_my_keep_alive():
             return
-        self._ensure_my_surface_active()
-        self._view_mode = "my"
-        self._merged_mode = False
-        self._parked_mode = False
-        self.mode_changed.emit("my")
+        # No usable My stash: repaint My from the day cache / server instead of
+        # leaving the Parked maps bound to the My table.
+        if self._view_mode != "my":
+            self.set_view_mode("my")
 
     async def _unpark_saved_rows(
         self,
