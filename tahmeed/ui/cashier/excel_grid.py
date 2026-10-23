@@ -6553,11 +6553,11 @@ class DailyRegister(QWidget):
         self._save_all_in_flight = True
         try:
             if self.has_unsaved_work(include_stashed_my=False):
-                # Parked Save rewrites the day draft without My rows; with no
-                # keep-alive My table that file is their only copy.
-                my_disk = (
-                    self._my_draft_rows_on_disk() if self._my_session is None else None
-                )
+                # Parked Save drops the keep-alive My table (cache invalidate) and
+                # rewrites the day draft without My rows. Write My to disk first,
+                # keep a copy, and put it back so the flip to My restores it.
+                self._flush_local_draft()
+                my_disk = self._my_draft_rows_on_disk()
                 ok = await self._do_save()
                 if my_disk:
                     self._restore_my_draft_rows_on_disk(my_disk)
