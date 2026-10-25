@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -46,6 +47,14 @@ def _matches(doc: dict, query: dict) -> bool:
                     return False
             if "$in" in expected and actual not in expected["$in"]:
                 return False
+            if "$nin" in expected and actual in expected["$nin"]:
+                return False
+            if "$regex" in expected:
+                flags = re.IGNORECASE if "i" in expected.get("$options", "") else 0
+                if not isinstance(actual, str) or not re.search(
+                    expected["$regex"], actual, flags
+                ):
+                    return False
             continue
         if actual != expected:
             return False
@@ -56,8 +65,13 @@ class FakeCursor:
     def __init__(self, documents: list[dict]) -> None:
         self.documents = list(documents)
         self._limit: int | None = None
+        self._skip = 0
 
     def sort(self, *_args: object, **_kwargs: object) -> "FakeCursor":
+        return self
+
+    def skip(self, value: int) -> "FakeCursor":
+        self._skip = value
         return self
 
     def limit(self, value: int) -> "FakeCursor":
@@ -65,7 +79,7 @@ class FakeCursor:
         return self
 
     async def to_list(self, length: int | None = None) -> list[dict]:
-        docs = list(self.documents)
+        docs = list(self.documents)[self._skip :]
         if self._limit is not None:
             docs = docs[: self._limit]
         if length is None:
@@ -166,6 +180,21 @@ class FakeTransactions:
                         doc.get(field) for doc in docs if doc.get(field) is not None
                     ]
                     docs = [{"_id": None, "mx": max(values)}] if values else []
+                elif group.get("_id") is None and "matches" in group:
+                    from app.import_ops import doc_money_parts
+
+                    parts = [doc_money_parts(d) for d in docs]
+                    docs = [
+                        {
+                            "_id": None,
+                            "matches": len(docs),
+                            "total_tzs": sum(p[0] for p in parts),
+                            "total_usd": sum(p[1] for p in parts),
+                            "days": sorted(
+                                {d["date"].strftime("%Y-%m-%d") for d in docs}
+                            ),
+                        }
+                    ] if docs else []
                 elif group.get("_id") is None and "count" in group:
                     docs = [
                         {
@@ -1132,6 +1161,273 @@ def test_search_and_browse_and_meta() -> None:
     assert "today" in overview.json() and "recent" in overview.json()
     assert resolve.json()["item"] == "Stationery"
     assert prefix.status_code == 200
+
+
+def test_browse_hides_trashed_deleted_and_discarded_rows() -> None:
+    user = _cashier()
+    base = {
+        "date": datetime(2026, 5, 2, 9, 0, 0),
+        "truck_number": "T9",
+        "amount": 100,
+        "item": "Fuel",
+        "category_name": "Fuel",
+    }
+    collection = FakeTransactions(
+        [
+            {**base, "_id": ObjectId(), "description": "Visible row"},
+            {**base, "_id": ObjectId(), "description": "Trashed row", "trashed": True},
+            {
+                **base,
+                "_id": ObjectId(),
+                "description": "Delete pending row",
+                "deletion_requested": True,
+            },
+            {**base, "_id": ObjectId(), "description": "Discarded row", "discarded": True},
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    rng = "date_from=2026-05-01&date_to=2026-05-31"
+    with TestClient(app) as client:
+        flat = client.get(f"/v1/transactions/flat?{rng}")
+        days = client.get(f"/v1/transactions/daily-summaries?{rng}")
+        descs = client.get(f"/v1/transactions/browse/descriptions?{rng}")
+        items = client.get(f"/v1/transactions/browse/items?{rng}")
+
+    assert flat.status_code == 200
+    assert [d["description"] for d in flat.json()["items"]] == ["Visible row"]
+    assert flat.json()["total"] == 1
+    assert days.status_code == 200
+    assert days.json()["items"][0]["entries_count"] == 1
+    assert days.json()["items"][0]["total_tzs"] == 100
+    assert descs.json()["items"] == ["Visible row"]
+    assert items.json()["items"] == ["Fuel"]
+
+
+def test_browse_flat_prefers_pending_edit_clone_over_original() -> None:
+    user = _cashier()
+    original_id = ObjectId()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": original_id,
+                "date": datetime(2026, 5, 3),
+                "description": "Original",
+                "truck_number": "T1",
+                "amount": 10,
+                "verified": True,
+            },
+            {
+                "_id": ObjectId(),
+                "date": datetime(2026, 5, 3),
+                "description": "Edited",
+                "truck_number": "T1",
+                "amount": 12,
+                "verified": False,
+                "original_transaction_id": original_id,
+            },
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        flat = client.get("/v1/transactions/flat")
+
+    assert [d["description"] for d in flat.json()["items"]] == ["Edited"]
+
+
+def test_browse_flat_pages_with_skip_and_limit() -> None:
+    user = _cashier()
+    collection = FakeTransactions(
+        [
+            {
+                "_id": ObjectId(),
+                "date": datetime(2026, 5, day),
+                "description": f"Row {day}",
+                "truck_number": "T1",
+                "amount": day,
+            }
+            for day in range(1, 6)
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        first = client.get("/v1/transactions/flat?limit=3")
+        second = client.get("/v1/transactions/flat?limit=3&skip=3")
+
+    assert first.json()["total"] == 5 and second.json()["total"] == 5
+    assert len(first.json()["items"]) == 3
+    assert len(second.json()["items"]) == 2
+    seen = [d["description"] for d in first.json()["items"] + second.json()["items"]]
+    assert sorted(seen) == [f"Row {day}" for day in range(1, 6)]
+    assert second.json()["skip"] == 3
+
+
+def _smart_rows() -> list[dict]:
+    def row(day: int, item: str, desc: str, payee: str, truck: str, **extra) -> dict:
+        return {
+            "_id": ObjectId(),
+            "date": datetime(2026, 3, day, 8, 0, 0),
+            "item": item,
+            "category_name": extra.pop("category_name", item),
+            "description": desc,
+            "payee": payee,
+            "truck_number": truck,
+            "amount": extra.pop("amount", 1000),
+            "currency": extra.pop("currency", "TZS"),
+            **extra,
+        }
+
+    return [
+        row(1, "Fuel", "Diesel top-up", "Puma Energy", "T103 DVL", amount=5000),
+        row(2, "Fuel", "Diesel refill", "Lake Oil", "T103 DVL", amount=3000),
+        row(2, "Tyres", "Front tyre (R22.5)", "Puma Energy", "T200 ABC"),
+        row(
+            5, "Allowance", "Driver per diem", "John", "T103 DVL",
+            amount=50, currency="USD", amount_usd=50,
+        ),
+        row(6, "Fuel", "Diesel trashed", "Puma Energy", "T103 DVL", trashed=True),
+        row(
+            7, "", "Old fuel row", "Puma Energy", "T300",
+            category_name="Fuel", deletion_requested=True,
+        ),
+    ]
+
+
+def _smart_client(rows: list[dict]):
+    app = _app(FakeTransactions(rows))
+    user = _cashier()
+    app.dependency_overrides[current_user] = lambda: user
+    return TestClient(app)
+
+
+def test_smart_search_requires_a_filter() -> None:
+    with _smart_client(_smart_rows()) as client:
+        res = client.get("/v1/transactions/smart-search")
+    assert res.status_code == 422
+
+
+def test_smart_search_single_filters_are_case_insensitive_contains() -> None:
+    with _smart_client(_smart_rows()) as client:
+        by_truck = client.get("/v1/transactions/smart-search?truck=t103")
+        by_payee = client.get("/v1/transactions/smart-search?payee=puma")
+        by_desc = client.get("/v1/transactions/smart-search?description=DIESEL")
+        by_item = client.get("/v1/transactions/smart-search?item=fue")
+
+    assert by_truck.status_code == 200
+    assert by_truck.json()["total"] == 3
+    assert by_payee.json()["total"] == 2
+    assert by_desc.json()["total"] == 2
+    assert by_item.json()["total"] == 2
+
+
+def test_smart_search_combines_filters_with_and() -> None:
+    with _smart_client(_smart_rows()) as client:
+        res = client.get(
+            "/v1/transactions/smart-search?item=fuel&payee=puma&truck=T103"
+        )
+    body = res.json()
+    assert [d["description"] for d in body["items"]] == ["Diesel top-up"]
+    assert body["summary"]["total_tzs"] == 5000
+
+
+def test_smart_search_item_matches_category_name_fallback() -> None:
+    rows = _smart_rows()
+    rows.append(
+        {
+            "_id": ObjectId(),
+            "date": datetime(2026, 3, 9),
+            "item": "",
+            "category_name": "Fuel",
+            "description": "Legacy fuel",
+            "payee": "",
+            "truck_number": "T1",
+            "amount": 10,
+        }
+    )
+    with _smart_client(rows) as client:
+        res = client.get("/v1/transactions/smart-search?item=fuel")
+    assert "Legacy fuel" in [d["description"] for d in res.json()["items"]]
+
+
+def test_smart_search_escapes_special_characters() -> None:
+    with _smart_client(_smart_rows()) as client:
+        res = client.get(
+            "/v1/transactions/smart-search", params={"description": "(R22.5)"}
+        )
+        star = client.get("/v1/transactions/smart-search", params={"payee": ".*"})
+    assert res.json()["total"] == 1
+    assert star.json()["total"] == 0
+
+
+def test_smart_search_open_ended_date_ranges() -> None:
+    with _smart_client(_smart_rows()) as client:
+        since = client.get("/v1/transactions/smart-search?date_from=2026-03-02")
+        until = client.get("/v1/transactions/smart-search?date_to=2026-03-02")
+        between = client.get(
+            "/v1/transactions/smart-search?date_from=2026-03-02&date_to=2026-03-02"
+        )
+    assert since.json()["total"] == 3
+    assert until.json()["total"] == 3
+    assert between.json()["total"] == 2
+
+
+def test_smart_search_summary_totals_and_days() -> None:
+    with _smart_client(_smart_rows()) as client:
+        res = client.get("/v1/transactions/smart-search?truck=T103")
+    summary = res.json()["summary"]
+    assert summary["total"] == 3
+    assert summary["days"] == 3
+    assert summary["total_tzs"] == 8000
+    assert summary["total_usd"] == 50
+
+
+def test_smart_search_paging_skips_summary_on_later_pages() -> None:
+    with _smart_client(_smart_rows()) as client:
+        first = client.get("/v1/transactions/smart-search?truck=T&limit=2")
+        second = client.get("/v1/transactions/smart-search?truck=T&limit=2&skip=2")
+    assert len(first.json()["items"]) == 2
+    assert first.json()["summary"]["total"] == 4
+    assert len(second.json()["items"]) == 2
+    assert second.json()["summary"] is None
+    assert second.json()["total"] == 4
+
+
+def test_smart_search_hides_superseded_original_of_pending_edit() -> None:
+    original_id = ObjectId()
+    rows = [
+        {
+            "_id": original_id,
+            "date": datetime(2026, 3, 3),
+            "item": "Fuel",
+            "description": "Original",
+            "payee": "Puma",
+            "truck_number": "T1",
+            "amount": 10,
+            "verified": True,
+        },
+        {
+            "_id": ObjectId(),
+            "date": datetime(2026, 3, 3),
+            "item": "Fuel",
+            "description": "Edited",
+            "payee": "Puma",
+            "truck_number": "T1",
+            "amount": 12,
+            "verified": False,
+            "original_transaction_id": original_id,
+        },
+    ]
+    with _smart_client(rows) as client:
+        res = client.get("/v1/transactions/smart-search?payee=puma")
+    body = res.json()
+    assert [d["description"] for d in body["items"]] == ["Edited"]
+    assert body["summary"]["total"] == 1
+    assert body["summary"]["total_tzs"] == 12
 
 
 def test_cashier_daily_uploads_endpoint() -> None:

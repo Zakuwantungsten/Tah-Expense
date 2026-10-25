@@ -34,6 +34,31 @@ def test_health_endpoints_without_mongodb() -> None:
     assert database.pings == 1
 
 
+class _RecordingDb:
+    def __init__(self) -> None:
+        self.touched: list[str] = []
+
+    def __getattr__(self, name: str):
+        self.touched.append(name)
+        raise RuntimeError("no database in this test")
+
+
+def test_live_skips_the_settings_read() -> None:
+    database = FakeDatabase()
+    database.db = _RecordingDb()
+    settings = Settings(
+        mongodb_uri="mongodb://localhost:27017",
+        jwt_secret="a-test-secret-that-is-definitely-32-characters",
+    )
+    with TestClient(create_app(settings=settings, database=database)) as client:
+        database.db.touched.clear()
+        live = client.get("/health/live")
+        assert live.json() == {"status": "ok"}
+        assert database.db.touched == []
+        client.get("/not-a-route")
+        assert "system_settings" in database.db.touched
+
+
 @pytest.mark.asyncio
 async def test_live_answers_while_import_lock_is_held() -> None:
     lock = batch_lock()

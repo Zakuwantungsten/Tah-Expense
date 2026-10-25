@@ -783,6 +783,74 @@ class BrowseUploadsPage(NamedTuple):
     cashier_names: Dict[ObjectId, str]
 
 
+class SmartSearchSummary(NamedTuple):
+    total: int
+    days: int
+    total_tzs: float
+    total_usd: float
+
+
+class SmartSearchPage(NamedTuple):
+    items: List[Transaction]
+    total: int
+    # Only on the first page (skip == 0); scroll pages return None.
+    summary: Optional[SmartSearchSummary]
+    cashier_names: Dict[ObjectId, str]
+
+
+async def smart_search_page(
+    *,
+    item: str = "",
+    description: str = "",
+    payee: str = "",
+    truck: str = "",
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> SmartSearchPage:
+    """Browse Smart Search — AND of case-insensitive contains filters, all days."""
+    params: dict = {"skip": int(skip), "limit": int(limit)}
+    for key, value in (
+        ("item", item),
+        ("description", description),
+        ("payee", payee),
+        ("truck", truck),
+    ):
+        text = (value or "").strip()
+        if text:
+            params[key] = text
+    if date_from:
+        params["date_from"] = date_from.isoformat()
+    if date_to:
+        params["date_to"] = date_to.isoformat()
+    payload = await api_client.request(
+        "GET", "v1/transactions/smart-search", params=params
+    )
+    items = [_tx_from_api(doc) for doc in payload.get("items") or []]
+    ids: list = []
+    for tx in items:
+        if tx.cashier_id:
+            ids.append(tx.cashier_id)
+        if tx.last_edited_by:
+            ids.append(tx.last_edited_by)
+    raw = payload.get("summary")
+    summary = None
+    if raw:
+        summary = SmartSearchSummary(
+            total=int(raw.get("total") or 0),
+            days=int(raw.get("days") or 0),
+            total_tzs=float(raw.get("total_tzs") or 0.0),
+            total_usd=float(raw.get("total_usd") or 0.0),
+        )
+    return SmartSearchPage(
+        items=items,
+        total=int(payload.get("total") or len(items)),
+        summary=summary,
+        cashier_names=_cashier_names_from_payload(payload.get("cashier_names"), ids),
+    )
+
+
 async def get_daily_summaries_page(
     date_from: date = None,
     date_to: date = None,
@@ -889,10 +957,13 @@ async def get_transactions_flat_page(
     descriptions="",
     daily_import_id: str = "",
     limit: int = 1000,
+    skip: int = 0,
 ) -> BrowseFlatPage:
     """Flat Browse rows + real total + cashier names (one RTT)."""
     desc_filter = descriptions if descriptions not in ("", None, []) else sub_item_match
     params: dict = {"limit": limit}
+    if skip:
+        params["skip"] = int(skip)
     if date_from:
         params["date_from"] = date_from.isoformat()
     if date_to:

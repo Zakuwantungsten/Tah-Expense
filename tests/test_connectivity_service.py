@@ -39,8 +39,60 @@ def test_status_labels():
     assert "database" in db_down.banner_message().lower()
 
 
-def test_probe_timeout_is_two_seconds():
-    assert _PROBE_TIMEOUT_S == 2.0
+def test_probe_timeout_covers_a_cold_tls_handshake():
+    assert _PROBE_TIMEOUT_S == 6.0
+
+
+@pytest.mark.asyncio
+async def test_single_failed_probe_does_not_publish_offline(monkeypatch):
+    from tahmeed.signals import app_signals
+
+    results = iter([
+        ConnectivityStatus(api_ok=True),
+        ConnectivityStatus(api_ok=False, api_detail="timeout"),
+        ConnectivityStatus(api_ok=True),
+        ConnectivityStatus(api_ok=False, api_detail="timeout"),
+        ConnectivityStatus(api_ok=False, api_detail="timeout"),
+    ])
+    monkeypatch.setattr(
+        "tahmeed.services.connectivity_service.probe_connectivity",
+        AsyncMock(side_effect=lambda: next(results)),
+    )
+    published: list[bool] = []
+
+    def _record(status):
+        published.append(status.online)
+
+    app_signals.connectivity_changed.connect(_record)
+    mon = connectivity_monitor
+    mon.stop()
+    mon._started = True
+    try:
+        for _ in range(5):
+            await mon._check_async()
+    finally:
+        mon.stop()
+        app_signals.connectivity_changed.disconnect(_record)
+    assert published == [True, True, False]
+
+
+def test_start_defers_the_first_probe(monkeypatch):
+    _app = QApplication.instance() or QApplication([])
+    fake_qtimer = MagicMock()
+    monkeypatch.setattr(
+        "tahmeed.services.connectivity_service.QTimer", fake_qtimer
+    )
+    mon = connectivity_monitor
+    mon.stop()
+    mon._busy_depth = 0
+    try:
+        mon.start()
+        fake_qtimer.singleShot.assert_called_once_with(
+            mon.FIRST_PROBE_DELAY_MS, mon._on_tick
+        )
+        assert mon._task is None
+    finally:
+        mon.stop()
 
 
 def test_loopback_banners_do_not_blame_the_internet(monkeypatch):

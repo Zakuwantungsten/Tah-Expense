@@ -47,6 +47,8 @@ from .serialization import json_safe, object_id
 from .attachments_api import attachments as attachments_router
 from .cashier_overview_ops import compute_overview_charts
 from .import_ops import (
+    _tzs_amount_expr,
+    _usd_amount_expr,
     daily_uploads_pipeline,
     null_daily_import_id_filter,
     unpack_daily_uploads_page,
@@ -57,10 +59,13 @@ from .transaction_ops import (
     DRAFT_OR_PARKED_MATCH,
     OPEN_REGISTER_MATCH,
     REGISTER_DAY_EXPR,
+    BROWSE_VISIBLE_MATCH,
     browse_match,
     filter_pending_edit_clones,
     register_day_clause,
     register_day_range_clause,
+    smart_search_has_filters,
+    smart_search_match,
 )
 
 _log = logging.getLogger("tahmeed.transactions")
@@ -683,6 +688,7 @@ async def transactions_flat(
     category_name: str = "",
     descriptions: str = "",
     daily_import_id: str = "",
+    skip: int = Query(0, ge=0),
     limit: int = Query(1000, ge=1, le=5000),
 ) -> dict:
     match = browse_match(
@@ -694,9 +700,14 @@ async def transactions_flat(
         daily_import_id=daily_import_id,
     )
     db = _database(request)
+    # Excluded in the query (not per page) so skip/limit pages never shift.
+    superseded = await _pending_edit_original_ids(db)
+    if superseded:
+        match["_id"] = {"$nin": superseded}
     docs = (
         await db.transactions.find(match)
-        .sort([("date", -1), ("created_at", -1)])
+        .sort([("date", -1), ("created_at", -1), ("_id", -1)])
+        .skip(skip)
         .limit(limit)
         .to_list(length=limit)
     )
@@ -712,6 +723,112 @@ async def transactions_flat(
     return {
         "items": json_safe(docs),
         "total": int(total),
+        "skip": skip,
+        "limit": limit,
+        "cashier_names": names,
+    }
+
+
+async def _pending_edit_original_ids(db: Any) -> list[ObjectId]:
+    """Originals superseded by an open pending-edit clone (show the clone only)."""
+    ids = await db.transactions.distinct(
+        "original_transaction_id",
+        {
+            **BROWSE_VISIBLE_MATCH,
+            "original_transaction_id": {"$ne": None},
+            "verified": {"$ne": True},
+        },
+    )
+    return [oid for oid in ids if oid is not None]
+
+
+@transactions.get("/smart-search")
+async def smart_search(
+    request: Request,
+    _actor: RegisterActor,
+    item: str = "",
+    description: str = "",
+    payee: str = "",
+    truck: str = "",
+    date_from: date | None = None,
+    date_to: date | None = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=2000),
+) -> dict:
+    """Browse Smart Search — AND of contains-filters across every register day.
+
+    ``summary`` (match count, distinct days, TZS / USD totals) is computed for
+    the first page only; scroll pages reuse the client's copy.
+    """
+    filters = dict(
+        item=item,
+        description=description,
+        payee=payee,
+        truck=truck,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    if not smart_search_has_filters(**filters):
+        raise ApiError(
+            422, "filters_required", "Enter at least one search filter"
+        )
+    db = _database(request)
+    match = smart_search_match(**filters)
+    superseded = await _pending_edit_original_ids(db)
+    if superseded:
+        match["_id"] = {"$nin": superseded}
+
+    docs = (
+        await db.transactions.find(match)
+        .sort([("date", -1), ("created_at", -1), ("_id", -1)])
+        .skip(skip)
+        .limit(limit)
+        .to_list(length=limit)
+    )
+
+    summary: dict[str, Any] | None = None
+    if skip == 0:
+        pipeline = [
+            {"$match": match},
+            {
+                "$group": {
+                    "_id": None,
+                    "matches": {"$sum": 1},
+                    "total_tzs": {"$sum": _tzs_amount_expr()},
+                    "total_usd": {"$sum": _usd_amount_expr()},
+                    "days": {
+                        "$addToSet": {
+                            "$dateToString": {"format": "%Y-%m-%d", "date": "$date"}
+                        }
+                    },
+                }
+            },
+        ]
+        rows = await aggregate_list(db.transactions, pipeline, length=1)
+        agg = rows[0] if rows else {}
+        summary = {
+            "total": int(agg.get("matches") or 0),
+            "days": len(agg.get("days") or []),
+            "total_tzs": float(agg.get("total_tzs") or 0.0),
+            "total_usd": float(agg.get("total_usd") or 0.0),
+        }
+        total = summary["total"]
+    else:
+        total = await db.transactions.count_documents(match)
+
+    cashier_oids: list[ObjectId] = []
+    for doc in docs:
+        for key in ("cashier_id", "last_edited_by"):
+            oid = _normalize_user_oid(doc.get(key))
+            if oid is not None:
+                cashier_oids.append(oid)
+    names = await _cashier_names_map(db, cashier_oids)
+    return {
+        "items": json_safe(docs),
+        "total": int(total),
+        "skip": skip,
+        "limit": limit,
+        "summary": summary,
         "cashier_names": names,
     }
 

@@ -1,11 +1,13 @@
 """
-TransactionBrowser — embedded browse page (Simple / Advanced / Uploads).
+TransactionBrowser — embedded browse page (Simple / Advanced / Smart Search / Uploads).
 
-Simple   — daily summary (one row per day): Date | TXN ID | Entries | Refund to Float | Total
-           Year + Month filters; keyword searches description OR truck OR memo
-Advanced — individual transaction rows with full register columns
-           Year + Month + multi-select Item / Description filters
-Uploads  — Excel daily imports list
+Simple       — daily summary (one row per day): Date | TXN ID | Entries | Refund to Float | Total
+               Year + Month filters; keyword searches description OR truck OR memo
+Advanced     — individual transaction rows with full register columns
+               Year + Month + multi-select Item / Description filters
+Smart Search — individual rows across every day; Item / Description / Payee /
+               Truck contains-filters (AND) + optional open-ended date range
+Uploads      — Excel daily imports list
 
 Year/Month combos are populated from real DB data. A loading overlay covers the
 table while searches run so the first open never looks empty mid-fetch.
@@ -22,16 +24,16 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QDateEdit,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QWidget, QStackedWidget,
-    QComboBox,
+    QAbstractItemView, QWidget, QStackedWidget, QStackedLayout,
+    QComboBox, QSizePolicy, QBoxLayout, QSpacerItem,
 )
-from PySide6.QtCore import Qt, QDate, Signal
+from PySide6.QtCore import Qt, QDate, QEvent, QObject, Signal
 from PySide6.QtGui import QColor, QFont
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.cashier_service import (
     get_daily_summaries_page, get_transactions_flat_page, get_browse_bootstrap,
-    get_browse_items, get_browse_descriptions,
+    get_browse_items, get_browse_descriptions, smart_search_page,
 )
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
@@ -40,6 +42,7 @@ from tahmeed.ui.accountant.separate_expenses import (
 )
 from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
 from tahmeed.ui.widgets.combo_styles import with_combo_popup
+from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 
@@ -74,6 +77,30 @@ _FIELD_SS = with_combo_popup(
     "  background: #FFFFFF;"
     "}"
     "QLineEdit:focus, QDateEdit:focus, QComboBox:focus { border-color: #0077C5; }"
+)
+
+
+# Filter rows must fit the narrowest Browse page (1100px window − 220px sidebar).
+_QWIDGETSIZE_MAX = 16777215
+_DATE_MIN_W = 106
+# Filter-panel width below which Advanced / Smart Search split onto two rows.
+_ADV_WRAP_BELOW = 1080
+_SMART_WRAP_BELOW = 1100
+_FILTER_ROW_H = 58
+_FILTER_WRAPPED_H = 112
+_MODE_ROW_H = 48
+_BTN_MIN_W = 54
+# Base button styles pad 16–18px a side, which alone exceeds _BTN_MIN_W.
+_COMPACT_BTN_PAD = "QPushButton { padding: 4px 8px; }"
+
+_SMART_INPUT_H = 32
+_SMART_FIELD_SS = with_combo_popup(
+    "QLineEdit, QDateEdit {"
+    "  border: 1px solid #d1d5db; border-radius: 4px;"
+    "  padding: 0 10px; font-size: 13px; color: #111827;"
+    "  background: #FFFFFF;"
+    "}"
+    "QLineEdit:focus, QDateEdit:focus { border-color: #0077C5; }"
 )
 
 
@@ -123,9 +150,45 @@ _A_COL_APR       = 9
 _A_COL_CASHIER   = 10
 _A_COL_EDITED_BY = 11
 
+# ── Column indices — Smart Search ─────────────────────────────────────────────
+
+_M_COL_DATE    = 0
+_M_COL_ITEM    = 1
+_M_COL_DESC    = 2
+_M_COL_PAYEE   = 3
+_M_COL_TRUCK   = 4
+_M_COL_MEMO    = 5
+_M_COL_REFUND  = 6
+_M_COL_TZS     = 7
+_M_COL_USD     = 8
+_M_COL_RECEIPT = 9
+_M_COL_CASHIER = 10
+
+_SMART_HEADERS = [
+    "Date", "Item", "Description", "Payee", "Truck No.", "Memo",
+    "Ref_Float", "TZS", "USD", "Receipt", "Cashier",
+]
+_SMART_PAGE_SIZE = 100
+_ADV_PAGE_SIZE = 100
+_SMART_HINT = "Enter at least one filter (Item, Description, Payee, Truck or a date), then press Find."
+
 _MODE_SIMPLE   = 0
 _MODE_ADVANCED = 1
-_MODE_UPLOADS  = 2
+_MODE_SMART    = 2
+_MODE_UPLOADS  = 3
+
+_RECEIPT_LABELS = {
+    "received": "RECEIPT",
+    "pending": "PENDING",
+    "missing": "MISSING",
+    "no_receipt": "NO RECEIPT",
+}
+_RECEIPT_COLORS = {
+    "received": "#16a34a",
+    "missing": "#dc2626",
+    "pending": "#d97706",
+    "no_receipt": "#6b7280",
+}
 
 _MONTH_NAMES = (
     "", "January", "February", "March", "April", "May", "June",
@@ -180,6 +243,17 @@ class TransactionBrowser(QWidget):
         self._can_manage_uploads = bool(can_manage_uploads)
         self._results_simple: List[dict] = []
         self._results_advanced: List[Transaction] = []
+        self._adv_total = 0
+        self._adv_params: dict = {}
+        self._adv_scroll_loading = False
+        self._results_smart: List[Transaction] = []
+        self._smart_total = 0
+        self._smart_summary = None
+        self._smart_names: dict = {}
+        self._smart_params: dict = {}
+        self._smart_searched = False
+        self._smart_scroll_loading = False
+        self._smart_suggestions_loaded = False
         self._results_uploads: list = []
         self._uploads_total = 0
         self._uploads_scroll_loading = False
@@ -189,10 +263,10 @@ class TransactionBrowser(QWidget):
         self._available_years: List[int] = []
         self._current_mode = _MODE_SIMPLE
         self._cascade_busy = False
-        self._filter_upload_id: str = ""
         self._find_generation = 0
         self._find_in_flight = False
         self._loading: Optional[LoadingOverlay] = None
+        self._wrap_rows: dict = {}
         self._build_ui()
 
     def _owns_upload(self, upload: dict) -> bool:
@@ -216,25 +290,9 @@ class TransactionBrowser(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self._build_header())
         root.addWidget(self._build_filter_panel())
         root.addWidget(self._build_table_stack(), 1)
         root.addWidget(self._build_action_bar())
-
-    def _build_header(self) -> QWidget:
-        h = QWidget()
-        h.setFixedHeight(48)
-        h.setStyleSheet("background:#1c1917;")
-        hl = QHBoxLayout(h)
-        hl.setContentsMargins(16, 0, 16, 0)
-        t = QLabel("Transaction Browser")
-        t.setStyleSheet("color:#ffffff;font-size:14px;font-weight:700;")
-        hl.addWidget(t)
-        s = QLabel("Daily days · Individual rows · Excel uploads")
-        s.setStyleSheet("color:#a8a29e;font-size:11px;margin-left:12px;")
-        hl.addWidget(s)
-        hl.addStretch()
-        return h
 
     # ── Filter panel ──────────────────────────────────────────────────────────
 
@@ -252,7 +310,10 @@ class TransactionBrowser(QWidget):
         mode_row.setSpacing(0)
         self._mode_btns: List[QPushButton] = []
         for i, (txt, pos) in enumerate(
-            zip(["Simple", "Advanced", "Uploads"], ["left", "mid", "right"])
+            zip(
+                ["Simple", "Advanced", "Smart Search", "Uploads"],
+                ["left", "mid", "mid", "right"],
+            )
         ):
             btn = QPushButton(txt)
             btn.setCheckable(True)
@@ -270,13 +331,30 @@ class TransactionBrowser(QWidget):
         self._filter_stack = QStackedWidget()
         self._filter_stack.addWidget(self._build_simple_panel())
         self._filter_stack.addWidget(self._build_advanced_panel())
+        self._filter_stack.addWidget(self._build_smart_panel())
         self._filter_stack.addWidget(self._build_uploads_panel())
         self._filter_stack.setCurrentIndex(_MODE_SIMPLE)
-        self._filter_stack.setFixedHeight(52)
+        self._filter_stack.setFixedHeight(_FILTER_ROW_H)
         vl.addWidget(self._filter_stack)
 
-        panel.setFixedHeight(100)
+        panel.setFixedHeight(_MODE_ROW_H + _FILTER_ROW_H)
+        self._filter_panel = panel
         return panel
+
+    def _apply_responsive(self) -> None:
+        """Stack Advanced / Smart Search filters on two rows when the page is narrow."""
+        avail = self.width() - 32
+        for row in self._wrap_rows.values():
+            row.set_wrapped(avail < row.breakpoint)
+        current = self._wrap_rows.get(self._current_mode)
+        h = _FILTER_WRAPPED_H if current is not None and current.wrapped else _FILTER_ROW_H
+        if self._filter_stack.height() != h:
+            self._filter_stack.setFixedHeight(h)
+            self._filter_panel.setFixedHeight(_MODE_ROW_H + h)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_responsive()
 
     # ── Simple filter panel ───────────────────────────────────────────────────
 
@@ -289,9 +367,9 @@ class TransactionBrowser(QWidget):
         hl.setAlignment(Qt.AlignVCenter)
 
         today = date.today()
-        self._s_year = _combo(88)
+        self._s_year = _combo(88, 66)
         self._s_year.addItem(str(today.year), today.year)
-        self._s_month = _combo(120)
+        self._s_month = _combo(120, 86)
         self._fill_month_combo(self._s_month)
         self._s_from = _date_edit(today.replace(day=1))
         self._s_to = _date_edit(date(today.year, today.month, _cal.monthrange(today.year, today.month)[1]))
@@ -304,7 +382,7 @@ class TransactionBrowser(QWidget):
         hl.addLayout(_field("Date To",   self._s_to))
         hl.addStretch()
 
-        self._kw_edit = _lineedit("Search keyword…", 190)
+        self._kw_edit = _lineedit("Search keyword…", 190, 110)
         self._kw_edit.returnPressed.connect(self._do_find)
         hl.addLayout(_field("Search", self._kw_edit))
 
@@ -324,15 +402,14 @@ class TransactionBrowser(QWidget):
     def _build_advanced_panel(self) -> QWidget:
         w = QWidget()
         w.setStyleSheet("background:transparent;")
-        hl = QHBoxLayout(w)
-        hl.setContentsMargins(0, 4, 0, 4)
-        hl.setSpacing(8)
-        hl.setAlignment(Qt.AlignVCenter)
+        row = _WrapRow(w, breakpoint=_ADV_WRAP_BELOW, first_stretch=1, second_stretch=1)
+        self._wrap_rows[_MODE_ADVANCED] = row
+        hl = row.first
 
         today = date.today()
-        self._a_year = _combo(88)
+        self._a_year = _combo(88, 64)
         self._a_year.addItem(str(today.year), today.year)
-        self._a_month = _combo(120)
+        self._a_month = _combo(120, 84)
         self._fill_month_combo(self._a_month)
         self._a_from = _date_edit(today.replace(day=1))
         self._a_to = _date_edit(date(today.year, today.month, _cal.monthrange(today.year, today.month)[1]))
@@ -345,12 +422,14 @@ class TransactionBrowser(QWidget):
 
         hl.addLayout(_field("Date From", self._a_from))
         hl.addLayout(_field("Date To",   self._a_to))
+        row.finish()
+        hl = row.second
 
         self._item_combo = CheckableMultiCombo(
             "All Items", noun_plural="items", parent=self,
         )
         self._item_combo.setFixedHeight(28)
-        self._item_combo.setFixedWidth(150)
+        _squeeze(self._item_combo, 92, 150)
         self._item_combo.setStyleSheet(_FIELD_SS)
         self._item_combo.set_options_loader(self._load_item_filter_options)
         self._item_combo.selectionChanged.connect(self._on_items_changed)
@@ -360,7 +439,7 @@ class TransactionBrowser(QWidget):
             "All Descriptions", noun_plural="descriptions", parent=self,
         )
         self._subitem_combo.setFixedHeight(28)
-        self._subitem_combo.setFixedWidth(160)
+        _squeeze(self._subitem_combo, 100, 160)
         self._subitem_combo.setStyleSheet(_FIELD_SS)
         self._subitem_combo.set_options_loader(self._load_desc_filter_options)
         self._subitem_combo.selectionChanged.connect(self._on_descs_changed)
@@ -368,7 +447,7 @@ class TransactionBrowser(QWidget):
 
         hl.addStretch()
 
-        self._adv_kw_edit = _lineedit("Search keyword…", 170)
+        self._adv_kw_edit = _lineedit("Search keyword…", 170, 92)
         self._adv_kw_edit.returnPressed.connect(self._do_find)
         hl.addLayout(_field("Search", self._adv_kw_edit))
 
@@ -381,6 +460,105 @@ class TransactionBrowser(QWidget):
             self._a_month.setCurrentIndex(idx)
         self._a_month.blockSignals(False)
         return w
+
+    # ── Smart Search filter panel ─────────────────────────────────────────────
+
+    def _build_smart_panel(self) -> QWidget:
+        w = QWidget()
+        w.setStyleSheet("background:transparent;")
+        row = _WrapRow(w, breakpoint=_SMART_WRAP_BELOW, first_stretch=1, second_stretch=1)
+        self._wrap_rows[_MODE_SMART] = row
+        hl = row.first
+
+        # Item / Payee suggest from the catalog as you type; Tab accepts.
+        self._m_item = CompleterLineEdit([], parent=w, ranked_contains=True)
+        self._m_payee = CompleterLineEdit([], parent=w, ranked_contains=True)
+        self._m_desc = QLineEdit()
+        self._m_truck = QLineEdit()
+        self._m_item.setToolTip("Type to see items · Tab accepts the suggestion")
+        self._m_payee.setToolTip("Type to see payees · Tab accepts the suggestion")
+        # Item gets the widest share, a bit more than Description.
+        for edit, placeholder, min_w, stretch, label in (
+            (self._m_item, "Type an item…", 104, 6, "Item"),
+            (self._m_desc, "e.g. Diesel", 92, 5, "Description"),
+            (self._m_payee, "Type a payee…", 92, 4, "Payee"),
+            (self._m_truck, "e.g. T103", 72, 3, "Truck No."),
+        ):
+            edit.setPlaceholderText(placeholder)
+            _squeeze(edit, min_w)
+            edit.setFixedHeight(_SMART_INPUT_H)
+            edit.setStyleSheet(_SMART_FIELD_SS)
+            edit.setClearButtonEnabled(True)
+            edit.returnPressed.connect(self._do_find)
+            hl.addLayout(_field(label, edit), stretch)
+        row.finish()
+        hl = row.second
+
+        self._m_from = _optional_date_edit()
+        self._m_to = _optional_date_edit()
+        for de in (self._m_from, self._m_to):
+            _squeeze(de, _DATE_MIN_W, 124)
+            de.setFixedHeight(_SMART_INPUT_H)
+            de.setStyleSheet(_SMART_FIELD_SS)
+            style_calendar_popup(de)
+        self._m_from.setToolTip("Leave as Any to search from the first entry")
+        self._m_to.setToolTip("Leave as Any to search up to the latest entry")
+        hl.addLayout(_field("Date From", self._m_from))
+        hl.addLayout(_field("Date To", self._m_to))
+        chain = (
+            self._m_item, self._m_desc, self._m_payee, self._m_truck,
+            self._m_from, self._m_to,
+        )
+        for first, second in zip(chain, chain[1:]):
+            QWidget.setTabOrder(first, second)
+        self._m_clear_dates = QPushButton("Clear dates")
+        self._m_clear_dates.setFixedHeight(_SMART_INPUT_H)
+        self._m_clear_dates.setAutoDefault(False)
+        self._m_clear_dates.setToolTip("Set Date From and Date To back to Any")
+        self._m_clear_dates.setStyleSheet(_BTN_STYLE + _COMPACT_BTN_PAD)
+        _squeeze(self._m_clear_dates, 80, 100)
+        self._m_clear_dates.clicked.connect(self._clear_smart_dates)
+        clear_col = QVBoxLayout()
+        clear_col.setSpacing(3)
+        clear_col.addWidget(_lbl(""))
+        clear_col.addWidget(self._m_clear_dates)
+        hl.addLayout(clear_col)
+        row.add_wrap_gap(hl)
+
+        m_find, m_reset = self._make_find_reset()
+        m_find.setFixedHeight(_SMART_INPUT_H)
+        m_reset.setFixedHeight(_SMART_INPUT_H)
+        self._find_btns.append(m_find)
+        hl.addLayout(_btn_col(m_find, m_reset))
+        return w
+
+    async def _load_smart_suggestions(self) -> None:
+        from tahmeed.services.category_service import get_payment_target_categories
+        from tahmeed.services.payee_service import get_payee_names
+
+        try:
+            cats = await get_payment_target_categories()
+            self._m_item.set_values(sorted({c.name for c in cats if c.name}, key=str.lower))
+        except Exception:
+            self._smart_suggestions_loaded = False
+        try:
+            self._m_payee.set_values(await get_payee_names())
+        except Exception:
+            self._smart_suggestions_loaded = False
+
+    def _clear_smart_dates(self) -> None:
+        self._m_from.setDate(_ANY_DATE)
+        self._m_to.setDate(_ANY_DATE)
+
+    def _smart_form_params(self) -> dict:
+        return dict(
+            item=self._m_item.text().strip(),
+            description=self._m_desc.text().strip(),
+            payee=self._m_payee.text().strip(),
+            truck=self._m_truck.text().strip(),
+            date_from=_optional_date(self._m_from),
+            date_to=_optional_date(self._m_to),
+        )
 
     def _build_uploads_panel(self) -> QWidget:
         w = QWidget()
@@ -405,14 +583,16 @@ class TransactionBrowser(QWidget):
 
     def _make_find_reset(self):
         find = QPushButton("Find")
-        find.setFixedSize(66, 28)
+        find.setFixedHeight(28)
+        _squeeze(find, _BTN_MIN_W, 66)
         find.setAutoDefault(False)
-        find.setStyleSheet(_PRIMARY_BTN)
+        find.setStyleSheet(_PRIMARY_BTN + _COMPACT_BTN_PAD)
         find.clicked.connect(self._do_find)
         reset = QPushButton("Reset")
-        reset.setFixedSize(66, 28)
+        reset.setFixedHeight(28)
+        _squeeze(reset, _BTN_MIN_W, 66)
         reset.setAutoDefault(False)
-        reset.setStyleSheet(_BTN_STYLE)
+        reset.setStyleSheet(_BTN_STYLE + _COMPACT_BTN_PAD)
         reset.clicked.connect(self._reset_filters)
         return find, reset
 
@@ -432,6 +612,7 @@ class TransactionBrowser(QWidget):
         self._uploads_table = self._build_uploads_table()
         self._table_stack.addWidget(self._simple_table)
         self._table_stack.addWidget(self._adv_table)
+        self._table_stack.addWidget(self._build_smart_page())
         self._table_stack.addWidget(self._uploads_table)
         lay.addWidget(self._table_stack)
         self._loading = LoadingOverlay(wrap, "Loading…")
@@ -530,7 +711,58 @@ class TransactionBrowser(QWidget):
         t.verticalHeader().setDefaultSectionSize(_ROW_H)
         t.doubleClicked.connect(self._on_go_to)
         t.itemSelectionChanged.connect(self._on_selection_changed)
+        t.verticalScrollBar().valueChanged.connect(self._on_adv_scroll)
         return t
+
+    def _build_smart_page(self) -> QWidget:
+        page = QWidget()
+        self._smart_layout = QStackedLayout(page)
+        self._smart_hint = QLabel(_SMART_HINT)
+        self._smart_hint.setAlignment(Qt.AlignCenter)
+        self._smart_hint.setWordWrap(True)
+        self._smart_hint.setStyleSheet(
+            "color:#6b7280;font-size:13px;background:#ffffff;padding:24px;"
+        )
+        self._smart_table = self._build_smart_table()
+        self._smart_layout.addWidget(self._smart_hint)
+        self._smart_layout.addWidget(self._smart_table)
+        self._smart_layout.setCurrentWidget(self._smart_hint)
+        return page
+
+    def _build_smart_table(self) -> QTableWidget:
+        t = QTableWidget()
+        t.setColumnCount(len(_SMART_HEADERS))
+        t.setHorizontalHeaderLabels(_SMART_HEADERS)
+        t.setStyleSheet(_TABLE_SS)
+        t.setAlternatingRowColors(False)
+        hh = t.horizontalHeader()
+        for i in range(len(_SMART_HEADERS)):
+            hh.setSectionResizeMode(i, QHeaderView.Interactive)
+        hh.setStretchLastSection(False)
+        hh.setSectionResizeMode(_M_COL_DESC, QHeaderView.Stretch)
+        t.setColumnWidth(_M_COL_DATE,    100)
+        t.setColumnWidth(_M_COL_ITEM,    110)
+        t.setColumnWidth(_M_COL_DESC,    220)
+        t.setColumnWidth(_M_COL_PAYEE,   130)
+        t.setColumnWidth(_M_COL_TRUCK,    90)
+        t.setColumnWidth(_M_COL_MEMO,     80)
+        t.setColumnWidth(_M_COL_REFUND,  105)
+        t.setColumnWidth(_M_COL_TZS,     105)
+        t.setColumnWidth(_M_COL_USD,      85)
+        t.setColumnWidth(_M_COL_RECEIPT,  82)
+        t.setColumnWidth(_M_COL_CASHIER, 110)
+        t.verticalHeader().setVisible(False)
+        t.setSelectionBehavior(QAbstractItemView.SelectRows)
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.verticalHeader().setDefaultSectionSize(_ROW_H)
+        t.doubleClicked.connect(self._on_go_to)
+        t.itemSelectionChanged.connect(self._on_selection_changed)
+        t.verticalScrollBar().valueChanged.connect(self._on_smart_scroll)
+        return t
+
+    def _show_smart_hint(self, text: str = _SMART_HINT) -> None:
+        self._smart_hint.setText(text)
+        self._smart_layout.setCurrentWidget(self._smart_hint)
 
     # ── Action bar ────────────────────────────────────────────────────────────
 
@@ -544,6 +776,7 @@ class TransactionBrowser(QWidget):
 
         self._count_label = QLabel("Days shown: —")
         self._count_label.setStyleSheet("color:#6b7280;font-size:12px;")
+        self._count_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self._goto_btn = QPushButton("Go To Date")
         self._goto_btn.setFixedWidth(110)
@@ -568,20 +801,24 @@ class TransactionBrowser(QWidget):
     # ── Mode switching ────────────────────────────────────────────────────────
 
     def _switch_mode(self, mode: int) -> None:
-        if mode != _MODE_ADVANCED:
-            self._filter_upload_id = ""
         self._show_mode(mode)
 
     def _show_mode(self, mode: int) -> None:
         self._current_mode = mode
         self._filter_stack.setCurrentIndex(mode)
         self._table_stack.setCurrentIndex(mode)
+        self._apply_responsive()
         for i, btn in enumerate(self._mode_btns):
             btn.setChecked(i == mode)
         if mode == _MODE_SIMPLE:
             self._count_label.setText("Days shown: —")
         elif mode == _MODE_UPLOADS:
             self._count_label.setText("Uploads: —")
+        elif mode == _MODE_SMART:
+            self._count_label.setText("Matches: —")
+            if not self._smart_suggestions_loaded:
+                self._smart_suggestions_loaded = True
+                asyncio.ensure_future(self._load_smart_suggestions())
         else:
             self._count_label.setText("Transactions: —")
         self._goto_btn.setEnabled(False)
@@ -755,11 +992,21 @@ class TransactionBrowser(QWidget):
                 date_from=_qdate_to_py(self._a_from.date()),
                 date_to=_qdate_to_py(self._a_to.date()),
             )
-        if self._filter_upload_id and self._current_mode == _MODE_ADVANCED:
-            params["daily_import_id"] = self._filter_upload_id
         return params
 
     def _do_find(self) -> None:
+        if (
+            self._current_mode == _MODE_SMART
+            and not _has_smart_filters(self._smart_form_params())
+        ):
+            self._find_generation += 1
+            self._find_in_flight = False
+            if self._loading is not None:
+                self._loading.hide_loading()
+            for btn in self._find_btns:
+                btn.setEnabled(True)
+            self._clear_smart_results()
+            return
         for btn in self._find_btns:
             btn.setEnabled(False)
         asyncio.ensure_future(self._async_find())
@@ -774,16 +1021,21 @@ class TransactionBrowser(QWidget):
                 msg = "Loading uploads…"
             elif mode == _MODE_SIMPLE:
                 msg = "Loading daily transactions…"
+            elif mode == _MODE_SMART:
+                msg = "Searching all days…"
             else:
                 msg = "Loading transactions…"
             self._loading.show_loading(msg)
         try:
-            if mode != _MODE_UPLOADS:
+            if mode not in (_MODE_UPLOADS, _MODE_SMART):
                 await self._ensure_period_ready()
                 if gen != self._find_generation:
                     return
             if mode == _MODE_UPLOADS:
                 await self._load_uploads()
+                return
+            if mode == _MODE_SMART:
+                await self._load_smart(gen)
                 return
             # Advanced Item/Sub-Item distincts load lazily on ▾ open (Phase 2).
             params = self._get_search_params()
@@ -795,21 +1047,17 @@ class TransactionBrowser(QWidget):
                 self._user_names = page.cashier_names
                 self._populate_simple(self._results_simple)
             else:
-                limit = 10000 if params.get("daily_import_id") else 1000
-                page = await get_transactions_flat_page(**params, limit=limit)
+                page = await get_transactions_flat_page(
+                    **params, limit=_ADV_PAGE_SIZE,
+                )
                 if gen != self._find_generation:
                     return
-                self._results_advanced = page.items
-                self._user_names = page.cashier_names
-                self._populate_advanced(
-                    self._results_advanced, total=page.total,
-                )
-                if params.get("daily_import_id"):
-                    self._count_label.setText(
-                        f"Upload rows: {len(self._results_advanced):,}"
-                    )
-                    self._export_btn.setEnabled(bool(self._results_advanced))
-                    return
+                self._adv_params = params
+                self._results_advanced = list(page.items)
+                self._adv_total = int(page.total or 0)
+                self._user_names = dict(page.cashier_names or {})
+                self._populate_advanced(self._results_advanced, reset=True)
+                self._schedule_adv_fill()
         except Exception as exc:
             if gen == self._find_generation:
                 from PySide6.QtWidgets import QMessageBox
@@ -905,6 +1153,175 @@ class TransactionBrowser(QWidget):
             self._count_label.setText(f"Uploads: {loaded:,} of {total:,}{suffix}")
         else:
             self._count_label.setText(f"Uploads: {loaded:,}{suffix}")
+
+    # ── Smart Search loading ──────────────────────────────────────────────────
+
+    def _clear_smart_results(self, hint: str = _SMART_HINT) -> None:
+        self._results_smart = []
+        self._smart_total = 0
+        self._smart_summary = None
+        self._smart_names = {}
+        self._smart_params = {}
+        self._smart_searched = False
+        self._smart_table.setRowCount(0)
+        self._show_smart_hint(hint)
+        self._update_smart_count_label()
+        self._goto_btn.setEnabled(False)
+        self._export_btn.setEnabled(False)
+
+    async def _load_smart(self, gen: int) -> None:
+        params = self._smart_form_params()
+        page = await smart_search_page(**params, skip=0, limit=_SMART_PAGE_SIZE)
+        if gen != self._find_generation:
+            return
+        self._smart_params = params
+        self._results_smart = list(page.items)
+        self._smart_total = int(page.total or 0)
+        self._smart_summary = page.summary
+        self._smart_names = dict(page.cashier_names or {})
+        self._smart_searched = True
+        self._populate_smart(self._results_smart, reset=True)
+        if not self._results_smart:
+            self._show_smart_hint("No entries match these filters.")
+        self._schedule_smart_fill()
+
+    async def _load_more_smart(self) -> None:
+        if self._smart_scroll_loading or self._find_in_flight:
+            return
+        if not self._smart_searched or len(self._results_smart) >= self._smart_total:
+            return
+        gen = self._find_generation
+        self._smart_scroll_loading = True
+        self._update_smart_count_label()
+        try:
+            page = await smart_search_page(
+                **self._smart_params,
+                skip=len(self._results_smart),
+                limit=_SMART_PAGE_SIZE,
+            )
+            if gen != self._find_generation:
+                return
+            if not page.items:
+                self._smart_total = len(self._results_smart)
+                return
+            self._smart_total = int(page.total or self._smart_total)
+            self._smart_names.update(page.cashier_names or {})
+            start = len(self._results_smart)
+            self._results_smart.extend(page.items)
+            self._populate_smart(page.items, reset=False, start_row=start)
+        except Exception as exc:
+            if gen == self._find_generation:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Search Error", str(exc))
+        finally:
+            self._smart_scroll_loading = False
+            self._update_smart_count_label()
+        self._schedule_smart_fill()
+
+    def _on_smart_scroll(self, _value: int) -> None:
+        if self._current_mode != _MODE_SMART:
+            return
+        bar = self._smart_table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if bar.value() >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more_smart())
+
+    def _schedule_smart_fill(self) -> None:
+        """Keep loading while the viewport has no scrollbar yet."""
+        bar = self._smart_table.verticalScrollBar()
+        if (
+            self._smart_searched
+            and not self._smart_scroll_loading
+            and len(self._results_smart) < self._smart_total
+            and bar.maximum() <= 0
+        ):
+            asyncio.ensure_future(self._load_more_smart())
+
+    def _update_smart_count_label(self) -> None:
+        if not self._smart_searched:
+            self._count_label.setText("Matches: —")
+            return
+        loaded = len(self._results_smart)
+        total = self._smart_total
+        if loaded < total:
+            text = f"Matches: {loaded:,} of {total:,}"
+        else:
+            text = f"Matches: {total:,}"
+        s = self._smart_summary
+        if s is not None:
+            day_word = "day" if s.days == 1 else "days"
+            text += f"  ·  {s.days:,} {day_word}  ·  TZS {s.total_tzs:,.0f}"
+            if s.total_usd:
+                text += f"  ·  USD {s.total_usd:,.2f}"
+        if self._smart_scroll_loading:
+            text += "  ·  Loading…"
+        elif loaded < total:
+            text += "  ·  Scroll for more"
+        self._count_label.setText(text)
+
+    def _populate_smart(
+        self,
+        txs: List[Transaction],
+        *,
+        reset: bool = True,
+        start_row: int = 0,
+    ) -> None:
+        t = self._smart_table
+        if reset:
+            start_row = 0
+            t.setRowCount(len(txs))
+        else:
+            t.setRowCount(start_row + len(txs))
+        if txs:
+            self._smart_layout.setCurrentWidget(t)
+        names = self._smart_names or {}
+
+        for offset, tx in enumerate(txs):
+            i = start_row + offset
+            row_bg = _stripe_bg(i)
+            d = tx.date
+            date_str = d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
+            t.setItem(i, _M_COL_DATE, _ro(date_str, bg=row_bg))
+            t.setItem(i, _M_COL_ITEM, _ro(tx.item or tx.category_name or "", bg=row_bg))
+            t.setItem(i, _M_COL_DESC, _ro(tx.description or "", bg=row_bg))
+            t.setItem(i, _M_COL_PAYEE, _ro(tx.payee or "", bg=row_bg))
+            t.setItem(i, _M_COL_TRUCK, _ro(tx.truck_number or "", bg=row_bg))
+            t.setItem(i, _M_COL_MEMO, _ro(tx.memo or "", bg=row_bg))
+
+            if tx.notes_flag:
+                ref_it = _ro("REFUND TO FLOAT", Qt.AlignCenter, bg=row_bg)
+                ref_it.setForeground(QColor("#EA580C"))
+            else:
+                ref_it = _ro("", bg=row_bg)
+            t.setItem(i, _M_COL_REFUND, ref_it)
+
+            tzs, usd = tx.money_parts()
+            tzs_it = _ro(
+                f"TZS {tzs:,.0f}" if tzs else "—",
+                Qt.AlignRight | Qt.AlignVCenter,
+                bg=row_bg,
+            )
+            if tzs < 0:
+                tzs_it.setForeground(QColor("#dc2626"))
+            t.setItem(i, _M_COL_TZS, tzs_it)
+            usd_it = _ro(
+                f"USD {usd:,.2f}" if usd else "—",
+                Qt.AlignRight | Qt.AlignVCenter,
+                bg=row_bg,
+            )
+            if usd < 0:
+                usd_it.setForeground(QColor("#dc2626"))
+            t.setItem(i, _M_COL_USD, usd_it)
+
+            t.setItem(i, _M_COL_RECEIPT, _receipt_item(tx.receipt_status, row_bg))
+            cashier = names.get(tx.cashier_id, "—") if tx.cashier_id else "—"
+            t.setItem(i, _M_COL_CASHIER, _ro(cashier, bg=row_bg))
+            _finish_table_row(t, i, row_bg)
+
+        self._update_smart_count_label()
+        self._goto_btn.setEnabled(bool(t.selectedItems()))
+        self._export_btn.setEnabled(bool(self._results_smart))
 
     def _populate_uploads(
         self,
@@ -1156,14 +1573,23 @@ class TransactionBrowser(QWidget):
         return f"Merged by {len(people)} users · {state}"
 
     def _populate_advanced(
-        self, txs: List[Transaction], *, total: int | None = None,
+        self,
+        txs: List[Transaction],
+        *,
+        reset: bool = True,
+        start_row: int = 0,
     ) -> None:
         t = self._adv_table
-        t.setRowCount(len(txs))
-        # Names filled by composite list payload in _async_find.
+        if reset:
+            start_row = 0
+            t.setRowCount(len(txs))
+        else:
+            t.setRowCount(start_row + len(txs))
+        # Names filled by composite list payload in _async_find / scroll pages.
         names = getattr(self, "_user_names", {}) or {}
 
-        for i, tx in enumerate(txs):
+        for offset, tx in enumerate(txs):
+            i = start_row + offset
             row_bg = _stripe_bg(i)
             d = tx.date
             date_str = d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
@@ -1190,23 +1616,7 @@ class TransactionBrowser(QWidget):
                 amt_it.setForeground(QColor("#dc2626"))
             t.setItem(i, _A_COL_TZS, amt_it)
 
-            status = (tx.receipt_status or "pending").strip().lower()
-            _rcpt_lbl = {
-                "received": "RECEIPT",
-                "pending": "PENDING",
-                "missing": "MISSING",
-                "no_receipt": "NO RECEIPT",
-            }.get(status, status.upper() if status else "—")
-            rec_it = _ro(_rcpt_lbl, Qt.AlignCenter, bg=row_bg)
-            rec_it.setForeground(QColor(
-                {
-                    "received": "#16a34a",
-                    "missing": "#dc2626",
-                    "pending": "#d97706",
-                    "no_receipt": "#6b7280",
-                }.get(status, "#6b7280")
-            ))
-            t.setItem(i, _A_COL_RECEIPT, rec_it)
+            t.setItem(i, _A_COL_RECEIPT, _receipt_item(tx.receipt_status, row_bg))
             t.setItem(i, _A_COL_OWNERSHIP, _ro(tx.ownership or "", bg=row_bg))
             t.setItem(i, _A_COL_APR, _ro(tx.approver or "", bg=row_bg))
             cashier = names.get(tx.cashier_id, "—") if tx.cashier_id else "—"
@@ -1215,13 +1625,76 @@ class TransactionBrowser(QWidget):
             t.setItem(i, _A_COL_EDITED_BY, _ro(edited, bg=row_bg))
             _finish_table_row(t, i, row_bg)
 
-        n = len(txs)
-        matched = int(total) if total is not None else n
-        if matched > n:
-            self._count_label.setText(f"Transactions: {n:,} of {matched:,}")
+        self._update_adv_count_label()
+        self._export_btn.setEnabled(bool(self._results_advanced))
+
+    def _update_adv_count_label(self) -> None:
+        loaded = len(self._results_advanced)
+        total = max(self._adv_total, loaded)
+        if loaded < total:
+            text = f"Transactions: {loaded:,} of {total:,}"
         else:
-            self._count_label.setText(f"Transactions: {n:,}")
-        self._export_btn.setEnabled(n > 0)
+            text = f"Transactions: {loaded:,}"
+        if self._adv_scroll_loading:
+            text += "  ·  Loading…"
+        elif loaded < total:
+            text += "  ·  Scroll for more"
+        self._count_label.setText(text)
+
+    async def _load_more_advanced(self) -> None:
+        if self._adv_scroll_loading or self._find_in_flight:
+            return
+        if len(self._results_advanced) >= self._adv_total:
+            return
+        gen = self._find_generation
+        self._adv_scroll_loading = True
+        self._update_adv_count_label()
+        try:
+            page = await get_transactions_flat_page(
+                **self._adv_params,
+                skip=len(self._results_advanced),
+                limit=_ADV_PAGE_SIZE,
+            )
+            if gen != self._find_generation:
+                return
+            if not page.items:
+                self._adv_total = len(self._results_advanced)
+                return
+            self._adv_total = int(page.total or self._adv_total)
+            names = getattr(self, "_user_names", None) or {}
+            names.update(page.cashier_names or {})
+            self._user_names = names
+            start = len(self._results_advanced)
+            self._results_advanced.extend(page.items)
+            self._populate_advanced(page.items, reset=False, start_row=start)
+        except Exception as exc:
+            if gen == self._find_generation:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Search Error", str(exc))
+        finally:
+            self._adv_scroll_loading = False
+            if gen == self._find_generation and self._current_mode == _MODE_ADVANCED:
+                self._update_adv_count_label()
+        self._schedule_adv_fill()
+
+    def _on_adv_scroll(self, _value: int) -> None:
+        if self._current_mode != _MODE_ADVANCED:
+            return
+        bar = self._adv_table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        if bar.value() >= bar.maximum() - 24:
+            asyncio.ensure_future(self._load_more_advanced())
+
+    def _schedule_adv_fill(self) -> None:
+        """Keep loading while the viewport has no scrollbar yet."""
+        bar = self._adv_table.verticalScrollBar()
+        if (
+            not self._adv_scroll_loading
+            and len(self._results_advanced) < self._adv_total
+            and bar.maximum() <= 0
+        ):
+            asyncio.ensure_future(self._load_more_advanced())
 
     # ── Reset ─────────────────────────────────────────────────────────────────
 
@@ -1229,7 +1702,12 @@ class TransactionBrowser(QWidget):
         if self._current_mode == _MODE_UPLOADS:
             self._do_find()
             return
-        self._filter_upload_id = ""
+        if self._current_mode == _MODE_SMART:
+            for edit in (self._m_item, self._m_desc, self._m_payee, self._m_truck):
+                edit.clear()
+            self._clear_smart_dates()
+            self._do_find()
+            return
         today = date.today()
         if self._current_mode == _MODE_SIMPLE:
             self._kw_edit.clear()
@@ -1275,7 +1753,10 @@ class TransactionBrowser(QWidget):
         if self._current_mode == _MODE_UPLOADS:
             self._goto_btn.setEnabled(self._uploads_table.currentRow() >= 0)
             return
-        active = self._simple_table if self._current_mode == _MODE_SIMPLE else self._adv_table
+        active = {
+            _MODE_SIMPLE: self._simple_table,
+            _MODE_SMART: self._smart_table,
+        }.get(self._current_mode, self._adv_table)
         self._goto_btn.setEnabled(bool(active.selectedItems()))
 
     def _on_go_to(self) -> None:
@@ -1301,6 +1782,18 @@ class TransactionBrowser(QWidget):
                 return
             descs = self._subitem_combo.selected_values()
             term = descs[0] if len(descs) == 1 else self._adv_kw_edit.text().strip()
+            self.go_to_date.emit(d, term)
+            return
+        if self._current_mode == _MODE_SMART:
+            row = self._smart_table.currentRow()
+            if row < 0 or row >= len(self._results_smart):
+                return
+            tx = self._results_smart[row]
+            # Imported rows live on their upload's register day, not the Excel date.
+            d = _as_py_date(tx.import_primary_date or tx.date)
+            if d is None:
+                return
+            term = (tx.description or tx.truck_number or "").strip()
             self.go_to_date.emit(d, term)
 
     # ── Export ────────────────────────────────────────────────────────────────
@@ -1359,6 +1852,26 @@ class TransactionBrowser(QWidget):
                     f"{s['total_tzs']:.0f}"    if s["total_tzs"]    else "0",
                 ]))
             n = len(self._results_simple)
+        elif self._current_mode == _MODE_SMART:
+            lines = ["\t".join(_SMART_HEADERS)]
+            names = self._smart_names or {}
+            for tx in self._results_smart:
+                d = tx.date
+                tzs, usd = tx.money_parts()
+                lines.append("\t".join([
+                    d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d),
+                    tx.item or tx.category_name or "",
+                    tx.description or "",
+                    tx.payee or "",
+                    tx.truck_number or "",
+                    tx.memo or "",
+                    "REFUND TO FLOAT" if tx.notes_flag else "",
+                    f"{tzs:.0f}",
+                    f"{usd:.2f}" if usd else "",
+                    (tx.receipt_status or "").capitalize(),
+                    names.get(tx.cashier_id, "") if tx.cashier_id else "",
+                ]))
+            n = len(self._results_smart)
         else:
             lines = ["\t".join([
                 "Date", "Item", "Description", "Truck No.", "Memo",
@@ -1417,6 +1930,21 @@ def _ro(
     return it
 
 
+def _receipt_item(receipt_status: Optional[str], bg: str) -> QTableWidgetItem:
+    status = (receipt_status or "pending").strip().lower()
+    label = _RECEIPT_LABELS.get(status, status.upper() if status else "—")
+    it = _ro(label, Qt.AlignCenter, bg=bg)
+    it.setForeground(QColor(_RECEIPT_COLORS.get(status, "#6b7280")))
+    return it
+
+
+def _has_smart_filters(params: dict) -> bool:
+    return any(
+        (str(params.get(key) or "").strip())
+        for key in ("item", "description", "payee", "truck")
+    ) or bool(params.get("date_from") or params.get("date_to"))
+
+
 def _lbl(text: str) -> QLabel:
     lbl = QLabel(text)
     lbl.setStyleSheet("font-size:11px;color:#374151;font-weight:500;background:transparent;")
@@ -1443,19 +1971,78 @@ def _btn_col(find: QPushButton, reset: QPushButton) -> QVBoxLayout:
     return vl
 
 
-def _combo(width: int) -> QComboBox:
+class _WrapRow:
+    """Two field groups: side by side on wide pages, stacked below ``breakpoint``."""
+
+    def __init__(
+        self,
+        host: QWidget,
+        *,
+        breakpoint: int,
+        first_stretch: int = 0,
+        second_stretch: int = 1,
+    ) -> None:
+        self.breakpoint = breakpoint
+        self.wrapped = False
+        self.layout = QBoxLayout(QBoxLayout.LeftToRight, host)
+        self.layout.setContentsMargins(0, 4, 0, 4)
+        self.layout.setSpacing(8)
+        self.first = QHBoxLayout()
+        self.second = QHBoxLayout()
+        for row in (self.first, self.second):
+            row.setSpacing(8)
+        self.layout.addLayout(self.first, first_stretch)
+        self.layout.addLayout(self.second, second_stretch)
+        self._wrap_gaps: list[QSpacerItem] = []
+
+    def add_wrap_gap(self, row: QHBoxLayout) -> None:
+        """Spacer that only expands once the groups are stacked.
+
+        On one row it must stay zero-width, or it soaks up the space the
+        fields need to reach their full width.
+        """
+        gap = QSpacerItem(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        self._wrap_gaps.append(gap)
+        row.addSpacerItem(gap)
+
+    def finish(self) -> None:
+        self.add_wrap_gap(self.first)
+
+    def set_wrapped(self, wrapped: bool) -> None:
+        if wrapped == self.wrapped:
+            return
+        self.wrapped = wrapped
+        self.layout.setDirection(
+            QBoxLayout.TopToBottom if wrapped else QBoxLayout.LeftToRight
+        )
+        self.layout.setSpacing(6 if wrapped else 8)
+        policy = QSizePolicy.Expanding if wrapped else QSizePolicy.Fixed
+        for gap in self._wrap_gaps:
+            gap.changeSize(0, 0, policy, QSizePolicy.Minimum)
+        self.layout.invalidate()
+
+
+def _squeeze(widget: QWidget, min_w: int, max_w: Optional[int] = None) -> QWidget:
+    """Full ``max_w`` on wide screens; shrink toward ``min_w`` instead of overlapping."""
+    widget.setMinimumWidth(min_w)
+    widget.setMaximumWidth(max_w if max_w else _QWIDGETSIZE_MAX)
+    widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    return widget
+
+
+def _combo(width: int, min_width: int) -> QComboBox:
     c = QComboBox()
     c.setFixedHeight(28)
-    c.setFixedWidth(width)
+    _squeeze(c, min_width, width)
     c.setStyleSheet(_FIELD_SS)
     return c
 
 
-def _lineedit(placeholder: str, width: int) -> QLineEdit:
+def _lineedit(placeholder: str, width: int, min_width: int) -> QLineEdit:
     e = QLineEdit()
     e.setPlaceholderText(placeholder)
     e.setFixedHeight(28)
-    e.setFixedWidth(width)
+    _squeeze(e, min_width, width)
     e.setStyleSheet(_FIELD_SS)
     return e
 
@@ -1464,12 +2051,53 @@ def _date_edit(d: date) -> QDateEdit:
     de = QDateEdit()
     de.setCalendarPopup(True)
     de.setDisplayFormat("dd/MM/yyyy")
-    de.setFixedWidth(115)
+    _squeeze(de, _DATE_MIN_W, 115)
     de.setFixedHeight(28)
     de.setDate(QDate(d.year, d.month, d.day))
     de.setStyleSheet(_FIELD_SS)
     style_calendar_popup(de)
     return de
+
+
+_ANY_DATE = QDate(2000, 1, 1)
+
+
+class _AnyDateCalendarFilter(QObject):
+    """Open the popup on today's month while the edit still shows "Any"."""
+
+    def __init__(self, edit: QDateEdit) -> None:
+        super().__init__(edit)
+        self._edit = edit
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.Show and self._edit.date() == _ANY_DATE:
+            today = QDate.currentDate()
+            watched.setCurrentPage(today.year(), today.month())
+        return False
+
+
+def _optional_date_edit() -> QDateEdit:
+    """Date edit whose minimum value reads "Any" (no bound)."""
+    de = QDateEdit()
+    de.setCalendarPopup(True)
+    de.setDisplayFormat("dd/MM/yyyy")
+    _squeeze(de, _DATE_MIN_W, 115)
+    de.setFixedHeight(28)
+    de.setMinimumDate(_ANY_DATE)
+    de.setSpecialValueText("Any")
+    de.setDate(_ANY_DATE)
+    de.setStyleSheet(_FIELD_SS)
+    style_calendar_popup(de)
+    cal = de.calendarWidget()
+    cal.installEventFilter(_AnyDateCalendarFilter(de))
+    return de
+
+
+def _optional_date(de: QDateEdit) -> Optional[date]:
+    qd = de.date()
+    if qd == _ANY_DATE:
+        return None
+    return _qdate_to_py(qd)
 
 
 def _as_py_date(val) -> Optional[date]:

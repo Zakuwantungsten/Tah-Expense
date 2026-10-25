@@ -85,6 +85,13 @@ class ApiClient:
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=httpx.Timeout(15.0, connect=5.0),
+                # Must outlive the 8s connectivity probe interval so probes
+                # reuse the TLS connection instead of a fresh ~2s handshake.
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=20,
+                    keepalive_expiry=60.0,
+                ),
                 transport=self._transport,
                 headers={"Accept": "application/json"},
                 verify=verify,

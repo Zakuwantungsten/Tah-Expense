@@ -46,6 +46,14 @@ OPEN_REGISTER_MATCH: dict[str, Any] = {
     "trashed": {"$ne": True},
 }
 
+# Browse / Smart Search: rows that left the books (trash, pending delete,
+# discarded rejects) must not appear in counts, totals or option lists.
+BROWSE_VISIBLE_MATCH: dict[str, Any] = {
+    "trashed": {"$ne": True},
+    "deletion_requested": {"$ne": True},
+    "discarded": {"$ne": True},
+}
+
 
 def day_bounds(target: date) -> tuple[datetime, datetime]:
     start = datetime.combine(target, time.min)
@@ -144,7 +152,7 @@ def browse_match(
     daily_import_id: str = "",
 ) -> dict[str, Any]:
     """Shared match clause for browse list / distinct-option queries."""
-    match: dict[str, Any] = {}
+    match: dict[str, Any] = dict(BROWSE_VISIBLE_MATCH)
     and_clauses: list[dict[str, Any]] = []
 
     uid = (daily_import_id or "").strip()
@@ -208,6 +216,73 @@ def browse_match(
 
     if truck.strip():
         match["truck_number"] = {"$regex": re.escape(truck.strip()), "$options": "i"}
+
+    if and_clauses:
+        match["$and"] = and_clauses
+    return match
+
+
+def _contains(text: str) -> dict[str, Any]:
+    return {"$regex": re.escape(text), "$options": "i"}
+
+
+def smart_search_has_filters(
+    *,
+    item: str = "",
+    description: str = "",
+    payee: str = "",
+    truck: str = "",
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> bool:
+    return bool(
+        item.strip()
+        or description.strip()
+        or payee.strip()
+        or truck.strip()
+        or date_from
+        or date_to
+    )
+
+
+def smart_search_match(
+    *,
+    item: str = "",
+    description: str = "",
+    payee: str = "",
+    truck: str = "",
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> dict[str, Any]:
+    """Smart Search: every filled field must match (case-insensitive contains).
+
+    Item checks both ``item`` and ``category_name`` because older rows only
+    carry the category. Dates are inclusive and either end may be open.
+    """
+    match: dict[str, Any] = dict(BROWSE_VISIBLE_MATCH)
+    and_clauses: list[dict[str, Any]] = []
+
+    if date_from or date_to:
+        date_filter: dict[str, Any] = {}
+        if date_from:
+            date_filter["$gte"] = datetime(date_from.year, date_from.month, date_from.day)
+        if date_to:
+            date_filter["$lte"] = datetime(
+                date_to.year, date_to.month, date_to.day, 23, 59, 59
+            )
+        match["date"] = date_filter
+
+    item_text = item.strip()
+    if item_text:
+        and_clauses.append(
+            {"$or": [{"item": _contains(item_text)}, {"category_name": _contains(item_text)}]}
+        )
+    if description.strip():
+        match["description"] = _contains(description.strip())
+    if payee.strip():
+        match["payee"] = _contains(payee.strip())
+    if truck.strip():
+        match["truck_number"] = _contains(truck.strip())
 
     if and_clauses:
         match["$and"] = and_clauses

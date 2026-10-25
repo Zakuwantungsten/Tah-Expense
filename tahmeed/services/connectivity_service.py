@@ -81,7 +81,10 @@ class ConnectivityStatus:
         return "#DC2626"
 
 
-_PROBE_TIMEOUT_S = 2.0
+# A cold TLS handshake through Cloudflare alone can take ~2s from East Africa.
+_PROBE_TIMEOUT_S = 6.0
+# One slow probe must not flash the red banner; it recovers on the next tick.
+_FAILURES_BEFORE_OFFLINE = 2
 
 
 def _loopback_api() -> bool:
@@ -141,6 +144,8 @@ class ConnectivityMonitor(QObject):
     """Periodic connectivity probe that publishes via app_signals."""
 
     INTERVAL_MS = 8_000
+    # start() runs while the dashboard is still building and loading data.
+    FIRST_PROBE_DELAY_MS = 3_000
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -153,6 +158,7 @@ class ConnectivityMonitor(QObject):
         self._busy_depth = 0
         self._status: ConnectivityStatus | None = None
         self._started = False
+        self._failures = 0
 
     @property
     def status(self) -> ConnectivityStatus | None:
@@ -167,10 +173,11 @@ class ConnectivityMonitor(QObject):
             return
         self._paused = False
         self._timer.start()
-        self._on_tick()
+        QTimer.singleShot(self.FIRST_PROBE_DELAY_MS, self._on_tick)
 
     def stop(self) -> None:
         self._started = False
+        self._failures = 0
         self._timer.stop()
         task = self._task
         if task is not None and not task.done():
@@ -228,6 +235,12 @@ class ConnectivityMonitor(QObject):
             )
             if self._paused and status.api_ok:
                 return
+            if status.api_ok:
+                self._failures = 0
+            else:
+                self._failures += 1
+                if self._failures < _FAILURES_BEFORE_OFFLINE:
+                    return
             prev = self._status
             self._status = status
             if (

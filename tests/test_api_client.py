@@ -125,3 +125,17 @@ def test_request_bytes_returns_raw_body() -> None:
         await client.close()
 
     asyncio.run(scenario())
+
+
+def test_idle_connections_outlive_the_connectivity_probe_interval() -> None:
+    from tahmeed.services.connectivity_service import ConnectivityMonitor
+
+    async def scenario() -> None:
+        client = ApiClient("https://api.test")
+        pool = client._http()._transport._pool
+        assert pool._keepalive_expiry * 1000 > ConnectivityMonitor.INTERVAL_MS
+        assert pool._max_connections == 100
+        assert pool._max_keepalive_connections == 20
+        await client.close()
+
+    asyncio.run(scenario())

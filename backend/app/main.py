@@ -13,7 +13,7 @@ from .api import api, merged_settings
 from .config import Settings, get_settings
 from .database import Database
 from .errors import ApiError, install_error_handlers, payload
-from .security_policy import docs_enabled, enforce_request_allowlists
+from .security_policy import docs_enabled, enforce_request_allowlists, path_skips_allowlist
 
 
 def create_app(settings: Settings | None = None, database: Database | None = None) -> FastAPI:
@@ -69,6 +69,8 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         if not getattr(request.state, "request_id", None):
             request.state.request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
         path = request.url.path
+        if path_skips_allowlist(path):
+            return await call_next(request)
         try:
             db = request.app.state.database.db
             settings_map = await merged_settings(db)

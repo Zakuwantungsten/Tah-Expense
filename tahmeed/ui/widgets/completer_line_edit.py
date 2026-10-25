@@ -246,6 +246,11 @@ class CompleterLineEdit(QLineEdit):
     def _end_commit(self) -> None:
         self._committing = False
 
+    def set_values(self, values: List[str]) -> None:
+        """Replace the suggestion list (e.g. once an async catalog load finishes)."""
+        self._values = list(values or [])
+        self._model.setStringList(self._values)
+
     def canonical(self, text: str) -> Optional[str]:
         """Return the stored value matching *text* case-insensitively, else None."""
         t = (text or "").strip().lower()
