@@ -60,6 +60,22 @@ def _return_to_login(login: "LoginWindow", window: "MainWindow", open_windows: l
         open_windows.remove(window)
 
 
+def _log_async_exception(loop, context: dict) -> None:
+    """Write asyncio callback / orphaned-task errors to desktop.log.
+
+    The packaged app has no console, so the default handler's output is lost.
+    """
+    import logging
+
+    exc = context.get("exception")
+    logging.getLogger("tahmeed.async").error(
+        "asyncio: %s",
+        context.get("message") or "unhandled error",
+        exc_info=(type(exc), exc, exc.__traceback__) if exc is not None else None,
+    )
+    loop.default_exception_handler(context)
+
+
 def _launch_verified_installer(installer: Path) -> bool:
     """Launch only the installer currently represented by valid ready metadata."""
     from tahmeed.services.update_service import (
@@ -203,6 +219,7 @@ def main() -> None:
 
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
+    loop.set_exception_handler(_log_async_exception)
 
     # Keep a reference so the GC doesn't collect the window
     _open_windows: list = []

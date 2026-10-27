@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
 from typing import Annotated, Any
 
@@ -75,6 +76,7 @@ transactions.include_router(attachments_router)
 
 _REGISTER_ROLES = ("admin", "cashier", "accountant")
 RegisterActor = Annotated[dict[str, Any], Depends(require_roles(*_REGISTER_ROLES))]
+_ALL_DESCRIPTIONS_TTL_S = 300.0
 
 _client_row_index_ensured = False
 
@@ -934,6 +936,16 @@ async def search_descriptions(
     limit: int = Query(12, ge=1, le=5000),
 ) -> dict:
     value = (prefix or "").strip()
+    cache: dict[int, tuple[float, list[str]]] | None = None
+    if not value:
+        # The unprefixed list groups every transaction; desktops fetch it on open.
+        cache = getattr(request.app.state, "all_descriptions_cache", None)
+        if cache is None:
+            cache = {}
+            request.app.state.all_descriptions_cache = cache
+        hit = cache.get(limit)
+        if hit is not None and time.monotonic() - hit[0] < _ALL_DESCRIPTIONS_TTL_S:
+            return {"items": list(hit[1]), "total": len(hit[1])}
     pipeline: list[dict[str, Any]] = [
         {"$match": {"description": {"$type": "string", "$ne": ""}}},
         {
@@ -956,6 +968,8 @@ async def search_descriptions(
     docs = await aggregate_list(_database(request).transactions, pipeline, length=limit)
     items = [str(doc.get("_id") or "").strip() for doc in docs if doc.get("_id")]
     items = [name for name in items if name]
+    if cache is not None:
+        cache[limit] = (time.monotonic(), list(items))
     return {"items": items, "total": len(items)}
 
 

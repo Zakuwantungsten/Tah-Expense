@@ -62,8 +62,9 @@ class LoadingOverlay(QFrame):
         self.show()
         self.raise_()
         self._panel.start()
-        from tahmeed.ui.async_utils import safe_process_events
-        safe_process_events()
+        # Paint now without pumping the event queue: processEvents() here ran
+        # queued timers re-entrantly (e.g. a modal truck dialog mid-navigation).
+        self.repaint()
 
     def hide_loading(self) -> None:
         self._panel.reset_progress()

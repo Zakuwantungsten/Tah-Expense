@@ -40,10 +40,13 @@ def test_verify_resolve_items_has_no_mapping_dialog() -> None:
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ensure_item_and_payee":
             body = ast.get_source_segment(src, node) or ""
             assert "DescriptionMappingDialog" not in body
-            assert "Item and Payee required" in body
+            # Unmapped rows block approve and offer Day Issues instead.
+            assert "_ask_open_day_issues" in body
+            assert "open_day_issues.emit" in body
             found = True
             break
     assert found
+    assert "Item and Payee required" in src
 
 
 def test_cashier_daily_import_still_skips_to_day_issues() -> None:

@@ -537,77 +537,6 @@ def test_transaction_to_doc_omits_null_import_id() -> None:
     assert doc2["daily_import_source"] == "file.xlsx"
 
 
-def test_browse_match_upload_id_skips_date_filter() -> None:
-    from tahmeed.services.cashier_service import _browse_match
-
-    match = _browse_match(
-        date_from=date(2025, 1, 1),
-        date_to=date(2025, 1, 31),
-        daily_import_id="batch-abc",
-    )
-    assert match["daily_import_id"] == "batch-abc"
-    assert "date" not in match
-
-
-def test_register_day_clause_keeps_prior_excel_on_primary_day() -> None:
-    """Aug 18 Excel rows filed under Aug 19 belong only to Aug 19."""
-    from tahmeed.services.cashier_service import _register_day_clause
-
-    aug18 = _register_day_clause(date(2026, 8, 18))
-    aug19 = _register_day_clause(date(2026, 8, 19))
-
-    prior = {
-        "date": datetime(2026, 8, 18, 10, 0, 0),
-        "import_primary_date": datetime(2026, 8, 19, 12, 0, 0),
-    }
-    primary = {
-        "date": datetime(2026, 8, 19, 10, 0, 0),
-        "import_primary_date": datetime(2026, 8, 19, 12, 0, 0),
-    }
-    manual = {
-        "date": datetime(2026, 8, 18, 9, 0, 0),
-    }
-
-    def matches(clause: dict, doc: dict) -> bool:
-        def _one(q: dict) -> bool:
-            if "$or" in q:
-                return any(_one(s) for s in q["$or"])
-            if "$and" in q:
-                return all(_one(s) for s in q["$and"])
-            for k, exp in q.items():
-                actual = doc.get(k)
-                if isinstance(exp, dict):
-                    if "$gte" in exp and not (
-                        actual is not None and actual >= exp["$gte"]
-                    ):
-                        return False
-                    if "$lte" in exp and not (
-                        actual is not None and actual <= exp["$lte"]
-                    ):
-                        return False
-                elif actual != exp:
-                    return False
-            return True
-
-        return _one(clause)
-
-    assert matches(aug19, prior)
-    assert matches(aug19, primary)
-    assert not matches(aug18, prior)
-    assert matches(aug18, manual)
-    assert not matches(aug19, manual)
-
-
-def test_register_day_expr_used_in_daily_summaries_pipeline() -> None:
-    """Simple day list must group by coalesce(import_primary_date, date)."""
-    import inspect
-    from tahmeed.services import cashier_service
-
-    src = inspect.getsource(cashier_service.get_daily_summaries)
-    assert "_REGISTER_DAY_EXPR" in src
-    assert "_register_day_range_clause" in src
-
-
 @pytest.mark.asyncio
 async def test_apply_mapping_keeps_assignment_when_save_fails(monkeypatch) -> None:
     async def boom(*_args, **_kwargs):
@@ -766,4 +695,3 @@ def test_daily_batch_content_hash_matches_saved_txs() -> None:
         memo=row.memo,
     )
     assert daily_batch_content_hash([row]) == daily_batch_content_hash_from_txs([tx])
-

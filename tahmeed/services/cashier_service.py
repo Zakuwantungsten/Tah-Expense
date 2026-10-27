@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+import time
 from datetime import datetime, date
 from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 from bson import ObjectId
@@ -1111,13 +1112,23 @@ async def get_browse_bootstrap() -> BrowseBootstrap:
 _desc_ranked: Optional[List[str]] = None
 _desc_counts: Optional[dict] = None
 _desc_lock = asyncio.Lock()
+_desc_loaded_at: Optional[float] = None
 _DESC_CACHE_LIMIT = 5000
+# History spans every day; refresh on age, not on each register day change.
+_DESC_CACHE_TTL_S = 600.0
 
 
 def invalidate_description_cache() -> None:
-    global _desc_ranked, _desc_counts
+    global _desc_ranked, _desc_counts, _desc_loaded_at
     _desc_ranked = None
     _desc_counts = None
+    _desc_loaded_at = None
+
+
+def description_cache_expired() -> bool:
+    if _desc_ranked is None or _desc_loaded_at is None:
+        return True
+    return time.monotonic() - _desc_loaded_at > _DESC_CACHE_TTL_S
 
 
 def _rebuild_desc_ranked() -> None:
@@ -1127,12 +1138,15 @@ def _rebuild_desc_ranked() -> None:
 
 
 async def ensure_description_cache() -> List[str]:
-    """Load distinct descriptions (all days) ranked by frequency."""
-    global _desc_ranked, _desc_counts
-    if _desc_ranked is not None:
+    """Load distinct descriptions (all days) ranked by frequency.
+
+    An expired cache stays usable for autocomplete until the refetch lands.
+    """
+    global _desc_ranked, _desc_counts, _desc_loaded_at
+    if not description_cache_expired():
         return _desc_ranked
     async with _desc_lock:
-        if _desc_ranked is not None:
+        if not description_cache_expired():
             return _desc_ranked
         payload = await api_client.request(
             "GET",
@@ -1147,6 +1161,7 @@ async def ensure_description_cache() -> List[str]:
         counts = {name: max(_DESC_CACHE_LIMIT - index, 1) for index, name in enumerate(ranked)}
         _desc_counts = counts
         _desc_ranked = ranked
+        _desc_loaded_at = time.monotonic()
         return _desc_ranked
 
 

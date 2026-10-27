@@ -246,6 +246,35 @@ def test_ensure_fresh_day_view_reloads_when_stale(register, monkeypatch):
     assert scheduled == []
 
 
+def test_ensure_fresh_day_view_skips_while_boot_load_pending(register, monkeypatch):
+    """Opening Table: reload_settings must not start a second load of the same day."""
+    scheduled = []
+
+    def capture(coro, *a, **k):
+        scheduled.append(coro)
+        if hasattr(coro, "close"):
+            coro.close()
+        return None
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.asyncio.ensure_future",
+        capture,
+    )
+
+    boot = MagicMock()
+    boot.done.return_value = False
+    register._boot_load_task = boot
+    register._day_tx_stale = True
+    register._day_tx_cache = None
+    register._load_in_flight = False
+    register.ensure_fresh_day_view()
+    assert scheduled == []
+
+    boot.done.return_value = True
+    register.ensure_fresh_day_view()
+    assert len(scheduled) == 1
+
+
 def test_keep_alive_flips_refuse_when_day_stale(register):
     register._day_tx_stale = True
     register._my_session = {"saved_count": 0}

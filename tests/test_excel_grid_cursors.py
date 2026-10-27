@@ -31,7 +31,8 @@ def register(qapp, monkeypatch):
     user = MagicMock()
     user._id = "cashier-1"
     reg = DailyRegister(user, [])
-    reg._merged_mode = True
+    # Merged has no entry surface; fill handle / editing live on My.
+    reg._merged_mode = False
     reg._saved_count = 0
 
     def _put(row, col, text):

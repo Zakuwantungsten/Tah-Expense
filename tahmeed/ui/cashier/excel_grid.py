@@ -1200,7 +1200,9 @@ class DailyRegister(QWidget):
             app_signals.connectivity_changed.connect(self._on_connectivity_changed)
         except Exception:
             pass
-        asyncio.ensure_future(self._load_date(self._current_date))
+        self._boot_load_task = asyncio.ensure_future(
+            self._load_date(self._current_date)
+        )
         asyncio.ensure_future(self._load_register_catalog())
         asyncio.ensure_future(self._load_people_names())
         asyncio.ensure_future(self._load_description_mapping_cache())
@@ -1796,6 +1798,9 @@ class DailyRegister(QWidget):
             return False
         self._draft_timer.stop()
         self._commit_open_editor()
+        # The stopped autosave would otherwise leave My rows only in memory.
+        if self.has_unsaved_work() or self._local_parked:
+            self._flush_local_draft()
         self._my_session = self._snapshot_grid_session()
         self._activate_table_surface(self._merged_table)
         self._view_mode = "merged"
@@ -2411,25 +2416,29 @@ class DailyRegister(QWidget):
         )
 
     async def _load_date(self, d: date) -> None:
+        with timed_op(
+            "register_load", day=str(d), merged=bool(self._merged_mode)
+        ) as meta:
+            await self._load_date_body(d, meta)
+
+    async def _load_date_body(self, d: date, meta: Optional[dict] = None) -> None:
         from tahmeed.ui.async_utils import pause_background_polls
 
-        with pause_background_polls(self):
-            await self._load_date_body(d)
-
-    async def _load_date_body(self, d: date) -> None:
         # Settle in-flight drain before wiping the grid (do not block on FAILED leftovers).
         if self._outbox_drain_in_flight or self._outbox_pending_rows():
+            if self._outbox_drain_in_flight:
+                self._show_register_loading("Finishing sync…")
             await self._await_outbox_idle(timeout_s=180, require_empty=False)
 
         self._load_gen += 1
         seq = self._load_gen
         self._load_in_flight = True
-        if getattr(self, "_description_cache_day", None) != d:
-            from tahmeed.services.cashier_service import invalidate_description_cache
+        from tahmeed.services.cashier_service import description_cache_expired
 
-            invalidate_description_cache()
-            self._description_cache_day = d
-            await self._load_description_cache()
+        if description_cache_expired():
+            # Never await here: a stale load resuming after a newer one finished
+            # would re-show the overlay and its finally would not hide it.
+            asyncio.ensure_future(self._load_description_cache())
         upload_id = self._load_upload_id
         if upload_id:
             self._show_register_loading("Loading upload…")
@@ -2445,7 +2454,11 @@ class DailyRegister(QWidget):
                 txs = await get_transactions_by_date(d, merged=True)
             else:
                 txs = await get_transactions_by_date(d, cashier_id=self._user._id)
+            if meta is not None:
+                meta["rows"] = len(txs)
             if seq != self._load_gen:
+                if meta is not None:
+                    meta["superseded"] = True
                 return
             # My and Merged keep separate copies. A merged fetch must not
             # replace the cashier day the My grid already showed.
@@ -2485,16 +2498,23 @@ class DailyRegister(QWidget):
             )
             if self._merged_mode and not upload_id:
                 self._merged_painted_key = self._merged_tx_cache_key
-            self._maybe_restore_draft_after_populate()
+            # Polls pause only around nested modal loops (Draft restored notice),
+            # not the whole fetch — that froze "Checked HH:MM:SS" on slow loads.
+            with pause_background_polls(self):
+                self._maybe_restore_draft_after_populate()
             self._maybe_announce_parked_after_load()
             # Successful paint — Table / My no longer need a forced refresh.
             self._day_tx_stale = False
             # Reconnect / open-day: push any PENDING/FAILED outbox rows.
             self._schedule_outbox_drain(delay_ms=800)
         except Exception as exc:
+            if meta is not None:
+                meta["ok"] = False
+                meta["error"] = f"{type(exc).__name__}: {exc}"
             if seq == self._load_gen:
                 # Keep ``_day_tx_stale`` so the next Table/My entry retries.
-                QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
+                with pause_background_polls(self):
+                    QMessageBox.critical(self, "Error", f"Failed to load:\n{exc}")
         finally:
             if seq == self._load_gen:
                 self._load_in_flight = False
@@ -2780,6 +2800,10 @@ class DailyRegister(QWidget):
         if not self._day_tx_stale and self._day_tx_cache is not None:
             return
         if self._load_in_flight:
+            return
+        # The constructor's load is scheduled but has not set _load_in_flight yet.
+        boot = getattr(self, "_boot_load_task", None)
+        if boot is not None and not boot.done():
             return
         asyncio.ensure_future(self._load_date(self._current_date))
 

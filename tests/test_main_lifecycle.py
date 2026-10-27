@@ -1,5 +1,6 @@
 from tahmeed import main
 from tahmeed.main import _launch_verified_installer, _return_to_login
+from tahmeed.services import update_service
 
 
 class FakeLogin:
@@ -35,12 +36,37 @@ def test_logout_shows_login_before_closing_last_window() -> None:
     assert windows == []
 
 
+def test_async_exception_handler_logs_then_defers_to_default(caplog, monkeypatch) -> None:
+    import logging
+
+    from tahmeed.main import _log_async_exception
+
+    defaults = []
+
+    class FakeLoop:
+        def default_exception_handler(self, context):
+            defaults.append(context)
+
+    try:
+        raise RuntimeError("Cannot enter into task")
+    except RuntimeError as exc:
+        context = {"message": "Exception in callback", "exception": exc}
+    # setup_logging() sets propagate=False on "tahmeed" in the app; caplog needs it on.
+    monkeypatch.setattr(logging.getLogger("tahmeed"), "propagate", True)
+    with caplog.at_level(logging.ERROR, logger="tahmeed.async"):
+        _log_async_exception(FakeLoop(), context)
+
+    assert "Exception in callback" in caplog.text
+    assert "Cannot enter into task" in caplog.text
+    assert defaults == [context]
+
+
 def test_installer_launch_marks_update_launched(monkeypatch, tmp_path) -> None:
     installer = tmp_path / "TahmeedExpenseSetup-1.0.1.exe"
     installer.write_bytes(b"verified")
-    monkeypatch.setattr(main, "recover_ready_update", lambda: installer)
+    monkeypatch.setattr(update_service, "recover_ready_update", lambda: installer)
     marked = []
-    monkeypatch.setattr(main, "mark_update_launched", lambda: marked.append(True))
+    monkeypatch.setattr(update_service, "mark_update_launched", lambda: marked.append(True))
     monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: None)
 
     assert _launch_verified_installer(installer) is True
@@ -50,7 +76,8 @@ def test_installer_launch_marks_update_launched(monkeypatch, tmp_path) -> None:
 def test_installer_launch_uses_argument_list_without_shell(monkeypatch, tmp_path) -> None:
     installer = tmp_path / "TahmeedExpenseSetup-1.0.1.exe"
     installer.write_bytes(b"verified")
-    monkeypatch.setattr(main, "recover_ready_update", lambda: installer)
+    monkeypatch.setattr(update_service, "recover_ready_update", lambda: installer)
+    monkeypatch.setattr(update_service, "mark_update_launched", lambda: None)
     calls = []
     monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: calls.append((args, kwargs)))
 
@@ -65,7 +92,7 @@ def test_installer_launch_uses_argument_list_without_shell(monkeypatch, tmp_path
 def test_installer_launch_rejects_path_not_in_ready_state(monkeypatch, tmp_path) -> None:
     verified = tmp_path / "verified.exe"
     requested = tmp_path / "other.exe"
-    monkeypatch.setattr(main, "recover_ready_update", lambda: verified)
+    monkeypatch.setattr(update_service, "recover_ready_update", lambda: verified)
     monkeypatch.setattr(
         main.subprocess,
         "Popen",

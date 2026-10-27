@@ -1,4 +1,5 @@
 import re
+import time
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -1161,6 +1162,46 @@ def test_search_and_browse_and_meta() -> None:
     assert "today" in overview.json() and "recent" in overview.json()
     assert resolve.json()["item"] == "Stationery"
     assert prefix.status_code == 200
+
+
+def test_unprefixed_descriptions_are_cached_until_ttl() -> None:
+    from app import transactions_api
+
+    collection = FakeTransactions([{"description": "Office supplies"}])
+    pipelines: list[list] = []
+
+    def aggregate(pipeline: list) -> FakeCursor:
+        pipelines.append(pipeline)
+        names = {d["description"].upper() for d in collection.documents}
+        prefix_stage = next(
+            (s["$match"]["_id"]["$regex"] for s in pipeline[2:] if "$match" in s),
+            "",
+        )
+        return FakeCursor(
+            [{"_id": n} for n in sorted(names) if re.match(prefix_stage, n)]
+        )
+
+    collection.aggregate = aggregate
+    app = _app(collection)
+    user = _cashier()
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        first = client.get("/v1/transactions/descriptions?limit=5000")
+        collection.documents.append({"description": "Diesel"})
+        cached = client.get("/v1/transactions/descriptions?limit=5000")
+        prefixed = client.get("/v1/transactions/descriptions?prefix=DIE")
+        app.state.all_descriptions_cache[5000] = (
+            time.monotonic() - transactions_api._ALL_DESCRIPTIONS_TTL_S - 1,
+            ["OFFICE SUPPLIES"],
+        )
+        refreshed = client.get("/v1/transactions/descriptions?limit=5000")
+
+    assert first.json()["items"] == ["OFFICE SUPPLIES"]
+    assert cached.json()["items"] == ["OFFICE SUPPLIES"]
+    assert prefixed.json()["items"] == ["DIESEL"]
+    assert refreshed.json()["items"] == ["DIESEL", "OFFICE SUPPLIES"]
+    assert len(pipelines) == 3
 
 
 def test_browse_hides_trashed_deleted_and_discarded_rows() -> None:

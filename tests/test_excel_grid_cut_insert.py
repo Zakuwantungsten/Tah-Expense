@@ -182,7 +182,7 @@ def test_navigate_to_date_shows_loading_overlay_immediately(register, monkeypatc
     register._loading.hide_loading()
     register.navigate_to_date(date(2026, 7, 23), merged=True)
     assert not register._loading.isHidden()
-    assert register._loading._message.text().startswith("Loading")
+    assert register._loading._panel.base_message().startswith("Loading")
 
 
 def test_navigate_to_upload_shows_loading_overlay_immediately(register, monkeypatch):
@@ -190,7 +190,7 @@ def test_navigate_to_upload_shows_loading_overlay_immediately(register, monkeypa
     register._loading.hide_loading()
     register.navigate_to_upload("upload-1", primary_date=date(2026, 7, 23))
     assert not register._loading.isHidden()
-    assert "upload" in register._loading._message.text().lower()
+    assert "upload" in register._loading._panel.base_message().lower()
 
 
 def test_load_date_hides_overlay_when_finished(register, monkeypatch):

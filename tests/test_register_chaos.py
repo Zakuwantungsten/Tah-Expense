@@ -72,7 +72,7 @@ async def test_double_save_ignored_while_in_flight(register, monkeypatch):
     """Second Save while first is flying must no-op (no duplicate posts)."""
     calls = {"n": 0}
 
-    async def slow_body(meta=None):
+    async def slow_body(meta=None, *, parked_only=False):
         calls["n"] += 1
         await asyncio.sleep(0.05)
         return True

@@ -121,15 +121,3 @@ def test_duplicate_review_dialog_reimport_hint_when_most_rows_match():
         )
     dlg = DuplicateReviewDialog(items, dup_days=5, pending_total=4)
     assert dlg._looks_like_reimport() is True
-
-
-def test_register_day_clause_uses_import_primary_date():
-    """Manual register saves stamp import_primary_date so rows stay on the open day."""
-    from datetime import date as date_cls
-    from tahmeed.services.cashier_service import _register_day_clause
-
-    target = date_cls(2026, 8, 23)
-    clause = _register_day_clause(target)
-    assert "$or" in clause
-    branches = clause["$or"]
-    assert any("import_primary_date" in b for b in branches)

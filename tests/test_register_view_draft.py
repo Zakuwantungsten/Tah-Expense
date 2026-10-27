@@ -202,6 +202,97 @@ async def test_cold_my_load_still_notifies(register, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stale_load_does_not_leave_loading_overlay(register, monkeypatch):
+    """Two loads of one day with a slow description fetch: Loading must clear."""
+    import asyncio
+
+    overlay = {"shown": False}
+    monkeypatch.setattr(
+        register,
+        "_show_register_loading",
+        lambda *_a, **_k: overlay.__setitem__("shown", True),
+    )
+    monkeypatch.setattr(
+        register,
+        "_hide_register_loading",
+        lambda: overlay.__setitem__("shown", False),
+    )
+    scheduled: list = []
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.asyncio.ensure_future",
+        lambda coro, *a, **k: scheduled.append(coro),
+    )
+    release_descriptions = asyncio.Event()
+
+    async def slow_descriptions():
+        await release_descriptions.wait()
+        return []
+
+    monkeypatch.setattr(
+        "tahmeed.services.cashier_service.ensure_description_cache",
+        slow_descriptions,
+    )
+
+    async def fake_get(_d, **_k):
+        return []
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.get_transactions_by_date",
+        fake_get,
+    )
+    from tahmeed.services import cashier_service
+
+    cashier_service.invalidate_description_cache()
+    register._draft_restore_policy = "off"
+    day = register._current_date
+
+    loop = asyncio.get_running_loop()
+    first = loop.create_task(register._load_date_body(day))
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await register._load_date_body(day)
+    assert overlay["shown"] is False
+
+    release_descriptions.set()
+    await first
+    assert overlay["shown"] is False
+    for coro in scheduled:
+        if hasattr(coro, "close"):
+            coro.close()
+
+
+@pytest.mark.asyncio
+async def test_load_waiting_on_sync_says_finishing_sync(register, monkeypatch):
+    messages: list = []
+    monkeypatch.setattr(
+        register,
+        "_show_register_loading",
+        lambda message="Loading…": messages.append(message),
+    )
+    monkeypatch.setattr(register, "_hide_register_loading", lambda: None)
+
+    async def fake_idle(*, timeout_s=180, require_empty=True):
+        register._outbox_drain_in_flight = False
+        return True
+
+    async def fake_get(_d, **_k):
+        return []
+
+    monkeypatch.setattr(register, "_await_outbox_idle", fake_idle)
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.get_transactions_by_date",
+        fake_get,
+    )
+    register._draft_restore_policy = "off"
+    register._outbox_drain_in_flight = True
+
+    await register._load_date_body(register._current_date)
+
+    assert messages[0] == "Finishing sync…"
+    assert messages[-1].startswith("Loading ")
+
+
+@pytest.mark.asyncio
 async def test_parked_persist_opens_parked_without_draft_notice(register, monkeypatch):
     notices: list = []
     monkeypatch.setattr(

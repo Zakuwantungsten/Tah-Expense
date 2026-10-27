@@ -43,6 +43,33 @@ def test_remember_description_boosts_same_session() -> None:
     cs.invalidate_description_cache()
 
 
+@pytest.mark.asyncio
+async def test_description_cache_refetches_only_when_expired(monkeypatch) -> None:
+    calls: list = []
+
+    async def request(method, path, **kwargs):
+        calls.append(path)
+        return {"items": ["DIESEL CSH"]}
+
+    monkeypatch.setattr(cs.api_client, "request", request)
+    cs.invalidate_description_cache()
+
+    assert await cs.ensure_description_cache() == ["DIESEL CSH"]
+    assert await cs.ensure_description_cache() == ["DIESEL CSH"]
+    assert len(calls) == 1
+    assert not cs.description_cache_expired()
+
+    monkeypatch.setattr(
+        cs, "_desc_loaded_at", cs._desc_loaded_at - cs._DESC_CACHE_TTL_S - 1
+    )
+    assert cs.description_cache_expired()
+    # Expired history still serves autocomplete until the refetch lands.
+    assert cs.search_descriptions_sync("DIE") == ["DIESEL CSH"]
+    await cs.ensure_description_cache()
+    assert len(calls) == 2
+    cs.invalidate_description_cache()
+
+
 def test_description_editor_does_not_use_fleet_when_sync_fn_set(monkeypatch) -> None:
     """Regression: warm fleet cache must not poison description suggestions."""
     _app()
