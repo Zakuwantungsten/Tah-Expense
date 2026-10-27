@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from bson import ObjectId
 
@@ -198,6 +199,27 @@ async def collect_day_issues(
     When ``cashier_id`` is set (cashier UI), only that cashier's rows count.
     Accountant UI passes ``cashier_id=None`` to include everyone.
     """
+    open_rows = await _load_open_rows(
+        target,
+        transactions=transactions,
+        extra_transactions=extra_transactions,
+        cashier_id=cashier_id,
+    )
+    descriptions = _open_row_descriptions(open_rows)
+    if not descriptions:
+        return DayIssuesSnapshot(target_date=target, issues=[])
+    mappings = await get_mappings_for_descriptions(descriptions)
+    payee_set = await _resolve_payee_set(payee_names)
+    return _build_day_snapshot(target, open_rows, mappings, payee_set)
+
+
+async def _load_open_rows(
+    target: date,
+    *,
+    transactions: Optional[Sequence] = None,
+    extra_transactions: Optional[Sequence] = None,
+    cashier_id: Optional[ObjectId] = None,
+) -> list:
     if transactions is not None:
         rows = list(transactions)
     elif cashier_id is not None:
@@ -209,8 +231,35 @@ async def collect_day_issues(
     if extra_transactions:
         rows = merge_transactions_for_day_issues(rows, extra_transactions)
     rows = filter_rows_for_cashier_scope(rows, cashier_id)
-    open_rows = [tx for tx in rows if _is_open_row(tx)]
+    return [tx for tx in rows if _is_open_row(tx)]
 
+
+def _open_row_descriptions(open_rows: Sequence) -> list[str]:
+    """One display description per normalized key."""
+    display_for: dict[str, str] = {}
+    for tx in open_rows:
+        raw = _row_description(tx)
+        key = normalize_description(raw)
+        if key:
+            display_for.setdefault(key, raw)
+    return list(display_for.values())
+
+
+async def _resolve_payee_set(payee_names: Optional[Sequence[str]]) -> set[str]:
+    if payee_names is None:
+        try:
+            return {n.upper() for n in await get_payee_names(active_only=True)}
+        except Exception:
+            return set()
+    return {str(n).strip().upper() for n in payee_names if str(n).strip()}
+
+
+def _build_day_snapshot(
+    target: date,
+    open_rows: Sequence,
+    mappings: dict,
+    payee_set: set[str],
+) -> DayIssuesSnapshot:
     desc_counts: Counter[str] = Counter()
     display_for: dict[str, str] = {}
     for tx in open_rows:
@@ -223,15 +272,6 @@ async def collect_day_issues(
 
     if not desc_counts:
         return DayIssuesSnapshot(target_date=target, issues=[])
-
-    mappings = await get_mappings_for_descriptions(list(display_for.values()))
-    if payee_names is None:
-        try:
-            payee_set = {n.upper() for n in await get_payee_names(active_only=True)}
-        except Exception:
-            payee_set = set()
-    else:
-        payee_set = {str(n).strip().upper() for n in payee_names if str(n).strip()}
 
     # Per-description: if every open row already has item+payee, not an issue.
     rows_by_key: dict[str, list] = {}
@@ -316,6 +356,26 @@ async def count_day_issues(
     return snap.total
 
 
+# Parallel day loads for All days; small enough not to swamp the API tunnel.
+_ALL_DAYS_CONCURRENCY = 4
+# Mapping lookups pass keys in the query string; batch to keep URLs short.
+_MAPPING_BATCH = 150
+
+
+async def _mappings_in_batches(descriptions: Sequence[str]) -> dict:
+    batches = [
+        list(descriptions[i:i + _MAPPING_BATCH])
+        for i in range(0, len(descriptions), _MAPPING_BATCH)
+    ]
+    results = await asyncio.gather(
+        *(get_mappings_for_descriptions(batch) for batch in batches)
+    )
+    merged: dict = {}
+    for part in results:
+        merged.update(part)
+    return merged
+
+
 async def collect_day_issues_all_days(
     *,
     cashier_id: Optional[ObjectId] = None,
@@ -326,31 +386,35 @@ async def collect_day_issues_all_days(
     limit_days: int = 120,
     day_cache: Optional[dict] = None,
     payee_names: Optional[Sequence[str]] = None,
+    only_days: Optional[Sequence[date]] = None,
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> DayIssuesSnapshot:
     """Build Day Issues across open register days (incomplete rows only).
 
     When *day_cache* is provided, previously scanned days are reused unless they
     are the live register day (always refreshed from live rows). Successful
-    scans are written back into *day_cache*.
+    scans are written back into *day_cache*. *only_days* skips the open-day
+    lookup and scans just those register days.
     """
     from tahmeed.services.cashier_service import get_open_day_summaries
 
     anchor = anchor_date or date.today()
-    all_cashiers = cashier_id is None
-    try:
-        summaries = await get_open_day_summaries(
-            cashier_id,
-            all_cashiers=all_cashiers,
-            limit=limit_days,
-        )
-    except Exception:
-        summaries = []
-
     days: list[date] = []
-    for row in summaries:
-        d = row.get("date")
-        if isinstance(d, date):
-            days.append(d)
+    if only_days:
+        days = [d for d in only_days if isinstance(d, date)]
+    else:
+        try:
+            summaries = await get_open_day_summaries(
+                cashier_id,
+                all_cashiers=cashier_id is None,
+                limit=limit_days,
+            )
+        except Exception:
+            summaries = []
+        for row in summaries:
+            d = row.get("date")
+            if isinstance(d, date):
+                days.append(d)
     if live_target is not None and live_target not in days:
         days.append(live_target)
     if not days and live_transactions is None and live_extras is None:
@@ -358,26 +422,50 @@ async def collect_day_issues_all_days(
             target_date=anchor, issues=[], scope="all", days_scanned=[]
         )
 
-    snaps: list[DayIssuesSnapshot] = []
+    by_day: dict[date, DayIssuesSnapshot] = {}
+    to_scan: list[date] = []
     for d in sorted(set(days)):
         is_live = live_target is not None and d == live_target
         cached = None if day_cache is None else day_cache.get(d)
         if cached is not None and not is_live:
-            snaps.append(cached)
-            continue
+            by_day[d] = cached
+        else:
+            to_scan.append(d)
+
+    gate = asyncio.Semaphore(_ALL_DAYS_CONCURRENCY)
+    done = 0
+    if progress is not None and to_scan:
+        progress(0, len(to_scan))
+
+    async def _load(d: date) -> list:
+        nonlocal done
         kwargs: dict = {"cashier_id": cashier_id}
-        if payee_names is not None:
-            kwargs["payee_names"] = payee_names
-        if is_live:
+        if live_target is not None and d == live_target:
             if live_transactions is not None:
                 kwargs["transactions"] = live_transactions
             if live_extras is not None:
                 kwargs["extra_transactions"] = live_extras
-        snap = await collect_day_issues(d, **kwargs)
+        async with gate:
+            rows = await _load_open_rows(d, **kwargs)
+        done += 1
+        if progress is not None:
+            progress(done, len(to_scan))
+        return rows
+
+    loaded = await asyncio.gather(*(_load(d) for d in to_scan))
+    descriptions = _open_row_descriptions([tx for rows in loaded for tx in rows])
+    mappings: dict = {}
+    payee_set: set[str] = set()
+    if descriptions:
+        mappings = await _mappings_in_batches(descriptions)
+        payee_set = await _resolve_payee_set(payee_names)
+    for d, rows in zip(to_scan, loaded):
+        snap = _build_day_snapshot(d, rows, mappings, payee_set)
         if day_cache is not None:
             day_cache[d] = snap
-        snaps.append(snap)
+        by_day[d] = snap
 
+    snaps = [by_day[d] for d in sorted(by_day)]
     if not snaps:
         return DayIssuesSnapshot(
             target_date=anchor, issues=[], scope="all", days_scanned=[]

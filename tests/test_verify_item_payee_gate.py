@@ -203,6 +203,7 @@ def test_day_issues_nav_from_unmapped_multi_day_and_keys() -> None:
     nav = _day_issues_nav_from_unmapped([a, b, c])
     assert nav.all_days is True
     assert nav.date == date(2026, 1, 5)  # most common
+    assert nav.days == (date(2026, 1, 5), date(2026, 1, 10))
     assert set(nav.description_keys) == {
         normalize_description("AGENCY FEE"),
         normalize_description("ALLOWANCE"),

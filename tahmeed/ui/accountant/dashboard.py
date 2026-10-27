@@ -670,6 +670,7 @@ class AccountantDashboard(QWidget):
                     day,
                     description_keys=nav.description_keys,
                     all_days=nav.all_days,
+                    days=nav.days,
                 )
             elif hasattr(widget, "open_for_date"):
                 widget.open_for_date(day)

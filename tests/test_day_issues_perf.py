@@ -261,6 +261,38 @@ def test_open_from_verify_filters_and_uses_all_days() -> None:
     assert calls == ["refresh"]
 
 
+def test_open_from_verify_limits_all_days_scan_to_handoff_days() -> None:
+    _app()
+    user = User(username="a1", password_hash="x", role="accountant", full_name="A1")
+    widget = DayIssuesWidget(user)
+    widget._schedule_refresh = lambda: None  # type: ignore[method-assign]
+    days = (date(2026, 3, 14), date(2026, 3, 15))
+
+    widget.open_from_verify(
+        date(2026, 3, 15),
+        description_keys=[normalize_description("CHANNELS")],
+        all_days=True,
+        days=days,
+    )
+    assert widget._scan_days == days
+
+    # Picking SHOW by hand goes back to every open day.
+    widget._scope_combo.setCurrentIndex(widget._scope_combo.findData("day"))
+    assert widget._scan_days is None
+
+
+def test_scan_progress_shows_days_on_overlay() -> None:
+    _app()
+    user = User(username="a1", password_hash="x", role="accountant", full_name="A1")
+    widget = DayIssuesWidget(user)
+
+    widget._show_scan_progress(2, 5)
+
+    panel = widget._loading_overlay._panel
+    assert "2 of 5 days" in panel.base_message()
+    widget._loading_overlay.hide_loading()
+
+
 def test_open_from_verify_single_day_keeps_this_day() -> None:
     from tahmeed.services.description_mapping_service import normalize_description
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import Counter
 from datetime import date, datetime, timedelta
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
@@ -27,6 +28,7 @@ from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 
 _T = TypeVar("_T")
+_log = logging.getLogger(__name__)
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE     = "#FFFFFF"
@@ -180,6 +182,7 @@ def _day_issues_nav_from_unmapped(txs: Sequence[Transaction]):
         date=_preferred_day_issues_date(txs),
         description_keys=tuple(sorted(keys)),
         all_days=len(days) > 1,
+        days=tuple(sorted(days)),
     )
 
 
@@ -425,7 +428,7 @@ class _FilterBar(QFrame):
         hl.addWidget(self._cashier_cb)
 
         self._date_cb = QComboBox()
-        self._date_cb.setFixedWidth(140)
+        self._date_cb.setFixedWidth(170)
         self._date_cb.setStyleSheet(_input_ss())
         self._date_cb.currentIndexChanged.connect(self.filter_changed)
         self._rebuild_date_options([])
@@ -527,26 +530,28 @@ class _FilterBar(QFrame):
         self._cashier_cb.blockSignals(False)
 
     def populate_available_dates(self, days: List[date]) -> None:
-        """Refresh day picker: All / Today / Yesterday + distinct queue days."""
+        """Refresh day picker: All Dates + every register day in the queue."""
         self._rebuild_date_options(days)
 
     def _rebuild_date_options(self, days: List[date]) -> None:
+        today = date.today()
         cur = self._date_cb.currentData()
         if cur is None:
             cur = _DATE_ALL
+        elif cur == _DATE_TODAY:
+            cur = today.isoformat()
+        elif cur == _DATE_YESTERDAY:
+            cur = (today - timedelta(days=1)).isoformat()
         self._date_cb.blockSignals(True)
         self._date_cb.clear()
         self._date_cb.addItem("All Dates", _DATE_ALL)
-        self._date_cb.addItem("Today", _DATE_TODAY)
-        self._date_cb.addItem("Yesterday", _DATE_YESTERDAY)
-
-        today = datetime.utcnow().date()
-        yesterday = today - timedelta(days=1)
-        extras = [d for d in days if d not in (today, yesterday)]
-        if extras:
-            self._date_cb.insertSeparator(self._date_cb.count())
-            for day in extras:
-                self._date_cb.addItem(_format_day_label(day), day.isoformat())
+        for day in sorted(set(days), reverse=True):
+            label = _format_day_label(day)
+            if day == today:
+                label += " (Today)"
+            elif day == today - timedelta(days=1):
+                label += " (Yesterday)"
+            self._date_cb.addItem(label, day.isoformat())
 
         idx = self._date_cb.findData(cur)
         # Keep a previously picked calendar day even if it left the queue list.
@@ -1588,22 +1593,36 @@ class VerifyInboxWidget(QWidget):
 
         self._select_all_loading = True
         gen = self._reload_generation
+        failed = False
         self._loading_overlay.show_loading("Selecting all records…")
         try:
-            from tahmeed.services.accountant_service import get_cashier_names
+            from tahmeed.services.accountant_service import (
+                count_unverified_filtered, get_cashier_names,
+            )
+
+            if not getattr(self, "_page_has_count", True):
+                # New skips counting on open; _total is only "loaded + 1".
+                total = await count_unverified_filtered(
+                    **self._filter_kw(), edited=False,
+                )
+                if gen != self._reload_generation:
+                    return
+                self._total = max(int(total), self._loaded)
+                self._page_has_count = True
+                self._subtabs._buttons[0].setText(f"New ({self._total})")
 
             while (
                 gen == self._reload_generation
                 and self._loaded < self._total
             ):
-                remaining = self._total - self._loaded
                 self._status.set_text(
                     f"Loading all records… {self._loaded:,} of {self._total:,}"
                 )
                 kw = self._filter_kw()
+                # The API caps one page at 500 rows.
                 txs = await self._fetch_page(
                     skip=self._loaded,
-                    limit=max(remaining, _SELECT_ALL_CHUNK),
+                    limit=_SELECT_ALL_CHUNK,
                     kw=kw,
                 )
                 if gen != self._reload_generation:
@@ -1632,12 +1651,17 @@ class VerifyInboxWidget(QWidget):
                 return
             self._set_all_checks(Qt.Checked)
         except Exception:
-            pass
+            failed = True
+            _log.warning("Verify select-all failed to load every record", exc_info=True)
         finally:
             self._select_all_loading = False
             self._loading_overlay.hide_loading()
             if gen == self._reload_generation:
                 self._update_status()
+                if failed:
+                    self._status.set_text(
+                        "Could not load every record, so nothing was selected. Try again."
+                    )
 
     def _update_bulk_buttons(self) -> None:
         any_checked = any(
@@ -1670,6 +1694,16 @@ class VerifyInboxWidget(QWidget):
             return await get_restore_requested_available_dates()
         return await get_unverified_available_dates(edited=False)
 
+    async def _refresh_available_dates(self, tab: int, generation: int) -> None:
+        """Reload the day picker on every load so newly submitted days appear."""
+        try:
+            days = await self._fetch_available_dates(tab)
+        except Exception:
+            _log.warning("Verify day list failed to load", exc_info=True)
+            return
+        if generation == self._reload_generation and tab == self._current_tab:
+            self._filter_bar.populate_available_dates(days)
+
     async def _load_filter_options(self, tab: int) -> Dict:
         from tahmeed.services.accountant_service import (
             get_unverified_trucks, get_unverified_cashier_ids,
@@ -1692,53 +1726,48 @@ class VerifyInboxWidget(QWidget):
             return await get_payment_target_categories()
 
         if tab == 2:
-            cats, trucks, cashier_ids, items, descs, days = await asyncio.gather(
+            cats, trucks, cashier_ids, items, descs = await asyncio.gather(
                 _cats(),
                 get_rejected_trucks(),
                 get_rejected_cashier_ids(),
                 get_rejected_items(descriptions=selected_descs or None),
                 get_rejected_descriptions(items=selected_items or None),
-                self._fetch_available_dates(tab),
             )
         elif tab == 4:
-            cats, trucks, cashier_ids, items, descs, days = await asyncio.gather(
+            cats, trucks, cashier_ids, items, descs = await asyncio.gather(
                 _cats(),
                 get_deletion_requested_trucks(),
                 get_deletion_requested_cashier_ids(),
                 get_deletion_requested_items(descriptions=selected_descs or None),
                 get_deletion_requested_descriptions(items=selected_items or None),
-                self._fetch_available_dates(tab),
             )
         elif tab == 5:
             from tahmeed.services.accountant_service import (
                 get_restore_requested_trucks, get_restore_requested_cashier_ids,
                 get_restore_requested_items, get_restore_requested_descriptions,
             )
-            cats, trucks, cashier_ids, items, descs, days = await asyncio.gather(
+            cats, trucks, cashier_ids, items, descs = await asyncio.gather(
                 _cats(),
                 get_restore_requested_trucks(),
                 get_restore_requested_cashier_ids(),
                 get_restore_requested_items(descriptions=selected_descs or None),
                 get_restore_requested_descriptions(items=selected_items or None),
-                self._fetch_available_dates(tab),
             )
         elif tab == 3:
-            cats, trucks, cashier_ids, items, descs, days = await asyncio.gather(
+            cats, trucks, cashier_ids, items, descs = await asyncio.gather(
                 _cats(),
                 get_unverified_trucks(),
                 get_unverified_cashier_ids(),
                 get_unverified_items(descriptions=selected_descs or None),
                 get_unverified_descriptions(items=selected_items or None),
-                self._fetch_available_dates(tab),
             )
         else:
-            cats, trucks, cashier_ids, items, descs, days = await asyncio.gather(
+            cats, trucks, cashier_ids, items, descs = await asyncio.gather(
                 _cats(),
                 get_unverified_trucks(),
                 get_unverified_cashier_ids(),
                 get_unverified_items(descriptions=selected_descs or None),
                 get_unverified_descriptions(items=selected_items or None),
-                self._fetch_available_dates(tab),
             )
         self._categories = [c.name for c in cats]
         self._category_objects = cats
@@ -1746,7 +1775,6 @@ class VerifyInboxWidget(QWidget):
         self._filter_bar.populate_trucks(trucks)
         self._filter_bar.populate_items(items)
         self._filter_bar.populate_descriptions(descs)
-        self._filter_bar.populate_available_dates(days)
         clist = sorted(
             [(cname_map.get(ci, "Unknown cashier"), ci) for ci in cashier_ids],
             key=lambda x: x[0],
@@ -1842,6 +1870,9 @@ class VerifyInboxWidget(QWidget):
                 safe_task(self._load_filter_options(tab))
                 if need_filters else None
             )
+            self._dates_task = safe_task(
+                self._refresh_available_dates(tab, generation)
+            )
 
             txs = await page_task
             if generation != self._reload_generation:
@@ -1917,7 +1948,7 @@ class VerifyInboxWidget(QWidget):
                     if filter_names:
                         self._cashier_names.update(filter_names)
                 except Exception:
-                    pass
+                    _log.warning("Verify filter options failed to load", exc_info=True)
             return
         except Exception as exc:
             if generation == self._reload_generation:
@@ -2488,10 +2519,9 @@ class VerifyInboxWidget(QWidget):
             categories = await get_payment_target_categories(include_inactive=True)
         except Exception as exc:
             self._clear_busy()
+            message = f"Could not load items from the server:\n{exc}"
             await self._await_ui(lambda: QMessageBox.critical(
-                self,
-                "Items Unavailable",
-                f"Could not load items from the server:\n{exc}",
+                self, "Items Unavailable", message,
             ))
             return []
 

@@ -108,6 +108,8 @@ class DayIssuesNavTarget:
     date: Optional[date] = None
     description_keys: Tuple[str, ...] = ()
     all_days: bool = False
+    # Register days of the blocked rows; All days scans only these when set.
+    days: Tuple[date, ...] = ()
 
 
 @dataclass
@@ -1059,6 +1061,8 @@ class DayIssuesWidget(QWidget):
         self._dirty = True
         # Per-day snapshots for All days (re-scan only dirty / live day).
         self._day_snap_cache: dict = {}
+        # Verify handoff: All days limited to the blocked rows' days (None = every open day).
+        self._scan_days: Optional[Tuple[date, ...]] = None
         self._lookups_loaded = False
         # Optional: (replace_transactions, extra_transactions) for live/unsaved rows.
         self._row_source = row_source
@@ -1459,6 +1463,7 @@ class DayIssuesWidget(QWidget):
 
     def open_for_date(self, target: date) -> None:
         """Deep-link from Table (or first visit): This day + *target*, then load."""
+        self._scan_days = None
         self._set_show_scope("day")
         self.set_date(target, force=True)
 
@@ -1504,12 +1509,14 @@ class DayIssuesWidget(QWidget):
         *,
         description_keys: Optional[Sequence[str]] = None,
         all_days: bool = False,
+        days: Optional[Sequence[date]] = None,
     ) -> None:
         """Deep-link from Verify approve gate: list the blocked descriptions.
 
         Applies a VALUE filter for *description_keys* and pre-checks them for
         Map Selected. Uses All days when the selection spans multiple register
-        days so every blocked description can appear.
+        days so every blocked description can appear; *days* limits that scan
+        to the blocked rows' register days.
         """
         keys = {
             normalize_description(k)
@@ -1528,6 +1535,8 @@ class DayIssuesWidget(QWidget):
             self._sync_value_filter_chrome()
         day = target or date.today()
         if all_days:
+            scan = tuple(sorted({d for d in (days or ()) if isinstance(d, date)}))
+            self._scan_days = scan or None
             self._set_show_scope("all")
             self.set_date(day, force=True)
         else:
@@ -1540,6 +1549,7 @@ class DayIssuesWidget(QWidget):
             self._schedule_refresh()
 
     def _on_scope_changed(self, _index: int = 0) -> None:
+        self._scan_days = None
         self._scope = self._scope_combo.currentData() or "day"
         self._date.setEnabled(self._scope == "day")
         self._open_reg_btn.setEnabled(self._scope == "day")
@@ -1637,6 +1647,8 @@ class DayIssuesWidget(QWidget):
                     live_extras=extra_txs,
                     day_cache=self._day_snap_cache,
                     payee_names=self._payees,
+                    only_days=self._scan_days,
+                    progress=None if quiet else self._show_scan_progress,
                 )
             else:
                 snap = await collect_day_issues(
@@ -1675,6 +1687,15 @@ class DayIssuesWidget(QWidget):
             self._loading = False
             if not quiet:
                 self._loading_overlay.hide_loading()
+
+    def _show_scan_progress(self, done: int, total: int) -> None:
+        if total <= 1:
+            return
+        self._loading_overlay.show_loading(
+            f"Scanning day issues: {done} of {total} days",
+            value=done,
+            maximum=total,
+        )
 
     def _apply_filters(self, *, repaint: bool = True) -> None:
         self._issues = filter_day_issues(
