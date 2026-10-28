@@ -51,6 +51,28 @@ def _reset_keyboard_modifiers() -> None:
     sink.deleteLater()
 
 
+def pytest_configure(config) -> None:
+    config.addinivalue_line(
+        "markers", "real_await_ui: keep DayIssuesWidget._await_ui on its QTimer path"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _day_issues_dialogs_inline(request, monkeypatch):
+    """pytest-asyncio loops do not pump Qt, so an ``_await_ui`` tick never fires."""
+    if request.node.get_closest_marker("real_await_ui") is not None:
+        return
+    try:
+        from tahmeed.ui.cashier.day_issues import DayIssuesWidget
+    except Exception:
+        return
+
+    async def _inline(_self, fn):
+        return fn()
+
+    monkeypatch.setattr(DayIssuesWidget, "_await_ui", _inline)
+
+
 @pytest.fixture(autouse=True)
 def _quiesce_qt_widgets(monkeypatch):
     # Depends on monkeypatch so this teardown runs before the test's patches

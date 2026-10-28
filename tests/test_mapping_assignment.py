@@ -86,6 +86,32 @@ async def test_create_item_falls_back_to_cashier_endpoint(monkeypatch) -> None:
     assert result._id == new_cat._id
 
 
+@pytest.mark.asyncio
+async def test_cashier_fallback_accepts_every_add_item_field(monkeypatch) -> None:
+    from tahmeed.services import category_service
+    from tahmeed.services import mapping_assignment_service as mas
+
+    async def manager_create(*_a, **_k):
+        raise ApiError("forbidden", status_code=403, code="forbidden")
+
+    sent: dict = {}
+
+    async def request(method, path, json=None, **_k):
+        sent.update(path=path, body=json)
+        return {"_id": str(ObjectId()), "name": json["name"]}
+
+    monkeypatch.setattr(mas, "create_category", manager_create)
+    monkeypatch.setattr(category_service.api_client, "request", request)
+
+    result = await mas.create_item_for_mapping(
+        "Fuel Supplier", {"is_supplier": True, "requires_truck": False}
+    )
+
+    assert result.name == "Fuel Supplier"
+    assert sent["path"] == "v1/categories/cashier-create"
+    assert sent["body"]["is_supplier"] is True
+
+
 def test_remember_category_replaces_placeholder() -> None:
     placeholder = Category(name="Parking")
     created = Category(_id=ObjectId(), name="Parking")

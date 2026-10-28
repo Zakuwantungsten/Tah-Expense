@@ -6098,11 +6098,17 @@ class DailyRegister(QWidget):
             if not ok:
                 return
 
+        # Same day on My: staging only touches unsaved rows, so the server day
+        # cache stays valid. Invalidating it here left the day "stale" with no
+        # reload, which forced every later My/Parked/Merged switch through a
+        # full server reload + draft rebuild.
+        keep_day_cache = primary == self._current_date and self._view_mode == "my"
         # Drop any crash-recovery draft for the target day so load cannot re-inject
         # old rows under the fresh import. The local Parked bucket survives,
         # except rows parked from an earlier import of this same file.
         self._clear_day_draft_keep_parked(primary, source=preview.source_filename)
-        self._invalidate_day_tx_cache()
+        if not keep_day_cache:
+            self._invalidate_day_tx_cache()
 
         self._skip_draft_restore = True
         try:
@@ -8288,11 +8294,15 @@ class DailyRegister(QWidget):
                     continue
                 rid = self._ensure_row_client_id(row)
                 pending = self._pending_row_meta.get(row)
-                new_rows.append({
+                entry = {
                     "client_row_id": rid,
                     "cells": cells_for_json(self._row_value_map(row)),
                     "pending_meta": serialize_pending_meta(pending),
-                })
+                }
+                allow = self._truck_allow_anyway.get(row)
+                if allow:
+                    entry["allow_anyway"] = allow
+                new_rows.append(entry)
         edit_mode_flag = self._edit_mode and include_dirty and bool(dirty_saved)
         return dirty_saved, new_rows, edit_mode_flag
 
@@ -8477,6 +8487,9 @@ class DailyRegister(QWidget):
                         row = start + offset
                         if row < self._saved_count:
                             continue
+                        allow = (entry.get("allow_anyway") or "").strip()
+                        if allow:
+                            self._truck_allow_anyway[row] = allow
                         truck_cells.extend(self._write_row_values(row, values))
                         meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
                         if rid:

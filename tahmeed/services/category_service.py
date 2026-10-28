@@ -255,6 +255,7 @@ async def create_cashier_category(
     show_in_cashier_sidebar: bool = False,
     sort_order: int = 0,
     lock_description: bool = False,
+    is_supplier: bool = False,
 ) -> Category:
     return await _create_category(
         "v1/categories/cashier-create",
@@ -269,6 +270,7 @@ async def create_cashier_category(
         show_in_cashier_sidebar,
         sort_order,
         lock_description,
+        is_supplier=is_supplier,
     )
 
 

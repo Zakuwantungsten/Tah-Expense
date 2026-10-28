@@ -50,7 +50,9 @@ from tahmeed.services.mapping_assignment_service import (
     materialize_mapping_assignment,
     remember_category,
 )
-from tahmeed.services.payee_service import add_payee, get_payee_names
+from tahmeed.services.payee_service import (
+    add_payee, get_payee_names, invalidate_payee_cache,
+)
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
     _finish_table_row, _table_cell_font, _table_style, _ROW_H,
@@ -1064,6 +1066,10 @@ class DayIssuesWidget(QWidget):
         # Verify handoff: All days limited to the blocked rows' days (None = every open day).
         self._scan_days: Optional[Tuple[date, ...]] = None
         self._lookups_loaded = False
+        # One Map dialog/save at a time; a second click would race the first.
+        self._map_in_flight = False
+        # Manual Refresh: re-download Item/Payee lists instead of the cached snapshot.
+        self._refetch_lookups = False
         # Optional: (replace_transactions, extra_transactions) for live/unsaved rows.
         self._row_source = row_source
         # Optional: stamp Payee+Item onto live Table / draft rows (Phase 3).
@@ -1356,6 +1362,26 @@ class DayIssuesWidget(QWidget):
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self.refresh())
 
+    async def _await_ui(self, fn: Callable[[], object]):
+        """Run a modal dialog from a Qt tick while this task is suspended.
+
+        exec() inside a running task blocks other tasks' wake-ups on Python
+        3.14 / qasync, and a dropped wake-up freezes that task for good.
+        """
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        def _run() -> None:
+            if fut.done():
+                return
+            try:
+                fut.set_result(fn())
+            except Exception as exc:
+                fut.set_exception(exc)
+
+        QTimer.singleShot(0, _run)
+        return await fut
+
     def _kick_mapping_apply_drain(self) -> None:
         from tahmeed.services.mapping_apply_outbox import drain_mapping_apply_outbox
         from tahmeed.ui.async_utils import schedule_coro
@@ -1392,10 +1418,9 @@ class DayIssuesWidget(QWidget):
         try:
             await set_setting("auto_fill_from_description_maps", on)
         except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "Setting not saved",
-                f"Could not save auto-fill preference:\n{exc}",
+            msg = f"Could not save auto-fill preference:\n{exc}"
+            await self._await_ui(
+                lambda: QMessageBox.warning(self, "Setting not saved", msg)
             )
             # Revert checkbox to last known server/default without re-saving.
             self._auto_fill_maps_chk.blockSignals(True)
@@ -1409,6 +1434,7 @@ class DayIssuesWidget(QWidget):
         self._dirty = True
         self._day_snap_cache.clear()
         self._lookups_loaded = False
+        self._refetch_lookups = True
         self._source_refresh_timer.stop()
         self._schedule_refresh()
 
@@ -1626,10 +1652,17 @@ class DayIssuesWidget(QWidget):
         self._loading = True
         if not quiet:
             self._loading_overlay.show_loading("Scanning day issues…")
+        error_msg: Optional[str] = None
         try:
             replace_txs, extra_txs = self._row_source_args()
             need_lookups = not self._lookups_loaded or not self._categories or not self._payees
             if need_lookups:
+                if self._refetch_lookups:
+                    from tahmeed.services.catalog_service import fetch_catalog_snapshot
+
+                    await fetch_catalog_snapshot(refresh=True)
+                    invalidate_payee_cache()
+                    self._refetch_lookups = False
                 cats, payees = await asyncio.gather(
                     get_payment_target_categories(),
                     get_payee_names(active_only=True),
@@ -1681,12 +1714,16 @@ class DayIssuesWidget(QWidget):
             self._dirty = False
             self._loaded = True
         except Exception as exc:
-            QMessageBox.critical(self, "Day Issues", f"Could not load issues:\n{exc}")
+            error_msg = f"Could not load issues:\n{exc}"
             self.issues_changed.emit(0)
         finally:
             self._loading = False
             if not quiet:
                 self._loading_overlay.hide_loading()
+        if error_msg is not None:
+            await self._await_ui(
+                lambda: QMessageBox.critical(self, "Day Issues", error_msg)
+            )
 
     def _show_scan_progress(self, done: int, total: int) -> None:
         if total <= 1:
@@ -1980,8 +2017,9 @@ class DayIssuesWidget(QWidget):
         try:
             cat = await create_item_for_mapping(data.get("name") or "", data)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to create item:\n{exc}")
+            msg = f"Failed to create item:\n{exc}"
             self._set_issue_cell(row, _COL_ITEM, "")
+            await self._await_ui(lambda: QMessageBox.critical(self, "Error", msg))
             return
         if not any(c.name.lower() == cat.name.lower() for c in self._categories):
             self._categories.append(cat)
@@ -1994,8 +2032,9 @@ class DayIssuesWidget(QWidget):
         try:
             await add_payee(name, currency=currency or "TZS")
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to create payee:\n{exc}")
+            msg = f"Failed to create payee:\n{exc}"
             self._set_issue_cell(row, _COL_PAYEE, "")
+            await self._await_ui(lambda: QMessageBox.critical(self, "Error", msg))
             return
         normalized = " ".join(name.upper().split())
         if payee_needs_create(normalized, self._payees):
@@ -2229,12 +2268,12 @@ class DayIssuesWidget(QWidget):
         """Commit inline drafts that have both Payee and Item (skip incomplete)."""
         filled = self._filled_drafts()
         if not filled:
-            QMessageBox.information(
+            await self._await_ui(lambda: QMessageBox.information(
                 self,
                 "Save Filled",
                 "Fill both Payee and Item on one or more rows first.\n"
                 "Incomplete drafts (only one field) are not saved.",
-            )
+            ))
             return
 
         resolved: List[tuple] = []
@@ -2254,13 +2293,13 @@ class DayIssuesWidget(QWidget):
 
         if unknown_items:
             sample = ", ".join(sorted(set(unknown_items))[:6])
-            QMessageBox.warning(
+            await self._await_ui(lambda: QMessageBox.warning(
                 self,
                 "Unknown Item",
                 f"These Item name(s) are not in the item list and were skipped:\n"
                 f"{sample}\n\n"
                 "Pick an existing item (or use Map Selected → New Item…).",
-            )
+            ))
             if not resolved:
                 return
 
@@ -2270,12 +2309,13 @@ class DayIssuesWidget(QWidget):
         })
         if odd_payees:
             tip = "\n".join(f"  · {p}" for p in odd_payees[:8])
-            if QMessageBox.question(
+            answer = await self._await_ui(lambda: QMessageBox.question(
                 self,
                 "Create payee(s)?",
                 f"These payees are not in the Payee list:\n{tip}\n\n"
                 "Create them and save the mappings?",
-            ) != QMessageBox.Yes:
+            ))
+            if answer != QMessageBox.Yes:
                 return
 
         self._loading_overlay.show_loading("Saving filled mappings…")
@@ -2284,7 +2324,10 @@ class DayIssuesWidget(QWidget):
                 await add_payee(name)
             except Exception as exc:
                 self._loading_overlay.hide_loading()
-                QMessageBox.warning(self, "Could Not Create Payee", str(exc))
+                msg = str(exc)
+                await self._await_ui(
+                    lambda: QMessageBox.warning(self, "Could Not Create Payee", msg)
+                )
                 return
             if payee_needs_create(name, self._payees):
                 self._payees.append(name)
@@ -2330,7 +2373,11 @@ class DayIssuesWidget(QWidget):
                 )
         except Exception as exc:
             self._last_mapping_undo = None
-            QMessageBox.critical(self, "Save Filled Failed", str(exc))
+            self._loading_overlay.hide_loading()
+            err = str(exc)
+            await self._await_ui(
+                lambda: QMessageBox.critical(self, "Save Filled Failed", err)
+            )
             return
         finally:
             self._loading_overlay.hide_loading()
@@ -2341,10 +2388,23 @@ class DayIssuesWidget(QWidget):
             f"{' (DB rows updating in background).' if live_n or committed else '.'}"
         )
         await self._finish_mapping_ui(descs)
-        if self._confirm_mapping_undo(msg):
+        if await self._await_ui(lambda: self._confirm_mapping_undo(msg)):
             await self._undo_last_mapping()
 
     async def _do_map(
+        self,
+        descriptions: List[str],
+        source_issues: List[DayIssue],
+    ) -> None:
+        if self._map_in_flight:
+            return
+        self._map_in_flight = True
+        try:
+            await self._run_map(descriptions, source_issues)
+        finally:
+            self._map_in_flight = False
+
+    async def _run_map(
         self,
         descriptions: List[str],
         source_issues: List[DayIssue],
@@ -2374,19 +2434,27 @@ class DayIssuesWidget(QWidget):
             prefill_payee=prefill_payee,
             prefill_item=prefill_item,
         )
-        if dlg.exec() != QDialog.Accepted:
+        if await self._await_ui(dlg.exec) != QDialog.Accepted:
             return
         assignment = dlg.result_assignment
         payee = dlg.result_payee
         if assignment is None or not payee:
             return
+        self._loading_overlay.show_loading("Saving mappings…")
         try:
             category = await materialize_mapping_assignment(assignment, self._categories)
         except Exception as exc:
-            QMessageBox.warning(self, "Could Not Save Item", str(exc))
+            self._loading_overlay.hide_loading()
+            err = str(exc)
+            await self._await_ui(
+                lambda: QMessageBox.warning(self, "Could Not Save Item", err)
+            )
             return
         if category is None or category._id is None:
-            QMessageBox.warning(self, "Select Item", "Please choose or create an item.")
+            self._loading_overlay.hide_loading()
+            await self._await_ui(lambda: QMessageBox.warning(
+                self, "Select Item", "Please choose or create an item."
+            ))
             return
         remember_category(self._categories, category)
 
@@ -2394,12 +2462,15 @@ class DayIssuesWidget(QWidget):
             try:
                 await add_payee(payee, currency=dlg.result_currency or "TZS")
             except Exception as exc:
-                QMessageBox.warning(self, "Could Not Create Payee", str(exc))
+                self._loading_overlay.hide_loading()
+                err = str(exc)
+                await self._await_ui(
+                    lambda: QMessageBox.warning(self, "Could Not Create Payee", err)
+                )
                 return
             if payee_needs_create(payee, self._payees):
                 self._payees.append(payee)
 
-        self._loading_overlay.show_loading("Saving mappings…")
         try:
             prior_by_key = await self._snapshot_prior_maps(descriptions)
             # Optimistic: live stamp first, bulk map upsert, DB apply in outbox.
@@ -2431,7 +2502,11 @@ class DayIssuesWidget(QWidget):
                 self._mapping_drafts.pop(normalize_description(desc), None)
         except Exception as exc:
             self._last_mapping_undo = None
-            QMessageBox.critical(self, "Mapping Failed", str(exc))
+            self._loading_overlay.hide_loading()
+            err = str(exc)
+            await self._await_ui(
+                lambda: QMessageBox.critical(self, "Mapping Failed", err)
+            )
             return
         finally:
             self._loading_overlay.hide_loading()
@@ -2456,7 +2531,7 @@ class DayIssuesWidget(QWidget):
             f"Saved register rows are updating in the background."
         )
         await self._finish_mapping_ui(descriptions)
-        if self._confirm_mapping_undo(msg):
+        if await self._await_ui(lambda: self._confirm_mapping_undo(msg)):
             await self._undo_last_mapping()
 
     async def _finish_mapping_ui(self, descriptions: Sequence[str]) -> None:
@@ -2570,7 +2645,9 @@ class DayIssuesWidget(QWidget):
             self._clear_live_rows(snap.descriptions, days=snap.dates)
             await self._clear_saved_rows(snap.descriptions, days=snap.dates)
         except Exception as exc:
-            QMessageBox.critical(self, "Undo Failed", str(exc))
+            self._loading_overlay.hide_loading()
+            err = str(exc)
+            await self._await_ui(lambda: QMessageBox.critical(self, "Undo Failed", err))
             return
         finally:
             self._loading_overlay.hide_loading()
@@ -2578,13 +2655,13 @@ class DayIssuesWidget(QWidget):
         self.mark_dirty(days=snap.dates)
         self.mappings_applied.emit()
         await self.refresh(quiet=False)
-        QMessageBox.information(
+        await self._await_ui(lambda: QMessageBox.information(
             self,
             "Mapping undone",
             f"Reverted {len(snap.descriptions):,} description(s).\n"
             "Description Maps and Table / register stamps from that action "
             "were reversed.",
-        )
+        ))
 
     def _clear_live_rows(
         self,

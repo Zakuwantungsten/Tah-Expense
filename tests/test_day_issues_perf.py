@@ -514,6 +514,177 @@ async def test_do_map_skips_catalog_reload_when_lists_are_warm(monkeypatch) -> N
     assert calls == ["dialog"]
 
 
+@pytest.mark.real_await_ui
+def test_await_ui_runs_dialog_on_a_qt_tick_not_inside_the_task() -> None:
+    import asyncio
+
+    from PySide6.QtTest import QTest
+
+    app = _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    ran: list[str] = []
+
+    def dialog() -> str:
+        ran.append("dialog")
+        return "accepted"
+
+    async def exercise() -> str:
+        task = asyncio.create_task(widget._await_ui(dialog))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # Not opened inside the task step; it waits for the Qt tick.
+        assert ran == [] and not task.done()
+        for _ in range(40):
+            app.processEvents()
+            if task.done():
+                break
+            await asyncio.sleep(0)
+            QTest.qWait(10)
+        return await task
+
+    assert asyncio.run(exercise()) == "accepted"
+    assert ran == ["dialog"]
+
+
+@pytest.mark.asyncio
+async def test_do_map_ignores_second_map_while_one_is_open(monkeypatch) -> None:
+    from PySide6.QtWidgets import QDialog
+
+    from tahmeed.models.category import Category
+
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    widget._lookups_loaded = True
+    widget._categories = [Category(name="Parking")]
+    widget._payees = ["CITY COUNCIL"]
+    seen: list[bool] = []
+
+    class FakeDlg:
+        def __init__(self, *_a, **_k):
+            seen.append(widget._map_in_flight)
+
+        def exec(self) -> int:
+            return QDialog.Rejected
+
+    monkeypatch.setattr("tahmeed.ui.cashier.day_issues.MapDescriptionsDialog", FakeDlg)
+
+    widget._map_in_flight = True
+    await widget._do_map(["LATRA FEE"], [_issue("LATRA FEE")])
+    assert seen == []
+
+    widget._map_in_flight = False
+    await widget._do_map(["LATRA FEE"], [_issue("LATRA FEE")])
+    assert seen == [True]
+    assert widget._map_in_flight is False
+
+
+@pytest.mark.asyncio
+async def test_do_map_shows_saving_before_creating_item(monkeypatch) -> None:
+    from PySide6.QtWidgets import QDialog, QMessageBox
+
+    from tahmeed.models.category import Category
+
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    widget._lookups_loaded = True
+    widget._categories = [Category(name="Parking")]
+    widget._payees = ["CITY COUNCIL"]
+    events: list[str] = []
+
+    class FakeDlg:
+        result_assignment = object()
+        result_payee = "NEW PAYEE"
+        result_create_payee = True
+        result_currency = "TZS"
+
+        def __init__(self, *_a, **_k):
+            pass
+
+        def exec(self) -> int:
+            return QDialog.Accepted
+
+    async def materialize(*_a, **_k):
+        events.append("materialize")
+        raise RuntimeError("server down")
+
+    monkeypatch.setattr("tahmeed.ui.cashier.day_issues.MapDescriptionsDialog", FakeDlg)
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.materialize_mapping_assignment", materialize
+    )
+    monkeypatch.setattr(
+        widget._loading_overlay, "show_loading",
+        lambda text, **_k: events.append(f"show:{text}"),
+    )
+    monkeypatch.setattr(
+        widget._loading_overlay, "hide_loading", lambda: events.append("hide")
+    )
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda _p, title, _m: events.append(f"warn:{title}")),
+    )
+
+    await widget._do_map(["LATRA FEE"], [_issue("LATRA FEE")])
+
+    assert events == [
+        "show:Saving mappings…",
+        "materialize",
+        "hide",
+        "warn:Could Not Save Item",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_manual_refresh_redownloads_item_and_payee_lists(monkeypatch) -> None:
+    from tahmeed.models.category import Category
+
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    widget._categories = [Category(name="Old Item")]
+    widget._payees = ["OLD PAYEE"]
+    widget._lookups_loaded = True
+    calls: list[str] = []
+
+    async def fetch(*, refresh: bool = False):
+        calls.append(f"fetch:{refresh}")
+        return {}
+
+    monkeypatch.setattr("tahmeed.services.catalog_service.fetch_catalog_snapshot", fetch)
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.invalidate_payee_cache",
+        lambda: calls.append("invalidate"),
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.get_payment_target_categories",
+        AsyncMock(return_value=[Category(name="New Item")]),
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.get_payee_names",
+        AsyncMock(return_value=["NEW PAYEE"]),
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.collect_day_issues",
+        AsyncMock(return_value=DayIssuesSnapshot(target_date=widget._target)),
+    )
+    widget._schedule_refresh = lambda: None  # type: ignore[method-assign]
+
+    widget.force_refresh()
+    await widget.refresh(quiet=True)
+
+    assert calls == ["fetch:True", "invalidate"]
+    assert [c.name for c in widget._categories] == ["New Item"]
+    assert widget._payees == ["NEW PAYEE"]
+
+    # A later soft refresh keeps using the cached lists.
+    calls.clear()
+    widget._lookups_loaded = False
+    await widget.refresh(quiet=True)
+    assert calls == []
+
+
 @pytest.mark.asyncio
 async def test_all_days_reuses_day_cache(monkeypatch) -> None:
     d1 = date(2026, 3, 1)
