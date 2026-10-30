@@ -284,7 +284,10 @@ async def transactions_by_date(
     target_date: date = Query(..., alias="date"),
     cashier_id: str | None = None,
     merged: bool = False,
+    include_parked: bool = False,
 ) -> dict:
+    """One register day. ``include_parked`` adds every cashier's parked rows
+    to a single-cashier day so the Parked tab is shared."""
     query: dict[str, Any] = {
         **register_day_clause(target_date),
         "rejected": {"$ne": True},
@@ -292,10 +295,13 @@ async def transactions_by_date(
         "trashed": {"$ne": True},
     }
     if not merged:
-        if cashier_id:
-            query["cashier_id"] = _valid_id(cashier_id)
+        owner = _valid_id(cashier_id) if cashier_id else actor["_id"]
+        if include_parked:
+            query["$and"] = [
+                {"$or": [{"cashier_id": owner}, {"register_status": "parked"}]}
+            ]
         else:
-            query["cashier_id"] = actor["_id"]
+            query["cashier_id"] = owner
     # cashier_id + date bounds match the register_by_day index when it exists.
     # The index is created by migrate, not on this request.
     cursor = (
@@ -631,6 +637,9 @@ async def daily_summaries(
                 "draft_count": {
                     "$sum": {"$cond": [{"$eq": ["$register_status", "draft"]}, 1, 0]}
                 },
+                "parked_count": {
+                    "$sum": {"$cond": [{"$eq": ["$register_status", "parked"]}, 1, 0]}
+                },
                 "submitted_count": {
                     "$sum": {
                         "$cond": [
@@ -671,6 +680,7 @@ async def daily_summaries(
                 "total_refund": doc["total_refund"],
                 "cashier_ids": cashier_ids,
                 "draft_count": int(doc.get("draft_count") or 0),
+                "parked_count": int(doc.get("parked_count") or 0),
                 "submitted_count": int(doc.get("submitted_count") or 0),
             }
         )
@@ -1299,12 +1309,20 @@ async def open_day_summaries(
     actor: RegisterActor,
     cashier_id: str | None = None,
     all_cashiers: bool = False,
+    include_parked: bool = False,
     limit: int = Query(120, ge=1, le=500),
 ) -> dict:
-    """Calendar days with open (unverified) register rows — Day Issues All days."""
+    """Calendar days with open (unverified) register rows — Day Issues All days.
+
+    ``include_parked`` adds days holding any cashier's parked rows (shared Parked).
+    """
     match: dict[str, Any] = dict(OPEN_REGISTER_MATCH)
     if not all_cashiers:
-        match["cashier_id"] = _actor_cashier_id(actor, cashier_id)
+        owner = _actor_cashier_id(actor, cashier_id)
+        if include_parked:
+            match["$or"] = [{"cashier_id": owner}, {"register_status": "parked"}]
+        else:
+            match["cashier_id"] = owner
     pipeline = [
         {"$match": match},
         {"$addFields": {"register_day": REGISTER_DAY_EXPR}},
@@ -1438,20 +1456,25 @@ async def submit_day_for_verify(
             },
         ],
     }
+    # Submit covers every cashier's drafts for the day; per-cashier badge
+    # deltas must follow each row's owner, not the submitter.
+    before = await load_badge_docs(db, submit_filter)
+    if before is not None:
+        submit_filter = {
+            "$and": [
+                {"_id": {"$in": [doc["_id"] for doc in before]}},
+                submit_filter,
+            ]
+        }
     result = await db.transactions.update_many(
         submit_filter,
         {"$set": {"register_status": "submitted"}},
     )
     updated = int(result.modified_count)
-    cashier_deltas = None
-    actor_id = actor.get("_id")
-    if updated and actor_id is not None and actor.get("role") == "cashier":
-        cashier_deltas = {str(actor_id): {"drafts": -updated, "parked": 0}}
-    await adjust_badges(
-        db,
-        {"drafts": -updated, "verify": updated},
-        cashier_deltas=cashier_deltas,
-    )
+    if before is not None:
+        await apply_remembered(db, before, {"register_status": "submitted"}, updated)
+    else:
+        await adjust_badges(db, {"drafts": -updated, "verify": updated})
     await record_operation_event(
         db,
         action="txn.submit_day",
@@ -1917,6 +1940,11 @@ async def bulk_create_transactions(
     }
 
 
+def _cashier_trash_scope(cashier_id: Any) -> dict[str, Any]:
+    """Trash rows the cashier owns or trashed (any cashier may delete a shared day's rows)."""
+    return {"$or": [{"cashier_id": cashier_id}, {"trashed_by": cashier_id}]}
+
+
 @transactions.get("/trash")
 async def list_cashier_trash(
     request: Request,
@@ -1925,20 +1953,22 @@ async def list_cashier_trash(
     limit: int = Query(100, ge=1, le=500),
     skip: int = Query(0, ge=0),
 ) -> dict:
-    """Soft-deleted rows owned by the cashier (own soft-trash + accountant-confirmed)."""
+    """Soft-deleted rows the cashier owns or trashed (soft-trash + accountant-confirmed)."""
     db = _database(request)
-    query: dict[str, Any] = {
-        "trashed": True,
-        "cashier_id": actor.get("_id"),
-    }
+    clauses: list[dict[str, Any]] = [_cashier_trash_scope(actor.get("_id"))]
     if search.strip():
         esc = re.escape(search.strip())
-        query["$or"] = [
-            {"description": {"$regex": esc, "$options": "i"}},
-            {"item": {"$regex": esc, "$options": "i"}},
-            {"truck_number": {"$regex": esc, "$options": "i"}},
-            {"category_name": {"$regex": esc, "$options": "i"}},
-        ]
+        clauses.append(
+            {
+                "$or": [
+                    {"description": {"$regex": esc, "$options": "i"}},
+                    {"item": {"$regex": esc, "$options": "i"}},
+                    {"truck_number": {"$regex": esc, "$options": "i"}},
+                    {"category_name": {"$regex": esc, "$options": "i"}},
+                ]
+            }
+        )
+    query: dict[str, Any] = {"trashed": True, "$and": clauses}
     docs = (
         await db.transactions.find(query)
         .sort([("trashed_at", -1), ("date", -1)])
@@ -1953,7 +1983,7 @@ async def list_cashier_trash(
 @transactions.get("/trash/count")
 async def count_cashier_trash(request: Request, actor: RegisterActor) -> dict:
     total = await _database(request).transactions.count_documents(
-        {"trashed": True, "cashier_id": actor.get("_id")}
+        {"trashed": True, **_cashier_trash_scope(actor.get("_id"))}
     )
     return {"count": int(total)}
 
@@ -1979,7 +2009,7 @@ async def bulk_request_restore_from_trash(
             "_id": {"$in": ids},
             "trashed": True,
             "verified": True,
-            "cashier_id": cashier_id,
+            **_cashier_trash_scope(cashier_id),
             "restore_requested": {"$ne": True},
         },
         {
@@ -2010,7 +2040,7 @@ async def bulk_restore_own_unverified_trash(
     request: Request,
     actor: RegisterActor,
 ) -> dict:
-    """Cashier immediately restores own draft/submitted soft-trashed rows."""
+    """Cashier immediately restores draft/submitted rows they own or trashed."""
     ids = _cashier_trash_ids(body)
     if not ids:
         return {"updated": 0}
@@ -2020,7 +2050,7 @@ async def bulk_restore_own_unverified_trash(
         "_id": {"$in": ids},
         "trashed": True,
         "verified": {"$ne": True},
-        "cashier_id": cashier_id,
+        **_cashier_trash_scope(cashier_id),
     }
     before = await load_badge_docs(db, restore_filter)
     result = await db.transactions.update_many(
@@ -2065,7 +2095,7 @@ async def bulk_purge_own_unverified_trash(
     request: Request,
     actor: RegisterActor,
 ) -> dict:
-    """Cashier permanently deletes own draft/submitted soft-trashed rows."""
+    """Cashier permanently deletes draft/submitted rows they own or trashed."""
     ids = _cashier_trash_ids(body)
     if not ids:
         return {"deleted": 0}
@@ -2075,7 +2105,7 @@ async def bulk_purge_own_unverified_trash(
         "_id": {"$in": ids},
         "trashed": True,
         "verified": {"$ne": True},
-        "cashier_id": cashier_id,
+        **_cashier_trash_scope(cashier_id),
     }
     before = await load_badge_docs(db, purge_filter)
     result = await db.transactions.delete_many(purge_filter)
@@ -2169,8 +2199,9 @@ async def apply_description_mapping(
     """Stamp Payee + Item onto matching open rows in one ``update_many``.
 
     Cashiers (and accountants using the register) share this path. Cashiers are
-    always scoped to their own rows; accountants/admins may stamp any open rows
-    or optionally narrow with ``cashier_id``.
+    scoped to their own rows plus every cashier's parked rows (shared Parked
+    tab); accountants/admins may stamp any open rows or optionally narrow with
+    ``cashier_id``.
     """
     keys = {
         _normalize_description_key(raw)
@@ -2204,20 +2235,16 @@ async def apply_description_mapping(
 
     role = str(actor.get("role") or "").lower()
     actor_id = actor.get("_id")
-    scope_cashier: ObjectId | None = None
+    query: dict[str, Any] = dict(OPEN_REGISTER_MATCH)
     if role == "cashier":
         if not isinstance(actor_id, ObjectId):
             try:
                 actor_id = object_id(str(actor_id))
             except ValueError as exc:
                 raise ApiError(500, "invalid_actor", "Authenticated user id is invalid") from exc
-        scope_cashier = actor_id
+        query["$or"] = [{"cashier_id": actor_id}, {"register_status": "parked"}]
     elif body.cashier_id:
-        scope_cashier = _valid_id(body.cashier_id)
-
-    query: dict[str, Any] = dict(OPEN_REGISTER_MATCH)
-    if scope_cashier is not None:
-        query["cashier_id"] = scope_cashier
+        query["cashier_id"] = _valid_id(body.cashier_id)
     if parsed_dates:
         if len(parsed_dates) == 1:
             query = {"$and": [query, register_day_clause(parsed_dates[0])]}
@@ -2335,18 +2362,10 @@ async def request_or_delete_transaction(
     if not doc:
         return {"result": "not_found"}
 
-    # Cashiers may only delete / trash their own rows (Merged view safety).
-    # Accountants and admins may act on any cashier's register row.
+    # Any register user may delete any cashier's row on a shared day; the row
+    # lands in both the owner's and the deleter's Trash (``trashed_by``).
     role = str(actor.get("role") or "").lower()
     actor_id = actor.get("_id")
-    owner_id = doc.get("cashier_id")
-    if role == "cashier" and owner_id is not None and actor_id is not None:
-        if str(owner_id) != str(actor_id):
-            raise ApiError(
-                403,
-                "forbidden",
-                "You can only delete your own register entries.",
-            )
 
     # Pending-edit clones are disposable — hard-delete the clone only.
     is_pending_edit = bool(doc.get("original_transaction_id")) and not doc.get("verified")
@@ -2454,26 +2473,20 @@ async def request_restore_from_trash(
     cashier_id = actor.get("_id")
     if body and body.cashier_id:
         cashier_id = _valid_id(body.cashier_id)
-    doc = await db.transactions.find_one(
-        {
-            "_id": oid,
-            "trashed": True,
-            "verified": True,
-            "cashier_id": cashier_id,
-        }
-    )
+    restore_filter = {
+        "_id": oid,
+        "trashed": True,
+        "verified": True,
+        **_cashier_trash_scope(cashier_id),
+    }
+    doc = await db.transactions.find_one(restore_filter)
     if not doc:
         return {"result": "not_found"}
     if doc.get("restore_requested"):
         return {"result": "already_requested"}
     before = dict(doc)
     await db.transactions.update_one(
-        {
-            "_id": oid,
-            "trashed": True,
-            "verified": True,
-            "cashier_id": cashier_id,
-        },
+        restore_filter,
         {
             "$set": {
                 "restore_requested": True,
@@ -2506,7 +2519,7 @@ async def cancel_restore_request(
     cancel_filter = {
         "_id": oid,
         "trashed": True,
-        "cashier_id": actor.get("_id"),
+        **_cashier_trash_scope(actor.get("_id")),
         "restore_requested": True,
     }
     before = await load_badge_docs(db, cancel_filter)

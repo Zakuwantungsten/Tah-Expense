@@ -92,7 +92,7 @@ async def test_collect_all_days_uses_open_summaries(monkeypatch) -> None:
     async def fake_summaries(*_a, **_k):
         return [{"date": d1}, {"date": d2}]
 
-    async def fake_by_date(target, merged=True, cashier_id=None):
+    async def fake_by_date(target, merged=True, cashier_id=None, **_k):
         if target == d1:
             return [_tx(cashier_id=me, description="A FEE", item="", payee="")]
         return [_tx(cashier_id=me, description="B FEE", item="", payee="")]
@@ -133,7 +133,7 @@ async def test_collect_all_days_loads_in_parallel_and_maps_once(monkeypatch) -> 
     peak = 0
     map_calls: list = []
 
-    async def fake_by_date(target, merged=True, cashier_id=None):
+    async def fake_by_date(target, merged=True, cashier_id=None, **_k):
         nonlocal in_flight, peak
         in_flight += 1
         peak = max(peak, in_flight)
@@ -174,7 +174,7 @@ async def test_collect_all_days_only_days_skips_open_day_lookup(monkeypatch) -> 
     async def no_summaries(*_a, **_k):
         raise AssertionError("open-day lookup must be skipped")
 
-    async def fake_by_date(target, merged=True, cashier_id=None):
+    async def fake_by_date(target, merged=True, cashier_id=None, **_k):
         fetched.append(target)
         return [_tx(description=f"FEE {target.day}", item="", payee="")]
 
@@ -195,3 +195,52 @@ async def test_collect_all_days_only_days_skips_open_day_lookup(monkeypatch) -> 
     assert sorted(fetched) == [d1, d3]
     assert set(snap.days_scanned) == {d1, d3}
     assert {i.description for i in snap.issues} == {"FEE 1", "FEE 3"}
+
+
+@pytest.mark.asyncio
+async def test_collect_all_days_uses_local_rows_for_every_day(monkeypatch) -> None:
+    d1, d2, d3 = date(2026, 3, 1), date(2026, 3, 2), date(2026, 3, 3)
+    me = ObjectId()
+    fetched: list = []
+
+    async def fake_summaries(*_a, **_k):
+        return [{"date": d1}]
+
+    async def fake_by_date(target, merged=True, cashier_id=None, **_k):
+        fetched.append(target)
+        if target == d1:
+            return [_tx(cashier_id=me, description="SERVER FEE")]
+        return []
+
+    monkeypatch.setattr(
+        "tahmeed.services.cashier_service.get_open_day_summaries", fake_summaries,
+    )
+    monkeypatch.setattr(
+        "tahmeed.services.day_issues_service.get_transactions_by_date", fake_by_date,
+    )
+    monkeypatch.setattr(
+        "tahmeed.services.day_issues_service.get_mappings_for_descriptions",
+        lambda _descs: _async({}),
+    )
+
+    # d2 was scanned before its draft rows were typed; the stale entry must not win.
+    cache = {d2: DayIssuesSnapshot(target_date=d2, issues=[])}
+    snap = await collect_day_issues_all_days(
+        cashier_id=me,
+        anchor_date=d1,
+        local_rows={
+            d2: (None, [_tx(cashier_id=me, description="DRAFT FEE")]),
+            d3: ([_tx(cashier_id=me, description="OPEN DAY FEE")], None),
+        },
+        day_cache=cache,
+        payee_names=[],
+    )
+
+    assert {i.description for i in snap.issues} == {
+        "SERVER FEE",
+        "DRAFT FEE",
+        "OPEN DAY FEE",
+    }
+    assert set(snap.days_scanned) == {d1, d2, d3}
+    assert sorted(fetched) == [d1, d2]
+    assert cache[d2].total == 1

@@ -42,6 +42,43 @@ def test_as_py_date_datetime_and_date():
     assert _as_py_date(None) is None
 
 
+def _status(**counts) -> str:
+    return TransactionBrowser._simple_status_text(
+        {"cashier_ids": ["c1"], **counts}, {"c1": "Aisha"}
+    )
+
+
+def test_simple_status_parked_rows_are_not_submitted():
+    assert (
+        _status(entries_count=8, draft_count=5, parked_count=3, submitted_count=0)
+        == "Aisha · 5 draft, 3 parked"
+    )
+
+
+def test_simple_status_all_parked():
+    assert (
+        _status(entries_count=3, draft_count=0, parked_count=3, submitted_count=0)
+        == "Aisha · All parked"
+    )
+
+
+def test_simple_status_mixed_with_legacy_rows():
+    # 2 legacy rows have no register_status and count as submitted.
+    assert (
+        _status(entries_count=7, draft_count=2, parked_count=1, submitted_count=2)
+        == "Aisha · 4 submitted, 2 draft, 1 parked"
+    )
+
+
+def test_simple_status_existing_labels_unchanged():
+    assert _status(entries_count=4, draft_count=0, submitted_count=4) == "Aisha · All submitted"
+    assert _status(entries_count=4, draft_count=4, submitted_count=0) == "Aisha · All draft"
+    assert (
+        _status(entries_count=5, draft_count=2, submitted_count=3)
+        == "Aisha · 3 submitted, 2 draft"
+    )
+
+
 def test_open_upload_jumps_to_register_not_advanced():
     browser = _browser()
     jumped = []

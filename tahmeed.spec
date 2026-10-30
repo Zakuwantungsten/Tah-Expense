@@ -18,6 +18,10 @@ datas = [
     ("tahmeed/assets/splash_mark.png", "tahmeed/assets"),
     ("tahmeed/assets/horse_mark.png", "tahmeed/assets"),
     ("tahmeed/assets/logo_blue.png", "tahmeed/assets"),
+    (
+        "tahmeed/assets/mapping_packs/expense_automation.tmpack.json",
+        "tahmeed/assets/mapping_packs",
+    ),
 ]
 datas += collect_data_files("qtawesome")
 

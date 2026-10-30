@@ -1,4 +1,4 @@
-"""Merged context menu: copy + own-delete; no entry actions while browsing."""
+"""Merged context menu: copy + delete; no entry actions while browsing."""
 from __future__ import annotations
 
 import sys
@@ -62,12 +62,12 @@ def test_merged_browse_menu_has_copy_and_own_delete(merged_register, monkeypatch
     assert "Paste" not in texts
 
 
-def test_merged_browse_others_row_copy_only(merged_register):
+def test_merged_browse_others_row_offers_delete(merged_register):
     merged_register._table.setCurrentCell(1, 3)
     menu = QMenu()
     merged_register._populate_context_menu(menu)
     texts = _action_texts(menu)
-    assert texts == ["Copy"]
+    assert texts == ["Copy", "Delete Saved Entry"]
 
 
 def test_merged_edit_menu_allows_cut_insert_not_blank_rows(merged_register):

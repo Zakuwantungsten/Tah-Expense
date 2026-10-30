@@ -25,7 +25,10 @@ async def test_submit_blocked_when_server_parked_remain(monkeypatch):
         cashier_id=ObjectId(),
     )
 
-    async def fake_by_date(*_a, **_k):
+    fetches: list[dict] = []
+
+    async def fake_by_date(*_a, **kwargs):
+        fetches.append(kwargs)
         return [parked]
 
     warned: list = []
@@ -48,6 +51,8 @@ async def test_submit_blocked_when_server_parked_remain(monkeypatch):
     assert result is None
     assert warned
     assert "Parked trucks block submit" in warned[0][1]
+    # Submit covers the whole day, so another cashier's parked rows count too.
+    assert fetches and fetches[0].get("include_parked") is True
 
 
 @pytest.mark.asyncio

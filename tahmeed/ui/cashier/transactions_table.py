@@ -1539,7 +1539,7 @@ class TransactionBrowser(QWidget):
 
     @staticmethod
     def _simple_status_text(summary: dict, names: dict) -> str:
-        """e.g. 'Merged by Aisha, John · All submitted' or 'Aisha · 2 draft, 3 submitted'."""
+        """e.g. 'Merged by Aisha, John · All submitted' or 'Aisha · 3 submitted, 2 draft, 1 parked'."""
         cashier_ids = summary.get("cashier_ids") or []
         people = []
         for cid in cashier_ids:
@@ -1551,18 +1551,28 @@ class TransactionBrowser(QWidget):
         people = sorted(set(people), key=str.lower)
 
         draft = int(summary.get("draft_count") or 0)
+        parked = int(summary.get("parked_count") or 0)
         submitted = int(summary.get("submitted_count") or 0)
         total = int(summary.get("entries_count") or 0)
         # Legacy rows without register_status count as submitted in the pipeline.
-        if draft + submitted < total:
-            submitted = total - draft
+        if draft + parked + submitted < total:
+            submitted = total - draft - parked
 
-        if draft and submitted:
-            state = f"{submitted} submitted, {draft} draft"
-        elif draft:
-            state = "All draft" if draft == total else f"{draft} draft"
-        else:
+        parts = [
+            (n, label)
+            for n, label in (
+                (submitted, "submitted"),
+                (draft, "draft"),
+                (parked, "parked"),
+            )
+            if n
+        ]
+        if not parts:
             state = "All submitted"
+        elif len(parts) == 1 and parts[0][0] == total:
+            state = f"All {parts[0][1]}"
+        else:
+            state = ", ".join(f"{n} {label}" for n, label in parts)
 
         if not people:
             return state

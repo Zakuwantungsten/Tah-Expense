@@ -408,17 +408,20 @@ class _IssuesCompleterDelegate(_IssuesRowDelegate):
         *,
         uppercase: bool = False,
         navigate: Optional[Callable[[int, int, str], None]] = None,
+        matcher: Optional[Callable[[str, List[str]], List[str]]] = None,
     ):
         super().__init__(parent)
         self._suggestions_getter = suggestions_getter
         self._uppercase = uppercase
         self._navigate = navigate
+        self._matcher = matcher
 
     def createEditor(self, parent, option, index):
         ed = CompleterLineEdit(
             self._suggestions_getter() or [],
             parent=parent,
             ranked_contains=True,
+            matcher=self._matcher,
         )
         ed.setStyleSheet(
             f"QLineEdit {{ color: {_T1}; background: {_WHITE};"
@@ -1036,6 +1039,7 @@ class DayIssuesWidget(QWidget):
         *,
         row_source: Optional[Callable[[date], Tuple[Optional[list], Optional[list]]]] = None,
         apply_live: Optional[Callable[..., int]] = None,
+        local_days: Optional[Callable[[], List[date]]] = None,
     ) -> None:
         super().__init__(parent)
         self._user = user
@@ -1072,6 +1076,8 @@ class DayIssuesWidget(QWidget):
         self._refetch_lookups = False
         # Optional: (replace_transactions, extra_transactions) for live/unsaved rows.
         self._row_source = row_source
+        # Optional: register days with rows only this desktop has (All days).
+        self._local_days = local_days
         # Optional: stamp Payee+Item onto live Table / draft rows (Phase 3).
         self._apply_live = apply_live
         # Last successful map — offered once via the success dialog Undo button.
@@ -1592,6 +1598,26 @@ class DayIssuesWidget(QWidget):
                 replace_txs, extra_txs = None, None
         return replace_txs, extra_txs
 
+    def _all_days_local_rows(self, replace_txs, extra_txs) -> dict:
+        """Live / unsaved register rows per day for the All-days scan."""
+        rows = {self._target: (replace_txs, extra_txs)}
+        if self._local_days is None or self._row_source is None:
+            return rows
+        try:
+            days = list(self._local_days() or [])
+        except Exception:
+            days = []
+        if self._scan_days:
+            days = [d for d in days if d in self._scan_days]
+        for d in days:
+            if d in rows:
+                continue
+            try:
+                rows[d] = self._row_source(d)
+            except Exception:
+                continue
+        return rows
+
     def _drop_issue_keys(self, keys: set) -> None:
         """Instant UI update after map — remove resolved descriptions from the list."""
         if not keys:
@@ -1675,9 +1701,7 @@ class DayIssuesWidget(QWidget):
                 snap = await collect_day_issues_all_days(
                     cashier_id=self._cashier_scope_id,
                     anchor_date=self._target,
-                    live_target=self._target,
-                    live_transactions=replace_txs,
-                    live_extras=extra_txs,
+                    local_rows=self._all_days_local_rows(replace_txs, extra_txs),
                     day_cache=self._day_snap_cache,
                     payee_names=self._payees,
                     only_days=self._scan_days,

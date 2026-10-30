@@ -1022,6 +1022,7 @@ class CashierDashboard(QWidget):
             user=self._user,
             row_source=self._register.day_issues_row_source,
             apply_live=self._register.apply_description_mapping_to_open_rows,
+            local_days=self._register.day_issues_local_days,
         )
         self._day_issues.open_register.connect(self._on_day_issues_open_register)
         self._day_issues.issues_changed.connect(self._on_day_issues_badge)

@@ -164,8 +164,11 @@ def _is_open_row(tx) -> bool:
 
 
 def _cashier_id_matches(tx, cashier_id: Optional[ObjectId]) -> bool:
-    """When *cashier_id* is set, keep only that cashier's rows."""
+    """When *cashier_id* is set, keep that cashier's rows plus every parked row
+    (the Parked tab is shared, so its issues are too)."""
     if cashier_id is None:
+        return True
+    if (getattr(tx, "register_status", "") or "") == "parked":
         return True
     cid = getattr(tx, "cashier_id", None)
     if cid is None:
@@ -196,8 +199,9 @@ async def collect_day_issues(
     for the open register day). Pass ``extra_transactions`` to overlay dirty
     saved rows and append unsaved / draft rows onto the DB result.
 
-    When ``cashier_id`` is set (cashier UI), only that cashier's rows count.
-    Accountant UI passes ``cashier_id=None`` to include everyone.
+    When ``cashier_id`` is set (cashier UI), that cashier's rows plus every
+    cashier's parked rows count. Accountant UI passes ``cashier_id=None`` to
+    include everyone.
     """
     open_rows = await _load_open_rows(
         target,
@@ -224,7 +228,7 @@ async def _load_open_rows(
         rows = list(transactions)
     elif cashier_id is not None:
         rows = await get_transactions_by_date(
-            target, merged=False, cashier_id=cashier_id
+            target, merged=False, cashier_id=cashier_id, include_parked=True
         )
     else:
         rows = await get_transactions_by_date(target, merged=True)
@@ -383,6 +387,7 @@ async def collect_day_issues_all_days(
     live_target: Optional[date] = None,
     live_transactions: Optional[Sequence] = None,
     live_extras: Optional[Sequence] = None,
+    local_rows: Optional[dict] = None,
     limit_days: int = 120,
     day_cache: Optional[dict] = None,
     payee_names: Optional[Sequence[str]] = None,
@@ -391,10 +396,12 @@ async def collect_day_issues_all_days(
 ) -> DayIssuesSnapshot:
     """Build Day Issues across open register days (incomplete rows only).
 
-    When *day_cache* is provided, previously scanned days are reused unless they
-    are the live register day (always refreshed from live rows). Successful
-    scans are written back into *day_cache*. *only_days* skips the open-day
-    lookup and scans just those register days.
+    *local_rows* maps register days to ``(replace_transactions,
+    extra_transactions)`` held only on this desktop (open register snapshot,
+    unsaved draft rows). Those days, and *live_target*, are always listed and
+    rescanned; other days reuse *day_cache* when provided. Successful scans are
+    written back into *day_cache*. *only_days* skips the open-day lookup and
+    scans just those register days.
     """
     from tahmeed.services.cashier_service import get_open_day_summaries
 
@@ -407,6 +414,7 @@ async def collect_day_issues_all_days(
             summaries = await get_open_day_summaries(
                 cashier_id,
                 all_cashiers=cashier_id is None,
+                include_parked=cashier_id is not None,
                 limit=limit_days,
             )
         except Exception:
@@ -415,9 +423,11 @@ async def collect_day_issues_all_days(
             d = row.get("date")
             if isinstance(d, date):
                 days.append(d)
-    if live_target is not None and live_target not in days:
-        days.append(live_target)
-    if not days and live_transactions is None and live_extras is None:
+    local = {d: rows for d, rows in (local_rows or {}).items() if isinstance(d, date)}
+    if live_target is not None and live_target not in local:
+        local[live_target] = (live_transactions, live_extras)
+    days.extend(d for d in local if d not in days)
+    if not days:
         return DayIssuesSnapshot(
             target_date=anchor, issues=[], scope="all", days_scanned=[]
         )
@@ -425,9 +435,8 @@ async def collect_day_issues_all_days(
     by_day: dict[date, DayIssuesSnapshot] = {}
     to_scan: list[date] = []
     for d in sorted(set(days)):
-        is_live = live_target is not None and d == live_target
         cached = None if day_cache is None else day_cache.get(d)
-        if cached is not None and not is_live:
+        if cached is not None and d not in local:
             by_day[d] = cached
         else:
             to_scan.append(d)
@@ -440,11 +449,11 @@ async def collect_day_issues_all_days(
     async def _load(d: date) -> list:
         nonlocal done
         kwargs: dict = {"cashier_id": cashier_id}
-        if live_target is not None and d == live_target:
-            if live_transactions is not None:
-                kwargs["transactions"] = live_transactions
-            if live_extras is not None:
-                kwargs["extra_transactions"] = live_extras
+        replace_txs, extra_txs = local.get(d) or (None, None)
+        if replace_txs is not None:
+            kwargs["transactions"] = replace_txs
+        if extra_txs is not None:
+            kwargs["extra_transactions"] = extra_txs
         async with gate:
             rows = await _load_open_rows(d, **kwargs)
         done += 1

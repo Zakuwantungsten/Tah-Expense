@@ -281,6 +281,30 @@ def test_open_from_verify_limits_all_days_scan_to_handoff_days() -> None:
     assert widget._scan_days is None
 
 
+def test_all_days_local_rows_cover_every_local_register_day() -> None:
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    target, open_day, draft_day = date(2026, 3, 1), date(2026, 3, 2), date(2026, 3, 3)
+    sources = {open_day: (["open"], None), draft_day: (None, ["draft"])}
+    widget = DayIssuesWidget(
+        user,
+        row_source=lambda d: sources.get(d, (None, None)),
+        local_days=lambda: [target, open_day, draft_day],
+    )
+    widget._target = target
+
+    rows = widget._all_days_local_rows(None, ["picked"])
+
+    assert rows == {
+        target: (None, ["picked"]),
+        open_day: (["open"], None),
+        draft_day: (None, ["draft"]),
+    }
+
+    widget._scan_days = (target, draft_day)
+    assert set(widget._all_days_local_rows(None, None)) == {target, draft_day}
+
+
 def test_scan_progress_shows_days_on_overlay() -> None:
     _app()
     user = User(username="a1", password_hash="x", role="accountant", full_name="A1")
@@ -695,7 +719,7 @@ async def test_all_days_reuses_day_cache(monkeypatch) -> None:
     async def fake_summaries(*_a, **_k):
         return [{"date": d1}, {"date": d2}]
 
-    async def fake_by_date(target, merged=True, cashier_id=None):
+    async def fake_by_date(target, merged=True, cashier_id=None, **_k):
         collect_calls.append(target)
         return [_tx(cashier_id=me, description=f"FEE {target}", item="", payee="")]
 

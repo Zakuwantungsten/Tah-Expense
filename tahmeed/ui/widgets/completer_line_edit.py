@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from PySide6.QtWidgets import QLineEdit, QCompleter, QApplication
 from PySide6.QtCore import Qt, QStringListModel, QTimer, QEvent
@@ -164,21 +164,28 @@ class CompleterLineEdit(QLineEdit):
         parent: Optional[QLineEdit] = None,
         *,
         ranked_contains: bool = False,
+        matcher: Optional[Callable[[str, List[str]], List[str]]] = None,
     ) -> None:
+        """``matcher(text, values)`` replaces the contains filter with its own
+        ranked list (e.g. truck plates typed without spaces); implies
+        ``ranked_contains``."""
         super().__init__(parent)
         self._values = list(values or [])
-        self._ranked_contains = ranked_contains
+        self._matcher = matcher
+        self._ranked_contains = ranked_contains or matcher is not None
         self._typed = ""          # last text the user actually typed (not from the preview)
         self._suppress_preview = False  # True after Delete dismisses preview
         self._preview_active   = False  # True while a preview suggestion is displayed
         self._committing = False  # True while Tab/click writes a chosen suggestion
         self._ignore_highlight = False  # True while we auto-select popup row 0
 
-        self._model = QStringListModel(self._values, self)
+        self._model = QStringListModel([] if matcher else self._values, self)
         self._completer = QCompleter(self._model, self)
         self._completer.setCaseSensitivity(Qt.CaseInsensitive)
         self._completer.setFilterMode(Qt.MatchContains)
-        self._completer.setCompletionMode(QCompleter.PopupCompletion)
+        self._completer.setCompletionMode(
+            QCompleter.UnfilteredPopupCompletion if matcher else QCompleter.PopupCompletion
+        )
         self._completer.setMaxVisibleItems(8)
         self.setCompleter(self._completer)
         # QLineEdit+PopupCompletion inserts the highlighted row via
@@ -249,6 +256,10 @@ class CompleterLineEdit(QLineEdit):
     def set_values(self, values: List[str]) -> None:
         """Replace the suggestion list (e.g. once an async catalog load finishes)."""
         self._values = list(values or [])
+        if self._matcher is not None:
+            text = self._typed
+            self._model.setStringList(self._matcher(text, self._values) if text.strip() else [])
+            return
         self._model.setStringList(self._values)
 
     def canonical(self, text: str) -> Optional[str]:
@@ -275,6 +286,11 @@ class CompleterLineEdit(QLineEdit):
         self._typed = text
         self._suppress_preview = False  # new keystroke — re-enable auto-preview
         self._preview_active   = False
+        if self._matcher is not None:
+            self._model.setStringList(
+                self._matcher(text, self._values) if (text or "").strip() else []
+            )
+            return
         if self._ranked_contains:
             self._reorder_model_for_query(text)
             # setStringList can leave QCompleter's filter stale; reset the prefix
@@ -332,7 +348,7 @@ class CompleterLineEdit(QLineEdit):
             return
         # Ensure the completion model is filtered for the typed text (Qt may
         # still have an empty/stale prefix after a model rewrite).
-        if self._completer.completionPrefix() != query:
+        if self._matcher is None and self._completer.completionPrefix() != query:
             self._completer.setCompletionPrefix(query)
         model = self._completer.completionModel()
         if model is None or model.rowCount() == 0:

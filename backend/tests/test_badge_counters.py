@@ -340,6 +340,42 @@ async def test_overlapping_bulk_create_and_submit_keep_both_deltas() -> None:
     assert counters.doc["cashiers"][str(user["_id"])]["drafts"] == 2
 
 
+def test_submit_day_moves_each_owners_draft_badge() -> None:
+    submitter = _cashier()
+    other = ObjectId()
+    day = datetime(2026, 10, 22, 9, 0, 0)
+    rows = [
+        _open("draft", cashier_id=submitter["_id"], date=day),
+        _open("draft", cashier_id=other, date=day),
+        _open("draft", cashier_id=other, date=day),
+        _open("parked", cashier_id=other, date=day),
+    ]
+    collection = FakeTransactions(rows)
+    counters = FakeCounters()
+    counters.doc = {
+        "_id": "badges",
+        "drafts": 3,
+        "parked": 1,
+        "verify": 0,
+        "cashiers": {
+            str(submitter["_id"]): {"drafts": 1, "parked": 0},
+            str(other): {"drafts": 2, "parked": 1},
+        },
+    }
+    app = _app(collection, counters)
+    app.dependency_overrides[current_user] = lambda: submitter
+
+    with TestClient(app) as client:
+        resp = client.post("/v1/transactions/submit-day", json={"date": "2026-10-22"})
+
+    assert resp.json()["updated"] == 3
+    assert counters.doc["drafts"] == 0
+    assert counters.doc["parked"] == 1
+    assert counters.doc["verify"] == 3
+    assert counters.doc["cashiers"][str(submitter["_id"])] == {"drafts": 0, "parked": 0}
+    assert counters.doc["cashiers"][str(other)] == {"drafts": 0, "parked": 1}
+
+
 def test_submit_day_delta_matches_modified_count() -> None:
     user = _cashier()
     day = datetime(2026, 10, 22, 9, 0, 0)

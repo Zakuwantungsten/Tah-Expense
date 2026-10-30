@@ -248,6 +248,7 @@ class AccountantDashboard(QWidget):
                 user=self._user,
                 row_source=self._day_issues_row_source,
                 apply_live=self._day_issues_apply_live,
+                local_days=self._day_issues_local_days,
             )
             widget.open_register.connect(self._on_day_issues_open_register)
             widget.issues_changed.connect(self._on_day_issues_badge)
@@ -576,6 +577,11 @@ class AccountantDashboard(QWidget):
         if self._register is None:
             return None, None
         return self._register.day_issues_row_source(target)
+
+    def _day_issues_local_days(self) -> list:
+        if self._register is None:
+            return []
+        return self._register.day_issues_local_days()
 
     def _day_issues_apply_live(self, target, descriptions, **kwargs) -> int:
         if self._register is None:

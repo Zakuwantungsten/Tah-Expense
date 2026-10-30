@@ -227,6 +227,7 @@ class FakeTransactions:
                     ]
                 elif isinstance(group.get("_id"), dict) and "year" in group["_id"]:
                     # daily-summaries / months style
+                    browse_summary = "submitted_count" in group
                     buckets: dict[tuple, dict] = {}
                     for doc in docs:
                         day = doc.get("date") or doc.get("import_primary_date")
@@ -250,11 +251,19 @@ class FakeTransactions:
                                 "submitted_count": 0,
                             },
                         )
-                        status = doc.get("register_status") or "draft"
-                        if status == "parked":
-                            bucket["parked_count"] += 1
-                        else:
+                        if browse_summary:
+                            # Browse counts every visible row; missing status is legacy submitted.
+                            status = doc.get("register_status") or "submitted"
                             bucket["entries_count"] += 1
+                            bucket[f"{status}_count"] = (
+                                bucket.get(f"{status}_count", 0) + 1
+                            )
+                        else:
+                            status = doc.get("register_status") or "draft"
+                            if status == "parked":
+                                bucket["parked_count"] += 1
+                            else:
+                                bucket["entries_count"] += 1
                         bucket["total_tzs"] += float(doc.get("amount") or 0)
                         cid = doc.get("cashier_id")
                         if cid is not None and cid not in bucket["cashier_ids"]:
@@ -631,6 +640,81 @@ def test_by_date_scopes_to_cashier() -> None:
     assert body["items"][0]["description"] == "mine"
 
 
+def test_by_date_include_parked_adds_every_cashiers_parked_rows() -> None:
+    user = _cashier()
+    other = ObjectId()
+    base = {
+        "date": datetime(2026, 4, 1, 10, 0, 0),
+        "import_primary_date": None,
+        "rejected": False,
+        "trashed": False,
+        "deletion_requested": False,
+    }
+    collection = FakeTransactions(
+        [
+            {**base, "_id": ObjectId(), "description": "my draft",
+             "cashier_id": user["_id"], "register_status": "draft"},
+            {**base, "_id": ObjectId(), "description": "my parked",
+             "cashier_id": user["_id"], "register_status": "parked"},
+            {**base, "_id": ObjectId(), "description": "their parked",
+             "cashier_id": other, "register_status": "parked"},
+            {**base, "_id": ObjectId(), "description": "their draft",
+             "cashier_id": other, "register_status": "draft"},
+            {**base, "_id": ObjectId(), "description": "their trashed parked",
+             "cashier_id": other, "register_status": "parked", "trashed": True},
+            {**base, "_id": ObjectId(), "description": "their parked other day",
+             "cashier_id": other, "register_status": "parked",
+             "date": datetime(2026, 4, 2, 10, 0, 0)},
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        shared = client.get("/v1/transactions/by-date?date=2026-04-01&include_parked=true")
+        own = client.get("/v1/transactions/by-date?date=2026-04-01")
+
+    assert shared.status_code == 200
+    assert {d["description"] for d in shared.json()["items"]} == {
+        "my draft",
+        "my parked",
+        "their parked",
+    }
+    assert {d["description"] for d in own.json()["items"]} == {"my draft", "my parked"}
+
+
+def test_open_day_summaries_include_parked_lists_shared_parked_days() -> None:
+    user = _cashier()
+    other = ObjectId()
+    open_row = {
+        "import_primary_date": None,
+        "verified": False,
+        "rejected": False,
+        "discarded": False,
+        "deletion_requested": False,
+        "trashed": False,
+    }
+    collection = FakeTransactions(
+        [
+            {**open_row, "_id": ObjectId(), "date": datetime(2026, 4, 1, 9),
+             "cashier_id": user["_id"], "register_status": "draft"},
+            {**open_row, "_id": ObjectId(), "date": datetime(2026, 4, 2, 9),
+             "cashier_id": other, "register_status": "parked"},
+            {**open_row, "_id": ObjectId(), "date": datetime(2026, 4, 3, 9),
+             "cashier_id": other, "register_status": "draft"},
+        ]
+    )
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        shared = client.get("/v1/transactions/open-day-summaries?include_parked=true")
+        own = client.get("/v1/transactions/open-day-summaries")
+
+    assert sorted(d["date"] for d in shared.json()["items"]) == ["2026-04-01", "2026-04-02"]
+    assert [d["date"] for d in own.json()["items"]] == ["2026-04-01"]
+
+
 def test_create_requires_auth() -> None:
     app = _app(FakeTransactions())
     with TestClient(app) as client:
@@ -767,30 +851,51 @@ def test_request_delete_soft_trash_unverified_and_request_verified() -> None:
     assert by_id[verified].get("trashed") is not True
 
 
-def test_cashier_cannot_request_delete_another_cashiers_row() -> None:
+def test_cashier_can_trash_another_cashiers_row_and_both_see_it() -> None:
     actor = _cashier()
-    owner = ObjectId()
+    owner = _cashier()
+    stranger = _cashier()
     tx_id = ObjectId()
     collection = FakeTransactions(
         [
             {
                 "_id": tx_id,
                 "verified": False,
-                "register_status": "draft",
-                "cashier_id": owner,
+                "register_status": "parked",
+                "cashier_id": owner["_id"],
                 "trashed": False,
+                "description": "Diesel",
             }
         ]
     )
     app = _app(collection)
-    app.dependency_overrides[current_user] = lambda: actor
+    current = {"user": actor}
+    app.dependency_overrides[current_user] = lambda: current["user"]
 
     with TestClient(app) as client:
         resp = client.post(f"/v1/transactions/{tx_id}/request-delete", json={})
+        deleter_trash = client.get("/v1/transactions/trash?search=diesel")
+        deleter_count = client.get("/v1/transactions/trash/count")
+        current["user"] = owner
+        owner_trash = client.get("/v1/transactions/trash")
+        current["user"] = stranger
+        stranger_trash = client.get("/v1/transactions/trash")
+        current["user"] = actor
+        restored = client.post(
+            "/v1/transactions/trash/bulk-restore-own", json={"ids": [str(tx_id)]}
+        )
 
-    assert resp.status_code == 403
-    assert resp.json()["error"]["code"] == "forbidden"
-    assert collection.documents[0].get("trashed") is not True
+    assert resp.status_code == 200
+    assert resp.json() == {"result": "trashed"}
+    assert [d["_id"] for d in deleter_trash.json()["items"]] == [str(tx_id)]
+    assert deleter_count.json() == {"count": 1}
+    assert [d["_id"] for d in owner_trash.json()["items"]] == [str(tx_id)]
+    assert stranger_trash.json()["items"] == []
+    assert restored.json() == {"updated": 1}
+    doc = collection.documents[0]
+    assert doc["trashed"] is False
+    assert doc["cashier_id"] == owner["_id"]
+    assert doc["register_status"] == "parked"
 
 
 def test_accountant_can_request_delete_any_cashiers_row() -> None:
@@ -1244,6 +1349,54 @@ def test_browse_hides_trashed_deleted_and_discarded_rows() -> None:
     assert days.json()["items"][0]["total_tzs"] == 100
     assert descs.json()["items"] == ["Visible row"]
     assert items.json()["items"] == ["Fuel"]
+
+
+def test_daily_summaries_count_parked_separately_from_submitted() -> None:
+    user = _cashier()
+    base = {
+        "date": datetime(2026, 5, 2, 9, 0, 0),
+        "truck_number": "T9",
+        "amount": 100,
+        "item": "Fuel",
+        "category_name": "Fuel",
+    }
+    collection = FakeTransactions(
+        [
+            {**base, "_id": ObjectId(), "register_status": "draft"},
+            {**base, "_id": ObjectId(), "register_status": "draft"},
+            {**base, "_id": ObjectId(), "register_status": "parked"},
+            {**base, "_id": ObjectId(), "register_status": "parked"},
+            {**base, "_id": ObjectId(), "register_status": "parked"},
+            {**base, "_id": ObjectId(), "register_status": "submitted"},
+            {**base, "_id": ObjectId()},
+        ]
+    )
+    pipelines: list[list] = []
+    real_aggregate = collection.aggregate
+
+    def capture(pipeline: list):
+        pipelines.append(pipeline)
+        return real_aggregate(pipeline)
+
+    collection.aggregate = capture
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/v1/transactions/daily-summaries?date_from=2026-05-01&date_to=2026-05-31"
+        )
+
+    assert resp.status_code == 200
+    day = resp.json()["items"][0]
+    assert day["entries_count"] == 7
+    assert day["draft_count"] == 2
+    assert day["parked_count"] == 3
+    assert day["submitted_count"] == 2
+    group = next(s["$group"] for s in pipelines[0] if "$group" in s)
+    assert group["parked_count"] == {
+        "$sum": {"$cond": [{"$eq": ["$register_status", "parked"]}, 1, 0]}
+    }
 
 
 def test_browse_flat_prefers_pending_edit_clone_over_original() -> None:
@@ -1921,6 +2074,51 @@ def test_apply_description_mapping_cashier_scoped() -> None:
     assert own_doc["category_id"] == cat_id
     assert other_doc["payee"] == ""
     assert any(e["action"] == "txn.bulk_mapping_apply" for e in events.documents)
+
+
+def test_apply_description_mapping_cashier_reaches_other_cashiers_parked_rows() -> None:
+    me = ObjectId()
+    other = ObjectId()
+    open_row = {
+        "description": "LATRA FEE",
+        "date": datetime(2026, 10, 13, 8),
+        "import_primary_date": None,
+        "verified": False,
+        "rejected": False,
+        "discarded": False,
+        "deletion_requested": False,
+        "trashed": False,
+        "payee": "",
+        "item": "",
+    }
+    their_parked = ObjectId()
+    their_draft = ObjectId()
+    collection = FakeTransactions(
+        [
+            {**open_row, "_id": their_parked, "cashier_id": other, "register_status": "parked"},
+            {**open_row, "_id": their_draft, "cashier_id": other, "register_status": "draft"},
+        ]
+    )
+    app = _app(collection, events=FakeOperationEvents())
+    app.dependency_overrides[current_user] = lambda: _cashier(me)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/transactions/apply-description-mapping",
+            json={
+                "description_keys": ["LATRA FEE"],
+                "payee": "LATRA",
+                "category_name": "FEES",
+                "category_id": str(ObjectId()),
+                "dates": ["2026-10-13"],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["updated"] == 1
+    docs = {d["_id"]: d for d in collection.documents}
+    assert docs[their_parked]["payee"] == "LATRA"
+    assert docs[their_draft]["payee"] == ""
 
 
 def test_apply_description_mapping_accountant_all_cashiers() -> None:

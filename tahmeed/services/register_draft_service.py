@@ -321,8 +321,12 @@ def apply_mapping_to_draft_payload(
     item_col: int = 2,
     payee_col: int = 12,
     normalize_description=None,
+    sections: tuple[str, ...] = ("new_rows", "dirty_saved", "parked_rows"),
 ) -> int:
-    """Stamp Payee + Item onto matching draft new/dirty rows. Mutates *draft*.
+    """Stamp Payee + Item onto matching draft rows. Mutates *draft* entries.
+
+    *sections* picks which lists to stamp: typed ``new_rows``, edited
+    ``dirty_saved`` and the local Parked bucket ``parked_rows``.
 
     Pass ``clear_category=True`` (Day Issues Undo) to drop ``category_id`` from
     pending meta while writing blank Item / Payee.
@@ -336,37 +340,28 @@ def apply_mapping_to_draft_payload(
         normalize_description = _norm
 
     updated = 0
-    new_rows = list(draft.get("new_rows") or [])
-    for entry in new_rows:
-        cells = cells_from_json(entry.get("cells"))
-        key = normalize_description((cells.get(desc_col) or "").strip())
-        if not key or key not in description_keys:
-            continue
-        cells[item_col] = item_name
-        cells[payee_col] = payee
-        entry["cells"] = cells_for_json(cells)
-        meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
-        if clear_category:
-            meta.pop("category_id", None)
-        elif category_id is not None:
-            meta["category_id"] = category_id
-        entry["pending_meta"] = serialize_pending_meta(meta)
-        updated += 1
-
-    dirty = list(draft.get("dirty_saved") or [])
-    for entry in dirty:
-        cells = cells_from_json(entry.get("cells"))
-        key = normalize_description((cells.get(desc_col) or "").strip())
-        if not key or key not in description_keys:
-            continue
-        cells[item_col] = item_name
-        cells[payee_col] = payee
-        entry["cells"] = cells_for_json(cells)
-        updated += 1
-
-    if updated:
-        draft["new_rows"] = new_rows
-        draft["dirty_saved"] = dirty
+    for section in sections:
+        entries = [e for e in (draft.get(section) or []) if isinstance(e, dict)]
+        hit = 0
+        for entry in entries:
+            cells = cells_from_json(entry.get("cells"))
+            key = normalize_description((cells.get(desc_col) or "").strip())
+            if not key or key not in description_keys:
+                continue
+            cells[item_col] = item_name
+            cells[payee_col] = payee
+            entry["cells"] = cells_for_json(cells)
+            if section != "dirty_saved":
+                meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+                if clear_category:
+                    meta.pop("category_id", None)
+                elif category_id is not None:
+                    meta["category_id"] = category_id
+                entry["pending_meta"] = serialize_pending_meta(meta)
+            hit += 1
+        if hit:
+            draft[section] = entries
+            updated += hit
     return updated
 
 
@@ -400,6 +395,23 @@ def load_register_draft(
         return None
     ensure_draft_client_row_ids(raw)
     return raw
+
+
+def local_draft_dates(user_id: ObjectId | str) -> list[date]:
+    """Register days with a local draft file (My or Merged) for *user_id*."""
+    prefix = f"{user_id}_"
+    try:
+        paths = list(drafts_root().glob(f"{prefix}*.json"))
+    except OSError:
+        return []
+    days: set[date] = set()
+    for path in paths:
+        raw = path.stem[len(prefix):].rsplit("_", 1)[0]
+        try:
+            days.add(date.fromisoformat(raw))
+        except ValueError:
+            continue
+    return sorted(days)
 
 
 def clear_register_draft(

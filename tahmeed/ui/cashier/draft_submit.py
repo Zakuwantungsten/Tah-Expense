@@ -61,9 +61,12 @@ async def _submit_draft_day_body(
     from tahmeed.services.settings_service import get_setting
 
     # Parked truck follow-up must be resolved before Submit (Register + Drafts).
+    # Submit covers every cashier's drafts for the day, so count all parked rows.
     parked_n = 0
     try:
-        txs = await get_transactions_by_date(day, cashier_id=cashier_id)
+        txs = await get_transactions_by_date(
+            day, cashier_id=cashier_id, include_parked=True
+        )
         parked_n = sum(
             1
             for tx in txs

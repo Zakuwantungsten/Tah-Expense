@@ -65,6 +65,45 @@ def test_apply_mapping_to_draft_payload_updates_matching_new_rows() -> None:
     assert other[COL_PAYEE] == "Y"
 
 
+def test_apply_mapping_to_draft_payload_stamps_parked_rows() -> None:
+    from datetime import date
+
+    def entry(desc: str, meta: dict | None = None) -> dict:
+        return {
+            "cells": cells_for_json({COL_DESC: desc, COL_ITEM: "", COL_PAYEE: ""}),
+            "pending_meta": meta,
+        }
+
+    draft = build_draft_payload(
+        user_id=ObjectId(),
+        username="c1",
+        register_date=date(2026, 3, 15),
+        merged=False,
+        edit_mode=False,
+        dirty_saved=[],
+        new_rows=[entry("LATRA FEE")],
+        parked_rows=[entry("LATRA FEE", {"parked": True})],
+    )
+    keys = {normalize_description("LATRA FEE")}
+    cat_id = ObjectId()
+    common = dict(
+        payee="CITY COUNCIL",
+        item_name="Parking",
+        category_id=cat_id,
+        desc_col=COL_DESC,
+        item_col=COL_ITEM,
+        payee_col=COL_PAYEE,
+    )
+
+    assert apply_mapping_to_draft_payload(draft, keys, sections=("parked_rows",), **common) == 1
+    assert cells_from_json(draft["new_rows"][0]["cells"])[COL_PAYEE] == ""
+    parked = draft["parked_rows"][0]
+    assert cells_from_json(parked["cells"])[COL_PAYEE] == "CITY COUNCIL"
+    assert parked["pending_meta"] == {"parked": True, "category_id": str(cat_id)}
+
+    assert apply_mapping_to_draft_payload(draft, keys, **common) == 2
+
+
 def test_save_mapping_signature_includes_payee() -> None:
     import inspect
 

@@ -87,6 +87,7 @@ from tahmeed.services.register_draft_service import (
     fingerprint_is_meaningful,
     hydrate_pending_meta,
     load_register_draft,
+    local_draft_dates,
     new_client_row_id,
     normalize_sync_status,
     save_register_draft,
@@ -1852,7 +1853,11 @@ class DailyRegister(QWidget):
         upload_id: str = "",
         reload_local_parked: bool = True,
     ) -> None:
-        """Update parked badge, filter for My/Parked/Merged, populate the grid."""
+        """Update parked badge, filter for My/Parked/Merged, populate the grid.
+
+        A cashier day also carries every cashier's parked rows (shared Parked
+        tab), so My keeps only the signed-in cashier's non-parked rows.
+        """
         parked_all = [
             tx for tx in txs
             if (getattr(tx, "register_status", "") or "") == "parked"
@@ -1861,33 +1866,32 @@ class DailyRegister(QWidget):
             # Disk is the durable copy of the local Parked bucket (My file).
             self._load_local_parked_from_disk()
         if not self._merged_mode:
-            own_parked = [
-                tx for tx in parked_all
-                if tx.cashier_id == self._user._id
-                or str(tx.cashier_id) == str(self._user._id)
-            ]
-            self._server_parked_count = len(own_parked)
+            self._server_parked_count = len(parked_all)
             self._emit_parked_count()
         if self._parked_mode:
-            view_txs = [
-                tx for tx in txs
-                if (getattr(tx, "register_status", "") or "") == "parked"
-            ]
+            view_txs = parked_all
         else:
             view_txs = [
                 tx for tx in txs
                 if (getattr(tx, "register_status", "") or "") != "parked"
             ]
+            if not self._merged_mode and not upload_id:
+                view_txs = [tx for tx in view_txs if self._is_own_tx(tx)]
         self._pending_row_meta.clear()
         self._populate(view_txs)
         if self._parked_mode and not upload_id:
             self._append_local_parked_rows()
-        show_cashier = self._merged_mode or bool(upload_id)
+        show_cashier = self._merged_mode or self._parked_mode or bool(upload_id)
         self._apply_column_visibility(show_cashier=show_cashier)
 
     # ------------------------------------------------------------------
     # Local Parked bucket (incorrect trucks awaiting Save → server parked)
     # ------------------------------------------------------------------
+
+    def _is_own_tx(self, tx) -> bool:
+        uid = getattr(self._user, "_id", None)
+        owner = getattr(tx, "cashier_id", None)
+        return uid is not None and owner is not None and str(owner) == str(uid)
 
     def _emit_parked_count(self) -> None:
         self._parked_day_count = int(self._server_parked_count) + len(
@@ -2453,7 +2457,9 @@ class DailyRegister(QWidget):
             elif self._merged_mode:
                 txs = await get_transactions_by_date(d, merged=True)
             else:
-                txs = await get_transactions_by_date(d, cashier_id=self._user._id)
+                txs = await get_transactions_by_date(
+                    d, cashier_id=self._user._id, include_parked=True
+                )
             if meta is not None:
                 meta["rows"] = len(txs)
             if seq != self._load_gen:
@@ -2472,17 +2478,9 @@ class DailyRegister(QWidget):
                 self._day_tx_cache_key = self._make_day_cache_key(
                     d, merged=False, upload_id=upload_id or ""
                 )
-            if self._parked_mode:
-                view_for_names = [
-                    tx for tx in txs
-                    if (getattr(tx, "register_status", "") or "") == "parked"
-                ]
-            else:
-                view_for_names = [
-                    tx for tx in txs
-                    if (getattr(tx, "register_status", "") or "") != "parked"
-                ]
-            ids = [tx.cashier_id for tx in view_for_names if tx.cashier_id]
+            # Names for every row in the day so a cached My → Parked flip
+            # can label other cashiers' parked rows without a refetch.
+            ids = list({tx.cashier_id for tx in txs if tx.cashier_id})
             cashier_names = {}
             if ids:
                 from tahmeed.services.accountant_service import get_cashier_names
@@ -2665,7 +2663,11 @@ class DailyRegister(QWidget):
             QMessageBox.critical(self, "Submit Failed", str(exc))
 
     async def _confirm_parked_trucks_for_submit(self, d: date) -> bool:
-        """Block submit while parked incorrect-truck rows remain for this cashier."""
+        """Block submit while parked incorrect-truck rows remain on this day.
+
+        Submit covers every cashier's drafts for the day, so any cashier's
+        parked rows block it.
+        """
         if self._parked_mode:
             # Grid is the live copy of the local bucket while Parked is open.
             self._local_parked = self._table_parked_entries()
@@ -2673,7 +2675,9 @@ class DailyRegister(QWidget):
         if count <= 0 and self._current_date == d:
             # Refresh count from server if we have not loaded Parked yet.
             try:
-                txs = await get_transactions_by_date(d, cashier_id=self._user._id)
+                txs = await get_transactions_by_date(
+                    d, cashier_id=self._user._id, include_parked=True
+                )
                 self._server_parked_count = sum(
                     1
                     for tx in txs
@@ -3165,21 +3169,14 @@ class DailyRegister(QWidget):
         return bucket
 
     def _server_parked_txs_for_totals(self) -> list:
-        """Parked server txs for the open day (own cashier unless Merged)."""
+        """Parked server txs for the open day, every cashier (shared Parked tab)."""
         if self._merged_mode:
             txs = list(self._merged_tx_cache or [])
         else:
             txs = list(self._day_tx_cache or [])
-        parked = [
+        return [
             tx for tx in txs
             if (getattr(tx, "register_status", "") or "") == "parked"
-        ]
-        if self._merged_mode:
-            return parked
-        uid = self._user._id
-        return [
-            tx for tx in parked
-            if tx.cashier_id == uid or str(tx.cashier_id) == str(uid)
         ]
 
     def _my_money_bucket(self) -> dict:
@@ -4343,15 +4340,9 @@ class DailyRegister(QWidget):
             sel_rows = sorted({i.row() for i in self._table.selectedIndexes()})
             if sel_rows and self._selection_is_full_rows(sel_rows):
                 saved = [r for r in sel_rows if r < self._saved_count]
-                owned = self._owned_saved_rows(saved)
-                if owned:
-                    self._delete_saved_rows(owned)
-                elif saved:
-                    QMessageBox.information(
-                        self,
-                        "Delete",
-                        "You can only delete your own register entries.",
-                    )
+                deletable = self._deletable_saved_rows(saved)
+                if deletable:
+                    self._delete_saved_rows(deletable)
                 # Unsaved full rows still use the existing row-remove path.
                 if any(r >= self._saved_count for r in sel_rows):
                     self._delete_rows()
@@ -5711,39 +5702,28 @@ class DailyRegister(QWidget):
     # Context menu
     # ------------------------------------------------------------------
 
-    def _owns_saved_row(self, row: int) -> bool:
-        """True when the signed-in user may delete/edit this saved register row.
+    def _can_delete_saved_row(self, row: int) -> bool:
+        """True for any saved register row: every cashier may fix a shared day."""
+        return self._saved_txs.get(row) is not None
 
-        Cashiers: own rows only. Accountants/admins: any row (Merged oversight).
-        """
-        role = (getattr(self._user, "role", "") or "").lower()
-        if role in ("admin", "accountant"):
-            return True
-        tx = self._saved_txs.get(row)
-        if tx is None:
-            return False
-        owner = getattr(tx, "cashier_id", None)
-        uid = getattr(self._user, "_id", None)
-        if owner is None or uid is None:
-            return False
-        return str(owner) == str(uid)
+    def _deletable_saved_rows(self, rows: list) -> list:
+        return [
+            r for r in rows if r in self._saved_ids and self._can_delete_saved_row(r)
+        ]
 
-    def _owned_saved_rows(self, rows: list) -> list:
-        return [r for r in rows if r in self._saved_ids and self._owns_saved_row(r)]
-
-    def _add_delete_own_saved_actions(
-        self, menu: QMenu, *, row: int, saved_sel: list, owned_sel: list
+    def _add_delete_saved_actions(
+        self, menu: QMenu, *, row: int, saved_sel: list, deletable_sel: list
     ) -> bool:
-        """Add Delete for owned saved rows. Returns True if an action was added."""
-        if owned_sel and self._selection_is_full_rows(saved_sel):
+        """Add Delete for saved rows. Returns True if an action was added."""
+        if deletable_sel and self._selection_is_full_rows(saved_sel):
             label = (
                 "Delete Saved Entr"
-                + ("ies" if len(owned_sel) > 1 else "y")
+                + ("ies" if len(deletable_sel) > 1 else "y")
             )
             act = menu.addAction(label)
-            act.triggered.connect(lambda: self._delete_saved_rows(owned_sel))
+            act.triggered.connect(lambda: self._delete_saved_rows(deletable_sel))
             return True
-        if 0 <= row < self._saved_count and self._owns_saved_row(row):
+        if 0 <= row < self._saved_count and self._can_delete_saved_row(row):
             act = menu.addAction("Delete Saved Entry")
             act.triggered.connect(lambda: self._delete_saved_row(row))
             return True
@@ -5753,15 +5733,15 @@ class DailyRegister(QWidget):
         row = self._table.currentRow()
         sel_rows = sorted({i.row() for i in self._table.selectedIndexes()})
         saved_sel = [r for r in sel_rows if r < self._saved_count]
-        owned_sel = self._owned_saved_rows(saved_sel)
+        deletable_sel = self._deletable_saved_rows(saved_sel)
 
         # Copy is always useful in Merged browse and My entry.
         menu.addAction("Copy", self._copy)
 
         if self._merged_mode and not self._edit_mode:
-            # Day browser: copy + delete own only. No entry / insert actions.
-            self._add_delete_own_saved_actions(
-                menu, row=row, saved_sel=saved_sel, owned_sel=owned_sel
+            # Day browser: copy + delete. No entry / insert actions.
+            self._add_delete_saved_actions(
+                menu, row=row, saved_sel=saved_sel, deletable_sel=deletable_sel
             )
             return
 
@@ -5771,10 +5751,9 @@ class DailyRegister(QWidget):
             menu.addAction("Paste", self._paste)
             if self._has_cut_buffer():
                 menu.addAction("Insert Cut Cells", self._insert_cut_cells)
-            if self._add_delete_own_saved_actions(
-                menu, row=row, saved_sel=saved_sel, owned_sel=owned_sel
-            ):
-                pass
+            self._add_delete_saved_actions(
+                menu, row=row, saved_sel=saved_sel, deletable_sel=deletable_sel
+            )
             if self._undo_stack or self._redo_stack:
                 menu.addSeparator()
             if self._undo_stack:
@@ -5785,12 +5764,12 @@ class DailyRegister(QWidget):
 
         # My entries — full entry surface.
         if not self._edit_mode and (
-            owned_sel
-            or (0 <= row < self._saved_count and self._owns_saved_row(row))
+            deletable_sel
+            or (0 <= row < self._saved_count and self._can_delete_saved_row(row))
         ):
             menu.addSeparator()
-            self._add_delete_own_saved_actions(
-                menu, row=row, saved_sel=saved_sel, owned_sel=owned_sel
+            self._add_delete_saved_actions(
+                menu, row=row, saved_sel=saved_sel, deletable_sel=deletable_sel
             )
             return
 
@@ -5867,25 +5846,10 @@ class DailyRegister(QWidget):
         self._delete_saved_rows([row])
 
     def _delete_saved_rows(self, rows: list) -> None:
-        requested = sorted({r for r in rows if r in self._saved_ids})
-        rows = self._owned_saved_rows(requested)
-        skipped = len(requested) - len(rows)
+        rows = self._deletable_saved_rows(sorted({r for r in rows if r in self._saved_ids}))
         n_rows = len(rows)
         if not n_rows:
-            if skipped:
-                QMessageBox.information(
-                    self,
-                    "Delete",
-                    "You can only delete your own register entries.",
-                )
             return
-        if skipped:
-            QMessageBox.information(
-                self,
-                "Delete",
-                f"{skipped} selected entr{'y belongs' if skipped == 1 else 'ies belong'} "
-                "to another cashier and will be skipped.",
-            )
 
         verified_n = 0
         pending_n = 0
@@ -6794,7 +6758,9 @@ class DailyRegister(QWidget):
     def _apply_column_visibility(self, *, show_cashier: bool | None = None) -> None:
         """Apply Cashier visibility + user Hide Column state."""
         if show_cashier is None:
-            show_cashier = bool(self._merged_mode or self._load_upload_id)
+            show_cashier = bool(
+                self._merged_mode or self._parked_mode or self._load_upload_id
+            )
         for col in range(self._table.columnCount()):
             if col == COL_CASHIER:
                 self._table.setColumnHidden(col, not show_cashier)
@@ -7505,14 +7471,12 @@ class DailyRegister(QWidget):
         self.day_issues_source_changed.emit()
 
     def snapshot_transactions_for_day_issues(self) -> list:
-        """Live Table rows (saved + unsaved) using current Item / Payee / Desc cells.
+        """Live rows for the open day — My entries AND Parked, whichever tab shows.
 
-        Used as the authoritative Day Issues source when this register date is open.
+        Uses current Item / Payee / Desc cells. Used as the authoritative Day
+        Issues source when this register date is open.
         """
-        from dataclasses import replace
         from datetime import datetime as _dt
-
-        from tahmeed.models.transaction import Transaction
 
         if self._current_date is None:
             return []
@@ -7521,15 +7485,44 @@ class DailyRegister(QWidget):
             self._current_date.month,
             self._current_date.day,
         )
+        out = self._day_issue_rows_from_table(
+            self._table,
+            saved_count=self._saved_count,
+            saved_txs=self._saved_txs,
+            base_dt=base_dt,
+        )
+        if self._parked_mode:
+            out.extend(self._hidden_my_rows_for_day_issues(base_dt))
+        else:
+            out.extend(self._hidden_parked_rows_for_day_issues(base_dt))
+        return out
+
+    def _day_issue_rows_from_table(
+        self,
+        table,
+        *,
+        saved_count: int,
+        saved_txs: dict,
+        base_dt,
+    ) -> list:
+        """Saved + typed rows of one register surface as Day Issues transactions."""
+        from dataclasses import replace
+
+        from tahmeed.models.transaction import Transaction
+
+        def cell(row: int, col: int) -> str:
+            it = table.item(row, col)
+            return it.text().strip() if it else ""
+
         out: list = []
-        for row in range(self._table.rowCount()):
-            if row >= self._saved_count and not self._row_has_data(row):
-                continue
-            desc = self._cell_text(row, COL_DESC).strip()
-            item = self._cell_text(row, COL_ITEM).strip()
-            payee = self._cell_text(row, COL_PAYEE).strip()
-            if row < self._saved_count:
-                base = self._saved_txs.get(row)
+        if table is None:
+            return out
+        for row in range(table.rowCount()):
+            desc = cell(row, COL_DESC)
+            item = cell(row, COL_ITEM)
+            payee = cell(row, COL_PAYEE)
+            if row < saved_count:
+                base = saved_txs.get(row)
                 if base is None:
                     continue
                 out.append(
@@ -7548,7 +7541,7 @@ class DailyRegister(QWidget):
                 Transaction(
                     date=base_dt,
                     description=desc,
-                    truck_number=self._cell_text(row, COL_TRUCK).strip(),
+                    truck_number=cell(row, COL_TRUCK),
                     amount=0.0,
                     item=item,
                     category_name=item,
@@ -7559,26 +7552,49 @@ class DailyRegister(QWidget):
             )
         return out
 
-    def local_draft_transactions_for_day_issues(self, target: date) -> list:
-        """Unsaved draft rows for *target* when the Table is not open on that date."""
-        from datetime import datetime as _dt
+    def _hidden_my_rows_for_day_issues(self, base_dt) -> list:
+        """My entries while Parked is showing: keep-alive table, else cache + draft."""
+        session = self._my_session
+        if session is not None and self._my_table is not None:
+            return self._day_issue_rows_from_table(
+                self._my_table,
+                saved_count=int(session.get("saved_count") or 0),
+                saved_txs=session.get("saved_txs") or {},
+                base_dt=base_dt,
+            )
+        saved = [
+            tx for tx in (self._day_tx_cache or [])
+            if (getattr(tx, "register_status", "") or "") != "parked"
+            and self._is_own_tx(tx)
+        ]
+        try:
+            draft = load_register_draft(
+                self._user._id, self._current_date, merged=False
+            )
+        except Exception:
+            draft = None
+        new_rows = (draft or {}).get("new_rows") or []
+        return saved + self._draft_entries_to_day_issue_txs(new_rows, base_dt)
 
+    def _hidden_parked_rows_for_day_issues(self, base_dt) -> list:
+        """Parked rows while My / Merged shows: saved parked + local Parked bucket."""
+        return list(self._server_parked_txs_for_totals()) + (
+            self._draft_entries_to_day_issue_txs(self._local_parked, base_dt)
+        )
+
+    def _draft_entries_to_day_issue_txs(self, entries, base_dt) -> list:
+        """Draft-file row entries (new / parked) as unsaved Day Issues transactions."""
         from tahmeed.models.transaction import Transaction
 
-        draft = load_register_draft(
-            self._user._id, target, merged=self._merged_mode
-        )
-        if draft is None or draft_is_empty(draft):
-            return []
-        base_dt = _dt(target.year, target.month, target.day)
         out: list = []
-        for entry in draft.get("new_rows") or []:
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
             cells = cells_from_json(entry.get("cells"))
             desc = (cells.get(COL_DESC) or "").strip()
             if not desc:
                 continue
             item = (cells.get(COL_ITEM) or "").strip()
-            payee = (cells.get(COL_PAYEE) or "").strip()
             out.append(
                 Transaction(
                     date=base_dt,
@@ -7587,12 +7603,59 @@ class DailyRegister(QWidget):
                     amount=0.0,
                     item=item,
                     category_name=item,
-                    payee=payee,
+                    payee=(cells.get(COL_PAYEE) or "").strip(),
                     cashier_id=getattr(self._user, "_id", None),
                     verified=False,
                 )
             )
         return out
+
+    def local_draft_transactions_for_day_issues(self, target: date) -> list:
+        """Unsaved draft rows for *target* when the Table is not open on that date.
+
+        New rows come from the active draft file; unsaved parked rows always
+        live in the My draft file.
+        """
+        from datetime import datetime as _dt
+
+        base_dt = _dt(target.year, target.month, target.day)
+        draft = load_register_draft(
+            self._user._id, target, merged=self._merged_mode
+        )
+        out: list = []
+        if draft is not None and not draft_is_empty(draft):
+            out = self._draft_entries_to_day_issue_txs(
+                draft.get("new_rows") or [], base_dt
+            )
+        my_draft = (
+            load_register_draft(self._user._id, target, merged=False)
+            if self._merged_mode
+            else draft
+        )
+        out.extend(
+            self._draft_entries_to_day_issue_txs(draft_parked_rows(my_draft), base_dt)
+        )
+        return out
+
+    def day_issues_local_days(self) -> list:
+        """Register days holding rows only this desktop has: the open day plus
+        days whose draft file still has unsaved rows."""
+        days: set = set()
+        if self._current_date is not None:
+            days.add(self._current_date)
+        try:
+            draft_days = local_draft_dates(self._user._id)
+        except Exception:
+            draft_days = []
+        for d in draft_days:
+            if d in days:
+                continue
+            try:
+                if self.local_draft_transactions_for_day_issues(d):
+                    days.add(d)
+            except Exception:
+                continue
+        return sorted(days)
 
     def day_issues_row_source(self, target: date) -> tuple:
         """Return ``(replace_transactions, extra_transactions)`` for Day Issues.
@@ -7670,70 +7733,30 @@ class DailyRegister(QWidget):
         emit_source_changed: bool = True,
         clear_category: bool = False,
     ) -> int:
-        from dataclasses import replace
-
-        from tahmeed.services.description_mapping_service import normalize_description
-
-        updated = 0
+        """Stamp the open day: visible table, the hidden My / Parked surface,
+        and the day caches the other tab repaints from."""
+        stamp = dict(
+            keys=keys,
+            payee=payee,
+            item_name=item_name,
+            category_id=category_id,
+            cashier_id=cashier_id,
+            clear_category=clear_category,
+        )
         self._commit_open_editor()
         prev_bulk = self._bulk_mutating
         self._bulk_mutating = True
-        prev = self._table.blockSignals(True)
         try:
-            for row in range(self._table.rowCount()):
-                if row >= self._saved_count and not self._row_has_data(row):
-                    continue
-                desc = self._cell_text(row, COL_DESC).strip()
-                key = normalize_description(desc)
-                if not key or key not in keys:
-                    continue
-                if row < self._saved_count:
-                    tx = self._saved_txs.get(row)
-                    if tx is None:
-                        continue
-                    if getattr(tx, "verified", False) or getattr(tx, "trashed", False):
-                        continue
-                    if getattr(tx, "discarded", False):
-                        continue
-                    if cashier_id is not None:
-                        cid = getattr(tx, "cashier_id", None)
-                        if cid is None or str(cid) != str(cashier_id):
-                            continue
-                    self._write_mapping_cells(
-                        row, item_name=item_name, payee=payee, saved=True
-                    )
-                    if clear_category:
-                        next_cat_id = None
-                    elif category_id is not None:
-                        next_cat_id = category_id
-                    else:
-                        next_cat_id = tx.category_id
-                    self._saved_txs[row] = replace(
-                        tx,
-                        item=item_name,
-                        category_name=item_name,
-                        category_id=next_cat_id,
-                        payee=payee,
-                    )
-                    updated += 1
-                    continue
-
-                if cashier_id is not None:
-                    # Unsaved rows belong to the signed-in user.
-                    if str(getattr(self._user, "_id", "") or "") != str(cashier_id):
-                        continue
-                self._write_mapping_cells(
-                    row, item_name=item_name, payee=payee, saved=False
-                )
-                meta = dict(self._pending_row_meta.get(row) or {})
-                if clear_category:
-                    meta.pop("category_id", None)
-                elif category_id is not None:
-                    meta["category_id"] = category_id
-                self._pending_row_meta[row] = meta
-                updated += 1
+            updated = self._stamp_mapping_on_table(
+                self._table,
+                saved_count=self._saved_count,
+                saved_txs=self._saved_txs,
+                pending_row_meta=self._pending_row_meta,
+                edit_mode=self._edit_mode,
+                **stamp,
+            )
+            updated += self._stamp_mapping_on_hidden_surface(**stamp)
         finally:
-            self._table.blockSignals(prev)
             self._bulk_mutating = prev_bulk
         if updated:
             self._schedule_draft_autosave()
@@ -7741,13 +7764,257 @@ class DailyRegister(QWidget):
                 self.day_issues_source_changed.emit()
         return updated
 
+    @staticmethod
+    def _mapping_reaches_saved_tx(tx, cashier_id) -> bool:
+        """Open saved row in scope: own rows, or any cashier's parked row."""
+        if tx is None:
+            return False
+        if getattr(tx, "verified", False) or getattr(tx, "trashed", False):
+            return False
+        if getattr(tx, "discarded", False):
+            return False
+        if cashier_id is None:
+            return True
+        if (getattr(tx, "register_status", "") or "") == "parked":
+            return True
+        cid = getattr(tx, "cashier_id", None)
+        return cid is not None and str(cid) == str(cashier_id)
+
+    @staticmethod
+    def _mapped_tx(tx, *, payee, item_name, category_id, clear_category):
+        from dataclasses import replace
+
+        if clear_category:
+            next_cat_id = None
+        elif category_id is not None:
+            next_cat_id = category_id
+        else:
+            next_cat_id = tx.category_id
+        return replace(
+            tx,
+            item=item_name,
+            category_name=item_name,
+            category_id=next_cat_id,
+            payee=payee,
+        )
+
+    def _mapping_reaches_unsaved(self, cashier_id) -> bool:
+        """Unsaved rows belong to the signed-in user."""
+        if cashier_id is None:
+            return True
+        return str(getattr(self._user, "_id", "") or "") == str(cashier_id)
+
+    def _stamp_mapping_on_table(
+        self,
+        table,
+        *,
+        saved_count: int,
+        saved_txs: dict,
+        pending_row_meta: dict,
+        edit_mode: bool,
+        keys: set,
+        payee: str,
+        item_name: str,
+        category_id=None,
+        cashier_id=None,
+        clear_category: bool = False,
+    ) -> int:
+        from tahmeed.services.description_mapping_service import normalize_description
+
+        if table is None:
+            return 0
+        updated = 0
+        prev = table.blockSignals(True)
+        try:
+            for row in range(table.rowCount()):
+                it = table.item(row, COL_DESC)
+                key = normalize_description(it.text().strip() if it else "")
+                if not key or key not in keys:
+                    continue
+                if row < saved_count:
+                    tx = saved_txs.get(row)
+                    if not self._mapping_reaches_saved_tx(tx, cashier_id):
+                        continue
+                    self._write_mapping_cells(
+                        row,
+                        item_name=item_name,
+                        payee=payee,
+                        saved=True,
+                        table=table,
+                        edit_mode=edit_mode,
+                    )
+                    saved_txs[row] = self._mapped_tx(
+                        tx,
+                        payee=payee,
+                        item_name=item_name,
+                        category_id=category_id,
+                        clear_category=clear_category,
+                    )
+                    updated += 1
+                    continue
+
+                if not self._mapping_reaches_unsaved(cashier_id):
+                    continue
+                self._write_mapping_cells(
+                    row,
+                    item_name=item_name,
+                    payee=payee,
+                    saved=False,
+                    table=table,
+                    edit_mode=edit_mode,
+                )
+                meta = dict(pending_row_meta.get(row) or {})
+                if clear_category:
+                    meta.pop("category_id", None)
+                elif category_id is not None:
+                    meta["category_id"] = category_id
+                pending_row_meta[row] = meta
+                updated += 1
+        finally:
+            table.blockSignals(prev)
+        return updated
+
+    def _stamp_mapping_on_hidden_surface(self, **stamp) -> int:
+        """Stamp the tab that is not showing. Returns rows only it holds."""
+        updated = 0
+        session = self._my_session
+        if self._parked_mode and session is not None and self._my_table is not None:
+            updated += self._stamp_mapping_on_table(
+                self._my_table,
+                saved_count=int(session.get("saved_count") or 0),
+                saved_txs=session.setdefault("saved_txs", {}),
+                pending_row_meta=session.setdefault("pending_row_meta", {}),
+                edit_mode=bool(session.get("edit_mode")),
+                **stamp,
+            )
+            self._stamp_mapping_on_day_caches(**stamp)
+            return updated
+
+        updated += self._stamp_mapping_on_day_caches(**stamp)
+        draft_stamp = {k: v for k, v in stamp.items() if k != "cashier_id"}
+        if not self._mapping_reaches_unsaved(stamp.get("cashier_id")):
+            return updated
+        if self._parked_mode:
+            # No keep-alive My table: My typed rows live in the My draft file.
+            updated += self._stamp_mapping_on_draft_file(
+                self._current_date,
+                merged=False,
+                sections=("new_rows", "dirty_saved"),
+                **draft_stamp,
+            )
+            return updated
+        updated += self._stamp_mapping_on_draft(
+            {"parked_rows": self._local_parked},
+            sections=("parked_rows",),
+            **draft_stamp,
+        )
+        if self._merged_mode:
+            # Merged autosave skips the Parked bucket; keep the My file in step.
+            self._stamp_mapping_on_draft_file(
+                self._current_date,
+                merged=False,
+                sections=("parked_rows",),
+                **draft_stamp,
+            )
+        return updated
+
+    def _stamp_mapping_on_day_caches(
+        self,
+        *,
+        keys: set,
+        payee: str,
+        item_name: str,
+        category_id=None,
+        cashier_id=None,
+        clear_category: bool = False,
+    ) -> int:
+        """Stamp cached day rows so a tab flip repaints the mapped values.
+
+        Returns how many stamped rows are hidden right now: parked rows while
+        My / Merged shows, My rows while Parked shows without a keep-alive table.
+        """
+        from tahmeed.services.description_mapping_service import normalize_description
+
+        if self._current_date is None:
+            return 0
+        day_key = self._make_day_cache_key(self._current_date, merged=False)
+        merged_key = self._make_day_cache_key(self._current_date, merged=True)
+        counted_cache = "merged" if self._merged_mode else "day"
+        count_parked = not self._parked_mode
+        hidden = 0
+        for name, cache, cache_key, want in (
+            ("day", self._day_tx_cache, self._day_tx_cache_key, day_key),
+            ("merged", self._merged_tx_cache, self._merged_tx_cache_key, merged_key),
+        ):
+            if cache is None or cache_key != want:
+                continue
+            for i, tx in enumerate(cache):
+                key = normalize_description(str(getattr(tx, "description", "") or ""))
+                if not key or key not in keys:
+                    continue
+                if not self._mapping_reaches_saved_tx(tx, cashier_id):
+                    continue
+                cache[i] = self._mapped_tx(
+                    tx,
+                    payee=payee,
+                    item_name=item_name,
+                    category_id=category_id,
+                    clear_category=clear_category,
+                )
+                is_parked = (getattr(tx, "register_status", "") or "") == "parked"
+                if name == counted_cache and is_parked == count_parked:
+                    hidden += 1
+        return hidden
+
+    def _stamp_mapping_on_draft(self, draft, *, sections, **stamp) -> int:
+        from tahmeed.services.register_draft_service import apply_mapping_to_draft_payload
+
+        return apply_mapping_to_draft_payload(
+            draft,
+            stamp["keys"],
+            payee=stamp["payee"],
+            item_name=stamp["item_name"],
+            category_id=stamp.get("category_id"),
+            clear_category=bool(stamp.get("clear_category")),
+            desc_col=COL_DESC,
+            item_col=COL_ITEM,
+            payee_col=COL_PAYEE,
+            sections=sections,
+        )
+
+    def _stamp_mapping_on_draft_file(
+        self, target: date, *, merged: bool, sections, **stamp
+    ) -> int:
+        try:
+            draft = load_register_draft(self._user._id, target, merged=merged)
+        except Exception:
+            return 0
+        if draft is None or draft_is_empty(draft):
+            return 0
+        updated = self._stamp_mapping_on_draft(draft, sections=sections, **stamp)
+        if updated:
+            try:
+                save_register_draft(draft)
+            except Exception:
+                return 0
+        return updated
+
     def _write_mapping_cells(
-        self, row: int, *, item_name: str, payee: str, saved: bool
+        self,
+        row: int,
+        *,
+        item_name: str,
+        payee: str,
+        saved: bool,
+        table=None,
+        edit_mode: Optional[bool] = None,
     ) -> None:
-        if saved and not self._edit_mode:
+        table = self._table if table is None else table
+        edit_mode = self._edit_mode if edit_mode is None else edit_mode
+        if saved and not edit_mode:
             flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
             bg: Optional[QBrush] = QBrush(SAVED_BG)
-        elif saved and self._edit_mode:
+        elif saved and edit_mode:
             flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
             bg = QBrush(EDIT_BG)
         else:
@@ -7755,10 +8022,10 @@ class DailyRegister(QWidget):
             bg = None
 
         for col, text in ((COL_ITEM, item_name), (COL_PAYEE, payee)):
-            it = self._table.item(row, col)
+            it = table.item(row, col)
             if it is None:
                 it = QTableWidgetItem(text)
-                self._table.setItem(row, col, it)
+                table.setItem(row, col, it)
             else:
                 it.setText(text)
             it.setFlags(flags)
@@ -7775,29 +8042,24 @@ class DailyRegister(QWidget):
         category_id=None,
         clear_category: bool = False,
     ) -> int:
-        from tahmeed.services.register_draft_service import apply_mapping_to_draft_payload
-
-        draft = load_register_draft(
-            self._user._id, target, merged=self._merged_mode
-        )
-        if draft is None or draft_is_empty(draft):
-            return 0
-        updated = apply_mapping_to_draft_payload(
-            draft,
-            keys,
+        stamp = dict(
+            keys=keys,
             payee=payee,
             item_name=item_name,
             category_id=category_id,
             clear_category=clear_category,
-            desc_col=COL_DESC,
-            item_col=COL_ITEM,
-            payee_col=COL_PAYEE,
         )
-        if updated:
-            try:
-                save_register_draft(draft)
-            except Exception:
-                return 0
+        updated = self._stamp_mapping_on_draft_file(
+            target,
+            merged=self._merged_mode,
+            sections=("new_rows", "dirty_saved", "parked_rows"),
+            **stamp,
+        )
+        if self._merged_mode:
+            # Unsaved parked rows always live in the My draft file.
+            updated += self._stamp_mapping_on_draft_file(
+                target, merged=False, sections=("parked_rows",), **stamp
+            )
         return updated
 
     # ------------------------------------------------------------------
@@ -10387,6 +10649,7 @@ class DailyRegister(QWidget):
         The rows are already drafts on the server, so they join My's saved
         prefix (never the unsaved entry pad) and the day cache drops their
         parked status so Parked and the badge do not show them again.
+        Another cashier's rows go back to that cashier's drafts, not this My.
         """
         bodies = {str(tx_id): dict(body or {}) for tx_id, body in pairs if tx_id}
         rows = sorted(
@@ -10404,7 +10667,9 @@ class DailyRegister(QWidget):
             tx.register_status = "draft"
             released.append(tx)
         self._apply_unparked_to_day_cache(released)
-        self._append_saved_txs_onto_my_surface(released)
+        self._append_saved_txs_onto_my_surface(
+            [tx for tx in released if self._is_own_tx(tx)]
+        )
         if rows:
             prev = self._table.blockSignals(True)
             self._bulk_mutating = True

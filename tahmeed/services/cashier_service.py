@@ -36,6 +36,7 @@ async def get_transactions_by_date(
     cashier_id=None,
     *,
     merged: bool = False,
+    include_parked: bool = False,
 ) -> List[Transaction]:
     """Load a calendar day's register rows.
 
@@ -44,7 +45,8 @@ async def get_transactions_by_date(
     and manual/legacy rows whose Excel ``date`` is that day.
 
     ``merged=True`` returns every cashier's rows for that day (Shared/Merged mode).
-    Otherwise ``cashier_id`` scopes to one user when provided.
+    Otherwise ``cashier_id`` scopes to one user when provided, and
+    ``include_parked=True`` adds every cashier's parked rows (shared Parked tab).
     Sorted by ``day_order`` then ``created_at``.
     """
     params: dict = {
@@ -53,6 +55,8 @@ async def get_transactions_by_date(
     }
     if not merged and cashier_id is not None:
         params["cashier_id"] = str(cashier_id)
+    if not merged and include_parked:
+        params["include_parked"] = "true"
     payload = await api_client.request("GET", "v1/transactions/by-date", params=params)
     return [_tx_from_api(doc) for doc in payload.get("items") or []]
 
@@ -1611,15 +1615,21 @@ async def get_open_day_summaries(
     cashier_id=None,
     *,
     all_cashiers: bool = False,
+    include_parked: bool = False,
     limit: int = 120,
 ) -> List[dict]:
-    """Calendar days with open (unverified) register rows — Day Issues All days."""
+    """Calendar days with open (unverified) register rows — Day Issues All days.
+
+    ``include_parked`` adds days that hold any cashier's parked rows.
+    """
     params: dict = {
         "all_cashiers": "true" if all_cashiers else "false",
         "limit": limit,
     }
     if not all_cashiers and cashier_id is not None:
         params["cashier_id"] = str(cashier_id)
+    if not all_cashiers and include_parked:
+        params["include_parked"] = "true"
     payload = await api_client.request(
         "GET", "v1/transactions/open-day-summaries", params=params
     )
