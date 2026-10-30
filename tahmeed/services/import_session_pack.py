@@ -1,4 +1,4 @@
-"""Load the QuickBooks expense automation's description memory as temporary mappings.
+"""The QuickBooks expense automation's description memory as Import Daily mappings.
 
 Only the automation's ``data/description_memory.json``
 (``{description: {payee, account, source}}``) is used.
@@ -8,10 +8,11 @@ plate is fixed row by row, never mapped. Its ``ignored_descriptions.json`` is
 not used either: every expense is tracked in this app.
 
 Accounts are QuickBooks account names (``Direct Costs:Spares``); they become
-Items through :class:`ItemIndex`. Everything lands in the session only.
+Items through :class:`ItemIndex`. Nothing is saved to Description Maps.
 
 A *pack file* holds the same memory in one JSON so it can be copied to
-another PC; one ships with the app as the built-in pack.
+another PC; one ships with the app as the built-in pack, used automatically.
+Loading another pack replaces the built-in mappings for that session only.
 """
 
 from __future__ import annotations
@@ -29,9 +30,9 @@ from typing import Dict, List, Optional
 from tahmeed.services.description_mapping_service import normalize_description
 from tahmeed.services.import_session_parser import normalize_import_description
 from tahmeed.services.import_session_service import (
-    MAPPING_SOURCE_MANUAL,
     MAPPING_SOURCE_PACK,
     ImportSession,
+    TempMapping,
 )
 from tahmeed.services.import_session_validation import ImportReferences
 
@@ -188,52 +189,59 @@ def load_builtin_pack() -> Optional[MappingPack]:
     return None if pack.is_empty else pack
 
 
+def _upper(value: str) -> str:
+    return " ".join((value or "").strip().upper().split())
+
+
+def pack_to_mappings(pack: MappingPack) -> Dict[str, TempMapping]:
+    """Description key -> mapping; the Account stays as the Item name to resolve."""
+    out: Dict[str, TempMapping] = {}
+    for entry in pack.mappings:
+        display = normalize_import_description(entry.description)
+        key = normalize_description(display)
+        if key:
+            out[key] = TempMapping(
+                display, _upper(entry.account), _upper(entry.payee), MAPPING_SOURCE_PACK
+            )
+    return out
+
+
+_builtin_cache: Optional[Dict[str, TempMapping]] = None
+
+
+def builtin_mappings() -> Dict[str, TempMapping]:
+    """The built-in pack's mappings (read once; empty when the pack is missing)."""
+    global _builtin_cache
+    if _builtin_cache is None:
+        pack = load_builtin_pack()
+        _builtin_cache = pack_to_mappings(pack) if pack is not None else {}
+    return _builtin_cache
+
+
 @dataclass
 class PackApplyResult:
     mappings_added: int = 0
-    mappings_kept: int = 0
     mappings_in_session: int = 0
     unresolved_items: Counter = field(default_factory=Counter)
     unresolved_payees: Counter = field(default_factory=Counter)
 
 
 def apply_mapping_pack(
-    session: ImportSession,
-    pack: MappingPack,
-    refs: ImportReferences,
-    *,
-    overwrite_manual: bool = False,
+    session: ImportSession, pack: MappingPack, refs: ImportReferences
 ) -> PackApplyResult:
-    """Copy the pack's mappings into the session as temporary mappings.
+    """Use ``pack`` instead of the built-in mappings for this session.
 
-    Mappings typed in this session win unless ``overwrite_manual``; earlier
-    pack entries are always refreshed.
+    Mappings typed in this session are not touched; they still win.
     """
-    result = PackApplyResult()
+    mappings = pack_to_mappings(pack)
+    result = PackApplyResult(mappings_added=len(mappings))
     session_keys = {normalize_description(r.description) for r in session.rows}
-    for entry in pack.mappings:
-        key = normalize_description(normalize_import_description(entry.description))
-        existing = session.temp_mappings.get(key)
-        if (
-            existing is not None
-            and existing.source == MAPPING_SOURCE_MANUAL
-            and not overwrite_manual
-        ):
-            result.mappings_kept += 1
-            continue
-        item = refs.items.resolve(entry.account)
-        payee = refs.payees.resolve(entry.payee)
-        if item is None:
-            result.unresolved_items[entry.account or "(blank)"] += 1
-        if payee is None:
-            result.unresolved_payees[entry.payee or "(blank)"] += 1
-        session.set_mapping(
-            entry.description,
-            item.name if item else entry.account,
-            payee or entry.payee,
-            source=MAPPING_SOURCE_PACK,
-        )
-        result.mappings_added += 1
+    for key, mapping in mappings.items():
+        if refs.items.resolve(mapping.item) is None:
+            result.unresolved_items[mapping.item or "(blank)"] += 1
+        if refs.payees.resolve(mapping.payee) is None:
+            result.unresolved_payees[mapping.payee or "(blank)"] += 1
         if key in session_keys:
             result.mappings_in_session += 1
+    session.set_pack_mappings(mappings, pack.name or Path(pack.folder).name)
     return result

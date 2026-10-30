@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -21,6 +23,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -39,6 +43,7 @@ from tahmeed.ui.accountant.import_session_grid import (
     GridModel,
     GridRow,
     GridView,
+    checkbox_qss,
     light_theme_qss,
 )
 from tahmeed.ui.dialog_theme import show_info, show_question, show_warning
@@ -102,10 +107,19 @@ class MappingChoice:
     new_item: Optional[dict] = None
     new_payee: Optional[Tuple[str, str]] = None
     save_global: bool = False
+    # Bulk mode (a Payee and/or Item per description): (description, item, payee)
+    # rows plus every name to create, {item name: fields} / {payee name: currency}.
+    rows: List[Tuple[str, str, str]] = field(default_factory=list)
+    new_items: Dict[str, dict] = field(default_factory=dict)
+    new_payees: Dict[str, str] = field(default_factory=dict)
+
+
+def _upper_name(value: str) -> str:
+    return " ".join((value or "").upper().split())
 
 
 class MapDescriptionsDialog(QDialog):
-    """One Item + Payee for every ticked description; may add a new Item / Payee."""
+    """One Item + Payee for every ticked description, or a new one per description."""
 
     def __init__(
         self,
@@ -168,6 +182,21 @@ class MapDescriptionsDialog(QDialog):
             form.addRow(label, row)
         root.addLayout(form)
 
+        self._payee_each = QCheckBox("A PAYEE per description, named like it")
+        self._item_each = QCheckBox("An ITEM per description, named like it")
+        for box, field_, button in (
+            (self._payee_each, self._payee, new_payee),
+            (self._item_each, self._item, new_item),
+        ):
+            box.setToolTip(
+                "Creates one per ticked description in one go, with no forms: new Payees "
+                "use one currency, new Items get default settings (no options ticked). "
+                "Existing names are reused; you see every name before anything is created."
+            )
+            box.toggled.connect(field_.setDisabled)
+            box.toggled.connect(button.setDisabled)
+            root.addWidget(box)
+
         self._save_global = QCheckBox(
             "Also save to Description Maps now (permanent, used on every PC)"
         )
@@ -210,13 +239,18 @@ class MapDescriptionsDialog(QDialog):
 
     def _on_save(self) -> None:
         descriptions = self._ticked()
-        item_text = self._item.text().strip()
-        payee_text = self._payee.text().strip()
+        payee_each = self._payee_each.isChecked()
+        item_each = self._item_each.isChecked()
+        item_text = "" if item_each else self._item.text().strip()
+        payee_text = "" if payee_each else self._payee.text().strip()
         if not descriptions:
             show_warning(self, "Map descriptions", "Tick at least one description.")
             return
-        if not item_text or not payee_text:
+        if (not item_each and not item_text) or (not payee_each and not payee_text):
             show_warning(self, "Map descriptions", "Both PAYEE and ITEM are required.")
+            return
+        if payee_each or item_each:
+            self._on_bulk_save(descriptions, payee_text, item_text)
             return
 
         new_payee = self._new_payee if self._new_payee and _same_name(self._new_payee[0], payee_text) else None
@@ -249,11 +283,299 @@ class MapDescriptionsDialog(QDialog):
         )
         self.accept()
 
+    def _on_bulk_save(self, descriptions: List[str], payee_text: str, item_text: str) -> None:
+        """A Payee and/or Item per description: no forms, one check, created in one go.
+
+        New Payees get the currency picked in the check; new Items get
+        :data:`BULK_ITEM_FIELDS`. A name made with New Payee… / New Item… keeps its form.
+        """
+        shared_payee = (self._resolve_payee(payee_text) or _upper_name(payee_text)) if payee_text else None
+        shared_item = (self._resolve_item(item_text) or _upper_name(item_text)) if item_text else None
+        preview = BulkMapPreviewDialog(
+            descriptions,
+            payee=shared_payee,
+            item=shared_item,
+            resolve_payee=self._resolve_payee,
+            resolve_item=self._resolve_item,
+            parent=self,
+        )
+        if preview.exec() != QDialog.Accepted or not preview.rows:
+            return
+        new_payees = {name: preview.currency for name in preview.new_payee_names}
+        if self._new_payee and self._new_payee[0] in new_payees:
+            new_payees[self._new_payee[0]] = self._new_payee[1]
+        new_items = {name: {**BULK_ITEM_FIELDS, "name": name} for name in preview.new_item_names}
+        if self._new_item:
+            name = _upper_name(str(self._new_item.get("name") or ""))
+            if name in new_items:
+                new_items[name] = {**self._new_item, "name": name}
+        self.choice = MappingChoice(
+            [desc for desc, _item, _payee in preview.rows],
+            item=shared_item or "",
+            payee=shared_payee or "",
+            save_global=self._save_global.isChecked(),
+            rows=preview.rows,
+            new_items=new_items,
+            new_payees=new_payees,
+        )
+        self.accept()
+
+
+# Items created in bulk: every option unticked (no receipt, truck, sidebar, …).
+BULK_ITEM_FIELDS = {
+    "requires_receipt": False,
+    "requires_truck": False,
+    "show_in_sidebar": False,
+    "show_in_cashier_sidebar": False,
+    "lock_description": False,
+    "restrict_in_pdf": False,
+    "restrict_in_excel": False,
+}
+
+
+_PREVIEW_DESC, _PREVIEW_PAYEE, _PREVIEW_PAYEE_IS, _PREVIEW_ITEM, _PREVIEW_ITEM_IS = range(5)
+_NEW_FG = "#B45309"
+_EXISTING_FG = "#15803D"
+_PREVIEW_TABLE_QSS = (
+    "QTableWidget{background:#FFFFFF;alternate-background-color:#F8FAFC;color:#111827;"
+    "border:1px solid #E5E7EB;border-radius:8px;gridline-color:transparent;"
+    "font-family:'Segoe UI';font-size:12px;"
+    "selection-background-color:#E8F4FD;selection-color:#111827;outline:0;}"
+    "QTableWidget::item{padding:0 8px;border-bottom:1px solid #F1F5F9;}"
+    "QTableWidget::item:selected{background:#E8F4FD;color:#111827;}"
+    "QTableWidget QLineEdit{background:#FFFFFF;color:#111827;border:1px solid #0077C5;"
+    "border-radius:4px;padding:0 6px;selection-background-color:#DBEAFE;selection-color:#111827;}"
+    "QHeaderView{background:#FFFFFF;border:none;}"
+    "QHeaderView::section{background:#FFFFFF;color:#6B7280;border:none;"
+    "border-bottom:1px solid #E5E7EB;padding:8px 8px;font-family:'Segoe UI';"
+    "font-weight:600;font-size:11px;}"
+    "QTableCornerButton::section{background:#FFFFFF;border:none;}"
+    "QScrollBar:vertical{width:10px;background:transparent;margin:2px;}"
+    "QScrollBar::handle:vertical{background:#CBD5E1;border-radius:4px;min-height:24px;}"
+    "QScrollBar:horizontal{height:10px;background:transparent;margin:2px;}"
+    "QScrollBar::handle:horizontal{background:#CBD5E1;border-radius:4px;min-width:24px;}"
+    "QScrollBar::add-line,QScrollBar::sub-line{width:0;height:0;}"
+    "QScrollBar::add-page,QScrollBar::sub-page{background:transparent;}"
+)
+
+
+class BulkMapPreviewDialog(QDialog):
+    """Every ticked description with its Payee and Item before anything is created.
+
+    ``payee`` / ``item`` is the shared name, or None for one named like each
+    description (editable here). Existing names are reused, never duplicated.
+    """
+
+    def __init__(
+        self,
+        descriptions: Sequence[str],
+        *,
+        payee: Optional[str],
+        item: Optional[str],
+        resolve_payee: Callable[[str], Optional[str]],
+        resolve_item: Callable[[str], Optional[str]],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        _light(self)
+        self._resolve = {_PREVIEW_PAYEE: resolve_payee, _PREVIEW_ITEM: resolve_item}
+        self._shared = {_PREVIEW_PAYEE: payee, _PREVIEW_ITEM: item}
+        self.rows: List[Tuple[str, str, str]] = []
+        self.new_payee_names: List[str] = []
+        self.new_item_names: List[str] = []
+        self.currency = "TZS"
+        self.setWindowTitle("Create & map — check the names")
+        self.setMinimumSize(860, 520)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 16)
+        root.setSpacing(10)
+        title = QLabel("Check the names")
+        title.setStyleSheet("color:#111827;font-family:'Segoe UI';font-size:15px;font-weight:700;")
+        root.addWidget(title)
+        intro = QLabel(
+            "Each ticked description gets the Payee and Item below. <b>New</b> names are "
+            "created, <b>Existing</b> ones are reused. Double-click a name to edit it, or "
+            "untick a row. Nothing is created until <b>Create &amp; Map</b>."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#6B7280;font-family:'Segoe UI';font-size:12px;")
+        root.addWidget(intro)
+
+        self._table = QTableWidget(len(descriptions), 5)
+        self._table.setHorizontalHeaderLabels(["DESCRIPTION", "PAYEE", "", "ITEM", ""])
+        self._table.setStyleSheet(_PREVIEW_TABLE_QSS + checkbox_qss())
+        palette = self._table.palette()
+        for role, color in (
+            (QPalette.Base, "#FFFFFF"),
+            (QPalette.AlternateBase, "#F8FAFC"),
+            (QPalette.Window, "#FFFFFF"),
+            (QPalette.Text, "#111827"),
+            (QPalette.WindowText, "#111827"),
+            (QPalette.Button, "#FFFFFF"),
+            (QPalette.ButtonText, "#6B7280"),
+        ):
+            palette.setColor(role, QColor(color))
+        self._table.setPalette(palette)
+        self._table.setAlternatingRowColors(True)
+        self._table.setShowGrid(False)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._table.setFocusPolicy(Qt.StrongFocus)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(32)
+        header = self._table.horizontalHeader()
+        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header.setHighlightSections(False)
+        for col, mode in (
+            (_PREVIEW_DESC, QHeaderView.Stretch),
+            (_PREVIEW_PAYEE, QHeaderView.Stretch),
+            (_PREVIEW_PAYEE_IS, QHeaderView.ResizeToContents),
+            (_PREVIEW_ITEM, QHeaderView.Stretch),
+            (_PREVIEW_ITEM_IS, QHeaderView.ResizeToContents),
+        ):
+            header.setSectionResizeMode(col, mode)
+        for row, desc in enumerate(descriptions):
+            cell = QTableWidgetItem(desc)
+            cell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            cell.setCheckState(Qt.Checked)
+            self._table.setItem(row, _PREVIEW_DESC, cell)
+            for col in (_PREVIEW_PAYEE, _PREVIEW_ITEM):
+                shared = self._shared[col]
+                name = shared if shared is not None else _upper_name(desc)
+                if shared is None:
+                    name = self._resolve[col](name) or name
+                value = QTableWidgetItem(name)
+                flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                value.setFlags(flags | Qt.ItemIsEditable if shared is None else flags)
+                if shared is not None:
+                    value.setForeground(QColor("#6B7280"))
+                    value.setToolTip("Shared by every ticked description")
+                else:
+                    value.setToolTip("Double-click to change the name")
+                self._table.setItem(row, col, value)
+                self._table.setItem(row, col + 1, QTableWidgetItem())
+                self._refresh_status(row, col)
+        self._table.itemChanged.connect(self._on_item_changed)
+        root.addWidget(self._table, 1)
+
+        bottom = QHBoxLayout()
+        self._summary = QLabel()
+        self._summary.setStyleSheet(
+            "color:#374151;font-family:'Segoe UI';font-size:12px;font-weight:600;"
+        )
+        bottom.addWidget(self._summary, 1)
+        self._currency = QComboBox()
+        self._currency.addItems(["TZS", "USD"])
+        self._currency.setMinimumWidth(80)
+        if payee is None or not resolve_payee(payee):
+            currency_label = QLabel("Currency for new payees")
+            currency_label.setStyleSheet("color:#6B7280;font-family:'Segoe UI';font-size:12px;")
+            bottom.addWidget(currency_label)
+            bottom.addWidget(self._currency)
+        root.addLayout(bottom)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        back = dialog_button("Back")
+        back.clicked.connect(self.reject)
+        create = dialog_button("Create && Map", primary=True)
+        create.setDefault(True)
+        create.clicked.connect(self._on_accept)
+        buttons.addWidget(back)
+        buttons.addWidget(create)
+        root.addLayout(buttons)
+        self._update_summary()
+
+    def _status(self, row: int, col: int) -> str:
+        """'Existing' or 'New' for the Payee / Item in ``row``."""
+        return "Existing" if self._resolve[col](self._table.item(row, col).text()) else "New"
+
+    def _refresh_status(self, row: int, col: int) -> None:
+        status = self._status(row, col)
+        cell = self._table.item(row, col + 1)
+        cell.setText(status)
+        cell.setFlags(Qt.ItemIsEnabled)
+        cell.setTextAlignment(Qt.AlignCenter)
+        cell.setForeground(QColor(_NEW_FG if status == "New" else _EXISTING_FG))
+        font = cell.font()
+        font.setBold(True)
+        font.setPointSize(8)
+        cell.setFont(font)
+
+    def _on_item_changed(self, cell: QTableWidgetItem) -> None:
+        if cell.column() not in (_PREVIEW_DESC, _PREVIEW_PAYEE, _PREVIEW_ITEM):
+            return
+        self._table.blockSignals(True)
+        try:
+            if cell.column() != _PREVIEW_DESC:
+                cell.setText(_upper_name(cell.text()))
+                self._refresh_status(cell.row(), cell.column())
+        finally:
+            self._table.blockSignals(False)
+        self._update_summary()
+
+    def _ticked_rows(self) -> List[int]:
+        return [
+            r for r in range(self._table.rowCount())
+            if self._table.item(r, _PREVIEW_DESC).checkState() == Qt.Checked
+        ]
+
+    def _new_names(self, col: int, rows: List[int]) -> List[str]:
+        names: List[str] = []
+        for r in rows:
+            name = self._table.item(r, col).text()
+            if self._status(r, col) == "New" and name and name not in names:
+                names.append(name)
+        return names
+
+    def _update_summary(self) -> None:
+        rows = self._ticked_rows()
+        self._summary.setText(
+            f"{len(rows):,} description(s) · "
+            f"{len(self._new_names(_PREVIEW_PAYEE, rows)):,} new Payee(s) · "
+            f"{len(self._new_names(_PREVIEW_ITEM, rows)):,} new Item(s)"
+        )
+
+    def _on_accept(self) -> None:
+        rows = self._ticked_rows()
+        if not rows:
+            show_warning(self, "Create & map", "Tick at least one description.")
+            return
+        out = []
+        for r in rows:
+            desc = self._table.item(r, _PREVIEW_DESC).text()
+            payee = self._table.item(r, _PREVIEW_PAYEE).text()
+            item = self._table.item(r, _PREVIEW_ITEM).text()
+            if not payee or not item:
+                show_warning(self, "Create & map", f"'{desc}' needs both a Payee and an Item.")
+                return
+            out.append((desc, item, payee))
+        new_payees = self._new_names(_PREVIEW_PAYEE, rows)
+        new_items = self._new_names(_PREVIEW_ITEM, rows)
+        currency = self._currency.currentText() or "TZS"
+        lines = []
+        if new_payees:
+            lines.append(f"Create {len(new_payees):,} new Payee(s) in {currency}.")
+        if new_items:
+            lines.append(
+                f"Create {len(new_items):,} new Item(s) with default settings "
+                "(no options ticked)."
+            )
+        lines.append(f"Map {len(out):,} description(s).")
+        answer = show_question(self, "Create & map", "\n".join(lines) + "\n\nGo ahead?", default_no=False)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.rows = out
+        self.new_payee_names = new_payees
+        self.new_item_names = new_items
+        self.currency = currency
+        self.accept()
+
 
 @dataclass
 class PackChoice:
     pack: MappingPack
-    overwrite_manual: bool
+    builtin: bool
 
 
 class LoadPackDialog(QDialog):
@@ -270,11 +592,11 @@ class LoadPackDialog(QDialog):
 
         root = QVBoxLayout(self)
         intro = QLabel(
-            "Load the QuickBooks expense automation's description mappings into this "
-            "session as <b>temporary</b> mappings. Accounts become Items; nothing is "
-            "saved to Description Maps.<br>Without a pack, rows are mapped with the "
-            "<b>Description Maps</b> tab only. Trucks are never taken from a pack — "
-            "fix each row's truck under Truck Issues."
+            "The <b>built-in</b> QuickBooks expense automation mappings are used "
+            "automatically. Load a newer pack (the automation folder or a "
+            "<i>.tmpack.json</i> file) to use it instead, for this session only. "
+            "Accounts become Items; nothing is saved to Description Maps, and mappings "
+            "you typed here are kept. Trucks never come from a pack."
         )
         intro.setWordWrap(True)
         root.addWidget(intro)
@@ -309,8 +631,6 @@ class LoadPackDialog(QDialog):
 
         self._count = QLabel()
         root.addWidget(self._count)
-        self._overwrite = QCheckBox("Replace mappings I already typed in this session")
-        root.addWidget(self._overwrite)
 
         buttons = QHBoxLayout()
         self._export_btn = dialog_button("Export Pack…")
@@ -322,7 +642,7 @@ class LoadPackDialog(QDialog):
         buttons.addStretch()
         cancel = dialog_button("Cancel")
         cancel.clicked.connect(self.reject)
-        self._load_btn = dialog_button("Load into Session", primary=True)
+        self._load_btn = dialog_button("Use for this Session", primary=True)
         self._load_btn.setDefault(True)
         self._load_btn.clicked.connect(self._on_load)
         buttons.addWidget(cancel)
@@ -331,7 +651,7 @@ class LoadPackDialog(QDialog):
 
         saved = str(QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(_PACK_FOLDER_KEY, "") or "")
         self._folder.setText(saved)
-        if saved or self._builtin is None:
+        if self._builtin is None:
             self._use_other.setChecked(True)
         else:
             self._use_builtin.setChecked(True)
@@ -369,7 +689,7 @@ class LoadPackDialog(QDialog):
     def _refresh(self) -> None:
         self._folder.setEnabled(self._use_other.isChecked())
         if self._use_builtin.isChecked():
-            self._show_pack(self._builtin, "Built-in pack shipped with the app.")
+            self._show_pack(self._builtin, "Built-in pack shipped with the app (the default).")
         else:
             self._read(self._folder.text())
 
@@ -433,7 +753,7 @@ class LoadPackDialog(QDialog):
             return
         remembered = "" if self._use_builtin.isChecked() else self._folder.text().strip()
         QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(_PACK_FOLDER_KEY, remembered)
-        self.choice = PackChoice(pack=pack, overwrite_manual=self._overwrite.isChecked())
+        self.choice = PackChoice(pack=pack, builtin=self._use_builtin.isChecked())
         self.accept()
 
 

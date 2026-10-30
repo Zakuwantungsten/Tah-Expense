@@ -6,7 +6,15 @@ from bson import ObjectId
 
 from tahmeed.models.description_mapping import DescriptionMapping
 from tahmeed.services.import_session_parser import StagedRow
-from tahmeed.services.import_session_service import ImportSession
+from tahmeed.services.import_session_service import (
+    MAPPING_SOURCE_PACK,
+    MODE_BOTH_BUILTIN_FIRST,
+    MODE_BOTH_MAPS_FIRST,
+    MODE_BUILTIN_ONLY,
+    MODE_MAPS_ONLY,
+    ImportSession,
+    TempMapping,
+)
 from tahmeed.services.import_session_validation import (
     DAY_BLOCKED,
     DAY_PUSHED,
@@ -19,6 +27,7 @@ from tahmeed.services.import_session_validation import (
     KIND_IGNORED,
     KIND_UNMAPPED,
     SOURCE_GLOBAL,
+    SOURCE_PACK,
     SOURCE_TEMP,
     ItemIndex,
     ItemRef,
@@ -121,21 +130,55 @@ def test_unmapped_temp_and_global_resolution() -> None:
     assert day.reasons == ["1 unmapped description(s)"]
 
 
-def test_priority_and_disabling_temp_mappings() -> None:
+def _pack(desc: str, item: str, payee: str) -> TempMapping:
+    return TempMapping(desc, item, payee, MAPPING_SOURCE_PACK)
+
+
+def test_mapping_modes_choose_built_in_and_description_maps() -> None:
     refs = references_from_snapshot(
         _snapshot(),
-        {"DIESEL": _global("DIESEL", FUEL_ID, "DIRECT COSTS:FUEL", "PUMA")},
+        {
+            "DIESEL": _global("DIESEL", FUEL_ID, "DIRECT COSTS:FUEL", "PUMA"),
+            "OIL": _global("OIL", FUEL_ID, "DIRECT COSTS:FUEL", "PUMA"),
+        },
     )
-    session = _session(_row(1, "DIESEL"))
+    refs.builtin_mappings = {
+        "DIESEL": _pack("DIESEL", "DIRECT COSTS:SPARES", "SPARE PARTS"),
+        "TOLLS": _pack("TOLLS", "DIRECT COSTS:SPARES", "SPARE PARTS"),
+    }
+    session = _session(_row(1, "DIESEL"), _row(2, "TOLLS"), _row(3, "OIL"), _row(4, "GET VALVE"))
+    session.set_mapping("GET VALVE", "FUEL", "PUMA")
+
+    def sources() -> list:
+        rows = validate_session(session, refs).rows
+        return [rows[f"f|S|{n}"].mapping_source for n in (1, 2, 3, 4)]
+
+    assert session.options.mapping_mode == MODE_BOTH_MAPS_FIRST
+    assert sources() == [SOURCE_GLOBAL, SOURCE_PACK, SOURCE_GLOBAL, SOURCE_TEMP]
+    session.options.mapping_mode = MODE_BOTH_BUILTIN_FIRST
+    assert sources() == [SOURCE_PACK, SOURCE_PACK, SOURCE_GLOBAL, SOURCE_TEMP]
+    session.options.mapping_mode = MODE_BUILTIN_ONLY
+    assert sources() == [SOURCE_PACK, SOURCE_PACK, "", SOURCE_TEMP]
+    session.options.mapping_mode = MODE_MAPS_ONLY
+    assert sources() == [SOURCE_GLOBAL, "", SOURCE_GLOBAL, SOURCE_TEMP]
+    assert validate_session(session, refs).rows["f|S|2"].issues == (ISSUE_UNMAPPED,)
+
+    # A mapping typed here and saved to Description Maps wins in every mode.
+    session.note_saved_to_maps(["oil"])
+    session.options.mapping_mode = MODE_BUILTIN_ONLY
+    assert sources()[2] == SOURCE_GLOBAL
+
+    # Typed mappings win over both.
     session.set_mapping("DIESEL", "SPARES", "SPARE PARTS")
-    assert validate_session(session, refs).rows["f|S|1"].mapping_source == SOURCE_TEMP
+    assert sources()[0] == SOURCE_TEMP
 
-    session.options.prefer_temp_mappings = False
-    assert validate_session(session, refs).rows["f|S|1"].mapping_source == SOURCE_GLOBAL
-
-    session.options.prefer_temp_mappings = True
-    session.options.use_temp_mappings = False
-    assert validate_session(session, refs).rows["f|S|1"].mapping_source == SOURCE_GLOBAL
+    # A loaded pack replaces the built-in mappings for this session.
+    session.set_pack_mappings({"TOLLS": _pack("TOLLS", "DIRECT COSTS:FUEL", "PUMA")}, "Newer")
+    rows = validate_session(session, refs).rows
+    assert (rows["f|S|2"].item, rows["f|S|2"].payee) == ("DIRECT COSTS:FUEL", "PUMA")
+    session.use_builtin_mappings()
+    rows = validate_session(session, refs).rows
+    assert (rows["f|S|2"].item, rows["f|S|2"].payee) == ("DIRECT COSTS:SPARES", "SPARE PARTS")
 
 
 def test_bad_preferred_mapping_falls_back_to_valid_other() -> None:

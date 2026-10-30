@@ -90,6 +90,8 @@ def _page(qapp, tmp_path: Path):
     widget._loaded = True
     widget._refs = _refs()
     widget._start = lambda coro: asyncio.run(coro)
+    # Session-only mappings unless a test saves to Description Maps on purpose.
+    widget._save_global_box.setChecked(False)
     widget._set_session(session)
     return widget, session
 
@@ -129,11 +131,13 @@ def test_days_issues_and_temporary_mapping_flow(qapp, tmp_path: Path) -> None:
     assert reloaded.get_mapping("GET VALVE") is not None
     assert reloaded.get_mapping("bank charges") is not None
 
-    # Switching temporary mappings off blocks the day again.
-    widget._use_temp.setChecked(False)
-    assert _day_status(widget, D1).startswith("Blocked")
-    widget._use_temp.setChecked(True)
+    # Mappings typed here count whichever mapping mode is chosen.
+    combo = widget._mapping_mode
+    combo.setCurrentIndex(combo.findData(svc.MODE_MAPS_ONLY))
+    assert session.options.mapping_mode == svc.MODE_MAPS_ONLY
+    assert "Description Maps only" in widget._banner.text()
     assert _day_status(widget, D1) == "Ready"
+    assert svc.load_session(session.session_id).options.mapping_mode == svc.MODE_MAPS_ONLY
 
     widget._on_tick_ready()
     assert widget.ticked_days() == [D1]
@@ -437,8 +441,23 @@ def test_banner_reports_description_map_fallback(qapp, tmp_path: Path) -> None:
     )
     widget._revalidate()
     text = widget._banner.text()
-    assert "No mapping pack loaded" in text
-    assert "Rows mapped by Description Maps: 1" in text
+    assert "Both — Description Maps first" in text
+    assert "built-in 0, Description Maps 1, typed here 0" in text
+    assert "Rows mapped: 0 Typed, 0 Built-in, 1 Description Maps" in text
+
+    session.set_pack_mappings(
+        {"DIESEL": svc.TempMapping("DIESEL", "DIRECT COSTS:FUEL", "PUMA", "pack")}, "Newer"
+    )
+    widget._revalidate()
+    text = widget._banner.text()
+    assert "pack 'Newer' (1) instead of built-in" in text
+    assert "Rows mapped: 0 Typed, 1 Built-in, 1 Description Maps" in text
+
+    combo = widget._mapping_mode
+    combo.setCurrentIndex(combo.findData(svc.MODE_BUILTIN_ONLY))
+    text = widget._banner.text()
+    assert "Description Maps 1" not in text
+    assert "Rows mapped: 0 Typed, 1 Built-in, 0 Description Maps" in text
 
 
 def test_finish_session_promotes_ticked_and_discards(qapp, tmp_path: Path, monkeypatch) -> None:
@@ -713,6 +732,7 @@ def test_save_filled_can_save_to_description_maps(qapp, tmp_path: Path, monkeypa
     messages = []
     monkeypatch.setattr(page_mod, "show_info", lambda _p, _t, text: messages.append(text))
 
+    assert page_mod.ImportDailyMasterWidget(user=None)._save_global_box.isChecked()
     widget, session = _page(qapp, tmp_path)
     session.set_mapping("GET VALVE", "FUEL", "PUMA")
     widget._changed()
@@ -727,9 +747,141 @@ def test_save_filled_can_save_to_description_maps(qapp, tmp_path: Path, monkeypa
         ("BANK CHARGES", "DIRECT COSTS:SPARES", "SPARE PARTS")
     ]
     assert session.get_mapping("BANK CHARGES") is None
+    assert session.typed_to_maps == {"BANK CHARGES"}
     assert widget._refs.global_mappings["BANK CHARGES"].payee == "SPARE PARTS"
     assert _day_status(widget, D1) == "Ready"
     assert "1 mapping(s) saved to Description Maps" in messages[-1]
+
+
+def _bulk_dialog(dlg_mod, descriptions):
+    return dlg_mod.MapDescriptionsDialog(
+        descriptions,
+        item_names=["DIRECT COSTS:SPARES"],
+        payee_names=["PUMA"],
+        resolve_item=lambda t: "DIRECT COSTS:SPARES" if "SPARES" in t.upper() else None,
+        resolve_payee=lambda t: "PUMA" if t.strip().upper() == "PUMA" else None,
+    )
+
+
+def test_map_dialog_payee_per_description(qapp, monkeypatch) -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QMessageBox
+
+    from tahmeed.ui.dialogs import import_session_dialogs as dlg_mod
+
+    seen = {}
+
+    def fake_exec(preview) -> int:
+        table = preview._table
+        seen["status"] = [table.item(r, dlg_mod._PREVIEW_PAYEE_IS).text() for r in range(3)]
+        seen["item_status"] = table.item(0, dlg_mod._PREVIEW_ITEM_IS).text()
+        table.item(2, dlg_mod._PREVIEW_PAYEE).setText("mary ann  ltd")
+        table.item(3, dlg_mod._PREVIEW_DESC).setCheckState(Qt.Unchecked)
+        seen["summary"] = preview._summary.text()
+        preview._currency.setCurrentText("USD")
+        preview._on_accept()
+        return preview.result()
+
+    questions = []
+    monkeypatch.setattr(
+        dlg_mod, "show_question",
+        lambda _p, _t, text, **_k: questions.append(text) or QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(dlg_mod.BulkMapPreviewDialog, "exec", fake_exec)
+    dlg = _bulk_dialog(dlg_mod, ["JOHN DOE", "puma", "MARY  ANN", "SKIP ME"])
+    dlg._payee_each.setChecked(True)
+    assert not dlg._payee.isEnabled()
+    dlg._item.setText("spares")
+    dlg._on_save()
+
+    assert seen["status"] == ["New", "Existing", "New"]
+    assert seen["item_status"] == "Existing"
+    assert questions == ["Create 2 new Payee(s) in USD.\nMap 3 description(s).\n\nGo ahead?"]
+    assert seen["summary"] == "3 description(s) · 2 new Payee(s) · 0 new Item(s)"
+    choice = dlg.choice
+    assert choice.rows == [
+        ("JOHN DOE", "DIRECT COSTS:SPARES", "JOHN DOE"),
+        ("puma", "DIRECT COSTS:SPARES", "PUMA"),
+        ("MARY  ANN", "DIRECT COSTS:SPARES", "MARY ANN LTD"),
+    ]
+    assert choice.descriptions == ["JOHN DOE", "puma", "MARY  ANN"]
+    assert choice.new_payees == {"JOHN DOE": "USD", "MARY ANN LTD": "USD"}
+    assert choice.new_items == {}
+
+
+def test_map_dialog_item_per_description_needs_no_forms(qapp, monkeypatch) -> None:
+    from PySide6.QtWidgets import QMessageBox
+
+    from tahmeed.ui.dialogs import import_session_dialogs as dlg_mod
+
+    def no_form(*_a, **_k):
+        raise AssertionError("no Add Item / Add Payee form in bulk mode")
+
+    def fake_exec(preview) -> int:
+        preview._on_accept()
+        return preview.result()
+
+    answer = {"value": QMessageBox.StandardButton.Yes}
+    monkeypatch.setattr(dlg_mod, "show_question", lambda *_a, **_k: answer["value"])
+    for name in ("run_add_item_dialog", "run_add_payee_dialog", "ask_new_item", "ask_new_payee"):
+        monkeypatch.setattr(dlg_mod, name, no_form)
+    monkeypatch.setattr(dlg_mod.BulkMapPreviewDialog, "exec", fake_exec)
+    dlg = _bulk_dialog(dlg_mod, ["GET VALVE", "spares", "TYRE  REPAIR"])
+    dlg._item_each.setChecked(True)
+    dlg._payee.setText("new garage")
+    dlg._on_save()
+
+    choice = dlg.choice
+    assert [r[1] for r in choice.rows] == ["GET VALVE", "DIRECT COSTS:SPARES", "TYRE REPAIR"]
+    assert {r[2] for r in choice.rows} == {"NEW GARAGE"}
+    assert choice.new_items == {
+        "GET VALVE": {**dlg_mod.BULK_ITEM_FIELDS, "name": "GET VALVE"},
+        "TYRE REPAIR": {**dlg_mod.BULK_ITEM_FIELDS, "name": "TYRE REPAIR"},
+    }
+    assert not any(dlg_mod.BULK_ITEM_FIELDS.values())
+    assert choice.new_payees == {"NEW GARAGE": "TZS"}
+
+    # Answering No to the confirmation creates nothing.
+    answer["value"] = QMessageBox.StandardButton.No
+    dlg = _bulk_dialog(dlg_mod, ["GET VALVE"])
+    dlg._item_each.setChecked(True)
+    dlg._payee.setText("puma")
+    dlg._on_save()
+    assert dlg.choice is None
+
+
+def test_bulk_map_creates_names_and_maps_each(qapp, tmp_path: Path, monkeypatch) -> None:
+    from tahmeed.ui.accountant import import_daily_master as page_mod
+    from tahmeed.ui.dialogs.import_session_dialogs import MappingChoice
+
+    calls = _fake_server(monkeypatch)
+    messages = []
+    monkeypatch.setattr(page_mod, "show_info", lambda _p, _t, text: messages.append(text))
+
+    class FakeDialog:
+        Accepted = 1
+
+        def __init__(self, descriptions, **_kwargs) -> None:
+            self.choice = MappingChoice(
+                list(descriptions), item="", payee="PUMA",
+                rows=[(d, d.upper(), "PUMA") for d in descriptions],
+                new_items={d.upper(): {"name": d.upper()} for d in descriptions},
+            )
+
+        def exec(self) -> int:
+            return 1
+
+    monkeypatch.setattr(page_mod, "MapDescriptionsDialog", FakeDialog)
+    widget, session = _page(qapp, tmp_path)
+    widget._tabs.setCurrentIndex(page_mod.TAB_ISSUES)
+    issues = [widget._issues_by_key[k] for k in ("GET VALVE", "BANK CHARGES")]
+    widget._open_map_dialog(issues)
+
+    assert sorted(calls["items"]) == ["BANK CHARGES", "GET VALVE"]
+    assert session.get_mapping("GET VALVE").item == "GET VALVE"
+    assert session.get_mapping("BANK CHARGES").payee == "PUMA"
+    assert _day_status(widget, D1) == "Ready"
+    assert "2 new Item(s)" in messages[-1]
 
 
 def test_map_dialog_new_item_and_payee(qapp, monkeypatch) -> None:

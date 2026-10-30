@@ -9,6 +9,7 @@ from bson import ObjectId
 from tahmeed.services.import_session_pack import (
     PACK_FILE_FORMAT,
     apply_mapping_pack,
+    builtin_mappings,
     builtin_pack_path,
     find_pack_folder,
     find_pack_source,
@@ -24,6 +25,8 @@ from tahmeed.services.import_session_service import (
 )
 from tahmeed.services.import_session_validation import (
     DAY_READY,
+    SOURCE_PACK,
+    SOURCE_TEMP,
     references_from_snapshot,
     validate_session,
 )
@@ -108,7 +111,7 @@ def test_missing_and_broken_files_are_reported(tmp_path: Path) -> None:
     assert pack.errors and pack.errors[0].startswith("description_memory.json")
 
 
-def test_apply_translates_accounts_and_keeps_manual(tmp_path: Path) -> None:
+def test_apply_replaces_built_in_and_keeps_typed(tmp_path: Path) -> None:
     session = ImportSession.new("t")
     session.rows = [
         _row(2, "1 GET VALVE", "141 EFP"),
@@ -121,18 +124,22 @@ def test_apply_translates_accounts_and_keeps_manual(tmp_path: Path) -> None:
 
     result = apply_mapping_pack(session, pack, refs)
 
-    get_valve = session.get_mapping("1 GET VALVE")
+    get_valve = session.pack_mappings["1 GET VALVE"]
     assert (get_valve.item, get_valve.payee, get_valve.source) == (
         "DIRECT COSTS:SPARES",
         "SPARE PARTS",
         MAPPING_SOURCE_PACK,
     )
+    assert session.pack_name == "expense automation"
+    assert session.get_mapping("1 GET VALVE") is None
     assert session.get_mapping("DIESEL").source == MAPPING_SOURCE_MANUAL
-    assert result.mappings_kept == 1
-    assert result.mappings_added == 2
-    assert result.mappings_in_session == 1
-    assert result.unresolved_items == {"Direct Costs:Tyres": 1}
-    assert result.unresolved_payees == {"Tyre World": 1}
+    assert result.mappings_added == 3
+    assert result.mappings_in_session == 2
+    assert result.unresolved_items == {"DIRECT COSTS:TYRES": 1}
+    assert result.unresolved_payees == {"TYRE WORLD": 1}
+    rows = validate_session(session, refs).rows
+    assert rows["f|S|2"].mapping_source == SOURCE_PACK
+    assert rows["f|S|3"].mapping_source == SOURCE_TEMP
     # Truck values are never mapped from the pack: each row is fixed on its own.
     assert not session.truck_fixes
 
@@ -147,9 +154,17 @@ def test_apply_translates_accounts_and_keeps_manual(tmp_path: Path) -> None:
     session.set_truck_fix("f|S|3", "")
     assert validate_session(session, refs).day(D1).status == DAY_READY
 
-    again = apply_mapping_pack(session, pack, refs, overwrite_manual=True)
-    assert again.mappings_kept == 0
-    assert session.get_mapping("DIESEL").item == "DIRECT COSTS:FUEL"
+    # Going back to the built-in pack drops the loaded one; typed mappings stay.
+    session.use_builtin_mappings()
+    assert session.pack_mappings == {}
+    assert session.get_mapping("DIESEL") is not None
+
+
+def test_builtin_mappings_feed_validation() -> None:
+    mappings = builtin_mappings()
+    assert len(mappings) > 1000
+    assert all(m.source == MAPPING_SOURCE_PACK for m in mappings.values())
+    assert builtin_mappings() is mappings
 
 
 def test_pack_file_round_trip_keeps_automation_formats(tmp_path: Path) -> None:

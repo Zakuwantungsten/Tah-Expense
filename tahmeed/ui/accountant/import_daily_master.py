@@ -1,11 +1,11 @@
 """Accountant page: bulk Import Daily → Master Expenses.
 
 Load many daily / MASTER Excel files into a local import session, group rows
-by reconciled day, fix descriptions and trucks with temporary mappings (typed
-here or loaded from the expense automation's mapping pack), then push ticked
-Ready days. Finishing the session discards it, optionally saving some
-temporary mappings to Description Maps first. The single-file flow stays
-available as "Single file".
+by reconciled day, map descriptions with the built-in expense automation
+mappings and/or Description Maps (plus mappings typed here), fix trucks row by
+row, then push ticked Ready days. Finishing the session discards it, optionally
+saving session-only typed mappings to Description Maps first. The single-file
+flow stays available as "Single file".
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from tahmeed.services.import_session_parser import (
     SKIP_REASON_LABELS,
     common_sheet_names,
 )
-from tahmeed.services.import_session_pack import apply_mapping_pack
+from tahmeed.services.import_session_pack import apply_mapping_pack, builtin_mappings
 from tahmeed.services.import_session_push import (
     DayNotReady,
     PriorUpload,
@@ -47,7 +47,10 @@ from tahmeed.services.import_session_push import (
     push_groups,
 )
 from tahmeed.services.import_session_service import (
-    MAPPING_SOURCE_MANUAL,
+    MODE_BOTH_BUILTIN_FIRST,
+    MODE_BOTH_MAPS_FIRST,
+    MODE_BUILTIN_ONLY,
+    MODE_MAPS_ONLY,
     ImportSession,
     add_files_to_session,
     delete_session,
@@ -60,11 +63,13 @@ from tahmeed.services.import_session_validation import (
     DAY_BLOCKED,
     DAY_PUSHED,
     DAY_READY,
+    ISSUE_BAD_ITEM,
+    ISSUE_BAD_PAYEE,
+    ISSUE_UNMAPPED,
     KIND_BAD_MAP,
     KIND_IGNORED,
     KIND_UNMAPPED,
-    SOURCE_GLOBAL,
-    SOURCE_TEMP,
+    SOURCE_LABELS,
     DescriptionIssue,
     ImportReferences,
     SessionValidation,
@@ -120,6 +125,12 @@ _T2 = "#6B7280"
 DRAFT_BG = "#FEF9C3"
 _BADGE_RED = "#DC2626"  # same as the sidebar badges
 _BADGE_GREY = "#9CA3AF"
+_MAPPING_MODE_LABELS = {
+    MODE_BOTH_MAPS_FIRST: "Both — Description Maps first",
+    MODE_BOTH_BUILTIN_FIRST: "Both — Built-in first",
+    MODE_BUILTIN_ONLY: "Built-in only",
+    MODE_MAPS_ONLY: "Description Maps only",
+}
 
 SCOPE_ALL = "All days"
 SCOPE_DAY = "Selected day"
@@ -241,18 +252,23 @@ class ImportDailyMasterWidget(QWidget):
         toolbar.addWidget(refresh_btn)
         pack_btn = dialog_button("Load Mapping Pack…")
         pack_btn.setToolTip(
-            "Load the expense automation's description mappings as temporary mappings "
-            "for this session (trucks are fixed row by row, never from a pack)"
+            "Use a newer expense automation pack instead of the built-in mappings for "
+            "this session, or export a pack (trucks never come from a pack)"
         )
         pack_btn.clicked.connect(self._on_load_pack)
         toolbar.addWidget(pack_btn)
         toolbar.addSpacing(16)
-        self._use_temp = QCheckBox("Use temporary mappings")
-        self._use_temp.toggled.connect(self._on_options_changed)
-        toolbar.addWidget(self._use_temp)
-        self._prefer_temp = QCheckBox("Temporary mappings win over Description Maps")
-        self._prefer_temp.toggled.connect(self._on_options_changed)
-        toolbar.addWidget(self._prefer_temp)
+        toolbar.addWidget(_label("MAPPINGS", muted=True))
+        self._mapping_mode = QComboBox()
+        for mode, text in _MAPPING_MODE_LABELS.items():
+            self._mapping_mode.addItem(text, mode)
+        self._mapping_mode.setToolTip(
+            "Which mappings fill in Payee + Item: the built-in QuickBooks automation "
+            "mappings, the Description Maps tab, or both (the first one listed wins). "
+            "Mappings you type in this session always apply."
+        )
+        self._mapping_mode.currentIndexChanged.connect(self._on_mapping_mode_changed)
+        toolbar.addWidget(self._mapping_mode)
         toolbar.addStretch()
         classic = dialog_button("Single file (classic)…")
         classic.setToolTip("Old one-file import straight to Master Expenses")
@@ -367,10 +383,11 @@ class ImportDailyMasterWidget(QWidget):
             btn = dialog_button(text, primary=primary)
             btn.clicked.connect(slot)
             bar.addWidget(btn)
-        self._save_global_box = QCheckBox("Also save to Description Maps")
+        self._save_global_box = QCheckBox("Save to Description Maps")
+        self._save_global_box.setChecked(True)
         self._save_global_box.setToolTip(
-            "Ticked: new mappings are saved to Description Maps right away (permanent, "
-            "every PC). Unticked: temporary for this session only."
+            "Ticked: mappings you enter are added to the Description Maps tab right away "
+            "(permanent, every PC). Untick for a one-off mapping kept in this session only."
         )
         bar.addWidget(self._save_global_box)
         bar.addStretch()
@@ -489,7 +506,7 @@ class ImportDailyMasterWidget(QWidget):
         page, layout, bar = self._tab_page()
         self._preview_model = GridModel(
             ["RECONCILED", "DATE", "PAYEE", "ITEM", "DESCRIPTION", "TRUCK", "TZS", "USD",
-             "MEMO", "SOURCE FILE", "STATUS"],
+             "MEMO", "SOURCE FILE", "MAPPED BY", "STATUS"],
             right_align=[6, 7],
         )
         self._preview_view = GridView(self._preview_model)
@@ -566,7 +583,9 @@ class ImportDailyMasterWidget(QWidget):
             invalidate_description_mapping_cache()
         show_widget_loading(self, "Loading items, payees, trucks and trailers…")
         try:
-            self._refs = await load_import_references(refresh=refresh)
+            refs = await load_import_references(refresh=refresh)
+            refs.builtin_mappings = builtin_mappings()
+            self._refs = refs
         finally:
             hide_widget_loading(self)
         self._revalidate()
@@ -590,14 +609,11 @@ class ImportDailyMasterWidget(QWidget):
         self._truck_draft_allowed.clear()
         self._current_day = None
         self._days_model.clear_checks()
-        for box, value in (
-            (self._use_temp, session.options.use_temp_mappings),
-            (self._prefer_temp, session.options.prefer_temp_mappings),
-        ):
-            box.blockSignals(True)
-            box.setChecked(value)
-            box.blockSignals(False)
-        self._prefer_temp.setEnabled(session.options.use_temp_mappings)
+        self._mapping_mode.blockSignals(True)
+        self._mapping_mode.setCurrentIndex(
+            max(0, self._mapping_mode.findData(session.options.mapping_mode))
+        )
+        self._mapping_mode.blockSignals(False)
         self._fill_session_combo()
         self._revalidate()
 
@@ -638,7 +654,7 @@ class ImportDailyMasterWidget(QWidget):
             return
         name, ok = get_text(self, "Rename session", "Session name:", self._session.name)
         if ok and name.strip():
-            self._session.name = name.strip()
+            self._session.rename(name)
             self._save()
             self._fill_session_combo()
 
@@ -663,12 +679,10 @@ class ImportDailyMasterWidget(QWidget):
         if self._session is not None:
             save_session(self._session)
 
-    def _on_options_changed(self, _checked: bool) -> None:
+    def _on_mapping_mode_changed(self, _index: int) -> None:
         if self._session is None:
             return
-        self._session.options.use_temp_mappings = self._use_temp.isChecked()
-        self._session.options.prefer_temp_mappings = self._prefer_temp.isChecked()
-        self._prefer_temp.setEnabled(self._use_temp.isChecked())
+        self._session.options.mapping_mode = self._mapping_mode.currentData()
         self._session.touch()
         self._save()
         self._revalidate()
@@ -769,25 +783,29 @@ class ImportDailyMasterWidget(QWidget):
         if usd:
             parts.append(f"USD {usd:,.2f}")
         parts.append(f"{len(session.skipped):,} skipped")
-        temp = f"Temporary: {len(session.temp_mappings):,} mapping(s)"
-        if not session.options.use_temp_mappings:
-            temp += " (switched off)"
-        temp += f", {len(session.truck_fixes):,} row truck fix(es)"
+        mappings = [f"Mappings: <b>{_MAPPING_MODE_LABELS[session.options.mapping_mode]}</b>"]
+        if session.options.mapping_mode != MODE_MAPS_ONLY:
+            if session.pack_mappings:
+                mappings.append(
+                    f"pack '{session.pack_name}' ({len(session.pack_mappings):,}) "
+                    "instead of built-in"
+                )
+            elif self._refs is not None:
+                mappings.append(f"built-in {len(self._refs.builtin_mappings):,}")
+        if session.options.mapping_mode != MODE_BUILTIN_ONLY and self._refs is not None:
+            mappings.append(f"Description Maps {len(self._refs.global_mappings):,}")
+        mappings.append(f"typed here {len(session.temp_mappings):,}")
+        line = ", ".join(mappings) + f" · {len(session.truck_fixes):,} row truck fix(es)"
         if result is not None:
-            by_source = {SOURCE_TEMP: 0, SOURCE_GLOBAL: 0}
+            by_source = {source: 0 for source in SOURCE_LABELS}
             for res in result.rows.values():
-                if res.ok and res.mapping_source in by_source:
+                mapped = not ({ISSUE_UNMAPPED, ISSUE_BAD_ITEM, ISSUE_BAD_PAYEE} & set(res.issues))
+                if mapped and res.mapping_source in by_source:
                     by_source[res.mapping_source] += 1
-            temp += (
-                f" · Rows mapped by Description Maps: {by_source[SOURCE_GLOBAL]:,}, "
-                f"by temporary mappings: {by_source[SOURCE_TEMP]:,}"
+            line += " · Rows mapped: " + ", ".join(
+                f"{by_source[source]:,} {label}" for source, label in SOURCE_LABELS.items()
             )
-        if not session.temp_mappings and self._refs is not None:
-            temp += (
-                f" · No mapping pack loaded — using the {len(self._refs.global_mappings):,} "
-                "Description Maps"
-            )
-        self._banner.setText(" · ".join(parts) + f"<br><span style='color:{_T2}'>{temp}</span>")
+        self._banner.setText(" · ".join(parts) + f"<br><span style='color:{_T2}'>{line}</span>")
 
     # -------------------------------------------------------------- day batches
 
@@ -1085,21 +1103,32 @@ class ImportDailyMasterWidget(QWidget):
         if dlg.exec() != LoadPackDialog.Accepted or dlg.choice is None:
             return
         choice = dlg.choice
-        result = apply_mapping_pack(
-            self._session,
-            choice.pack,
-            self._refs,
-            overwrite_manual=choice.overwrite_manual,
+        off = (
+            "\n\nMappings is set to 'Description Maps only', so built-in / pack mappings "
+            "are not used until you change it."
+            if self._session.options.mapping_mode == MODE_MAPS_ONLY
+            else ""
         )
+        if choice.builtin:
+            self._session.use_builtin_mappings()
+            self._changed()
+            show_info(
+                self,
+                "Load mapping pack",
+                f"'{self._session.name}' uses the {len(self._refs.builtin_mappings):,} "
+                f"built-in mappings.{off}",
+            )
+            return
+        result = apply_mapping_pack(self._session, choice.pack, self._refs)
         self._changed()
 
         lines = [
-            f"Loaded into '{self._session.name}' (temporary):",
+            f"'{self._session.name}' now uses pack '{self._session.pack_name}' instead of "
+            "the built-in mappings:",
             f"  · {result.mappings_added:,} description mapping(s), "
             f"{result.mappings_in_session:,} used by this session's rows",
+            "  · Mappings you typed here are kept and still win",
         ]
-        if result.mappings_kept:
-            lines.append(f"  · {result.mappings_kept:,} of your own mapping(s) kept")
 
         def top(counter, label: str) -> None:
             if not counter:
@@ -1114,12 +1143,12 @@ class ImportDailyMasterWidget(QWidget):
             lines.append(
                 "\nDescriptions using those show as 'Bad map' in Day Issues — map them there."
             )
-        show_info(self, "Load mapping pack", "\n".join(lines))
+        show_info(self, "Load mapping pack", "\n".join(lines) + off)
 
     # ------------------------------------------------------------- finish session
 
     def _promote_candidates(self) -> List[PromoteCandidate]:
-        """Temporary mappings whose Item and Payee exist, so they can be saved for good."""
+        """Session-only typed mappings whose Item and Payee exist, to save for good."""
         session, refs = self._session, self._refs
         if session is None or refs is None:
             return []
@@ -1148,10 +1177,10 @@ class ImportDailyMasterWidget(QWidget):
                     description=mapping.description,
                     payee=payee,
                     item=item.name,
-                    source="Typed here" if mapping.source == MAPPING_SOURCE_MANUAL else "Mapping pack",
+                    source="Typed here",
                     rows=rows_by_key.get(key, 0),
                     current=current_text,
-                    ticked=mapping.source == MAPPING_SOURCE_MANUAL and not same,
+                    ticked=not same,
                 )
             )
         out.sort(key=lambda c: (-c.rows, c.description))
@@ -1233,7 +1262,7 @@ class ImportDailyMasterWidget(QWidget):
             colors = {0: IGNORED_BG}
         elif issue.key in self._issue_drafts:
             colors.update({_ISSUE_PAYEE_COL: DRAFT_BG, _ISSUE_ITEM_COL: DRAFT_BG})
-        source = {SOURCE_TEMP: "Temporary", SOURCE_GLOBAL: "Description Maps"}.get(issue.source, "")
+        source = SOURCE_LABELS.get(issue.source, "")
         return GridRow(
             key=issue.key,
             cells=[
@@ -1390,11 +1419,17 @@ class ImportDailyMasterWidget(QWidget):
         choice = dlg.choice
         self._save_global_box.setChecked(choice.save_global)
         self._issues_model.clear_checks()
+        if choice.rows:
+            rows, new_items, new_payees = choice.rows, choice.new_items, choice.new_payees
+        else:
+            rows = [(d, choice.item, choice.payee) for d in choice.descriptions]
+            new_items = {choice.item: choice.new_item} if choice.new_item else {}
+            new_payees = dict([choice.new_payee]) if choice.new_payee else {}
         self._start(
             self._save_mappings(
-                [(d, choice.item, choice.payee) for d in choice.descriptions],
-                new_items={choice.item: choice.new_item} if choice.new_item else {},
-                new_payees=dict([choice.new_payee]) if choice.new_payee else {},
+                rows,
+                new_items=new_items,
+                new_payees=new_payees,
                 save_global=choice.save_global,
             )
         )
@@ -1480,12 +1515,17 @@ class ImportDailyMasterWidget(QWidget):
         with pause_background_polls(self):
             show_widget_loading(self, "Saving mappings…")
             try:
-                for name, currency in new_payees.items():
+                for n, (name, currency) in enumerate(new_payees.items(), 1):
+                    if len(new_payees) > 1:
+                        show_widget_loading(self, f"Adding Payees {n:,}/{len(new_payees):,}…")
                     await payee_service.add_payee(name, currency=currency or "TZS")
                     refs.payees.add(name)
-                for name, fields in new_items.items():
+                for n, (name, fields) in enumerate(new_items.items(), 1):
+                    if len(new_items) > 1:
+                        show_widget_loading(self, f"Adding Items {n:,}/{len(new_items):,}…")
                     category = await mapping_assignment_service.create_item_for_mapping(name, fields)
                     refs.items.add(ItemRef(category._id, category.name))
+                show_widget_loading(self, "Saving mappings…")
 
                 entries = []
                 for desc, item_name, payee_name in rows:
@@ -1502,6 +1542,7 @@ class ImportDailyMasterWidget(QWidget):
                             refs.global_mappings[mapping.description_key] = mapping
                     for desc, *_rest in entries:
                         session.remove_mapping(desc)
+                    session.note_saved_to_maps(desc for desc, *_rest in entries)
                     saved_global = len(saved)
             except Exception as exc:
                 hide_widget_loading(self)
@@ -1513,13 +1554,18 @@ class ImportDailyMasterWidget(QWidget):
                 self._changed()
             hide_widget_loading(self)
 
+        def listed(names) -> str:
+            names = list(names)
+            more = f" … and {len(names) - 8:,} more" if len(names) > 8 else ""
+            return ", ".join(names[:8]) + more
+
         created = []
         if new_payees:
-            created.append(f"{len(new_payees)} new Payee(s): " + ", ".join(new_payees))
+            created.append(f"{len(new_payees)} new Payee(s): " + listed(new_payees))
         if new_items:
-            created.append(f"{len(new_items)} new Item(s): " + ", ".join(new_items))
+            created.append(f"{len(new_items)} new Item(s): " + listed(new_items))
         if created or saved_global:
-            lines = created + (
+            lines = created + [f"{len(rows):,} description(s) mapped."] + (
                 [f"{saved_global:,} mapping(s) saved to Description Maps."] if saved_global else []
             )
             show_info(self, "Save mappings", "\n".join(lines))
@@ -1913,9 +1959,10 @@ class ImportDailyMasterWidget(QWidget):
                             row.amount_usd,
                             row.memo,
                             row.source_file,
+                            SOURCE_LABELS.get(res.mapping_source, ""),
                             "Not pushed (ignored)" if res.ignored else status,
                         ],
-                        cell_colors={10: bg},
+                        cell_colors={11: bg},
                     )
                 )
         self._preview_model.set_rows(rows)
@@ -1965,6 +2012,7 @@ class ImportDailyMasterWidget(QWidget):
             self._session.remove_file(key)
         self._files_model.clear_checks()
         self._changed()
+        self._fill_session_combo()
 
     def _on_reload_files(self) -> None:
         if self._session is None:

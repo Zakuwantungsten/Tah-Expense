@@ -19,7 +19,14 @@ from bson import ObjectId
 from tahmeed.models.description_mapping import DescriptionMapping
 from tahmeed.services.description_mapping_service import normalize_description
 from tahmeed.services.import_session_parser import StagedRow
-from tahmeed.services.import_session_service import ImportSession, TempMapping, truck_key
+from tahmeed.services.import_session_service import (
+    MODE_BOTH_BUILTIN_FIRST,
+    MODE_BUILTIN_ONLY,
+    MODE_MAPS_ONLY,
+    ImportSession,
+    TempMapping,
+    truck_key,
+)
 from tahmeed.services.import_truck_check import is_blank_truck_value, resolve_truck_cell
 from tahmeed.services.truck_format import DEFAULT_PLACE_LABELS, merge_allowed_labels
 
@@ -36,8 +43,14 @@ KIND_UNMAPPED = "Unmapped"
 KIND_BAD_MAP = "Bad map"
 KIND_IGNORED = "Ignored"
 
-SOURCE_TEMP = "temp"
-SOURCE_GLOBAL = "global"
+SOURCE_TEMP = "temp"  # typed in this session
+SOURCE_PACK = "pack"  # built-in mappings, or a pack loaded for the session
+SOURCE_GLOBAL = "global"  # Description Maps
+SOURCE_LABELS: Dict[str, str] = {
+    SOURCE_TEMP: "Typed",
+    SOURCE_PACK: "Built-in",
+    SOURCE_GLOBAL: "Description Maps",
+}
 
 
 def _norm_name(value: str) -> str:
@@ -202,6 +215,8 @@ class ImportReferences:
     fleet: Set[str]
     place_labels: List[str] = field(default_factory=lambda: list(DEFAULT_PLACE_LABELS))
     global_mappings: Dict[str, DescriptionMapping] = field(default_factory=dict)
+    # Built-in pack shipped with the app: description key -> Payee + Account.
+    builtin_mappings: Dict[str, TempMapping] = field(default_factory=dict)
 
     def fleet_names(self) -> List[str]:
         return sorted(self.fleet)
@@ -289,7 +304,9 @@ class _MappingOutcome:
     issues: Tuple[str, ...] = (ISSUE_UNMAPPED,)
 
 
-def _temp_outcome(mapping: TempMapping, refs: ImportReferences) -> _MappingOutcome:
+def _temp_outcome(
+    mapping: TempMapping, refs: ImportReferences, source: str = SOURCE_TEMP
+) -> _MappingOutcome:
     item = refs.items.resolve(mapping.item)
     payee = refs.payees.resolve(mapping.payee)
     issues = []
@@ -301,7 +318,7 @@ def _temp_outcome(mapping: TempMapping, refs: ImportReferences) -> _MappingOutco
         item=item.name if item else mapping.item,
         category_id=item.id if item else None,
         payee=payee or mapping.payee,
-        source=SOURCE_TEMP,
+        source=source,
         issues=tuple(issues),
     )
 
@@ -328,19 +345,32 @@ def resolve_description(
     session: ImportSession,
     refs: ImportReferences,
 ) -> _MappingOutcome:
-    """Preferred source first; fall back to the other when the first is a bad map."""
+    """Typed here first, then built-in / Description Maps as the session's mode says.
+
+    The first mapping whose Item and Payee exist wins; when none does, the first
+    one found is reported as a bad map.
+    """
     key = normalize_description(description)
-    temp = session.temp_mappings.get(key) if session.options.use_temp_mappings else None
+    mode = session.options.mapping_mode
+    pack_source = session.pack_mappings or refs.builtin_mappings
+    pack = pack_source.get(key) if mode != MODE_MAPS_ONLY else None
     glob = refs.global_mappings.get(key)
-    if session.options.prefer_temp_mappings:
-        ordered = [(temp, _temp_outcome), (glob, _global_outcome)]
-    else:
-        ordered = [(glob, _global_outcome), (temp, _temp_outcome)]
+    typed_glob = glob if key in session.typed_to_maps else None
+    if mode == MODE_BUILTIN_ONLY or typed_glob is not None:
+        glob = None
+
+    by_pack = (pack, lambda m: _temp_outcome(m, refs, SOURCE_PACK))
+    by_maps = (glob, lambda m: _global_outcome(m, refs))
+    ordered = [
+        (session.temp_mappings.get(key), lambda m: _temp_outcome(m, refs)),
+        (typed_glob, lambda m: _global_outcome(m, refs)),
+    ] + ([by_pack, by_maps] if mode == MODE_BOTH_BUILTIN_FIRST else [by_maps, by_pack])
+
     first_bad: Optional[_MappingOutcome] = None
     for mapping, evaluate in ordered:
         if mapping is None:
             continue
-        outcome = evaluate(mapping, refs)
+        outcome = evaluate(mapping)
         if not outcome.issues:
             return outcome
         if first_bad is None:

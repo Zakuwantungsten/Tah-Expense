@@ -85,7 +85,9 @@ def test_round_trip_save_load_list_delete(tmp_path: Path) -> None:
     session.set_mapping("Diesel", "FUEL", "PUMA")
     session.ignore(["Bank charges"])
     session.set_truck_fix(session.rows[0].row_id, "T100 ABC")
-    session.options.prefer_temp_mappings = False
+    session.options.mapping_mode = svc.MODE_BUILTIN_ONLY
+    session.set_pack_mappings({"TOLLS": svc.TempMapping("TOLLS", "TOLL", "TANROADS", "pack")}, "Newer")
+    session.note_saved_to_maps(["  diesel "])
     session.mark_day_pushed(date(2026, 10, 1), row_count=1, upload_ids=["u1"])
     svc.save_session(session)
 
@@ -96,7 +98,10 @@ def test_round_trip_save_load_list_delete(tmp_path: Path) -> None:
     assert loaded.temp_mappings == session.temp_mappings
     assert loaded.ignored == session.ignored
     assert loaded.truck_fixes == session.truck_fixes == {session.rows[0].row_id: "T100 ABC"}
-    assert loaded.options.prefer_temp_mappings is False
+    assert loaded.options.mapping_mode == svc.MODE_BUILTIN_ONLY
+    assert loaded.pack_mappings == session.pack_mappings
+    assert loaded.pack_name == "Newer"
+    assert loaded.typed_to_maps == {"DIESEL"}
     assert loaded.pushed_days[date(2026, 10, 1)].upload_ids == ["u1"]
 
     summaries = svc.list_sessions()
@@ -105,6 +110,73 @@ def test_round_trip_save_load_list_delete(tmp_path: Path) -> None:
     ]
     assert svc.delete_session(session.session_id)
     assert svc.list_sessions() == []
+
+
+@pytest.mark.parametrize(
+    ("old_options", "mode"),
+    [
+        ({}, svc.MODE_BOTH_BUILTIN_FIRST),
+        ({"use_temp_mappings": True, "prefer_temp_mappings": False}, svc.MODE_BOTH_MAPS_FIRST),
+        ({"use_temp_mappings": False, "prefer_temp_mappings": True}, svc.MODE_MAPS_ONLY),
+        ({"mapping_mode": "builtin_only"}, svc.MODE_BUILTIN_ONLY),
+    ],
+)
+def test_older_sessions_keep_their_mapping_choice(old_options: dict, mode: str) -> None:
+    data = svc.ImportSession.new("Old").to_dict()
+    data["options"] = old_options
+    data.pop("pack_mappings")
+    data.pop("pack_name")
+    data["temp_mappings"] = [
+        {"description": "DIESEL", "item": "FUEL", "payee": "PUMA", "source": "manual"},
+        {"description": "TOLLS", "item": "TOLL", "payee": "TANROADS", "source": "pack"},
+    ]
+    session = svc.ImportSession.from_dict(data)
+    assert session.options.mapping_mode == mode
+    assert set(session.temp_mappings) == {"DIESEL"}
+    assert set(session.pack_mappings) == {"TOLLS"}
+    assert session.pack_name == "Loaded earlier"
+
+
+def test_default_name_follows_the_file_dates(tmp_path: Path) -> None:
+    session = svc.ImportSession.new()
+    assert session.auto_named and session.name.startswith("Import ")
+    first = parse_workbook(_daily(tmp_path, "MATUMIZI YA 01-10-26.xlsx", "Diesel"))
+    session.add_parsed(first)
+    assert session.name == "MATUMIZI 01/10/2026"
+    second = _daily(tmp_path, "MATUMIZI YA 19-10-26.xlsx", "Diesel")
+    wb = openpyxl.load_workbook(second)
+    wb.active["A2"] = datetime(2026, 10, 19)
+    wb.save(second)
+    session.add_parsed(parse_workbook(second))
+    assert session.name == "MATUMIZI 01/10/2026 – 19/10/2026"
+
+    session.remove_file(first.file.file_key)
+    assert session.name == "MATUMIZI 19/10/2026"
+    loaded = svc.ImportSession.from_dict(session.to_dict())
+    assert loaded.auto_named and loaded.name == "MATUMIZI 19/10/2026"
+
+    # A typed name is never changed.
+    session.rename("October backlog")
+    session.add_parsed(first)
+    assert session.name == "October backlog" and not session.auto_named
+    named = svc.ImportSession.new("Mine")
+    named.add_parsed(first)
+    assert named.name == "Mine"
+
+    # Older sessions: only the default name follows the dates.
+    old = svc.ImportSession.new("Import 30/10/2026 16:08").to_dict()
+    old.pop("auto_named")
+    assert svc.ImportSession.from_dict(old).auto_named
+    old["name"] = "Backlog"
+    assert not svc.ImportSession.from_dict(old).auto_named
+
+
+def test_new_sessions_use_both_with_description_maps_first() -> None:
+    session = svc.ImportSession.new()
+    assert session.options.mapping_mode == svc.MODE_BOTH_MAPS_FIRST
+    session.set_pack_mappings({"TOLLS": svc.TempMapping("TOLLS", "TOLL", "TANROADS", "pack")}, "X")
+    session.use_builtin_mappings()
+    assert session.pack_mappings == {} and session.pack_name == ""
 
 
 def test_list_sessions_skips_corrupt_files() -> None:
