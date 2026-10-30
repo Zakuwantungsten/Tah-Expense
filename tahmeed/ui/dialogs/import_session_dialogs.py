@@ -649,9 +649,9 @@ class TruckFixDialog(QDialog):
             btn.clicked.connect(slot)
             buttons.addWidget(btn)
         btn.setDefault(True)
+        root.addLayout(buttons)
         # Tab in CORRECT TRUCK takes the highlighted suggestion, then Enter applies.
         QWidget.setTabOrder(self._correct, btn)
-        root.addLayout(buttons)
 
         start = next(
             (i for i, w in enumerate(self._remaining) if _same_name(w.value, start_value)), 0
