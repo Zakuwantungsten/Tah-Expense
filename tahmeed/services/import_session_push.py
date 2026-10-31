@@ -14,7 +14,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from tahmeed.services.daily_import_service import (
     _ref_float_from_notes,
@@ -143,6 +143,46 @@ def build_push_groups(
                 row_payload(row, res, upload_id=group.upload_id, upload_name=name)
             )
     return list(groups.values())
+
+
+def _row_day(payload: dict) -> date:
+    value = payload["date"]
+    return value.date() if isinstance(value, datetime) else value
+
+
+@dataclass
+class DateOutlier:
+    """Rows of one day whose Excel date is in another month (or year)."""
+
+    batch_date: date
+    row_date: date
+    rows: int
+
+
+def date_outliers(groups: Iterable[PushGroup]) -> List[DateOutlier]:
+    """Master Expenses files rows by their own date, so these land in another month."""
+    counts: Dict[tuple, int] = defaultdict(int)
+    for group in groups:
+        for payload in group.payloads:
+            row_date = _row_day(payload)
+            if (row_date.year, row_date.month) != (group.batch_date.year, group.batch_date.month):
+                counts[(group.batch_date, row_date)] += 1
+    return [DateOutlier(b, r, n) for (b, r), n in sorted(counts.items())]
+
+
+def supplier_rows(groups: Iterable[PushGroup], is_supplier: Callable[[str], bool]) -> Dict[str, int]:
+    """Rows per supplier item: pushed, but Master Expenses never lists them."""
+    counts: Dict[str, int] = defaultdict(int)
+    for group in groups:
+        for payload in group.payloads:
+            if is_supplier(payload["item"]):
+                counts[payload["item"]] += 1
+    return dict(counts)
+
+
+def row_date_range(groups: Iterable[PushGroup]) -> Optional[Tuple[date, date]]:
+    days = [_row_day(p) for g in groups for p in g.payloads]
+    return (min(days), max(days)) if days else None
 
 
 @dataclass

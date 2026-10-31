@@ -9,6 +9,7 @@ from tahmeed.ui.cashier.saved_view import (
     _COL_ACTIONS,
     _COL_DATE,
     _COL_DEFAULTS,
+    _COL_PARKED,
     _COL_SNO,
     _SAVED_ROW,
     _SAVED_ROW_ALT,
@@ -90,8 +91,9 @@ def test_tx_money_buckets_split_currencies() -> None:
 def test_saved_table_layout_has_sno_and_faint_blue() -> None:
     assert _COL_SNO == 0
     assert _COL_DATE == 1
-    assert _COL_ACTIONS == 9
-    assert len(_COL_DEFAULTS) == 10
+    assert _COL_PARKED == 5
+    assert _COL_ACTIONS == 10
+    assert len(_COL_DEFAULTS) == 11
     assert _SAVED_ROW == "#E8F4FD"
     assert _SAVED_ROW_ALT == "#EFF6FF"
 
@@ -142,3 +144,13 @@ def test_summarize_batches_and_filter_by_date() -> None:
     assert days[0].unmapped_count == 1
     assert len(filter_day_summaries(days, "13 oct")) == 1
     assert len(filter_day_summaries(days, "zzz")) == 0
+    assert days[0].parked_count == 0
+
+
+def test_summarize_batches_carries_parked_counts() -> None:
+    d1, d2 = date(2026, 10, 13), date(2026, 10, 12)
+    batches = [(d1, [_tx(amount=1)]), (d2, [])]
+    days = summarize_draft_day_batches(batches, {d1: 3, d2: 2})
+    assert [s.parked_count for s in days] == [3, 2]
+    # Parked-only day still gets a row with zero saved entries.
+    assert days[1].entries_count == 0

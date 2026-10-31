@@ -217,9 +217,14 @@ class ImportReferences:
     global_mappings: Dict[str, DescriptionMapping] = field(default_factory=dict)
     # Built-in pack shipped with the app: description key -> Payee + Account.
     builtin_mappings: Dict[str, TempMapping] = field(default_factory=dict)
+    # Supplier items: rows using them are pushed but Master Expenses hides them.
+    suppliers: Set[str] = field(default_factory=set)
 
     def fleet_names(self) -> List[str]:
         return sorted(self.fleet)
+
+    def is_supplier(self, item: str) -> bool:
+        return _norm_name(item) in self.suppliers
 
 
 def _fleet_numbers(documents: object) -> List[str]:
@@ -237,11 +242,13 @@ def references_from_snapshot(
     global_mappings: Optional[Dict[str, DescriptionMapping]] = None,
 ) -> ImportReferences:
     """Build references from a catalog snapshot. Fleet = trucks, trailers, motorcycles & cars."""
-    items = [
-        ItemRef(doc.get("_id") or doc.get("id"), str(doc.get("name") or ""))
+    categories = [
+        doc
         for doc in snapshot.get("categories") or []
         if isinstance(doc, dict) and doc.get("name") and doc.get("active", True) is not False
     ]
+    items = [ItemRef(doc.get("_id") or doc.get("id"), str(doc["name"])) for doc in categories]
+    suppliers = {_norm_name(str(doc["name"])) for doc in categories if doc.get("is_supplier")}
     payees = [
         str(doc.get("name") or "") if isinstance(doc, dict) else str(doc or "")
         for doc in snapshot.get("payees") or []
@@ -259,6 +266,7 @@ def references_from_snapshot(
         fleet=fleet,
         place_labels=sorted(merge_allowed_labels(DEFAULT_PLACE_LABELS, extra_labels)),
         global_mappings=dict(global_mappings or {}),
+        suppliers=suppliers,
     )
 
 

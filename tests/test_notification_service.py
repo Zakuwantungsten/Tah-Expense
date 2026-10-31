@@ -31,6 +31,30 @@ def test_verify_notification_count_uses_authenticated_accountant_endpoint(
     assert calls == [("GET", "v1/accountant/notification-counts")]
 
 
+def test_reset_cache_drops_stale_etag_for_new_dashboard(monkeypatch) -> None:
+    sent: list[object] = []
+
+    class _Response:
+        status_code = 200
+        headers = {"etag": '"1"'}
+
+        def json(self) -> dict:
+            return {"verify": 4}
+
+    async def request_response(method: str, path: str, **kwargs: object) -> _Response:
+        sent.append(kwargs.get("headers"))
+        return _Response()
+
+    monkeypatch.setattr(
+        notification_service.api_client, "request_response", request_response
+    )
+    notification_service._badge_etag = '"stale"'
+    notification_service.reset_verify_notification_cache()
+
+    assert asyncio.run(notification_service.get_verify_notification_count()) == 4
+    assert sent == [None]
+
+
 class _ActiveTimer:
     def isActive(self) -> bool:
         return True

@@ -107,6 +107,36 @@ def test_groups_per_day_and_source_file_with_payloads() -> None:
     assert second["serial"] == "XL3"
 
 
+def test_rows_master_files_elsewhere_are_reported() -> None:
+    session = _session(
+        _row(2, "GET VALVE", excel_date=date(2026, 9, 30)),
+        _row(3, "GET VALVE", excel_date=date(2025, 10, 1)),
+        _row(4, "GET VALVE", excel_date=date(2025, 10, 1)),
+        _row(5, "GET VALVE", excel_date=date(2026, 10, 20)),
+        _row(6, "GET VALVE"),
+    )
+    refs = references_from_snapshot(
+        {
+            "categories": [
+                {"_id": SPARES_ID, "name": "DIRECT COSTS:SPARES", "is_supplier": True},
+                {"_id": ObjectId(), "name": "OLD SUPPLIER", "is_supplier": True, "active": False},
+            ],
+            "payees": [{"name": "SPARE PARTS"}],
+        }
+    )
+    assert refs.suppliers == {"DIRECT COSTS:SPARES"}
+    groups = push.build_push_groups(session, validate_session(session, refs), [D1])
+
+    assert [(o.batch_date, o.row_date, o.rows) for o in push.date_outliers(groups)] == [
+        (D1, date(2025, 10, 1), 2),
+        (D1, date(2026, 9, 30), 1),
+    ]
+    assert push.row_date_range(groups) == (date(2025, 10, 1), date(2026, 10, 20))
+    assert push.supplier_rows(groups, refs.is_supplier) == {"DIRECT COSTS:SPARES": 5}
+    assert push.supplier_rows(groups, _refs().is_supplier) == {}
+    assert push.row_date_range([]) is None
+
+
 def test_blocked_day_cannot_be_pushed() -> None:
     session = _session(_row(2, "GET VALVE"), _row(2, "UNKNOWN", day=D2, source="MATUMIZI YA 02-10-26.xlsx"))
     validation = validate_session(session, _refs())

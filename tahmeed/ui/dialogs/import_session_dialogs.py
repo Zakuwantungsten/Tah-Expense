@@ -777,6 +777,7 @@ class FinishSessionDialog(QDialog):
         candidates: Sequence[PromoteCandidate],
         *,
         note: str = "",
+        pushed_note: str = "",
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -788,14 +789,19 @@ class FinishSessionDialog(QDialog):
 
         root = QVBoxLayout(self)
         intro = QLabel(
-            "Finishing discards this session: its staged rows, temporary mappings and truck "
-            "fixes. Rows already pushed, new Items / Payees and mappings already saved to "
-            "Description Maps all stay.<br>"
-            "Tick temporary mappings to keep for good — they are saved to "
-            "<b>Description Maps</b> first."
+            "Finishing closes this session and deletes its working copy: staged rows, "
+            "temporary mappings and truck fixes. Rows already pushed to Master Expenses, "
+            "new Items / Payees and mappings already in Description Maps all stay.<br>"
+            "The only choice below is whether to keep the ticked temporary mappings in "
+            "<b>Description Maps</b> for future imports."
         )
         intro.setWordWrap(True)
         root.addWidget(intro)
+        if pushed_note:
+            done = QLabel(pushed_note)
+            done.setWordWrap(True)
+            done.setStyleSheet("color:#15803D;font-weight:600;")
+            root.addWidget(done)
         if note:
             warn = QLabel(note)
             warn.setWordWrap(True)
@@ -830,9 +836,10 @@ class FinishSessionDialog(QDialog):
         buttons = QHBoxLayout()
         cancel = dialog_button("Cancel")
         cancel.clicked.connect(self.reject)
-        discard = dialog_button("Finish Without Saving")
+        discard = dialog_button("Finish — Don't Keep Mappings")
+        discard.setToolTip("Close the session without adding mappings to Description Maps")
         discard.clicked.connect(self._on_discard)
-        self._save_btn = dialog_button("Save Ticked && Finish", primary=True)
+        self._save_btn = dialog_button("Keep Ticked Mappings && Finish", primary=True)
         self._save_btn.clicked.connect(self._on_save)
         buttons.addWidget(cancel)
         buttons.addStretch()

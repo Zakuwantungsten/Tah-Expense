@@ -73,10 +73,40 @@ def exclusive_lock(path: Path) -> Iterator[None]:
 def _lock_owner_is_alive(path: Path) -> bool:
     try:
         pid = int(path.read_text(encoding="ascii").strip())
-        os.kill(pid, 0)
     except (OSError, ValueError):
         return False
+    if os.name == "nt":
+        return _windows_process_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
     return True
+
+
+def _windows_process_is_alive(pid: int) -> bool:
+    # os.kill(pid, 0) on Windows sends CTRL_C_EVENT to the process group.
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def ensure_free_space(directory: Path, minimum_free_bytes: int) -> int:

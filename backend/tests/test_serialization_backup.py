@@ -65,6 +65,19 @@ def test_exclusive_lock_rejects_concurrent_owner(tmp_path: Path) -> None:
             pass
 
 
+def test_lock_owner_check_detects_dead_process(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    lock = tmp_path / "backup.lock"
+    lock.write_text(f"{child.pid}\n", encoding="ascii")
+    assert backup._lock_owner_is_alive(lock) is False
+    lock.write_text(f"{os.getpid()}\n", encoding="ascii")
+    assert backup._lock_owner_is_alive(lock) is True
+
+
 class FakeBackupJobs:
     def __init__(self) -> None:
         self.inserted: dict | None = None

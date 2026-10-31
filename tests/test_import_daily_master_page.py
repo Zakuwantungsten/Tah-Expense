@@ -331,6 +331,9 @@ def _ready_page(qapp, tmp_path: Path, monkeypatch):
     monkeypatch.setattr(page_mod, "show_question", lambda *a, **k: QMessageBox.StandardButton.Yes)
     monkeypatch.setattr(page_mod, "show_info", lambda _p, _t, text: messages.append(text))
     monkeypatch.setattr(page_mod, "show_warning", lambda _p, _t, text: messages.append(text))
+    monkeypatch.setattr(
+        page_mod, "_push_report_box", lambda _p, text, **_k: messages.append(text) or False
+    )
     return widget, session, messages
 
 
@@ -366,9 +369,15 @@ def test_push_ticked_days_to_master(qapp, tmp_path: Path, monkeypatch) -> None:
     assert _day_status(widget, D1) == "Pushed" and _day_status(widget, D2) == "Pushed"
     assert widget.ticked_days() == []
     assert "Pushed 2 of 2 day(s)" in messages[-1]
+    assert "dated 01/10/2026 – 02/10/2026" in messages[-1]
     assert svc.load_session(session.session_id).is_day_pushed(D2)
 
+    # Pushed days cannot be ticked; Unmark works on the highlighted row.
     widget._days_model.set_checked([D1])
+    assert widget.ticked_days() == []
+    widget._on_tick_ready()
+    assert widget.ticked_days() == []
+    widget._days_view.select_key(D1)
     widget._on_unmark_pushed()
     assert _day_status(widget, D1) == "Ready"
     assert session.is_day_pushed(D2)

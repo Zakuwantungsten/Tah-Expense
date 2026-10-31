@@ -1583,15 +1583,21 @@ async def get_draft_day_summaries(
     cashier_id=None,
     *,
     all_cashiers: bool = False,
+    include_parked: bool = False,
     limit: int = 120,
 ) -> List[dict]:
-    """Calendar days that have at least one draft entry, newest first."""
+    """Calendar days that have at least one draft entry, newest first.
+
+    ``include_parked`` counts every cashier's parked rows (shared Parked tab).
+    """
     params: dict = {
         "all_cashiers": "true" if all_cashiers else "false",
         "limit": limit,
     }
     if not all_cashiers and cashier_id is not None:
         params["cashier_id"] = str(cashier_id)
+    if not all_cashiers and include_parked:
+        params["include_parked"] = "true"
     payload = await api_client.request(
         "GET", "v1/transactions/drafts/day-summaries", params=params
     )

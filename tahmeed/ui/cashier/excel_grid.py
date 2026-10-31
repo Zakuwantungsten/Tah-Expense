@@ -1865,9 +1865,9 @@ class DailyRegister(QWidget):
         if not upload_id and reload_local_parked:
             # Disk is the durable copy of the local Parked bucket (My file).
             self._load_local_parked_from_disk()
-        if not self._merged_mode:
-            self._server_parked_count = len(parked_all)
-            self._emit_parked_count()
+        # My (include_parked) and Merged both carry every cashier's parked rows.
+        self._server_parked_count = len(parked_all)
+        self._emit_parked_count()
         if self._parked_mode:
             view_txs = parked_all
         else:

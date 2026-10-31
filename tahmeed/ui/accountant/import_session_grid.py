@@ -54,6 +54,7 @@ BLOCKED_BG = "#FEE2E2"
 UNMAPPED_BG = "#FEF3C7"
 PUSHED_BG = "#BBF7D0"
 IGNORED_BG = "#F3F4F6"
+LOCKED_FG = "#9CA3AF"
 
 
 @dataclass
@@ -65,6 +66,8 @@ class GridRow:
     editable: Set[int] = field(default_factory=set)
     # Per-cell backgrounds (cell index -> colour), over ``background`` / stripes.
     cell_colors: Dict[int, str] = field(default_factory=dict)
+    # False: no tick box and greyed text (e.g. a day already pushed).
+    checkable: bool = True
 
 
 def _checkmark_url() -> str:
@@ -168,9 +171,12 @@ class GridModel(QAbstractTableModel):
     def set_rows(self, rows: List[GridRow]) -> None:
         self.beginResetModel()
         self._rows = rows
-        keys = {r.key for r in rows}
+        keys = {r.key for r in rows if r.checkable}
         self._checked &= keys
         self.endResetModel()
+
+    def is_checkable(self, key: Hashable) -> bool:
+        return any(r.key == key and r.checkable for r in self._rows)
 
     def update_row(
         self,
@@ -202,6 +208,7 @@ class GridModel(QAbstractTableModel):
     def set_checked(self, keys, checked: bool = True) -> None:
         keys = set(keys)
         if checked:
+            keys &= {r.key for r in self._rows if r.checkable}
             self._checked |= keys
         else:
             self._checked -= keys
@@ -237,9 +244,11 @@ class GridModel(QAbstractTableModel):
         row = self._rows[index.row()]
         col = index.column()
         if role == Qt.ForegroundRole:
-            return QBrush(QColor(T1))
+            return QBrush(QColor(T1 if row.checkable else LOCKED_FG))
         if self._checkable and col == 0:
             if role == Qt.CheckStateRole:
+                if not row.checkable:
+                    return None
                 return Qt.Checked if row.key in self._checked else Qt.Unchecked
             if role == SORT_ROLE:
                 return 0 if row.key in self._checked else 1
@@ -268,9 +277,9 @@ class GridModel(QAbstractTableModel):
         if not index.isValid():
             return Qt.NoItemFlags
         base = Qt.ItemIsEnabled | Qt.ItemIsSelectable
-        if self._checkable and index.column() == 0:
-            return base | Qt.ItemIsUserCheckable
         row = self._rows[index.row()]
+        if self._checkable and index.column() == 0:
+            return base | Qt.ItemIsUserCheckable if row.checkable else base
         if index.column() - self._offset in row.editable:
             return base | Qt.ItemIsEditable
         return base
@@ -280,6 +289,8 @@ class GridModel(QAbstractTableModel):
             return False
         row = self._rows[index.row()]
         if self._checkable and index.column() == 0 and role == Qt.CheckStateRole:
+            if not row.checkable:
+                return False
             state = Qt.CheckState(value) if not isinstance(value, Qt.CheckState) else value
             if state == Qt.Checked:
                 self._checked.add(row.key)
@@ -351,7 +362,11 @@ class GridView(QTableView):
     def _on_header_clicked(self, section: int) -> None:
         if not self.grid_model._checkable or section != 0:
             return
-        visible = [self.source_key(r) for r in range(self.proxy.rowCount())]
+        visible = [
+            key
+            for key in (self.source_key(r) for r in range(self.proxy.rowCount()))
+            if self.grid_model.is_checkable(key)
+        ]
         checked = set(self.grid_model.checked_keys())
         all_on = bool(visible) and all(k in checked for k in visible)
         self.grid_model.set_checked(visible, not all_on)

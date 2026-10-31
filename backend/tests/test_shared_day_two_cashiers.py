@@ -121,6 +121,48 @@ def test_second_cashier_fixes_deletes_and_submits_first_cashiers_parked_rows() -
     assert oil["register_status"] == "submitted"
 
 
+def test_saved_day_list_counts_every_cashiers_parked_rows() -> None:
+    a, b = _cashier(), _cashier()
+    collection = FakeTransactions()
+    app = _app(collection, FakeCounters())
+    acting = {"user": a}
+    app.dependency_overrides[current_user] = lambda: acting["user"]
+
+    with TestClient(app) as client:
+        client.post(
+            "/v1/transactions/bulk-create",
+            json={
+                "items": [
+                    _row("A FUEL", "a-1"),
+                    _row("A OIL", "a-2", "parked"),
+                    _row("A TYRE", "a-3", "parked"),
+                ]
+            },
+        )
+        acting["user"] = b
+        client.post(
+            "/v1/transactions/bulk-create",
+            json={"items": [_row("B FUEL", "b-1"), _row("B OIL", "b-2", "parked")]},
+        )
+
+        own = client.get("/v1/transactions/drafts/day-summaries").json()["items"]
+        pipelines: list = []
+        real_aggregate = collection.aggregate
+        collection.aggregate = lambda p: pipelines.append(p) or real_aggregate(p)
+        shared = client.get(
+            "/v1/transactions/drafts/day-summaries?include_parked=true"
+        ).json()["items"]
+
+    assert [(d["entries_count"], d["parked_count"]) for d in own] == [(1, 1)]
+    # B's saved drafts stay B's own; parked counts A's rows too.
+    assert [(d["entries_count"], d["parked_count"]) for d in shared] == [(1, 3)]
+    # TZS stays B's own rows (the fake aggregate does not evaluate $cond).
+    group = next(s["$group"] for s in pipelines[0] if "$group" in s)
+    assert group["total_tzs"] == {
+        "$sum": {"$cond": [{"$eq": ["$cashier_id", b["_id"]]}, "$amount", 0]}
+    }
+
+
 def test_second_cashiers_day_issues_list_and_map_first_cashiers_parked_rows() -> None:
     a, b = _cashier(), _cashier()
     collection = FakeTransactions()

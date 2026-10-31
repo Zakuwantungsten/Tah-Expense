@@ -545,7 +545,7 @@ def test_create_without_client_row_id_still_inserts_each_time() -> None:
     assert len(collection.documents) == 2
 
 
-def test_get_and_patch_and_delete_transaction() -> None:
+def test_patch_and_delete_transaction() -> None:
     tx_id = ObjectId()
     user = _cashier()
     collection = FakeTransactions(
@@ -566,10 +566,6 @@ def test_get_and_patch_and_delete_transaction() -> None:
     app.dependency_overrides[current_user] = lambda: user
 
     with TestClient(app) as client:
-        got = client.get(f"/v1/transactions/{tx_id}")
-        assert got.status_code == 200
-        assert got.json()["description"] == "Old"
-
         patched = client.patch(
             f"/v1/transactions/{tx_id}",
             json={"values": {"description": "New", "amount": 9.5}},

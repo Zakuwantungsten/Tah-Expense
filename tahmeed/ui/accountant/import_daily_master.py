@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import qtawesome as qta
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -43,8 +43,11 @@ from tahmeed.services.import_session_push import (
     PriorUpload,
     PushGroup,
     build_push_groups,
+    date_outliers,
     find_prior_uploads,
     push_groups,
+    row_date_range,
+    supplier_rows,
 )
 from tahmeed.services.import_session_service import (
     MODE_BOTH_BUILTIN_FIRST,
@@ -162,6 +165,20 @@ def _scope_combo(default_day: bool = False) -> QComboBox:
     return combo
 
 
+def _push_report_box(parent: QWidget, text: str, *, warning: bool, can_open: bool) -> bool:
+    """Push result message; True when the user picks Open in Master Expenses."""
+    icon = QMessageBox.Icon.Warning if warning else QMessageBox.Icon.Information
+    box = QMessageBox(icon, "Push to Master", text, QMessageBox.StandardButton.NoButton, parent)
+    open_btn = None
+    if can_open:
+        open_btn = box.addButton("Open in Master Expenses", QMessageBox.ButtonRole.ActionRole)
+    ok = box.addButton(QMessageBox.StandardButton.Ok)
+    box.setDefaultButton(ok)
+    style_message_box(box)
+    box.exec()
+    return open_btn is not None and box.clickedButton() is open_btn
+
+
 def _label(text: str = "", *, muted: bool = False) -> QLabel:
     lbl = QLabel(text)
     lbl.setStyleSheet(
@@ -173,6 +190,8 @@ def _label(text: str = "", *, muted: bool = False) -> QLabel:
 
 class ImportDailyMasterWidget(QWidget):
     """Bulk daily Excel import workspace (Day Batches, Issues, Trucks, …)."""
+
+    open_master_dates = Signal(object, object)  # first, last row date
 
     def __init__(self, user: User, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -339,7 +358,10 @@ class ImportDailyMasterWidget(QWidget):
         )
         push.clicked.connect(self._on_push)
         unmark = dialog_button("Unmark Pushed")
-        unmark.setToolTip("Let a pushed day be pushed again (rows already in Master are skipped)")
+        unmark.setToolTip(
+            "Click Pushed days to highlight them, then Unmark to push them again "
+            "(rows already in Master are skipped)"
+        )
         unmark.clicked.connect(self._on_unmark_pushed)
         bar.addWidget(tick_ready)
         bar.addWidget(clear)
@@ -811,10 +833,18 @@ class ImportDailyMasterWidget(QWidget):
         rows: List[GridRow] = []
         if self._validation is not None:
             for day in self._validation.days:
+                pushed = day.status == DAY_PUSHED
+                tooltip = "\n".join(day.reasons) or "All rows mapped; trucks valid."
                 if day.status == DAY_READY:
                     bg, status = READY_BG, DAY_READY
-                elif day.status == DAY_PUSHED:
+                elif pushed:
                     bg, status = PUSHED_BG, DAY_PUSHED
+                    info = self._session.pushed_days.get(day.batch_date) if self._session else None
+                    when = f" on {info.pushed_at:%d/%m/%Y %H:%M}" if info else ""
+                    tooltip = (
+                        f"Pushed to Master Expenses{when}. To push it again, click the "
+                        "row and use Unmark Pushed."
+                    )
                 else:
                     bg, status = BLOCKED_BG, f"{DAY_BLOCKED} ({len(day.reasons)})"
                 rows.append(
@@ -830,7 +860,8 @@ class ImportDailyMasterWidget(QWidget):
                             status,
                         ],
                         cell_colors={6: bg},
-                        tooltip="\n".join(day.reasons) or "All rows mapped; trucks valid.",
+                        tooltip=tooltip,
+                        checkable=not pushed,
                     )
                 )
         current = self._current_day
@@ -973,7 +1004,7 @@ class ImportDailyMasterWidget(QWidget):
             finally:
                 self._days_model.clear_checks()
                 self._changed()
-            self._report_push(summary, len({g.batch_date for g in groups}))
+            self._report_push(summary, groups)
 
     def _confirm_push(
         self,
@@ -1004,6 +1035,7 @@ class ImportDailyMasterWidget(QWidget):
             )
         if check_error:
             text += f"\n\nCould not check Browse → Uploads for earlier imports:\n{check_error}"
+        text += self._visibility_warnings(groups)
 
         if not clashes:
             answer = show_question(self, "Push to Master", text, default_no=False)
@@ -1044,30 +1076,71 @@ class ImportDailyMasterWidget(QWidget):
             return kept
         return []
 
-    def _report_push(self, summary, day_count: int) -> None:
+    def _visibility_warnings(self, groups: List[PushGroup]) -> str:
+        """Rows that will be pushed but not show where the user expects in Master."""
+        text = ""
+        outliers = date_outliers(groups)
+        if outliers:
+            rows = sum(o.rows for o in outliers)
+            listing = "\n".join(
+                f"  · {_fmt_day(o.batch_date)} file: {o.rows:,} row(s) dated {_fmt_day(o.row_date)}"
+                for o in outliers[:8]
+            ) + (f"\n  · …and {len(outliers) - 8} more" if len(outliers) > 8 else "")
+            text += (
+                f"\n\n{rows:,} row(s) have an Excel date in another month than their day. "
+                "Master Expenses lists rows by that date, so they will show under that "
+                f"month / year (check the Excel dates if that is a typo):\n{listing}"
+            )
+        if self._refs is not None:
+            suppliers = supplier_rows(groups, self._refs.is_supplier)
+            if suppliers:
+                rows = sum(suppliers.values())
+                names = ", ".join(
+                    f"{name} ({n:,})"
+                    for name, n in sorted(suppliers.items(), key=lambda kv: -kv[1])[:6]
+                )
+                text += (
+                    f"\n\n{rows:,} row(s) use supplier items ({names}). Supplier payments are "
+                    "saved but never listed in Master Expenses — only in Browse → Uploads."
+                )
+        return text
+
+    def _report_push(self, summary, groups: List[PushGroup]) -> None:
         if summary is None:
             return
+        day_count = len({g.batch_date for g in groups})
+        pushed_days = {d.batch_date for d in summary.days}
+        pushed_groups = [g for g in groups if g.batch_date in pushed_days]
         pushed = len(summary.days)
         lines = [f"Pushed {pushed} of {day_count} day(s) to Master Expenses."]
+        span = row_date_range(pushed_groups)
         if pushed:
             lines.append(f"{summary.inserted:,} row(s) added.")
             if summary.duplicates_skipped:
                 lines.append(f"{summary.duplicates_skipped:,} row(s) were already there (skipped).")
             if summary.skipped_no_item:
                 lines.append(f"{summary.skipped_no_item:,} row(s) skipped (no item).")
+            if span is not None:
+                lines.append(
+                    f"In Master Expenses they are dated {_fmt_day(span[0])} – {_fmt_day(span[1])}."
+                )
             lines.append("They are listed in Browse → Uploads under their MATUMIZI file names.")
+            warnings = self._visibility_warnings(pushed_groups)
+            if warnings:
+                lines.append(warnings.lstrip("\n"))
         if summary.failed_day is not None:
             lines.append(
                 f"\nStopped at {_fmt_day(summary.failed_day)}:\n{summary.error}\n\n"
                 "Days before it are saved. Push the rest again — rows already in "
                 "Master are skipped."
             )
-            show_warning(self, "Push to Master", "\n".join(lines))
         elif summary.cancelled:
             lines.append(f"\nCancelled — {day_count - pushed} day(s) not pushed.")
-            show_info(self, "Push to Master", "\n".join(lines))
-        else:
-            show_info(self, "Push to Master", "\n".join(lines))
+        can_open = bool(pushed) and span is not None
+        if _push_report_box(
+            self, "\n".join(lines), warning=summary.failed_day is not None, can_open=can_open
+        ) and can_open:
+            self.open_master_dates.emit(span[0], span[1])
 
     def _on_unmark_pushed(self) -> None:
         if self._session is None:
@@ -1075,7 +1148,7 @@ class ImportDailyMasterWidget(QWidget):
         keys = self._days_view.acted_keys()
         days = [d for d in keys if self._session.is_day_pushed(d)]
         if not days:
-            show_info(self, "Unmark Pushed", "Tick or highlight Pushed days first.")
+            show_info(self, "Unmark Pushed", "Click Pushed days to highlight them first.")
             return
         answer = show_question(
             self,
@@ -1198,7 +1271,17 @@ class ImportDailyMasterWidget(QWidget):
             if pending
             else ""
         )
-        dlg = FinishSessionDialog(self._promote_candidates(), note=note, parent=self)
+        pushed = self._session.pushed_days
+        pushed_note = ""
+        if pushed:
+            rows = sum(p.row_count for p in pushed.values())
+            pushed_note = (
+                f"{len(pushed)} day(s) already pushed ({rows:,} row(s)) are saved in Master "
+                "Expenses. Finishing does not remove them, whichever button you press."
+            )
+        dlg = FinishSessionDialog(
+            self._promote_candidates(), note=note, pushed_note=pushed_note, parent=self
+        )
         if dlg.exec() != FinishSessionDialog.Accepted:
             return
         self._start(self._finish(dlg.promote_keys))
@@ -1238,9 +1321,12 @@ class ImportDailyMasterWidget(QWidget):
                     refs.global_mappings[key] = mapping
             saved = len(saved_maps)
         name = session.name
+        pushed = len(session.pushed_days)
         delete_session(session.session_id)
         self._set_session(self._new_session())
-        message = f"Session '{name}' finished and discarded."
+        message = f"Session '{name}' finished."
+        if pushed:
+            message += f"\n\nIts {pushed} pushed day(s) stay in Master Expenses."
         if saved:
             message += f"\n\n{saved:,} mapping(s) saved to Description Maps."
         show_info(self, "Finish session", message)

@@ -1191,6 +1191,11 @@ async def resubmit_rejected_transactions(
     db = _database(request)
     now = utcnow().replace(tzinfo=None)
     updated = 0
+    # Resubmit puts rows back in Verify; the stored badge must follow.
+    oids = [_valid_id(raw_id) for raw_id in body.updates_by_id]
+    before_docs = await load_badge_docs(db, {"_id": {"$in": oids}})
+    before_by_id = {doc["_id"]: doc for doc in before_docs or []}
+    badge_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for raw_id, field_updates in body.updates_by_id.items():
         payload = _coerce_write_fields(dict(field_updates or {}))
         payload.update(
@@ -1213,6 +1218,11 @@ async def resubmit_rejected_transactions(
         )
         if result.modified_count:
             updated += 1
+            before = before_by_id.get(_valid_id(raw_id))
+            if before is not None:
+                badge_pairs.append((before, {**before, **payload}))
+    if badge_pairs:
+        await note_many(db, badge_pairs)
     await record_operation_event(
         db,
         action="txn.resubmit",
@@ -1245,12 +1255,25 @@ async def draft_day_summaries(
     actor: RegisterActor,
     cashier_id: str | None = None,
     all_cashiers: bool = False,
+    include_parked: bool = False,
     limit: int = Query(120, ge=1, le=500),
 ) -> dict:
-    """Calendar days with drafts and/or parked rows, newest first."""
+    """Calendar days with drafts and/or parked rows, newest first.
+
+    ``include_parked`` counts every cashier's parked rows on a single-cashier
+    list (shared Parked tab); drafts and ``total_tzs`` stay the cashier's own.
+    """
     match: dict[str, Any] = dict(DRAFT_OR_PARKED_MATCH)
+    total_tzs: Any = "$amount"
     if not all_cashiers:
-        match["cashier_id"] = _actor_cashier_id(actor, cashier_id)
+        owner = _actor_cashier_id(actor, cashier_id)
+        if include_parked:
+            match["$or"] = [{"cashier_id": owner}, {"register_status": "parked"}]
+            total_tzs = {
+                "$cond": [{"$eq": ["$cashier_id", owner]}, "$amount", 0]
+            }
+        else:
+            match["cashier_id"] = owner
     pipeline = [
         {"$match": match},
         {"$addFields": {"register_day": REGISTER_DAY_EXPR}},
@@ -1279,7 +1302,7 @@ async def draft_day_summaries(
                         ]
                     }
                 },
-                "total_tzs": {"$sum": "$amount"},
+                "total_tzs": {"$sum": total_tzs},
                 "cashier_ids": {"$addToSet": "$cashier_id"},
             }
         },
@@ -2313,9 +2336,11 @@ async def patch_transaction(
     if not values:
         raise ApiError(422, "empty_patch", "No fields to update")
     db = _database(request)
+    before = await load_badge_docs(db, {"_id": oid})
     result = await db.transactions.update_one({"_id": oid}, {"$set": values})
     if result.matched_count == 0:
         raise ApiError(404, "not_found", "Transaction not found")
+    await apply_remembered(db, before, values, int(result.modified_count))
     doc = await db.transactions.find_one({"_id": oid})
     await record_operation_event(
         db,

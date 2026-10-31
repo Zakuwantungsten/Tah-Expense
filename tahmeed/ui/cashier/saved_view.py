@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 import qtawesome as qta
 from PySide6.QtCore import Qt, Signal
@@ -36,19 +36,20 @@ from tahmeed.ui.cashier.register_delegates import _is_refund_float
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
-# S/N | Date | Entries | Mapped | Unmapped | TZS | USD | Kwacha | Refund | ⋯
-_COL_DEFAULTS = [44, 110, 70, 70, 80, 130, 110, 110, 130, 44]
+# S/N | Date | Entries | Mapped | Unmapped | Parked | TZS | USD | Kwacha | Refund | ⋯
+_COL_DEFAULTS = [44, 110, 70, 70, 80, 70, 130, 110, 110, 130, 44]
 _COL_SNO = 0
 _COL_DATE = 1
 _COL_ENTRIES = 2
 _COL_MAPPED = 3
 _COL_UNMAPPED = 4
-_COL_TZS = 5
-_COL_USD = 6
-_COL_ZMW = 7
-_COL_REFUND = 8
-_COL_ACTIONS = 9
-_COL_KEY = "saved_days_table_v2"
+_COL_PARKED = 5
+_COL_TZS = 6
+_COL_USD = 7
+_COL_ZMW = 8
+_COL_REFUND = 9
+_COL_ACTIONS = 10
+_COL_KEY = "saved_days_table_v3"
 
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -59,6 +60,7 @@ _T1 = "#111827"
 _T2 = "#6B7280"
 _GREEN = "#15803D"
 _GREEN_L = "#DCFCE7"
+_PARKED = "#B45309"
 _SAVED_ROW = "#E8F4FD"
 _SAVED_ROW_ALT = "#EFF6FF"
 _ZMW_CODES = frozenset({"ZMW", "ZMB", "ZK"})
@@ -79,6 +81,7 @@ class SavedDaySummary:
     total_usd: float
     total_zmw: float
     total_refund: float
+    parked_count: int = 0
 
 
 def tx_register_day(tx: Transaction) -> Optional[date]:
@@ -129,7 +132,11 @@ def tx_money_buckets(tx: Transaction) -> tuple[float, float, float]:
     return tzs, usd, 0.0
 
 
-def summarize_draft_day(day: date, rows: Sequence[Transaction]) -> SavedDaySummary:
+def summarize_draft_day(
+    day: date,
+    rows: Sequence[Transaction],
+    parked_count: int = 0,
+) -> SavedDaySummary:
     """Build one Saved summary from draft transactions for *day*."""
     mapped = unmapped = 0
     tzs = usd = zmw = refund = 0.0
@@ -154,14 +161,20 @@ def summarize_draft_day(day: date, rows: Sequence[Transaction]) -> SavedDaySumma
         total_usd=usd,
         total_zmw=zmw,
         total_refund=refund,
+        parked_count=max(0, int(parked_count or 0)),
     )
 
 
 def summarize_draft_day_batches(
     day_batches: Sequence[Tuple[date, Sequence[Transaction]]],
+    parked_counts: Optional[Mapping[date, int]] = None,
 ) -> List[SavedDaySummary]:
     """Newest day first — one summary per batch."""
-    return [summarize_draft_day(day, rows) for day, rows in day_batches]
+    parked_counts = parked_counts or {}
+    return [
+        summarize_draft_day(day, rows, parked_counts.get(day, 0))
+        for day, rows in day_batches
+    ]
 
 
 def filter_day_summaries(
@@ -180,6 +193,7 @@ def filter_day_summaries(
             str(s.entries_count),
             str(s.mapped_count),
             str(s.unmapped_count),
+            str(s.parked_count),
             f"{s.total_tzs:.0f}",
             f"{s.total_usd:.2f}",
             f"{s.total_zmw:.2f}",
@@ -379,9 +393,9 @@ class SavedView(QWidget):
         th_vl = QVBoxLayout(table_host)
         th_vl.setContentsMargins(0, 0, 0, 0)
 
-        self._table = QTableWidget(0, 10)
+        self._table = QTableWidget(0, len(_COL_DEFAULTS))
         self._table.setHorizontalHeaderLabels([
-            "S/N", "Date", "Entries", "Mapped", "Unmapped",
+            "S/N", "Date", "Entries", "Mapped", "Unmapped", "Parked",
             "TZS", "USD", "Kwacha", "Refund", "",
         ])
         self._table.verticalHeader().setVisible(False)
@@ -429,6 +443,7 @@ class SavedView(QWidget):
             days = await get_draft_day_summaries(
                 cashier_id,
                 all_cashiers=self._show_all,
+                include_parked=True,
             )
             merged = self._show_all
             tasks = [
@@ -449,7 +464,12 @@ class SavedView(QWidget):
                 if isinstance(result, Exception):
                     continue
                 day_batches.append((summary["date"], result))
-            self._all_days = summarize_draft_day_batches(day_batches)
+            parked_counts = {
+                d["date"]: int(d.get("parked_count") or 0)
+                for d in days
+                if isinstance(d.get("date"), date)
+            }
+            self._all_days = summarize_draft_day_batches(day_batches, parked_counts)
             self._apply_filter()
         except Exception as exc:
             QMessageBox.critical(self, "Saved", f"Could not load saved drafts:\n{exc}")
@@ -489,6 +509,10 @@ class SavedView(QWidget):
             if s.unmapped_count:
                 unmapped.setForeground(QColor(_GOLD))
             self._table.setItem(i, _COL_UNMAPPED, unmapped)
+            parked = _cell(str(s.parked_count), align=Qt.AlignCenter)
+            if s.parked_count:
+                parked.setForeground(QColor(_PARKED))
+            self._table.setItem(i, _COL_PARKED, parked)
             self._table.setItem(i, _COL_TZS, _cell(_fmt_tzs(s.total_tzs)))
             self._table.setItem(i, _COL_USD, _cell(_fmt_usd(s.total_usd)))
             self._table.setItem(i, _COL_ZMW, _cell(_fmt_zmw(s.total_zmw)))

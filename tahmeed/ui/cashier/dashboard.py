@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QFrame, QLabel, QLineEdit, QPushButton, QDialog, QMessageBox,
     QSizePolicy, QDateEdit,
 )
-from PySide6.QtCore import Qt, Signal, QDate, QTimer
+from PySide6.QtCore import Qt, Signal, QDate, QEvent, QPoint, QTimer
 
 from tahmeed.config import APP_NAME, APP_VERSION, COMPANY_NAME
 from tahmeed.models.user import User
@@ -52,6 +52,8 @@ _GOLD   = "#B18E5E"
 _T1     = "#111827"
 _T2     = "#6B7280"
 _BTN_H  = 30  # slim professional control height
+_BADGE_RED = "#DC2626"  # same red as the sidebar / Import tab badges
+_PARKED_BADGE_H = 16
 
 # ── Button styles ────────────────────────────────────────────────────────────────
 # Filled primary (Save), outlined secondaries, warm cancel, gold submit.
@@ -638,6 +640,22 @@ class _ActionBar(QFrame):
         tg.addWidget(self._merged_btn)
         hl.addWidget(toggle, 0, Qt.AlignVCenter)
 
+        # Red count bubble over the Parked pill's top-right corner. Parented to
+        # the bar (not the pill) so it can overhang the pill's edges.
+        self._parked_badge = QLabel("", self)
+        self._parked_badge.setAlignment(Qt.AlignCenter)
+        self._parked_badge.setFixedHeight(_PARKED_BADGE_H)
+        self._parked_badge.setMinimumWidth(_PARKED_BADGE_H)
+        self._parked_badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._parked_badge.setStyleSheet(
+            f"QLabel{{background:{_BADGE_RED};color:#FFFFFF;"
+            f"border-radius:{_PARKED_BADGE_H // 2}px;padding:0 4px;"
+            "font-family:'Segoe UI';font-size:10px;font-weight:700;}"
+        )
+        self._parked_badge.hide()
+        toggle.installEventFilter(self)
+        self._parked_btn.installEventFilter(self)
+
         self._status = QLabel("")
         self._status.setStyleSheet(
             "QLabel{background:#FEF3C7;color:#92400E;border:1px solid #FDE68A;"
@@ -740,10 +758,34 @@ class _ActionBar(QFrame):
     def set_parked_count(self, count: int) -> None:
         """Badge the Parked pill with how many rows need truck follow-up."""
         self._parked_count = max(0, int(count or 0))
-        if self._parked_count:
-            self._parked_btn.setText(f"Parked ({self._parked_count})")
-        else:
-            self._parked_btn.setText("Parked")
+        if not self._parked_count:
+            self._parked_badge.hide()
+            return
+        n = self._parked_count
+        self._parked_badge.setText(f"{n:,}" if n < 1000 else "999+")
+        self._parked_badge.adjustSize()
+        self._place_parked_badge()
+        self._parked_badge.show()
+        self._parked_badge.raise_()
+
+    def _place_parked_badge(self) -> None:
+        btn = self._parked_btn
+        top_right = btn.mapTo(self, QPoint(btn.width(), 0))
+        badge = self._parked_badge
+        x = top_right.x() - badge.width() + _PARKED_BADGE_H // 2
+        y = max(0, top_right.y() - _PARKED_BADGE_H // 2)
+        badge.move(x, y)
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        if event.type() in (QEvent.Move, QEvent.Resize, QEvent.Show):
+            if not self._parked_badge.isHidden():
+                self._place_parked_badge()
+        return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if not self._parked_badge.isHidden():
+            self._place_parked_badge()
 
     def set_edit_state(self, active: bool, dirty_count: int = 0) -> None:
         """Show edit-mode status pill next to search."""

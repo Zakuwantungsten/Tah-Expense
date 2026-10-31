@@ -225,6 +225,46 @@ def test_create_and_submit_adjust_stored_badges_without_a_second_insert() -> Non
     assert scans_after == scans_before
 
 
+def test_resubmit_and_patch_unreject_move_verify_badge() -> None:
+    user = _cashier()
+    first = _open("submitted", cashier_id=user["_id"], rejected=True)
+    second = _open("submitted", cashier_id=user["_id"], rejected=True)
+    accountant = {**_cashier(), "role": "accountant"}
+    collection = FakeTransactions([first, second])
+    counters = FakeCounters()
+    app = _app(collection, counters)
+    acting = {"user": user}
+    app.dependency_overrides[current_user] = lambda: acting["user"]
+
+    with TestClient(app) as client:
+        resubmit = client.post(
+            "/v1/transactions/cashier/resubmit",
+            json={
+                "cashier_id": str(user["_id"]),
+                "updates_by_id": {str(first["_id"]): {"description": "FIXED"}},
+            },
+        )
+        assert resubmit.json() == {"updated": 1}
+        assert counters.doc["verify"] == 1
+        acting["user"] = accountant
+        etag = client.get("/v1/accountant/notification-counts").headers["etag"]
+
+        acting["user"] = user
+        patched = client.patch(
+            f"/v1/transactions/{second['_id']}",
+            json={"values": {"rejected": False, "rejection_reason": None}},
+        )
+        assert patched.status_code == 200
+        acting["user"] = accountant
+        again = client.get(
+            "/v1/accountant/notification-counts", headers={"If-None-Match": etag}
+        )
+
+    assert counters.doc["verify"] == 2
+    assert again.status_code == 200
+    assert again.json() == {"verify": 2}
+
+
 def test_bulk_patch_park_moves_draft_to_parked() -> None:
     user = _cashier()
     row_id = ObjectId()

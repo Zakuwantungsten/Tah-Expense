@@ -59,6 +59,9 @@ _LAZY_PAGE_KEYS = frozenset({
     "browse",
 })
 
+# Each tick reads one stored badge document; unchanged ticks are a 304.
+_NOTIFICATION_POLL_MS = 2_000
+
 # Opening the register after one of these pages repeats the catalog snapshot.
 _CATALOG_EDITORS = frozenset({
     "manage_categories",
@@ -91,8 +94,13 @@ class AccountantDashboard(QWidget):
         self._build()
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._load_categories())
+        from tahmeed.services.notification_service import (
+            reset_verify_notification_cache,
+        )
+
+        reset_verify_notification_cache()
         self._notification_timer = QTimer(self)
-        self._notification_timer.setInterval(15_000)
+        self._notification_timer.setInterval(_NOTIFICATION_POLL_MS)
         self._notification_timer.timeout.connect(self._poll_notification_counts)
         self._notification_poll_task: asyncio.Task | None = None
         self._notification_timer.start()
@@ -266,7 +274,9 @@ class AccountantDashboard(QWidget):
 
         if key == "import_daily":
             from tahmeed.ui.accountant.import_daily_master import ImportDailyMasterWidget
-            return ImportDailyMasterWidget(user=self._user)
+            widget = ImportDailyMasterWidget(user=self._user)
+            widget.open_master_dates.connect(self._on_open_master_dates)
+            return widget
 
         if key == "toll_plaza":
             from tahmeed.ui.accountant.separate_expenses import TollPlazaWidget
@@ -533,6 +543,8 @@ class AccountantDashboard(QWidget):
         self._sidebar.set_drafts_badge(nxt)
         if hasattr(self._sidebar, "set_saved_badge"):
             self._sidebar.set_saved_badge(nxt)
+        # Submitted rows land in Verify; do not wait for the next poll tick.
+        QTimer.singleShot(0, self._poll_notification_counts)
 
     def _on_register_drafts_changed(self) -> None:
         if getattr(self, "_skip_draft_recount", False):
@@ -684,6 +696,22 @@ class AccountantDashboard(QWidget):
                 widget.set_date(day)
 
         if in_running_task() and "day_issues" not in self._pages:
+            schedule_call(_go)
+        else:
+            _go()
+
+    def _on_open_master_dates(self, start, end) -> None:
+        from tahmeed.ui.async_utils import in_running_task, schedule_call
+
+        self._sidebar.select("master_expenses")
+        self._nav_key = "master_expenses"
+
+        def _go() -> None:
+            widget = self._ensure_page("master_expenses")
+            self._stack.setCurrentIndex(self._page_indices["master_expenses"])
+            widget.show_dates(start, end)
+
+        if in_running_task() and "master_expenses" not in self._pages:
             schedule_call(_go)
         else:
             _go()

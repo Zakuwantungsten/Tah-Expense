@@ -7,6 +7,15 @@ from tahmeed.services.api_client import api_client
 _badge_etag = ""
 
 
+def reset_verify_notification_cache() -> None:
+    """Forget the last ETag so the next poll returns the full count.
+
+    A new dashboard starts with an empty badge; a 304 would leave it blank.
+    """
+    global _badge_etag
+    _badge_etag = ""
+
+
 async def get_verify_notification_count() -> Optional[int]:
     """Stored verify total. ``None`` when ``updated_at`` has not changed."""
     global _badge_etag

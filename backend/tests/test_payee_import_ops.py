@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from backend.app.payee_import_ops import (
+from app.payee_import_ops import (
     commit_payee_list,
     normalize_payee_row,
     prepare_payee_docs,

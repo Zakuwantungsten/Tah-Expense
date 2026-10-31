@@ -15,7 +15,7 @@ QuickBooks-style full verified ledger with:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 import calendar
 from typing import Dict, List, Optional, Set
 
@@ -571,6 +571,15 @@ class _FilterBar(QFrame):
         self._from_date.blockSignals(False)
         self._to_date.blockSignals(False)
 
+    def set_dates(self, start: date, end: date) -> None:
+        """Set From/To without firing filters."""
+        self._from_date.blockSignals(True)
+        self._to_date.blockSignals(True)
+        self._from_date.setDate(QDate(start.year, start.month, start.day))
+        self._to_date.setDate(QDate(end.year, end.month, end.day))
+        self._from_date.blockSignals(False)
+        self._to_date.blockSignals(False)
+
     def clear_filters(self) -> None:
         """Reset search/combos and clear From/To back to unset placeholders."""
         self._search.blockSignals(True)
@@ -866,6 +875,29 @@ class MasterExpensesWidget(QWidget):
     def refresh(self) -> None:
         self._filters_loaded = False
         self._reset_and_load()
+
+    def show_dates(self, start: date, end: date) -> None:
+        """Show ``start``–``end`` (within ``start``'s FY) with every other filter cleared."""
+        year = start.year
+        if self._fy_cb.findData(year) < 0:
+            self._fy_cb.addItem(str(year), year)
+        self._fy_cb.blockSignals(True)
+        self._fy_cb.setCurrentIndex(self._fy_cb.findData(year))
+        self._fy_cb.blockSignals(False)
+        self._year = year
+        app_state.fiscal_year = year
+        self._month_bar.blockSignals(True)
+        self._month_bar.reset()
+        self._month_bar.blockSignals(False)
+        self._month = 0
+        self._filter_bar.blockSignals(True)
+        self._filter_bar.clear_filters()
+        self._filter_bar.blockSignals(False)
+        self._filter_bar.set_dates(start, min(end, date(year, 12, 31)))
+        self._sort_field = "date"
+        self._sort_asc = False
+        self._table.reset_default_sort()
+        self.refresh()
 
     async def _reload_year_options(self) -> None:
         """Populate FY combo from years that actually exist in Master."""

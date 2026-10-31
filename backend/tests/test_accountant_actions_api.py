@@ -122,6 +122,8 @@ def test_approve_and_reject() -> None:
                 "verified": False,
                 "rejected": False,
                 "description": "Diesel",
+                "item": "Fuel",
+                "payee": "SHELL",
             }
         ]
     )
@@ -165,8 +167,8 @@ def test_bulk_approve_reject_and_category() -> None:
     cat = ObjectId()
     collection = FakeTransactions(
         [
-            {"_id": a, "verified": False, "item": "X", "category_name": "X"},
-            {"_id": b, "verified": False, "item": "Y", "category_name": "Y"},
+            {"_id": a, "verified": False, "item": "X", "category_name": "X", "payee": "P"},
+            {"_id": b, "verified": False, "item": "Y", "category_name": "Y", "payee": "P"},
         ]
     )
     app = _app(collection)
@@ -227,6 +229,7 @@ def test_re_approve_cascade_and_simple() -> None:
                 "description": "New",
                 "amount": 25.0,
                 "item": "New",
+                "payee": "SHELL",
                 "edited_after_verification": True,
                 "last_edited_at": datetime(2026, 6, 1),
                 "last_edited_by": ObjectId(),
@@ -236,6 +239,8 @@ def test_re_approve_cascade_and_simple() -> None:
                 "verified": False,
                 "edited_after_verification": True,
                 "description": "Legacy edit",
+                "item": "Fuel",
+                "payee": "SHELL",
             },
         ]
     )
