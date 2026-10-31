@@ -753,14 +753,12 @@ class ImportDailyMasterWidget(QWidget):
         session, result = self._session, self._validation
         if session is None:
             self._banner.setText("Loading…")
+            self._banner.show()
             return
         if not session.rows and not session.skipped:
-            self._banner.setText(
-                f"<b>{session.name}</b> — no files yet. Click <b>Add Excel Files…</b> and pick "
-                "one or many daily MATUMIZI files or MASTER workbooks. Rows are grouped by the "
-                "reconciled date in the file name (e.g. <i>MATUMIZI YA 19-10-26</i>)."
-            )
+            self._banner.hide()
             return
+        self._banner.show()
         tzs = sum(r.amount for r in session.rows if r.currency == "TZS")
         usd = sum(r.amount_usd or 0.0 for r in session.rows)
         parts = [

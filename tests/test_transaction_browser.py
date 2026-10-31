@@ -402,3 +402,23 @@ def test_uploads_table_has_sn_and_total_after_cashier():
     assert headers[_U_COL_TOTAL] == "Total"
     assert _U_COL_TOTAL == _U_COL_CASHIER + 1
     assert headers.index("Total") == headers.index("Cashier") + 1
+
+
+def test_simple_table_shows_usd_total_before_refund_and_total() -> None:
+    from datetime import date
+
+    browser = _browser()
+    rows = [
+        {"date": date(2026, 5, 2), "entries_count": 4, "total_tzs": 3070,
+         "total_usd": 100.5, "total_refund": 0, "cashier_ids": []},
+        {"date": date(2026, 5, 3), "entries_count": 1, "total_tzs": 700,
+         "total_refund": 0, "cashier_ids": []},
+    ]
+    browser._results_simple = rows
+    browser._populate_simple(rows)
+    t = browser._simple_table
+    headers = [t.horizontalHeaderItem(c).text() for c in range(t.columnCount())]
+    assert headers[-3:] == ["Total USD", "Refund to Float", "Total Amount"]
+    assert t.item(0, 4).text() == "USD 100.50"
+    assert t.item(1, 4).text() == "—"
+    assert t.item(0, 6).text() == "TZS 3,070"

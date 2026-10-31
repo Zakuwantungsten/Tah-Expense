@@ -132,8 +132,9 @@ _S_COL_DATE    = 0
 _S_COL_TXN_ID  = 1
 _S_COL_ENTRIES = 2
 _S_COL_STATUS  = 3
-_S_COL_REFUND  = 4
-_S_COL_TOTAL   = 5
+_S_COL_USD     = 4
+_S_COL_REFUND  = 5
+_S_COL_TOTAL   = 6
 
 # ── Column indices — Advanced (individual) ────────────────────────────────────
 
@@ -651,15 +652,15 @@ class TransactionBrowser(QWidget):
 
     def _build_simple_table(self) -> QTableWidget:
         t = QTableWidget()
-        t.setColumnCount(6)
+        t.setColumnCount(7)
         t.setHorizontalHeaderLabels(
             ["Date", "Transaction ID", "Entries", "Merged / Status",
-             "Refund to Float", "Total Amount"]
+             "Total USD", "Refund to Float", "Total Amount"]
         )
         t.setStyleSheet(_TABLE_SS)
         t.setAlternatingRowColors(False)
         hh = t.horizontalHeader()
-        for i in range(6):
+        for i in range(7):
             hh.setSectionResizeMode(i, QHeaderView.Interactive)
         hh.setStretchLastSection(False)
         hh.setSectionResizeMode(_S_COL_STATUS, QHeaderView.Stretch)
@@ -667,6 +668,7 @@ class TransactionBrowser(QWidget):
         t.setColumnWidth(_S_COL_TXN_ID,  150)
         t.setColumnWidth(_S_COL_ENTRIES,  70)
         t.setColumnWidth(_S_COL_STATUS,  260)
+        t.setColumnWidth(_S_COL_USD,     120)
         t.setColumnWidth(_S_COL_REFUND,  140)
         t.setColumnWidth(_S_COL_TOTAL,   130)
         t.verticalHeader().setVisible(False)
@@ -1512,6 +1514,16 @@ class TransactionBrowser(QWidget):
             status_it = _ro(self._simple_status_text(s, names), bg=row_bg)
             t.setItem(i, _S_COL_STATUS, status_it)
 
+            usd = float(s.get("total_usd") or 0)
+            usd_it = _ro(
+                f"USD {usd:,.2f}" if usd else "—",
+                Qt.AlignRight | Qt.AlignVCenter,
+                bg=row_bg,
+            )
+            if usd < 0:
+                usd_it.setForeground(QColor("#dc2626"))
+            t.setItem(i, _S_COL_USD, usd_it)
+
             refund = s["total_refund"]
             ref_it = _ro(
                 f"TZS {refund:,.0f}" if refund else "—",
@@ -1849,7 +1861,7 @@ class TransactionBrowser(QWidget):
             names = getattr(self, "_user_names", {}) or {}
             lines = [
                 "Date\tTransaction ID\tEntries\tMerged / Status"
-                "\tRefund to Float (TZS)\tTotal Amount (TZS)"
+                "\tTotal USD\tRefund to Float (TZS)\tTotal Amount (TZS)"
             ]
             for s in self._results_simple:
                 d = s["date"]
@@ -1858,6 +1870,7 @@ class TransactionBrowser(QWidget):
                     f"TXN-{d.strftime('%Y%m%d')}",
                     str(s["entries_count"]),
                     self._simple_status_text(s, names),
+                    f"{float(s.get('total_usd') or 0):.2f}",
                     f"{s['total_refund']:.0f}" if s["total_refund"] else "0",
                     f"{s['total_tzs']:.0f}"    if s["total_tzs"]    else "0",
                 ]))

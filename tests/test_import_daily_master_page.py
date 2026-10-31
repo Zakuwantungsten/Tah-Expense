@@ -427,6 +427,15 @@ def test_load_pack_dialog_builtin_folder_and_export(qapp, tmp_path: Path, monkey
     dlg.close()
 
 
+def test_banner_hidden_until_files_are_added(qapp, tmp_path: Path) -> None:
+    widget, session = _page(qapp, tmp_path)
+    assert not widget._banner.isHidden()
+    widget._set_session(svc.ImportSession.new())
+    assert widget._banner.isHidden()
+    widget._set_session(session)
+    assert not widget._banner.isHidden()
+
+
 def test_banner_reports_description_map_fallback(qapp, tmp_path: Path) -> None:
     from tahmeed.models.description_mapping import DescriptionMapping
 

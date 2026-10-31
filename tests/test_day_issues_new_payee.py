@@ -122,3 +122,78 @@ def test_new_item_joins_suggestions_before_payee_is_filled(qapp) -> None:
     assert assignment.new_item_fields["color"] == "#112233"
     assert dlg.result_payee == "BONDS DESK"
     dlg.close()
+
+
+def _bulk_dialog(monkeypatch, descriptions, answer=None):
+    from bson import ObjectId
+    from PySide6.QtWidgets import QMessageBox
+
+    from tahmeed.ui.cashier import day_issues as di
+    from tahmeed.ui.dialogs import import_session_dialogs as dlg_mod
+
+    def no_form(*_a, **_k):
+        raise AssertionError("no Add Item / Add Payee form in bulk mode")
+
+    def fake_exec(preview) -> int:
+        preview._on_accept()
+        return preview.result()
+
+    monkeypatch.setattr(di, "ItemDialog", no_form)
+    monkeypatch.setattr(di, "_NewPayeeDialog", no_form)
+    monkeypatch.setattr(
+        dlg_mod, "show_question",
+        lambda *_a, **_k: answer or QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(di.BulkMapPreviewDialog, "exec", fake_exec)
+    return MapDescriptionsDialog(
+        descriptions,
+        [Category(name="Parking", _id=ObjectId())],
+        ["CITY COUNCIL"],
+    )
+
+
+def test_bulk_payee_per_description(qapp, monkeypatch) -> None:
+    dlg = _bulk_dialog(monkeypatch, ["JOHN DOE", "city council", "MARY  ANN"])
+    dlg._payee_each.setChecked(True)
+    assert not dlg._payee.isEnabled()
+    dlg._item.setText("parking")
+    dlg._accept()
+    assert dlg.result_assignment is None
+    assert dlg.result_rows == [
+        ("JOHN DOE", "JOHN DOE", "Parking"),
+        ("city council", "CITY COUNCIL", "Parking"),
+        ("MARY  ANN", "MARY ANN", "Parking"),
+    ]
+    assert dlg.result_new_payees == {"JOHN DOE": "TZS", "MARY ANN": "TZS"}
+    assert dlg.result_new_items == {}
+    dlg.close()
+
+
+def test_bulk_item_per_description_needs_no_forms(qapp, monkeypatch) -> None:
+    from tahmeed.ui.dialogs.import_session_dialogs import BULK_ITEM_FIELDS
+
+    dlg = _bulk_dialog(monkeypatch, ["GET VALVE", "parking", "TYRE REPAIR"])
+    dlg._item_each.setChecked(True)
+    dlg._payee.setText("new garage")
+    dlg._accept()
+    assert [r[2] for r in dlg.result_rows] == ["GET VALVE", "Parking", "TYRE REPAIR"]
+    assert {r[1] for r in dlg.result_rows} == {"NEW GARAGE"}
+    assert dlg.result_new_payees == {"NEW GARAGE": "TZS"}
+    assert dlg.result_new_items == {
+        "GET VALVE": {**BULK_ITEM_FIELDS, "name": "GET VALVE"},
+        "TYRE REPAIR": {**BULK_ITEM_FIELDS, "name": "TYRE REPAIR"},
+    }
+    dlg.close()
+
+
+def test_bulk_declined_confirmation_saves_nothing(qapp, monkeypatch) -> None:
+    from PySide6.QtWidgets import QMessageBox
+
+    dlg = _bulk_dialog(
+        monkeypatch, ["GET VALVE"], answer=QMessageBox.StandardButton.No
+    )
+    dlg._item_each.setChecked(True)
+    dlg._payee.setText("city council")
+    dlg._accept()
+    assert dlg.result_rows == [] and dlg.result_assignment is None
+    dlg.close()

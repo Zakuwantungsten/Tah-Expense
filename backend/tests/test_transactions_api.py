@@ -265,6 +265,12 @@ class FakeTransactions:
                             else:
                                 bucket["entries_count"] += 1
                         bucket["total_tzs"] += float(doc.get("amount") or 0)
+                        if "total_usd" in group:
+                            from app.import_ops import doc_money_parts
+
+                            bucket["total_usd"] = (
+                                bucket.get("total_usd", 0.0) + doc_money_parts(doc)[1]
+                            )
                         cid = doc.get("cashier_id")
                         if cid is not None and cid not in bucket["cashier_ids"]:
                             bucket["cashier_ids"].append(cid)
@@ -1397,6 +1403,53 @@ def test_daily_summaries_count_parked_separately_from_submitted() -> None:
     assert group["parked_count"] == {
         "$sum": {"$cond": [{"$eq": ["$register_status", "parked"]}, 1, 0]}
     }
+
+
+def test_daily_summaries_total_usd_per_day() -> None:
+    from app.import_ops import _usd_amount_expr
+
+    user = _cashier()
+    base = {"truck_number": "T9", "item": "Fuel", "category_name": "Fuel"}
+    may2 = datetime(2026, 5, 2, 9, 0, 0)
+    may3 = datetime(2026, 5, 3, 9, 0, 0)
+    collection = FakeTransactions(
+        [
+            {**base, "_id": ObjectId(), "date": may2, "amount": 1000, "currency": "TZS"},
+            # USD-only entry (amount mirrored into amount_usd).
+            {**base, "_id": ObjectId(), "date": may2, "amount": 50, "currency": "USD",
+             "amount_usd": 50},
+            # Legacy USD entry without amount_usd.
+            {**base, "_id": ObjectId(), "date": may2, "amount": 20, "currency": "USD"},
+            # TZS and USD on one entry.
+            {**base, "_id": ObjectId(), "date": may2, "amount": 2000, "currency": "TZS",
+             "amount_usd": 30.5},
+            {**base, "_id": ObjectId(), "date": may3, "amount": 700, "currency": "TZS"},
+        ]
+    )
+    pipelines: list[list] = []
+    real_aggregate = collection.aggregate
+
+    def capture(pipeline: list):
+        pipelines.append(pipeline)
+        return real_aggregate(pipeline)
+
+    collection.aggregate = capture
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/v1/transactions/daily-summaries?date_from=2026-05-01&date_to=2026-05-31"
+        )
+
+    assert resp.status_code == 200
+    by_day = {d["date"]: d for d in resp.json()["items"]}
+    assert by_day["2026-05-02"]["total_usd"] == 100.5
+    assert by_day["2026-05-03"]["total_usd"] == 0.0
+    # The TZS total is unchanged (raw amounts).
+    assert by_day["2026-05-02"]["total_tzs"] == 3070
+    group = next(s["$group"] for s in pipelines[0] if "$group" in s)
+    assert group["total_usd"] == {"$sum": _usd_amount_expr()}
 
 
 def test_browse_flat_prefers_pending_edit_clone_over_original() -> None:

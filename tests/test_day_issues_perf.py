@@ -766,3 +766,89 @@ async def test_all_days_reuses_day_cache(monkeypatch) -> None:
     assert any(i.description == "LIVE ONLY" for i in live_snap.issues)
     assert d1 in cache
     assert any(i.description == "LIVE ONLY" for i in cache[d1].issues)
+
+
+@pytest.mark.asyncio
+async def test_bulk_map_creates_names_then_saves_each_row(monkeypatch) -> None:
+    from PySide6.QtWidgets import QDialog
+
+    from tahmeed.models.category import Category
+
+    _app()
+    user = User(username="c1", password_hash="x", role="cashier", full_name="C1")
+    widget = DayIssuesWidget(user)
+    widget._lookups_loaded = True
+    parking = Category(name="Parking", _id=ObjectId())
+    widget._categories = [parking]
+    widget._payees = ["CITY COUNCIL"]
+    calls: dict = {"payees": [], "items": [], "maps": [], "stamped": [], "applied": []}
+
+    class FakeDlg:
+        result_rows = [
+            ("JOHN DOE", "JOHN DOE", "GET VALVE"),
+            ("LATRA FEE", "CITY COUNCIL", "Parking"),
+        ]
+        result_new_payees = {"JOHN DOE": "USD"}
+        result_new_items = {"GET VALVE": {"name": "GET VALVE", "requires_truck": False}}
+
+        def __init__(self, *_a, **_k):
+            pass
+
+        def exec(self) -> int:
+            return QDialog.Accepted
+
+    async def add_payee(name, currency="TZS"):
+        calls["payees"].append((name, currency))
+
+    async def materialize(assignment, categories):
+        calls["items"].append((assignment.new_item_name, assignment.new_item_fields))
+        return Category(name=assignment.new_item_name, _id=ObjectId())
+
+    async def save_bulk(entries):
+        calls["maps"].extend((d, n, p) for d, _cid, n, p in entries)
+        return []
+
+    async def no_prior(_descs):
+        return {}
+
+    async def finish(_descs):
+        return None
+
+    monkeypatch.setattr("tahmeed.ui.cashier.day_issues.MapDescriptionsDialog", FakeDlg)
+    monkeypatch.setattr("tahmeed.ui.cashier.day_issues.add_payee", add_payee)
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.day_issues.materialize_mapping_assignment", materialize
+    )
+    monkeypatch.setattr(
+        "tahmeed.services.description_mapping_service.save_mappings_bulk", save_bulk
+    )
+    widget._snapshot_prior_maps = no_prior  # type: ignore[method-assign]
+    widget._finish_mapping_ui = finish  # type: ignore[method-assign]
+    widget._stamp_live_rows = (  # type: ignore[method-assign]
+        lambda descs, payee, item, _cid: calls["stamped"].append((descs[0], payee, item)) or 1
+    )
+    widget._enqueue_saved_row_apply = (  # type: ignore[method-assign]
+        lambda descs, payee, item, _cid: calls["applied"].append((tuple(descs), payee, item))
+    )
+    messages: list[str] = []
+    widget._confirm_mapping_undo = (  # type: ignore[method-assign]
+        lambda msg: messages.append(msg) or False
+    )
+
+    await widget._do_map(["JOHN DOE", "LATRA FEE"], [_issue("JOHN DOE"), _issue("LATRA FEE")])
+
+    assert calls["payees"] == [("JOHN DOE", "USD")]
+    assert calls["items"] == [("GET VALVE", {"name": "GET VALVE", "requires_truck": False})]
+    assert calls["maps"] == [
+        ("JOHN DOE", "GET VALVE", "JOHN DOE"),
+        ("LATRA FEE", "Parking", "CITY COUNCIL"),
+    ]
+    assert calls["stamped"] == [
+        ("JOHN DOE", "JOHN DOE", "GET VALVE"),
+        ("LATRA FEE", "CITY COUNCIL", "Parking"),
+    ]
+    assert len(calls["applied"]) == 2
+    assert "JOHN DOE" in widget._payees
+    assert widget._last_mapping_undo is not None
+    assert "Created 1 new Payee(s): JOHN DOE" in messages[-1]
+    assert "Mapped 2 description(s)" in messages[-1]

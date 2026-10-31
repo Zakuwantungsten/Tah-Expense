@@ -630,6 +630,7 @@ async def daily_summaries(
                 },
                 "entries_count": {"$sum": 1},
                 "total_tzs": {"$sum": "$amount"},
+                "total_usd": {"$sum": _usd_amount_expr()},
                 "total_refund": {
                     "$sum": {"$cond": [{"$eq": ["$notes_flag", True]}, "$amount", 0]}
                 },
@@ -677,6 +678,7 @@ async def daily_summaries(
                 "date": date(group["year"], group["month"], group["day"]).isoformat(),
                 "entries_count": doc["entries_count"],
                 "total_tzs": doc["total_tzs"],
+                "total_usd": float(doc.get("total_usd") or 0.0),
                 "total_refund": doc["total_refund"],
                 "cashier_ids": cashier_ids,
                 "draft_count": int(doc.get("draft_count") or 0),

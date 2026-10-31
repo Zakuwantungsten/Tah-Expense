@@ -57,6 +57,7 @@ from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.accountant.separate_expenses import (
     _finish_table_row, _table_cell_font, _table_style, _ROW_H,
 )
+from tahmeed.ui.dialogs.import_session_dialogs import BULK_ITEM_FIELDS, BulkMapPreviewDialog
 from tahmeed.ui.dialogs.item_dialog import ItemDialog
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.combo_styles import with_combo_popup
@@ -612,6 +613,10 @@ class MapDescriptionsDialog(QDialog):
         self.result_category: Optional[Category] = None
         self.result_assignment: Optional[MappingAssignment] = None
         self.result_create_payee: bool = False
+        # Bulk mode: (description, payee, item) rows plus the names to create.
+        self.result_rows: List[Tuple[str, str, str]] = []
+        self.result_new_payees: dict[str, str] = {}
+        self.result_new_items: dict[str, dict] = {}
         n = len(self._descriptions)
         self.setWindowTitle(
             f"Map {n} Description{'s' if n != 1 else ''}"
@@ -689,6 +694,22 @@ class MapDescriptionsDialog(QDialog):
         new_item = _btn("New Item…", primary=False)
         new_item.clicked.connect(self._on_new_item)
         btn_row.addWidget(new_item)
+
+        self._payee_each = QCheckBox("A PAYEE per description, named like it")
+        self._item_each = QCheckBox("An ITEM per description, named like it")
+        for box, field_, button in (
+            (self._payee_each, self._payee, new_payee),
+            (self._item_each, self._item, new_item),
+        ):
+            box.setStyleSheet(_checkbox_style())
+            box.setToolTip(
+                "Creates one per selected description in one go, with no forms: new Payees "
+                "use one currency, new Items get default settings (no options ticked). "
+                "Existing names are reused; you see every name before anything is created."
+            )
+            box.toggled.connect(field_.setDisabled)
+            box.toggled.connect(button.setDisabled)
+            vl.addWidget(box)
         save = _btn("Save Mapping", primary=True)
         save.clicked.connect(self._accept)
         btn_row.addWidget(save)
@@ -778,13 +799,64 @@ class MapDescriptionsDialog(QDialog):
         # Stay open so the new name is a suggestion. Payee is required on Save.
         self._select_item(name, fields=data, mark_create=True)
 
+    def _resolve_payee(self, name: str) -> Optional[str]:
+        payee = " ".join((name or "").upper().split())
+        if not payee or payee_needs_create(payee, self._known_payees_at_open):
+            return None
+        return payee
+
+    def _resolve_item(self, name: str) -> Optional[str]:
+        key = " ".join((name or "").split()).lower()
+        cat = next(
+            (c for c in self._categories if c._id is not None and c.name.strip().lower() == key),
+            None,
+        )
+        return cat.name if cat is not None else None
+
+    def _accept_bulk(self) -> None:
+        """A Payee and/or Item per description: check the names, then no forms."""
+        payee_each = self._payee_each.isChecked()
+        item_each = self._item_each.isChecked()
+        payee = "" if payee_each else " ".join(self._payee.text().upper().split())
+        raw_item = "" if item_each else self._item.text().strip()
+        item = (self._item.canonical(raw_item) or raw_item) if raw_item else ""
+        if (not payee_each and not payee) or (not item_each and not item):
+            QMessageBox.warning(self, "Validation", "Payee and Item are required.")
+            return
+        preview = BulkMapPreviewDialog(
+            self._descriptions,
+            payee=None if payee_each else payee,
+            item=None if item_each else (self._resolve_item(item) or item),
+            resolve_payee=self._resolve_payee,
+            resolve_item=self._resolve_item,
+            parent=self,
+        )
+        if preview.exec() != QDialog.Accepted or not preview.rows:
+            return
+        self.result_new_payees = {
+            name: self._payee_currencies.get(name, preview.currency)
+            for name in preview.new_payee_names
+        }
+        self.result_new_items = {
+            name: {
+                **(self._pending_new_items.get(name.lower()) or BULK_ITEM_FIELDS),
+                "name": name,
+            }
+            for name in preview.new_item_names
+        }
+        self.result_rows = [(desc, row_payee, row_item) for desc, row_item, row_payee in preview.rows]
+        self.accept()
+
     def _accept(self) -> None:
-        payee = " ".join(self._payee.text().upper().split())
-        raw_item = self._item.text().strip()
-        item_name = self._item.canonical(raw_item) or raw_item
         if not self._descriptions:
             QMessageBox.warning(self, "Validation", "Select at least one description.")
             return
+        if self._payee_each.isChecked() or self._item_each.isChecked():
+            self._accept_bulk()
+            return
+        payee = " ".join(self._payee.text().upper().split())
+        raw_item = self._item.text().strip()
+        item_name = self._item.canonical(raw_item) or raw_item
         if not payee:
             QMessageBox.warning(self, "Validation", "Payee is required.")
             return
@@ -2357,6 +2429,31 @@ class DayIssuesWidget(QWidget):
                 self._payees.append(name)
 
         descs = [desc for desc, _p, _c in resolved]
+        outcome = await self._commit_resolved(resolved, error_title="Save Filled Failed")
+        if outcome is None:
+            return
+        live_n, committed = outcome
+
+        msg = (
+            f"Saved {committed:,} filled mapping(s) to Description Maps.\n"
+            f"Updated {live_n:,} open row(s) on Table/draft"
+            f"{' (DB rows updating in background).' if live_n or committed else '.'}"
+        )
+        await self._finish_mapping_ui(descs)
+        if await self._await_ui(lambda: self._confirm_mapping_undo(msg)):
+            await self._undo_last_mapping()
+
+    async def _commit_resolved(
+        self, resolved: List[tuple], *, error_title: str
+    ) -> Optional[Tuple[int, int]]:
+        """Save ``(description, payee, category)`` rows to Description Maps.
+
+        Stamps open Table/draft rows, saves the maps in one call, keeps an
+        Undo snapshot and queues the saved-row update. Returns
+        ``(live rows updated, mappings saved)``, or None after showing the error.
+        Hides the loading overlay when done.
+        """
+        descs = [desc for desc, _p, _c in resolved]
         live_n = 0
         committed = 0
         try:
@@ -2400,19 +2497,90 @@ class DayIssuesWidget(QWidget):
             self._loading_overlay.hide_loading()
             err = str(exc)
             await self._await_ui(
-                lambda: QMessageBox.critical(self, "Save Filled Failed", err)
+                lambda: QMessageBox.critical(self, error_title, err)
             )
-            return
+            return None
         finally:
             self._loading_overlay.hide_loading()
+        return live_n, committed
 
-        msg = (
-            f"Saved {committed:,} filled mapping(s) to Description Maps.\n"
+    async def _run_bulk_map(self, dlg: "MapDescriptionsDialog") -> None:
+        """Create the batch's new Payees / Items (no forms), then save every row."""
+        new_payees, new_items = dlg.result_new_payees, dlg.result_new_items
+        self._loading_overlay.show_loading("Saving mappings…")
+        try:
+            for n, (name, currency) in enumerate(new_payees.items(), 1):
+                if len(new_payees) > 1:
+                    self._loading_overlay.show_loading(
+                        f"Adding Payees {n:,}/{len(new_payees):,}…"
+                    )
+                if payee_needs_create(name, self._payees):
+                    await add_payee(name, currency=currency or "TZS")
+                    self._payees.append(name)
+            for n, (name, fields) in enumerate(new_items.items(), 1):
+                if len(new_items) > 1:
+                    self._loading_overlay.show_loading(
+                        f"Adding Items {n:,}/{len(new_items):,}…"
+                    )
+                category = await materialize_mapping_assignment(
+                    MappingAssignment(
+                        action="assign",
+                        description=name,
+                        category=Category(name=name),
+                        create_new=True,
+                        new_item_name=name,
+                        new_item_fields=dict(fields),
+                    ),
+                    self._categories,
+                )
+                remember_category(self._categories, category)
+        except Exception as exc:
+            self._loading_overlay.hide_loading()
+            err = str(exc)
+            await self._await_ui(
+                lambda: QMessageBox.warning(self, "Could Not Create Names", err)
+            )
+            return
+
+        resolved: List[tuple] = []
+        for desc, payee, item_name in dlg.result_rows:
+            key = " ".join(item_name.split()).lower()
+            cat = next(
+                (
+                    c for c in self._categories
+                    if c._id is not None and c.name.strip().lower() == key
+                ),
+                None,
+            )
+            if cat is not None:
+                resolved.append((desc, payee, cat))
+        if not resolved:
+            self._loading_overlay.hide_loading()
+            return
+        self._loading_overlay.show_loading("Saving mappings…")
+        outcome = await self._commit_resolved(resolved, error_title="Mapping Failed")
+        if outcome is None:
+            return
+        live_n, committed = outcome
+
+        def listed(names) -> str:
+            names = list(names)
+            more = f" … and {len(names) - 8:,} more" if len(names) > 8 else ""
+            return ", ".join(names[:8]) + more
+
+        lines = []
+        if new_payees:
+            lines.append(f"Created {len(new_payees):,} new Payee(s): {listed(new_payees)}")
+        if new_items:
+            lines.append(f"Created {len(new_items):,} new Item(s): {listed(new_items)}")
+        lines.append(
+            f"Mapped {committed:,} description(s) and saved them to Description Maps.\n"
             f"Updated {live_n:,} open row(s) on Table/draft"
             f"{' (DB rows updating in background).' if live_n or committed else '.'}"
         )
+        descs = [desc for desc, _p, _c in resolved]
         await self._finish_mapping_ui(descs)
-        if await self._await_ui(lambda: self._confirm_mapping_undo(msg)):
+        if await self._await_ui(lambda: self._confirm_mapping_undo("\n\n".join(lines))):
             await self._undo_last_mapping()
 
     async def _do_map(
@@ -2459,6 +2627,9 @@ class DayIssuesWidget(QWidget):
             prefill_item=prefill_item,
         )
         if await self._await_ui(dlg.exec) != QDialog.Accepted:
+            return
+        if getattr(dlg, "result_rows", None):
+            await self._run_bulk_map(dlg)
             return
         assignment = dlg.result_assignment
         payee = dlg.result_payee
