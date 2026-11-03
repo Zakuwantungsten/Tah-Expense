@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import time
 from typing import Optional
 
 from PySide6.QtWidgets import (
@@ -101,6 +102,7 @@ class AccountantDashboard(QWidget):
         reset_verify_notification_cache()
         self._notification_live = True
         self._notification_poll_in_flight = False
+        self._protect_verify_badge_until = 0.0
         self._notification_poll_task: asyncio.Task | None = None
         # Keep a timer only as a watchdog to restart a dead long-poll loop.
         self._notification_timer = QTimer(self)
@@ -539,15 +541,23 @@ class AccountantDashboard(QWidget):
         self._sidebar.set_verify_badge(max(0, current + int(delta or 0)))
 
     def _note_submitted_drafts(self, updated: int) -> None:
-        """Submit already returned the count. Move the drafts badge by that amount."""
+        """Submit already returned the count — update badges without waiting on poll."""
+        n = int(updated or 0)
         self._skip_draft_recount = True
         current = self._sidebar.drafts_badge() if hasattr(self._sidebar, "drafts_badge") else 0
-        nxt = max(0, current - int(updated or 0))
+        nxt = max(0, current - n)
         self._sidebar.set_drafts_badge(nxt)
         if hasattr(self._sidebar, "set_saved_badge"):
             self._sidebar.set_saved_badge(nxt)
-        # Submitted rows land in Verify; refresh stored badges immediately.
-        QTimer.singleShot(0, self._kick_notification_refresh)
+        # Optimistic Verify bump so the sidebar moves even if /wait is down.
+        # Submit runs inside pause_background_polls; a force GET can briefly
+        # still see the pre-submit counter — don't let that wipe this bump.
+        if n > 0 and hasattr(self._sidebar, "set_verify_badge"):
+            verify = self._sidebar.verify_badge() if hasattr(self._sidebar, "verify_badge") else 0
+            self._sidebar.set_verify_badge(verify + n)
+            self._protect_verify_badge_until = time.monotonic() + 8.0
+        # After the submit pause resumes (~next tick), pull stored counters.
+        QTimer.singleShot(200, self._kick_notification_refresh)
 
     def _on_register_drafts_changed(self) -> None:
         if getattr(self, "_skip_draft_recount", False):
@@ -778,20 +788,17 @@ class AccountantDashboard(QWidget):
         if not self._notification_timer.isActive():
             self._notification_timer.start()
         self._start_notification_stream()
+        # Pull once after dialogs so submit/edit badge bumps are confirmed.
+        QTimer.singleShot(0, self._kick_notification_refresh)
         from tahmeed.services.connectivity_service import connectivity_monitor
 
         connectivity_monitor.resume()
 
     def _kick_notification_refresh(self) -> None:
-        """Drop cached ETag and restart the long-poll so submit shows up now."""
-        from tahmeed.services.notification_service import reset_verify_notification_cache
+        """Drop cached ETag and pull fresh counts (used by watchdog / resume)."""
+        from tahmeed.ui.async_utils import schedule_coro
 
-        reset_verify_notification_cache()
-        task = getattr(self, "_notification_poll_task", None)
-        if task is not None and not task.done():
-            task.cancel()
-        self._notification_poll_task = None
-        self._start_notification_stream()
+        schedule_coro(self._refresh_notification_counts_now())
 
     def _ensure_notification_stream(self) -> None:
         """Watchdog: restart the long-poll loop if it died."""
@@ -819,7 +826,19 @@ class AccountantDashboard(QWidget):
         self._notification_poll_task = create_task(loop())
 
     def _apply_notification_counts(self, payload: dict) -> None:
-        self._sidebar.set_verify_badge(int(payload.get("verify") or 0))
+        incoming = int(payload.get("verify") or 0)
+        current = self._sidebar.verify_badge() if hasattr(self._sidebar, "verify_badge") else 0
+        protect_until = float(getattr(self, "_protect_verify_badge_until", 0.0) or 0.0)
+        if (
+            incoming < current
+            and protect_until
+            and time.monotonic() < protect_until
+        ):
+            # Keep the post-submit bump until the stored counter catches up.
+            incoming = current
+        else:
+            self._protect_verify_badge_until = 0.0
+        self._sidebar.set_verify_badge(incoming)
         if "drafts" in payload:
             count = int(payload.get("drafts") or 0)
             self._sidebar.set_drafts_badge(count)
@@ -828,17 +847,38 @@ class AccountantDashboard(QWidget):
         page = self._pages.get("verify")
         apply = getattr(page, "apply_stored_counts", None) if page is not None else None
         if callable(apply):
-            apply(payload)
+            patched = dict(payload)
+            patched["verify"] = incoming
+            apply(patched)
+
+    async def _refresh_notification_counts_now(self) -> None:
+        """Force a GET of stored badges, then ensure the long-poll loop is alive."""
+        from tahmeed.services.notification_service import (
+            get_notification_counts,
+            reset_verify_notification_cache,
+        )
+
+        reset_verify_notification_cache()
+        try:
+            payload = await get_notification_counts(force=True)
+            if payload is not None:
+                self._apply_notification_counts(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        if self._notification_live:
+            self._ensure_notification_stream()
 
     async def _notification_stream_loop(self) -> None:
-        """Near-realtime badges via /notification-counts/wait (no 2s busy poll)."""
+        """Near-realtime badges via /notification-counts/wait (GET fallback)."""
         from tahmeed.services.notification_service import (
             get_notification_counts,
             wait_notification_counts,
         )
 
         try:
-            snap = await get_notification_counts()
+            snap = await get_notification_counts(force=True)
             if snap is not None and self._notification_live:
                 self._apply_notification_counts(snap)
         except asyncio.CancelledError:
@@ -855,6 +895,15 @@ class AccountantDashboard(QWidget):
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # Wait failed (network / older API) — soft-poll once, then retry.
+                try:
+                    snap = await get_notification_counts(force=True)
+                    if snap is not None and self._notification_live:
+                        self._apply_notification_counts(snap)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
                 await asyncio.sleep(2.0)
 
     async def _poll_notification_counts_async(self) -> None:
