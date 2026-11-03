@@ -220,6 +220,8 @@ def test_re_approve_cascade_and_simple() -> None:
                 "verified": True,
                 "description": "Old",
                 "amount": 10.0,
+                "currency": "TZS",
+                "amount_usd": 40.0,
                 "item": "Old",
             },
             {
@@ -228,6 +230,8 @@ def test_re_approve_cascade_and_simple() -> None:
                 "original_transaction_id": original_id,
                 "description": "New",
                 "amount": 25.0,
+                "currency": "TZS",
+                "amount_usd": None,
                 "item": "New",
                 "payee": "SHELL",
                 "edited_after_verification": True,
@@ -255,6 +259,7 @@ def test_re_approve_cascade_and_simple() -> None:
         original = next(d for d in collection.documents if d["_id"] == original_id)
         assert original["description"] == "New"
         assert original["amount"] == 25.0
+        assert original["amount_usd"] is None
         assert original["verified"] is True
         assert all(d["_id"] != pending_id for d in collection.documents)
 

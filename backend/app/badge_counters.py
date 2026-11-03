@@ -6,11 +6,16 @@ The request path must not ``count_documents`` on ``transactions``. Startup and
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from .accountant_ops import DELETION_BASE_MATCH, pending_inbox_count_query
+from .accountant_ops import (
+    DELETION_BASE_MATCH,
+    edited_count_query,
+    pending_inbox_count_query,
+)
 from .transaction_ops import DRAFT_BASE_MATCH, DRAFT_OR_PARKED_MATCH, PARKED_BASE_MATCH
 
 logger = logging.getLogger(__name__)
@@ -18,6 +23,7 @@ logger = logging.getLogger(__name__)
 BADGE_ID = "badges"
 BADGE_KEYS = (
     "verify",
+    "edited",
     "drafts",
     "parked",
     "deletion_requests",
@@ -32,8 +38,11 @@ BADGE_TOUCH_FIELDS = frozenset(
         "deletion_requested",
         "trashed",
         "restore_requested",
+        "edited_after_verification",
     }
 )
+# Same-process waiters for /notification-counts/wait (multi-worker still re-reads Mongo).
+_badge_waiters: set[asyncio.Event] = set()
 _BADGE_PROJECTION = {field: 1 for field in BADGE_TOUCH_FIELDS}
 _BADGE_PROJECTION["cashier_id"] = 1
 
@@ -56,6 +65,11 @@ def in_verify(doc: dict[str, Any]) -> bool:
         and _not_true(doc, "trashed")
         and _not_true(doc, "deletion_requested")
     )
+
+
+def in_edited(doc: dict[str, Any]) -> bool:
+    """Submitted pending-edit rows waiting for re-approval (Verify → Edited)."""
+    return in_verify(doc) and doc.get("edited_after_verification") is True
 
 
 def in_drafts(doc: dict[str, Any]) -> bool:
@@ -89,6 +103,7 @@ def membership(doc: dict[str, Any] | None) -> dict[str, int]:
         return {key: 0 for key in BADGE_KEYS}
     return {
         "verify": int(in_verify(doc)),
+        "edited": int(in_edited(doc)),
         "drafts": int(in_drafts(doc)),
         "parked": int(in_parked(doc)),
         "deletion_requests": int(in_deletion_requests(doc)),
@@ -141,6 +156,64 @@ def verify_badge_total(doc: dict[str, Any] | None) -> int:
     )
 
 
+def notification_payload(doc: dict[str, Any] | None) -> dict[str, int]:
+    """Sidebar + Verify sub-tab totals from the stored badge document."""
+    src = doc or {}
+    verify_raw = int(src.get("verify") or 0)
+    edited = int(src.get("edited") or 0)
+    return {
+        "verify": verify_badge_total(src),
+        "inbox": verify_raw,
+        "new": max(0, verify_raw - edited),
+        "edited": edited,
+        "drafts": drafts_badge_total(src),
+        "deletion_requests": int(src.get("deletion_requests") or 0),
+        "restore_requests": int(src.get("restore_requests") or 0),
+    }
+
+
+def _wake_badge_waiters() -> None:
+    for event in list(_badge_waiters):
+        event.set()
+
+
+async def wait_for_badge_change(
+    db: Any,
+    *,
+    etag: str | None,
+    timeout: float = 25.0,
+    poll_seconds: float = 0.35,
+) -> dict[str, Any]:
+    """Block until the badge document's ETag changes or ``timeout`` elapses.
+
+    Same-process writers wake waiters immediately via :func:`adjust_badges`.
+    Other API workers are covered by the short Mongo re-read loop.
+    """
+    deadline = asyncio.get_running_loop().time() + max(0.5, float(timeout))
+    wanted = normalize_etag(etag)
+    event = asyncio.Event()
+    _badge_waiters.add(event)
+    try:
+        while True:
+            doc = await read_badges(db)
+            current = badge_etag(doc)
+            if not wanted or not badge_etag_matches(wanted, current):
+                return doc
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return doc
+            event.clear()
+            try:
+                await asyncio.wait_for(
+                    event.wait(),
+                    timeout=min(poll_seconds, remaining),
+                )
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        _badge_waiters.discard(event)
+
+
 def drafts_badge_total(
     doc: dict[str, Any] | None,
     *,
@@ -165,10 +238,24 @@ def badge_etag(doc: dict[str, Any] | None) -> str:
     return f'"{token}"'
 
 
+def normalize_etag(value: str | None) -> str | None:
+    """Accept quoted or bare ``updated_at`` tokens as a quoted ETag."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.startswith("W/"):
+        text = text[2:].strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text
+    return f'"{text}"' if text else None
+
+
 def badge_etag_matches(header: str | None, etag: str) -> bool:
-    if not header or not etag:
+    left = normalize_etag(header)
+    right = normalize_etag(etag)
+    if not left or not right:
         return False
-    return header.strip() == etag
+    return left == right
 
 
 async def read_badges(db: Any) -> dict[str, Any]:
@@ -206,6 +293,7 @@ async def adjust_badges(
         {"$inc": inc, "$set": {"updated_at": datetime.now(timezone.utc)}},
         upsert=True,
     )
+    _wake_badge_waiters()
 
 
 async def note_transition(
@@ -288,6 +376,7 @@ async def repair_badge_counters(db: Any) -> None:
         return
     actual = {
         "verify": int(await transactions.count_documents(pending_inbox_count_query())),
+        "edited": int(await transactions.count_documents(edited_count_query())),
         "drafts": int(await transactions.count_documents(dict(DRAFT_BASE_MATCH))),
         "parked": int(await transactions.count_documents(dict(PARKED_BASE_MATCH))),
         "deletion_requests": int(
@@ -320,6 +409,7 @@ async def repair_badge_counters(db: Any) -> None:
         },
         upsert=True,
     )
+    _wake_badge_waiters()
 
 
 async def _cashier_buckets(transactions: Any) -> dict[str, dict[str, int]]:

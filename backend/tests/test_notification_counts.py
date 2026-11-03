@@ -80,6 +80,9 @@ def test_notification_counts_reads_stored_badges(role: str) -> None:
         {
             "_id": "badges",
             "verify": 7,
+            "edited": 2,
+            "drafts": 1,
+            "parked": 1,
             "deletion_requests": 3,
             "restore_requests": 0,
         }
@@ -94,7 +97,15 @@ def test_notification_counts_reads_stored_badges(role: str) -> None:
         response = client.get("/v1/accountant/notification-counts")
 
     assert response.status_code == 200
-    assert response.json() == {"verify": 10}
+    assert response.json() == {
+        "verify": 10,
+        "inbox": 7,
+        "new": 5,
+        "edited": 2,
+        "drafts": 2,
+        "deletion_requests": 3,
+        "restore_requests": 0,
+    }
     assert response.headers["etag"] == '"0"'
     assert transactions.queries == []
     assert badges.queries == [{"_id": "badges"}]
@@ -107,6 +118,39 @@ def test_notification_counts_reads_stored_badges(role: str) -> None:
     assert same.status_code == 304
     assert same.content == b""
     assert len(badges.queries) == 2
+
+def test_notification_counts_wait_returns_payload() -> None:
+    badges = FakeBadges(
+        {
+            "_id": "badges",
+            "verify": 4,
+            "edited": 1,
+            "drafts": 0,
+            "parked": 0,
+            "deletion_requests": 0,
+            "restore_requests": 0,
+            "updated_at": "stamp-1",
+        }
+    )
+    database = SimpleNamespace(
+        db=SimpleNamespace(transactions=FakeTransactions(), system_counters=badges)
+    )
+    app = create_app(settings=settings(), database=database)
+    app.dependency_overrides[current_user] = lambda: {"role": "accountant"}
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/accountant/notification-counts/wait",
+            params={"etag": "stamp-1", "timeout": 1},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["verify"] == 4
+    assert body["edited"] == 1
+    assert body["new"] == 3
+    assert response.headers["etag"] == '"stamp-1"'
+
 
 def test_notification_counts_rejects_cashier() -> None:
     transactions = FakeTransactions(count=7)

@@ -59,8 +59,8 @@ _LAZY_PAGE_KEYS = frozenset({
     "browse",
 })
 
-# Each tick reads one stored badge document; unchanged ticks are a 304.
-_NOTIFICATION_POLL_MS = 2_000
+# Long-poll wait; reconnects immediately when system_counters change.
+_NOTIFICATION_WAIT_S = 25.0
 
 # Opening the register after one of these pages repeats the catalog snapshot.
 _CATALOG_EDITORS = frozenset({
@@ -99,12 +99,15 @@ class AccountantDashboard(QWidget):
         )
 
         reset_verify_notification_cache()
-        self._notification_timer = QTimer(self)
-        self._notification_timer.setInterval(_NOTIFICATION_POLL_MS)
-        self._notification_timer.timeout.connect(self._poll_notification_counts)
+        self._notification_live = True
+        self._notification_poll_in_flight = False
         self._notification_poll_task: asyncio.Task | None = None
+        # Keep a timer only as a watchdog to restart a dead long-poll loop.
+        self._notification_timer = QTimer(self)
+        self._notification_timer.setInterval(int(_NOTIFICATION_WAIT_S * 1000) + 5_000)
+        self._notification_timer.timeout.connect(self._ensure_notification_stream)
         self._notification_timer.start()
-        self._poll_notification_counts()
+        self._start_notification_stream()
         schedule_coro(self._refresh_day_issues_badge())
         # Preload the heavy separate-expenses module after the UI is up so the
         # first sidebar click into those tabs does not stall on cold import.
@@ -543,8 +546,8 @@ class AccountantDashboard(QWidget):
         self._sidebar.set_drafts_badge(nxt)
         if hasattr(self._sidebar, "set_saved_badge"):
             self._sidebar.set_saved_badge(nxt)
-        # Submitted rows land in Verify; do not wait for the next poll tick.
-        QTimer.singleShot(0, self._poll_notification_counts)
+        # Submitted rows land in Verify; refresh stored badges immediately.
+        QTimer.singleShot(0, self._kick_notification_refresh)
 
     def _on_register_drafts_changed(self) -> None:
         if getattr(self, "_skip_draft_recount", False):
@@ -758,7 +761,8 @@ class AccountantDashboard(QWidget):
         self._on_nav(key)
 
     def pause_notification_polling(self) -> None:
-        """Stop badge and connectivity polls during nested Qt dialogs (Py3.14)."""
+        """Stop badge stream and connectivity polls during nested Qt dialogs."""
+        self._notification_live = False
         self._notification_timer.stop()
         task = getattr(self, "_notification_poll_task", None)
         if task is not None and not task.done():
@@ -770,59 +774,104 @@ class AccountantDashboard(QWidget):
         connectivity_monitor.pause()
 
     def resume_notification_polling(self) -> None:
+        self._notification_live = True
         if not self._notification_timer.isActive():
             self._notification_timer.start()
+        self._start_notification_stream()
         from tahmeed.services.connectivity_service import connectivity_monitor
 
         connectivity_monitor.resume()
 
-    def _poll_notification_counts(self) -> None:
-        """QTimer slot — schedule poll without nesting into a running task.
+    def _kick_notification_refresh(self) -> None:
+        """Drop cached ETag and restart the long-poll so submit shows up now."""
+        from tahmeed.services.notification_service import reset_verify_notification_cache
 
-        Using ``@asyncSlot`` here conflicts with Python 3.12+/3.14 when another
-        coroutine (e.g. truck Excel/PDF export) is mid-execution: qasync tries to
-        enter the poll task while that other task is still current.
+        reset_verify_notification_cache()
+        task = getattr(self, "_notification_poll_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._notification_poll_task = None
+        self._start_notification_stream()
 
-        Also skip this tick when ``asyncio.current_task()`` is set — that means we
-        are inside another coroutine's nested Qt event loop (e.g. QFileDialog /
-        QMessageBox). The next timer tick will retry.
-        """
-        if self._notification_poll_in_flight:
+    def _ensure_notification_stream(self) -> None:
+        """Watchdog: restart the long-poll loop if it died."""
+        if not getattr(self, "_notification_live", False):
             return
-        if not self._notification_timer.isActive():
+        prev = getattr(self, "_notification_poll_task", None)
+        if prev is not None and not prev.done():
+            return
+        self._start_notification_stream()
+
+    def _start_notification_stream(self) -> None:
+        if not getattr(self, "_notification_live", False):
             return
         from tahmeed.ui.async_utils import create_task, in_running_task
 
         if in_running_task():
+            QTimer.singleShot(0, self._ensure_notification_stream)
             return
-        # Drop a stale unfinished poll rather than stacking wakeups mid-modal.
-        prev = self._notification_poll_task
+        prev = getattr(self, "_notification_poll_task", None)
         if prev is not None and not prev.done():
             return
-        self._notification_poll_task = create_task(
-            self._poll_notification_counts_async()
+        loop = getattr(self, "_notification_stream_loop", None)
+        if loop is None:
+            loop = self._notification_stream_loop
+        self._notification_poll_task = create_task(loop())
+
+    def _apply_notification_counts(self, payload: dict) -> None:
+        self._sidebar.set_verify_badge(int(payload.get("verify") or 0))
+        if "drafts" in payload:
+            count = int(payload.get("drafts") or 0)
+            self._sidebar.set_drafts_badge(count)
+            if hasattr(self._sidebar, "set_saved_badge"):
+                self._sidebar.set_saved_badge(count)
+        page = self._pages.get("verify")
+        apply = getattr(page, "apply_stored_counts", None) if page is not None else None
+        if callable(apply):
+            apply(payload)
+
+    async def _notification_stream_loop(self) -> None:
+        """Near-realtime badges via /notification-counts/wait (no 2s busy poll)."""
+        from tahmeed.services.notification_service import (
+            get_notification_counts,
+            wait_notification_counts,
         )
 
-    async def _poll_notification_counts_async(self) -> None:
-        if self._notification_poll_in_flight:
-            return
-        if not self._notification_timer.isActive():
-            return
-        self._notification_poll_in_flight = True
         try:
-            from tahmeed.services.notification_service import (
-                get_verify_notification_count,
-            )
-
-            count = await get_verify_notification_count()
-            if count is None:
-                return
-            self._sidebar.set_verify_badge(count)
-            await self._refresh_drafts_badge()
+            snap = await get_notification_counts()
+            if snap is not None and self._notification_live:
+                self._apply_notification_counts(snap)
         except asyncio.CancelledError:
             raise
         except Exception:
-            # A transient API failure must not make a known count disappear.
+            pass
+
+        while self._notification_live:
+            try:
+                payload = await wait_notification_counts(timeout=_NOTIFICATION_WAIT_S)
+                if not self._notification_live:
+                    break
+                self._apply_notification_counts(payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(2.0)
+
+    async def _poll_notification_counts_async(self) -> None:
+        """Compatibility wrapper for tests / one-shot refresh."""
+        if self._notification_poll_in_flight:
+            return
+        self._notification_poll_in_flight = True
+        try:
+            from tahmeed.services.notification_service import get_notification_counts
+
+            payload = await get_notification_counts()
+            if payload is None:
+                return
+            self._apply_notification_counts(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
             pass
         finally:
             self._notification_poll_in_flight = False

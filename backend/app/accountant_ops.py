@@ -453,6 +453,7 @@ RE_APPROVE_CASCADE_FIELDS = frozenset(
         "truck_number",
         "amount",
         "currency",
+        "amount_usd",
         "lpo_do",
         "do_number",
         "memo",

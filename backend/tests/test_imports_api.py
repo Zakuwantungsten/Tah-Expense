@@ -275,6 +275,7 @@ def test_daily_commit_inserts_verified_rows() -> None:
                         "truck_number": "T1 AA",
                         "amount": 1000,
                         "category_name": "DIESEL",
+                        "payee": "shell station",
                         "daily_import_id": "up-daily-1",
                         "daily_import_source": "daily.xlsx",
                     },
@@ -297,6 +298,7 @@ def test_daily_commit_inserts_verified_rows() -> None:
     doc = txs.documents[0]
     assert doc["verified"] is True
     assert doc["item"] == "DIESEL"
+    assert doc["payee"] == "SHELL STATION"
     assert doc["import_row_key"]
     assert doc["daily_import_id"] == "up-daily-1"
 

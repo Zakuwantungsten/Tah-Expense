@@ -497,7 +497,7 @@ async def accountant_notification_counts(
     request: Request,
     _manager: Annotated[dict, Depends(require_roles("admin", "accountant"))],
 ) -> dict[str, int]:
-    """Badge total from the stored counter, not a collection scan.
+    """Badge totals from the stored counter, not a collection scan.
 
     ``If-None-Match`` of the badge ``updated_at`` returns 304. The client
     keeps the badges it already has.
@@ -505,8 +505,8 @@ async def accountant_notification_counts(
     from .badge_counters import (
         badge_etag,
         badge_etag_matches,
+        notification_payload,
         read_badges,
-        verify_badge_total,
     )
 
     doc = await read_badges(database(request))
@@ -514,10 +514,36 @@ async def accountant_notification_counts(
     headers = {"ETag": etag}
     if badge_etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=304, headers=headers)
-    return JSONResponse(
-        {"verify": verify_badge_total(doc)},
-        headers=headers,
+    return JSONResponse(notification_payload(doc), headers=headers)
+
+
+@accountant.get("/notification-counts/wait")
+async def accountant_notification_counts_wait(
+    request: Request,
+    _manager: Annotated[dict, Depends(require_roles("admin", "accountant"))],
+    etag: str = "",
+    timeout: float = 25.0,
+) -> dict[str, int]:
+    """Long-poll until badge ``updated_at`` changes (near-realtime).
+
+    Pass the last ETag as ``etag``. Returns the full payload immediately when
+    the stamp differs, or the current payload when ``timeout`` elapses.
+    """
+    from .badge_counters import (
+        badge_etag,
+        notification_payload,
+        wait_for_badge_change,
     )
+
+    capped = max(1.0, min(float(timeout or 25.0), 55.0))
+    raw_etag = (etag or request.headers.get("if-none-match") or "").strip()
+    doc = await wait_for_badge_change(
+        database(request),
+        etag=raw_etag or None,
+        timeout=capped,
+    )
+    current = badge_etag(doc)
+    return JSONResponse(notification_payload(doc), headers={"ETag": current})
 
 
 @settings_api.get("")

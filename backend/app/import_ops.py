@@ -14,6 +14,7 @@ from datetime import date, datetime
 from typing import Any, Optional, Sequence, Tuple
 
 from bson import ObjectId
+from pymongo import UpdateOne
 from pymongo.errors import BulkWriteError
 
 from .accountant_master_ops import stamp_truck_sort_key
@@ -57,6 +58,16 @@ def _norm(value: Any) -> str:
     if isinstance(value, date):
         return value.isoformat()
     return str(value).strip().upper()
+
+
+def normalize_payee_text(value: Any) -> str:
+    """Canonical PAYEE for transaction docs. Never invent or force blank.
+
+    Empty only when the payload truly has no payee. Import/commit paths must
+    call this instead of hardcoding an empty string so Table / Day Issues /
+    reports see the mapped payee even when Master Expenses has no Payee column.
+    """
+    return " ".join(str(value or "").strip().upper().split())
 
 
 def daily_import_row_key(payload: dict[str, Any]) -> str:
@@ -148,7 +159,7 @@ def verified_doc_from_daily_payload(
         "ref_float": ref_float,
         "ownership": (payload.get("ownership") or "").upper(),
         "approver": (payload.get("approver") or "").upper(),
-        "payee": " ".join((payload.get("payee") or "").strip().upper().split()),
+        "payee": normalize_payee_text(payload.get("payee")),
         "cheque": "",
         "reported_date": None,
         # Attribute the batch to the importing accountant so rows show in
@@ -235,7 +246,7 @@ def verified_doc_from_master_payload(
         "ref_float": (payload.get("ref_float") or "").strip(),
         "ownership": (payload.get("ownership") or "").upper(),
         "approver": (payload.get("approver") or "").upper(),
-        "payee": (payload.get("payee") or "").strip(),
+        "payee": normalize_payee_text(payload.get("payee")),
         "cheque": (payload.get("cheque") or "").strip(),
         "reported_date": None,
         "cashier_id": None,
@@ -357,6 +368,49 @@ async def insert_many_idempotent(
         if other:
             raise
         return inserted, dupes
+
+
+async def backfill_blank_daily_payees(
+    collection: Any,
+    docs: Sequence[dict[str, Any]],
+    *,
+    session: Any = None,
+) -> int:
+    """Fill blank ``payee`` on existing daily-import rows from a re-push batch.
+
+    Idempotent inserts skip duplicates by ``(daily_import_id, import_row_key)``
+    and that key does not include payee. Rows inserted when payee was forced
+    empty (or mapped later) would otherwise stay blank forever. This only
+    updates docs whose payee is missing/blank; non-blank values are left alone.
+    """
+    ops: list[Any] = []
+    for doc in docs:
+        payee = normalize_payee_text(doc.get("payee"))
+        upload_id = str(doc.get("daily_import_id") or "").strip()
+        row_key = str(doc.get("import_row_key") or "").strip()
+        if not payee or not upload_id or not row_key:
+            continue
+        ops.append(
+            UpdateOne(
+                {
+                    "daily_import_id": upload_id,
+                    "import_row_key": row_key,
+                    "$or": [
+                        {"payee": {"$exists": False}},
+                        {"payee": None},
+                        {"payee": ""},
+                    ],
+                },
+                {"$set": {"payee": payee}},
+            )
+        )
+    if not ops:
+        return 0
+    kwargs: dict[str, Any] = {"ordered": False}
+    if session is not None:
+        kwargs["session"] = session
+    result = await collection.bulk_write(ops, **kwargs)
+    return int(getattr(result, "modified_count", 0) or 0)
 
 
 def build_issue_query(
@@ -653,12 +707,16 @@ async def commit_daily_to_master(
             n, d = await insert_many_idempotent(db.transactions, batch)
             inserted += n
             duplicates += d
+            if d:
+                await backfill_blank_daily_payees(db.transactions, batch)
             batch.clear()
 
     if batch:
         n, d = await insert_many_idempotent(db.transactions, batch)
         inserted += n
         duplicates += d
+        if d:
+            await backfill_blank_daily_payees(db.transactions, batch)
 
     return {
         "inserted": inserted,

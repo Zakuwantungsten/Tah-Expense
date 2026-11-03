@@ -8,12 +8,14 @@ from bson import ObjectId
 from pymongo.errors import BulkWriteError
 
 from app.import_ops import (
+    backfill_blank_daily_payees,
     build_issue_query,
     daily_import_row_key,
     daily_uploads_pipeline,
     doc_money_parts,
     insert_many_idempotent,
     month_label,
+    normalize_payee_text,
     normalize_receipt,
     null_daily_import_id_filter,
     reset_import_index_cache,
@@ -48,6 +50,12 @@ def test_month_label_and_receipt() -> None:
     assert normalize_receipt("") == "pending"
     assert normalize_receipt("No Receipt") == "missing"
     assert normalize_receipt("received") == "received"
+
+
+def test_normalize_payee_text_does_not_force_empty() -> None:
+    assert normalize_payee_text(" shell  station ") == "SHELL STATION"
+    assert normalize_payee_text("") == ""
+    assert normalize_payee_text(None) == ""
 
 
 def test_verified_doc_from_daily_payload() -> None:
@@ -98,6 +106,7 @@ def test_verified_doc_from_master_payload() -> None:
             "truck_number": "T99 XYZ",
             "amount": 200,
             "category_name": "TYRES",
+            "payee": "tyre world",
             "serial": 42,
             "memo": "front",
             "notes": "urgent",
@@ -110,6 +119,7 @@ def test_verified_doc_from_master_payload() -> None:
     assert doc["master_import_id"] == "m-upload"
     assert doc["master_import_source"] == "master.xlsx"
     assert doc["master_serial"] == 42
+    assert doc["payee"] == "TYRE WORLD"
     assert doc["memo"] == "front | urgent"
     assert doc["receipt_status"] == "received"
     assert doc["verified"] is True
@@ -230,6 +240,26 @@ class _KeyedTransactions:
             )
         return type("Result", (), {"inserted_ids": inserted_ids})()
 
+    async def bulk_write(self, ops, ordered: bool = False):
+        modified = 0
+        for op in ops:
+            filt = getattr(op, "_filter", None) or getattr(op, "filter", None) or {}
+            doc = getattr(op, "_doc", None) or getattr(op, "doc", None) or {}
+            upload_id = filt.get("daily_import_id")
+            row_key = filt.get("import_row_key")
+            payee = (doc.get("$set") or {}).get("payee")
+            if not upload_id or not row_key or not payee:
+                continue
+            for stored in self.documents:
+                if (
+                    stored.get("daily_import_id") == upload_id
+                    and stored.get("import_row_key") == row_key
+                    and not (stored.get("payee") or "").strip()
+                ):
+                    stored["payee"] = payee
+                    modified += 1
+        return type("Result", (), {"modified_count": modified})()
+
 
 class _IndexOnly:
     async def create_index(self, *_args, **_kwargs) -> None:
@@ -270,3 +300,68 @@ async def test_commit_one_thousand_then_same_keys_insert_zero() -> None:
     assert second["duplicates_skipped"] == 1000
     assert len(transactions.documents) == 1000
     assert first["upload_id"] == "up-1000"
+
+
+@pytest.mark.asyncio
+async def test_commit_repush_backfills_blank_payee() -> None:
+    """Re-push with mapped payee fills rows that were stored with blank payee."""
+    from types import SimpleNamespace
+
+    from app.import_ops import commit_daily_to_master
+
+    reset_import_index_cache()
+    transactions = _KeyedTransactions()
+    db = SimpleNamespace(
+        transactions=transactions,
+        imported_feeds=_IndexOnly(),
+        separate_expenses=_IndexOnly(),
+    )
+    blank = {
+        "date": "2026-03-01T00:00:00",
+        "description": "GET VALVE",
+        "truck_number": "T1 AA",
+        "amount": 500,
+        "category_name": "DIRECT COSTS:SPARES",
+        "payee": "",
+        "daily_import_id": "up-payee",
+        "daily_import_source": "daily.xlsx",
+        "serial": 7,
+    }
+    first = await commit_daily_to_master(db, [blank])
+    assert first["inserted"] == 1
+    assert transactions.documents[0]["payee"] == ""
+
+    filled = dict(blank)
+    filled["payee"] = "spare parts"
+    second = await commit_daily_to_master(db, [filled])
+    assert second["inserted"] == 0
+    assert second["duplicates_skipped"] == 1
+    assert len(transactions.documents) == 1
+    assert transactions.documents[0]["payee"] == "SPARE PARTS"
+
+
+@pytest.mark.asyncio
+async def test_backfill_blank_daily_payees_skips_nonblank() -> None:
+    collection = MagicMock()
+    collection.bulk_write = AsyncMock(
+        return_value=type("Result", (), {"modified_count": 1})()
+    )
+    docs = [
+        {
+            "daily_import_id": "up-1",
+            "import_row_key": "key-1",
+            "payee": "PUMA",
+        },
+        {
+            "daily_import_id": "up-1",
+            "import_row_key": "",
+            "payee": "IGNORED",
+        },
+    ]
+    modified = await backfill_blank_daily_payees(collection, docs)
+    assert modified == 1
+    collection.bulk_write.assert_awaited_once()
+    ops = collection.bulk_write.await_args.args[0]
+    assert len(ops) == 1
+    assert ops[0]._filter["import_row_key"] == "key-1"
+    assert ops[0]._doc["$set"]["payee"] == "PUMA"

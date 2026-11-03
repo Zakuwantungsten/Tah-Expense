@@ -1239,6 +1239,24 @@ class VerifyInboxWidget(QWidget):
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
+    def apply_stored_counts(self, payload: dict) -> None:
+        """Apply unfiltered totals from ``system_counters`` (no inbox scan).
+
+        Keeps Rejected / Issues labels from the last filtered fetch when present
+        so New-tab opens still show Edited without visiting that sub-tab.
+        """
+        new_count = int(payload.get("new") or 0)
+        edited = int(payload.get("edited") or 0)
+        deleted = int(payload.get("deletion_requests") or 0)
+        restore = int(payload.get("restore_requests") or 0)
+        rejected = int(getattr(self, "_stored_rejected_count", 0) or 0)
+        issues = int(getattr(self, "_stored_issues_count", 0) or 0)
+        self._subtabs.set_counts(
+            new_count, edited, rejected, issues, deleted, restore,
+        )
+        pending = int(payload.get("verify") or 0)
+        self.badge_updated.emit(pending)
+
     def refresh(self) -> None:
         self._filters_tab = -1
         self._category_objects = []
@@ -1894,6 +1912,8 @@ class VerifyInboxWidget(QWidget):
                     issues_count, deleted_count, restore_count, pending,
                 ) = counts
                 self._page_has_count = True
+                self._stored_rejected_count = rejected_count
+                self._stored_issues_count = issues_count
                 if tab == 2:
                     total = rejected_count
                 elif tab == 1:

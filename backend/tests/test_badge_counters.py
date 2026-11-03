@@ -119,6 +119,11 @@ async def test_seed_matches_today_count_functions(caplog) -> None:
         _open("draft", cashier_id=cashier),
         _open("parked", cashier_id=other),
         _open("submitted", cashier_id=cashier),
+        _open(
+            "submitted",
+            cashier_id=cashier,
+            edited_after_verification=True,
+        ),
         _open("draft", cashier_id=cashier, trashed=True),
         {
             "_id": ObjectId(),
@@ -147,11 +152,12 @@ async def test_seed_matches_today_count_functions(caplog) -> None:
     assert counters.doc["drafts"] == await collection.count_documents(dict(DRAFT_BASE_MATCH))
     assert counters.doc["parked"] == await collection.count_documents(dict(PARKED_BASE_MATCH))
     assert counters.doc["verify"] == await collection.count_documents(pending_inbox_count_query())
+    assert counters.doc["edited"] == 1
     assert counters.doc["deletion_requests"] == 1
     assert counters.doc["restore_requests"] == 1
     assert counters.doc["drafts"] == 2
     assert counters.doc["parked"] == 1
-    assert counters.doc["verify"] == 1
+    assert counters.doc["verify"] == 2
     mine = counters.doc["cashiers"][str(cashier)]
     assert mine["drafts"] == 2
     assert counters.doc["cashiers"][str(other)]["parked"] == 1
@@ -159,7 +165,7 @@ async def test_seed_matches_today_count_functions(caplog) -> None:
     counters.doc["verify"] = 99
     with caplog.at_level("WARNING"):
         await repair_badge_counters(db)
-    assert counters.doc["verify"] == 1
+    assert counters.doc["verify"] == 2
     assert "drifted" in caplog.text
 
 
@@ -262,7 +268,10 @@ def test_resubmit_and_patch_unreject_move_verify_badge() -> None:
 
     assert counters.doc["verify"] == 2
     assert again.status_code == 200
-    assert again.json() == {"verify": 2}
+    body = again.json()
+    assert body["verify"] == 2
+    assert body["inbox"] == 2
+    assert body["edited"] == 0
 
 
 def test_bulk_patch_park_moves_draft_to_parked() -> None:
