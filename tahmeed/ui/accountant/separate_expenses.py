@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
+from tahmeed.ui.accountant.feed_upload_actions import upload_browse_headers
 from tahmeed.ui.widgets.export_paging import EXPORT_PAGE_SIZE, fetch_all_pages
 from tahmeed.ui.widgets.export_runner import (
     attach_export_overlay,
@@ -256,6 +257,137 @@ def _bind_feed_columns(table: QTableWidget, key: str) -> None:
     defaults = [max(table.columnWidth(i), 72) for i in range(table.columnCount())]
     bind_column_width_persistence(
         table, f"sep_{key}", defaults, auto_fit_if_unset=True,
+    )
+
+
+class _UploadBrowseChromeMixin:
+    """Checkbox + Action column + bulk Delete selected for upload browse tables.
+
+    Host must define ``upload_clicked``, ``delete_clicked``, ``bulk_delete_clicked``,
+    ``self._uploads``, and ``self._table``.
+    """
+
+    _col_chk = 0
+
+    def _action_col(self) -> int:
+        return max(0, self._table.columnCount() - 1)
+
+    def _add_upload_browse_toolbar(self, layout: QVBoxLayout) -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import make_upload_browse_toolbar
+
+        bar, self._bulk_delete_btn = make_upload_browse_toolbar(
+            on_delete_selected=self._emit_bulk_delete,
+            on_select_all=lambda: self._set_all_upload_checks(True),
+            on_clear=lambda: self._set_all_upload_checks(False),
+        )
+        layout.addWidget(bar)
+        self._table.itemChanged.connect(self._on_upload_check_changed)
+
+    def _finish_upload_browse_columns(self) -> None:
+        """Pin checkbox / Action widths after autofit."""
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(self._col_chk, QHeaderView.Fixed)
+        self._table.setColumnWidth(self._col_chk, 36)
+        action = self._action_col()
+        hdr.setSectionResizeMode(action, QHeaderView.Fixed)
+        self._table.setColumnWidth(action, 72)
+
+    def _put_upload_row_chrome(self, row: int) -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import (
+            make_upload_check_item,
+            make_upload_delete_button,
+        )
+
+        self._table.blockSignals(True)
+        try:
+            self._table.setItem(row, self._col_chk, make_upload_check_item())
+        finally:
+            self._table.blockSignals(False)
+        btn = make_upload_delete_button(
+            lambda r=row: self._emit_row_delete(r)
+        )
+        self._table.setCellWidget(row, self._action_col(), btn)
+
+    def _selected_uploads(self) -> List[dict]:
+        out: List[dict] = []
+        for r, up in enumerate(self._uploads):
+            item = self._table.item(r, self._col_chk)
+            if item is not None and item.checkState() == Qt.Checked:
+                out.append(up)
+        return out
+
+    def _set_all_upload_checks(self, checked: bool) -> None:
+        state = Qt.Checked if checked else Qt.Unchecked
+        self._table.blockSignals(True)
+        try:
+            for r in range(self._table.rowCount()):
+                item = self._table.item(r, self._col_chk)
+                if item is not None:
+                    item.setCheckState(state)
+        finally:
+            self._table.blockSignals(False)
+        self._sync_bulk_delete_btn()
+
+    def _on_upload_check_changed(self, item: QTableWidgetItem) -> None:
+        if item is not None and item.column() == self._col_chk:
+            self._sync_bulk_delete_btn()
+
+    def _sync_bulk_delete_btn(self) -> None:
+        btn = getattr(self, "_bulk_delete_btn", None)
+        if btn is not None:
+            n = len(self._selected_uploads())
+            btn.setEnabled(n > 0)
+            btn.setText(
+                "Delete selected" if n <= 0 else f"Delete selected ({n})"
+            )
+        # Keep chk / Action pinned after autofit on first data load.
+        if getattr(self, "_table", None) is not None and self._table.columnCount() > 1:
+            self._finish_upload_browse_columns()
+
+    def _emit_row_delete(self, row: int) -> None:
+        if 0 <= row < len(self._uploads):
+            self.delete_clicked.emit(self._uploads[row])
+
+    def _emit_bulk_delete(self) -> None:
+        docs = self._selected_uploads()
+        if docs:
+            self.bulk_delete_clicked.emit(docs)
+
+    def _on_browse_cell_clicked(self, row: int, col: int) -> None:
+        if col in (self._col_chk, self._action_col()):
+            return
+        if 0 <= row < len(self._uploads):
+            self.upload_clicked.emit(self._uploads[row])
+
+
+def _start_bulk_upload_delete(
+    parent: QWidget,
+    uploads: List[dict],
+    *,
+    feed_slug: str,
+    on_done: Callable[[], None],
+) -> None:
+    """Confirm + soft-delete many uploads with a single Undo."""
+    from tahmeed.ui.accountant.feed_upload_actions import (
+        confirm_move_uploads_to_trash,
+        soft_delete_uploads_with_undo,
+    )
+
+    docs = [u for u in (uploads or []) if str(u.get("_id") or "").strip()]
+    if not docs:
+        return
+    records = sum(int(u.get("record_count", 0) or 0) for u in docs)
+    if not confirm_move_uploads_to_trash(
+        parent, upload_count=len(docs), record_count=records
+    ):
+        return
+    asyncio.ensure_future(
+        soft_delete_uploads_with_undo(
+            parent,
+            feed_slug=feed_slug,
+            uploads=docs,
+            on_done=on_done,
+        )
     )
 
 
@@ -1315,9 +1447,10 @@ _TOLL_DETAIL_HEADERS = [
 ]
 
 # Summary columns shown in the upload-list browse table
-_TOLL_BROWSE_HEADERS = [
+# (checkbox + ACTION added via upload_browse_headers)
+_TOLL_BROWSE_HEADERS = upload_browse_headers([
     "UPLOAD DATE", "FILE NAME", "RECORDS", "TOTAL (ZMW)", "DATE RANGE",
-]
+])
 
 _TOLL_TEMPLATE_TITLE = "Dot Com Zambia — Toll Plaza Export"
 
@@ -1824,11 +1957,12 @@ class _TollAllEntries(_FeedExportMixin, QWidget):
 #  Upload Browse sub-widget — one row per import batch
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _TollUploadBrowse(QWidget):
+class _TollUploadBrowse(_UploadBrowseChromeMixin, QWidget):
     """Table of every Toll Plaza import batch. Clicking a row drills into it."""
 
     upload_clicked = Signal(object)   # emits the upload summary dict
     delete_clicked = Signal(object)
+    bulk_delete_clicked = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1848,20 +1982,22 @@ class _TollUploadBrowse(QWidget):
         self._table = _make_table(_TOLL_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(0, 160)
-        self._table.setColumnWidth(1, 240)
-        self._table.setColumnWidth(2, 80)
-        self._table.setColumnWidth(3, 120)
+        self._table.setColumnWidth(1, 160)
+        self._table.setColumnWidth(2, 240)
+        self._table.setColumnWidth(3, 80)
+        self._table.setColumnWidth(4, 120)
         self._table.setStyleSheet(_table_style())
-        _bind_feed_columns(self._table, "toll_browse")
+        _bind_feed_columns(self._table, "toll_browse_act")
+        self._finish_upload_browse_columns()
         self._table.setCursor(Qt.PointingHandCursor)
-        self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.cellClicked.connect(self._on_browse_cell_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_menu)
+        self._add_upload_browse_toolbar(vl)
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click any row to view its records · right-click to delete an upload.",
+            "Click a row to open it · use Action or Delete selected to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -1901,21 +2037,19 @@ class _TollUploadBrowse(QWidget):
             max_d = str(up.get("max_toll_date", "") or "").strip()
             date_range = f"{min_d[:10]} — {max_d[:10]}" if min_d else "—"
 
-            t.setItem(r, 0, _cell(date_str))
-            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
-            t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 3, _cell(f"{zmw:,.0f}", align=Qt.AlignRight | Qt.AlignVCenter))
-            t.setItem(r, 4, _cell(date_range))
+            t.setItem(r, 1, _cell(date_str))
+            t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(f"{zmw:,.0f}", align=Qt.AlignRight | Qt.AlignVCenter))
+            t.setItem(r, 5, _cell(date_range))
+            self._put_upload_row_chrome(r)
             _finish_table_row(t, r)
             total_zmw  += zmw
             total_recs += count
 
         self._totals.set_total("zmw",   total_zmw,  "ZMW ")
         self._totals.set_total("count", total_recs, "")
-
-    def _on_row_clicked(self, row: int, _col: int) -> None:
-        if row < len(self._uploads):
-            self.upload_clicked.emit(self._uploads[row])
+        self._sync_bulk_delete_btn()
 
     def _on_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
@@ -2191,6 +2325,7 @@ class TollPlazaWidget(QWidget):
         self._browse = _TollUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
         self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
         self._upload_stack.addWidget(self._browse)
 
         self._detail = _TollUploadDetail()
@@ -2301,6 +2436,14 @@ class TollPlazaWidget(QWidget):
             on_done=lambda: (self._all_entries.refresh(), self._show_browse()),
         )
 
+    def _on_bulk_delete_uploads(self, docs: list) -> None:
+        _start_bulk_upload_delete(
+            self,
+            docs,
+            feed_slug="toll-plaza",
+            on_done=lambda: (self._all_entries.refresh(), self._show_browse()),
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  2. ParkingCongoWidget
@@ -2330,9 +2473,9 @@ _PCONGO_TEMPLATE_HEADERS = [
     "CASHIER", "VEHICLE #", "DIRECTION", "GATE IN", "TICKET",
 ]
 
-_PCONGO_BROWSE_HEADERS = [
+_PCONGO_BROWSE_HEADERS = upload_browse_headers([
     "UPLOAD DATE", "FILE NAME", "RECORDS", "DATE RANGE",
-]
+])
 
 _PCONGO_SCROLL_CHUNK = 50
 
@@ -2625,11 +2768,12 @@ class _ParkingCongoAllEntries(_FeedExportMixin, QWidget):
 #  Upload Browse sub-widget — one row per import batch
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _ParkingCongoUploadBrowse(QWidget):
+class _ParkingCongoUploadBrowse(_UploadBrowseChromeMixin, QWidget):
     """Table of every Parking Congo import batch. Clicking a row drills into it."""
 
     upload_clicked = Signal(object)
     delete_clicked = Signal(object)
+    bulk_delete_clicked = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2645,19 +2789,21 @@ class _ParkingCongoUploadBrowse(QWidget):
         self._table = _make_table(_PCONGO_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(0, 180)
-        self._table.setColumnWidth(1, 260)
-        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(1, 180)
+        self._table.setColumnWidth(2, 260)
+        self._table.setColumnWidth(3, 80)
         self._table.setStyleSheet(_table_style())
-        _bind_feed_columns(self._table, "pcongo_browse")
+        _bind_feed_columns(self._table, "pcongo_browse_act")
+        self._finish_upload_browse_columns()
         self._table.setCursor(Qt.PointingHandCursor)
-        self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.cellClicked.connect(self._on_browse_cell_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_menu)
+        self._add_upload_browse_toolbar(vl)
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click any row to view its records · right-click to delete an upload.",
+            "Click a row to open it · use Action or Delete selected to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -2694,15 +2840,13 @@ class _ParkingCongoUploadBrowse(QWidget):
             max_d  = str(up.get("max_date", "") or "").strip()
             date_range = f"{min_d[:10]} — {max_d[:10]}" if min_d else "—"
 
-            t.setItem(r, 0, _cell(date_str))
-            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
-            t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 3, _cell(date_range))
+            t.setItem(r, 1, _cell(date_str))
+            t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(date_range))
+            self._put_upload_row_chrome(r)
             _finish_table_row(t, r)
-
-    def _on_row_clicked(self, row: int, _col: int) -> None:
-        if row < len(self._uploads):
-            self.upload_clicked.emit(self._uploads[row])
+        self._sync_bulk_delete_btn()
 
     def _on_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
@@ -3159,6 +3303,7 @@ class ParkingCongoWidget(QWidget):
         self._browse = _ParkingCongoUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
         self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
         self._upload_stack.addWidget(self._browse)
 
         self._detail = _ParkingCongoUploadDetail()
@@ -3310,6 +3455,19 @@ class ParkingCongoWidget(QWidget):
         )
 
 
+    def _on_bulk_delete_uploads(self, docs: list) -> None:
+        def _done() -> None:
+            self._all_entries.refresh()
+            self._deposited.refresh()
+            self._show_browse()
+
+        _start_bulk_upload_delete(
+            self,
+            docs,
+            feed_slug="parking-congo",
+            on_done=_done,
+        )
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  3. CongoExpensesWidget  — Excel import (last sheet), upload browse + detail
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3318,9 +3476,9 @@ _CONGO_HEADERS = [
     "S/NO", "DATE", "LPO NO", "TRUCK NO", "DESCRIPTION", "AMOUNT (USD)",
 ]
 
-_CONGO_BROWSE_HEADERS = [
+_CONGO_BROWSE_HEADERS = upload_browse_headers([
     "UPLOAD DATE", "FILE NAME", "SHEET", "RECORDS", "BALANCE (USD)", "DATE RANGE",
-]
+])
 
 
 def _parse_congo_sheet(ws) -> List[dict]:
@@ -3947,9 +4105,10 @@ class CongoImportDialog(QDialog):
                 self._import_btn.setText(f"Import {len(self._records):,} Rows")
 
 
-class _CongoExpUploadBrowse(QWidget):
+class _CongoExpUploadBrowse(_UploadBrowseChromeMixin, QWidget):
     upload_clicked = Signal(object)
     delete_clicked = Signal(object)
+    bulk_delete_clicked = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -3971,20 +4130,22 @@ class _CongoExpUploadBrowse(QWidget):
         self._table = _make_kimvi_table(_CONGO_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(0, 160)
-        self._table.setColumnWidth(1, 220)
-        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(1, 160)
+        self._table.setColumnWidth(2, 220)
         self._table.setColumnWidth(3, 80)
-        self._table.setColumnWidth(4, 120)
-        _bind_feed_columns(self._table, "congo_browse")
+        self._table.setColumnWidth(4, 80)
+        self._table.setColumnWidth(5, 120)
+        _bind_feed_columns(self._table, "congo_browse_act")
+        self._finish_upload_browse_columns()
         self._table.setCursor(Qt.PointingHandCursor)
-        self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.cellClicked.connect(self._on_browse_cell_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_menu)
+        self._add_upload_browse_toolbar(vl)
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click any row to view its records · right-click to delete an upload.",
+            "Click a row to open it · use Action or Delete selected to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -4030,17 +4191,18 @@ class _CongoExpUploadBrowse(QWidget):
             else:
                 date_range = "—"
 
-            t.setItem(r, 0, _cell(date_str))
-            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
-            t.setItem(r, 2, _cell(up.get("sheet_label") or "—", align=Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 1, _cell(date_str))
+            t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 3, _cell(up.get("sheet_label") or "—", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
             bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else "")
-            t.setItem(r, 4, _cell(
+            t.setItem(r, 5, _cell(
                 _kimvi_fmt_amount(balance),
                 color=bal_color,
                 align=Qt.AlignRight | Qt.AlignVCenter,
             ))
-            t.setItem(r, 5, _cell(date_range))
+            t.setItem(r, 6, _cell(date_range))
+            self._put_upload_row_chrome(r)
             _finish_table_row(t, r)
 
             total_balance += balance
@@ -4048,10 +4210,7 @@ class _CongoExpUploadBrowse(QWidget):
 
         self._totals.set_total("balance", total_balance, "Balance USD ")
         self._totals.set_total("count",   total_recs,    "")
-
-    def _on_row_clicked(self, row: int, _col: int) -> None:
-        if row < len(self._uploads):
-            self.upload_clicked.emit(self._uploads[row])
+        self._sync_bulk_delete_btn()
 
     def _on_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
@@ -4325,6 +4484,7 @@ class CongoExpensesWidget(QWidget):
         self._browse = _CongoExpUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
         self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
         self._upload_stack.addWidget(self._browse)
 
         self._detail = _CongoExpUploadDetail()
@@ -4487,15 +4647,29 @@ class CongoExpensesWidget(QWidget):
         )
 
 
+    def _on_bulk_delete_uploads(self, docs: list) -> None:
+        def _done() -> None:
+            self._all_entries.refresh()
+            self._money_in.refresh()
+            self._called_out.refresh()
+            self._show_browse()
+
+        _start_bulk_upload_delete(
+            self,
+            docs,
+            feed_slug="congo",
+            on_done=_done,
+        )
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  4. AhmedKimviWidget  — Excel import (last sheet), upload browse + detail
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _KIMVI_HEADERS = ["S/NO", "DATE", "TRUCK NO", "PARTICULARS", "AMOUNT (USD)"]
 
-_KIMVI_BROWSE_HEADERS = [
+_KIMVI_BROWSE_HEADERS = upload_browse_headers([
     "UPLOAD DATE", "FILE NAME", "SHEET", "RECORDS", "BALANCE (USD)", "DATE RANGE",
-]
+])
 
 _KIMVI_IN_FG = _CREDIT_FG
 _make_kimvi_table = _make_table
@@ -4909,7 +5083,7 @@ class BulkSheetImportDialog(QDialog):
         asyncio.ensure_future(self._async_import(pending))
 
     async def _async_import(self, pending: List[dict]) -> None:
-        from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
+        from tahmeed.ui.accountant.import_truck_gate import run_bulk_import_truck_gate
         from tahmeed.services.import_truck_check import truck_field_for
         from tahmeed.ui.async_utils import pause_background_polls
 
@@ -4919,6 +5093,7 @@ class BulkSheetImportDialog(QDialog):
 
         with pause_background_polls(self):
             try:
+                prepared: List[dict] = []
                 for batch in pending:
                     docs = []
                     for rec in batch["records"]:
@@ -4927,23 +5102,29 @@ class BulkSheetImportDialog(QDialog):
                         doc["upload_id"]       = batch["upload_id"]
                         doc["source_filename"] = self._source_filename
                         docs.append(doc)
+                    prepared.append({
+                        **batch,
+                        "docs": docs,
+                    })
 
-                    if self._feed_key and truck_field_for(self._feed_key):
-                        gate = await run_import_truck_gate(
-                            self,
-                            docs,
-                            feed_key=self._feed_key,
-                            upload_id=batch["upload_id"],
-                            source_filename=self._source_filename,
-                            sheet_label=batch["sheet_label"],
-                            can_add=True,
-                        )
-                        if gate.aborted:
-                            break
-                        docs = gate.rows
-                        total_skipped += gate.skipped_count
-                        if not docs:
-                            continue
+                if self._feed_key and truck_field_for(self._feed_key):
+                    gate = await run_bulk_import_truck_gate(
+                        self,
+                        prepared,
+                        feed_key=self._feed_key,
+                        source_filename=self._source_filename,
+                        can_add=True,
+                    )
+                    if gate.aborted:
+                        self._refresh_import_btn()
+                        return
+                    prepared = gate.batches
+                    total_skipped = gate.skipped_count
+
+                for batch in prepared:
+                    docs = list(batch.get("docs") or [])
+                    if not docs:
+                        continue
 
                     if self._feed_key == "zambia_parking" and batch.get("records"):
                         from tahmeed.services import accountant_service as svc
@@ -5477,11 +5658,12 @@ class _KimviCalledOutEntries(_KimviEntriesBase):
         super().__init__(called_out_only=True, parent=parent)
 
 
-class _KimviUploadBrowse(QWidget):
+class _KimviUploadBrowse(_UploadBrowseChromeMixin, QWidget):
     """Table of every Ahmed Kimvi import batch."""
 
     upload_clicked = Signal(object)
     delete_clicked = Signal(object)
+    bulk_delete_clicked = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -5503,20 +5685,22 @@ class _KimviUploadBrowse(QWidget):
         self._table = _make_kimvi_table(_KIMVI_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(0, 160)
-        self._table.setColumnWidth(1, 220)
-        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(1, 160)
+        self._table.setColumnWidth(2, 220)
         self._table.setColumnWidth(3, 80)
-        self._table.setColumnWidth(4, 120)
-        _bind_feed_columns(self._table, "kimvi_browse")
+        self._table.setColumnWidth(4, 80)
+        self._table.setColumnWidth(5, 120)
+        _bind_feed_columns(self._table, "kimvi_browse_act")
+        self._finish_upload_browse_columns()
         self._table.setCursor(Qt.PointingHandCursor)
-        self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.cellClicked.connect(self._on_browse_cell_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_menu)
+        self._add_upload_browse_toolbar(vl)
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click any row to view its records · right-click to delete an upload.",
+            "Click a row to open it · use Action or Delete selected to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -5562,17 +5746,18 @@ class _KimviUploadBrowse(QWidget):
             else:
                 date_range = "—"
 
-            t.setItem(r, 0, _cell(date_str))
-            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
-            t.setItem(r, 2, _cell(up.get("sheet_label") or "—", align=Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 1, _cell(date_str))
+            t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 3, _cell(up.get("sheet_label") or "—", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
             bal_color = _KIMVI_IN_FG if balance < 0 else (_RED if balance > 0 else "")
-            t.setItem(r, 4, _cell(
+            t.setItem(r, 5, _cell(
                 _kimvi_fmt_amount(balance),
                 color=bal_color,
                 align=Qt.AlignRight | Qt.AlignVCenter,
             ))
-            t.setItem(r, 5, _cell(date_range))
+            t.setItem(r, 6, _cell(date_range))
+            self._put_upload_row_chrome(r)
             _finish_table_row(t, r)
 
             total_balance += balance
@@ -5580,10 +5765,7 @@ class _KimviUploadBrowse(QWidget):
 
         self._totals.set_total("balance", total_balance, "Balance USD ")
         self._totals.set_total("count",   total_recs,    "")
-
-    def _on_row_clicked(self, row: int, _col: int) -> None:
-        if row < len(self._uploads):
-            self.upload_clicked.emit(self._uploads[row])
+        self._sync_bulk_delete_btn()
 
     def _on_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
@@ -5864,6 +6046,7 @@ class AhmedKimviWidget(QWidget):
         self._browse = _KimviUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
         self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
         self._upload_stack.addWidget(self._browse)
 
         self._detail = _KimviUploadDetail()
@@ -6026,6 +6209,20 @@ class AhmedKimviWidget(QWidget):
         )
 
 
+    def _on_bulk_delete_uploads(self, docs: list) -> None:
+        def _done() -> None:
+            self._all_entries.refresh()
+            self._money_in.refresh()
+            self._called_out.refresh()
+            self._show_browse()
+
+        _start_bulk_upload_delete(
+            self,
+            docs,
+            feed_slug="kimvi",
+            on_done=_done,
+        )
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  5. ZambiaParkingWidget  — weekly statement import, upload browse + detail
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6034,9 +6231,9 @@ _ZAMBIA_PARK_HEADERS = [
     "DATE", "TYPE", "PLATE NUM.", "TICKET NO.", "DEBIT", "CREDIT", "BALANCE", "HEADING TO",
 ]
 
-_ZAMBIA_BROWSE_HEADERS = [
+_ZAMBIA_BROWSE_HEADERS = upload_browse_headers([
     "UPLOAD DATE", "FILE NAME", "SHEET", "RECORDS", "CLOSING BAL (ZMW)", "DATE RANGE",
-]
+])
 
 
 def _zambia_to_float(val) -> Optional[float]:
@@ -6742,9 +6939,10 @@ class ZambiaParkingImportDialog(QDialog):
                 self._import_btn.setText(f"Import {len(self._records):,} Rows")
 
 
-class _ZambiaParkingUploadBrowse(QWidget):
+class _ZambiaParkingUploadBrowse(_UploadBrowseChromeMixin, QWidget):
     upload_clicked = Signal(object)
     delete_clicked = Signal(object)
+    bulk_delete_clicked = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -6766,20 +6964,22 @@ class _ZambiaParkingUploadBrowse(QWidget):
         self._table = _make_table(_ZAMBIA_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(0, 160)
-        self._table.setColumnWidth(1, 220)
-        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(1, 160)
+        self._table.setColumnWidth(2, 220)
         self._table.setColumnWidth(3, 80)
-        self._table.setColumnWidth(4, 130)
-        _bind_feed_columns(self._table, "zambia_browse")
+        self._table.setColumnWidth(4, 80)
+        self._table.setColumnWidth(5, 130)
+        _bind_feed_columns(self._table, "zambia_browse_act")
+        self._finish_upload_browse_columns()
         self._table.setCursor(Qt.PointingHandCursor)
-        self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.cellClicked.connect(self._on_browse_cell_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_menu)
+        self._add_upload_browse_toolbar(vl)
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click any row to view its records · right-click to delete an upload.",
+            "Click a row to open it · use Action or Delete selected to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -6824,15 +7024,16 @@ class _ZambiaParkingUploadBrowse(QWidget):
             else:
                 date_range = "—"
 
-            t.setItem(r, 0, _cell(date_str))
-            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
-            t.setItem(r, 2, _cell(up.get("sheet_label") or "—", align=Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 4, _cell(
+            t.setItem(r, 1, _cell(date_str))
+            t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 3, _cell(up.get("sheet_label") or "—", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 5, _cell(
                 _fmt_num(closing_bal, "ZMW ", 0),
                 align=Qt.AlignRight | Qt.AlignVCenter,
             ))
-            t.setItem(r, 5, _cell(date_range))
+            t.setItem(r, 6, _cell(date_range))
+            self._put_upload_row_chrome(r)
             _finish_table_row(t, r)
 
             total_balance += closing_bal
@@ -6840,10 +7041,7 @@ class _ZambiaParkingUploadBrowse(QWidget):
 
         self._totals.set_total("balance", total_balance, "Closing bal: ZMW ")
         self._totals.set_total("count",   total_recs,    "")
-
-    def _on_row_clicked(self, row: int, _col: int) -> None:
-        if row < len(self._uploads):
-            self.upload_clicked.emit(self._uploads[row])
+        self._sync_bulk_delete_btn()
 
     def _on_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
@@ -7117,6 +7315,7 @@ class ZambiaParkingWidget(QWidget):
         self._browse = _ZambiaParkingUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
         self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
         self._upload_stack.addWidget(self._browse)
 
         self._detail = _ZambiaParkingUploadDetail()
@@ -7262,6 +7461,19 @@ class ZambiaParkingWidget(QWidget):
             on_done=_done,
         )
 
+
+    def _on_bulk_delete_uploads(self, docs: list) -> None:
+        def _done() -> None:
+            self._all_entries.refresh()
+            self._money_in.refresh()
+            self._show_browse()
+
+        _start_bulk_upload_delete(
+            self,
+            docs,
+            feed_slug="zambia-parking",
+            on_done=_done,
+        )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Placeholder widget factory  (Afritrack, Third Party, COMESA)
@@ -8684,9 +8896,10 @@ def _afritrack_rows_to_records(
     return records
 
 
-class _AfritrackUploadBrowse(QWidget):
+class _AfritrackUploadBrowse(_UploadBrowseChromeMixin, QWidget):
     upload_clicked = Signal(object)
     delete_clicked = Signal(object)
+    bulk_delete_clicked = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -8699,22 +8912,26 @@ class _AfritrackUploadBrowse(QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        headers = ["UPLOAD DATE", "PERIOD", "FILE", "ROWS", "TAHMEED", "INVOICE", "VARIANCE"]
+        headers = upload_browse_headers(
+            ["UPLOAD DATE", "PERIOD", "FILE", "ROWS", "TAHMEED", "INVOICE", "VARIANCE"]
+        )
         self._table = _make_table(headers)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(0, 150)
-        self._table.setColumnWidth(1, 95)
-        self._table.setColumnWidth(2, 220)
-        self._table.setColumnWidth(3, 70)
-        self._table.setColumnWidth(4, 110)
+        self._table.setColumnWidth(1, 150)
+        self._table.setColumnWidth(2, 95)
+        self._table.setColumnWidth(3, 220)
+        self._table.setColumnWidth(4, 70)
         self._table.setColumnWidth(5, 110)
         self._table.setColumnWidth(6, 110)
-        _bind_feed_columns(self._table, "afritrack_browse")
+        self._table.setColumnWidth(7, 110)
+        _bind_feed_columns(self._table, "afritrack_browse_act")
+        self._finish_upload_browse_columns()
         self._table.setCursor(Qt.PointingHandCursor)
-        self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.cellClicked.connect(self._on_browse_cell_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_menu)
+        self._add_upload_browse_toolbar(vl)
         vl.addWidget(self._table, 1)
 
         self._totals = _TotalsBar([
@@ -8756,26 +8973,24 @@ class _AfritrackUploadBrowse(QWidget):
             tah = float(up.get("total_tahmeed", 0) or 0)
             inv = float(up.get("total_invoice", 0) or 0)
             var = float(up.get("total_variance", 0) or 0)
-            t.setItem(r, 0, _cell(date_str))
-            t.setItem(r, 1, _cell(up.get("period") or "—"))
-            t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
-            t.setItem(r, 3, _cell(f"{count:,}", Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 4, _cell(_fmt_num(tah, decimals=2), Qt.AlignRight | Qt.AlignVCenter, mono=True))
-            t.setItem(r, 5, _cell(_fmt_num(inv, decimals=2), Qt.AlignRight | Qt.AlignVCenter, mono=True))
-            t.setItem(r, 6, _cell(
+            t.setItem(r, 1, _cell(date_str))
+            t.setItem(r, 2, _cell(up.get("period") or "—"))
+            t.setItem(r, 3, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 4, _cell(f"{count:,}", Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 5, _cell(_fmt_num(tah, decimals=2), Qt.AlignRight | Qt.AlignVCenter, mono=True))
+            t.setItem(r, 6, _cell(_fmt_num(inv, decimals=2), Qt.AlignRight | Qt.AlignVCenter, mono=True))
+            t.setItem(r, 7, _cell(
                 _fmt_num(var, decimals=2), Qt.AlignRight | Qt.AlignVCenter, mono=True,
                 color=_RED if var < 0 else (_GREEN if var > 0 else ""),
             ))
+            self._put_upload_row_chrome(r)
             _finish_table_row(t, r)
             total_t += tah; total_i += inv; total_v += var; total_c += count
         self._totals.set_total("t", total_t, "USD ")
         self._totals.set_total("i", total_i, "USD ")
         self._totals.set_total("v", total_v, "USD ")
         self._totals.set_total("c", total_c, "")
-
-    def _on_row_clicked(self, row: int, _col: int) -> None:
-        if 0 <= row < len(self._uploads):
-            self.upload_clicked.emit(self._uploads[row])
+        self._sync_bulk_delete_btn()
 
     def _on_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
@@ -9042,6 +9257,7 @@ class AfritrackWidget(QWidget):
         self._browse = _AfritrackUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
         self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
         self._upload_stack.addWidget(self._browse)
 
         self._detail = _AfritrackUploadDetail()
@@ -9206,6 +9422,14 @@ class AfritrackWidget(QWidget):
             on_done=lambda: (self._all_entries.refresh(), self._show_browse()),
         )
 
+
+    def _on_bulk_delete_uploads(self, docs: list) -> None:
+        _start_bulk_upload_delete(
+            self,
+            docs,
+            feed_slug="afritrack",
+            on_done=lambda: (self._all_entries.refresh(), self._show_browse()),
+        )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Insurance helpers — QB-style table, file readers, import dialog, exporters
@@ -10276,9 +10500,9 @@ _RAHNTECH_HEADERS = [
 ]
 _RAHNTECH_TEMPLATE_TITLE = "RahnTech — Transacted Devices"
 _RAHNTECH_TEMPLATE_FILENAME = "RahnTech_Import_Template.xlsx"
-_RAHNTECH_BROWSE_HEADERS = [
+_RAHNTECH_BROWSE_HEADERS = upload_browse_headers([
     "UPLOAD DATE", "FILE NAME", "RECORDS", "DATE RANGE",
-]
+])
 _RAHNTECH_COL_MAP = {
     "sn":            ["s/n", "sn", "#"],
     "sales_date":    ["sales date", "date", "transaction date"],
@@ -10592,11 +10816,12 @@ class _RahnTechAllEntries(_FeedExportMixin, QWidget):
         self._reset_and_load()
 
 
-class _RahnTechUploadBrowse(QWidget):
+class _RahnTechUploadBrowse(_UploadBrowseChromeMixin, QWidget):
     """Table of every RahnTech import batch. Clicking a row drills into it."""
 
     upload_clicked = Signal(object)
     delete_clicked = Signal(object)
+    bulk_delete_clicked = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -10615,18 +10840,23 @@ class _RahnTechUploadBrowse(QWidget):
         self._table = _make_table(_RAHNTECH_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(0, 160)
-        self._table.setColumnWidth(1, 260)
-        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(1, 160)
+        self._table.setColumnWidth(2, 260)
+        self._table.setColumnWidth(3, 80)
         self._table.setStyleSheet(_table_style())
-        _bind_feed_columns(self._table, "rahntech_browse")
+        _bind_feed_columns(self._table, "rahntech_browse_act")
+        self._finish_upload_browse_columns()
         self._table.setCursor(Qt.PointingHandCursor)
-        self._table.cellClicked.connect(self._on_row_clicked)
+        self._table.cellClicked.connect(self._on_browse_cell_clicked)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_menu)
+        self._add_upload_browse_toolbar(vl)
         vl.addWidget(self._table, 1)
 
-        hint = _lbl("Click any row to view its records · right-click to delete an upload.", size=11, color=_TM)
+        hint = _lbl(
+            "Click a row to open it · use Action or Delete selected to trash uploads.",
+            size=11, color=_TM,
+        )
         hint.setAlignment(Qt.AlignCenter)
         vl.addWidget(hint)
 
@@ -10662,18 +10892,16 @@ class _RahnTechUploadBrowse(QWidget):
             max_d = str(up.get("max_sales_date", "") or "").strip()
             date_range = f"{min_d[:10]} — {max_d[:10]}" if min_d else "—"
 
-            t.setItem(r, 0, _cell(date_str))
-            t.setItem(r, 1, _cell(up.get("source_filename") or "Unknown"))
-            t.setItem(r, 2, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
-            t.setItem(r, 3, _cell(date_range))
+            t.setItem(r, 1, _cell(date_str))
+            t.setItem(r, 2, _cell(up.get("source_filename") or "Unknown"))
+            t.setItem(r, 3, _cell(f"{count:,}", align=Qt.AlignCenter | Qt.AlignVCenter))
+            t.setItem(r, 4, _cell(date_range))
+            self._put_upload_row_chrome(r)
             _finish_table_row(t, r)
             total_recs += count
 
         self._totals.set_total("count", total_recs, "")
-
-    def _on_row_clicked(self, row: int, _col: int) -> None:
-        if row < len(self._uploads):
-            self.upload_clicked.emit(self._uploads[row])
+        self._sync_bulk_delete_btn()
 
     def _on_menu(self, pos) -> None:
         row = self._table.rowAt(pos.y())
@@ -10924,6 +11152,7 @@ class RahnTechWidget(QWidget):
         self._browse = _RahnTechUploadBrowse()
         self._browse.upload_clicked.connect(self._show_detail)
         self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
         self._upload_stack.addWidget(self._browse)
 
         self._detail = _RahnTechUploadDetail()
@@ -11026,5 +11255,13 @@ class RahnTechWidget(QWidget):
             feed_slug="rahntech",
             upload_id=upload_id,
             filename=filename,
+            on_done=lambda: (self._all_entries.refresh(), self._show_browse()),
+        )
+
+    def _on_bulk_delete_uploads(self, docs: list) -> None:
+        _start_bulk_upload_delete(
+            self,
+            docs,
+            feed_slug="rahntech",
             on_done=lambda: (self._all_entries.refresh(), self._show_browse()),
         )
