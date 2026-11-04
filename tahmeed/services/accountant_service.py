@@ -3770,8 +3770,8 @@ async def get_toll_plaza_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
-    sort_field: str = "toll_date",
-    sort_asc: bool = True,
+    sort_field: str = "transaction_date",
+    sort_asc: bool = False,
 ) -> list:
     from tahmeed.services import feed_service as _feeds
     return await _feeds.get_toll_plaza_upload_records(upload_id=upload_id, search=search, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
@@ -3797,7 +3797,7 @@ async def get_parking_congo_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
-    sort_field: str = "payment_date",
+    sort_field: str = "transaction_date",
     sort_asc: bool = False,
 ) -> list:
     from tahmeed.services import feed_service as _feeds
@@ -3987,7 +3987,7 @@ async def get_rahntech_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
-    sort_field: str = "sales_date",
+    sort_field: str = "transaction_date",
     sort_asc: bool = False,
 ) -> list:
     from tahmeed.services import feed_service as _feeds
@@ -4360,8 +4360,8 @@ async def get_diesel_upload_records(
     search: str = "",
     limit: int = 50,
     skip: int = 0,
-    sort_field: str = "date",
-    sort_asc: bool = True,
+    sort_field: str = "transaction_date",
+    sort_asc: bool = False,
 ) -> list:
     from tahmeed.services import feed_service as _feeds
     return await _feeds.get_diesel_upload_records(feed_type=feed_type, upload_id=upload_id, search=search, limit=limit, skip=skip, sort_field=sort_field, sort_asc=sort_asc)
@@ -5055,7 +5055,11 @@ def _imported_feed_overview_query(
     ranging on those returns nothing under the fiscal-year From/To filter.
     """
     return _with_date_range(
-        {"feed_type": feed_type, truck_field: _truck_exact(truck)},
+        {
+            "feed_type": feed_type,
+            truck_field: _truck_exact(truck),
+            "trashed": {"$ne": True},
+        },
         "transaction_date",
         date_from,
         date_to,

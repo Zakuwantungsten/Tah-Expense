@@ -147,8 +147,25 @@ class FakeFeeds:
         for doc in self.documents:
             if _matches(doc, query):
                 doc.update(update.get("$set") or {})
+                for key in update.get("$unset") or {}:
+                    doc.pop(key, None)
                 return SimpleNamespace(matched_count=1, modified_count=1)
         return SimpleNamespace(matched_count=0, modified_count=0)
+
+    async def update_many(self, query: dict, update: dict) -> SimpleNamespace:
+        matched = 0
+        modified = 0
+        for doc in self.documents:
+            if not _matches(doc, query):
+                continue
+            matched += 1
+            before = dict(doc)
+            doc.update(update.get("$set") or {})
+            for key in update.get("$unset") or {}:
+                doc.pop(key, None)
+            if doc != before:
+                modified += 1
+        return SimpleNamespace(matched_count=matched, modified_count=modified)
 
     def aggregate(self, pipeline: list) -> FakeCursor:
         docs = [dict(d) for d in self.documents]
@@ -319,6 +336,36 @@ class FakeFeeds:
                         b["record_count"] += 1
                         b["total_zmw"] += float(d.get("tender_amount") or 0)
                     docs = list(buckets.values())
+                elif isinstance(gid, dict) and "upload_id" in gid:
+                    # Trash listing: group by disc + upload_id
+                    buckets: dict[tuple, dict] = {}
+                    disc_expr = str(gid.get("disc") or "")
+                    disc_field = disc_expr[1:] if disc_expr.startswith("$") else "feed_type"
+                    for d in docs:
+                        uid = str(d.get("upload_id") or "")
+                        if not uid:
+                            continue
+                        disc_val = str(d.get(disc_field) or "")
+                        key = (disc_val, uid)
+                        b = buckets.setdefault(
+                            key,
+                            {
+                                "_id": {"disc": disc_val, "upload_id": uid},
+                                "source_filename": d.get("source_filename"),
+                                "upload_label": d.get("upload_label"),
+                                "sheet_label": d.get("sheet_label"),
+                                "import_date": d.get("import_date"),
+                                "trashed_at": d.get("trashed_at"),
+                                "record_count": 0,
+                            },
+                        )
+                        b["record_count"] += 1
+                        ta = d.get("trashed_at")
+                        if ta and (
+                            b.get("trashed_at") is None or ta > b.get("trashed_at")
+                        ):
+                            b["trashed_at"] = ta
+                    docs = list(buckets.values())
             elif "$sort" in stage:
                 continue
         return FakeCursor(docs)
@@ -428,6 +475,13 @@ def test_toll_uploads_and_delete() -> None:
         cnt = client.get("/v1/feeds/toll-plaza/uploads/up-1/records/count")
         tot = client.get("/v1/feeds/toll-plaza/uploads/up-1/totals")
         deleted = client.delete("/v1/feeds/toll-plaza/uploads/up-1")
+        after_uploads = client.get("/v1/feeds/toll-plaza/uploads")
+        after_records = client.get("/v1/feeds/toll-plaza/records")
+        trash = client.get("/v1/feeds/trash")
+        restored = client.post("/v1/feeds/toll-plaza/uploads/up-1/restore")
+        live_again = client.get("/v1/feeds/toll-plaza/uploads")
+        client.delete("/v1/feeds/toll-plaza/uploads/up-1")
+        purged = client.delete("/v1/feeds/toll-plaza/uploads/up-1/purge")
 
     assert uploads.status_code == 200
     assert uploads.json()[0]["_id"] == "up-1"
@@ -436,6 +490,15 @@ def test_toll_uploads_and_delete() -> None:
     assert cnt.json()["count"] == 2
     assert tot.json()["total_zmw"] == 75.0
     assert deleted.json()["deleted"] == 2
+    assert deleted.json()["trashed"] is True
+    assert after_uploads.json() == []
+    assert after_records.json() == []
+    assert trash.status_code == 200
+    assert trash.json()["total"] == 1
+    assert trash.json()["items"][0]["upload_id"] == "up-1"
+    assert restored.json()["restored"] == 2
+    assert len(live_again.json()) == 1
+    assert purged.json()["deleted"] == 2
     assert feeds.documents == []
 
 

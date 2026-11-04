@@ -2179,24 +2179,35 @@ class _BaseDieselWidget(QWidget):
             self._tabs.set_index(1)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import confirm_move_upload_to_trash
+        from tahmeed.services.feed_service import feed_slug
+        upload_id = str(upload_doc.get("_id") or "")
+        if not upload_id:
+            return
         count = int(upload_doc.get("record_count", 0))
-        sheet = upload_doc.get("sheet_label") or upload_doc.get("source_filename") or ""
-        if QMessageBox.question(
-            self, "Delete upload",
-            f"Delete this upload ({sheet}) and its {count:,} records?",
-        ) != QMessageBox.Yes:
+        sheet = str(
+            upload_doc.get("sheet_label")
+            or upload_doc.get("source_filename")
+            or "Diesel upload"
+        )
+        if not confirm_move_upload_to_trash(self, filename=sheet, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(str(upload_doc.get("_id") or "")))
+        asyncio.ensure_future(
+            self._delete_upload(upload_id, sheet, feed_slug(self._FEED_TYPE))
+        )
 
-    async def _delete_upload(self, upload_id: str) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            await svc.delete_diesel_upload(self._FEED_TYPE, upload_id)
-        except Exception as exc:
-            QMessageBox.critical(self, "Delete Error", str(exc))
-            return
-        self._all_entries.refresh()
-        self._show_browse()
+    async def _delete_upload(
+        self, upload_id: str, filename: str = "", slug: str = ""
+    ) -> None:
+        from tahmeed.services.feed_service import feed_slug as to_slug
+        from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
+        await soft_delete_upload_with_undo(
+            self,
+            feed_slug=slug or to_slug(self._FEED_TYPE),
+            upload_id=upload_id,
+            filename=filename,
+            on_done=lambda: (self._all_entries.refresh(), self._show_browse()),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

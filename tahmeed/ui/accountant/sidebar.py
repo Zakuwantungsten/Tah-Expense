@@ -74,6 +74,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("comesa",          "COMESA Covers",        "mdi.certificate",       {}),
         ("sm_burhani",      "SM Burhani",           "mdi.scale-balance",     {}),
         ("rahntech",        "RahnTech",             "mdi.devices",           {}),
+        ("feeds_trash",     "Uploads Trash",        "mdi.delete-outline",    {}),
     ]),
     ("FUEL CONSUMPTION", [
         ("fuel_overview",   "Fuel Overview", "mdi.chart-box-outline", {}),

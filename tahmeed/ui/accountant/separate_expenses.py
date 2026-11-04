@@ -2281,35 +2281,25 @@ class TollPlazaWidget(QWidget):
             self._tabs.set_index(1)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import confirm_move_upload_to_trash
         upload_id = str(upload_doc.get("_id") or "")
         if not upload_id:
             return
-        filename = upload_doc.get("source_filename") or "Unknown file"
+        filename = str(upload_doc.get("source_filename") or "Unknown file")
         count = int(upload_doc.get("record_count", 0))
-        if QMessageBox.question(
-            self,
-            "Delete Upload",
-            f"Delete \"{filename}\" and all {count:,} records in this upload?\n\n"
-            "This cannot be undone.",
-        ) != QMessageBox.Yes:
+        if not confirm_move_upload_to_trash(self, filename=filename, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id))
+        asyncio.ensure_future(self._delete_upload(upload_id, filename))
 
-    async def _delete_upload(self, upload_id: str) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            deleted = await svc.delete_toll_plaza_upload(upload_id)
-        except Exception as exc:
-            QMessageBox.critical(self, "Delete Error", str(exc))
-            return
-        if deleted <= 0:
-            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
-            return
-        QMessageBox.information(
-            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+    async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
+        await soft_delete_upload_with_undo(
+            self,
+            feed_slug="toll-plaza",
+            upload_id=upload_id,
+            filename=filename,
+            on_done=lambda: (self._all_entries.refresh(), self._show_browse()),
         )
-        self._all_entries.refresh()
-        self._show_browse()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2801,7 +2791,7 @@ class _ParkingCongoUploadDetail(_FeedExportMixin, QWidget):
         self._table = _make_table(_PCONGO_DETAIL_HEADERS)
         self._sort_state = wire_feed_table_sort(
             self._table, PARKING_CONGO_DETAIL_SORT,
-            default_field="payment_date", default_asc=False,
+            default_field="transaction_date", default_asc=False,
             on_sort_changed=lambda _f, _a: self._go_page(1),
         )
         _bind_feed_columns(self._table, "pcongo")
@@ -3293,36 +3283,31 @@ class ParkingCongoWidget(QWidget):
             self._tabs.set_index(1)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import confirm_move_upload_to_trash
         upload_id = str(upload_doc.get("_id") or "")
         if not upload_id:
             return
-        filename = upload_doc.get("source_filename") or "Unknown file"
+        filename = str(upload_doc.get("source_filename") or "Unknown file")
         count = int(upload_doc.get("record_count", 0))
-        if QMessageBox.question(
-            self,
-            "Delete Upload",
-            f"Delete \"{filename}\" and all {count:,} records in this upload?\n\n"
-            "This cannot be undone.",
-        ) != QMessageBox.Yes:
+        if not confirm_move_upload_to_trash(self, filename=filename, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id))
+        asyncio.ensure_future(self._delete_upload(upload_id, filename))
 
-    async def _delete_upload(self, upload_id: str) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            deleted = await svc.delete_parking_congo_upload(upload_id)
-        except Exception as exc:
-            QMessageBox.critical(self, "Delete Error", str(exc))
-            return
-        if deleted <= 0:
-            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
-            return
-        QMessageBox.information(
-            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+    async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
+
+        def _done() -> None:
+            self._all_entries.refresh()
+            self._deposited.refresh()
+            self._show_browse()
+
+        await soft_delete_upload_with_undo(
+            self,
+            feed_slug="parking-congo",
+            upload_id=upload_id,
+            filename=filename,
+            on_done=_done,
         )
-        self._all_entries.refresh()
-        self._deposited.refresh()
-        self._show_browse()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4475,35 +4460,31 @@ class CongoExpensesWidget(QWidget):
         upload_id = str(upload_doc.get("_id") or "")
         if not upload_id:
             return
-        filename = upload_doc.get("source_filename") or "Unknown file"
+        filename = str(upload_doc.get("source_filename") or "Unknown file")
         sheet_label = upload_doc.get("sheet_label") or "—"
         count = int(upload_doc.get("record_count", 0))
-        if QMessageBox.question(
-            self,
-            "Delete Upload",
-            f"Delete sheet \"{sheet_label}\" from \"{filename}\" "
-            f"and all {count:,} records?\n\nThis cannot be undone.",
-        ) != QMessageBox.Yes:
+        from tahmeed.ui.accountant.feed_upload_actions import confirm_move_upload_to_trash
+        label = f'{filename} / {sheet_label}'
+        if not confirm_move_upload_to_trash(self, filename=label, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id))
+        asyncio.ensure_future(self._delete_upload(upload_id, label))
 
-    async def _delete_upload(self, upload_id: str) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            deleted = await svc.delete_congo_upload(upload_id)
-        except Exception as exc:
-            QMessageBox.critical(self, "Delete Error", str(exc))
-            return
-        if deleted <= 0:
-            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
-            return
-        QMessageBox.information(
-            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+    async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
+
+        def _done() -> None:
+            self._all_entries.refresh()
+            self._money_in.refresh()
+            self._called_out.refresh()
+            self._show_browse()
+
+        await soft_delete_upload_with_undo(
+            self,
+            feed_slug="congo",
+            upload_id=upload_id,
+            filename=filename,
+            on_done=_done,
         )
-        self._all_entries.refresh()
-        self._money_in.refresh()
-        self._called_out.refresh()
-        self._show_browse()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6015,38 +5996,34 @@ class AhmedKimviWidget(QWidget):
             self._tabs.set_index(3)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import confirm_move_upload_to_trash
         upload_id = str(upload_doc.get("_id") or "")
         if not upload_id:
             return
-        filename = upload_doc.get("source_filename") or "Unknown file"
+        filename = str(upload_doc.get("source_filename") or "Unknown file")
         sheet_label = upload_doc.get("sheet_label") or "—"
         count = int(upload_doc.get("record_count", 0))
-        if QMessageBox.question(
-            self,
-            "Delete Upload",
-            f"Delete sheet \"{sheet_label}\" from \"{filename}\" "
-            f"and all {count:,} records?\n\nThis cannot be undone.",
-        ) != QMessageBox.Yes:
+        label = f'{filename} / {sheet_label}'
+        if not confirm_move_upload_to_trash(self, filename=label, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id))
+        asyncio.ensure_future(self._delete_upload(upload_id, label))
 
-    async def _delete_upload(self, upload_id: str) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            deleted = await svc.delete_kimvi_upload(upload_id)
-        except Exception as exc:
-            QMessageBox.critical(self, "Delete Error", str(exc))
-            return
-        if deleted <= 0:
-            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
-            return
-        QMessageBox.information(
-            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+    async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
+
+        def _done() -> None:
+            self._all_entries.refresh()
+            self._money_in.refresh()
+            self._called_out.refresh()
+            self._show_browse()
+
+        await soft_delete_upload_with_undo(
+            self,
+            feed_slug="kimvi",
+            upload_id=upload_id,
+            filename=filename,
+            on_done=_done,
         )
-        self._all_entries.refresh()
-        self._money_in.refresh()
-        self._called_out.refresh()
-        self._show_browse()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7260,34 +7237,30 @@ class ZambiaParkingWidget(QWidget):
         upload_id = str(upload_doc.get("_id") or "")
         if not upload_id:
             return
-        filename = upload_doc.get("source_filename") or "Unknown file"
+        filename = str(upload_doc.get("source_filename") or "Unknown file")
         sheet_label = upload_doc.get("sheet_label") or "—"
         count = int(upload_doc.get("record_count", 0))
-        if QMessageBox.question(
-            self,
-            "Delete Upload",
-            f"Delete sheet \"{sheet_label}\" from \"{filename}\" "
-            f"and all {count:,} records?\n\nThis cannot be undone.",
-        ) != QMessageBox.Yes:
+        from tahmeed.ui.accountant.feed_upload_actions import confirm_move_upload_to_trash
+        label = f'{filename} / {sheet_label}'
+        if not confirm_move_upload_to_trash(self, filename=label, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id))
+        asyncio.ensure_future(self._delete_upload(upload_id, label))
 
-    async def _delete_upload(self, upload_id: str) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            deleted = await svc.delete_zambia_parking_upload(upload_id)
-        except Exception as exc:
-            QMessageBox.critical(self, "Delete Error", str(exc))
-            return
-        if deleted <= 0:
-            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
-            return
-        QMessageBox.information(
-            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+    async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
+
+        def _done() -> None:
+            self._all_entries.refresh()
+            self._money_in.refresh()
+            self._show_browse()
+
+        await soft_delete_upload_with_undo(
+            self,
+            feed_slug="zambia-parking",
+            upload_id=upload_id,
+            filename=filename,
+            on_done=_done,
         )
-        self._all_entries.refresh()
-        self._money_in.refresh()
-        self._show_browse()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9209,26 +9182,29 @@ class AfritrackWidget(QWidget):
             self._tabs.set_index(1)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
-        count = int(upload_doc.get("record_count", 0))
-        if QMessageBox.question(
-            self, "Delete upload",
-            f"Delete this Afritrack upload and its {count:,} rows?",
-        ) != QMessageBox.Yes:
+        from tahmeed.ui.accountant.feed_upload_actions import confirm_move_upload_to_trash
+        upload_id = str(upload_doc.get("_id") or "")
+        if not upload_id:
             return
-        asyncio.ensure_future(self._delete_upload(str(upload_doc.get("_id") or "")))
-
-    async def _delete_upload(self, upload_id: str) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            deleted = await svc.delete_afritrack_upload(upload_id)
-        except Exception as exc:
-            QMessageBox.critical(self, "Delete Error", str(exc))
-            return
-        QMessageBox.information(
-            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+        filename = str(
+            upload_doc.get("source_filename")
+            or upload_doc.get("period")
+            or "Afritrack upload"
         )
-        self._all_entries.refresh()
-        self._show_browse()
+        count = int(upload_doc.get("record_count", 0))
+        if not confirm_move_upload_to_trash(self, filename=filename, count=count):
+            return
+        asyncio.ensure_future(self._delete_upload(upload_id, filename))
+
+    async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
+        await soft_delete_upload_with_undo(
+            self,
+            feed_slug="afritrack",
+            upload_id=upload_id,
+            filename=filename,
+            on_done=lambda: (self._all_entries.refresh(), self._show_browse()),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -11033,31 +11009,22 @@ class RahnTechWidget(QWidget):
             self._tabs.set_index(1)
 
     def _on_delete_upload(self, upload_doc: dict) -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import confirm_move_upload_to_trash
         upload_id = str(upload_doc.get("_id") or "")
         if not upload_id:
             return
-        filename = upload_doc.get("source_filename") or "Unknown file"
+        filename = str(upload_doc.get("source_filename") or "Unknown file")
         count = int(upload_doc.get("record_count", 0))
-        if QMessageBox.question(
-            self,
-            "Delete Upload",
-            f"Delete upload from \"{filename}\" and all {count:,} records?\n\nThis cannot be undone.",
-        ) != QMessageBox.Yes:
+        if not confirm_move_upload_to_trash(self, filename=filename, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id))
+        asyncio.ensure_future(self._delete_upload(upload_id, filename))
 
-    async def _delete_upload(self, upload_id: str) -> None:
-        from tahmeed.services import accountant_service as svc
-        try:
-            deleted = await svc.delete_rahntech_upload(upload_id)
-        except Exception as exc:
-            QMessageBox.critical(self, "Delete Error", str(exc))
-            return
-        if deleted <= 0:
-            QMessageBox.warning(self, "Delete Upload", "No records were deleted.")
-            return
-        QMessageBox.information(
-            self, "Upload Deleted", f"Removed {deleted:,} record{'s' if deleted != 1 else ''}."
+    async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
+        from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
+        await soft_delete_upload_with_undo(
+            self,
+            feed_slug="rahntech",
+            upload_id=upload_id,
+            filename=filename,
+            on_done=lambda: (self._all_entries.refresh(), self._show_browse()),
         )
-        self._all_entries.refresh()
-        self._show_browse()

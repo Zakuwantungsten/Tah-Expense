@@ -89,8 +89,18 @@ class ReconciliationEntry:
             doc["_id"] = self._id
         return doc
 
+    @staticmethod
+    def _coerce_float(value, default: float = 0.0) -> float:
+        if value is None or value == "":
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     @classmethod
     def from_doc(cls, doc: dict) -> "ReconciliationEntry":
+        asycuda = doc.get("asycuda_amount")
         return cls(
             _id=doc.get("_id"),
             entity=doc.get("entity", "sm_burhani"),
@@ -106,8 +116,10 @@ class ReconciliationEntry:
             importer=doc.get("importer", ""),
             consignment=doc.get("consignment", ""),
             truck_and_trailer=doc.get("truck_and_trailer", ""),
-            charge=doc.get("charge", 0.0) or 0.0,
-            asycuda_amount=doc.get("asycuda_amount"),
+            charge=cls._coerce_float(doc.get("charge", 0.0), 0.0),
+            asycuda_amount=(
+                None if asycuda in (None, "") else cls._coerce_float(asycuda)
+            ),
             exporter=doc.get("exporter", ""),
             confirmed=doc.get("confirmed", False),
             disputed=doc.get("disputed", False),

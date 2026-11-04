@@ -23,7 +23,9 @@ def diesel_columns_sort(columns: List[Tuple[str, str, str]]) -> List[ColumnSpec]
         if key == "sn":
             specs.append((label, None, "text"))
             continue
+        # date is a display string; chronological sort uses transaction_date.
+        sort_key = "transaction_date" if key == "date" else key
         sort_kind = "truck" if key in _TRUCK_KEYS else _KIND_MAP.get(kind, "text")
-        specs.append((label, key, sort_kind))
+        specs.append((label, sort_key, sort_kind))
     specs.append(("UPLOAD DESCRIPTION", "upload_label", "text"))
     return specs

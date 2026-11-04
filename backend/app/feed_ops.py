@@ -405,6 +405,163 @@ def feed_collection(db: Any, spec: FeedSpec) -> Any:
     return getattr(db, spec.collection)
 
 
+# Human labels for the shared Uploads Trash UI (slug → label).
+UPLOAD_TRASH_FEED_LABELS: dict[str, str] = {
+    "toll-plaza": "Toll Plaza",
+    "parking-congo": "Parking Congo",
+    "rahntech": "RahnTech",
+    "zambia-parking": "Zambia Parking",
+    "diesel-infinity": "Infinity",
+    "diesel-lake-zambia": "Lake Zambia",
+    "diesel-lake-tunduma": "Lake Tunduma",
+    "diesel-gbp": "GBP Diesel",
+    "kimvi": "Ahmed Kimvi",
+    "congo": "Congo Expenses",
+    "afritrack": "Afritrack",
+}
+
+# Disc value → slug for trash listing across collections.
+_DISC_TO_SLUG: dict[str, str] = {
+    spec.disc_value: spec.slug for spec in _FEED_SPECS.values() if spec.has_uploads
+}
+
+
+def not_trashed_clause() -> dict[str, Any]:
+    return {"trashed": {"$ne": True}}
+
+
+def and_not_trashed(query: dict[str, Any]) -> dict[str, Any]:
+    """Exclude soft-deleted upload rows from live ledger queries."""
+    clause = not_trashed_clause()
+    if not query:
+        return dict(clause)
+    if query.get("trashed") is not None:
+        return query
+    and_list = query.get("$and")
+    if isinstance(and_list, list) and any(
+        isinstance(part, dict) and "trashed" in part for part in and_list
+    ):
+        return query
+    return {"$and": [query, clause]}
+
+
+def inject_not_trashed_match(pipeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add ``trashed != true`` to the first ``$match`` (or prepend one)."""
+    clause = not_trashed_clause()
+    if pipeline and isinstance(pipeline[0], dict) and "$match" in pipeline[0]:
+        match = dict(pipeline[0]["$match"])
+        if "trashed" in match:
+            return pipeline
+        match.update(clause)
+        return [{"$match": match}, *pipeline[1:]]
+    return [{"$match": clause}, *list(pipeline)]
+
+
+def upload_match(spec: FeedSpec, upload_id: str, *, trashed: bool | None = None) -> dict[str, Any]:
+    query: dict[str, Any] = {
+        spec.disc_field: spec.disc_value,
+        "upload_id": (upload_id or "").strip(),
+    }
+    if trashed is True:
+        query["trashed"] = True
+    elif trashed is False:
+        query.update(not_trashed_clause())
+    return query
+
+
+def trashed_uploads_pipeline(
+    *,
+    disc_field: str,
+    disc_values: Sequence[str] | None = None,
+    search: str = "",
+    feed_slug_filter: str = "",
+) -> list[dict[str, Any]]:
+    """Aggregate soft-deleted uploads for one collection (imported / separate)."""
+    match: dict[str, Any] = {
+        "trashed": True,
+        "upload_id": {"$exists": True, "$ne": ""},
+    }
+    if disc_values:
+        match[disc_field] = {"$in": list(disc_values)}
+    else:
+        match[disc_field] = {"$exists": True}
+
+    slug = (feed_slug_filter or "").strip().lower()
+    if slug:
+        spec = _FEED_SPECS.get(slug)
+        if spec is None or spec.disc_field != disc_field:
+            # Force empty result when filter targets the other collection.
+            match["_id"] = {"$exists": False}
+        else:
+            match[disc_field] = spec.disc_value
+
+    stages: list[dict[str, Any]] = [{"$match": match}]
+    text = (search or "").strip()
+    if text:
+        rx = re.escape(text)
+        stages.append(
+            {
+                "$match": {
+                    "$or": [
+                        {"source_filename": {"$regex": rx, "$options": "i"}},
+                        {"upload_label": {"$regex": rx, "$options": "i"}},
+                        {"sheet_label": {"$regex": rx, "$options": "i"}},
+                        {"upload_id": {"$regex": rx, "$options": "i"}},
+                    ]
+                }
+            }
+        )
+    stages.extend(
+        [
+            {
+                "$group": {
+                    "_id": {
+                        "disc": f"${disc_field}",
+                        "upload_id": "$upload_id",
+                    },
+                    "source_filename": {"$first": "$source_filename"},
+                    "upload_label": {"$first": "$upload_label"},
+                    "sheet_label": {"$first": "$sheet_label"},
+                    "import_date": {"$first": "$import_date"},
+                    "trashed_at": {"$max": "$trashed_at"},
+                    "record_count": {"$sum": 1},
+                }
+            },
+            {"$sort": {"trashed_at": -1, "import_date": -1}},
+        ]
+    )
+    return stages
+
+
+def format_trashed_upload_row(row: dict[str, Any], *, disc_field: str) -> dict[str, Any]:
+    """Normalize an aggregated trash row for the API/UI."""
+    key = row.get("_id") or {}
+    disc_value = ""
+    upload_id = ""
+    if isinstance(key, dict):
+        disc_value = str(key.get("disc") or "")
+        upload_id = str(key.get("upload_id") or "")
+    slug = _DISC_TO_SLUG.get(disc_value, "")
+    filename = (
+        str(row.get("source_filename") or "").strip()
+        or str(row.get("upload_label") or "").strip()
+        or str(row.get("sheet_label") or "").strip()
+        or upload_id
+        or "—"
+    )
+    return {
+        "feed": slug,
+        "feed_label": UPLOAD_TRASH_FEED_LABELS.get(slug, slug or disc_value),
+        "disc_field": disc_field,
+        "disc_value": disc_value,
+        "upload_id": upload_id,
+        "source_filename": filename,
+        "import_date": row.get("import_date"),
+        "trashed_at": row.get("trashed_at"),
+        "record_count": int(row.get("record_count") or 0),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Shared query helpers
 # ---------------------------------------------------------------------------
@@ -475,6 +632,17 @@ def date_range_clause(
     return {field: rng}
 
 
+# Display-string date fields rewritten at import (e.g. "01 May 2026"). Sorting
+# them lexicographically groups by day-of-month; use the real datetime instead.
+_DISPLAY_DATE_SORT_ALIASES = {
+    "payment_date": "transaction_date",
+    "toll_date": "transaction_date",
+    "sales_date": "transaction_date",
+    "date": "transaction_date",
+    "date_str": "expense_date",
+}
+
+
 def ledger_sort_clauses(
     sort_field: str,
     sort_asc: bool,
@@ -484,6 +652,9 @@ def ledger_sort_clauses(
     tie_break: Sequence[tuple[str, int]] = (("created_at", -1),),
 ) -> list[tuple[str, int]]:
     field = sort_field if sort_field in allowed else default
+    alias = _DISPLAY_DATE_SORT_ALIASES.get(field)
+    if alias is not None and alias in allowed:
+        field = alias
     direction = 1 if sort_asc else -1
     clauses: list[tuple[str, int]] = []
     if field in TRUCK_SORT_FIELDS:
@@ -757,6 +928,7 @@ def parking_congo_deposits_query(
 ) -> dict[str, Any]:
     clauses: list[dict[str, Any]] = [
         {"feed_type": "parking_congo"},
+        not_trashed_clause(),
         parking_congo_deposit_clause(),
     ]
     if search.strip():
@@ -825,16 +997,18 @@ def empty_toll_totals() -> dict[str, Any]:
 
 
 def existing_feed_keys_query(keys: Sequence[str]) -> dict[str, Any]:
-    return {
-        "$or": [
-            {"receipt_no": {"$in": list(keys)}},
-            {"serial": {"$in": list(keys)}},
-            {"ticket_no": {"$in": list(keys)}},
-            {"lpo_no": {"$in": list(keys)}},
-            {"ledger_id": {"$in": list(keys)}},
-            {"trip_number": {"$in": list(keys)}},
-        ]
-    }
+    return and_not_trashed(
+        {
+            "$or": [
+                {"receipt_no": {"$in": list(keys)}},
+                {"serial": {"$in": list(keys)}},
+                {"ticket_no": {"$in": list(keys)}},
+                {"lpo_no": {"$in": list(keys)}},
+                {"ledger_id": {"$in": list(keys)}},
+                {"trip_number": {"$in": list(keys)}},
+            ]
+        }
+    )
 
 
 def collect_existing_feed_keys(docs: Sequence[dict[str, Any]]) -> set[str]:

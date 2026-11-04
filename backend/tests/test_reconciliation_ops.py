@@ -8,10 +8,12 @@ from app.reconciliation_ops import (
     all_records_query,
     build_query,
     default_bonds_station_docs,
+    safe_double,
     station_display_name,
     station_query_value,
     station_slug,
     totals_from_aggregate,
+    totals_group_stage,
     truck_field_search_regex,
     truck_search_clauses,
     unique_stations_in_order,
@@ -19,6 +21,8 @@ from app.reconciliation_ops import (
     upload_records_sort,
     uploads_pipeline,
     validate_table,
+    years_import_pipeline,
+    years_t1_pipeline,
 )
 
 
@@ -92,3 +96,20 @@ def test_uploads_pipeline_and_bonds_seed() -> None:
     seed = default_bonds_station_docs()
     assert len(seed) == 3
     assert seed[0]["slug"] == "nakonde"
+
+
+def test_safe_double_converts_strings() -> None:
+    expr = safe_double("charge")
+    assert expr["$convert"]["input"] == "$charge"
+    assert expr["$convert"]["to"] == "double"
+    assert expr["$convert"]["onError"] == 0.0
+    stage = totals_group_stage()
+    assert stage["$group"]["charge_total"] == {"$sum": expr}
+
+
+def test_years_pipelines_require_bson_dates() -> None:
+    t1 = years_t1_pipeline("rpa_schedule")
+    assert t1[0]["$match"]["t1_date"] == {"$type": "date"}
+    imp = years_import_pipeline("rpa_schedule", station="nakonde")
+    assert imp[0]["$match"]["import_date"] == {"$type": "date"}
+    assert imp[0]["$match"]["station"] == "nakonde"

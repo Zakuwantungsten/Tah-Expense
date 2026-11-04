@@ -655,7 +655,12 @@ class _ReconAllEntries(QWidget):
         return recon_svc.station_query_value(self._station)
 
     async def _load_stations(self) -> None:
-        stations = await recon_svc.get_recon_stations(self._table)
+        try:
+            stations = await recon_svc.get_recon_stations(self._table)
+        except Exception as exc:
+            self._status_lbl.setText(f"Failed to load stations: {exc}")
+            hide_widget_loading(self)
+            return
         if not stations and not self._bonds:
             self._tabs.setVisible(False)
             self._station = ""
@@ -712,31 +717,44 @@ class _ReconAllEntries(QWidget):
         month = self._effective_month()
         ok = False
         try:
-            rows, total, totals = await asyncio.gather(
-                recon_svc.get_recon_all_records(
-                    self._table, self._station_filter(), self._search, self._year, month, _SCROLL_CHUNK, 0,
-                ),
-                recon_svc.count_recon_all_records(
+            try:
+                rows, total = await asyncio.gather(
+                    recon_svc.get_recon_all_records(
+                        self._table, self._station_filter(), self._search, self._year, month, _SCROLL_CHUNK, 0,
+                    ),
+                    recon_svc.count_recon_all_records(
+                        self._table, self._station_filter(), self._search, self._year, month,
+                    ),
+                )
+            except Exception as exc:
+                self._status_lbl.setText(f"Failed to load records: {exc}")
+                return
+            try:
+                totals = await recon_svc.get_recon_all_totals(
                     self._table, self._station_filter(), self._search, self._year, month,
-                ),
-                recon_svc.get_recon_all_totals(
-                    self._table, self._station_filter(), self._search, self._year, month,
-                ),
-            )
-        except Exception:
-            self._status_lbl.setText("Failed to load records.")
-        else:
+                )
+            except Exception:
+                totals = {
+                    "count": total,
+                    "invoiced": 0.0,
+                    "confirmed": 0.0,
+                    "variance": 0.0,
+                    "disputed": 0,
+                }
             self._total = total
             self._append_rows(rows)
             self._loaded = len(rows)
-            self._totals.set_total("charge", totals["invoiced"], "$ ")
-            self._totals.set_total("count", totals["count"], "")
+            self._totals.set_total("charge", totals.get("invoiced", 0.0), "$ ")
+            self._totals.set_total("count", totals.get("count", total), "")
             if self._bonds:
-                self._inv_lbl.setText(f"Invoiced: $ {totals['invoiced']:,.0f}")
-                self._conf_lbl.setText(f"Confirmed: $ {totals['confirmed']:,.0f}")
-                self._var_lbl.setText(f"Variance: $ {totals['variance']:,.0f}")
-                self._disp_lbl.setText(f"Disputed: {totals['disputed']}")
+                self._inv_lbl.setText(f"Invoiced: $ {totals.get('invoiced', 0):,.0f}")
+                self._conf_lbl.setText(f"Confirmed: $ {totals.get('confirmed', 0):,.0f}")
+                self._var_lbl.setText(f"Variance: $ {totals.get('variance', 0):,.0f}")
+                self._disp_lbl.setText(f"Disputed: {totals.get('disputed', 0)}")
             ok = True
+        except Exception as exc:
+            self._status_lbl.setText(f"Failed to load records: {exc}")
+            ok = False
         finally:
             self._loading = False
             hide_widget_loading(self)
@@ -989,9 +1007,12 @@ class _ReconUploadBrowse(QWidget):
         self._table_w.customContextMenuRequested.connect(self._on_menu)
         vl.addWidget(self._table_w, 1)
 
-        hint = _lbl("Click any row to view its records · right-click to delete an upload.", size=11, color=_TM)
-        hint.setAlignment(Qt.AlignCenter)
-        vl.addWidget(hint)
+        self._hint = _lbl(
+            "Click any row to view its records · right-click to delete an upload.",
+            size=11, color=_TM,
+        )
+        self._hint.setAlignment(Qt.AlignCenter)
+        vl.addWidget(self._hint)
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load())
@@ -1002,6 +1023,13 @@ class _ReconUploadBrowse(QWidget):
             uploads = await recon_svc.get_recon_uploads(self._table)
             self._uploads = uploads
             self._fill(uploads)
+            self._hint.setText(
+                "Click any row to view its records · right-click to delete an upload."
+            )
+        except Exception as exc:
+            self._uploads = []
+            self._fill([])
+            self._hint.setText(f"Failed to load uploads: {exc}")
         finally:
             hide_widget_loading(self)
 
@@ -1019,8 +1047,11 @@ class _ReconUploadBrowse(QWidget):
                 if isinstance(import_dt, datetime)
                 else (str(import_dt) if import_dt else "—")
             )
-            count = int(up.get("record_count", 0))
-            charge = float(up.get("total_charge", 0))
+            count = int(up.get("record_count", 0) or 0)
+            try:
+                charge = float(up.get("total_charge", 0) or 0)
+            except (TypeError, ValueError):
+                charge = 0.0
             period = str(up.get("schedule_period") or "—").strip() or "—"
             stations = [
                 recon_svc.station_display_name(s) for s in (up.get("stations") or [])
@@ -1220,11 +1251,16 @@ class _ReconUploadDetail(QWidget):
         return recon_svc.station_query_value(self._station)
 
     async def _load_stations(self) -> None:
-        stations = recon_svc.unique_station_docs(
-            await recon_svc.get_recon_upload_stations(
-                self._upload_id, self._table,
+        try:
+            stations = recon_svc.unique_station_docs(
+                await recon_svc.get_recon_upload_stations(
+                    self._upload_id, self._table,
+                )
             )
-        )
+        except Exception as exc:
+            self._status_lbl.setText(f"Failed to load stations: {exc}")
+            hide_widget_loading(self)
+            return
         if not stations:
             self._tabs.setVisible(False)
             self._station = ""
@@ -1253,31 +1289,44 @@ class _ReconUploadDetail(QWidget):
         show_widget_loading(self, "Loading upload records…")
         ok = False
         try:
-            rows, total, totals = await asyncio.gather(
-                recon_svc.get_recon_upload_records(
-                    self._upload_id, self._table, self._station_filter(), self._search, _SCROLL_CHUNK, 0,
-                ),
-                recon_svc.count_recon_upload_records(
-                    self._upload_id, self._table, self._station_filter(), self._search,
-                ),
-                recon_svc.get_recon_upload_totals(
+            try:
+                rows, total = await asyncio.gather(
+                    recon_svc.get_recon_upload_records(
+                        self._upload_id, self._table, self._station_filter(), self._search, _SCROLL_CHUNK, 0,
+                    ),
+                    recon_svc.count_recon_upload_records(
+                        self._upload_id, self._table, self._station_filter(), self._search,
+                    ),
+                )
+            except Exception as exc:
+                self._status_lbl.setText(f"Failed to load records: {exc}")
+                return
+            try:
+                totals = await recon_svc.get_recon_upload_totals(
                     self._upload_id, self._table, self._station_filter(),
-                ),
-            )
-        except Exception:
-            self._status_lbl.setText("Failed to load records.")
-        else:
+                )
+            except Exception:
+                totals = {
+                    "count": total,
+                    "invoiced": 0.0,
+                    "confirmed": 0.0,
+                    "variance": 0.0,
+                    "disputed": 0,
+                }
             self._total = total
             self._append_rows(rows)
             self._loaded = len(rows)
-            self._totals.set_total("charge", totals["invoiced"], "$ ")
-            self._totals.set_total("count", totals["count"], "")
+            self._totals.set_total("charge", totals.get("invoiced", 0.0), "$ ")
+            self._totals.set_total("count", totals.get("count", total), "")
             if self._bonds:
-                self._inv_lbl.setText(f"Invoiced: $ {totals['invoiced']:,.0f}")
-                self._conf_lbl.setText(f"Confirmed: $ {totals['confirmed']:,.0f}")
-                self._var_lbl.setText(f"Variance: $ {totals['variance']:,.0f}")
-                self._disp_lbl.setText(f"Disputed: {totals['disputed']}")
+                self._inv_lbl.setText(f"Invoiced: $ {totals.get('invoiced', 0):,.0f}")
+                self._conf_lbl.setText(f"Confirmed: $ {totals.get('confirmed', 0):,.0f}")
+                self._var_lbl.setText(f"Variance: $ {totals.get('variance', 0):,.0f}")
+                self._disp_lbl.setText(f"Disputed: {totals.get('disputed', 0)}")
             ok = True
+        except Exception as exc:
+            self._status_lbl.setText(f"Failed to load records: {exc}")
+            ok = False
         finally:
             self._loading = False
             hide_widget_loading(self)
@@ -1483,9 +1532,15 @@ class _ReconShellWidget(QWidget):
             self._skipped.refresh()
 
     def refresh(self) -> None:
-        self._all_entries.refresh()
-        self._show_browse()
-        if hasattr(self, "_skipped"):
+        # Only refresh the visible surface — Skipped loads when its tab is opened.
+        # Prefetching Skipped on every open raced the All Entries load and surfaced
+        # modal API errors while the main table still said "Loading…".
+        idx = self._main_stack.currentIndex()
+        if idx == 0:
+            self._all_entries.refresh()
+        elif idx == 1:
+            self._show_browse()
+        elif idx == 2 and hasattr(self, "_skipped"):
             self._skipped.refresh()
 
     def _show_browse(self) -> None:
@@ -1591,7 +1646,8 @@ class RPAScheduleWidget(_ReconShellWidget):
             import_label="Import RPA Schedule",
             parent=parent,
         )
-        self.refresh()
+        # Dashboard `_show_recon` always schedule_call(refresh) — avoid a double
+        # load race that clears the table mid-flight and leaves "Loading…".
 
 
 class BondsWidget(_ReconShellWidget):
@@ -1605,4 +1661,3 @@ class BondsWidget(_ReconShellWidget):
             bonds=True,
             parent=parent,
         )
-        self.refresh()

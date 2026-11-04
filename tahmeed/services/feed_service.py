@@ -8,10 +8,35 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, TypeVar
+
+import httpx
 
 from tahmeed.services.api_client import api_client
 from tahmeed.services.api_models import desktop_document, jsonable_document
+
+# Stay under API schema caps (import 20k, existing-keys 10k) and keep each
+# POST body small enough for a reliable round-trip.
+_IMPORT_CHUNK = 2_000
+_EXISTING_KEYS_CHUNK = 5_000
+_IMPORT_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+
+_T = TypeVar("_T")
+
+
+def _chunks(items: Sequence[_T], size: int) -> Iterable[Sequence[_T]]:
+    if size <= 0:
+        yield items
+        return
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def _import_row_payload(row: dict) -> dict:
+    """Serialize one import row; drop Excel ``_raw`` to shrink the JSON body."""
+    doc = jsonable_document(dict(row))
+    doc.pop("_raw", None)
+    return doc
 
 # feed_type / expense_type → URL slug
 _FEED_SLUGS: Dict[str, str] = {
@@ -204,32 +229,83 @@ async def upload_totals(slug: str, upload_id: str, **kwargs: Any) -> dict:
 
 
 async def delete_upload(slug: str, upload_id: str) -> int:
+    """Soft-delete an upload batch (moves to Uploads Trash)."""
     payload = await api_client.request(
         "DELETE", f"v1/feeds/{slug}/uploads/{upload_id}"
     )
     return int((payload or {}).get("deleted") or 0)
 
 
+async def restore_upload(slug: str, upload_id: str) -> int:
+    payload = await api_client.request(
+        "POST", f"v1/feeds/{slug}/uploads/{upload_id}/restore"
+    )
+    return int((payload or {}).get("restored") or 0)
+
+
+async def purge_upload(slug: str, upload_id: str) -> int:
+    """Permanently delete a soft-deleted upload from Trash."""
+    payload = await api_client.request(
+        "DELETE", f"v1/feeds/{slug}/uploads/{upload_id}/purge"
+    )
+    return int((payload or {}).get("deleted") or 0)
+
+
+async def list_trashed_uploads(
+    *,
+    feed: str = "",
+    search: str = "",
+    skip: int = 0,
+    limit: int = 100,
+) -> dict:
+    payload = await api_client.request(
+        "GET",
+        "v1/feeds/trash",
+        params=_params(feed=feed or None, search=search or None, skip=skip, limit=limit),
+    )
+    return dict(payload or {})
+
+
+async def count_trashed_uploads(*, feed: str = "", search: str = "") -> int:
+    payload = await api_client.request(
+        "GET",
+        "v1/feeds/trash/count",
+        params=_params(feed=feed or None, search=search or None),
+    )
+    return int((payload or {}).get("count") or 0)
+
+
 async def existing_keys(slug: str, keys: Sequence[str]) -> set:
     if not keys:
         return set()
-    payload = await api_client.request(
-        "POST",
-        f"v1/feeds/{slug}/existing-keys",
-        json={"keys": list(keys)},
-    )
-    return set((payload or {}).get("keys") or [])
+    found: set = set()
+    key_list = list(keys)
+    for chunk in _chunks(key_list, _EXISTING_KEYS_CHUNK):
+        payload = await api_client.request(
+            "POST",
+            f"v1/feeds/{slug}/existing-keys",
+            json={"keys": list(chunk)},
+            timeout=_IMPORT_TIMEOUT,
+        )
+        found.update((payload or {}).get("keys") or [])
+    return found
 
 
 async def import_rows(slug: str, rows: Sequence[dict]) -> int:
+    """POST import rows in chunks (schema max 20k; large files need many posts)."""
     if not rows:
         return 0
-    payload = await api_client.request(
-        "POST",
-        f"v1/feeds/{slug}/import",
-        json={"rows": [jsonable_document(dict(r)) for r in rows]},
-    )
-    return int((payload or {}).get("inserted") or 0)
+    inserted = 0
+    row_list = list(rows)
+    for chunk in _chunks(row_list, _IMPORT_CHUNK):
+        payload = await api_client.request(
+            "POST",
+            f"v1/feeds/{slug}/import",
+            json={"rows": [_import_row_payload(r) for r in chunk]},
+            timeout=_IMPORT_TIMEOUT,
+        )
+        inserted += int((payload or {}).get("inserted") or 0)
+    return inserted
 
 
 async def sheet_labels(slug: str, labels: Sequence[str]) -> set:

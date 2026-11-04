@@ -47,6 +47,7 @@ _LAZY_PAGE_KEYS = frozenset({
     "lake_tunduma",
     "gbp_diesel",
     "rahntech",
+    "feeds_trash",
     "manage_trucks",
     "manage_trailers",
     "manage_motor_vehicles",
@@ -342,6 +343,10 @@ class AccountantDashboard(QWidget):
         if key == "rahntech":
             from tahmeed.ui.accountant.separate_expenses import RahnTechWidget
             return RahnTechWidget()
+
+        if key == "feeds_trash":
+            from tahmeed.ui.accountant.feeds_trash import FeedsTrashWidget
+            return FeedsTrashWidget()
 
         if key == "manage_trucks":
             from tahmeed.ui.accountant.fleet_registry import TrucksRegistryWidget

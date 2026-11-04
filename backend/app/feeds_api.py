@@ -14,15 +14,18 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from .dependencies import require_roles
 from .errors import ApiError
 from .feed_ops import (
+    COLLECTION_IMPORTED,
     COLLECTION_SEPARATE,
     DIESEL_SLUGS,
     FeedSpec,
     RECON_SKIPPED_FEED_KEYS,
     SEPARATE_SKIPPED_FEED_KEYS,
+    UPLOAD_TRASH_FEED_LABELS,
     afritrack_all_query,
     afritrack_totals_pipeline,
     afritrack_upload_query,
     afritrack_uploads_pipeline,
+    and_not_trashed,
     apply_skipped_truck_update,
     collect_existing_feed_keys,
     diesel_all_query,
@@ -46,7 +49,9 @@ from .feed_ops import (
     finalize_diesel_totals,
     finalize_usd_ledger_totals,
     finalize_zambia_totals,
+    format_trashed_upload_row,
     group_skipped_records_for_reupload,
+    inject_not_trashed_match,
     insurance_existing_keys_query,
     insurance_query,
     insurance_totals_pipeline,
@@ -69,7 +74,9 @@ from .feed_ops import (
     toll_totals_pipeline,
     toll_upload_query,
     toll_uploads_pipeline,
+    trashed_uploads_pipeline,
     unique_diesel_file_labels,
+    upload_match,
     usd_ledger_all_query,
     usd_ledger_totals_pipeline,
     usd_ledger_upload_query,
@@ -142,8 +149,8 @@ def _diesel_handler(feed_type: str) -> LedgerHandler:
         uploads_pipeline=lambda: diesel_uploads_pipeline(feed_type),
         totals_pipeline=diesel_totals_pipeline,
         empty_totals=empty_diesel_totals,
-        all_tie_break=(("date", -1), ("import_date", -1)),
-        upload_default_sort="date",
+        all_tie_break=(("transaction_date", -1), ("import_date", -1)),
+        upload_default_sort="transaction_date",
         legacy_date_field="date",
         supports_file_labels=True,
         is_diesel=True,
@@ -158,8 +165,8 @@ _HANDLERS: dict[str, LedgerHandler] = {
         uploads_pipeline=toll_uploads_pipeline,
         totals_pipeline=toll_totals_pipeline,
         empty_totals=empty_toll_totals,
-        all_tie_break=(("toll_date", -1), ("import_date", -1)),
-        upload_default_sort="toll_date",
+        all_tie_break=(("transaction_date", -1), ("import_date", -1)),
+        upload_default_sort="transaction_date",
         legacy_date_field="toll_date",
     ),
     "parking-congo": LedgerHandler(
@@ -168,8 +175,8 @@ _HANDLERS: dict[str, LedgerHandler] = {
         uploads_pipeline=parking_congo_uploads_pipeline,
         totals_pipeline=parking_congo_totals_pipeline,
         empty_totals=empty_parking_totals,
-        all_tie_break=(("payment_date", -1), ("import_date", -1)),
-        upload_default_sort="payment_date",
+        all_tie_break=(("transaction_date", -1), ("import_date", -1)),
+        upload_default_sort="transaction_date",
         legacy_date_field="payment_date",
     ),
     "rahntech": LedgerHandler(
@@ -178,8 +185,8 @@ _HANDLERS: dict[str, LedgerHandler] = {
         uploads_pipeline=rahntech_uploads_pipeline,
         totals_pipeline=rahntech_totals_pipeline,
         empty_totals=empty_rahntech_totals,
-        all_tie_break=(("sales_date", -1), ("import_date", -1)),
-        upload_default_sort="sales_date",
+        all_tie_break=(("transaction_date", -1), ("import_date", -1)),
+        upload_default_sort="transaction_date",
         legacy_date_field="sales_date",
     ),
     "zambia-parking": LedgerHandler(
@@ -188,8 +195,8 @@ _HANDLERS: dict[str, LedgerHandler] = {
         uploads_pipeline=zambia_parking_uploads_pipeline,
         totals_pipeline=zambia_parking_totals_pipeline,
         empty_totals=empty_zambia_totals,
-        all_tie_break=(("date", -1), ("import_date", -1)),
-        upload_default_sort="row_index",
+        all_tie_break=(("transaction_date", -1), ("import_date", -1)),
+        upload_default_sort="transaction_date",
         legacy_date_field="date",
         finalize_totals=finalize_zambia_totals,
         supports_credit_only=True,
@@ -219,8 +226,8 @@ def _usd_handler(expense_type: str) -> LedgerHandler:
         uploads_pipeline=lambda: usd_ledger_uploads_pipeline(expense_type),
         totals_pipeline=usd_ledger_totals_pipeline,
         empty_totals=empty_usd_ledger_totals,
-        all_tie_break=(("date_str", -1), ("created_at", -1)),
-        upload_default_sort="row_index",
+        all_tie_break=(("expense_date", -1), ("created_at", -1)),
+        upload_default_sort="expense_date",
         legacy_date_field="date_str",
         finalize_totals=finalize_usd_ledger_totals,
         supports_money_filters=True,
@@ -339,7 +346,7 @@ def _all_query(
     if handler.supports_money_filters:
         kwargs["money_in_only"] = money_in_only
         kwargs["called_out_only"] = called_out_only
-    return handler.all_query(**kwargs)
+    return and_not_trashed(handler.all_query(**kwargs))
 
 
 def _parse_file_labels(raw: str | None) -> list[str]:
@@ -548,6 +555,93 @@ async def reupload_skipped_rows(
     return {"saved": saved}
 
 
+# --- Uploads Trash (static paths before /{feed}/...) --------------------------
+
+
+async def _collect_trashed_uploads(
+    request: Request,
+    *,
+    feed: str = "",
+    search: str = "",
+) -> list[dict[str, Any]]:
+    db = _database(request)
+    feed_filter = (feed or "").strip().lower()
+    rows: list[dict[str, Any]] = []
+
+    imported = await aggregate_list(
+        getattr(db, COLLECTION_IMPORTED),
+        trashed_uploads_pipeline(
+            disc_field="feed_type",
+            search=search,
+            feed_slug_filter=feed_filter,
+        ),
+        length=None,
+    )
+    rows.extend(
+        format_trashed_upload_row(row, disc_field="feed_type") for row in imported
+    )
+
+    separate = await aggregate_list(
+        getattr(db, COLLECTION_SEPARATE),
+        trashed_uploads_pipeline(
+            disc_field="expense_type",
+            search=search,
+            feed_slug_filter=feed_filter,
+        ),
+        length=None,
+    )
+    rows.extend(
+        format_trashed_upload_row(row, disc_field="expense_type") for row in separate
+    )
+
+    rows.sort(
+        key=lambda r: (
+            r.get("trashed_at") or datetime.min,
+            r.get("import_date") or datetime.min,
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+@feeds.get("/trash")
+async def list_trashed_uploads(
+    request: Request,
+    manager: Manager,
+    feed: str = Query(""),
+    search: str = Query(""),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    """Soft-deleted upload batches across imported + separate expense feeds."""
+    del manager
+    rows = await _collect_trashed_uploads(request, feed=feed, search=search)
+    total = len(rows)
+    page = rows[skip : skip + limit]
+    return json_safe(
+        {
+            "items": page,
+            "total": total,
+            "feeds": [
+                {"slug": slug, "label": label}
+                for slug, label in UPLOAD_TRASH_FEED_LABELS.items()
+            ],
+        }
+    )
+
+
+@feeds.get("/trash/count")
+async def count_trashed_uploads(
+    request: Request,
+    manager: Manager,
+    feed: str = Query(""),
+    search: str = Query(""),
+) -> dict[str, Any]:
+    del manager
+    rows = await _collect_trashed_uploads(request, feed=feed, search=search)
+    return {"count": len(rows)}
+
+
 # --- Records ------------------------------------------------------------------
 
 
@@ -735,15 +829,17 @@ async def feed_years(
         date_field = "expense_date"
     else:
         date_field = "transaction_date"
-    pipeline = [
-        {
-            "$match": {
-                spec.disc_field: spec.disc_value,
-                date_field: {"$exists": True, "$ne": None},
-            }
-        },
-        {"$group": {"_id": {"$year": f"${date_field}"}}},
-    ]
+    pipeline = inject_not_trashed_match(
+        [
+            {
+                "$match": {
+                    spec.disc_field: spec.disc_value,
+                    date_field: {"$exists": True, "$ne": None},
+                }
+            },
+            {"$group": {"_id": {"$year": f"${date_field}"}}},
+        ]
+    )
     years.update(
         years_from_transaction_dates(
             await aggregate_list(coll, pipeline, length=None)
@@ -752,13 +848,15 @@ async def feed_years(
     if not handler.years_on_import_date:
         legacy = await coll.distinct(
             handler.legacy_date_field,
-            {
-                spec.disc_field: spec.disc_value,
-                "$or": [
-                    {date_field: {"$exists": False}},
-                    {date_field: None},
-                ],
-            },
+            and_not_trashed(
+                {
+                    spec.disc_field: spec.disc_value,
+                    "$or": [
+                        {date_field: {"$exists": False}},
+                        {date_field: None},
+                    ],
+                }
+            ),
         )
         years.update(years_from_legacy_dates(legacy))
     return {"items": sorted(years, reverse=True)}
@@ -871,7 +969,7 @@ async def zambia_existing_sheet_labels(
     ]
     found = await _database(request).imported_feeds.distinct(
         "sheet_label",
-        {"feed_type": "zambia_parking", "$or": clauses},
+        and_not_trashed({"feed_type": "zambia_parking", "$or": clauses}),
     )
     found_upper = {norm_sheet_label(s) for s in found if s}
     return {
@@ -893,7 +991,9 @@ async def zambia_content_hash_matches(
         return {"matches": []}
     ids = await _database(request).imported_feeds.distinct(
         "upload_id",
-        {"feed_type": "zambia_parking", "content_hash": content_hash},
+        and_not_trashed(
+            {"feed_type": "zambia_parking", "content_hash": content_hash}
+        ),
     )
     matches = []
     for uid in ids:
@@ -918,7 +1018,7 @@ async def list_feed_uploads(
     handler = _handler(spec)
     rows = await aggregate_list(
         feed_collection(_database(request), spec),
-        handler.uploads_pipeline(),
+        inject_not_trashed_match(handler.uploads_pipeline()),
         length=None,
     )
     return json_safe(rows)
@@ -940,7 +1040,7 @@ async def list_upload_records(
     spec = _feed(feed)
     _require_uploads(spec)
     handler = _handler(spec)
-    query = handler.upload_query(upload_id, search)
+    query = and_not_trashed(handler.upload_query(upload_id, search))
     sort_clauses = ledger_sort_clauses(
         sort_field or handler.upload_default_sort,
         sort_asc,
@@ -970,7 +1070,7 @@ async def count_upload_records(
     spec = _feed(feed)
     _require_uploads(spec)
     handler = _handler(spec)
-    query = handler.upload_query(upload_id, search)
+    query = and_not_trashed(handler.upload_query(upload_id, search))
     count = await feed_collection(_database(request), spec).count_documents(query)
     return {"count": int(count)}
 
@@ -987,7 +1087,7 @@ async def upload_totals(
     spec = _feed(feed)
     _require_uploads(spec)
     handler = _handler(spec)
-    query = handler.upload_query(upload_id, search)
+    query = and_not_trashed(handler.upload_query(upload_id, search))
     result = await aggregate_list(
         feed_collection(_database(request), spec),
         handler.totals_pipeline(query),
@@ -1006,19 +1106,84 @@ async def delete_feed_upload(
     request: Request,
     manager: Manager,
 ) -> dict[str, Any]:
+    """Soft-delete an upload batch (moves to Uploads Trash)."""
     spec = _feed(feed)
     _require_uploads(spec)
     _handler(spec)  # ensure implemented
     uid = (upload_id or "").strip()
     if not uid:
         return {"deleted": 0}
+    now = utcnow()
+    actor_id = str(manager.get("_id") or manager.get("id") or "")
+    result = await feed_collection(_database(request), spec).update_many(
+        upload_match(spec, uid, trashed=False),
+        {
+            "$set": {
+                "trashed": True,
+                "trashed_at": now,
+                "trashed_by": actor_id or None,
+            }
+        },
+    )
+    deleted = int(result.modified_count or 0)
+    await _audit(
+        request,
+        action="feed.upload_trash",
+        actor=manager,
+        feed=spec.slug,
+        details={"upload_id": uid, "deleted": deleted},
+    )
+    return {"deleted": deleted, "trashed": True}
+
+
+@feeds.post("/{feed}/uploads/{upload_id}/restore")
+async def restore_feed_upload(
+    feed: str,
+    upload_id: str,
+    request: Request,
+    manager: Manager,
+) -> dict[str, Any]:
+    """Restore a soft-deleted upload from Uploads Trash."""
+    spec = _feed(feed)
+    _require_uploads(spec)
+    uid = (upload_id or "").strip()
+    if not uid:
+        return {"restored": 0}
+    result = await feed_collection(_database(request), spec).update_many(
+        upload_match(spec, uid, trashed=True),
+        {"$unset": {"trashed": "", "trashed_at": "", "trashed_by": ""}},
+    )
+    restored = int(result.modified_count or 0)
+    await _audit(
+        request,
+        action="feed.upload_restore",
+        actor=manager,
+        feed=spec.slug,
+        details={"upload_id": uid, "restored": restored},
+    )
+    return {"restored": restored}
+
+
+@feeds.delete("/{feed}/uploads/{upload_id}/purge")
+async def purge_feed_upload(
+    feed: str,
+    upload_id: str,
+    request: Request,
+    manager: Manager,
+) -> dict[str, Any]:
+    """Permanently delete a soft-deleted upload (Trash only)."""
+    spec = _feed(feed)
+    _require_uploads(spec)
+    uid = (upload_id or "").strip()
+    if not uid:
+        return {"deleted": 0}
     result = await feed_collection(_database(request), spec).delete_many(
-        {spec.disc_field: spec.disc_value, "upload_id": uid}
+        upload_match(spec, uid, trashed=True)
     )
     deleted = int(result.deleted_count or 0)
     await _audit(
         request,
-        action="feed.upload_delete",
+        action="feed.upload_purge",
         actor=manager,
         feed=spec.slug,
         details={"upload_id": uid, "deleted": deleted},
@@ -1045,7 +1210,7 @@ async def list_file_labels(
         )
     docs = await aggregate_list(
         feed_collection(_database(request), spec),
-        diesel_file_labels_pipeline(spec.disc_value),
+        inject_not_trashed_match(diesel_file_labels_pipeline(spec.disc_value)),
         length=None,
     )
     labels = unique_diesel_file_labels(str(d.get("_id") or "") for d in docs)
@@ -1075,7 +1240,9 @@ async def diesel_duplicate_check(
     if content_hash:
         ids = await coll.distinct(
             "upload_id",
-            {"feed_type": spec.disc_value, "content_hash": content_hash},
+            and_not_trashed(
+                {"feed_type": spec.disc_value, "content_hash": content_hash}
+            ),
         )
         for uid in ids:
             key = str(uid or "").strip()
@@ -1087,7 +1254,7 @@ async def diesel_duplicate_check(
         spec.disc_value, body.source_filename, body.sheet_label
     )
     if fname_q:
-        ids = await coll.distinct("upload_id", fname_q)
+        ids = await coll.distinct("upload_id", and_not_trashed(fname_q))
         seen = {m["upload_id"] for m in matches}
         for uid in ids:
             key = str(uid or "").strip()
@@ -1166,7 +1333,7 @@ async def existing_sheet_labels(
     ]
     found = await feed_collection(_database(request), spec).distinct(
         "sheet_label",
-        {spec.disc_field: spec.disc_value, "$or": clauses},
+        and_not_trashed({spec.disc_field: spec.disc_value, "$or": clauses}),
     )
     found_upper = {norm_sheet_label(s) for s in found if s}
     return {

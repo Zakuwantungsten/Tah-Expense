@@ -68,6 +68,51 @@ def test_ledger_sort_uses_truck_sort_key() -> None:
     assert clauses[1] == ("vehicle_reg", 1)
 
 
+def test_ledger_sort_remaps_payment_date_to_transaction_date() -> None:
+    """payment_date is a display string; chronological sort must use datetime."""
+    clauses = ledger_sort_clauses(
+        "payment_date",
+        True,
+        frozenset({"payment_date", "transaction_date"}),
+        default="transaction_date",
+    )
+    assert clauses[0] == ("transaction_date", 1)
+
+
+def test_ledger_sort_remaps_display_date_fields() -> None:
+    allowed = frozenset(
+        {"toll_date", "sales_date", "date", "date_str", "transaction_date", "expense_date"}
+    )
+    assert ledger_sort_clauses("toll_date", False, allowed, default="transaction_date")[0] == (
+        "transaction_date",
+        -1,
+    )
+    assert ledger_sort_clauses("sales_date", True, allowed, default="transaction_date")[0] == (
+        "transaction_date",
+        1,
+    )
+    assert ledger_sort_clauses("date", True, allowed, default="transaction_date")[0] == (
+        "transaction_date",
+        1,
+    )
+    assert ledger_sort_clauses("date_str", False, allowed, default="expense_date")[0] == (
+        "expense_date",
+        -1,
+    )
+
+
+def test_and_not_trashed_wraps_query() -> None:
+    from app.feed_ops import and_not_trashed, not_trashed_clause
+
+    assert and_not_trashed({}) == not_trashed_clause()
+    wrapped = and_not_trashed({"feed_type": "toll_plaza"})
+    assert wrapped == {
+        "$and": [{"feed_type": "toll_plaza"}, {"trashed": {"$ne": True}}]
+    }
+    already = {"trashed": {"$ne": True}, "feed_type": "x"}
+    assert and_not_trashed(already) is already or and_not_trashed(already) == already
+
+
 def test_prepare_toll_doc_normalizes_date() -> None:
     now = datetime(2026, 10, 9, 12, 0, 0)
     doc = prepare_imported_feed_doc(

@@ -157,6 +157,7 @@ async def _imported_feed_rows(
                 {
                     "feed_type": "zambia_parking",
                     "plate_num": truck_exact_clause(truck),
+                    "trashed": {"$ne": True},
                 },
                 "transaction_date",
                 date_from,

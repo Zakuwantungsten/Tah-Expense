@@ -78,7 +78,11 @@ def imported_feed_overview_query(
     date_to: datetime | None = None,
 ) -> dict[str, Any]:
     return with_date_range(
-        {"feed_type": feed_type, truck_field: truck_exact_clause(truck)},
+        {
+            "feed_type": feed_type,
+            truck_field: truck_exact_clause(truck),
+            "trashed": {"$ne": True},
+        },
         "transaction_date",
         date_from,
         date_to,

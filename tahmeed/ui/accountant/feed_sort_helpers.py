@@ -14,7 +14,8 @@ from tahmeed.ui.widgets.sortable_ledger_header import (
 
 # Toll Plaza detail / all entries
 TOLL_DETAIL_SORT: List[ColumnSpec] = [
-    ("TOLL DATE", "toll_date", "date"),
+    # Sort on transaction_date (real datetime); toll_date is a display string.
+    ("TOLL DATE", "transaction_date", "date"),
     ("TOLL PLAZA", "toll_plaza", "text"),
     ("CLIENT NAME", "client_name", "text"),
     ("CARD NO", "card_no", "text"),
@@ -30,7 +31,9 @@ TOLL_DETAIL_SORT: List[ColumnSpec] = [
 PARKING_CONGO_DETAIL_SORT: List[ColumnSpec] = [
     ("#", "sn", "number"),
     ("LEDGER ID", "ledger_id", "text"),
-    ("PAYMENT DATE", "payment_date", "date"),
+    # Sort on transaction_date (real datetime). payment_date is a "%d %b %Y"
+    # display string — Mongo string-sorts it by day-of-month first.
+    ("PAYMENT DATE", "transaction_date", "date"),
     ("TYPE", "transaction_type", "text"),
     ("AMOUNT", "amount", "number"),
     ("RUNNING BAL", "running_balance", "number"),
@@ -59,7 +62,8 @@ CONGO_SORT: List[ColumnSpec] = [
 ]
 
 ZAMBIA_PARKING_SORT: List[ColumnSpec] = [
-    ("DATE", "date", "date"),
+    # Sort on transaction_date (real datetime); date is a "%d %b %Y" string.
+    ("DATE", "transaction_date", "date"),
     ("TYPE", "transaction_type", "text"),
     ("PLATE NUM.", "plate_num", "truck"),
     ("TICKET NO.", "ticket_no", "text"),
@@ -84,7 +88,8 @@ AFRITRACK_DETAIL_SORT: List[ColumnSpec] = [
 
 RAHNTECH_SORT: List[ColumnSpec] = [
     ("S/N", None, "text"),
-    ("SALES DATE", "sales_date", "date"),
+    # Sort on transaction_date (real datetime); sales_date is a display string.
+    ("SALES DATE", "transaction_date", "date"),
     ("TRIP NUMBER", "trip_number", "text"),
     ("DEVICE NUMBER", "device_number", "text"),
     ("TRUCK NUMBER", "truck_number", "truck"),

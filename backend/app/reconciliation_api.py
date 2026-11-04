@@ -256,9 +256,14 @@ async def available_years(
         years_t1_pipeline(table, station),
         years_import_pipeline(table, station),
     ):
-        for doc in await aggregate_list(db.reconciliation_entries, pipeline, 
-            length=None
-        ):
+        try:
+            docs = await aggregate_list(
+                db.reconciliation_entries, pipeline, length=None
+            )
+        except Exception:
+            # Mixed/legacy date types must not 500 the whole years endpoint.
+            continue
+        for doc in docs:
             yr = doc.get("_id")
             if isinstance(yr, int) and 1990 <= yr <= 2100:
                 years.add(yr)

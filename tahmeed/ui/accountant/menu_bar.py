@@ -295,6 +295,8 @@ class AccountantMenuBar(QMenuBar):
             ("&RahnTech", "rahntech"),
         ]:
             self._add(expenses, label, lambda k=key: self._nav(k))
+        expenses.addSeparator()
+        self._add(expenses, "Uploads &Trash", lambda: self._nav("feeds_trash"))
         burhani = expenses.addMenu("&SM Burhani")
         self._add(
             burhani,
@@ -359,6 +361,8 @@ class AccountantMenuBar(QMenuBar):
         ]
         for label, key in entries:
             self._add(m, label, lambda k=key: self._nav(k))
+        m.addSeparator()
+        self._add(m, "Uploads &Trash", lambda: self._nav("feeds_trash"))
         m.addSeparator()
         burhani = m.addMenu("&SM Burhani")
         self._add(

@@ -76,7 +76,15 @@ def unique_stations_in_order(slugs: Any) -> list[str]:
 
 
 def safe_double(field: str) -> dict[str, Any]:
-    return {"$ifNull": [f"${field}", 0.0]}
+    """Coerce numeric fields for `$sum` — Excel imports often leave strings."""
+    return {
+        "$convert": {
+            "input": f"${field}",
+            "to": "double",
+            "onError": 0.0,
+            "onNull": 0.0,
+        }
+    }
 
 
 def _plate_flex_body(compact: str) -> str:
@@ -245,10 +253,11 @@ def uploads_pipeline(table: str) -> list[dict[str, Any]]:
 
 
 def years_t1_pipeline(table: str, station: str = "") -> list[dict[str, Any]]:
+    # `$year` only accepts BSON dates — string leftovers from Excel must be skipped.
     query: dict[str, Any] = {
         "entity": ENTITY,
         "table": table,
-        "t1_date": {"$exists": True, "$ne": None},
+        "t1_date": {"$type": "date"},
     }
     station = station_query_value(station)
     if station:
@@ -263,7 +272,7 @@ def years_import_pipeline(table: str, station: str = "") -> list[dict[str, Any]]
     query: dict[str, Any] = {
         "entity": ENTITY,
         "table": table,
-        "import_date": {"$exists": True, "$ne": None},
+        "import_date": {"$type": "date"},
     }
     station = station_query_value(station)
     if station:
