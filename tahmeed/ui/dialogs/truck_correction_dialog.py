@@ -4,8 +4,10 @@ All flagged trucks appear in one combined list. As each row is fixed,
 accepted as a place label (YARD/GARAGE), or cleared, it disappears from
 the list. When the list is empty the dialog closes automatically.
 
-Applying a correction can also fix every other open row with the same
-pasted value (e.g. many ``T760 DN`` → ``T760 HDN``).
+Applying a correction can also fix every other open row — and held
+later-page issues — with the same pasted value (e.g. many ``T760 DN``
+→ ``T760 HDN``). Apply all commits every open card that already has a
+valid fleet (or known place-label) correction typed in.
 """
 
 from __future__ import annotations
@@ -433,6 +435,16 @@ class TruckCorrectionDialog(QDialog):
         allow_all.setToolTip("Allow every remaining row even if not in the fleet")
         allow_all.clicked.connect(self._allow_all_remaining)
         footer.addWidget(allow_all)
+        apply_all = QPushButton("Apply all")
+        apply_all.setCursor(Qt.PointingHandCursor)
+        apply_all.setFixedHeight(_CTRL_H)
+        apply_all.setStyleSheet(_BTN_BLUE)
+        apply_all.setToolTip(
+            "Apply every open row that already has a valid fleet truck "
+            "or known place label typed in (skip the rest)"
+        )
+        apply_all.clicked.connect(self._apply_all_ready)
+        footer.addWidget(apply_all)
         footer.addStretch()
         cancel_btn = QPushButton("Park remaining" if self._allow_park else "Cancel")
         cancel_btn.setCursor(Qt.PointingHandCursor)
@@ -907,32 +919,56 @@ class TruckCorrectionDialog(QDialog):
             if other is not rw and _norm_key(self._edit_source_for_issue(other.issue)) == key
         ]
 
+    def _similar_held_issues(self, rw: _RowWidgets) -> List[TruckIssue]:
+        """Held (later-page) issues with the same pasted value as ``rw``."""
+        key = _norm_key(self._edit_source_for_issue(rw.issue))
+        if not key:
+            return []
+        return [
+            issue
+            for issue in self._held_issues
+            if _norm_key(self._edit_source_for_issue(issue)) == key
+        ]
+
     def _confirm_apply_similar(
         self,
         rw: _RowWidgets,
         corrected: str,
         *,
         action: str = "apply",
-    ) -> List[_RowWidgets]:
-        """Ask whether to fix other open rows with the same pasted value."""
+    ) -> tuple[List[_RowWidgets], List[TruckIssue]]:
+        """Ask whether to fix other open + held rows with the same pasted value."""
         similar = self._similar_open_rows(rw)
-        if not similar:
-            return []
+        held = self._similar_held_issues(rw)
+        total = len(similar) + len(held)
+        if total == 0:
+            return [], []
         original = rw.issue.original
         verb = {
             "apply": "Apply",
             "allow": "Allow",
             "add": "Add / apply",
         }.get(action, "Apply")
+        held_note = (
+            f" ({len(held):,} still on later pages)"
+            if held and similar
+            else (
+                f" on later pages"
+                if held and not similar
+                else ""
+            )
+        )
         reply = show_question(
             self,
             "Similar trucks",
-            f'{verb} "{corrected}" to this row and {len(similar)} other '
-            f'row(s) with the same pasted value "{original}"?\n\n'
+            f'{verb} "{corrected}" to this row and {total} other '
+            f'row(s) with the same pasted value "{original}"{held_note}?\n\n'
             "Choose No to fix only this row.",
             default_no=False,
         )
-        return similar if reply == QMessageBox.Yes else []
+        if reply == QMessageBox.Yes:
+            return similar, held
+        return [], []
 
     def _resolve_issue(
         self,
@@ -1383,8 +1419,10 @@ class TruckCorrectionDialog(QDialog):
         if err is not None:
             return
         merged = "/".join(parts or [])
-        also = self._confirm_apply_similar(rw, merged, action="add")
-        self._finish_resolved(rw, corrected=merged, also=also)
+        also, also_held = self._confirm_apply_similar(rw, merged, action="add")
+        self._finish_resolved(
+            rw, corrected=merged, also=also, also_held=also_held
+        )
 
     # ── Resolve one row → remove from list ────────────────────────────────
 
@@ -1437,6 +1475,33 @@ class TruckCorrectionDialog(QDialog):
             self._notify_resolved(issue)
         self._held_issues.clear()
 
+    def _resolve_held_similar(
+        self,
+        issue: TruckIssue,
+        *,
+        corrected: str,
+        skip: bool = False,
+        omit_row: bool = False,
+        allow_anyway: bool = False,
+        is_place_label: bool = False,
+    ) -> None:
+        """Resolve one held (not-yet-rendered) issue with the same correction."""
+        if issue not in self._held_issues:
+            return
+        self._held_issues.remove(issue)
+        self._resolve_issue(
+            issue,
+            corrected=self._with_combo_suffix(
+                issue, corrected, is_place_label=is_place_label
+            ),
+            skip=skip,
+            omit_row=omit_row,
+            allow_anyway=allow_anyway,
+            is_place_label=is_place_label,
+        )
+        self.issues.append(issue)
+        self._notify_resolved(issue)
+
     def _finish_resolved(
         self,
         rw: _RowWidgets,
@@ -1447,30 +1512,22 @@ class TruckCorrectionDialog(QDialog):
         allow_anyway: bool = False,
         is_place_label: bool = False,
         also: Optional[List[_RowWidgets]] = None,
+        also_held: Optional[List[TruckIssue]] = None,
     ) -> None:
-        """Resolve ``rw`` and optionally the similar rows in ``also``."""
-        self._remove_row(
-            rw,
-            self._resolve_issue(
-                rw.issue,
-                corrected=self._with_combo_suffix(
-                    rw.issue, corrected, is_place_label=is_place_label
-                ),
-                skip=skip,
-                omit_row=omit_row,
-                allow_anyway=allow_anyway,
-                is_place_label=is_place_label,
-            ),
-        )
-        for other in list(also or []):
-            if other not in self._rows:
-                continue
+        """Resolve ``rw`` and optionally similar open cards / held issues."""
+        also = [other for other in (also or []) if other in self._rows and other is not rw]
+        also_held = list(also_held or [])
+        batch = bool(also or also_held)
+        nested_defer = self._defer_page
+        if batch and not nested_defer:
+            self._defer_page = True
+        try:
             self._remove_row(
-                other,
+                rw,
                 self._resolve_issue(
-                    other.issue,
+                    rw.issue,
                     corrected=self._with_combo_suffix(
-                        other.issue, corrected, is_place_label=is_place_label
+                        rw.issue, corrected, is_place_label=is_place_label
                     ),
                     skip=skip,
                     omit_row=omit_row,
@@ -1478,6 +1535,40 @@ class TruckCorrectionDialog(QDialog):
                     is_place_label=is_place_label,
                 ),
             )
+            for other in also:
+                if other not in self._rows:
+                    continue
+                self._remove_row(
+                    other,
+                    self._resolve_issue(
+                        other.issue,
+                        corrected=self._with_combo_suffix(
+                            other.issue, corrected, is_place_label=is_place_label
+                        ),
+                        skip=skip,
+                        omit_row=omit_row,
+                        allow_anyway=allow_anyway,
+                        is_place_label=is_place_label,
+                    ),
+                )
+            for issue in also_held:
+                self._resolve_held_similar(
+                    issue,
+                    corrected=corrected,
+                    skip=skip,
+                    omit_row=omit_row,
+                    allow_anyway=allow_anyway,
+                    is_place_label=is_place_label,
+                )
+        finally:
+            if batch and not nested_defer:
+                self._defer_page = False
+        if batch and not nested_defer:
+            self._update_count()
+            if not self._rows:
+                if self._show_next_issue_page():
+                    return
+                self.accept()
 
     def _clear_row(self, rw: _RowWidgets) -> None:
         issue = rw.issue
@@ -1566,16 +1657,17 @@ class TruckCorrectionDialog(QDialog):
                     note="The value will be kept on this row as a partner / non-fleet truck.",
                 ):
                     return
-            also = (
+            also, also_held = (
                 self._confirm_apply_similar(rw, text, action="allow")
                 if ask_similar
-                else []
+                else ([], [])
             )
             self._finish_resolved(
                 rw,
                 corrected=text,
                 allow_anyway=bool(unmatched),
                 also=also,
+                also_held=also_held,
             )
             return
 
@@ -1596,16 +1688,17 @@ class TruckCorrectionDialog(QDialog):
 
         # Place labels are not fleet vehicles — allow without registry check
         if is_place or is_allowed_place_label(value, self._allowed_labels):
-            also = (
+            also, also_held = (
                 self._confirm_apply_similar(rw, value, action="allow")
                 if ask_similar
-                else []
+                else ([], [])
             )
             self._finish_resolved(
                 rw,
                 corrected=normalize_place_label(value),
                 is_place_label=True,
                 also=also,
+                also_held=also_held,
             )
             return
 
@@ -1613,13 +1706,15 @@ class TruckCorrectionDialog(QDialog):
         if matched is not None and not self._is_two_trailer_issue(rw.issue):
             rw.edit.setText(matched)
             self._refresh_status_badge(rw)
-            also = (
+            also, also_held = (
                 self._confirm_apply_similar(rw, matched, action="apply")
                 if ask_similar
-                else []
+                else ([], [])
             )
             # In registry — treat as a normal apply, not an override
-            self._finish_resolved(rw, corrected=matched, also=also)
+            self._finish_resolved(
+                rw, corrected=matched, also=also, also_held=also_held
+            )
             return
 
         if matched is not None:
@@ -1657,16 +1752,17 @@ class TruckCorrectionDialog(QDialog):
                 rw.edit.setFocus()
                 return
 
-        also = (
+        also, also_held = (
             self._confirm_apply_similar(rw, value, action="allow")
             if ask_similar
-            else []
+            else ([], [])
         )
         self._finish_resolved(
             rw,
             corrected=value,
             allow_anyway=True,
             also=also,
+            also_held=also_held,
         )
 
     def _skip_all_remaining(self) -> None:
@@ -1861,12 +1957,13 @@ class TruckCorrectionDialog(QDialog):
         if text not in self._allowed_labels:
             self._allowed_labels.add(text)
             self.new_labels.append(text)
-        also = self._confirm_apply_similar(rw, text, action="apply")
+        also, also_held = self._confirm_apply_similar(rw, text, action="apply")
         self._finish_resolved(
             rw,
             corrected=text,
             is_place_label=True,
             also=also,
+            also_held=also_held,
         )
 
     def _apply_combo_row(self, rw: _RowWidgets) -> None:
@@ -1883,8 +1980,10 @@ class TruckCorrectionDialog(QDialog):
             show_warning(self, "Truck / trailer", err)
             return
         merged = "/".join(parts or [])
-        also = self._confirm_apply_similar(rw, merged, action="apply")
-        self._finish_resolved(rw, corrected=merged, also=also)
+        also, also_held = self._confirm_apply_similar(rw, merged, action="apply")
+        self._finish_resolved(
+            rw, corrected=merged, also=also, also_held=also_held
+        )
 
     def _apply_row(self, rw: _RowWidgets) -> None:
         if rw.part_edits:
@@ -1913,17 +2012,27 @@ class TruckCorrectionDialog(QDialog):
 
         if is_allowed_place_label(text, self._allowed_labels):
             value = normalize_place_label(text)
-            also = self._confirm_apply_similar(rw, value, action="apply")
+            also, also_held = self._confirm_apply_similar(rw, value, action="apply")
             self._finish_resolved(
-                rw, corrected=value, is_place_label=True, also=also,
+                rw,
+                corrected=value,
+                is_place_label=True,
+                also=also,
+                also_held=also_held,
             )
             return
 
         norm = normalize_truck_number(text, allowed_labels=self._allowed_labels)
         if norm.status == "place_label":
-            also = self._confirm_apply_similar(rw, norm.value, action="apply")
+            also, also_held = self._confirm_apply_similar(
+                rw, norm.value, action="apply"
+            )
             self._finish_resolved(
-                rw, corrected=norm.value, is_place_label=True, also=also,
+                rw,
+                corrected=norm.value,
+                is_place_label=True,
+                also=also,
+                also_held=also_held,
             )
             return
 
@@ -1965,8 +2074,10 @@ class TruckCorrectionDialog(QDialog):
             rw.edit.setFocus()
             return
 
-        also = self._confirm_apply_similar(rw, matched, action="apply")
-        self._finish_resolved(rw, corrected=matched, also=also)
+        also, also_held = self._confirm_apply_similar(rw, matched, action="apply")
+        self._finish_resolved(
+            rw, corrected=matched, also=also, also_held=also_held
+        )
 
     def _ask_registry_kind(self, number: str) -> Optional[str]:
         """Ask which fleet collection to use. Returns collection path or None."""
@@ -2093,8 +2204,79 @@ class TruckCorrectionDialog(QDialog):
         self._refresh_kind_label(rw)
         if self._is_two_trailer_issue(rw.issue):
             return
-        also = self._confirm_apply_similar(rw, number, action="add")
-        self._finish_resolved(rw, corrected=number, also=also)
+        also, also_held = self._confirm_apply_similar(rw, number, action="add")
+        self._finish_resolved(
+            rw, corrected=number, also=also, also_held=also_held
+        )
+
+    def _ready_apply_plan(
+        self, rw: _RowWidgets
+    ) -> Optional[tuple[str, bool]]:
+        """Return ``(corrected, is_place_label)`` when the card can Apply cleanly."""
+        if rw.part_edits:
+            parts, err = self._combo_resolved_parts(rw)
+            if err is None and parts:
+                return "/".join(parts), False
+            return None
+        text = rw.edit.text().strip()
+        if not text or self._is_two_trailer_issue(rw.issue):
+            return None
+        if is_allowed_place_label(text, self._allowed_labels):
+            return normalize_place_label(text), True
+        norm = normalize_truck_number(text, allowed_labels=self._allowed_labels)
+        if norm.status == "place_label":
+            return norm.value, True
+        if norm.status not in ("ok", "normalized"):
+            return None
+        matched = try_match_fleet(norm.value, self._fleet)
+        if matched is None:
+            return None
+        return matched, False
+
+    def _apply_all_ready(self) -> None:
+        """Apply every open card that already has a valid typed correction."""
+        plans = [
+            (rw, plan)
+            for rw in self._rows
+            if (plan := self._ready_apply_plan(rw)) is not None
+        ]
+        if not plans:
+            show_info(
+                self,
+                "Apply all",
+                "No rows are ready to apply yet.\n\n"
+                "Type a valid fleet truck (or a known place label like YARD) "
+                "on the rows you want, then click Apply all.",
+            )
+            return
+
+        n = len(plans)
+        plural = "s" if n != 1 else ""
+
+        def _work() -> None:
+            self._defer_page = True
+            try:
+                for i, (rw, plan) in enumerate(list(plans)):
+                    if rw not in self._rows:
+                        continue
+                    corrected, is_place = plan
+                    self._finish_resolved(
+                        rw,
+                        corrected=corrected,
+                        is_place_label=is_place,
+                    )
+                    if i == 0 or (i + 1) % 8 == 0 or i + 1 == n:
+                        self._pump_busy()
+            finally:
+                self._defer_page = False
+            self._update_count()
+            if not self._rows:
+                if self._show_next_issue_page():
+                    return
+                if self.isVisible():
+                    self.accept()
+
+        self._run_bulk_busy(f"Applying {n} truck{plural}…", _work)
 
     # ── Dialog close ──────────────────────────────────────────────────────
 

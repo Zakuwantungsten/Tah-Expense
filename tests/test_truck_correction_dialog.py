@@ -244,7 +244,7 @@ def test_allow_anyway_accept_resolves_override(qapp, monkeypatch) -> None:
         fleet=set(),
     )
     monkeypatch.setattr(dlg, "_confirm_allow", lambda **_kw: True)
-    monkeypatch.setattr(dlg, "_confirm_apply_similar", lambda *_a, **_k: [])
+    monkeypatch.setattr(dlg, "_confirm_apply_similar", lambda *_a, **_k: ([], []))
     rw = dlg._rows[0]
     dlg._allow_anyway_row(rw)
     assert dlg._rows == []
@@ -261,7 +261,7 @@ def test_allow_clears_stale_parked_flag(qapp, monkeypatch) -> None:
     issue.parked = True
     dlg = TruckCorrectionDialog([issue], fleet=set())
     monkeypatch.setattr(dlg, "_confirm_allow", lambda **_kw: True)
-    monkeypatch.setattr(dlg, "_confirm_apply_similar", lambda *_a, **_k: [])
+    monkeypatch.setattr(dlg, "_confirm_apply_similar", lambda *_a, **_k: ([], []))
     dlg._allow_anyway_row(dlg._rows[0])
     assert dlg.issues[0].parked is False
     assert dlg.issues[0].allow_anyway is True
@@ -509,4 +509,102 @@ def test_dialog_shows_one_page_of_cards(qapp) -> None:
     assert rw.allow_btn is not None and rw.allow_btn.text() == "Allow"
     assert rw.skip_row_btn is not None and rw.skip_row_btn.text() == "Park"
     assert rw.status_badge.text()
+    dlg.close()
+
+
+def test_similar_held_issues_match_same_pasted_value(qapp) -> None:
+    issues = [
+        TruckIssue(row=0, original="T760 DN", kind="invalid_format"),
+        *[
+            TruckIssue(row=i, original=f"T{i} ZZZ", kind="not_in_registry")
+            for i in range(1, 100)
+        ],
+        TruckIssue(row=100, original="T760  dn", kind="invalid_format"),
+        TruckIssue(row=101, original="T761 DN", kind="invalid_format"),
+    ]
+    dlg = TruckCorrectionDialog(
+        issues,
+        fleet={"T760 HDN"},
+        fleet_kinds={"T760 HDN": "truck"},
+    )
+    assert len(dlg._rows) == dlg._issue_page
+    assert len(dlg._held_issues) == 2
+    first = dlg._rows[0]
+    held = dlg._similar_held_issues(first)
+    assert len(held) == 1
+    assert held[0].row == 100
+    dlg.close()
+
+
+def test_apply_similar_resolves_held_pages(qapp, monkeypatch) -> None:
+    issues = [
+        TruckIssue(row=0, original="T760 DN", kind="invalid_format"),
+        *[
+            TruckIssue(row=i, original=f"T{i} ZZZ", kind="not_in_registry")
+            for i in range(1, 100)
+        ],
+        TruckIssue(row=100, original="T760 DN", kind="invalid_format"),
+        TruckIssue(row=101, original="T761 DN", kind="invalid_format"),
+    ]
+    dlg = TruckCorrectionDialog(
+        issues,
+        fleet={"T760 HDN"},
+        fleet_kinds={"T760 HDN": "truck"},
+    )
+    monkeypatch.setattr(
+        dlg,
+        "_confirm_apply_similar",
+        lambda rw, corrected, action="apply": (
+            dlg._similar_open_rows(rw),
+            dlg._similar_held_issues(rw),
+        ),
+    )
+    rw = dlg._rows[0]
+    rw.edit.setText("T760 HDN")
+    dlg._apply_row(rw)
+    assert all(issue.row != 0 for issue in [r.issue for r in dlg._rows])
+    assert all(issue.row != 100 for issue in dlg._held_issues)
+    fixed = [i for i in dlg.issues if i.corrected == "T760 HDN"]
+    assert {i.row for i in fixed} == {0, 100}
+    assert any(i.row == 101 for i in dlg._held_issues)
+    dlg.close()
+
+
+def test_apply_all_button_exists_after_allow_all(qapp) -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    dlg = TruckCorrectionDialog(
+        [TruckIssue(row=0, original="T999 ZZZ", kind="not_in_registry")],
+        fleet=set(),
+    )
+    labels = [
+        (b.text() or "").replace("&", "")
+        for b in dlg.findChildren(QPushButton)
+        if b.isVisibleTo(dlg)
+    ]
+    assert "Allow all" in labels
+    assert "Apply all" in labels
+    assert labels.index("Apply all") > labels.index("Allow all")
+    dlg.close()
+
+
+def test_apply_all_ready_applies_typed_fleet_matches(qapp, monkeypatch) -> None:
+    dlg = TruckCorrectionDialog(
+        [
+            TruckIssue(row=0, original="T760 DN", kind="invalid_format"),
+            TruckIssue(row=1, original="T999 ZZZ", kind="not_in_registry"),
+            TruckIssue(row=2, original="T100 BAD", kind="invalid_format"),
+        ],
+        fleet={"T760 HDN", "T100 ABC"},
+        fleet_kinds={"T760 HDN": "truck", "T100 ABC": "truck"},
+    )
+    monkeypatch.setattr(dlg, "_confirm_apply_similar", lambda *_a, **_k: ([], []))
+    dlg._rows[0].edit.setText("T760 HDN")
+    dlg._rows[2].edit.setText("T100 ABC")
+    # Leave row 1 as a non-fleet value — Apply all should skip it.
+    dlg._apply_all_ready()
+    assert len(dlg._rows) == 1
+    assert dlg._rows[0].issue.row == 1
+    assert {i.row for i in dlg.issues} == {0, 2}
+    assert {i.corrected for i in dlg.issues} == {"T760 HDN", "T100 ABC"}
     dlg.close()
