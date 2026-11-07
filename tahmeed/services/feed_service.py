@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence, TypeVar
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, TypeVar, Union
 
 import httpx
 
@@ -291,12 +291,28 @@ async def existing_keys(slug: str, keys: Sequence[str]) -> set:
     return found
 
 
-async def import_rows(slug: str, rows: Sequence[dict]) -> int:
-    """POST import rows in chunks (schema max 20k; large files need many posts)."""
+async def import_rows(
+    slug: str,
+    rows: Sequence[dict],
+    *,
+    progress: Optional[
+        Callable[[int, int], Union[None, Awaitable[None]]]
+    ] = None,
+) -> int:
+    """POST import rows in chunks (schema max 20k; large files need many posts).
+
+    Optional ``progress(done, total)`` is called after each chunk (sync or async).
+    """
     if not rows:
         return 0
     inserted = 0
     row_list = list(rows)
+    total = len(row_list)
+    done = 0
+    if progress is not None:
+        maybe = progress(0, total)
+        if maybe is not None:
+            await maybe
     for chunk in _chunks(row_list, _IMPORT_CHUNK):
         payload = await api_client.request(
             "POST",
@@ -305,6 +321,11 @@ async def import_rows(slug: str, rows: Sequence[dict]) -> int:
             timeout=_IMPORT_TIMEOUT,
         )
         inserted += int((payload or {}).get("inserted") or 0)
+        done += len(chunk)
+        if progress is not None:
+            maybe = progress(min(done, total), total)
+            if maybe is not None:
+                await maybe
     return inserted
 
 
@@ -353,13 +374,19 @@ async def get_existing_feed_keys(
     return await existing_keys(feed_slug(feed_type), keys)
 
 
-async def save_imported_feed(records: list) -> int:
+async def save_imported_feed(
+    records: list,
+    *,
+    progress: Optional[
+        Callable[[int, int], Union[None, Awaitable[None]]]
+    ] = None,
+) -> int:
     if not records:
         return 0
     feed_type = str(records[0].get("feed_type") or "").strip()
     if not feed_type:
         raise ValueError("Imported feed rows require feed_type")
-    return await import_rows(feed_slug(feed_type), records)
+    return await import_rows(feed_slug(feed_type), records, progress=progress)
 
 
 async def get_toll_plaza_all_records(
@@ -1099,8 +1126,14 @@ async def kimvi_existing_sheet_labels(labels: List[str]) -> set:
     return await sheet_labels("kimvi", labels)
 
 
-async def save_kimvi_import(records: list) -> int:
-    return await import_rows("kimvi", records)
+async def save_kimvi_import(
+    records: list,
+    *,
+    progress: Optional[
+        Callable[[int, int], Union[None, Awaitable[None]]]
+    ] = None,
+) -> int:
+    return await import_rows("kimvi", records, progress=progress)
 
 
 async def get_kimvi_uploads() -> list:
@@ -1218,8 +1251,14 @@ async def congo_existing_sheet_labels(labels: List[str]) -> set:
     return await sheet_labels("congo", labels)
 
 
-async def save_congo_import(records: list) -> int:
-    return await import_rows("congo", records)
+async def save_congo_import(
+    records: list,
+    *,
+    progress: Optional[
+        Callable[[int, int], Union[None, Awaitable[None]]]
+    ] = None,
+) -> int:
+    return await import_rows("congo", records, progress=progress)
 
 
 async def get_congo_uploads() -> list:

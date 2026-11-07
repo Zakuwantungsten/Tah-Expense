@@ -13,7 +13,13 @@ from tahmeed.ui.widgets.brand_loader import BrandLoaderPanel
 class LoadingOverlay(QFrame):
     """Covers ``parent`` while async work is in progress."""
 
-    def __init__(self, parent: QWidget, message: str = "Loading…") -> None:
+    def __init__(
+        self,
+        parent: QWidget,
+        message: str = "Loading…",
+        *,
+        show_progress: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("loadingOverlay")
         # Must remain an embedded child — never a top-level HWND flash.
@@ -32,8 +38,10 @@ class LoadingOverlay(QFrame):
         layout.setAlignment(Qt.AlignCenter)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Horse + message only — no progress bar on tab/page overlays.
-        self._panel = BrandLoaderPanel(self, message, mark_width=160, show_progress=False)
+        # Tab/page overlays stay message-only; import dialogs pass show_progress=True.
+        self._panel = BrandLoaderPanel(
+            self, message, mark_width=160, show_progress=show_progress
+        )
         layout.addWidget(self._panel, alignment=Qt.AlignCenter)
 
         parent.installEventFilter(self)

@@ -3755,9 +3755,9 @@ def _uppercase_import_text(doc: dict) -> None:
             doc[key] = val.upper()
 
 
-async def save_imported_feed(records: list) -> int:
+async def save_imported_feed(records: list, *, progress=None) -> int:
     from tahmeed.services import feed_service as _feeds
-    return await _feeds.save_imported_feed(records=records)
+    return await _feeds.save_imported_feed(records=records, progress=progress)
 
 
 async def get_toll_plaza_uploads() -> list:
@@ -4633,9 +4633,9 @@ async def kimvi_existing_sheet_labels(labels: List[str]) -> set:
     return await _feeds.kimvi_existing_sheet_labels(labels=labels)
 
 
-async def save_kimvi_import(records: list) -> int:
+async def save_kimvi_import(records: list, *, progress=None) -> int:
     from tahmeed.services import feed_service as _feeds
-    return await _feeds.save_kimvi_import(records=records)
+    return await _feeds.save_kimvi_import(records=records, progress=progress)
 
 
 async def get_kimvi_uploads() -> list:
@@ -4792,9 +4792,9 @@ async def congo_existing_sheet_labels(labels: List[str]) -> set:
     return await _feeds.congo_existing_sheet_labels(labels=labels)
 
 
-async def save_congo_import(records: list) -> int:
+async def save_congo_import(records: list, *, progress=None) -> int:
     from tahmeed.services import feed_service as _feeds
-    return await _feeds.save_congo_import(records=records)
+    return await _feeds.save_congo_import(records=records, progress=progress)
 
 
 async def get_congo_uploads() -> list:

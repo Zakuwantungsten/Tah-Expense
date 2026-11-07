@@ -935,6 +935,17 @@ class _DropZone(QFrame):
         self._path_lbl.setText(Path(path).name)
 
 
+def _hide_import_upload_chrome(
+    drop: Optional[QWidget] = None,
+    browse_row: Optional[QWidget] = None,
+) -> None:
+    """Hide drop zone + browse row once the preview is on screen."""
+    if drop is not None:
+        drop.hide()
+    if browse_row is not None:
+        browse_row.hide()
+
+
 def _read_file_rows(
     path: str, header_row: int = 0
 ) -> Tuple[List[str], List[List[Any]]]:
@@ -1101,9 +1112,9 @@ class ImportDialog(QDialog):
         vl.addWidget(self._drop)
 
         # Browse + optional template download
-        browse_row = QWidget()
-        browse_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(browse_row)
+        self._browse_row = QWidget()
+        self._browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(self._browse_row)
         brl.setContentsMargins(0, 0, 0, 0)
         brl.setSpacing(8)
         if self._template_headers:
@@ -1116,7 +1127,7 @@ class ImportDialog(QDialog):
         self._browse_btn.clicked.connect(self._browse)
         brl.addStretch()
         brl.addWidget(self._browse_btn)
-        vl.addWidget(browse_row)
+        vl.addWidget(self._browse_row)
 
         # Stats row
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
@@ -1153,7 +1164,8 @@ class ImportDialog(QDialog):
 
         vl.addWidget(btn_row)
 
-        self._loading = LoadingOverlay(self, "Reading file…")
+        # Determinate #0077C5 bar for parse / save stages (tab overlays stay bar-free).
+        self._loading = LoadingOverlay(self, "Reading file…", show_progress=True)
 
     def _set_busy(
         self,
@@ -1323,6 +1335,7 @@ class ImportDialog(QDialog):
         dupe_count = len(records) - len(self._new_rows)
 
         self._fill_preview(self._new_rows[:10])
+        _hide_import_upload_chrome(self._drop, self._browse_row)
         self._clear_busy(enable_import=bool(self._new_rows))
         self._stats_lbl.setText(
             f"New records: {len(self._new_rows):,}     "
@@ -1393,12 +1406,22 @@ class ImportDialog(QDialog):
                         self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
                         return
 
+                total = len(rows)
                 self._set_busy(
-                    f"Saving {len(rows):,} records…",
+                    f"Saving 0 of {total:,} records…",
                     value=0,
-                    maximum=0,
+                    maximum=max(1, total),
                 )
-                saved = await self._save_fn(rows)
+
+                async def _on_save_progress(done: int, tot: int) -> None:
+                    self._update_busy(
+                        f"Saving {done:,} of {tot:,} records…",
+                        value=done,
+                        maximum=max(1, tot),
+                    )
+                    await asyncio.sleep(0)
+
+                saved = await self._save_fn(rows, progress=_on_save_progress)
                 self._last_skipped = skipped
                 self._clear_busy()
                 self.imported.emit(saved)
@@ -1641,7 +1664,13 @@ class _SegmentTabBar(QWidget):
 
     tab_changed = Signal(int)
 
-    def __init__(self, labels: List[str], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        labels: List[str],
+        parent: QWidget | None = None,
+        *,
+        stretch: bool = True,
+    ) -> None:
         super().__init__(parent)
         self._index = 0
         self._buttons: List[QPushButton] = []
@@ -1656,7 +1685,8 @@ class _SegmentTabBar(QWidget):
             btn.clicked.connect(lambda checked=False, idx=i: self.set_index(idx))
             self._buttons.append(btn)
             hl.addWidget(btn)
-        hl.addStretch()
+        if stretch:
+            hl.addStretch()
         self._apply_styles()
 
     def set_index(self, idx: int, emit: bool = True) -> None:
@@ -1704,8 +1734,277 @@ def _populate_year_combo(cb: QComboBox, years: List[int], selected_year: int) ->
     return active
 
 
-class _TollAllEntries(_FeedExportMixin, QWidget):
-    """Flat, filterable list of every Toll Plaza record — infinite scroll."""
+def _make_feed_chrome_bar(
+    tabs: _SegmentTabBar,
+) -> Tuple[QFrame, QHBoxLayout, QHBoxLayout]:
+    """Single compact row: filters (left) · stretch · tabs · money KPI (far right).
+
+    Height stays fixed at 44px — money KPIs use tiny stacked type, not a taller bar.
+    """
+    chrome = QFrame()
+    chrome.setObjectName("feedChromeBar")
+    chrome.setStyleSheet(
+        f"QFrame#feedChromeBar{{background:{_HDR_BG};border:1px solid {_BORDER};"
+        f"border-radius:6px;}}"
+    )
+    chrome.setFixedHeight(44)
+    hl = QHBoxLayout(chrome)
+    hl.setContentsMargins(8, 4, 8, 4)
+    hl.setSpacing(8)
+
+    filter_host = QWidget()
+    filter_host.setStyleSheet("background:transparent;")
+    filter_host.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+    filter_hl = QHBoxLayout(filter_host)
+    filter_hl.setContentsMargins(0, 0, 0, 0)
+    filter_hl.setSpacing(8)
+    hl.addWidget(filter_host, 0, Qt.AlignVCenter)
+
+    hl.addStretch(1)
+
+    tabs.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    hl.addWidget(tabs, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+    summary_host = QWidget()
+    summary_host.setStyleSheet("background:transparent;")
+    summary_host.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    summary_hl = QHBoxLayout(summary_host)
+    summary_hl.setContentsMargins(0, 0, 0, 0)
+    summary_hl.setSpacing(0)
+    hl.addWidget(summary_host, 0, Qt.AlignRight | Qt.AlignVCenter)
+    return chrome, filter_hl, summary_hl
+
+
+def _chrome_clear_host(host_hl: QHBoxLayout) -> None:
+    while host_hl.count():
+        item = host_hl.takeAt(0)
+        w = item.widget()
+        if w is not None:
+            w.setParent(None)
+
+
+def _chrome_set_filters(filter_hl: QHBoxLayout, widgets: List[QWidget]) -> None:
+    """Replace chrome filter host contents (widgets are reparented, not deleted)."""
+    _chrome_clear_host(filter_hl)
+    for w in widgets:
+        filter_hl.addWidget(w, 0, Qt.AlignVCenter)
+
+
+def _chrome_set_summary(summary_hl: QHBoxLayout, widget: QWidget | None) -> None:
+    """Show one compact money-KPI stack on the far right, or clear it."""
+    _chrome_clear_host(summary_hl)
+    if widget is not None:
+        summary_hl.addWidget(widget, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+
+class _FeedRibbonPageMixin:
+    """Shared ribbon + chrome wiring for Separate Expenses feed shells.
+
+    Expects subclasses to set before calling ``_wire_feed_ribbon``:
+      ``_ribbon``, ``_tabs``, ``_chrome_filters``, ``_main_stack``,
+      and usually ``_all_entries`` / ``_upload_stack`` / ``_browse`` /
+      ``_detail`` / ``_skipped``.
+    Optional: ``_ribbon_filter_tab_indexes`` (default ``{0}``).
+    """
+
+    _ribbon_filter_tab_indexes: set = {0}
+
+    def _wire_feed_ribbon(self) -> None:
+        r = self._ribbon
+        r.find_clicked.connect(self._on_ribbon_find)
+        r.export_clicked.connect(self._on_ribbon_export)
+        r.print_clicked.connect(self._on_ribbon_print)
+        r.clear_filters_clicked.connect(self._on_ribbon_clear_filters)
+        r.recalculate_clicked.connect(self._on_ribbon_recalculate)
+        r.columns_clicked.connect(self._on_ribbon_columns)
+        if hasattr(self, "_open_import"):
+            r.import_clicked.connect(self._open_import)
+        elif hasattr(self, "_do_import"):
+            r.import_clicked.connect(self._do_import)
+        if hasattr(self, "_download_template"):
+            r.download_template_clicked.connect(self._download_template)
+        if hasattr(self, "_open_bulk_import"):
+            r.bulk_import_clicked.connect(self._open_bulk_import)
+
+    def _ribbon_page(self, idx: int):
+        """Widget for tab ``idx`` (override when the list page is the shell itself)."""
+        return self._main_stack.widget(idx)
+
+    def _sync_chrome_for_tab(self, idx: int) -> None:
+        page = self._ribbon_page(idx)
+        widgets: List[QWidget] = []
+        summary = None
+        if idx in getattr(self, "_ribbon_filter_tab_indexes", {0}):
+            if hasattr(page, "filter_widgets"):
+                widgets = list(page.filter_widgets())
+            elif page is getattr(self, "_all_entries", None) and hasattr(
+                self._all_entries, "filter_widgets"
+            ):
+                widgets = list(self._all_entries.filter_widgets())
+            if hasattr(page, "summary_widget"):
+                summary = page.summary_widget()
+        _chrome_set_filters(self._chrome_filters, widgets)
+        if hasattr(self, "_chrome_summary"):
+            _chrome_set_summary(self._chrome_summary, summary)
+        self._ribbon.set_filter_actions_enabled(bool(widgets))
+
+    def _ribbon_active_list_page(self):
+        """Page that owns list filters / export (All Entries or similar)."""
+        idx = self._tabs.current_index()
+        if idx in getattr(self, "_ribbon_filter_tab_indexes", {0}):
+            return self._ribbon_page(idx)
+        return getattr(self, "_all_entries", None)
+
+    def _on_ribbon_find(self) -> None:
+        indexes = getattr(self, "_ribbon_filter_tab_indexes", {0})
+        if self._tabs.current_index() not in indexes:
+            self._tabs.set_index(min(indexes))
+        page = self._ribbon_active_list_page()
+        if page is not None and hasattr(page, "focus_search"):
+            page.focus_search()
+
+    def _on_ribbon_export(self, scope: str) -> None:
+        idx = self._tabs.current_index()
+        target = None
+        if idx in getattr(self, "_ribbon_filter_tab_indexes", {0}):
+            target = self._ribbon_page(idx)
+        elif (
+            hasattr(self, "_upload_stack")
+            and self._tabs.current_index() == getattr(self, "_ribbon_uploads_tab", 1)
+            and self._upload_stack.currentIndex() == 1
+            and hasattr(self, "_detail")
+        ):
+            target = self._detail
+        if target is None or not hasattr(target, "_on_export_filtered"):
+            QMessageBox.information(
+                self, "Export",
+                "Open a list tab (or an upload detail) to export records.",
+            )
+            return
+        if scope == "all":
+            target._on_export_all()
+        else:
+            target._on_export_filtered()
+
+    @staticmethod
+    def _ribbon_table_of(page) -> QWidget | None:
+        """Prefer ``_tbl`` (SM Burhani) then a real ``_table`` widget."""
+        if page is None:
+            return None
+        for name in ("_tbl", "_table"):
+            t = getattr(page, name, None)
+            if t is not None and hasattr(t, "render") and hasattr(t, "resizeColumnsToContents"):
+                return t
+        return None
+
+    def _on_ribbon_print(self) -> None:
+        try:
+            from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+        except ImportError:
+            QMessageBox.information(
+                self, "Print",
+                "Print support is not available in this build.\nUse Export instead.",
+            )
+            return
+        idx = self._tabs.current_index()
+        page = self._ribbon_page(idx)
+        table = self._ribbon_table_of(page)
+        if (
+            table is None
+            and hasattr(self, "_upload_stack")
+            and idx == getattr(self, "_ribbon_uploads_tab", 1)
+        ):
+            if self._upload_stack.currentIndex() == 1 and hasattr(self, "_detail"):
+                table = self._ribbon_table_of(self._detail)
+            elif hasattr(self, "_browse"):
+                table = self._ribbon_table_of(self._browse)
+        if table is None:
+            QMessageBox.information(self, "Print", "Nothing to print on this tab.")
+            return
+        printer = QPrinter(QPrinter.HighResolution)
+        dlg = QPrintDialog(printer, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        table.render(printer)
+
+    def _on_ribbon_clear_filters(self) -> None:
+        indexes = getattr(self, "_ribbon_filter_tab_indexes", {0})
+        if self._tabs.current_index() not in indexes:
+            self._tabs.set_index(min(indexes))
+        page = self._ribbon_active_list_page()
+        if page is not None and hasattr(page, "_clear_filters"):
+            page._clear_filters()
+
+    def _on_ribbon_recalculate(self) -> None:
+        idx = self._tabs.current_index()
+        page = self._ribbon_page(idx)
+        if (
+            hasattr(self, "_upload_stack")
+            and idx == getattr(self, "_ribbon_uploads_tab", 1)
+            and self._upload_stack.currentIndex() == 1
+        ):
+            doc = getattr(getattr(self, "_detail", None), "_upload_doc", None)
+            if doc and hasattr(self._detail, "load_upload"):
+                self._detail.load_upload(doc)
+                return
+        if hasattr(page, "refresh"):
+            page.refresh()
+        elif hasattr(self, "_skipped") and page is self._skipped:
+            self._skipped.refresh()
+
+    def _on_ribbon_columns(self) -> None:
+        idx = self._tabs.current_index()
+        page = self._ribbon_page(idx)
+        if hasattr(page, "autofit_columns"):
+            page.autofit_columns()
+            return
+        table = self._ribbon_table_of(page)
+        if (
+            table is None
+            and hasattr(self, "_upload_stack")
+            and idx == getattr(self, "_ribbon_uploads_tab", 1)
+        ):
+            if self._upload_stack.currentIndex() == 1:
+                table = self._ribbon_table_of(getattr(self, "_detail", None))
+            else:
+                table = self._ribbon_table_of(getattr(self, "_browse", None))
+        if table is not None:
+            table.resizeColumnsToContents()
+
+
+class _LiftedFiltersMixin:
+    """Shared helpers for list pages whose filters live in the feed chrome bar."""
+
+    def filter_widgets(self) -> List[QWidget]:
+        return list(getattr(self, "_chrome_filter_widgets", []))
+
+    def summary_widget(self) -> QWidget | None:
+        """Optional Money In/Out/Balance stack for the chrome far-right slot."""
+        return getattr(self, "_chrome_summary_widget", None)
+
+    def focus_search(self) -> None:
+        edit = getattr(self, "_search_edit", None)
+        if edit is not None:
+            edit.setFocus(Qt.ShortcutFocusReason)
+            edit.selectAll()
+
+    def autofit_columns(self) -> None:
+        table = getattr(self, "_table", None)
+        if table is not None:
+            table.resizeColumnsToContents()
+
+    def _register_chrome_filters(self, *widgets: QWidget) -> None:
+        self._chrome_filter_widgets = [w for w in widgets if w is not None]
+
+    def _register_chrome_summary(self, widget: QWidget | None) -> None:
+        self._chrome_summary_widget = widget
+
+
+class _TollAllEntries(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
+    """Flat, filterable list of every Toll Plaza record — infinite scroll.
+
+    Filter controls live in the feed chrome bar; table only here (no totals).
+    """
 
     _export_title = "Toll Plaza"
     _export_filename = "TollPlaza"
@@ -1722,31 +2021,20 @@ class _TollAllEntries(_FeedExportMixin, QWidget):
         self._loading = False
         self._build()
 
-    def _build(self) -> None:
-        self.setStyleSheet("background:transparent;")
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(8)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
+    def _build_filter_controls(self) -> None:
+        """Create filter widgets for the parent chrome bar (not laid out here)."""
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search vehicle, plaza, receipt, cashier…")
-        self._search_edit.setFixedWidth(280)
+        self._search_edit.setMinimumWidth(220)
+        self._search_edit.setMaximumWidth(320)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
 
         self._year_cb = QComboBox()
         self._year_cb.addItem("All Years", 0)
         self._year_cb.setFixedWidth(110)
         self._year_cb.setStyleSheet(_input_ss())
         self._year_cb.currentIndexChanged.connect(self._on_year)
-        tbl.addWidget(self._year_cb)
 
         self._month_cb = QComboBox()
         for label, val in _TOLL_MONTHS:
@@ -1755,23 +2043,26 @@ class _TollAllEntries(_FeedExportMixin, QWidget):
         self._month_cb.setStyleSheet(_input_ss())
         self._month_cb.setEnabled(False)
         self._month_cb.currentIndexChanged.connect(self._on_month)
-        tbl.addWidget(self._month_cb)
 
+        self._date_host = QWidget()
+        self._date_host.setStyleSheet("background:transparent;")
+        date_hl = QHBoxLayout(self._date_host)
+        date_hl.setContentsMargins(0, 0, 0, 0)
+        date_hl.setSpacing(8)
         self._from_date, self._to_date = add_from_to_editors(
-            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            date_hl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
             optional=True,
         )
+        self._register_chrome_filters(
+            self._search_edit, self._year_cb, self._month_cb, self._date_host,
+        )
 
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(self._clear_filters)
-        tbl.addWidget(clear_btn)
-
-        tbl.addStretch()
-        self._add_export_btn(tbl)
-        vl.addWidget(tb)
-
-        self._totals = _TotalsBar([("zmw", "ZMW "), ("count", "Total records: ")])
-        vl.addWidget(self._totals)
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        self._build_filter_controls()
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
 
         self._table = _make_table(_TOLL_DETAIL_HEADERS)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -1835,8 +2126,7 @@ class _TollAllEntries(_FeedExportMixin, QWidget):
             from tahmeed.services import accountant_service as svc
             month = self._effective_month()
             try:
-                totals, recs, total = await asyncio.gather(
-                    svc.get_toll_plaza_all_totals(self._search, self._year, month, **self._date_kw()),
+                recs, total = await asyncio.gather(
                     svc.get_toll_plaza_all_records(
                         self._search, self._year, month,
                         limit=_TOLL_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
@@ -1850,8 +2140,6 @@ class _TollAllEntries(_FeedExportMixin, QWidget):
             self._total = total
             self._append_rows(recs)
             self._loaded = len(recs)
-            self._totals.set_total("zmw",   float(totals.get("total_zmw", 0)), "ZMW ")
-            self._totals.set_total("count", int(totals.get("count", 0)), "")
             self._update_status()
 
         finally:
@@ -2274,13 +2562,15 @@ class _TollUploadDetail(_FeedExportMixin, QWidget):
 #  1. TollPlazaWidget — master/detail shell
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TollPlazaWidget(QWidget):
+class TollPlazaWidget(_FeedRibbonPageMixin, QWidget):
     """
     Toll Plaza main page.
 
     All Entries tab: every record across uploads with month/year filters and
     infinite scroll.  Uploads tab: batch browse list; clicking a row drills
     into the per-record detail view for that upload.
+
+    Chrome: title + QB-style ribbon + filters left / tabs right (no totals).
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -2289,23 +2579,27 @@ class TollPlazaWidget(QWidget):
         self.refresh()
 
     def _build(self) -> None:
+        from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
+
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
-        vl.setSpacing(12)
+        vl.setContentsMargins(16, 12, 16, 12)
+        vl.setSpacing(8)
 
-        header = _PageHeader("Toll Plaza", "mdi.boom-gate")
-        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
-        tmpl_btn.clicked.connect(self._download_template)
-        self._import_btn = _btn("Import from Dot Com Zambia", "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        header.add_right(tmpl_btn)
-        header.add_right(self._import_btn)
-        vl.addWidget(header)
-        vl.addWidget(_hsep())
+        vl.addWidget(_PageHeader("Toll Plaza", "mdi.boom-gate"))
 
-        self._tabs = _SegmentTabBar(["All Entries", "Uploads", "Skipped"])
-        vl.addWidget(self._tabs)
+        self._ribbon = FeedRibbonToolbar(
+            import_label="Import from\nDot Com Zambia",
+            import_tip="Import Dot Com Zambia spreadsheet",
+        )
+        self._wire_feed_ribbon()
+        vl.addWidget(self._ribbon)
+
+        self._tabs = _SegmentTabBar(
+            ["All Entries", "Uploads", "Skipped"], stretch=False,
+        )
+        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
@@ -2342,12 +2636,13 @@ class TollPlazaWidget(QWidget):
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+        self._sync_chrome_for_tab(0)
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
+        self._sync_chrome_for_tab(idx)
         if idx == 2:
             self._skipped.refresh()
-
 
     def refresh(self) -> None:
         self._all_entries.refresh()
@@ -2528,14 +2823,17 @@ def _pcongo_fill_detail_row(t: QTableWidget, r: int, rec: dict) -> None:
     _finish_table_row(t, r, bg=_GREEN_L if is_deposit else None)
 
 
-class _ParkingCongoAllEntries(_FeedExportMixin, QWidget):
+class _ParkingCongoAllEntries(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
     _export_title = "Parking Congo"
     _export_filename = "ParkingCongo"
     _export_headers = _PCONGO_DETAIL_HEADERS
     _export_row_fn = staticmethod(_pcongo_export_row)
     _export_svc = "get_parking_congo_all_records"
 
-    """Flat, filterable list of every Parking Congo record — infinite scroll."""
+    """Flat, filterable list of every Parking Congo record — infinite scroll.
+
+    Filter controls live in the feed chrome bar; table only here (no totals).
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2547,31 +2845,20 @@ class _ParkingCongoAllEntries(_FeedExportMixin, QWidget):
         self._loading = False
         self._build()
 
-    def _build(self) -> None:
-        self.setStyleSheet("background:transparent;")
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(8)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
+    def _build_filter_controls(self) -> None:
+        """Create filter widgets for the parent chrome bar (not laid out here)."""
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search vehicle, ledger ID, type, cashier…")
-        self._search_edit.setFixedWidth(300)
+        self._search_edit.setMinimumWidth(220)
+        self._search_edit.setMaximumWidth(320)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
 
         self._year_cb = QComboBox()
         self._year_cb.addItem("All Years", 0)
         self._year_cb.setFixedWidth(110)
         self._year_cb.setStyleSheet(_input_ss())
         self._year_cb.currentIndexChanged.connect(self._on_year)
-        tbl.addWidget(self._year_cb)
 
         self._month_cb = QComboBox()
         for label, val in _TOLL_MONTHS:
@@ -2580,23 +2867,26 @@ class _ParkingCongoAllEntries(_FeedExportMixin, QWidget):
         self._month_cb.setStyleSheet(_input_ss())
         self._month_cb.setEnabled(False)
         self._month_cb.currentIndexChanged.connect(self._on_month)
-        tbl.addWidget(self._month_cb)
 
+        self._date_host = QWidget()
+        self._date_host.setStyleSheet("background:transparent;")
+        date_hl = QHBoxLayout(self._date_host)
+        date_hl.setContentsMargins(0, 0, 0, 0)
+        date_hl.setSpacing(8)
         self._from_date, self._to_date = add_from_to_editors(
-            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            date_hl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
             optional=True,
         )
+        self._register_chrome_filters(
+            self._search_edit, self._year_cb, self._month_cb, self._date_host,
+        )
 
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(self._clear_filters)
-        tbl.addWidget(clear_btn)
-
-        tbl.addStretch()
-        self._add_export_btn(tbl)
-        vl.addWidget(tb)
-
-        self._totals = _TotalsBar([("amount", "Total: "), ("count", "Total records: ")])
-        vl.addWidget(self._totals)
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        self._build_filter_controls()
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
 
         self._table = _make_table(_PCONGO_DETAIL_HEADERS)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -2660,8 +2950,7 @@ class _ParkingCongoAllEntries(_FeedExportMixin, QWidget):
             from tahmeed.services import accountant_service as svc
             month = self._effective_month()
             try:
-                totals, recs, total = await asyncio.gather(
-                    svc.get_parking_congo_all_totals(self._search, self._year, month, **self._date_kw()),
+                recs, total = await asyncio.gather(
                     svc.get_parking_congo_all_records(
                         self._search, self._year, month,
                         limit=_PCONGO_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state),
@@ -2675,8 +2964,6 @@ class _ParkingCongoAllEntries(_FeedExportMixin, QWidget):
             self._total = total
             self._append_rows(recs)
             self._loaded = len(recs)
-            self._totals.set_total("amount", float(totals.get("amount", 0)), "")
-            self._totals.set_total("count",  int(totals.get("count", 0)), "")
             self._update_status()
 
         finally:
@@ -3031,7 +3318,7 @@ _PCONGO_DEPOSIT_HEADERS = [
 ]
 
 
-class _ParkingCongoDeposited(_FeedExportMixin, QWidget):
+class _ParkingCongoDeposited(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
     _export_title = "Parking Congo Deposits"
     _export_filename = "ParkingCongo_Deposits"
     _export_headers = _PCONGO_DEPOSIT_HEADERS
@@ -3052,11 +3339,32 @@ class _ParkingCongoDeposited(_FeedExportMixin, QWidget):
         self._rows: List[dict] = []
         self._build()
 
+    def _build_filter_controls(self) -> None:
+        """Create filter widgets for the parent chrome bar (not laid out here)."""
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search ledger ID, cashier, details, file…")
+        self._search_edit.setMinimumWidth(220)
+        self._search_edit.setMaximumWidth(320)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+
+        self._date_host = QWidget()
+        self._date_host.setStyleSheet("background:transparent;")
+        date_hl = QHBoxLayout(self._date_host)
+        date_hl.setContentsMargins(0, 0, 0, 0)
+        date_hl.setSpacing(8)
+        self._from_date, self._to_date = add_from_to_editors(
+            date_hl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            optional=True,
+        )
+        self._register_chrome_filters(self._search_edit, self._date_host)
+
     def _build(self) -> None:
         self.setStyleSheet("background:transparent;")
+        self._build_filter_controls()
         vl = QVBoxLayout(self)
         vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(8)
+        vl.setSpacing(6)
 
         hint = _lbl(
             "Account deposits from the Congo ledger (credits, not trucks). "
@@ -3065,34 +3373,6 @@ class _ParkingCongoDeposited(_FeedExportMixin, QWidget):
         )
         hint.setWordWrap(True)
         vl.addWidget(hint)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search ledger ID, cashier, details, file…")
-        self._search_edit.setFixedWidth(300)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-
-        self._from_date, self._to_date = add_from_to_editors(
-            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
-            optional=True,
-        )
-
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(self._clear_filters)
-        tbl.addWidget(clear_btn)
-        tbl.addStretch()
-        self._add_export_btn(tbl)
-        vl.addWidget(tb)
-
-        self._totals = _TotalsBar([("amount", "Total deposited: "), ("count", "Deposits: ")])
-        vl.addWidget(self._totals)
 
         self._table = _make_table(_PCONGO_DEPOSIT_HEADERS)
         _bind_feed_columns(self._table, "pcongo_deposits")
@@ -3139,8 +3419,7 @@ class _ParkingCongoDeposited(_FeedExportMixin, QWidget):
         try:
             from tahmeed.services import accountant_service as svc
             try:
-                totals, recs, total = await asyncio.gather(
-                    svc.get_parking_congo_deposit_totals(self._search, **self._date_kw()),
+                recs, total = await asyncio.gather(
                     svc.get_parking_congo_deposits(
                         self._search, limit=_PCONGO_SCROLL_CHUNK, skip=0, **self._date_kw(),
                     ),
@@ -3153,8 +3432,6 @@ class _ParkingCongoDeposited(_FeedExportMixin, QWidget):
             self._total = total
             self._append_rows(recs)
             self._loaded = len(recs)
-            self._totals.set_total("amount", float(totals.get("amount", 0)), "")
-            self._totals.set_total("count",  int(totals.get("count", 0)), "")
             self._update_status()
 
         finally:
@@ -3251,7 +3528,7 @@ class _ParkingCongoDeposited(_FeedExportMixin, QWidget):
 #  2. ParkingCongoWidget — master/detail shell
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ParkingCongoWidget(QWidget):
+class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
     """
     Parking Congo main page.
 
@@ -3259,7 +3536,12 @@ class ParkingCongoWidget(QWidget):
     infinite scroll.  Uploads tab: batch browse list; clicking a row drills
     into the per-record detail view for that upload.  Deposited: deposit
     credits with date filters.  Skipped: unknown trucks parked for follow-up.
+
+    Chrome: title + QB-style ribbon + filters left / tabs right (no totals).
     """
+
+    _ribbon_uploads_tab = 1
+    _ribbon_filter_tab_indexes = {0, 2}
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -3267,23 +3549,27 @@ class ParkingCongoWidget(QWidget):
         self.refresh()
 
     def _build(self) -> None:
+        from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
+
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
-        vl.setSpacing(12)
+        vl.setContentsMargins(16, 12, 16, 12)
+        vl.setSpacing(8)
 
-        header = _PageHeader("Parking Congo", "mdi.parking")
-        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
-        tmpl_btn.clicked.connect(self._download_template)
-        self._import_btn = _btn("Import from Congo Ledger", "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        header.add_right(tmpl_btn)
-        header.add_right(self._import_btn)
-        vl.addWidget(header)
-        vl.addWidget(_hsep())
+        vl.addWidget(_PageHeader("Parking Congo", "mdi.parking"))
 
-        self._tabs = _SegmentTabBar(["All Entries", "Uploads", "Deposited", "Skipped"])
-        vl.addWidget(self._tabs)
+        self._ribbon = FeedRibbonToolbar(
+            import_label="Import from\nCongo Ledger",
+            import_tip="Import Congo ledger spreadsheet",
+        )
+        self._wire_feed_ribbon()
+        vl.addWidget(self._ribbon)
+
+        self._tabs = _SegmentTabBar(
+            ["All Entries", "Uploads", "Deposited", "Skipped"], stretch=False,
+        )
+        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
@@ -3324,9 +3610,11 @@ class ParkingCongoWidget(QWidget):
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+        self._sync_chrome_for_tab(0)
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
+        self._sync_chrome_for_tab(idx)
         if idx == 2:
             self._deposited.refresh()
         elif idx == 3:
@@ -3481,6 +3769,17 @@ _CONGO_BROWSE_HEADERS = upload_browse_headers([
 ])
 
 
+def _report_parse_progress(
+    progress: Optional[Callable[[str, int, int], None]],
+    message: str,
+    value: int,
+    maximum: int,
+) -> None:
+    """Optional determinate progress hook for Excel parse (UploadBusy)."""
+    if progress is not None:
+        progress(message, value, maximum)
+
+
 def _parse_congo_sheet(ws) -> List[dict]:
     """Parse one Congo Expenses worksheet into row dicts."""
     rows = list(ws.iter_rows(values_only=True))
@@ -3540,30 +3839,56 @@ def _parse_congo_sheet(ws) -> List[dict]:
     return records
 
 
-def _parse_congo_last_sheet(path: str) -> Tuple[str, List[dict]]:
+def _parse_congo_last_sheet(
+    path: str,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+) -> Tuple[str, List[dict]]:
     """Read only the last worksheet from a Congo Expenses workbook."""
     if not _HAS_OPENPYXL:
         raise RuntimeError("openpyxl is required to import Congo Expenses Excel files.")
 
+    _report_parse_progress(progress, "Opening workbook…", 0, 2)
     wb = openpyxl.load_workbook(path, data_only=True)
     if not wb.sheetnames:
+        _report_parse_progress(progress, "No sheets found", 2, 2)
         return "", []
 
     sheet_name = wb.sheetnames[-1]
-    return sheet_name, _parse_congo_sheet(wb[sheet_name])
+    _report_parse_progress(progress, f"Parsing sheet: {sheet_name}", 1, 2)
+    records = _parse_congo_sheet(wb[sheet_name])
+    _report_parse_progress(
+        progress,
+        f"Read {len(records):,} rows from {sheet_name}",
+        2,
+        2,
+    )
+    return sheet_name, records
 
 
-def _parse_congo_all_sheets(path: str) -> List[dict]:
+def _parse_congo_all_sheets(
+    path: str,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+) -> List[dict]:
     """Parse every worksheet in a Congo Expenses workbook."""
     if not _HAS_OPENPYXL:
         raise RuntimeError("openpyxl is required to import Congo Expenses Excel files.")
 
+    _report_parse_progress(progress, "Opening workbook…", 0, 1)
     wb = openpyxl.load_workbook(path, data_only=True)
+    names = list(wb.sheetnames)
+    n = max(1, len(names))
+    _report_parse_progress(progress, f"Loaded {len(names):,} sheet(s)…", 0, n)
     batches: List[dict] = []
-    for sheet_name in wb.sheetnames:
+    for i, sheet_name in enumerate(names):
         records = _parse_congo_sheet(wb[sheet_name])
         if records:
             batches.append({"sheet_label": sheet_name, "records": records})
+        _report_parse_progress(
+            progress,
+            f"Parsing sheet {i + 1:,} of {len(names):,}: {sheet_name}",
+            i + 1,
+            n,
+        )
     return batches
 
 
@@ -3595,7 +3920,7 @@ def _congo_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
 
 
 def _make_congo_summary_cards() -> Tuple[QFrame, QLabel, QLabel, QLabel]:
-    """Money In / Money Out / Balance summary strip for Congo views."""
+    """Money In / Money Out / Balance strip for upload-detail views (full card)."""
     frame = QFrame()
     frame.setStyleSheet(
         f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
@@ -3614,20 +3939,58 @@ def _make_congo_summary_cards() -> Tuple[QFrame, QLabel, QLabel, QLabel]:
     return frame, in_lbl, out_lbl, bal_lbl
 
 
+def _chrome_kpi_label(text: str, *, color: str, weight: int = 600) -> QLabel:
+    """One line of the chrome money stack — sized to fit the fixed 44px bar."""
+    lbl = QLabel(text)
+    lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    lbl.setStyleSheet(
+        f"color:{color};font-size:8px;font-weight:{weight};"
+        "font-family:'Segoe UI';background:transparent;padding:0;margin:0;"
+    )
+    return lbl
+
+
+def _make_chrome_money_kpi(currency: str = "USD") -> Tuple[QWidget, QLabel, QLabel, QLabel]:
+    """Compact 3-row Money In / Out / Balance for the chrome far-right slot."""
+    wrap = QWidget()
+    wrap.setStyleSheet("background:transparent;")
+    wrap.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    vl = QVBoxLayout(wrap)
+    vl.setContentsMargins(10, 0, 0, 0)
+    vl.setSpacing(0)
+    in_lbl = _chrome_kpi_label(f"In {currency}: —", color=_GREEN, weight=700)
+    out_lbl = _chrome_kpi_label(f"Out {currency}: —", color=_T2, weight=600)
+    bal_lbl = _chrome_kpi_label(f"Bal {currency}: —", color=_T1, weight=700)
+    for lbl in (in_lbl, out_lbl, bal_lbl):
+        lbl._chrome_kpi = True  # type: ignore[attr-defined]
+    vl.addWidget(in_lbl)
+    vl.addWidget(out_lbl)
+    vl.addWidget(bal_lbl)
+    return wrap, in_lbl, out_lbl, bal_lbl
+
+
 def _set_congo_summary(in_lbl: QLabel, out_lbl: QLabel, bal_lbl: QLabel,
                        money_in: float, money_out: float) -> None:
     balance = money_in + money_out
-    in_lbl.setText(f"Money In: USD {_kimvi_fmt_amount(money_in)}")
-    out_lbl.setText(f"Money Out: USD {_kimvi_fmt_amount(money_out)}")
+    compact = bool(getattr(in_lbl, "_chrome_kpi", False))
+    if compact:
+        in_lbl.setText(f"In USD {_kimvi_fmt_amount(money_in)}")
+        out_lbl.setText(f"Out USD {_kimvi_fmt_amount(money_out)}")
+        bal_lbl.setText(f"Bal USD {_kimvi_fmt_amount(balance)}")
+        bal_size = "8px"
+    else:
+        in_lbl.setText(f"Money In: USD {_kimvi_fmt_amount(money_in)}")
+        out_lbl.setText(f"Money Out: USD {_kimvi_fmt_amount(money_out)}")
+        bal_lbl.setText(f"Balance: USD {_kimvi_fmt_amount(balance)}")
+        bal_size = "12px"
     bal_color = _CREDIT_FG if balance < 0 else (_RED if balance > 0 else _T1)
-    bal_lbl.setText(f"Balance: USD {_kimvi_fmt_amount(balance)}")
     bal_lbl.setStyleSheet(
-        f"color:{bal_color};font-size:12px;font-weight:600;"
-        "font-family:'Segoe UI';background:transparent;"
+        f"color:{bal_color};font-size:{bal_size};font-weight:700;"
+        "font-family:'Segoe UI';background:transparent;padding:0;margin:0;"
     )
 
 
-class _CongoEntriesBase(_FeedExportMixin, QWidget):
+class _CongoEntriesBase(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
     _export_title = "Congo Expenses"
     _export_filename = "CongoExpenses"
     _export_headers = _CONGO_HEADERS
@@ -3653,31 +4016,20 @@ class _CongoEntriesBase(_FeedExportMixin, QWidget):
         self._loading = False
         self._build()
 
-    def _build(self) -> None:
-        self.setStyleSheet("background:transparent;")
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(8)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
+    def _build_filter_controls(self) -> None:
+        """Create filter widgets for the parent chrome bar (not laid out here)."""
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search LPO, truck, description, date…")
-        self._search_edit.setFixedWidth(300)
+        self._search_edit.setMinimumWidth(220)
+        self._search_edit.setMaximumWidth(320)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
 
         self._year_cb = QComboBox()
         self._year_cb.addItem("All Years", 0)
         self._year_cb.setFixedWidth(110)
         self._year_cb.setStyleSheet(_input_ss())
         self._year_cb.currentIndexChanged.connect(self._on_year)
-        tbl.addWidget(self._year_cb)
 
         self._month_cb = QComboBox()
         for label, val in _TOLL_MONTHS:
@@ -3686,28 +4038,31 @@ class _CongoEntriesBase(_FeedExportMixin, QWidget):
         self._month_cb.setStyleSheet(_input_ss())
         self._month_cb.setEnabled(False)
         self._month_cb.currentIndexChanged.connect(self._on_month)
-        tbl.addWidget(self._month_cb)
 
+        self._date_host = QWidget()
+        self._date_host.setStyleSheet("background:transparent;")
+        date_hl = QHBoxLayout(self._date_host)
+        date_hl.setContentsMargins(0, 0, 0, 0)
+        date_hl.setSpacing(8)
         self._from_date, self._to_date = add_from_to_editors(
-            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            date_hl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
             optional=True,
         )
+        self._register_chrome_filters(
+            self._search_edit, self._year_cb, self._month_cb, self._date_host,
+        )
 
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(self._clear_filters)
-        tbl.addWidget(clear_btn)
-
-        tbl.addStretch()
-        self._add_export_btn(tbl)
-        vl.addWidget(tb)
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        self._build_filter_controls()
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
 
         self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
-            _make_congo_summary_cards()
+            _make_chrome_money_kpi("USD")
         )
-        vl.addWidget(self._summary_frame)
-
-        self._totals = _TotalsBar([("count", "Total records: ")])
-        vl.addWidget(self._totals)
+        self._register_chrome_summary(self._summary_frame)
 
         self._table = _make_kimvi_table(_CONGO_HEADERS)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -3798,7 +4153,6 @@ class _CongoEntriesBase(_FeedExportMixin, QWidget):
                 float(totals.get("money_in", 0)),
                 float(totals.get("money_out", 0)),
             )
-            self._totals.set_total("count", int(totals.get("count", 0)), "")
             self._update_status()
 
         finally:
@@ -3941,15 +4295,15 @@ class CongoImportDialog(QDialog):
         self._drop.file_dropped.connect(self._on_file)
         vl.addWidget(self._drop)
 
-        browse_row = QWidget()
-        browse_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(browse_row)
+        self._browse_row = QWidget()
+        self._browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(self._browse_row)
         brl.setContentsMargins(0, 0, 0, 0)
         browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
         browse_btn.clicked.connect(self._browse)
         brl.addStretch()
         brl.addWidget(browse_btn)
-        vl.addWidget(browse_row)
+        vl.addWidget(self._browse_row)
 
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
         vl.addWidget(self._stats_lbl)
@@ -3992,60 +4346,77 @@ class CongoImportDialog(QDialog):
 
         self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
+        busy = UploadBusy(self, f"Reading {Path(path).name}…", title="Import")
+        busy.__enter__()
         try:
-            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
-                sheet_label, records = _parse_congo_last_sheet(path)
+            def on_progress(message: str, value: int, maximum: int) -> None:
+                busy.update(message, value=value, maximum=maximum)
+
+            sheet_label, records = _parse_congo_last_sheet(path, progress=on_progress)
         except Exception as exc:
+            busy.close()
             self._stats_lbl.setText(f"Error reading file: {exc}")
             self._import_btn.setEnabled(False)
             return
 
         self._sheet_label = sheet_label
         self._records = records
-        asyncio.ensure_future(self._check_sheet(sheet_label, records))
+        asyncio.ensure_future(self._check_sheet(sheet_label, records, busy=busy))
 
-    async def _check_sheet(self, sheet_label: str, records: List[dict]) -> None:
+    async def _check_sheet(self, sheet_label: str, records: List[dict], busy=None) -> None:
         from tahmeed.services import accountant_service as svc
 
         try:
-            exists = await svc.congo_sheet_exists(sheet_label)
-        except Exception:
-            exists = False
+            if busy is not None:
+                busy.update("Checking if sheet was uploaded…", value=1, maximum=2)
+                await busy.tick()
+            try:
+                exists = await svc.congo_sheet_exists(sheet_label)
+            except Exception:
+                exists = False
 
-        self._already_exists = exists
-        money_in  = sum(r["amount_usd"] for r in records if r["amount_usd"] < 0)
-        money_out = sum(r["amount_usd"] for r in records if r["amount_usd"] > 0)
-        balance   = money_in + money_out
+            self._already_exists = exists
+            money_in  = sum(r["amount_usd"] for r in records if r["amount_usd"] < 0)
+            money_out = sum(r["amount_usd"] for r in records if r["amount_usd"] > 0)
+            balance   = money_in + money_out
 
-        if exists:
-            self._stats_lbl.setText(
-                f"Sheet \"{sheet_label}\" was already uploaded — import blocked."
-            )
-            self._import_btn.setEnabled(False)
-            self._import_btn.setText("Already Uploaded")
-        elif not records:
-            self._stats_lbl.setText(
-                f"Last sheet \"{sheet_label}\" has no data rows to import."
-            )
-            self._import_btn.setEnabled(False)
-            self._import_btn.setText("Import Sheet")
-        else:
-            self._stats_lbl.setText(
-                f"Last sheet: {sheet_label}     "
-                f"Rows: {len(records):,}     "
-                f"In: USD {money_in:,.0f}     "
-                f"Out: USD {money_out:,.0f}     "
-                f"Balance: USD {balance:,.0f}"
-            )
-            self._import_btn.setEnabled(True)
-            self._import_btn.setText(f"Import {len(records):,} Rows")
+            if busy is not None:
+                busy.update("Building preview…", value=2, maximum=2)
+                await busy.tick()
 
-        t = self._preview_tbl
-        t.setRowCount(0)
-        for rec in records[:10]:
-            row = t.rowCount()
-            t.insertRow(row)
-            _congo_fill_row(t, row, rec)
+            if exists:
+                self._stats_lbl.setText(
+                    f"Sheet \"{sheet_label}\" was already uploaded — import blocked."
+                )
+                self._import_btn.setEnabled(False)
+                self._import_btn.setText("Already Uploaded")
+            elif not records:
+                self._stats_lbl.setText(
+                    f"Last sheet \"{sheet_label}\" has no data rows to import."
+                )
+                self._import_btn.setEnabled(False)
+                self._import_btn.setText("Import Sheet")
+            else:
+                self._stats_lbl.setText(
+                    f"Last sheet: {sheet_label}     "
+                    f"Rows: {len(records):,}     "
+                    f"In: USD {money_in:,.0f}     "
+                    f"Out: USD {money_out:,.0f}     "
+                    f"Balance: USD {balance:,.0f}"
+                )
+                self._import_btn.setEnabled(True)
+                self._import_btn.setText(f"Import {len(records):,} Rows")
+
+            t = self._preview_tbl
+            t.setRowCount(0)
+            for rec in records[:10]:
+                row = t.rowCount()
+                t.insertRow(row)
+                _congo_fill_row(t, row, rec)
+            _hide_import_upload_chrome(self._drop, self._browse_row)
+        finally:
+            if busy is not None:
+                busy.close()
 
     def _do_import(self) -> None:
         if self._already_exists or not self._records:
@@ -4058,6 +4429,7 @@ class CongoImportDialog(QDialog):
         from tahmeed.services import accountant_service as svc
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
         from tahmeed.ui.async_utils import pause_background_polls
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
 
         docs = []
         for rec in self._records:
@@ -4096,7 +4468,21 @@ class CongoImportDialog(QDialog):
                         self._import_btn.setEnabled(True)
                         self._import_btn.setText(f"Import {len(self._records):,} Rows")
                     return
-                saved = await svc.save_congo_import(gate.rows)
+                total = len(gate.rows)
+                with UploadBusy(
+                    self, f"Saving {total:,} rows…", title="Import"
+                ) as busy:
+                    async def _on_progress(done: int, tot: int) -> None:
+                        busy.update(
+                            f"Saving {done:,} of {tot:,} rows…",
+                            value=done,
+                            maximum=max(1, tot),
+                        )
+                        await busy.tick()
+
+                    busy.update(f"Saving 0 of {total:,} rows…", value=0, maximum=max(1, total))
+                    await busy.tick()
+                    saved = await svc.save_congo_import(gate.rows, progress=_on_progress)
                 self.imported.emit(saved)
                 self.accept()
             except Exception as exc:
@@ -4430,35 +4816,41 @@ class _CongoExpUploadDetail(_FeedExportMixin, QWidget):
         self._reset_and_load()
 
 
-class CongoExpensesWidget(QWidget):
+class CongoExpensesWidget(_FeedRibbonPageMixin, QWidget):
+    """Congo Expenses: title + QB-style ribbon + filters left / tabs right."""
+
+    _ribbon_uploads_tab = 3
+    _ribbon_filter_tab_indexes = {0, 1, 2}
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._build()
         self.refresh()
 
     def _build(self) -> None:
+        from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
+
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
-        vl.setSpacing(12)
+        vl.setContentsMargins(16, 12, 16, 12)
+        vl.setSpacing(8)
 
-        header = _PageHeader("Congo Expenses", "mdi.map-marker")
-        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
-        tmpl_btn.clicked.connect(self._download_template)
-        bulk_btn = _btn("Bulk Import All Sheets", "mdi.file-multiple-outline", primary=False)
-        bulk_btn.clicked.connect(self._open_bulk_import)
-        self._import_btn = _btn("Import Latest Sheet", "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        header.add_right(tmpl_btn)
-        header.add_right(bulk_btn)
-        header.add_right(self._import_btn)
-        vl.addWidget(header)
-        vl.addWidget(_hsep())
+        vl.addWidget(_PageHeader("Congo Expenses", "mdi.map-marker"))
+
+        self._ribbon = FeedRibbonToolbar(
+            import_label="Import Latest\nSheet",
+            import_tip="Import the latest sheet from a Congo Expenses workbook",
+            bulk_import_label="Bulk Import\nAll Sheets",
+        )
+        self._wire_feed_ribbon()
+        vl.addWidget(self._ribbon)
 
         self._tabs = _SegmentTabBar(
-            ["All Entries", "Money In", "Called Out", "Uploads", "Skipped"]
+            ["All Entries", "Money In", "Called Out", "Uploads", "Skipped"],
+            stretch=False,
         )
-        vl.addWidget(self._tabs)
+        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
@@ -4501,9 +4893,11 @@ class CongoExpensesWidget(QWidget):
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+        self._sync_chrome_for_tab(0)
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
+        self._sync_chrome_for_tab(idx)
         if idx == 4:
             self._skipped.refresh()
 
@@ -4731,30 +5125,56 @@ def _parse_kimvi_sheet(ws) -> List[dict]:
     return records
 
 
-def _parse_kimvi_last_sheet(path: str) -> Tuple[str, List[dict]]:
+def _parse_kimvi_last_sheet(
+    path: str,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+) -> Tuple[str, List[dict]]:
     """Read only the last worksheet from an Ahmed Kimvi expenses workbook."""
     if not _HAS_OPENPYXL:
         raise RuntimeError("openpyxl is required to import Ahmed Kimvi Excel files.")
 
+    _report_parse_progress(progress, "Opening workbook…", 0, 2)
     wb = openpyxl.load_workbook(path, data_only=True)
     if not wb.sheetnames:
+        _report_parse_progress(progress, "No sheets found", 2, 2)
         return "", []
 
     sheet_name = wb.sheetnames[-1]
-    return sheet_name, _parse_kimvi_sheet(wb[sheet_name])
+    _report_parse_progress(progress, f"Parsing sheet: {sheet_name}", 1, 2)
+    records = _parse_kimvi_sheet(wb[sheet_name])
+    _report_parse_progress(
+        progress,
+        f"Read {len(records):,} rows from {sheet_name}",
+        2,
+        2,
+    )
+    return sheet_name, records
 
 
-def _parse_kimvi_all_sheets(path: str) -> List[dict]:
+def _parse_kimvi_all_sheets(
+    path: str,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+) -> List[dict]:
     """Parse every worksheet in an Ahmed Kimvi expenses workbook."""
     if not _HAS_OPENPYXL:
         raise RuntimeError("openpyxl is required to import Ahmed Kimvi Excel files.")
 
+    _report_parse_progress(progress, "Opening workbook…", 0, 1)
     wb = openpyxl.load_workbook(path, data_only=True)
+    names = list(wb.sheetnames)
+    n = max(1, len(names))
+    _report_parse_progress(progress, f"Loaded {len(names):,} sheet(s)…", 0, n)
     batches: List[dict] = []
-    for sheet_name in wb.sheetnames:
+    for i, sheet_name in enumerate(names):
         records = _parse_kimvi_sheet(wb[sheet_name])
         if records:
             batches.append({"sheet_label": sheet_name, "records": records})
+        _report_parse_progress(
+            progress,
+            f"Parsing sheet {i + 1:,} of {len(names):,}: {sheet_name}",
+            i + 1,
+            n,
+        )
     return batches
 
 
@@ -4822,15 +5242,15 @@ class BulkSheetImportDialog(QDialog):
         self._drop.file_dropped.connect(self._on_file)
         vl.addWidget(self._drop)
 
-        browse_row = QWidget()
-        browse_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(browse_row)
+        self._browse_row = QWidget()
+        self._browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(self._browse_row)
         brl.setContentsMargins(0, 0, 0, 0)
         browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
         browse_btn.clicked.connect(self._browse)
         brl.addStretch()
         brl.addWidget(browse_btn)
-        vl.addWidget(browse_row)
+        vl.addWidget(self._browse_row)
 
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
         vl.addWidget(self._stats_lbl)
@@ -4897,10 +5317,15 @@ class BulkSheetImportDialog(QDialog):
 
         self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
+        busy = UploadBusy(self, f"Reading {Path(path).name}…", title="Import")
+        busy.__enter__()
         try:
-            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
-                batches = self._parse_all_fn(path)
+            def on_progress(message: str, value: int, maximum: int) -> None:
+                busy.update(message, value=value, maximum=maximum)
+
+            batches = self._parse_all_fn(path, progress=on_progress)
         except Exception as exc:
+            busy.close()
             self._stats_lbl.setText(f"Error reading file: {exc}")
             self._import_btn.setEnabled(False)
             self._sheet_rows = []
@@ -4909,68 +5334,90 @@ class BulkSheetImportDialog(QDialog):
             self._set_select_btns_enabled(False)
             return
 
-        asyncio.ensure_future(self._check_batches(batches))
+        # Keep the same busy dialog through sheet-status checks (no empty gap).
+        asyncio.ensure_future(self._check_batches(batches, busy=busy))
 
-    async def _check_batches(self, batches: List[dict]) -> None:
-        labels = [b["sheet_label"] for b in batches]
+    async def _check_batches(self, batches: List[dict], busy=None) -> None:
         try:
-            existing: set = await self._existing_fn(labels)
-        except Exception:
-            existing = set()
+            n = max(1, len(batches))
+            if busy is not None:
+                busy.update("Checking uploaded sheets…", value=0, maximum=n)
+                await busy.tick()
 
-        self._sheet_rows = []
-        self._skipped_count = 0
+            labels = [b["sheet_label"] for b in batches]
+            try:
+                existing: set = await self._existing_fn(labels)
+            except Exception:
+                existing = set()
 
-        for batch in batches:
-            label   = batch["sheet_label"]
-            records = list(batch["records"])
-            balance = self._balance_fn(records)
-            status = "New"
-            if self._feed_key == "zambia_parking" and records:
-                # Exact whole-statement content only (not ticket / sheet-name).
-                from tahmeed.services import accountant_service as svc
-                try:
-                    matching = await svc.zambia_exact_content_already_uploaded(records)
-                except Exception:
-                    matching = []
-                if matching:
+            self._sheet_rows = []
+            self._skipped_count = 0
+
+            for i, batch in enumerate(batches):
+                label   = batch["sheet_label"]
+                records = list(batch["records"])
+                balance = self._balance_fn(records)
+                status = "New"
+                if busy is not None:
+                    busy.update(
+                        f"Checking sheet {i + 1:,} of {len(batches):,}: {label}",
+                        value=i + 1,
+                        maximum=n,
+                    )
+                    await busy.tick()
+                if self._feed_key == "zambia_parking" and records:
+                    # Exact whole-statement content only (not ticket / sheet-name).
+                    from tahmeed.services import accountant_service as svc
+                    try:
+                        matching = await svc.zambia_exact_content_already_uploaded(records)
+                    except Exception:
+                        matching = []
+                    if matching:
+                        status = "Already uploaded"
+                        self._skipped_count += 1
+                elif label in existing:
                     status = "Already uploaded"
                     self._skipped_count += 1
-            elif label in existing:
-                status = "Already uploaded"
-                self._skipped_count += 1
 
-            self._sheet_rows.append({
-                "sheet_label": label,
-                "records":     records,
-                "upload_id":   str(uuid.uuid4()),
-                "count":       len(records),
-                "balance":     balance,
-                "status":      status,
-            })
+                self._sheet_rows.append({
+                    "sheet_label": label,
+                    "records":     records,
+                    "upload_id":   str(uuid.uuid4()),
+                    "count":       len(records),
+                    "balance":     balance,
+                    "status":      status,
+                })
 
-        new_sheets = sum(1 for r in self._sheet_rows if r["status"] == "New")
-        new_rows   = sum(
-            r["count"] for r in self._sheet_rows if r["status"] == "New"
-        )
+            if busy is not None:
+                busy.update("Building preview…", value=n, maximum=n)
+                await busy.tick()
 
-        if not batches:
-            self._stats_lbl.setText("Workbook has no sheets with data to import.")
-        elif new_sheets == 0:
-            self._stats_lbl.setText(
-                f"All {len(batches):,} sheets were already uploaded — nothing new to import."
-            )
-        else:
-            self._stats_lbl.setText(
-                f"Sheets ready: {new_sheets:,} / {len(batches):,}     "
-                f"New rows: {new_rows:,}     "
-                f"Already uploaded sheets: {self._skipped_count:,}"
+            new_sheets = sum(1 for r in self._sheet_rows if r["status"] == "New")
+            new_rows   = sum(
+                r["count"] for r in self._sheet_rows if r["status"] == "New"
             )
 
-        self._fill_preview()
-        self._apply_initial_selection()
-        self._set_select_btns_enabled(bool(self._sheet_rows))
-        self._refresh_import_btn()
+            if not batches:
+                self._stats_lbl.setText("Workbook has no sheets with data to import.")
+            elif new_sheets == 0:
+                self._stats_lbl.setText(
+                    f"All {len(batches):,} sheets were already uploaded — nothing new to import."
+                )
+            else:
+                self._stats_lbl.setText(
+                    f"Sheets ready: {new_sheets:,} / {len(batches):,}     "
+                    f"New rows: {new_rows:,}     "
+                    f"Already uploaded sheets: {self._skipped_count:,}"
+                )
+
+            self._fill_preview()
+            _hide_import_upload_chrome(self._drop, self._browse_row)
+            self._apply_initial_selection()
+            self._set_select_btns_enabled(bool(self._sheet_rows))
+            self._refresh_import_btn()
+        finally:
+            if busy is not None:
+                busy.close()
 
     def _fill_preview(self) -> None:
         t = self._preview_tbl
@@ -5086,6 +5533,7 @@ class BulkSheetImportDialog(QDialog):
         from tahmeed.ui.accountant.import_truck_gate import run_bulk_import_truck_gate
         from tahmeed.services.import_truck_check import truck_field_for
         from tahmeed.ui.async_utils import pause_background_polls
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
 
         sheets_imported = 0
         total_rows      = 0
@@ -5121,21 +5569,61 @@ class BulkSheetImportDialog(QDialog):
                     prepared = gate.batches
                     total_skipped = gate.skipped_count
 
-                for batch in prepared:
-                    docs = list(batch.get("docs") or [])
-                    if not docs:
-                        continue
+                total_docs = sum(len(b.get("docs") or []) for b in prepared)
+                rows_done = 0
+                with UploadBusy(
+                    self,
+                    f"Saving {total_docs:,} rows…",
+                    title="Import",
+                ) as busy:
+                    busy.update(
+                        f"Saving 0 of {total_docs:,} rows…",
+                        value=0,
+                        maximum=max(1, total_docs),
+                    )
+                    await busy.tick()
 
-                    if self._feed_key == "zambia_parking" and batch.get("records"):
-                        from tahmeed.services import accountant_service as svc
-                        file_hash = svc.zambia_batch_content_hash(batch["records"])
-                        for row in docs:
-                            row["content_hash"] = file_hash
+                    for bi, batch in enumerate(prepared):
+                        docs = list(batch.get("docs") or [])
+                        if not docs:
+                            continue
 
-                    saved = await self._save_fn(docs)
-                    if saved:
-                        sheets_imported += 1
-                        total_rows      += saved
+                        if self._feed_key == "zambia_parking" and batch.get("records"):
+                            from tahmeed.services import accountant_service as svc
+                            file_hash = svc.zambia_batch_content_hash(batch["records"])
+                            for row in docs:
+                                row["content_hash"] = file_hash
+
+                        label = str(batch.get("sheet_label") or f"Sheet {bi + 1}")
+                        base_done = rows_done
+
+                        async def _on_save_progress(
+                            done: int,
+                            _total: int,
+                            *,
+                            _base: int = base_done,
+                            _label: str = label,
+                        ) -> None:
+                            overall = min(_base + done, total_docs)
+                            busy.update(
+                                f"Saving {_label} · {overall:,} of {total_docs:,} rows…",
+                                value=overall,
+                                maximum=max(1, total_docs),
+                            )
+                            await busy.tick()
+
+                        saved = await self._save_fn(docs, progress=_on_save_progress)
+                        rows_done += len(docs)
+                        if saved:
+                            sheets_imported += 1
+                            total_rows      += saved
+
+                    busy.update(
+                        f"Saved {total_rows:,} of {total_docs:,} rows",
+                        value=max(1, total_docs),
+                        maximum=max(1, total_docs),
+                    )
+                    await busy.tick()
 
                 self._last_skipped = total_skipped
                 if sheets_imported or total_skipped:
@@ -5182,15 +5670,15 @@ class KimviImportDialog(QDialog):
         self._drop.file_dropped.connect(self._on_file)
         vl.addWidget(self._drop)
 
-        browse_row = QWidget()
-        browse_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(browse_row)
+        self._browse_row = QWidget()
+        self._browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(self._browse_row)
         brl.setContentsMargins(0, 0, 0, 0)
         browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
         browse_btn.clicked.connect(self._browse)
         brl.addStretch()
         brl.addWidget(browse_btn)
-        vl.addWidget(browse_row)
+        vl.addWidget(self._browse_row)
 
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
         vl.addWidget(self._stats_lbl)
@@ -5236,55 +5724,72 @@ class KimviImportDialog(QDialog):
 
         self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
+        busy = UploadBusy(self, f"Reading {Path(path).name}…", title="Import")
+        busy.__enter__()
         try:
-            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
-                sheet_label, records = _parse_kimvi_last_sheet(path)
+            def on_progress(message: str, value: int, maximum: int) -> None:
+                busy.update(message, value=value, maximum=maximum)
+
+            sheet_label, records = _parse_kimvi_last_sheet(path, progress=on_progress)
         except Exception as exc:
+            busy.close()
             self._stats_lbl.setText(f"Error reading file: {exc}")
             self._import_btn.setEnabled(False)
             return
 
         self._sheet_label = sheet_label
         self._records = records
-        asyncio.ensure_future(self._check_sheet(sheet_label, records))
+        asyncio.ensure_future(self._check_sheet(sheet_label, records, busy=busy))
 
-    async def _check_sheet(self, sheet_label: str, records: List[dict]) -> None:
+    async def _check_sheet(self, sheet_label: str, records: List[dict], busy=None) -> None:
         from tahmeed.services import accountant_service as svc
 
         try:
-            exists = await svc.kimvi_sheet_exists(sheet_label)
-        except Exception:
-            exists = False
+            if busy is not None:
+                busy.update("Checking if sheet was uploaded…", value=1, maximum=2)
+                await busy.tick()
+            try:
+                exists = await svc.kimvi_sheet_exists(sheet_label)
+            except Exception:
+                exists = False
 
-        self._already_exists = exists
-        money_in  = sum(r["amount_usd"] for r in records if r["amount_usd"] < 0)
-        money_out = sum(r["amount_usd"] for r in records if r["amount_usd"] > 0)
-        balance   = money_in + money_out
+            self._already_exists = exists
+            money_in  = sum(r["amount_usd"] for r in records if r["amount_usd"] < 0)
+            money_out = sum(r["amount_usd"] for r in records if r["amount_usd"] > 0)
+            balance   = money_in + money_out
 
-        if exists:
-            self._stats_lbl.setText(
-                f"Sheet \"{sheet_label}\" was already uploaded — import blocked."
-            )
-            self._import_btn.setEnabled(False)
-            self._import_btn.setText("Already Uploaded")
-        elif not records:
-            self._stats_lbl.setText(
-                f"Last sheet \"{sheet_label}\" has no data rows to import."
-            )
-            self._import_btn.setEnabled(False)
-            self._import_btn.setText("Import Sheet")
-        else:
-            self._stats_lbl.setText(
-                f"Last sheet: {sheet_label}     "
-                f"Rows: {len(records):,}     "
-                f"In: USD {money_in:,.0f}     "
-                f"Out: USD {money_out:,.0f}     "
-                f"Balance: USD {balance:,.0f}"
-            )
-            self._import_btn.setEnabled(True)
-            self._import_btn.setText(f"Import {len(records):,} Rows")
+            if busy is not None:
+                busy.update("Building preview…", value=2, maximum=2)
+                await busy.tick()
 
-        self._fill_preview(records[:10])
+            if exists:
+                self._stats_lbl.setText(
+                    f"Sheet \"{sheet_label}\" was already uploaded — import blocked."
+                )
+                self._import_btn.setEnabled(False)
+                self._import_btn.setText("Already Uploaded")
+            elif not records:
+                self._stats_lbl.setText(
+                    f"Last sheet \"{sheet_label}\" has no data rows to import."
+                )
+                self._import_btn.setEnabled(False)
+                self._import_btn.setText("Import Sheet")
+            else:
+                self._stats_lbl.setText(
+                    f"Last sheet: {sheet_label}     "
+                    f"Rows: {len(records):,}     "
+                    f"In: USD {money_in:,.0f}     "
+                    f"Out: USD {money_out:,.0f}     "
+                    f"Balance: USD {balance:,.0f}"
+                )
+                self._import_btn.setEnabled(True)
+                self._import_btn.setText(f"Import {len(records):,} Rows")
+
+            self._fill_preview(records[:10])
+            _hide_import_upload_chrome(self._drop, self._browse_row)
+        finally:
+            if busy is not None:
+                busy.close()
 
     def _fill_preview(self, rows: List[dict]) -> None:
         t = self._preview_tbl
@@ -5305,6 +5810,7 @@ class KimviImportDialog(QDialog):
         from tahmeed.services import accountant_service as svc
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
         from tahmeed.ui.async_utils import pause_background_polls
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
 
         docs = []
         for rec in self._records:
@@ -5343,7 +5849,21 @@ class KimviImportDialog(QDialog):
                         self._import_btn.setEnabled(True)
                         self._import_btn.setText(f"Import {len(self._records):,} Rows")
                     return
-                saved = await svc.save_kimvi_import(gate.rows)
+                total = len(gate.rows)
+                with UploadBusy(
+                    self, f"Saving {total:,} rows…", title="Import"
+                ) as busy:
+                    async def _on_progress(done: int, tot: int) -> None:
+                        busy.update(
+                            f"Saving {done:,} of {tot:,} rows…",
+                            value=done,
+                            maximum=max(1, tot),
+                        )
+                        await busy.tick()
+
+                    busy.update(f"Saving 0 of {total:,} rows…", value=0, maximum=max(1, total))
+                    await busy.tick()
+                    saved = await svc.save_kimvi_import(gate.rows, progress=_on_progress)
                 self.imported.emit(saved)
                 self.accept()
             except Exception as exc:
@@ -5378,7 +5898,7 @@ def _kimvi_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     t.setRowHeight(r, _ROW_H)
 
 
-class _KimviEntriesBase(_FeedExportMixin, QWidget):
+class _KimviEntriesBase(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
     _export_title = "Ahmed Kimvi"
     _export_filename = "AhmedKimvi"
     _export_headers = _KIMVI_HEADERS
@@ -5404,31 +5924,20 @@ class _KimviEntriesBase(_FeedExportMixin, QWidget):
         self._loading = False
         self._build()
 
-    def _build(self) -> None:
-        self.setStyleSheet("background:transparent;")
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(8)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
+    def _build_filter_controls(self) -> None:
+        """Create filter widgets for the parent chrome bar (not laid out here)."""
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search truck, particulars, date…")
-        self._search_edit.setFixedWidth(300)
+        self._search_edit.setMinimumWidth(220)
+        self._search_edit.setMaximumWidth(320)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
 
         self._year_cb = QComboBox()
         self._year_cb.addItem("All Years", 0)
         self._year_cb.setFixedWidth(110)
         self._year_cb.setStyleSheet(_input_ss())
         self._year_cb.currentIndexChanged.connect(self._on_year)
-        tbl.addWidget(self._year_cb)
 
         self._month_cb = QComboBox()
         for label, val in _TOLL_MONTHS:
@@ -5437,28 +5946,31 @@ class _KimviEntriesBase(_FeedExportMixin, QWidget):
         self._month_cb.setStyleSheet(_input_ss())
         self._month_cb.setEnabled(False)
         self._month_cb.currentIndexChanged.connect(self._on_month)
-        tbl.addWidget(self._month_cb)
 
+        self._date_host = QWidget()
+        self._date_host.setStyleSheet("background:transparent;")
+        date_hl = QHBoxLayout(self._date_host)
+        date_hl.setContentsMargins(0, 0, 0, 0)
+        date_hl.setSpacing(8)
         self._from_date, self._to_date = add_from_to_editors(
-            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            date_hl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
             optional=True,
         )
+        self._register_chrome_filters(
+            self._search_edit, self._year_cb, self._month_cb, self._date_host,
+        )
 
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(self._clear_filters)
-        tbl.addWidget(clear_btn)
-
-        tbl.addStretch()
-        self._add_export_btn(tbl)
-        vl.addWidget(tb)
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        self._build_filter_controls()
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
 
         self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
-            _make_congo_summary_cards()
+            _make_chrome_money_kpi("USD")
         )
-        vl.addWidget(self._summary_frame)
-
-        self._totals = _TotalsBar([("count", "Total records: ")])
-        vl.addWidget(self._totals)
+        self._register_chrome_summary(self._summary_frame)
 
         self._table = _make_kimvi_table(_KIMVI_HEADERS)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -5549,7 +6061,6 @@ class _KimviEntriesBase(_FeedExportMixin, QWidget):
                 float(totals.get("money_in", 0)),
                 float(totals.get("money_out", 0)),
             )
-            self._totals.set_total("count", int(totals.get("count", 0)), "")
             self._update_status()
 
         finally:
@@ -5986,12 +6497,16 @@ class _KimviUploadDetail(_FeedExportMixin, QWidget):
         self._reset_and_load()
 
 
-class AhmedKimviWidget(QWidget):
+class AhmedKimviWidget(_FeedRibbonPageMixin, QWidget):
     """
     Ahmed Kimvi (Klesa) main page.
 
     Tabs: All Entries, Money In, Called Out, Uploads, Skipped.
+    Chrome: title + QB-style ribbon + filters left / tabs right.
     """
+
+    _ribbon_uploads_tab = 3
+    _ribbon_filter_tab_indexes = {0, 1, 2}
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -5999,28 +6514,29 @@ class AhmedKimviWidget(QWidget):
         self.refresh()
 
     def _build(self) -> None:
+        from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
+
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
-        vl.setSpacing(12)
+        vl.setContentsMargins(16, 12, 16, 12)
+        vl.setSpacing(8)
 
-        header = _PageHeader("Ahmed Kimvi (Klesa)", "mdi.account-cash")
-        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
-        tmpl_btn.clicked.connect(self._download_template)
-        bulk_btn = _btn("Bulk Import All Sheets", "mdi.file-multiple-outline", primary=False)
-        bulk_btn.clicked.connect(self._open_bulk_import)
-        self._import_btn = _btn("Import Latest Sheet", "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        header.add_right(tmpl_btn)
-        header.add_right(bulk_btn)
-        header.add_right(self._import_btn)
-        vl.addWidget(header)
-        vl.addWidget(_hsep())
+        vl.addWidget(_PageHeader("Ahmed Kimvi (Klesa)", "mdi.account-cash"))
+
+        self._ribbon = FeedRibbonToolbar(
+            import_label="Import Latest\nSheet",
+            import_tip="Import the latest sheet from an Ahmed Kimvi workbook",
+            bulk_import_label="Bulk Import\nAll Sheets",
+        )
+        self._wire_feed_ribbon()
+        vl.addWidget(self._ribbon)
 
         self._tabs = _SegmentTabBar(
-            ["All Entries", "Money In", "Called Out", "Uploads", "Skipped"]
+            ["All Entries", "Money In", "Called Out", "Uploads", "Skipped"],
+            stretch=False,
         )
-        vl.addWidget(self._tabs)
+        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
@@ -6063,9 +6579,11 @@ class AhmedKimviWidget(QWidget):
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+        self._sync_chrome_for_tab(0)
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
+        self._sync_chrome_for_tab(idx)
         if idx == 4:
             self._skipped.refresh()
 
@@ -6309,30 +6827,56 @@ def _parse_zambia_parking_sheet(ws, sheet_label: str = "") -> List[dict]:
     return records
 
 
-def _parse_zambia_last_sheet(path: str) -> Tuple[str, List[dict]]:
+def _parse_zambia_last_sheet(
+    path: str,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+) -> Tuple[str, List[dict]]:
     """Read only the last worksheet from a Zambia Parking workbook."""
     if not _HAS_OPENPYXL:
         raise RuntimeError("openpyxl is required to import Zambia Parking Excel files.")
 
+    _report_parse_progress(progress, "Opening workbook…", 0, 2)
     wb = openpyxl.load_workbook(path, data_only=True)
     if not wb.sheetnames:
+        _report_parse_progress(progress, "No sheets found", 2, 2)
         return "", []
 
     sheet_name = wb.sheetnames[-1]
-    return sheet_name, _parse_zambia_parking_sheet(wb[sheet_name], sheet_name)
+    _report_parse_progress(progress, f"Parsing sheet: {sheet_name}", 1, 2)
+    records = _parse_zambia_parking_sheet(wb[sheet_name], sheet_name)
+    _report_parse_progress(
+        progress,
+        f"Read {len(records):,} rows from {sheet_name}",
+        2,
+        2,
+    )
+    return sheet_name, records
 
 
-def _parse_zambia_all_sheets(path: str) -> List[dict]:
+def _parse_zambia_all_sheets(
+    path: str,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+) -> List[dict]:
     """Parse every worksheet in a Zambia Parking workbook."""
     if not _HAS_OPENPYXL:
         raise RuntimeError("openpyxl is required to import Zambia Parking Excel files.")
 
+    _report_parse_progress(progress, "Opening workbook…", 0, 1)
     wb = openpyxl.load_workbook(path, data_only=True)
+    names = list(wb.sheetnames)
+    n = max(1, len(names))
+    _report_parse_progress(progress, f"Loaded {len(names):,} sheet(s)…", 0, n)
     batches: List[dict] = []
-    for sheet_name in wb.sheetnames:
+    for i, sheet_name in enumerate(names):
         records = _parse_zambia_parking_sheet(wb[sheet_name], sheet_name)
         if records:
             batches.append({"sheet_label": sheet_name, "records": records})
+        _report_parse_progress(
+            progress,
+            f"Parsing sheet {i + 1:,} of {len(names):,}: {sheet_name}",
+            i + 1,
+            n,
+        )
     return batches
 
 
@@ -6372,7 +6916,7 @@ def _zambia_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
 
 
 def _make_zambia_summary_cards() -> Tuple[QFrame, QLabel, QLabel, QLabel]:
-    """Money In (credit) / Money Out (debit) / Balance summary strip for Zambia views."""
+    """Money In / Out / Balance strip for Zambia upload-detail views (full card)."""
     frame = QFrame()
     frame.setStyleSheet(
         f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
@@ -6396,17 +6940,25 @@ def _set_zambia_summary(
     total_credit: float, total_debit: float,
 ) -> None:
     balance = total_credit - total_debit
-    in_lbl.setText(f"Money In: ZMW {_fmt_num(total_credit, '', 0)}")
-    out_lbl.setText(f"Money Out: ZMW {_fmt_num(total_debit, '', 0)}")
+    compact = bool(getattr(in_lbl, "_chrome_kpi", False))
+    if compact:
+        in_lbl.setText(f"In ZMW {_fmt_num(total_credit, '', 0)}")
+        out_lbl.setText(f"Out ZMW {_fmt_num(total_debit, '', 0)}")
+        bal_lbl.setText(f"Bal ZMW {_fmt_num(balance, '', 0)}")
+        bal_size = "8px"
+    else:
+        in_lbl.setText(f"Money In: ZMW {_fmt_num(total_credit, '', 0)}")
+        out_lbl.setText(f"Money Out: ZMW {_fmt_num(total_debit, '', 0)}")
+        bal_lbl.setText(f"Balance: ZMW {_fmt_num(balance, '', 0)}")
+        bal_size = "12px"
     bal_color = _GREEN if balance > 0 else (_RED if balance < 0 else _T1)
-    bal_lbl.setText(f"Balance: ZMW {_fmt_num(balance, '', 0)}")
     bal_lbl.setStyleSheet(
-        f"color:{bal_color};font-size:12px;font-weight:600;"
-        "font-family:'Segoe UI';background:transparent;"
+        f"color:{bal_color};font-size:{bal_size};font-weight:700;"
+        "font-family:'Segoe UI';background:transparent;padding:0;margin:0;"
     )
 
 
-class _ZambiaParkingEntriesBase(_FeedExportMixin, QWidget):
+class _ZambiaParkingEntriesBase(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
     _export_title = "Zambia Parking"
     _export_filename = "ZambiaParking"
     _export_headers = _ZAMBIA_PARK_HEADERS
@@ -6426,31 +6978,20 @@ class _ZambiaParkingEntriesBase(_FeedExportMixin, QWidget):
         self._loading = False
         self._build()
 
-    def _build(self) -> None:
-        self.setStyleSheet("background:transparent;")
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(8)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
+    def _build_filter_controls(self) -> None:
+        """Create filter widgets for the parent chrome bar (not laid out here)."""
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search plate, ticket, destination, type…")
-        self._search_edit.setFixedWidth(300)
+        self._search_edit.setMinimumWidth(220)
+        self._search_edit.setMaximumWidth(320)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
 
         self._year_cb = QComboBox()
         self._year_cb.addItem("All Years", 0)
         self._year_cb.setFixedWidth(110)
         self._year_cb.setStyleSheet(_input_ss())
         self._year_cb.currentIndexChanged.connect(self._on_year)
-        tbl.addWidget(self._year_cb)
 
         self._month_cb = QComboBox()
         for label, val in _TOLL_MONTHS:
@@ -6459,28 +7000,31 @@ class _ZambiaParkingEntriesBase(_FeedExportMixin, QWidget):
         self._month_cb.setStyleSheet(_input_ss())
         self._month_cb.setEnabled(False)
         self._month_cb.currentIndexChanged.connect(self._on_month)
-        tbl.addWidget(self._month_cb)
 
+        self._date_host = QWidget()
+        self._date_host.setStyleSheet("background:transparent;")
+        date_hl = QHBoxLayout(self._date_host)
+        date_hl.setContentsMargins(0, 0, 0, 0)
+        date_hl.setSpacing(8)
         self._from_date, self._to_date = add_from_to_editors(
-            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            date_hl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
             optional=True,
         )
+        self._register_chrome_filters(
+            self._search_edit, self._year_cb, self._month_cb, self._date_host,
+        )
 
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(self._clear_filters)
-        tbl.addWidget(clear_btn)
-
-        tbl.addStretch()
-        self._add_export_btn(tbl)
-        vl.addWidget(tb)
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        self._build_filter_controls()
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
 
         self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
-            _make_zambia_summary_cards()
+            _make_chrome_money_kpi("ZMW")
         )
-        vl.addWidget(self._summary_frame)
-
-        self._totals = _TotalsBar([("count", "Total records: ")])
-        vl.addWidget(self._totals)
+        self._register_chrome_summary(self._summary_frame)
 
         self._table = _make_table(_ZAMBIA_PARK_HEADERS)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -6571,7 +7115,6 @@ class _ZambiaParkingEntriesBase(_FeedExportMixin, QWidget):
                 float(totals.get("total_credit", 0)),
                 float(totals.get("total_debit", 0)),
             )
-            self._totals.set_total("count", int(totals.get("count", 0)), "")
             self._update_status()
 
         finally:
@@ -6705,15 +7248,15 @@ class ZambiaParkingImportDialog(QDialog):
         self._drop.file_dropped.connect(self._on_file)
         vl.addWidget(self._drop)
 
-        browse_row = QWidget()
-        browse_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(browse_row)
+        self._browse_row = QWidget()
+        self._browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(self._browse_row)
         brl.setContentsMargins(0, 0, 0, 0)
         browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
         browse_btn.clicked.connect(self._browse)
         brl.addStretch()
         brl.addWidget(browse_btn)
-        vl.addWidget(browse_row)
+        vl.addWidget(self._browse_row)
 
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
         vl.addWidget(self._stats_lbl)
@@ -6763,83 +7306,102 @@ class ZambiaParkingImportDialog(QDialog):
 
         self._stats_lbl.setText("Reading file…")
         self._source_filename = Path(path).name
+        busy = UploadBusy(self, f"Reading {Path(path).name}…", title="Import")
+        busy.__enter__()
         try:
-            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
-                sheet_label, records = _parse_zambia_last_sheet(path)
+            def on_progress(message: str, value: int, maximum: int) -> None:
+                busy.update(message, value=value, maximum=maximum)
+
+            sheet_label, records = _parse_zambia_last_sheet(path, progress=on_progress)
         except Exception as exc:
+            busy.close()
             self._stats_lbl.setText(f"Error reading file: {exc}")
             self._import_btn.setEnabled(False)
             return
 
         self._sheet_label = sheet_label
         self._records = records
-        asyncio.ensure_future(self._check_sheet(sheet_label, records))
+        asyncio.ensure_future(self._check_sheet(sheet_label, records, busy=busy))
 
-    async def _check_sheet(self, sheet_label: str, records: List[dict]) -> None:
+    async def _check_sheet(self, sheet_label: str, records: List[dict], busy=None) -> None:
         from tahmeed.services import accountant_service as svc
 
-        self._all_file_records = list(records)
-        self._matching_uploads: List[dict] = []
+        can_review = False
+        try:
+            if busy is not None:
+                busy.update("Checking for prior uploads…", value=1, maximum=2)
+                await busy.tick()
 
-        matching: List[dict] = []
-        if records:
-            try:
-                matching = await svc.zambia_exact_content_already_uploaded(records)
-            except Exception:
-                matching = []
-        self._matching_uploads = matching
+            self._all_file_records = list(records)
+            self._matching_uploads: List[dict] = []
 
-        already = bool(matching)
-        self._already_exists = already
-        self._records = [] if already else list(records)
+            matching: List[dict] = []
+            if records:
+                try:
+                    matching = await svc.zambia_exact_content_already_uploaded(records)
+                except Exception:
+                    matching = []
+            self._matching_uploads = matching
 
-        total_debit  = sum(r.get("debit") or 0 for r in records)
-        total_credit = sum(r.get("credit") or 0 for r in records)
-        closing_bal  = _zambia_batch_balance(records)
+            already = bool(matching)
+            self._already_exists = already
+            self._records = [] if already else list(records)
 
-        can_review = bool(matching)
-        self._review_dupes_btn.setEnabled(can_review)
-        self._review_dupes_btn.setText(
-            f"Review Prior Upload ({len(matching):,})" if matching else "Review Prior Upload"
-        )
+            total_debit  = sum(r.get("debit") or 0 for r in records)
+            total_credit = sum(r.get("credit") or 0 for r in records)
+            closing_bal  = _zambia_batch_balance(records)
 
-        if already:
-            names = ", ".join(
-                (u.get("source_filename") or u.get("sheet_label") or "prior upload")
-                for u in matching[:3]
+            can_review = bool(matching)
+            self._review_dupes_btn.setEnabled(can_review)
+            self._review_dupes_btn.setText(
+                f"Review Prior Upload ({len(matching):,})" if matching else "Review Prior Upload"
             )
-            self._stats_lbl.setText(
-                f"Already imported — same statement content as {names}"
-                f"{'…' if len(matching) > 3 else ''}. Import blocked "
-                f"(open the prior upload instead). Trucks are not checked "
-                f"until the file is new."
-            )
-            self._import_btn.setEnabled(False)
-            self._import_btn.setText("Already Uploaded")
-        elif not records:
-            self._stats_lbl.setText(
-                f"Last sheet \"{sheet_label}\" has no data rows to import."
-            )
-            self._import_btn.setEnabled(False)
-            self._import_btn.setText("Import Sheet")
-        else:
-            self._stats_lbl.setText(
-                f"Last sheet: {sheet_label}     "
-                f"Rows: {len(records):,}     "
-                f"Debit: ZMW {total_debit:,.0f}     "
-                f"Credit: ZMW {total_credit:,.0f}     "
-                f"Closing: ZMW {closing_bal:,.0f}"
-            )
-            self._import_btn.setEnabled(True)
-            self._import_btn.setText(f"Import {len(records):,} Rows")
 
-        t = self._preview_tbl
-        t.setRowCount(0)
-        preview_src = [] if already else records
-        for rec in preview_src[:10]:
-            row = t.rowCount()
-            t.insertRow(row)
-            _zambia_fill_row(t, row, rec)
+            if busy is not None:
+                busy.update("Building preview…", value=2, maximum=2)
+                await busy.tick()
+
+            if already:
+                names = ", ".join(
+                    (u.get("source_filename") or u.get("sheet_label") or "prior upload")
+                    for u in matching[:3]
+                )
+                self._stats_lbl.setText(
+                    f"Already imported — same statement content as {names}"
+                    f"{'…' if len(matching) > 3 else ''}. Import blocked "
+                    f"(open the prior upload instead). Trucks are not checked "
+                    f"until the file is new."
+                )
+                self._import_btn.setEnabled(False)
+                self._import_btn.setText("Already Uploaded")
+            elif not records:
+                self._stats_lbl.setText(
+                    f"Last sheet \"{sheet_label}\" has no data rows to import."
+                )
+                self._import_btn.setEnabled(False)
+                self._import_btn.setText("Import Sheet")
+            else:
+                self._stats_lbl.setText(
+                    f"Last sheet: {sheet_label}     "
+                    f"Rows: {len(records):,}     "
+                    f"Debit: ZMW {total_debit:,.0f}     "
+                    f"Credit: ZMW {total_credit:,.0f}     "
+                    f"Closing: ZMW {closing_bal:,.0f}"
+                )
+                self._import_btn.setEnabled(True)
+                self._import_btn.setText(f"Import {len(records):,} Rows")
+
+            t = self._preview_tbl
+            t.setRowCount(0)
+            preview_src = [] if already else records
+            for rec in preview_src[:10]:
+                row = t.rowCount()
+                t.insertRow(row)
+                _zambia_fill_row(t, row, rec)
+            _hide_import_upload_chrome(self._drop, self._browse_row)
+        finally:
+            if busy is not None:
+                busy.close()
 
         if can_review:
             from tahmeed.ui.async_utils import schedule_call
@@ -6872,6 +7434,7 @@ class ZambiaParkingImportDialog(QDialog):
         from tahmeed.services import accountant_service as svc
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
         from tahmeed.ui.async_utils import pause_background_polls
+        from tahmeed.ui.widgets.upload_busy import UploadBusy
 
         docs = []
         for rec in self._records:
@@ -6930,7 +7493,23 @@ class ZambiaParkingImportDialog(QDialog):
                 file_hash = svc.zambia_batch_content_hash(self._all_file_records or docs)
                 for row in gate.rows:
                     row["content_hash"] = file_hash
-                saved = await svc.save_imported_feed(gate.rows)
+                total = len(gate.rows)
+                with UploadBusy(
+                    self, f"Saving {total:,} rows…", title="Import"
+                ) as busy:
+                    async def _on_progress(done: int, tot: int) -> None:
+                        busy.update(
+                            f"Saving {done:,} of {tot:,} rows…",
+                            value=done,
+                            maximum=max(1, tot),
+                        )
+                        await busy.tick()
+
+                    busy.update(f"Saving 0 of {total:,} rows…", value=0, maximum=max(1, total))
+                    await busy.tick()
+                    saved = await svc.save_imported_feed(
+                        gate.rows, progress=_on_progress
+                    )
                 self.imported.emit(saved)
                 self.accept()
             except Exception as exc:
@@ -7260,12 +7839,16 @@ class _ZambiaParkingUploadDetail(_FeedExportMixin, QWidget):
         self._reset_and_load()
 
 
-class ZambiaParkingWidget(QWidget):
+class ZambiaParkingWidget(_FeedRibbonPageMixin, QWidget):
     """
     Zambia Parking main page.
 
-    Three tabs: All Entries, Money In (credit), and Uploads (browse + drill-down).
+    Tabs: All Entries, Money In (credit), Uploads (browse + drill-down), Skipped.
+    Chrome: title + QB-style ribbon + filters left / tabs right.
     """
+
+    _ribbon_uploads_tab = 2
+    _ribbon_filter_tab_indexes = {0, 1}
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -7273,26 +7856,28 @@ class ZambiaParkingWidget(QWidget):
         self.refresh()
 
     def _build(self) -> None:
+        from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
+
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
-        vl.setSpacing(12)
+        vl.setContentsMargins(16, 12, 16, 12)
+        vl.setSpacing(8)
 
-        header = _PageHeader("Zambia Parking", "mdi.map")
-        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
-        tmpl_btn.clicked.connect(self._download_template)
-        bulk_btn = _btn("Bulk Import All Sheets", "mdi.file-multiple-outline", primary=False)
-        bulk_btn.clicked.connect(self._open_bulk_import)
-        self._import_btn = _btn("Import Latest Sheet", "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        header.add_right(tmpl_btn)
-        header.add_right(bulk_btn)
-        header.add_right(self._import_btn)
-        vl.addWidget(header)
-        vl.addWidget(_hsep())
+        vl.addWidget(_PageHeader("Zambia Parking", "mdi.map"))
 
-        self._tabs = _SegmentTabBar(["All Entries", "Money In", "Uploads", "Skipped"])
-        vl.addWidget(self._tabs)
+        self._ribbon = FeedRibbonToolbar(
+            import_label="Import Latest\nSheet",
+            import_tip="Import the latest sheet from a Zambia Parking workbook",
+            bulk_import_label="Bulk Import\nAll Sheets",
+        )
+        self._wire_feed_ribbon()
+        vl.addWidget(self._ribbon)
+
+        self._tabs = _SegmentTabBar(
+            ["All Entries", "Money In", "Uploads", "Skipped"], stretch=False,
+        )
+        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
@@ -7332,9 +7917,11 @@ class ZambiaParkingWidget(QWidget):
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+        self._sync_chrome_for_tab(0)
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
+        self._sync_chrome_for_tab(idx)
         if idx == 3:
             self._skipped.refresh()
 
@@ -8592,14 +9179,17 @@ def _afritrack_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     _finish_table_row(t, r)
 
 
-class _AfritrackAllEntries(_FeedExportMixin, QWidget):
+class _AfritrackAllEntries(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
     _export_title = "Afritrack"
     _export_filename = "Afritrack"
     _export_headers = _AF_DETAIL_HEADERS
     _export_row_fn = staticmethod(_afritrack_export_row)
     _export_svc = "get_afritrack_all_records"
 
-    """Flat, filterable list of every Afritrack record with infinite scroll."""
+    """Flat, filterable list of every Afritrack record with infinite scroll.
+
+    Filter controls live in the feed chrome bar; table only here (no totals).
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -8611,31 +9201,20 @@ class _AfritrackAllEntries(_FeedExportMixin, QWidget):
         self._loading = False
         self._build()
 
-    def _build(self) -> None:
-        self.setStyleSheet("background:transparent;")
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(8)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
+    def _build_filter_controls(self) -> None:
+        """Create filter widgets for the parent chrome bar (not laid out here)."""
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search truck, remarks, period, file…")
-        self._search_edit.setFixedWidth(300)
+        self._search_edit.setMinimumWidth(220)
+        self._search_edit.setMaximumWidth(320)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
 
         self._year_cb = QComboBox()
         self._year_cb.addItem("All Years", 0)
         self._year_cb.setFixedWidth(110)
         self._year_cb.setStyleSheet(_input_ss())
         self._year_cb.currentIndexChanged.connect(self._on_year)
-        tbl.addWidget(self._year_cb)
 
         self._month_cb = QComboBox()
         for label, val in _TOLL_MONTHS:
@@ -8644,28 +9223,26 @@ class _AfritrackAllEntries(_FeedExportMixin, QWidget):
         self._month_cb.setStyleSheet(_input_ss())
         self._month_cb.setEnabled(False)
         self._month_cb.currentIndexChanged.connect(self._on_month)
-        tbl.addWidget(self._month_cb)
 
+        self._date_host = QWidget()
+        self._date_host.setStyleSheet("background:transparent;")
+        date_hl = QHBoxLayout(self._date_host)
+        date_hl.setContentsMargins(0, 0, 0, 0)
+        date_hl.setSpacing(8)
         self._from_date, self._to_date = add_from_to_editors(
-            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            date_hl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
             optional=True,
         )
+        self._register_chrome_filters(
+            self._search_edit, self._year_cb, self._month_cb, self._date_host,
+        )
 
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(self._clear_filters)
-        tbl.addWidget(clear_btn)
-
-        tbl.addStretch()
-        self._add_export_btn(tbl)
-        vl.addWidget(tb)
-
-        self._totals = _TotalsBar([
-            ("t", "Tahmeed "),
-            ("i", "Invoice "),
-            ("v", "Variance "),
-            ("c", "Rows "),
-        ])
-        vl.addWidget(self._totals)
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        self._build_filter_controls()
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
 
         self._table = _make_table(_AF_DETAIL_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -8732,8 +9309,7 @@ class _AfritrackAllEntries(_FeedExportMixin, QWidget):
             from tahmeed.services import accountant_service as svc
             month = self._effective_month()
             try:
-                totals, recs, total = await asyncio.gather(
-                    svc.get_afritrack_all_totals(self._search, self._year, month, **self._date_kw()),
+                recs, total = await asyncio.gather(
                     svc.get_afritrack_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state)),
                     svc.count_afritrack_all_records(self._search, self._year, month, **self._date_kw()),
                 )
@@ -8744,10 +9320,6 @@ class _AfritrackAllEntries(_FeedExportMixin, QWidget):
             self._total = total
             self._append_rows(recs)
             self._loaded = len(recs)
-            self._totals.set_total("t", float(totals.get("total_tahmeed", 0) or 0), "USD ")
-            self._totals.set_total("i", float(totals.get("total_invoice", 0) or 0), "USD ")
-            self._totals.set_total("v", float(totals.get("total_variance", 0) or 0), "USD ")
-            self._totals.set_total("c", int(totals.get("count", 0) or 0), "")
             self._update_status()
         finally:
             self._loading = False
@@ -9214,30 +9786,36 @@ class _AfritrackUploadDetail(_FeedExportMixin, QWidget):
             asyncio.ensure_future(self._load_more())
 
 
-class AfritrackWidget(QWidget):
+class AfritrackWidget(_FeedRibbonPageMixin, QWidget):
+    """Afritrack Schedule: title + QB-style ribbon + filters left / tabs right."""
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._build()
         self.refresh()
 
     def _build(self) -> None:
+        from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
+
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
-        vl.setSpacing(12)
+        vl.setContentsMargins(16, 12, 16, 12)
+        vl.setSpacing(8)
 
-        header = _PageHeader("Afritrack Schedule", "mdi.satellite-variant")
-        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
-        tmpl_btn.clicked.connect(self._download_template)
-        import_btn = _btn("Import from Excel", "mdi.upload-outline")
-        import_btn.clicked.connect(self._open_import)
-        header.add_right(tmpl_btn)
-        header.add_right(import_btn)
-        vl.addWidget(header)
-        vl.addWidget(_hsep())
+        vl.addWidget(_PageHeader("Afritrack Schedule", "mdi.satellite-variant"))
 
-        self._tabs = _SegmentTabBar(["All Entries", "Uploads", "Skipped"])
-        vl.addWidget(self._tabs)
+        self._ribbon = FeedRibbonToolbar(
+            import_label="Import from\nExcel",
+            import_tip="Import Afritrack schedule spreadsheet",
+        )
+        self._wire_feed_ribbon()
+        vl.addWidget(self._ribbon)
+
+        self._tabs = _SegmentTabBar(
+            ["All Entries", "Uploads", "Skipped"], stretch=False,
+        )
+        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
@@ -9274,9 +9852,11 @@ class AfritrackWidget(QWidget):
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+        self._sync_chrome_for_tab(0)
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
+        self._sync_chrome_for_tab(idx)
         if idx == 1:
             self._show_browse()
         elif idx == 2:
@@ -9372,8 +9952,27 @@ class AfritrackWidget(QWidget):
                 else:
                     QMessageBox.warning(self, "Import", msg)
                 return
-            with UploadBusy(self, "Saving imported rows…", title="Import"):
-                saved = await svc.save_imported_feed(gate.rows)
+            total = len(gate.rows)
+            with UploadBusy(
+                self, f"Saving {total:,} rows…", title="Import"
+            ) as busy:
+                async def _on_progress(done: int, tot: int) -> None:
+                    busy.update(
+                        f"Saving {done:,} of {tot:,} rows…",
+                        value=done,
+                        maximum=max(1, tot),
+                    )
+                    await busy.tick()
+
+                busy.update(
+                    f"Saving 0 of {total:,} rows…",
+                    value=0,
+                    maximum=max(1, total),
+                )
+                await busy.tick()
+                saved = await svc.save_imported_feed(
+                    gate.rows, progress=_on_progress
+                )
         except Exception as exc:
             QMessageBox.critical(self, "Import Error", str(exc))
             return
@@ -9646,16 +10245,16 @@ class _InsuranceImportDialog(QDialog):
         self._drop.file_dropped.connect(self._on_file)
         vl.addWidget(self._drop)
 
-        browse_row = QWidget()
-        browse_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(browse_row)
+        self._browse_row = QWidget()
+        self._browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(self._browse_row)
         brl.setContentsMargins(0, 0, 0, 0)
         brl.setSpacing(8)
         browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
         browse_btn.clicked.connect(self._browse)
         brl.addStretch()
         brl.addWidget(browse_btn)
-        vl.addWidget(browse_row)
+        vl.addWidget(self._browse_row)
 
         self._stats_lbl = _lbl("No file loaded.", size=12, color=_T2)
         vl.addWidget(self._stats_lbl)
@@ -9723,6 +10322,7 @@ class _InsuranceImportDialog(QDialog):
         self._import_btn.setEnabled(bool(self._new_rows))
         self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
         self._fill_preview(self._new_rows[:10])
+        _hide_import_upload_chrome(self._drop, self._browse_row)
 
     def _fill_preview(self, rows: List[dict]) -> None:
         t = self._preview_tbl
@@ -9785,7 +10385,29 @@ class _InsuranceImportDialog(QDialog):
                         self._import_btn.setText(f"Import {len(self._new_rows):,} Records")
                         return
 
-                saved = await svc.save_imported_feed(rows)
+                from tahmeed.ui.widgets.upload_busy import UploadBusy
+
+                total = len(rows)
+                with UploadBusy(
+                    self, f"Saving {total:,} rows…", title="Import"
+                ) as busy:
+                    async def _on_progress(done: int, tot: int) -> None:
+                        busy.update(
+                            f"Saving {done:,} of {tot:,} rows…",
+                            value=done,
+                            maximum=max(1, tot),
+                        )
+                        await busy.tick()
+
+                    busy.update(
+                        f"Saving 0 of {total:,} rows…",
+                        value=0,
+                        maximum=max(1, total),
+                    )
+                    await busy.tick()
+                    saved = await svc.save_imported_feed(
+                        rows, progress=_on_progress
+                    )
                 self._last_skipped = skipped
                 self.imported.emit(saved)
                 self.accept()
@@ -9968,7 +10590,9 @@ _COMESA_PREVIEW_KEYS    = ["name", "card_no", "valid_from", "valid_to",
                             "truck_reg", "premium", "month"]
 
 
-class ComesaWidget(_FeedExportMixin, QWidget):
+class ComesaWidget(_FeedRibbonPageMixin, _LiftedFiltersMixin, _FeedExportMixin, QWidget):
+    """COMESA Covers: info card + QB-style ribbon + filters left / tabs right."""
+
     _export_title = "COMESA Covers"
     _export_filename = "COMESA_Covers"
     _export_headers = _COMESA_PREVIEW_HEADERS
@@ -9976,6 +10600,8 @@ class ComesaWidget(_FeedExportMixin, QWidget):
     _export_svc = "get_insurance_feed"
     _export_kind = "insurance"
     _export_feed = "comesa"
+
+    _ribbon_filter_tab_indexes = {0}
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -9987,10 +10613,33 @@ class ComesaWidget(_FeedExportMixin, QWidget):
         self._build()
         self.refresh()
 
+    def _ribbon_page(self, idx: int):
+        # The All Entries list lives on this widget itself.
+        return self if idx == 0 else self._main_stack.widget(idx)
+
+    def _build_filter_controls(self) -> None:
+        """Create filter widgets for the chrome bar (not laid out in the page)."""
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search card no., truck, name…")
+        self._search_edit.setMinimumWidth(220)
+        self._search_edit.setMaximumWidth(320)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+
+        self._month_cb = QComboBox()
+        for m in _INS_MONTHS:
+            self._month_cb.addItem(m, "" if m == "All Months" else m)
+        self._month_cb.setFixedWidth(155)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+        self._register_chrome_filters(self._search_edit, self._month_cb)
+
     def _build(self) -> None:
+        from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
+
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 16, 20, 12)
+        vl.setContentsMargins(16, 12, 16, 12)
         vl.setSpacing(8)
 
         # QB info card
@@ -9999,8 +10648,19 @@ class ComesaWidget(_FeedExportMixin, QWidget):
         )
         vl.addWidget(self._info_card)
 
-        self._tabs = _SegmentTabBar(["All Entries", "Skipped"])
-        vl.addWidget(self._tabs)
+        self._ribbon = FeedRibbonToolbar(
+            import_label="Import",
+            import_tip="Import COMESA covers spreadsheet",
+            show_template=False,
+        )
+        self._wire_feed_ribbon()
+        vl.addWidget(self._ribbon)
+
+        self._tabs = _SegmentTabBar(["All Entries", "Skipped"], stretch=False)
+        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        vl.addWidget(chrome)
+
+        self._build_filter_controls()
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
@@ -10010,38 +10670,6 @@ class ComesaWidget(_FeedExportMixin, QWidget):
         evl = QVBoxLayout(entries_host)
         evl.setContentsMargins(0, 0, 0, 0)
         evl.setSpacing(8)
-
-        # Toolbar
-        tb  = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search card no., truck, name…")
-        self._search_edit.setFixedWidth(250)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-
-        self._month_cb = QComboBox()
-        for m in _INS_MONTHS:
-            self._month_cb.addItem(m, "" if m == "All Months" else m)
-        self._month_cb.setFixedWidth(155)
-        self._month_cb.setStyleSheet(_input_ss())
-        self._month_cb.currentIndexChanged.connect(self._on_month)
-        tbl.addWidget(self._month_cb)
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False, height=32)
-        clear_btn.clicked.connect(self._clear_filters)
-        tbl.addWidget(clear_btn)
-        tbl.addStretch()
-
-        self._import_btn = _btn("Import", "mdi.upload-outline", height=32)
-        self._import_btn.clicked.connect(self._do_import)
-        tbl.addWidget(self._import_btn)
-        self._add_export_btn(tbl)
-        evl.addWidget(tb)
 
         # Table card
         card = QFrame()
@@ -10082,9 +10710,11 @@ class ComesaWidget(_FeedExportMixin, QWidget):
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+        self._sync_chrome_for_tab(0)
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
+        self._sync_chrome_for_tab(idx)
         if idx == 1:
             self._skipped.refresh()
 
@@ -10212,7 +10842,9 @@ _STATUS_COLORS = {
 }
 
 
-class ThirdPartyWidget(_FeedExportMixin, QWidget):
+class ThirdPartyWidget(_FeedRibbonPageMixin, _LiftedFiltersMixin, _FeedExportMixin, QWidget):
+    """Third Party Covers: info card + QB-style ribbon + filters left / tabs right."""
+
     _export_title = "Third Party Covers"
     _export_filename = "ThirdParty_Covers"
     _export_headers = _TP_PREVIEW_HEADERS
@@ -10220,6 +10852,8 @@ class ThirdPartyWidget(_FeedExportMixin, QWidget):
     _export_svc = "get_insurance_feed"
     _export_kind = "insurance"
     _export_feed = "third_party"
+
+    _ribbon_filter_tab_indexes = {0}
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -10232,10 +10866,43 @@ class ThirdPartyWidget(_FeedExportMixin, QWidget):
         self._build()
         self.refresh()
 
+    def _ribbon_page(self, idx: int):
+        # The All Entries list lives on this widget itself.
+        return self if idx == 0 else self._main_stack.widget(idx)
+
+    def _build_filter_controls(self) -> None:
+        """Create filter widgets for the chrome bar (not laid out in the page)."""
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search reg. no., name…")
+        self._search_edit.setMinimumWidth(200)
+        self._search_edit.setMaximumWidth(280)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(self._on_search)
+
+        self._month_cb = QComboBox()
+        for m in _INS_MONTHS:
+            self._month_cb.addItem(m, "" if m == "All Months" else m)
+        self._month_cb.setFixedWidth(155)
+        self._month_cb.setStyleSheet(_input_ss())
+        self._month_cb.currentIndexChanged.connect(self._on_month)
+
+        self._status_cb = QComboBox()
+        for label, val in [("All Status", ""), ("PAID", "PAID"),
+                            ("UNPAID", "UNPAID")]:
+            self._status_cb.addItem(label, val)
+        self._status_cb.setFixedWidth(120)
+        self._status_cb.setStyleSheet(_input_ss())
+        self._status_cb.currentIndexChanged.connect(self._on_status)
+        self._register_chrome_filters(
+            self._search_edit, self._month_cb, self._status_cb,
+        )
+
     def _build(self) -> None:
+        from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
+
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 16, 20, 12)
+        vl.setContentsMargins(16, 12, 16, 12)
         vl.setSpacing(8)
 
         # QB info card
@@ -10244,8 +10911,19 @@ class ThirdPartyWidget(_FeedExportMixin, QWidget):
         )
         vl.addWidget(self._info_card)
 
-        self._tabs = _SegmentTabBar(["All Entries", "Skipped"])
-        vl.addWidget(self._tabs)
+        self._ribbon = FeedRibbonToolbar(
+            import_label="Import",
+            import_tip="Import Third Party covers spreadsheet",
+            show_template=False,
+        )
+        self._wire_feed_ribbon()
+        vl.addWidget(self._ribbon)
+
+        self._tabs = _SegmentTabBar(["All Entries", "Skipped"], stretch=False)
+        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        vl.addWidget(chrome)
+
+        self._build_filter_controls()
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
@@ -10255,47 +10933,6 @@ class ThirdPartyWidget(_FeedExportMixin, QWidget):
         evl = QVBoxLayout(entries_host)
         evl.setContentsMargins(0, 0, 0, 0)
         evl.setSpacing(8)
-
-        # Toolbar
-        tb  = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search reg. no., name…")
-        self._search_edit.setFixedWidth(220)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-
-        self._month_cb = QComboBox()
-        for m in _INS_MONTHS:
-            self._month_cb.addItem(m, "" if m == "All Months" else m)
-        self._month_cb.setFixedWidth(155)
-        self._month_cb.setStyleSheet(_input_ss())
-        self._month_cb.currentIndexChanged.connect(self._on_month)
-        tbl.addWidget(self._month_cb)
-
-        self._status_cb = QComboBox()
-        for label, val in [("All Status", ""), ("PAID", "PAID"),
-                            ("UNPAID", "UNPAID")]:
-            self._status_cb.addItem(label, val)
-        self._status_cb.setFixedWidth(120)
-        self._status_cb.setStyleSheet(_input_ss())
-        self._status_cb.currentIndexChanged.connect(self._on_status)
-        tbl.addWidget(self._status_cb)
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False, height=32)
-        clear_btn.clicked.connect(self._clear_filters)
-        tbl.addWidget(clear_btn)
-        tbl.addStretch()
-
-        self._import_btn = _btn("Import", "mdi.upload-outline", height=32)
-        self._import_btn.clicked.connect(self._do_import)
-        tbl.addWidget(self._import_btn)
-        self._add_export_btn(tbl)
-        evl.addWidget(tb)
 
         # Table card
         card = QFrame()
@@ -10338,9 +10975,11 @@ class ThirdPartyWidget(_FeedExportMixin, QWidget):
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+        self._sync_chrome_for_tab(0)
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
+        self._sync_chrome_for_tab(idx)
         if idx == 1:
             self._skipped.refresh()
 
@@ -10588,14 +11227,17 @@ def _rahntech_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     _finish_table_row(t, r)
 
 
-class _RahnTechAllEntries(_FeedExportMixin, QWidget):
+class _RahnTechAllEntries(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
     _export_title = "RahnTech"
     _export_filename = "RahnTech"
     _export_headers = _RAHNTECH_HEADERS
     _export_row_fn = staticmethod(_rahntech_export_row)
     _export_svc = "get_rahntech_all_records"
 
-    """Flat, filterable list of every RahnTech record with infinite scroll."""
+    """Flat, filterable list of every RahnTech record with infinite scroll.
+
+    Filter controls live in the feed chrome bar; table only here (no totals).
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -10607,31 +11249,20 @@ class _RahnTechAllEntries(_FeedExportMixin, QWidget):
         self._loading = False
         self._build()
 
-    def _build(self) -> None:
-        self.setStyleSheet("background:transparent;")
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(8)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
+    def _build_filter_controls(self) -> None:
+        """Create filter widgets for the parent chrome bar (not laid out here)."""
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search truck, driver, trip, device…")
-        self._search_edit.setFixedWidth(300)
+        self._search_edit.setMinimumWidth(220)
+        self._search_edit.setMaximumWidth(320)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
 
         self._year_cb = QComboBox()
         self._year_cb.addItem("All Years", 0)
         self._year_cb.setFixedWidth(110)
         self._year_cb.setStyleSheet(_input_ss())
         self._year_cb.currentIndexChanged.connect(self._on_year)
-        tbl.addWidget(self._year_cb)
 
         self._month_cb = QComboBox()
         for label, val in _TOLL_MONTHS:
@@ -10640,23 +11271,26 @@ class _RahnTechAllEntries(_FeedExportMixin, QWidget):
         self._month_cb.setStyleSheet(_input_ss())
         self._month_cb.setEnabled(False)
         self._month_cb.currentIndexChanged.connect(self._on_month)
-        tbl.addWidget(self._month_cb)
 
+        self._date_host = QWidget()
+        self._date_host.setStyleSheet("background:transparent;")
+        date_hl = QHBoxLayout(self._date_host)
+        date_hl.setContentsMargins(0, 0, 0, 0)
+        date_hl.setSpacing(8)
         self._from_date, self._to_date = add_from_to_editors(
-            tbl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
+            date_hl, self._reset_and_load, input_ss=_input_ss(), lbl_factory=_lbl,
             optional=True,
         )
+        self._register_chrome_filters(
+            self._search_edit, self._year_cb, self._month_cb, self._date_host,
+        )
 
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(self._clear_filters)
-        tbl.addWidget(clear_btn)
-
-        tbl.addStretch()
-        self._add_export_btn(tbl)
-        vl.addWidget(tb)
-
-        self._totals = _TotalsBar([("count", "Total records: ")])
-        vl.addWidget(self._totals)
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        self._build_filter_controls()
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
 
         self._table = _make_table(_RAHNTECH_HEADERS)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -10718,8 +11352,7 @@ class _RahnTechAllEntries(_FeedExportMixin, QWidget):
             from tahmeed.services import accountant_service as svc
             month = self._effective_month()
             try:
-                totals, recs, total = await asyncio.gather(
-                    svc.get_rahntech_all_totals(self._search, self._year, month, **self._date_kw()),
+                recs, total = await asyncio.gather(
                     svc.get_rahntech_all_records(self._search, self._year, month, limit=_SCROLL_CHUNK, skip=0, **self._date_kw(), **sort_kw(self._sort_state)),
                     svc.count_rahntech_all_records(self._search, self._year, month, **self._date_kw()),
                 )
@@ -10729,7 +11362,6 @@ class _RahnTechAllEntries(_FeedExportMixin, QWidget):
             self._total = total
             self._append_rows(recs)
             self._loaded = len(recs)
-            self._totals.set_total("count", int(totals.get("count", 0)), "")
             self._update_status()
 
         finally:
@@ -11105,9 +11737,11 @@ class _RahnTechUploadDetail(_FeedExportMixin, QWidget):
             asyncio.ensure_future(self._load_more())
 
 
-class RahnTechWidget(QWidget):
+class RahnTechWidget(_FeedRibbonPageMixin, QWidget):
     """
     RahnTech main page — browse uploads then drill into per-record detail.
+
+    Chrome: title + QB-style ribbon + filters left / tabs right.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -11116,23 +11750,27 @@ class RahnTechWidget(QWidget):
         self.refresh()
 
     def _build(self) -> None:
+        from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
+
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
-        vl.setSpacing(12)
+        vl.setContentsMargins(16, 12, 16, 12)
+        vl.setSpacing(8)
 
-        header = _PageHeader("RahnTech", "mdi.devices")
-        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
-        tmpl_btn.clicked.connect(self._download_template)
-        self._import_btn = _btn("Import Transacted Devices", "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        header.add_right(tmpl_btn)
-        header.add_right(self._import_btn)
-        vl.addWidget(header)
-        vl.addWidget(_hsep())
+        vl.addWidget(_PageHeader("RahnTech", "mdi.devices"))
 
-        self._tabs = _SegmentTabBar(["All Entries", "Uploads", "Skipped"])
-        vl.addWidget(self._tabs)
+        self._ribbon = FeedRibbonToolbar(
+            import_label="Import Transacted\nDevices",
+            import_tip="Import RahnTech transacted devices spreadsheet",
+        )
+        self._wire_feed_ribbon()
+        vl.addWidget(self._ribbon)
+
+        self._tabs = _SegmentTabBar(
+            ["All Entries", "Uploads", "Skipped"], stretch=False,
+        )
+        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
@@ -11169,9 +11807,11 @@ class RahnTechWidget(QWidget):
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+        self._sync_chrome_for_tab(0)
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
+        self._sync_chrome_for_tab(idx)
         if idx == 2:
             self._skipped.refresh()
 

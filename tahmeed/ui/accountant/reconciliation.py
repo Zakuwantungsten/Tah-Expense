@@ -29,7 +29,7 @@ from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
-    QPushButton, QStackedWidget, QVBoxLayout, QWidget,
+    QPushButton, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 # Reuse the shared primitives / design tokens from the Separate Expenses module
@@ -38,9 +38,11 @@ from tahmeed.ui.accountant.separate_expenses import (
     _WHITE, _BG, _BORDER, _BLUE, _BLUE_L, _GREEN, _GREEN_L, _AMBER, _AMBER_L,
     _RED, _RED_L, _T1, _T2, _TM, _HDR_BG,
     _lbl, _btn, _input_ss, _hsep, _make_table, _cell, _fmt_num,
-    _DropZone, _PageHeader, _TotalsBar, _SegmentTabBar,
+    _DropZone, _hide_import_upload_chrome, _PageHeader, _TotalsBar, _SegmentTabBar,
     _table_style, _finish_table_row, _populate_year_combo, _TOLL_MONTHS, _SCROLL_CHUNK,
     _write_xlsx_template,
+    _FeedRibbonPageMixin, _LiftedFiltersMixin,
+    _make_feed_chrome_bar, _chrome_kpi_label,
 )
 from tahmeed.models.reconciliation import ReconciliationEntry
 from tahmeed.services import reconciliation_service as recon_svc
@@ -367,15 +369,15 @@ class ReconImportDialog(QDialog):
         self._drop.file_dropped.connect(self._on_file)
         vl.addWidget(self._drop)
 
-        browse_row = QWidget()
-        browse_row.setStyleSheet("background:transparent;")
-        brl = QHBoxLayout(browse_row)
+        self._browse_row = QWidget()
+        self._browse_row.setStyleSheet("background:transparent;")
+        brl = QHBoxLayout(self._browse_row)
         brl.setContentsMargins(0, 0, 0, 0)
         brl.addStretch()
         browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
         browse_btn.clicked.connect(self._browse)
         brl.addWidget(browse_btn)
-        vl.addWidget(browse_row)
+        vl.addWidget(self._browse_row)
 
         self._stats = _lbl("No file loaded.", size=12, color=_T2)
         vl.addWidget(self._stats)
@@ -468,6 +470,7 @@ class ReconImportDialog(QDialog):
                 f"Import {len(new):,} Records" if new else "Import Records"
             )
             self._fill_preview(new[:10])
+            _hide_import_upload_chrome(self._drop, self._browse_row)
         except Exception as exc:
             self._new = []
             self._import_btn.setEnabled(False)
@@ -530,7 +533,25 @@ class ReconImportDialog(QDialog):
                     self._import_btn.setText(f"Import {len(self._new):,} Records")
                 return
             entries = [ReconciliationEntry.from_doc(d) for d in gate.rows]
-            saved = await recon_svc.save_reconciliation_rows(entries)
+            from tahmeed.ui.widgets.upload_busy import UploadBusy
+
+            total = len(entries)
+            with UploadBusy(
+                self, f"Saving {total:,} rows…", title="Import"
+            ) as busy:
+                busy.update(
+                    f"Saving {total:,} rows…",
+                    value=0,
+                    maximum=max(1, total),
+                )
+                await busy.tick()
+                saved = await recon_svc.save_reconciliation_rows(entries)
+                busy.update(
+                    f"Saved {saved:,} rows",
+                    value=max(1, total),
+                    maximum=max(1, total),
+                )
+                await busy.tick()
             self._last_station_summary = recon_svc.format_station_counts(
                 e.station for e in entries
             )
@@ -551,8 +572,29 @@ _RECON_BROWSE_HEADERS = [
 ]
 
 
-class _ReconAllEntries(QWidget):
-    """Flat, filterable list of every SM Burhani record for one table."""
+def _make_bonds_chrome_kpi() -> Tuple[QWidget, QLabel, QLabel, QLabel, QLabel]:
+    """Compact Invoiced / Confirmed / Variance / Disputed for Bonds chrome."""
+    wrap = QWidget()
+    wrap.setStyleSheet("background:transparent;")
+    wrap.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    vl = QVBoxLayout(wrap)
+    vl.setContentsMargins(10, 0, 0, 0)
+    vl.setSpacing(0)
+    inv = _chrome_kpi_label("Inv $ —", color=_T1, weight=700)
+    conf = _chrome_kpi_label("Conf $ —", color=_GREEN, weight=700)
+    var = _chrome_kpi_label("Var $ —", color=_AMBER, weight=700)
+    disp = _chrome_kpi_label("Disp 0", color=_T2, weight=600)
+    for lbl in (inv, conf, var, disp):
+        lbl._chrome_kpi = True  # type: ignore[attr-defined]
+        vl.addWidget(lbl)
+    return wrap, inv, conf, var, disp
+
+
+class _ReconAllEntries(_LiftedFiltersMixin, QWidget):
+    """Flat, filterable list of every SM Burhani record for one table.
+
+    Search / year / month live in the feed chrome bar; station chips stay here.
+    """
 
     def __init__(self, table: str, cols, bonds: bool = False, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -568,55 +610,19 @@ class _ReconAllEntries(QWidget):
         self._loading = False
         self._build()
 
-    def _build(self) -> None:
-        self.setStyleSheet("background:transparent;")
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(8)
-
-        self._tabs = _StationTabBar(allow_add=self._bonds)
-        self._tabs.station_changed.connect(self._on_station)
-        self._tabs.add_requested.connect(self._add_station)
-        vl.addWidget(self._tabs)
-
-        if self._bonds:
-            self._summary = QFrame()
-            self._summary.setStyleSheet(
-                f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;border-radius:6px;}}"
-            )
-            sl = QHBoxLayout(self._summary)
-            sl.setContentsMargins(16, 10, 16, 10)
-            sl.setSpacing(28)
-            self._inv_lbl = _lbl("Invoiced: —", size=12, weight=600)
-            self._conf_lbl = _lbl("Confirmed: —", size=12, weight=600, color=_GREEN)
-            self._var_lbl = _lbl("Variance: —", size=12, weight=600, color=_AMBER)
-            self._disp_lbl = _lbl("Disputed: 0", size=12, color=_T2)
-            sl.addWidget(self._inv_lbl)
-            sl.addWidget(self._conf_lbl)
-            sl.addWidget(self._var_lbl)
-            sl.addWidget(self._disp_lbl)
-            sl.addStretch()
-            vl.addWidget(self._summary)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
+    def _build_filter_controls(self) -> None:
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search PRN, SM ref, importer, truck…")
-        self._search_edit.setFixedWidth(300)
+        self._search_edit.setMinimumWidth(220)
+        self._search_edit.setMaximumWidth(320)
         self._search_edit.setStyleSheet(_input_ss())
         self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
 
         self._year_cb = QComboBox()
         self._year_cb.addItem("All Years", 0)
         self._year_cb.setFixedWidth(110)
         self._year_cb.setStyleSheet(_input_ss())
         self._year_cb.currentIndexChanged.connect(self._on_year)
-        tbl.addWidget(self._year_cb)
 
         self._month_cb = QComboBox()
         for label, val in _TOLL_MONTHS:
@@ -625,14 +631,35 @@ class _ReconAllEntries(QWidget):
         self._month_cb.setStyleSheet(_input_ss())
         self._month_cb.setEnabled(False)
         self._month_cb.currentIndexChanged.connect(self._on_month)
-        tbl.addWidget(self._month_cb)
-        tbl.addStretch()
-        vl.addWidget(tb)
 
-        self._totals = _TotalsBar([("charge", "$ "), ("count", "Total records: ")])
-        vl.addWidget(self._totals)
+        self._register_chrome_filters(
+            self._search_edit, self._year_cb, self._month_cb,
+        )
+
+    def _build(self) -> None:
+        self.setStyleSheet("background:transparent;")
+        self._build_filter_controls()
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
+
+        self._tabs = _StationTabBar(allow_add=self._bonds)
+        self._tabs.station_changed.connect(self._on_station)
+        self._tabs.add_requested.connect(self._add_station)
+        vl.addWidget(self._tabs)
+
+        if self._bonds:
+            (
+                self._summary,
+                self._inv_lbl,
+                self._conf_lbl,
+                self._var_lbl,
+                self._disp_lbl,
+            ) = _make_bonds_chrome_kpi()
+            self._register_chrome_summary(self._summary)
 
         self._tbl = _make_table([c[0] for c in self._cols])
+        self._table_widget = self._tbl  # alias for ribbon print/columns helpers
         hdr = self._tbl.horizontalHeader()
         for i, (_, _f, width, _a, _m) in enumerate(self._cols):
             self._tbl.setColumnWidth(i, width)
@@ -644,6 +671,25 @@ class _ReconAllEntries(QWidget):
         self._status_lbl = _lbl("", size=11, color=_TM)
         self._status_lbl.setAlignment(Qt.AlignCenter)
         vl.addWidget(self._status_lbl)
+
+    def autofit_columns(self) -> None:
+        self._tbl.resizeColumnsToContents()
+
+    def _clear_filters(self) -> None:
+        self._search = ""
+        self._year = 0
+        self._month = 0
+        self._search_edit.blockSignals(True)
+        self._search_edit.setText("")
+        self._search_edit.blockSignals(False)
+        self._year_cb.blockSignals(True)
+        self._year_cb.setCurrentIndex(0)
+        self._year_cb.blockSignals(False)
+        self._month_cb.blockSignals(True)
+        self._month_cb.setCurrentIndex(0)
+        self._month_cb.setEnabled(False)
+        self._month_cb.blockSignals(False)
+        self._reset_and_load()
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load_stations())
@@ -744,13 +790,11 @@ class _ReconAllEntries(QWidget):
             self._total = total
             self._append_rows(rows)
             self._loaded = len(rows)
-            self._totals.set_total("charge", totals.get("invoiced", 0.0), "$ ")
-            self._totals.set_total("count", totals.get("count", total), "")
             if self._bonds:
-                self._inv_lbl.setText(f"Invoiced: $ {totals.get('invoiced', 0):,.0f}")
-                self._conf_lbl.setText(f"Confirmed: $ {totals.get('confirmed', 0):,.0f}")
-                self._var_lbl.setText(f"Variance: $ {totals.get('variance', 0):,.0f}")
-                self._disp_lbl.setText(f"Disputed: {totals.get('disputed', 0)}")
+                self._inv_lbl.setText(f"Inv $ {totals.get('invoiced', 0):,.0f}")
+                self._conf_lbl.setText(f"Conf $ {totals.get('confirmed', 0):,.0f}")
+                self._var_lbl.setText(f"Var $ {totals.get('variance', 0):,.0f}")
+                self._disp_lbl.setText(f"Disp {totals.get('disputed', 0)}")
             ok = True
         except Exception as exc:
             self._status_lbl.setText(f"Failed to load records: {exc}")
@@ -1448,8 +1492,15 @@ class _ReconUploadDetail(QWidget):
                 QMessageBox.critical(self, "Save Error", f"Could not save file:\n{exc}")
 
 
-class _ReconShellWidget(QWidget):
-    """All Entries + Uploads + Skipped shell for one SM Burhani table."""
+class _ReconShellWidget(_FeedRibbonPageMixin, QWidget):
+    """All Entries + Uploads + Skipped shell for one SM Burhani table.
+
+    Chrome: title + QB-style ribbon + filters left / tabs right (same as
+    Separate Expenses feeds).
+    """
+
+    _ribbon_uploads_tab = 1
+    _ribbon_filter_tab_indexes = {0}
 
     def __init__(
         self,
@@ -1471,23 +1522,34 @@ class _ReconShellWidget(QWidget):
         self._build()
 
     def _build(self) -> None:
+        from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
+
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
-        vl.setContentsMargins(20, 20, 20, 16)
-        vl.setSpacing(12)
+        vl.setContentsMargins(16, 12, 16, 12)
+        vl.setSpacing(8)
 
-        header = _PageHeader(self._title, self._icon)
-        tmpl_btn = _btn("Download Template", "mdi.download-outline", primary=False)
-        tmpl_btn.clicked.connect(self._download_template)
-        self._import_btn = _btn(self._import_label, "mdi.upload-outline")
-        self._import_btn.clicked.connect(self._open_import)
-        header.add_right(tmpl_btn)
-        header.add_right(self._import_btn)
-        vl.addWidget(header)
-        vl.addWidget(_hsep())
+        vl.addWidget(_PageHeader(self._title, self._icon))
 
-        self._tabs = _SegmentTabBar(["All Entries", "Uploads", "Skipped"])
-        vl.addWidget(self._tabs)
+        # Two-line import label when the string is long (ribbon text-under-icon).
+        import_lbl = self._import_label
+        if " " in import_lbl and "\n" not in import_lbl:
+            parts = import_lbl.split(" ", 1)
+            import_lbl = f"{parts[0]}\n{parts[1]}"
+        self._ribbon = FeedRibbonToolbar(
+            import_label=import_lbl,
+            import_tip=self._import_label,
+        )
+        self._wire_feed_ribbon()
+        vl.addWidget(self._ribbon)
+
+        self._tabs = _SegmentTabBar(
+            ["All Entries", "Uploads", "Skipped"], stretch=False,
+        )
+        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(
+            self._tabs,
+        )
+        vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
@@ -1525,10 +1587,16 @@ class _ReconShellWidget(QWidget):
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
+        self._sync_chrome_for_tab(0)
 
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
-        if idx == 2:
+        self._sync_chrome_for_tab(idx)
+        # Lazy-load like Skipped — Uploads were never refreshed on tab open,
+        # so the browse table stayed empty even when All Entries had rows.
+        if idx == 1:
+            self._show_browse()
+        elif idx == 2:
             self._skipped.refresh()
 
     def refresh(self) -> None:

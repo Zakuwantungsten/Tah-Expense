@@ -162,46 +162,77 @@ async def _run_import_truck_gate_inner(
         # Unexpected reject with nothing resolved — abort save
         return ImportTruckGateResult(rows=[], skipped_count=0, aborted=True)
 
-    # Persist any registry adds queued by the dialog
-    for kind, number in dlg.pending_registry_adds:
-        try:
-            await add_fleet_by_collection(kind, number)
-        except Exception as exc:
-            show_warning(
-                parent,
-                "Registry",
-                f"Could not add {number} to registry:\n{exc}",
-            )
+    with UploadBusy(
+        parent,
+        "Applying truck corrections…",
+        title="Preparing import",
+    ) as busy:
+        busy.update("Applying truck corrections…", value=0, maximum=3)
+        await busy.tick()
 
-    if dlg.new_labels:
-        try:
-            merged = merge_allowed_labels(labels, dlg.new_labels)
-            await settings_service.set_setting(
-                "allowed_truck_labels", sorted(merged)
+        # Persist any registry adds queued by the dialog
+        adds = list(dlg.pending_registry_adds)
+        for i, (kind, number) in enumerate(adds):
+            busy.update(
+                f"Updating fleet registry… {i + 1:,} of {len(adds):,}",
+                value=0,
+                maximum=3,
             )
-        except Exception:
-            pass
+            await busy.tick()
+            try:
+                await add_fleet_by_collection(kind, number)
+            except Exception as exc:
+                show_warning(
+                    parent,
+                    "Registry",
+                    f"Could not add {number} to registry:\n{exc}",
+                )
 
-    to_save, skipped_pairs = apply_truck_resolutions(rows, field, dlg.issues)
-    skipped_count = 0
-    if skipped_pairs:
-        docs = skipped_docs_from_pairs(
-            skipped_pairs,
-            feed_key=feed_key,
-            truck_field=field,
-            target_upload_id=upload_id,
-            source_filename=source_filename,
-            sheet_label=sheet_label,
+        if dlg.new_labels:
+            try:
+                merged = merge_allowed_labels(labels, dlg.new_labels)
+                await settings_service.set_setting(
+                    "allowed_truck_labels", sorted(merged)
+                )
+            except Exception:
+                pass
+
+        busy.update(
+            f"Applying corrections to {len(rows):,} rows…",
+            value=1,
+            maximum=3,
         )
-        try:
-            skipped_count = await svc.save_skipped_import_rows(docs)
-        except Exception as exc:
-            show_warning(
-                parent,
-                "Skipped rows",
-                f"Could not park skipped rows for follow-up:\n{exc}",
+        await busy.tick()
+        to_save, skipped_pairs = apply_truck_resolutions(rows, field, dlg.issues)
+
+        skipped_count = 0
+        if skipped_pairs:
+            busy.update(
+                f"Parking {len(skipped_pairs):,} skipped row(s)…",
+                value=2,
+                maximum=3,
             )
-            skipped_count = len(skipped_pairs)
+            await busy.tick()
+            docs = skipped_docs_from_pairs(
+                skipped_pairs,
+                feed_key=feed_key,
+                truck_field=field,
+                target_upload_id=upload_id,
+                source_filename=source_filename,
+                sheet_label=sheet_label,
+            )
+            try:
+                skipped_count = await svc.save_skipped_import_rows(docs)
+            except Exception as exc:
+                show_warning(
+                    parent,
+                    "Skipped rows",
+                    f"Could not park skipped rows for follow-up:\n{exc}",
+                )
+                skipped_count = len(skipped_pairs)
+
+        busy.update("Corrections applied", value=3, maximum=3)
+        await busy.tick()
 
     return ImportTruckGateResult(rows=to_save, skipped_count=skipped_count)
 
@@ -350,57 +381,89 @@ async def _run_bulk_import_truck_gate_inner(
     if result_code not in (TruckCorrectionDialog.Accepted, 1) and not dlg.issues:
         return BulkImportTruckGateResult(batches=[], skipped_count=0, aborted=True)
 
-    for kind, number in dlg.pending_registry_adds:
-        try:
-            await add_fleet_by_collection(kind, number)
-        except Exception as exc:
-            show_warning(
-                parent,
-                "Registry",
-                f"Could not add {number} to registry:\n{exc}",
-            )
+    sheet_total = max(1, len(ranges))
+    with UploadBusy(
+        parent,
+        "Applying truck corrections…",
+        title="Preparing import",
+    ) as busy:
+        busy.update("Applying truck corrections…", value=0, maximum=sheet_total + 1)
+        await busy.tick()
 
-    if dlg.new_labels:
-        try:
-            merged = merge_allowed_labels(labels, dlg.new_labels)
-            await settings_service.set_setting(
-                "allowed_truck_labels", sorted(merged)
+        adds = list(dlg.pending_registry_adds)
+        for i, (kind, number) in enumerate(adds):
+            busy.update(
+                f"Updating fleet registry… {i + 1:,} of {len(adds):,}",
+                value=0,
+                maximum=sheet_total + 1,
             )
-        except Exception:
-            pass
-
-    out_batches: List[dict] = []
-    total_skipped = 0
-    for start, end, batch in ranges:
-        slice_rows = flat[start:end]
-        local_issues = []
-        for iss in dlg.issues:
-            if start <= iss.row < end:
-                local = copy(iss)
-                local.row = iss.row - start
-                local_issues.append(local)
-        to_save, skipped_pairs = apply_truck_resolutions(
-            slice_rows, field, local_issues
-        )
-        if skipped_pairs:
-            docs = skipped_docs_from_pairs(
-                skipped_pairs,
-                feed_key=feed_key,
-                truck_field=field,
-                target_upload_id=str(batch.get("upload_id") or ""),
-                source_filename=source_filename,
-                sheet_label=str(batch.get("sheet_label") or ""),
-            )
+            await busy.tick()
             try:
-                total_skipped += await svc.save_skipped_import_rows(docs)
+                await add_fleet_by_collection(kind, number)
             except Exception as exc:
                 show_warning(
                     parent,
-                    "Skipped rows",
-                    f"Could not park skipped rows for follow-up:\n{exc}",
+                    "Registry",
+                    f"Could not add {number} to registry:\n{exc}",
                 )
-                total_skipped += len(skipped_pairs)
-        out_batches.append({**batch, "docs": to_save})
+
+        if dlg.new_labels:
+            try:
+                merged = merge_allowed_labels(labels, dlg.new_labels)
+                await settings_service.set_setting(
+                    "allowed_truck_labels", sorted(merged)
+                )
+            except Exception:
+                pass
+
+        out_batches: List[dict] = []
+        total_skipped = 0
+        for bi, (start, end, batch) in enumerate(ranges):
+            label = str(batch.get("sheet_label") or f"Sheet {bi + 1}")
+            busy.update(
+                f"Applying corrections · {label} ({bi + 1:,}/{len(ranges):,})",
+                value=bi + 1,
+                maximum=sheet_total + 1,
+            )
+            await busy.tick()
+            slice_rows = flat[start:end]
+            local_issues = []
+            for iss in dlg.issues:
+                if start <= iss.row < end:
+                    local = copy(iss)
+                    local.row = iss.row - start
+                    local_issues.append(local)
+            to_save, skipped_pairs = apply_truck_resolutions(
+                slice_rows, field, local_issues
+            )
+            if skipped_pairs:
+                busy.update(
+                    f"Parking {len(skipped_pairs):,} skipped · {label}",
+                    value=bi + 1,
+                    maximum=sheet_total + 1,
+                )
+                await busy.tick()
+                docs = skipped_docs_from_pairs(
+                    skipped_pairs,
+                    feed_key=feed_key,
+                    truck_field=field,
+                    target_upload_id=str(batch.get("upload_id") or ""),
+                    source_filename=source_filename,
+                    sheet_label=str(batch.get("sheet_label") or ""),
+                )
+                try:
+                    total_skipped += await svc.save_skipped_import_rows(docs)
+                except Exception as exc:
+                    show_warning(
+                        parent,
+                        "Skipped rows",
+                        f"Could not park skipped rows for follow-up:\n{exc}",
+                    )
+                    total_skipped += len(skipped_pairs)
+            out_batches.append({**batch, "docs": to_save})
+
+        busy.update("Corrections applied", value=sheet_total + 1, maximum=sheet_total + 1)
+        await busy.tick()
 
     return BulkImportTruckGateResult(
         batches=out_batches,
