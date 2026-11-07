@@ -1734,13 +1734,8 @@ def _populate_year_combo(cb: QComboBox, years: List[int], selected_year: int) ->
     return active
 
 
-def _make_feed_chrome_bar(
-    tabs: _SegmentTabBar,
-) -> Tuple[QFrame, QHBoxLayout, QHBoxLayout]:
-    """Single compact row: filters (left) · stretch · tabs · money KPI (far right).
-
-    Height stays fixed at 44px — money KPIs use tiny stacked type, not a taller bar.
-    """
+def _make_feed_chrome_bar(tabs: _SegmentTabBar) -> Tuple[QFrame, QHBoxLayout]:
+    """Single compact row: filters (left) · stretch · tabs (right). Height 44px."""
     chrome = QFrame()
     chrome.setObjectName("feedChromeBar")
     chrome.setStyleSheet(
@@ -1764,15 +1759,7 @@ def _make_feed_chrome_bar(
 
     tabs.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
     hl.addWidget(tabs, 0, Qt.AlignRight | Qt.AlignVCenter)
-
-    summary_host = QWidget()
-    summary_host.setStyleSheet("background:transparent;")
-    summary_host.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-    summary_hl = QHBoxLayout(summary_host)
-    summary_hl.setContentsMargins(0, 0, 0, 0)
-    summary_hl.setSpacing(0)
-    hl.addWidget(summary_host, 0, Qt.AlignRight | Qt.AlignVCenter)
-    return chrome, filter_hl, summary_hl
+    return chrome, filter_hl
 
 
 def _chrome_clear_host(host_hl: QHBoxLayout) -> None:
@@ -1788,13 +1775,6 @@ def _chrome_set_filters(filter_hl: QHBoxLayout, widgets: List[QWidget]) -> None:
     _chrome_clear_host(filter_hl)
     for w in widgets:
         filter_hl.addWidget(w, 0, Qt.AlignVCenter)
-
-
-def _chrome_set_summary(summary_hl: QHBoxLayout, widget: QWidget | None) -> None:
-    """Show one compact money-KPI stack on the far right, or clear it."""
-    _chrome_clear_host(summary_hl)
-    if widget is not None:
-        summary_hl.addWidget(widget, 0, Qt.AlignRight | Qt.AlignVCenter)
 
 
 class _FeedRibbonPageMixin:
@@ -1844,8 +1824,9 @@ class _FeedRibbonPageMixin:
             if hasattr(page, "summary_widget"):
                 summary = page.summary_widget()
         _chrome_set_filters(self._chrome_filters, widgets)
-        if hasattr(self, "_chrome_summary"):
-            _chrome_set_summary(self._chrome_summary, summary)
+        # Totals live on the ribbon far-right (not the chrome filter bar).
+        if hasattr(self, "_ribbon") and hasattr(self._ribbon, "set_summary_widget"):
+            self._ribbon.set_summary_widget(summary)
         self._ribbon.set_filter_actions_enabled(bool(widgets))
 
     def _ribbon_active_list_page(self):
@@ -2598,7 +2579,7 @@ class TollPlazaWidget(_FeedRibbonPageMixin, QWidget):
         self._tabs = _SegmentTabBar(
             ["All Entries", "Uploads", "Skipped"], stretch=False,
         )
-        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        chrome, self._chrome_filters = _make_feed_chrome_bar(self._tabs)
         vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
@@ -3568,7 +3549,7 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
         self._tabs = _SegmentTabBar(
             ["All Entries", "Uploads", "Deposited", "Skipped"], stretch=False,
         )
-        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        chrome, self._chrome_filters = _make_feed_chrome_bar(self._tabs)
         vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
@@ -3939,33 +3920,61 @@ def _make_congo_summary_cards() -> Tuple[QFrame, QLabel, QLabel, QLabel]:
     return frame, in_lbl, out_lbl, bal_lbl
 
 
-def _chrome_kpi_label(text: str, *, color: str, weight: int = 600) -> QLabel:
-    """One line of the chrome money stack — sized to fit the fixed 44px bar."""
+_RIBBON_KPI_ICON = 20  # match ribbon tool icons (~22px)
+_RIBBON_KPI_FONT = "11px"
+
+
+def _ribbon_kpi_row(
+    icon: str, text: str, *, color: str, weight: int = 600,
+) -> Tuple[QWidget, QLabel]:
+    """One icon + label row for the ribbon far-right totals stack."""
+    row = QWidget()
+    row.setStyleSheet("background:transparent;")
+    hl = QHBoxLayout(row)
+    hl.setContentsMargins(0, 0, 0, 0)
+    hl.setSpacing(6)
+    ico = QLabel()
+    ico.setFixedSize(_RIBBON_KPI_ICON, _RIBBON_KPI_ICON)
+    ico.setStyleSheet("background:transparent;")
+    try:
+        ico.setPixmap(
+            qta.icon(icon, color=color).pixmap(_RIBBON_KPI_ICON, _RIBBON_KPI_ICON)
+        )
+    except Exception:
+        pass
     lbl = QLabel(text)
-    lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
     lbl.setStyleSheet(
-        f"color:{color};font-size:8px;font-weight:{weight};"
+        f"color:{color};font-size:{_RIBBON_KPI_FONT};font-weight:{weight};"
         "font-family:'Segoe UI';background:transparent;padding:0;margin:0;"
     )
-    return lbl
+    hl.addWidget(ico, 0, Qt.AlignVCenter)
+    hl.addWidget(lbl, 0, Qt.AlignVCenter)
+    return row, lbl
 
 
 def _make_chrome_money_kpi(currency: str = "USD") -> Tuple[QWidget, QLabel, QLabel, QLabel]:
-    """Compact 3-row Money In / Out / Balance for the chrome far-right slot."""
+    """Compact 3-row Money In / Out / Balance for the ribbon far-right slot."""
     wrap = QWidget()
     wrap.setStyleSheet("background:transparent;")
-    wrap.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    wrap.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
     vl = QVBoxLayout(wrap)
-    vl.setContentsMargins(10, 0, 0, 0)
-    vl.setSpacing(0)
-    in_lbl = _chrome_kpi_label(f"In {currency}: —", color=_GREEN, weight=700)
-    out_lbl = _chrome_kpi_label(f"Out {currency}: —", color=_T2, weight=600)
-    bal_lbl = _chrome_kpi_label(f"Bal {currency}: —", color=_T1, weight=700)
+    vl.setContentsMargins(8, 2, 4, 2)
+    vl.setSpacing(2)
+    in_row, in_lbl = _ribbon_kpi_row(
+        "mdi.arrow-down-bold", f"In {currency} —", color=_GREEN, weight=700,
+    )
+    out_row, out_lbl = _ribbon_kpi_row(
+        "mdi.arrow-up-bold", f"Out {currency} —", color=_T2, weight=600,
+    )
+    bal_row, bal_lbl = _ribbon_kpi_row(
+        "mdi.scale-balance", f"Bal {currency} —", color=_T1, weight=700,
+    )
     for lbl in (in_lbl, out_lbl, bal_lbl):
         lbl._chrome_kpi = True  # type: ignore[attr-defined]
-    vl.addWidget(in_lbl)
-    vl.addWidget(out_lbl)
-    vl.addWidget(bal_lbl)
+    vl.addWidget(in_row)
+    vl.addWidget(out_row)
+    vl.addWidget(bal_row)
     return wrap, in_lbl, out_lbl, bal_lbl
 
 
@@ -3977,7 +3986,7 @@ def _set_congo_summary(in_lbl: QLabel, out_lbl: QLabel, bal_lbl: QLabel,
         in_lbl.setText(f"In USD {_kimvi_fmt_amount(money_in)}")
         out_lbl.setText(f"Out USD {_kimvi_fmt_amount(money_out)}")
         bal_lbl.setText(f"Bal USD {_kimvi_fmt_amount(balance)}")
-        bal_size = "8px"
+        bal_size = _RIBBON_KPI_FONT
     else:
         in_lbl.setText(f"Money In: USD {_kimvi_fmt_amount(money_in)}")
         out_lbl.setText(f"Money Out: USD {_kimvi_fmt_amount(money_out)}")
@@ -4849,7 +4858,7 @@ class CongoExpensesWidget(_FeedRibbonPageMixin, QWidget):
             ["All Entries", "Money In", "Called Out", "Uploads", "Skipped"],
             stretch=False,
         )
-        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        chrome, self._chrome_filters = _make_feed_chrome_bar(self._tabs)
         vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
@@ -6535,7 +6544,7 @@ class AhmedKimviWidget(_FeedRibbonPageMixin, QWidget):
             ["All Entries", "Money In", "Called Out", "Uploads", "Skipped"],
             stretch=False,
         )
-        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        chrome, self._chrome_filters = _make_feed_chrome_bar(self._tabs)
         vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
@@ -6945,7 +6954,7 @@ def _set_zambia_summary(
         in_lbl.setText(f"In ZMW {_fmt_num(total_credit, '', 0)}")
         out_lbl.setText(f"Out ZMW {_fmt_num(total_debit, '', 0)}")
         bal_lbl.setText(f"Bal ZMW {_fmt_num(balance, '', 0)}")
-        bal_size = "8px"
+        bal_size = _RIBBON_KPI_FONT
     else:
         in_lbl.setText(f"Money In: ZMW {_fmt_num(total_credit, '', 0)}")
         out_lbl.setText(f"Money Out: ZMW {_fmt_num(total_debit, '', 0)}")
@@ -7876,7 +7885,7 @@ class ZambiaParkingWidget(_FeedRibbonPageMixin, QWidget):
         self._tabs = _SegmentTabBar(
             ["All Entries", "Money In", "Uploads", "Skipped"], stretch=False,
         )
-        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        chrome, self._chrome_filters = _make_feed_chrome_bar(self._tabs)
         vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
@@ -9814,7 +9823,7 @@ class AfritrackWidget(_FeedRibbonPageMixin, QWidget):
         self._tabs = _SegmentTabBar(
             ["All Entries", "Uploads", "Skipped"], stretch=False,
         )
-        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        chrome, self._chrome_filters = _make_feed_chrome_bar(self._tabs)
         vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()
@@ -10657,7 +10666,7 @@ class ComesaWidget(_FeedRibbonPageMixin, _LiftedFiltersMixin, _FeedExportMixin, 
         vl.addWidget(self._ribbon)
 
         self._tabs = _SegmentTabBar(["All Entries", "Skipped"], stretch=False)
-        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        chrome, self._chrome_filters = _make_feed_chrome_bar(self._tabs)
         vl.addWidget(chrome)
 
         self._build_filter_controls()
@@ -10920,7 +10929,7 @@ class ThirdPartyWidget(_FeedRibbonPageMixin, _LiftedFiltersMixin, _FeedExportMix
         vl.addWidget(self._ribbon)
 
         self._tabs = _SegmentTabBar(["All Entries", "Skipped"], stretch=False)
-        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        chrome, self._chrome_filters = _make_feed_chrome_bar(self._tabs)
         vl.addWidget(chrome)
 
         self._build_filter_controls()
@@ -11769,7 +11778,7 @@ class RahnTechWidget(_FeedRibbonPageMixin, QWidget):
         self._tabs = _SegmentTabBar(
             ["All Entries", "Uploads", "Skipped"], stretch=False,
         )
-        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(self._tabs)
+        chrome, self._chrome_filters = _make_feed_chrome_bar(self._tabs)
         vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()

@@ -42,7 +42,7 @@ from tahmeed.ui.accountant.separate_expenses import (
     _table_style, _finish_table_row, _populate_year_combo, _TOLL_MONTHS, _SCROLL_CHUNK,
     _write_xlsx_template,
     _FeedRibbonPageMixin, _LiftedFiltersMixin,
-    _make_feed_chrome_bar, _chrome_kpi_label,
+    _make_feed_chrome_bar,
 )
 from tahmeed.models.reconciliation import ReconciliationEntry
 from tahmeed.services import reconciliation_service as recon_svc
@@ -573,20 +573,33 @@ _RECON_BROWSE_HEADERS = [
 
 
 def _make_bonds_chrome_kpi() -> Tuple[QWidget, QLabel, QLabel, QLabel, QLabel]:
-    """Compact Invoiced / Confirmed / Variance / Disputed for Bonds chrome."""
+    """Compact Invoiced / Confirmed / Variance / Disputed for the ribbon far-right."""
+    from tahmeed.ui.accountant.separate_expenses import _ribbon_kpi_row
+
     wrap = QWidget()
     wrap.setStyleSheet("background:transparent;")
-    wrap.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    wrap.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
     vl = QVBoxLayout(wrap)
-    vl.setContentsMargins(10, 0, 0, 0)
-    vl.setSpacing(0)
-    inv = _chrome_kpi_label("Inv $ —", color=_T1, weight=700)
-    conf = _chrome_kpi_label("Conf $ —", color=_GREEN, weight=700)
-    var = _chrome_kpi_label("Var $ —", color=_AMBER, weight=700)
-    disp = _chrome_kpi_label("Disp 0", color=_T2, weight=600)
+    vl.setContentsMargins(8, 2, 4, 2)
+    vl.setSpacing(2)
+    inv_row, inv = _ribbon_kpi_row(
+        "mdi.file-document-outline", "Inv $ —", color=_T1, weight=700,
+    )
+    conf_row, conf = _ribbon_kpi_row(
+        "mdi.check-circle-outline", "Conf $ —", color=_GREEN, weight=700,
+    )
+    var_row, var = _ribbon_kpi_row(
+        "mdi.swap-horizontal", "Var $ —", color=_AMBER, weight=700,
+    )
+    disp_row, disp = _ribbon_kpi_row(
+        "mdi.alert-outline", "Disp 0", color=_T2, weight=600,
+    )
     for lbl in (inv, conf, var, disp):
         lbl._chrome_kpi = True  # type: ignore[attr-defined]
-        vl.addWidget(lbl)
+    vl.addWidget(inv_row)
+    vl.addWidget(conf_row)
+    vl.addWidget(var_row)
+    vl.addWidget(disp_row)
     return wrap, inv, conf, var, disp
 
 
@@ -1546,9 +1559,7 @@ class _ReconShellWidget(_FeedRibbonPageMixin, QWidget):
         self._tabs = _SegmentTabBar(
             ["All Entries", "Uploads", "Skipped"], stretch=False,
         )
-        chrome, self._chrome_filters, self._chrome_summary = _make_feed_chrome_bar(
-            self._tabs,
-        )
+        chrome, self._chrome_filters = _make_feed_chrome_bar(self._tabs)
         vl.addWidget(chrome)
 
         self._main_stack = QStackedWidget()

@@ -254,6 +254,15 @@ class FeedRibbonToolbar(QFrame):
 
         root.addStretch(1)
 
+        # Far-right totals slot (Money In/Out/Bal, Bonds KPIs, …) — page-owned widget.
+        self._summary_host = QWidget()
+        self._summary_host.setStyleSheet("background:transparent;")
+        self._summary_host.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self._summary_hl = QHBoxLayout(self._summary_host)
+        self._summary_hl.setContentsMargins(8, 2, 4, 2)
+        self._summary_hl.setSpacing(0)
+        root.addWidget(self._summary_host, 0, Qt.AlignRight | Qt.AlignVCenter)
+
         self.set_entry_actions_enabled(new=False, save=False, delete=False, copy=False)
         self._set_btn_enabled(self._btn_attach, False)
 
@@ -337,3 +346,13 @@ class FeedRibbonToolbar(QFrame):
     def set_filter_actions_enabled(self, enabled: bool) -> None:
         self._set_btn_enabled(self._btn_clear, enabled)
         self._set_btn_enabled(self._btn_find, enabled)
+
+    def set_summary_widget(self, widget: Optional[QWidget]) -> None:
+        """Park a compact KPI stack on the far right (or clear it)."""
+        while self._summary_hl.count():
+            item = self._summary_hl.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+        if widget is not None:
+            self._summary_hl.addWidget(widget, 0, Qt.AlignRight | Qt.AlignVCenter)
