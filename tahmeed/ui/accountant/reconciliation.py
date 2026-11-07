@@ -10,9 +10,10 @@ the Excel files the accountant receives from the bonding company:
                       with a reconciliation summary card.
 
 Both use the upload-browse pattern (list of imports → click → full records),
-allow Import (upload the schedule .xlsx, header-row auto-detected, dedup by
-PRN + ENTRY REG) and Export (branded .xlsx), and use the same QuickBooks-style
-striped table as the rest of the dashboard.
+allow Import (one or more schedule .xlsx files at once, header-row
+auto-detected, dedup by PRN + ENTRY REG across files and the server) and
+Export (branded .xlsx), and use the same QuickBooks-style striped table as
+the rest of the dashboard.
 """
 
 from __future__ import annotations
@@ -340,8 +341,32 @@ def _fmt_recon_value(entry: ReconciliationEntry, field: str) -> str:
 #  Import dialog
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_RECON_EXCEL_SUFFIXES = {".xlsx", ".xls"}
+
+
+def _recon_excel_paths(paths: List[str]) -> List[str]:
+    """Keep unique existing Excel paths (order preserved)."""
+    out: List[str] = []
+    seen: set = set()
+    for raw in paths:
+        path = str(raw or "").strip()
+        if not path:
+            continue
+        p = Path(path)
+        if p.suffix.lower() not in _RECON_EXCEL_SUFFIXES:
+            continue
+        if not p.is_file():
+            continue
+        key = str(p.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
 class ReconImportDialog(QDialog):
-    """Upload an SM Burhani schedule, dedup by PRN+ENTRY REG, preview, import."""
+    """Upload one or more SM Burhani schedules, dedup by PRN+ENTRY REG, preview, import."""
 
     imported = Signal(int)
 
@@ -351,7 +376,8 @@ class ReconImportDialog(QDialog):
         self._cols = cols
         self._entries: List[ReconciliationEntry] = []
         self._new: List[ReconciliationEntry] = []
-        self._source_path = ""
+        self._source_paths: List[str] = []
+        self._file_lines: List[str] = []
         self._last_skipped = 0
         self._last_station_summary = ""
 
@@ -366,7 +392,7 @@ class ReconImportDialog(QDialog):
         vl.setContentsMargins(20, 20, 20, 20)
 
         self._drop = _DropZone()
-        self._drop.file_dropped.connect(self._on_file)
+        self._drop.files_dropped.connect(self._on_files)
         vl.addWidget(self._drop)
 
         self._browse_row = QWidget()
@@ -374,12 +400,13 @@ class ReconImportDialog(QDialog):
         brl = QHBoxLayout(self._browse_row)
         brl.setContentsMargins(0, 0, 0, 0)
         brl.addStretch()
-        browse_btn = _btn("Browse File", "mdi.folder-open-outline", primary=False)
+        browse_btn = _btn("Browse Files", "mdi.folder-open-outline", primary=False)
         browse_btn.clicked.connect(self._browse)
         brl.addWidget(browse_btn)
         vl.addWidget(self._browse_row)
 
-        self._stats = _lbl("No file loaded.", size=12, color=_T2)
+        self._stats = _lbl("No files loaded.", size=12, color=_T2)
+        self._stats.setWordWrap(True)
         vl.addWidget(self._stats)
         vl.addWidget(_hsep())
 
@@ -404,30 +431,73 @@ class ReconImportDialog(QDialog):
         vl.addWidget(btn_row)
 
     def _browse(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open SM Burhani Schedule", "", "Excel Files (*.xlsx *.xls)"
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open SM Burhani Schedule(s)", "", "Excel Files (*.xlsx *.xls)"
         )
-        if path:
-            self._drop.set_path(path)
-            self._on_file(path)
+        if paths:
+            self._drop.set_paths(paths)
+            self._on_files(paths)
 
-    def _on_file(self, path: str) -> None:
+    def _on_files(self, paths: List[str]) -> None:
         from tahmeed.ui.async_utils import schedule_coro
         from tahmeed.ui.widgets.upload_busy import UploadBusy
 
-        self._source_path = path
+        excel_paths = _recon_excel_paths(list(paths or []))
+        self._source_paths = excel_paths
+        self._file_lines = []
+        self._entries = []
+        self._new = []
         self._import_btn.setEnabled(False)
         self._import_btn.setText("Import Records")
         self._preview.setRowCount(0)
-        self._stats.setText("Reading file…")
-        try:
-            with UploadBusy(self, f"Reading {Path(path).name}…", title="Import"):
-                self._entries = parse_recon_workbook(path, self._table)
-        except Exception as exc:
-            self._stats.setText(f"Error reading file: {exc}")
+
+        if not excel_paths:
+            self._stats.setText("No Excel files selected (.xlsx / .xls).")
             return
-        if not self._entries:
-            self._stats.setText("No recognizable schedule rows found in this file.")
+
+        n = len(excel_paths)
+        self._stats.setText(f"Reading {n:,} file{'s' if n != 1 else ''}…")
+        merged: List[ReconciliationEntry] = []
+        file_lines: List[str] = []
+        try:
+            with UploadBusy(
+                self,
+                f"Reading {n:,} file{'s' if n != 1 else ''}…",
+                title="Import",
+            ) as busy:
+                for i, path in enumerate(excel_paths, start=1):
+                    name = Path(path).name
+                    busy.update(
+                        f"Reading {name} ({i:,}/{n:,})…",
+                        value=i - 1,
+                        maximum=n,
+                    )
+                    try:
+                        rows = parse_recon_workbook(path, self._table)
+                    except Exception as exc:
+                        file_lines.append(f"{name} — error: {exc}")
+                        continue
+                    if not rows:
+                        file_lines.append(f"{name} — no schedule rows")
+                        continue
+                    for e in rows:
+                        e.source_filename = name
+                        e._import_path = path  # type: ignore[attr-defined]
+                    merged.extend(rows)
+                    file_lines.append(f"{name} — {len(rows):,} rows")
+                busy.update("Done reading", value=n, maximum=n)
+        except Exception as exc:
+            self._stats.setText(f"Error reading files: {exc}")
+            return
+
+        self._file_lines = file_lines
+        self._entries = merged
+        if not merged:
+            detail = "\n".join(file_lines) if file_lines else ""
+            self._stats.setText(
+                "No recognizable schedule rows found."
+                + (f"\n{detail}" if detail else "")
+            )
             return
         # UploadBusy.processEvents can leave a qasync task current (Py 3.14).
         # Defer dupe-check so Import Records is not left disabled forever.
@@ -454,17 +524,22 @@ class ReconImportDialog(QDialog):
 
             station_txt = recon_svc.format_station_counts(e.station for e in new)
             dupe = len(self._entries) - len(new)
+            n_files = len(self._source_paths) or 1
+            files_part = f"{n_files:,} file{'s' if n_files != 1 else ''}"
             station_part = f"  ·  {station_txt}" if station_txt else ""
             if new:
-                self._stats.setText(
-                    f"New records: {len(new):,}     "
+                summary = (
+                    f"{files_part} · New records: {len(new):,} · "
                     f"Duplicates (skipped): {dupe:,}{station_part}"
                 )
             else:
-                self._stats.setText(
-                    f"No new records to import. "
+                summary = (
+                    f"{files_part} · No new records to import. "
                     f"Duplicates (skipped): {dupe:,}{station_part}"
                 )
+            if self._file_lines:
+                summary = summary + "\n" + "\n".join(self._file_lines)
+            self._stats.setText(summary)
             self._import_btn.setEnabled(bool(new))
             self._import_btn.setText(
                 f"Import {len(new):,} Records" if new else "Import Records"
@@ -499,19 +574,35 @@ class ReconImportDialog(QDialog):
         from tahmeed.ui.accountant.import_truck_gate import run_import_truck_gate
 
         try:
-            upload_id = str(uuid.uuid4())
-            filename = Path(self._source_path).name if self._source_path else "Unknown"
+            # One Uploads row per source file; truck gate runs once on the merge.
+            path_to_uid: Dict[str, str] = {}
             docs = []
             for e in self._new:
-                e.upload_id = upload_id
-                e.source_filename = filename
+                path = str(getattr(e, "_import_path", "") or "").strip()
+                if not path:
+                    path = e.source_filename or "Unknown"
+                if path not in path_to_uid:
+                    path_to_uid[path] = str(uuid.uuid4())
+                e.upload_id = path_to_uid[path]
+                if not e.source_filename:
+                    e.source_filename = Path(path).name
                 docs.append(e.to_doc())
+
+            n_files = len(path_to_uid) or 1
+            gate_label = (
+                next(iter(path_to_uid))
+                if n_files == 1
+                else f"{n_files} files"
+            )
+            if n_files == 1:
+                gate_label = Path(gate_label).name
+            batch_uid = str(uuid.uuid4())
             gate = await run_import_truck_gate(
                 self,
                 docs,
                 feed_key=self._table,
-                upload_id=upload_id,
-                source_filename=filename,
+                upload_id=batch_uid,
+                source_filename=gate_label,
                 can_add=True,
             )
             if gate.aborted:

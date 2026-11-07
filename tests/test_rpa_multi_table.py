@@ -6,6 +6,7 @@ from pathlib import Path
 
 from tahmeed.ui.accountant.reconciliation import (
     _parse_recon_sheet_rows,
+    _recon_excel_paths,
     parse_recon_workbook,
 )
 
@@ -213,3 +214,14 @@ def test_existing_recon_keys_are_scoped_to_table(monkeypatch) -> None:
             "json": {"keys": ["111|S1", "222|S2"]},
         }
     ]
+
+
+def test_recon_excel_paths_filters_dedupes_and_keeps_order(tmp_path: Path) -> None:
+    a = tmp_path / "week1.xlsx"
+    b = tmp_path / "week2.XLS"
+    c = tmp_path / "notes.csv"
+    a.write_bytes(b"")
+    b.write_bytes(b"")
+    c.write_text("x", encoding="utf-8")
+    got = _recon_excel_paths([str(a), str(a), str(b), str(c), "", str(tmp_path / "missing.xlsx")])
+    assert got == [str(a), str(b)]

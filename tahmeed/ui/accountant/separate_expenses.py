@@ -883,6 +883,7 @@ class _TotalsBar(QFrame):
 class _DropZone(QFrame):
     """Drag-and-drop file drop target."""
     file_dropped = Signal(str)
+    files_dropped = Signal(list)  # list[str] — all local paths from a drop
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -906,6 +907,7 @@ class _DropZone(QFrame):
         vl.addWidget(_lbl("Drag & drop .xlsx or .csv here", size=13, color=_T2))
         self._path_lbl = _lbl("", size=11, color=_TM)
         self._path_lbl.setAlignment(Qt.AlignCenter)
+        self._path_lbl.setWordWrap(True)
         vl.addWidget(self._path_lbl)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
@@ -924,15 +926,34 @@ class _DropZone(QFrame):
         )
 
     def dropEvent(self, event: QDropEvent) -> None:
-        urls = event.mimeData().urls()
-        if urls:
-            path = urls[0].toLocalFile()
-            self._path_lbl.setText(path)
-            self.file_dropped.emit(path)
+        paths = [
+            u.toLocalFile()
+            for u in event.mimeData().urls()
+            if u.isLocalFile() and u.toLocalFile()
+        ]
+        if paths:
+            self.set_paths(paths)
+            self.files_dropped.emit(paths)
+            self.file_dropped.emit(paths[0])
         self.dragLeaveEvent(event)
 
     def set_path(self, path: str) -> None:
-        self._path_lbl.setText(Path(path).name)
+        self.set_paths([path] if path else [])
+
+    def set_paths(self, paths: List[str]) -> None:
+        clean = [str(p) for p in paths if str(p).strip()]
+        if not clean:
+            self._path_lbl.setText("")
+            return
+        if len(clean) == 1:
+            self._path_lbl.setText(Path(clean[0]).name)
+            return
+        names = [Path(p).name for p in clean]
+        shown = ", ".join(names[:3])
+        extra = len(names) - 3
+        if extra > 0:
+            shown = f"{shown} (+{extra} more)"
+        self._path_lbl.setText(f"{len(names)} files: {shown}")
 
 
 def _hide_import_upload_chrome(
