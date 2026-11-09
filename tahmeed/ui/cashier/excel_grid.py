@@ -81,8 +81,10 @@ from tahmeed.services.register_draft_service import (
     clear_register_draft,
     draft_is_empty,
     draft_parked_rows,
+    draft_skipped_rows,
     entry_client_row_id,
     entry_is_parked,
+    entry_is_skipped,
     expense_content_fingerprint,
     fingerprint_is_meaningful,
     hydrate_pending_meta,
@@ -1033,8 +1035,9 @@ class DailyRegister(QWidget):
     day_issues_source_changed = Signal()
     undo_redo_changed     = Signal(bool, bool)  # can_undo, can_redo
     edit_state_changed = Signal(bool, int)         # (edit_mode_active, dirty_row_count)
-    mode_changed      = Signal(str)                # "my" | "parked" | "merged"
+    mode_changed      = Signal(str)                # "my" | "parked" | "skipped" | "merged"
     parked_count_changed = Signal(int)             # parked truck rows for the day
+    skipped_count_changed = Signal(int)            # local skipped rows for the day
     attachment_count_changed = Signal(int)         # selected row attachment count
     save_busy_changed = Signal(bool)               # True while Save/Submit is in flight
     # Day-level Cheque for the always-visible header field
@@ -1075,9 +1078,10 @@ class DailyRegister(QWidget):
         # Guards QuickBooks-style not-in-list prompts (row, col) while modal is open.
         self._not_in_list_prompting: set = set()
         self._cashier_names: dict = {}     # ObjectId -> display name
-        self._view_mode: str = "my"        # "my" | "parked" | "merged"
+        self._view_mode: str = "my"        # "my" | "parked" | "skipped" | "merged"
         self._merged_mode: bool = False    # Shared/Merged day (all cashiers)
         self._parked_mode: bool = False    # Parked incorrect-truck follow-up
+        self._skipped_mode: bool = False   # Skipped import/dup follow-up
         self._parked_day_count: int = 0
         # Server rows already saved with register_status=parked.
         self._server_parked_count: int = 0
@@ -1086,6 +1090,8 @@ class DailyRegister(QWidget):
         # My draft file (``parked_rows``) holds them between Park and Save.
         self._announce_parked_on_load: bool = False
         self._local_parked: list = []
+        # Local Skipped bucket (import Skip / Move to Skipped dups).
+        self._local_skipped: list = []
         self._current_date: Optional[date] = date.today()
         self._saved_count: int   = 0
         self._saved_ids: dict    = {}   # row_index -> ObjectId
@@ -1292,14 +1298,16 @@ class DailyRegister(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Tables: My stays alive; Parked and Merged are separate surfaces ──
+        # ── Tables: My stays alive; Parked / Skipped / Merged are separate ──
         self._my_table = self._make_register_table()
         self._parked_table = self._make_register_table()
+        self._skipped_table = self._make_register_table()
         self._merged_table = self._make_register_table()
         self._table = self._my_table
         self._table_stack = QStackedWidget(self)
         self._table_stack.addWidget(self._my_table)
         self._table_stack.addWidget(self._parked_table)
+        self._table_stack.addWidget(self._skipped_table)
         self._table_stack.addWidget(self._merged_table)
         self._table_stack.setCurrentWidget(self._my_table)
 
@@ -1315,22 +1323,23 @@ class DailyRegister(QWidget):
         root.addWidget(self._table_host, 1)
         self._loading = LoadingOverlay(self._table_host, "Loading…")
 
-        # ── Footer — totals only ───────────────────────────────────────
+        # ── Footer — one table-row tall (Excel / WPS style) ─────────────
         footer = QWidget()
-        footer.setFixedHeight(48)
+        footer.setFixedHeight(DEFAULT_ROW_HEIGHT)
         footer.setStyleSheet(
             "background: #f5f6f7;"
-            "border-top: 2px solid #d1d5db;"
+            "border-top: 1px solid #d1d5db;"
         )
         fl = QHBoxLayout(footer)
-        fl.setContentsMargins(10, 0, 14, 0)
+        fl.setContentsMargins(8, 0, 10, 0)
         fl.setSpacing(4)
 
         fl.addStretch()
 
         self._totals_label = QLabel("0 entries")
         self._totals_label.setStyleSheet(
-            "color: #374151; font-size: 12px; font-weight: 500;"
+            "color: #374151; font-size: 11px; font-weight: 500;"
+            "font-family: 'Segoe UI';"
         )
         fl.addWidget(self._totals_label)
 
@@ -1681,10 +1690,15 @@ class DailyRegister(QWidget):
         self._emit_undo_redo_state()
 
     def _ensure_my_surface_active(self) -> None:
-        """Leave Parked keep-alive (if any) and bind the My table for loads."""
+        """Leave Parked/Skipped keep-alive (if any) and bind the My table for loads."""
         if self._parked_mode and self._my_table is not None:
             if self._table is self._parked_table:
                 self._local_parked = self._table_parked_entries()
+            self._clear_my_session()
+            self._activate_table_surface(self._my_table)
+        elif self._skipped_mode and self._my_table is not None:
+            if self._table is self._skipped_table:
+                self._local_skipped = self._table_skipped_entries()
             self._clear_my_session()
             self._activate_table_surface(self._my_table)
         elif self._my_table is not None and self._table is not self._my_table:
@@ -1707,6 +1721,7 @@ class DailyRegister(QWidget):
         self._view_mode = "parked"
         self._merged_mode = False
         self._parked_mode = True
+        self._skipped_mode = False
         self.mode_changed.emit("parked")
         self._draft_restore_policy = "off"
         if blank:
@@ -1752,9 +1767,11 @@ class DailyRegister(QWidget):
         self._view_mode = "my"
         self._merged_mode = False
         self._parked_mode = False
+        self._skipped_mode = False
         self.mode_changed.emit("my")
         self._draft_restore_policy = "notify"
         self._emit_parked_count()
+        self._emit_skipped_count()
         self._update_footer()
         self.edit_state_changed.emit(
             bool(self._edit_mode), len(self._dirty_rows)
@@ -1863,12 +1880,16 @@ class DailyRegister(QWidget):
             if (getattr(tx, "register_status", "") or "") == "parked"
         ]
         if not upload_id and reload_local_parked:
-            # Disk is the durable copy of the local Parked bucket (My file).
+            # Disk is the durable copy of local Parked / Skipped buckets.
             self._load_local_parked_from_disk()
+            self._load_local_skipped_from_disk()
         # My (include_parked) and Merged both carry every cashier's parked rows.
         self._server_parked_count = len(parked_all)
         self._emit_parked_count()
-        if self._parked_mode:
+        self._emit_skipped_count()
+        if self._skipped_mode:
+            view_txs = []
+        elif self._parked_mode:
             view_txs = parked_all
         else:
             view_txs = [
@@ -1881,7 +1902,14 @@ class DailyRegister(QWidget):
         self._populate(view_txs)
         if self._parked_mode and not upload_id:
             self._append_local_parked_rows()
-        show_cashier = self._merged_mode or self._parked_mode or bool(upload_id)
+        if self._skipped_mode and not upload_id:
+            self._append_local_skipped_rows()
+        show_cashier = (
+            self._merged_mode
+            or self._parked_mode
+            or self._skipped_mode
+            or bool(upload_id)
+        )
         self._apply_column_visibility(show_cashier=show_cashier)
 
     # ------------------------------------------------------------------
@@ -1912,6 +1940,52 @@ class DailyRegister(QWidget):
             draft = None
         self._local_parked = draft_parked_rows(draft)
 
+    def _load_local_skipped_from_disk(self) -> None:
+        """Refresh ``_local_skipped`` from the My draft file for the open day."""
+        if self._current_date is None:
+            self._local_skipped = []
+            return
+        try:
+            draft = load_register_draft(
+                self._user._id, self._current_date, merged=False
+            )
+        except Exception:
+            draft = None
+        self._local_skipped = draft_skipped_rows(draft)
+
+    def _emit_skipped_count(self) -> None:
+        self.skipped_count_changed.emit(len(self._local_skipped))
+
+    def _rollback_materialized_parked_rows(self, rows: list[int]) -> None:
+        """Remove Parked copies appended for Save when the dialog aborts."""
+        rows = sorted(
+            {int(r) for r in rows if isinstance(r, int)},
+            reverse=True,
+        )
+        if not rows:
+            return
+        prev = self._table.blockSignals(True)
+        self._bulk_mutating = True
+        try:
+            for row in rows:
+                if row < self._saved_count or row >= self._table.rowCount():
+                    continue
+                self._shift_row_maps_on_remove(row)
+                self._table.removeRow(row)
+            min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+            if self._table.rowCount() < min_rows:
+                start = self._table.rowCount()
+                self._table.setRowCount(min_rows)
+                self._init_editable_rows(start, min_rows)
+        finally:
+            self._bulk_mutating = False
+            self._table.blockSignals(prev)
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._emit_undo_redo_state()
+        self._renumber()
+        self._update_footer()
+
     def _table_parked_entries(self) -> list:
         """Serialize unsaved rows marked parked that are on the grid right now."""
         out: list = []
@@ -1938,7 +2012,12 @@ class DailyRegister(QWidget):
         Used when Save runs from My: parked rows already left the My table into
         the local bucket. Returns the row indices that were added.
         """
-        if self._parked_mode or self._merged_mode or not self._local_parked:
+        if (
+            self._parked_mode
+            or self._skipped_mode
+            or self._merged_mode
+            or not self._local_parked
+        ):
             return []
         existing: set[str] = set()
         for row in range(self._saved_count, self._table.rowCount()):
@@ -2028,6 +2107,298 @@ class DailyRegister(QWidget):
         self._update_footer()
         self._flush_day_issues_source_changed(force=True)
 
+    # ------------------------------------------------------------------
+    # Local Skipped bucket (import Skip / duplicate Move to Skipped)
+    # ------------------------------------------------------------------
+
+    def _append_local_skipped_rows(self) -> None:
+        """Skipped view: show local skipped rows as editable unsaved rows."""
+        entries = list(self._local_skipped)
+        if not entries:
+            return
+        self._bulk_mutating = True
+        self._restoring_draft = True
+        prev = self._table.blockSignals(True)
+        try:
+            start = self._table.rowCount()
+            self._table.setRowCount(start + len(entries))
+            self._init_editable_rows(start, start + len(entries))
+            for offset, entry in enumerate(entries):
+                row = start + offset
+                values = cells_from_json(entry.get("cells"))
+                self._write_row_values(row, values)
+                meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+                meta["skipped"] = True
+                meta.pop("sync_status", None)
+                rid = entry_client_row_id(entry) or meta.get("client_row_id")
+                meta["client_row_id"] = rid or new_client_row_id()
+                self._pending_row_meta[row] = meta
+                self._activate_row(row)
+                self._sync_row_date(row)
+        finally:
+            self._table.blockSignals(prev)
+            self._restoring_draft = False
+            self._bulk_mutating = False
+        self._renumber()
+        self._update_footer()
+
+    def _table_skipped_entries(self) -> list:
+        """Serialize rows currently shown on the Skipped surface."""
+        out: list = []
+        for row in range(self._saved_count, self._table.rowCount()):
+            if not self._row_has_data(row):
+                continue
+            rid = self._ensure_row_client_id(row)
+            meta = dict(self._pending_row_meta.get(row) or {})
+            meta["skipped"] = True
+            meta["client_row_id"] = rid
+            meta.pop("sync_status", None)
+            out.append({
+                "client_row_id": rid,
+                "cells": cells_for_json(self._row_value_map(row)),
+                "pending_meta": serialize_pending_meta(meta),
+            })
+        return out
+
+    def _merge_local_skipped_entries(self, entries: list) -> int:
+        """Append skipped draft entries by client_row_id. Returns how many added."""
+        if not entries:
+            return 0
+        existing_ids = {
+            entry_client_row_id(e)
+            for e in self._local_skipped
+            if entry_client_row_id(e)
+        }
+        added = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+            meta["skipped"] = True
+            rid = entry_client_row_id(entry) or meta.get("client_row_id") or new_client_row_id()
+            meta["client_row_id"] = rid
+            entry = {
+                "client_row_id": rid,
+                "cells": entry.get("cells") or {},
+                "pending_meta": serialize_pending_meta(meta),
+            }
+            if rid in existing_ids:
+                continue
+            self._local_skipped.append(entry)
+            existing_ids.add(rid)
+            added += 1
+        if added:
+            self._emit_skipped_count()
+        return added
+
+    def _move_rows_to_skipped(
+        self,
+        rows: list[int],
+        *,
+        skip_reason: str = "duplicate_deferred",
+    ) -> int:
+        """Extract My-grid rows into the Skipped bucket and remove them from My."""
+        rows = sorted(
+            {
+                int(r) for r in rows
+                if isinstance(r, int)
+                and r >= self._saved_count
+                and r < self._table.rowCount()
+                and self._row_has_data(r)
+            },
+            reverse=True,
+        )
+        if not rows:
+            return 0
+        entries: list = []
+        for row in sorted(rows):
+            rid = self._ensure_row_client_id(row)
+            meta = dict(self._pending_row_meta.get(row) or {})
+            meta["skipped"] = True
+            meta["skip_reason"] = skip_reason
+            meta["client_row_id"] = rid
+            meta.pop("sync_status", None)
+            meta.pop("parked", None)
+            entries.append({
+                "client_row_id": rid,
+                "cells": cells_for_json(self._row_value_map(row)),
+                "pending_meta": serialize_pending_meta(meta),
+            })
+        prev = self._table.blockSignals(True)
+        self._bulk_mutating = True
+        try:
+            for row in rows:
+                self._shift_row_maps_on_remove(row)
+                self._table.removeRow(row)
+            min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+            if self._table.rowCount() < min_rows:
+                start = self._table.rowCount()
+                self._table.setRowCount(min_rows)
+                self._init_editable_rows(start, min_rows)
+        finally:
+            self._bulk_mutating = False
+            self._table.blockSignals(prev)
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._emit_undo_redo_state()
+        self._renumber()
+        n = self._merge_local_skipped_entries(entries)
+        self._flush_local_draft()
+        self._update_footer()
+        return n
+
+    def revive_skipped_rows(self, *, all_rows: bool = False) -> int:
+        """Move Skipped rows back onto My as ordinary unsaved drafts."""
+        self._commit_open_editor()
+        if self._skipped_mode and self._table is self._skipped_table:
+            self._local_skipped = self._table_skipped_entries()
+        if not self._local_skipped:
+            return 0
+        if all_rows:
+            to_revive = list(self._local_skipped)
+            self._local_skipped = []
+        else:
+            selected = sorted({
+                idx.row()
+                for idx in self._table.selectedIndexes()
+                if idx.row() >= self._saved_count
+            })
+            if not selected and self._skipped_mode:
+                # No selection → revive all when on Skipped.
+                to_revive = list(self._local_skipped)
+                self._local_skipped = []
+            else:
+                ids: set[str] = set()
+                for row in selected:
+                    rid = entry_client_row_id({
+                        "client_row_id": (self._pending_row_meta.get(row) or {}).get(
+                            "client_row_id"
+                        )
+                    }) or self._ensure_row_client_id(row)
+                    if rid:
+                        ids.add(rid)
+                to_revive = [
+                    e for e in self._local_skipped
+                    if entry_client_row_id(e) in ids
+                ]
+                self._local_skipped = [
+                    e for e in self._local_skipped
+                    if entry_client_row_id(e) not in ids
+                ]
+        if not to_revive:
+            return 0
+        # Strip skipped flags so My treats them as normal drafts.
+        cleaned = []
+        for entry in to_revive:
+            meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+            meta.pop("skipped", None)
+            meta.pop("skip_reason", None)
+            cleaned.append({
+                "client_row_id": entry_client_row_id(entry) or new_client_row_id(),
+                "cells": entry.get("cells") or {},
+                "pending_meta": serialize_pending_meta(meta) or {},
+            })
+        self._emit_skipped_count()
+        if self._view_mode != "my":
+            self.set_view_mode("my")
+        n = self._paint_draft_entries_on_my(cleaned)
+        self._flush_local_draft()
+        if n:
+            self.transient_status.emit(
+                f"Revived {n} skipped row{'s' if n != 1 else ''} onto My entries"
+            )
+        return n
+
+    def _paint_draft_entries_on_my(self, entries: list) -> int:
+        """Append draft-shaped entries onto the live My grid as unsaved rows."""
+        if not entries:
+            return 0
+        if self._table is not self._my_table:
+            return self._append_entries_onto_my_surface(entries)
+        start = self._first_empty_editable_row()
+        needed = start + len(entries) - self._table.rowCount()
+        if needed > 0:
+            self._append_editable_rows(needed + 5)
+        truck_cells: list = []
+        prev = self._table.blockSignals(True)
+        self._bulk_mutating = True
+        self._restoring_draft = True
+        suppress = self._suppress_truck_dialog
+        self._suppress_truck_dialog = True
+        try:
+            for offset, entry in enumerate(entries):
+                row = start + offset
+                values = cells_from_json(entry.get("cells"))
+                truck_cells.extend(self._write_row_values(row, values))
+                meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+                meta.pop("parked", None)
+                meta.pop("skipped", None)
+                meta.pop("skip_reason", None)
+                meta.pop("sync_status", None)
+                rid = (
+                    entry_client_row_id(entry)
+                    or meta.get("client_row_id")
+                    or new_client_row_id()
+                )
+                meta["client_row_id"] = rid
+                self._pending_row_meta[row] = meta
+                self._activate_row(row)
+                self._sync_row_date(row)
+            self._finalize_truck_cells(truck_cells)
+        finally:
+            self._suppress_truck_dialog = suppress
+            self._table.blockSignals(prev)
+            self._bulk_mutating = False
+            self._restoring_draft = False
+        self._renumber()
+        self._update_footer()
+        return len(entries)
+
+    def discard_skipped_rows(self, *, all_rows: bool = False) -> int:
+        """Permanently drop Skipped rows from the local bucket."""
+        self._commit_open_editor()
+        if self._skipped_mode and self._table is self._skipped_table:
+            self._local_skipped = self._table_skipped_entries()
+        before = len(self._local_skipped)
+        if not before:
+            return 0
+        if all_rows:
+            self._local_skipped = []
+        else:
+            selected = sorted({
+                idx.row()
+                for idx in self._table.selectedIndexes()
+                if idx.row() >= self._saved_count
+            })
+            if not selected:
+                self._local_skipped = []
+            else:
+                ids: set[str] = set()
+                for row in selected:
+                    rid = entry_client_row_id({
+                        "client_row_id": (self._pending_row_meta.get(row) or {}).get(
+                            "client_row_id"
+                        )
+                    }) or self._ensure_row_client_id(row)
+                    if rid:
+                        ids.add(rid)
+                self._local_skipped = [
+                    e for e in self._local_skipped
+                    if entry_client_row_id(e) not in ids
+                ]
+        dropped = before - len(self._local_skipped)
+        if self._skipped_mode:
+            self._reset_parked_surface_maps()
+            self._populate([])
+            self._append_local_skipped_rows()
+        self._flush_local_draft()
+        self._emit_skipped_count()
+        if dropped:
+            self.transient_status.emit(
+                f"Discarded {dropped} skipped row{'s' if dropped != 1 else ''}"
+            )
+        return dropped
+
     def _append_entries_onto_my_surface(self, entries: list) -> int:
         """Write promoted parked entries onto the keep-alive My table + session."""
         if not entries or self._my_table is None:
@@ -2111,6 +2482,7 @@ class DailyRegister(QWidget):
                 dirty_saved=[],
                 new_rows=[],
                 parked_rows=list(self._local_parked),
+                skipped_rows=list(self._local_skipped),
             )
         new_rows = [e for e in (draft.get("new_rows") or []) if isinstance(e, dict)]
         have = {entry_client_row_id(e) for e in new_rows} - {None, ""}
@@ -2523,22 +2895,27 @@ class DailyRegister(QWidget):
         self.set_view_mode("merged" if merged else "my")
 
     def set_view_mode(self, mode: str) -> None:
-        """Switch My entries / Parked / Merged.
+        """Switch My entries / Parked / Skipped / Merged.
 
-        My stays mounted. Parked and Merged are separate grids. Merged loads
-        every cashier once, then flips back to the My grid already on screen.
+        My stays mounted. Parked, Skipped, and Merged are separate grids.
         """
-        mode = mode if mode in ("my", "parked", "merged") else "my"
+        mode = mode if mode in ("my", "parked", "skipped", "merged") else "my"
         if mode == self._view_mode:
             return
         prev = self._view_mode
 
-        # Fast path: My ↔ Parked / My ↔ Merged keep My mounted.
+        # Fast path: My ↔ Parked / Skipped / Merged keep My mounted.
         if prev == "my" and mode == "parked":
             if self._flip_to_parked_keep_my():
                 return
         if prev == "parked" and mode == "my":
             if self._flip_to_my_keep_alive():
+                return
+        if prev == "my" and mode == "skipped":
+            if self._flip_to_skipped_keep_my():
+                return
+        if prev == "skipped" and mode == "my":
+            if self._flip_to_my_from_skipped():
                 return
         if prev == "my" and mode == "merged":
             if self._flip_to_merged_keep_my():
@@ -2549,33 +2926,44 @@ class DailyRegister(QWidget):
 
         self._draft_timer.stop()
         self._commit_open_editor()
-        # Leaving Parked without a keep-alive session: sync bucket, then use My.
+        # Leaving Parked/Skipped without a keep-alive session: sync bucket.
         if self._parked_mode and self._table is self._parked_table:
             self._local_parked = self._table_parked_entries()
-        if prev == "parked" or mode == "merged" or prev == "merged":
-            # Merged (or slow Parked→My) still needs a durable draft snapshot.
-            if self.has_unsaved_work() or self._parked_mode or self._local_parked:
+        if self._skipped_mode and self._table is self._skipped_table:
+            self._local_skipped = self._table_skipped_entries()
+        if prev in ("parked", "skipped", "merged") or mode == "merged":
+            if (
+                self.has_unsaved_work()
+                or self._parked_mode
+                or self._skipped_mode
+                or self._local_parked
+                or self._local_skipped
+            ):
                 self._flush_local_draft()
         self._ensure_my_surface_active()
         self._view_mode = mode
         self._merged_mode = mode == "merged"
         self._parked_mode = mode == "parked"
+        self._skipped_mode = mode == "skipped"
         self._reset_edit_state()
         self.mode_changed.emit(self._view_mode)
         if self._current_date is None:
             self._populate([])
             return
-        if mode in ("parked", "merged"):
+        if mode in ("parked", "skipped", "merged"):
             self._draft_restore_policy = "off"
-        elif mode == "my" and prev in ("parked", "merged"):
+        elif mode == "my" and prev in ("parked", "skipped", "merged"):
             self._draft_restore_policy = "silent"
         else:
             self._draft_restore_policy = "notify"
-        # Slow Parked (no My session): bind parked surface before populate.
+        # Slow Parked/Skipped (no My session): bind surface before populate.
         if mode == "parked" and self._parked_table is not None:
             self._activate_table_surface(self._parked_table)
             self._reset_parked_surface_maps()
-            # Clear the last painted Parked day before the cache/load fills it.
+            self._populate([])
+        if mode == "skipped" and self._skipped_table is not None:
+            self._activate_table_surface(self._skipped_table)
+            self._reset_parked_surface_maps()
             self._populate([])
         # After delete/discard, never reuse a stale in-memory day cache.
         if not self._day_tx_stale and self._try_apply_cached_view():
@@ -2584,6 +2972,58 @@ class DailyRegister(QWidget):
         self._view_load_task = asyncio.ensure_future(
             self._load_date(self._current_date)
         )
+
+    def _flip_to_skipped_keep_my(self) -> bool:
+        """My → Skipped without flush/wipe/restore. Returns False if unavailable."""
+        if self._my_table is None or self._skipped_table is None:
+            return False
+        blank = self._current_date is None
+        if not blank and (self._day_tx_stale or self._load_in_flight):
+            return False
+        self._draft_timer.stop()
+        self._commit_open_editor()
+        self._my_session = self._snapshot_grid_session()
+        self._activate_table_surface(self._skipped_table)
+        self._reset_parked_surface_maps()
+        self._view_mode = "skipped"
+        self._merged_mode = False
+        self._parked_mode = False
+        self._skipped_mode = True
+        self.mode_changed.emit("skipped")
+        self._draft_restore_policy = "off"
+        self._load_local_skipped_from_disk()
+        self._populate([])
+        self._append_local_skipped_rows()
+        self._emit_skipped_count()
+        return True
+
+    def _flip_to_my_from_skipped(self) -> bool:
+        """Skipped → My using the preserved My table. Returns False to slow-path."""
+        if self._my_table is None or self._my_session is None:
+            return False
+        if self._day_tx_stale and self._current_date is not None:
+            return False
+        self._draft_timer.stop()
+        self._commit_open_editor()
+        self._local_skipped = self._table_skipped_entries()
+        self._activate_table_surface(self._my_table)
+        self._restore_grid_session(self._my_session)
+        self._clear_my_session()
+        self._view_mode = "my"
+        self._merged_mode = False
+        self._parked_mode = False
+        self._skipped_mode = False
+        self.mode_changed.emit("my")
+        self._draft_restore_policy = "notify"
+        self._flush_local_draft()
+        self._emit_skipped_count()
+        self._update_footer()
+        self.edit_state_changed.emit(
+            bool(self._edit_mode), len(self._dirty_rows)
+        )
+        self._emit_undo_redo_state()
+        self._emit_active_cheque()
+        return True
 
     async def _set_view_mode_and_wait(self, mode: str) -> bool:
         """``set_view_mode`` plus any load it scheduled. True if *mode* is showing."""
@@ -6135,6 +6575,17 @@ class DailyRegister(QWidget):
                     maximum=total,
                 )
                 await busy.tick()
+            skipped_n = self._merge_local_skipped_entries(
+                list(getattr(preview, "skipped_rows", None) or [])
+            )
+            if skipped_n:
+                self._flush_local_draft()
+            note = ""
+            if skipped_n:
+                note = (
+                    f"\n\n{skipped_n} skipped row(s) are under the Skipped tab "
+                    "(Revive or Discard anytime)."
+                )
             QMessageBox.information(
                 self,
                 "Import ready",
@@ -6143,7 +6594,8 @@ class DailyRegister(QWidget):
                 "Excel row dates are kept as written. Open this upload (or this "
                 "reconciled day in Simple) anytime to see every row in the batch.\n\n"
                 "Review the Table, make any edits, then click Save.\n"
-                "Saved entries go to the accountant Verify inbox.",
+                "Saved entries go to the accountant Verify inbox."
+                + note,
             )
             self.day_issues_source_changed.emit()
         finally:
@@ -6205,10 +6657,10 @@ class DailyRegister(QWidget):
         source: str = "",
         clear_merged: bool | None = None,
     ) -> None:
-        """Clear typed / recovered draft rows for *primary*, keep local Parked.
+        """Clear typed / recovered draft rows for *primary*, keep Parked + Skipped.
 
-        ``source``: rows parked from an earlier import of that same file are
-        dropped so a re-import does not double them up under Parked.
+        ``source``: rows parked/skipped from an earlier import of that same file
+        are dropped so a re-import does not double them.
         ``clear_merged``: also drop the Merged recovery file (default: only when
         Merged is the current view).
         """
@@ -6217,19 +6669,22 @@ class DailyRegister(QWidget):
         try:
             draft = load_register_draft(self._user._id, primary, merged=False)
             parked = draft_parked_rows(draft)
+            skipped = draft_skipped_rows(draft)
             if source:
                 key = (source or "").strip().lower()
-                parked = [
-                    e for e in parked
-                    if (
+
+                def _not_same_source(e: dict) -> bool:
+                    src = (
                         (hydrate_pending_meta(e.get("pending_meta")) or {}).get(
                             "daily_import_source"
                         )
                         or ""
                     ).strip().lower()
-                    != key
-                ]
-            if parked:
+                    return src != key
+
+                parked = [e for e in parked if _not_same_source(e)]
+                skipped = [e for e in skipped if _not_same_source(e)]
+            if parked or skipped:
                 save_register_draft(
                     build_draft_payload(
                         user_id=self._user._id,
@@ -6240,6 +6695,7 @@ class DailyRegister(QWidget):
                         dirty_saved=[],
                         new_rows=[],
                         parked_rows=parked,
+                        skipped_rows=skipped,
                     )
                 )
             else:
@@ -6248,7 +6704,9 @@ class DailyRegister(QWidget):
                 clear_register_draft(self._user._id, primary, merged=True)
             if primary == self._current_date:
                 self._local_parked = parked
+                self._local_skipped = skipped
                 self._emit_parked_count()
+                self._emit_skipped_count()
         except Exception:
             pass
 
@@ -6927,8 +7385,10 @@ class DailyRegister(QWidget):
         if self._my_table is not None:
             self._activate_table_surface(self._my_table)
         self._local_parked = []
+        self._local_skipped = []
         self._server_parked_count = 0
         self._emit_parked_count()
+        self._emit_skipped_count()
         self._load_gen += 1  # cancel any in-flight date load
         self._load_upload_id = ""
         self._skip_draft_restore = False
@@ -8502,20 +8962,23 @@ class DailyRegister(QWidget):
             pass
 
     def _clear_local_draft(self, *, both_modes: bool = False) -> None:
-        """Drop typed / dirty recovery rows. The local Parked bucket survives."""
+        """Drop typed / dirty recovery rows. Parked + Skipped buckets survive."""
         self._draft_timer.stop()
         if self._current_date is None:
             return
         try:
             if self._parked_mode:
                 self._local_parked = self._table_parked_entries()
+            if self._skipped_mode:
+                self._local_skipped = self._table_skipped_entries()
             parked = list(self._local_parked)
+            skipped = list(self._local_skipped)
             if both_modes or self._merged_mode:
                 clear_register_draft(
                     self._user._id, self._current_date, merged=True
                 )
             if both_modes or not self._merged_mode:
-                if parked:
+                if parked or skipped:
                     save_register_draft(
                         build_draft_payload(
                             user_id=self._user._id,
@@ -8526,6 +8989,7 @@ class DailyRegister(QWidget):
                             dirty_saved=[],
                             new_rows=[],
                             parked_rows=parked,
+                            skipped_rows=skipped,
                         )
                     )
                 else:
@@ -8572,6 +9036,7 @@ class DailyRegister(QWidget):
         # Merged never persists typed "new" rows — entry belongs in My.
         new_rows: list = []
         parked_rows: list = []
+        skipped_rows: list = []
         dirty_saved: list = []
         edit_mode_flag = False
         if self._parked_mode:
@@ -8579,6 +9044,7 @@ class DailyRegister(QWidget):
             # My table (preferred) or the on-disk stash (slow path / cold).
             self._local_parked = self._table_parked_entries()
             parked_rows = list(self._local_parked)
+            skipped_rows = list(self._local_skipped)
             parked_dirty, _parked_new, parked_edit = self._capture_rows_from_bound_table(
                 include_dirty=include_dirty
             )
@@ -8623,11 +9089,47 @@ class DailyRegister(QWidget):
             dirty_saved = list(dirty_saved) + list(parked_dirty)
             if parked_edit and parked_dirty:
                 edit_mode_flag = True
+        elif self._skipped_mode:
+            self._local_skipped = self._table_skipped_entries()
+            skipped_rows = list(self._local_skipped)
+            parked_rows = list(self._local_parked)
+            if self._my_session is not None and self._my_table is not None:
+                skipped_maps = self._snapshot_grid_session()
+                skipped_table = self._table
+                try:
+                    self._table = self._my_table
+                    self._restore_grid_session(self._my_session)
+                    dirty_saved, new_rows, edit_mode_flag = (
+                        self._capture_rows_from_bound_table(include_dirty=include_dirty)
+                    )
+                    self._my_session = self._snapshot_grid_session()
+                finally:
+                    self._table = skipped_table
+                    self._restore_grid_session(skipped_maps)
+            else:
+                try:
+                    on_disk = load_register_draft(
+                        self._user._id, self._current_date, merged=False
+                    )
+                except Exception:
+                    on_disk = None
+                if on_disk:
+                    new_rows = [
+                        e for e in (on_disk.get("new_rows") or [])
+                        if isinstance(e, dict)
+                    ]
+                    dirty_saved = [
+                        e for e in (on_disk.get("dirty_saved") or [])
+                        if isinstance(e, dict)
+                    ]
+                    if dirty_saved:
+                        edit_mode_flag = bool(on_disk.get("edit_mode", True))
         elif not self._merged_mode:
             dirty_saved, new_rows, edit_mode_flag = self._capture_rows_from_bound_table(
                 include_dirty=include_dirty
             )
             parked_rows = list(self._local_parked)
+            skipped_rows = list(self._local_skipped)
         else:
             dirty_saved, new_rows, edit_mode_flag = self._capture_rows_from_bound_table(
                 include_dirty=include_dirty
@@ -8642,6 +9144,7 @@ class DailyRegister(QWidget):
             dirty_saved=dirty_saved,
             new_rows=new_rows,
             parked_rows=parked_rows,
+            skipped_rows=skipped_rows,
         )
 
     def _restore_local_draft(self) -> Optional[tuple]:
@@ -8671,8 +9174,22 @@ class DailyRegister(QWidget):
                     continue
                 self._local_parked.append(entry)
             self._emit_parked_count()
+        migrated_skipped = [e for e in new_entries if entry_is_skipped(e)]
+        if migrated_skipped and not self._merged_mode:
+            new_entries = [e for e in new_entries if not entry_is_skipped(e)]
+            self._merge_local_skipped_entries(migrated_skipped)
+        # Always refresh skipped bucket from draft section.
+        if not self._merged_mode:
+            disk_skipped = draft_skipped_rows(draft)
+            if disk_skipped:
+                self._merge_local_skipped_entries(disk_skipped)
         if not dirty_entries and not new_entries:
-            if migrated_parked and not self._merged_mode and not self._parked_mode:
+            if (
+                (migrated_parked or migrated_skipped)
+                and not self._merged_mode
+                and not self._parked_mode
+                and not self._skipped_mode
+            ):
                 self._flush_local_draft()
             return None
 
@@ -8712,10 +9229,15 @@ class DailyRegister(QWidget):
                         it.setBackground(QBrush(DIRTY_BG))
                 dirty_applied += 1
 
-            # Never restore typed new rows onto Merged / Parked (entry is My-only).
+            # Never restore typed new rows onto Merged / Parked / Skipped.
             # Prefer client_row_id match (Phase 1); fall back to content fingerprint
             # (Phase 0) so legacy drafts without ids still cannot inflate totals.
-            if new_entries and not self._merged_mode and not self._parked_mode:
+            if (
+                new_entries
+                and not self._merged_mode
+                and not self._parked_mode
+                and not self._skipped_mode
+            ):
                 known_ids = self._saved_client_row_ids()
                 saved_fps = self._saved_expense_fingerprint_counts()
                 to_restore: list = []
@@ -9136,12 +9658,14 @@ class DailyRegister(QWidget):
         # ── Pass 2: insert brand-new rows (INSERT) — My + parked ───
         pending_inserts: list[tuple[int, Transaction]] = []
         queued = 0
+        moved_to_skipped = 0
+        materialized_parked: list[int] = []
         if not self._merged_mode:
             dup_days = int(getattr(self, "_duplicate_check_days", 5) or 5)
 
             # My Save: bring local Parked bucket onto the grid so inserts cover them.
             if not self._parked_mode and self._local_parked:
-                self._materialize_local_parked_for_save()
+                materialized_parked = self._materialize_local_parked_for_save()
 
             # Pre-scan: warn once if any new draft rows carry a date other than the open day.
             # Parked follow-up rows skip this dialog.
@@ -9174,6 +9698,7 @@ class DailyRegister(QWidget):
                         QMessageBox.Yes | QMessageBox.No,
                         QMessageBox.No,
                     ) == QMessageBox.No:
+                        self._rollback_materialized_parked_rows(materialized_parked)
                         return False
 
             duplicate_items: list[DuplicateReviewItem] = []
@@ -9245,44 +9770,109 @@ class DailyRegister(QWidget):
                     ))
 
             save_anyway: set[int] = set()
+            save_anyway_match_by_id: dict = {}
             if duplicate_items and not parked_only:
+                from tahmeed.ui.async_utils import pause_background_polls
+                from tahmeed.ui.widgets.export_runner import await_ui
+
                 dlg = DuplicateReviewDialog(
                     duplicate_items,
                     dup_days=dup_days,
                     parent=self,
                     pending_total=len(draft_inserts),
                 )
-                if dlg.exec() != QDialog.Accepted:
+                with pause_background_polls(self):
+                    accepted = await await_ui(
+                        lambda: dlg.exec() == QDialog.Accepted
+                    )
+                if not accepted:
+                    self._rollback_materialized_parked_rows(materialized_parked)
                     self._flush_local_draft()
                     return False
                 save_anyway = dlg.save_anyway_rows()
                 deferred_dups = dlg.deferred_duplicate_rows()
+                for row in save_anyway:
+                    rid = entry_client_row_id({
+                        "client_row_id": (self._pending_row_meta.get(row) or {}).get(
+                            "client_row_id"
+                        )
+                    }) or self._ensure_row_client_id(row)
+                    if not rid:
+                        continue
+                    matched = next(
+                        (
+                            item.existing for item in duplicate_items
+                            if item.row == row
+                            and getattr(item.existing, "_id", None) is not None
+                        ),
+                        None,
+                    )
+                    save_anyway_match_by_id[rid] = matched
 
-            duplicate_rows = {item.row for item in duplicate_items}
-            match_by_row = {
-                item.row: item.existing
-                for item in duplicate_items
-                if getattr(item.existing, "_id", None) is not None
-            }
+            # Move deferred duplicates into Skipped before index-sensitive save.
+            moved_to_skipped = 0
+            if deferred_dups:
+                moved_to_skipped = self._move_rows_to_skipped(
+                    sorted(deferred_dups), skip_reason="duplicate_deferred"
+                )
+                deferred_dups = set()
+                # Row indices shifted — rebuild insert list from the live grid.
+                pending_inserts = []
+                append_order = None
+                try:
+                    append_order = await next_day_order(self._current_date)
+                except Exception:
+                    append_order = None
+                for row in range(self._saved_count, self._table.rowCount()):
+                    if not self._row_has_data(row):
+                        continue
+                    if parked_only and not self._row_marked_parked(row):
+                        continue
+                    try:
+                        tx = self._build_transaction_from_row(row)
+                    except ValueError as exc:
+                        errors.append(f"Row {row + 1}: {exc}")
+                        continue
+                    if tx is None:
+                        continue
+                    if append_order is not None:
+                        tx.day_order = append_order
+                        append_order += 1
+                    else:
+                        tx.day_order = row
+                    pending_inserts.append((row, tx))
+                materialized_parked = [
+                    row for row in range(self._saved_count, self._table.rowCount())
+                    if self._row_has_data(row) and self._row_marked_parked(row)
+                ]
+
             to_save: list[tuple[int, Transaction]] = []
             for row, tx in pending_inserts:
-                if row in duplicate_rows and row not in save_anyway:
-                    continue
-                tx.possible_duplicate = row in save_anyway
-                if row in save_anyway:
-                    matched = match_by_row.get(row)
+                rid = (
+                    getattr(tx, "client_row_id", None)
+                    or entry_client_row_id({
+                        "client_row_id": (self._pending_row_meta.get(row) or {}).get(
+                            "client_row_id"
+                        )
+                    })
+                    or ""
+                )
+                matched = save_anyway_match_by_id.get(rid) if rid else None
+                tx.possible_duplicate = matched is not None or (
+                    bool(rid) and rid in save_anyway_match_by_id
+                )
+                if rid and rid in save_anyway_match_by_id:
+                    tx.possible_duplicate = True
+                    matched = save_anyway_match_by_id.get(rid)
                     tx.duplicate_of_id = (
-                        matched._id if matched is not None else None
+                        matched._id
+                        if matched is not None and getattr(matched, "_id", None)
+                        else None
                     )
                 else:
+                    tx.possible_duplicate = False
                     tx.duplicate_of_id = None
                 to_save.append((row, tx))
-            # Ensure deferred dups are ordinary unsaved rows (no sync_status).
-            for row in deferred_dups:
-                row_meta = dict(self._pending_row_meta.get(row) or {})
-                if "sync_status" in row_meta:
-                    row_meta.pop("sync_status", None)
-                    self._pending_row_meta[row] = row_meta
 
             # Parked inserts always sync so they leave the local bucket immediately.
             # Draft inserts on My may use the async outbox (unchanged).
@@ -9392,7 +9982,7 @@ class DailyRegister(QWidget):
             meta["already_exists"] = already_exists
             meta["queued"] = queued
             meta["errors"] = len(errors)
-            meta["deferred_dups"] = len(deferred_dups)
+            meta["deferred_dups"] = int(moved_to_skipped or len(deferred_dups))
             meta["kept_parked"] = kept_parked
             if parked_only:
                 meta["parked_only"] = True
@@ -9418,21 +10008,24 @@ class DailyRegister(QWidget):
             return False
 
         if saved == 0 and updated == 0 and queued == 0:
-            # Cashier deferred possible duplicates — leave them on the table.
-            live_deferred = [
-                row for row in deferred_dups
-                if row >= self._saved_count and self._row_has_data(row)
-            ]
-            if live_deferred:
+            # Dup rows already moved to Skipped — roll back Parked copies on My.
+            if materialized_parked:
+                still = [
+                    r for r in materialized_parked
+                    if r < self._table.rowCount()
+                    and self._row_has_data(r)
+                    and self._row_marked_parked(r)
+                ]
+                self._rollback_materialized_parked_rows(still)
+            if moved_to_skipped:
                 self._flush_local_draft()
-                n = len(live_deferred)
-                plural = "" if n == 1 else "s"
+                plural = "" if moved_to_skipped == 1 else "s"
                 self.transient_status.emit(
-                    f"Kept {n} possible duplicate{plural} on the table — "
-                    "Save when ready"
+                    f"Moved {moved_to_skipped} possible duplicate{plural} to Skipped"
                 )
                 if meta is not None:
                     meta["deferred_only"] = True
+                    meta["deferred_dups"] = moved_to_skipped
                 return True
             if parked_only:
                 # Other unsaved (non-parked) rows may remain — do not warn.

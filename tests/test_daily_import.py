@@ -12,6 +12,7 @@ from tahmeed.services.daily_import_service import (
     DailyImportCancelled,
     DailyImportPreview,
     DailyImportRow,
+    REASON_EMPTY_DESCRIPTION,
     REASON_MISSING_DATE,
     _looks_like_classic_matumizi,
     absorb_import_problems,
@@ -443,6 +444,33 @@ def test_parse_missing_date_becomes_problem_not_silent_skip(tmp_path: Path) -> N
     assert result.skipped_blank == 1  # only TOTAL auto-skipped
 
 
+def test_parse_empty_description_with_amount_becomes_problem(tmp_path: Path) -> None:
+    path = tmp_path / "matumizi_blank_desc.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Date", "Description", "TZS", "Truck No."])
+    ws.append([datetime(2026, 8, 20), "DIESEL", 10000, "T688 EAF"])
+    ws.append([datetime(2026, 8, 20), "", 14500, "T459 EAG"])  # blank desc + amount
+    ws.append([None, "", 3200, ""])  # blank desc + amount + missing date
+    ws.append([datetime(2026, 8, 20), "", None, ""])  # blank desc, no amount → skip
+    wb.save(path)
+    wb.close()
+
+    result = parse_daily_expenses_excel(path)
+    assert len(result.rows) == 1
+    assert result.rows[0].description == "DIESEL"
+    assert len(result.problems) == 2
+    assert all(p.reason == REASON_EMPTY_DESCRIPTION for p in result.problems)
+    by_row = {p.excel_row: p for p in result.problems}
+    assert by_row[3].amount == 14500.0
+    assert by_row[3].date == datetime(2026, 8, 20)
+    assert by_row[3].description == ""
+    assert by_row[4].amount == 3200.0
+    assert by_row[4].date is None
+    assert result.skipped_blank == 1
+    assert result.skip_reasons.get(REASON_EMPTY_DESCRIPTION) == 3  # 2 problems + 1 skip
+
+
 @pytest.mark.asyncio
 async def test_absorb_import_problems_promotes_fixed_and_counts_skips(
     monkeypatch,
@@ -505,6 +533,13 @@ async def test_absorb_import_problems_promotes_fixed_and_counts_skips(
     assert preview.skipped_blank == 1
     assert preview.skip_reasons.get("missing_date_user_skip") == 1
     assert normalize_description("TOLLS") in preview.unmapped
+    assert len(preview.skipped_rows) == 1
+    skipped = preview.skipped_rows[0]
+    assert skipped["cells"].get("3") == "SKIP ME" or "SKIP ME" in skipped["cells"].values()
+    meta = skipped.get("pending_meta") or {}
+    assert meta.get("skipped") is True
+    assert meta.get("skip_reason") == "missing_date_user_skip"
+    assert "SKIP ME" not in {r.description for r in preview.rows}
 
 
 def test_problem_to_import_row_requires_date() -> None:
@@ -514,6 +549,20 @@ def test_problem_to_import_row_requires_date() -> None:
         excel_row=2,
         reason=REASON_MISSING_DATE,
         description="X",
+    )
+    with pytest.raises(ValueError):
+        problem_to_import_row(problem)
+
+
+def test_problem_to_import_row_requires_description() -> None:
+    from tahmeed.services.daily_import_service import DailyImportProblemRow
+
+    problem = DailyImportProblemRow(
+        excel_row=2,
+        reason=REASON_EMPTY_DESCRIPTION,
+        description="  ",
+        date=datetime(2026, 8, 20),
+        amount=100.0,
     )
     with pytest.raises(ValueError):
         problem_to_import_row(problem)

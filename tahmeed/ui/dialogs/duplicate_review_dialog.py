@@ -152,7 +152,7 @@ class DuplicateReviewDialog(QDialog):
             subtitle = QLabel(
                 "Most of these rows already match expenses in the system — "
                 "often from re-importing the same Excel file. Prefer "
-                "Keep for later unless you are sure each new row is a separate "
+                "Move to Skipped unless you are sure each new row is a separate "
                 "expense. Each pair shows the new row (red) above the existing "
                 "expense (cream)."
             )
@@ -160,8 +160,8 @@ class DuplicateReviewDialog(QDialog):
             subtitle = QLabel(
                 "Each pair shows the new row (red) above the existing expense (cream). "
                 "Tick Save to keep the new row anyway — it will be flagged for "
-                "Verify → Issues. Unchecked pairs stay on the table for later "
-                "(or use Keep for later)."
+                "Verify → Issues. Unchecked pairs (or Move to Skipped) go to the "
+                "Skipped tab for Revive or Discard."
             )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(
@@ -231,10 +231,10 @@ class DuplicateReviewDialog(QDialog):
 
         buttons = QDialogButtonBox()
         save_btn = buttons.addButton("Save checked", QDialogButtonBox.AcceptRole)
-        keep_btn = buttons.addButton("Keep for later", QDialogButtonBox.ActionRole)
+        keep_btn = buttons.addButton("Move to Skipped", QDialogButtonBox.ActionRole)
         keep_btn.setToolTip(
-            "Leave these possible duplicates on the table without saving them. "
-            "Click Save again when you are ready."
+            "Move these possible duplicates to the Skipped tab. "
+            "Revive them onto My entries later, or Discard."
         )
         cancel_btn = buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
         for btn, style in (

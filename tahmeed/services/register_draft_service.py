@@ -21,7 +21,8 @@ from tahmeed.config import APP_NAME
 
 # v4: ``parked_rows`` — incorrect-truck rows parked locally until Save persists
 # them as ``register_status=parked`` (or Clear parked moves them to Trash).
-SCHEMA_VERSION = 4
+# v5: ``skipped_rows`` — import/dup skips kept locally for Revive / Discard.
+SCHEMA_VERSION = 5
 
 # Per-row outbox sync state (stored in pending_meta / draft new_rows).
 SYNC_PENDING = "PENDING"
@@ -71,17 +72,19 @@ def entry_client_row_id(entry: dict | None) -> str:
 def ensure_draft_client_row_ids(payload: dict | None) -> dict | None:
     """Stamp missing ``client_row_id`` + normalize sync_status on draft rows.
 
-    Covers both ``new_rows`` (My entries) and ``parked_rows`` (local Parked).
+    Covers ``new_rows``, ``parked_rows``, and ``skipped_rows``.
     """
     if not isinstance(payload, dict):
         return payload
     changed = False
     new_rows, changed_new = _stamp_draft_rows(payload.get("new_rows"))
     parked_rows, changed_parked = _stamp_draft_rows(payload.get("parked_rows"))
-    changed = changed_new or changed_parked
+    skipped_rows, changed_skipped = _stamp_draft_rows(payload.get("skipped_rows"))
+    changed = changed_new or changed_parked or changed_skipped
     if changed or int(payload.get("schema_version") or 1) < SCHEMA_VERSION:
         payload["new_rows"] = new_rows
         payload["parked_rows"] = parked_rows
+        payload["skipped_rows"] = skipped_rows
         payload["schema_version"] = SCHEMA_VERSION
     return payload
 
@@ -268,6 +271,7 @@ def build_draft_payload(
     dirty_saved: list[dict],
     new_rows: list[dict],
     parked_rows: Optional[list[dict]] = None,
+    skipped_rows: Optional[list[dict]] = None,
 ) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -281,6 +285,8 @@ def build_draft_payload(
         "new_rows": new_rows,
         # Local Parked bucket (My file only): rows whose truck is still wrong.
         "parked_rows": list(parked_rows or []),
+        # Local Skipped bucket: import/dup skips awaiting Revive or Discard.
+        "skipped_rows": list(skipped_rows or []),
     }
 
 
@@ -291,6 +297,7 @@ def draft_is_empty(payload: dict | None) -> bool:
         not payload.get("dirty_saved")
         and not payload.get("new_rows")
         and not payload.get("parked_rows")
+        and not payload.get("skipped_rows")
     )
 
 
@@ -301,12 +308,27 @@ def draft_parked_rows(payload: dict | None) -> list[dict]:
     return [e for e in (payload.get("parked_rows") or []) if isinstance(e, dict)]
 
 
+def draft_skipped_rows(payload: dict | None) -> list[dict]:
+    """Locally skipped (import/dup) rows stored in a My draft file."""
+    if not isinstance(payload, dict):
+        return []
+    return [e for e in (payload.get("skipped_rows") or []) if isinstance(e, dict)]
+
+
 def entry_is_parked(entry: dict | None) -> bool:
     """True when a draft ``new_rows`` entry carries the parked follow-up flag."""
     if not isinstance(entry, dict):
         return False
     meta = entry.get("pending_meta")
     return bool(isinstance(meta, dict) and meta.get("parked"))
+
+
+def entry_is_skipped(entry: dict | None) -> bool:
+    """True when a draft entry is marked skipped (Revive/Discard bucket)."""
+    if not isinstance(entry, dict):
+        return False
+    meta = entry.get("pending_meta")
+    return bool(isinstance(meta, dict) and meta.get("skipped"))
 
 
 def apply_mapping_to_draft_payload(
@@ -321,12 +343,14 @@ def apply_mapping_to_draft_payload(
     item_col: int = 2,
     payee_col: int = 12,
     normalize_description=None,
-    sections: tuple[str, ...] = ("new_rows", "dirty_saved", "parked_rows"),
+    sections: tuple[str, ...] = (
+        "new_rows", "dirty_saved", "parked_rows", "skipped_rows",
+    ),
 ) -> int:
     """Stamp Payee + Item onto matching draft rows. Mutates *draft* entries.
 
     *sections* picks which lists to stamp: typed ``new_rows``, edited
-    ``dirty_saved`` and the local Parked bucket ``parked_rows``.
+    ``dirty_saved``, local Parked ``parked_rows``, and Skipped ``skipped_rows``.
 
     Pass ``clear_category=True`` (Day Issues Undo) to drop ``category_id`` from
     pending meta while writing blank Item / Payee.

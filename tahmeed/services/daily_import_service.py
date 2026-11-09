@@ -118,6 +118,8 @@ class DailyImportPreview:
     skipped_blank: int = 0
     skip_reasons: Dict[str, int] = field(default_factory=dict)
     problem_rows: List[DailyImportProblemRow] = field(default_factory=list)
+    # Draft-shaped entries for Skipped tab (user Skip in Fix import rows).
+    skipped_rows: List[dict] = field(default_factory=list)
     primary_date: Optional[date] = None
     detected_dates: List[date] = field(default_factory=list)
     date_counts: Dict[date, int] = field(default_factory=dict)
@@ -332,10 +334,13 @@ def problem_to_import_row(problem: DailyImportProblemRow) -> DailyImportRow:
     """Promote a fixed problem row into a normal import row."""
     if problem.date is None:
         raise ValueError("Problem row has no date assigned")
+    desc = (problem.description or "").strip()
+    if not desc:
+        raise ValueError("Problem row has no description assigned")
     return DailyImportRow(
         serial=problem.serial,
         date=problem.date,
-        description=problem.description,
+        description=desc.upper(),
         truck_number=problem.truck_number,
         lpo_do=problem.lpo_do,
         do_number=problem.do_number,
@@ -356,11 +361,14 @@ def parse_daily_expenses_excel(
     sheet_name: Optional[str] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
 ) -> DailyParseResult:
-    """Parse Daily Register Excel into accepted rows + date problems + auto-skips.
+    """Parse Daily Register Excel into accepted rows + problems + auto-skips.
 
-    Rows with a description but missing/invalid date are kept in ``problems``
-    (not silently dropped). Empty rows, blank descriptions, and TOTAL lines
-    remain auto-skipped with a reason breakdown.
+    Kept in ``problems`` (not silently dropped):
+    - rows with a description but missing/invalid date
+    - rows with an amount but blank description
+
+    Empty rows, blank description with no amount, and TOTAL lines remain
+    auto-skipped with a reason breakdown.
     """
     path = Path(path)
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -402,7 +410,48 @@ def parse_daily_expenses_excel(
                 continue
             row = list(row)
             desc = cell_str(_col(row, cols, "description"))
+            raw_date = _col(row, cols, "date")
+            dt = parse_date_value(raw_date)
+            tzs = parse_amount(_col(row, cols, "tzs"))
+            usd = parse_amount(_col(row, cols, "usd")) if "usd" in cols else None
+            amount, amount_usd, currency = pack_money(tzs, usd)
+            has_amount = tzs is not None or usd is not None
+            serial = _parse_serial(_col(row, cols, "serial"))
+            notes = cell_str(_col(row, cols, "notes"))
+            truck = cell_str(_col(row, cols, "truck")).upper()
+            lpo = cell_str(_col(row, cols, "lpo")).upper()
+            do_no = cell_str(_col(row, cols, "do")).upper()
+            memo = cell_str(_col(row, cols, "memo")).upper()
+            receipt = cell_str(_col(row, cols, "receipt"))
+            ownership = cell_str(_col(row, cols, "ownership")).upper()
+            approver = cell_str(_col(row, cols, "approver")).upper()
+
             if not desc:
+                # Amount present → flag for description (and date if needed).
+                if has_amount:
+                    problems.append(
+                        DailyImportProblemRow(
+                            excel_row=excel_row,
+                            reason=REASON_EMPTY_DESCRIPTION,
+                            description="",
+                            truck_number=truck,
+                            lpo_do=lpo,
+                            do_number=do_no,
+                            memo=memo,
+                            notes=notes,
+                            amount=amount,
+                            currency=currency,
+                            amount_usd=amount_usd,
+                            receipt_status=receipt,
+                            ownership=ownership,
+                            approver=approver,
+                            serial=serial,
+                            raw_date_text=cell_str(raw_date),
+                            date=dt,
+                        )
+                    )
+                    _bump_reason(skip_reasons, REASON_EMPTY_DESCRIPTION)
+                    continue
                 skipped += 1
                 _bump_reason(skip_reasons, REASON_EMPTY_DESCRIPTION)
                 continue
@@ -414,20 +463,6 @@ def parse_daily_expenses_excel(
                 _bump_reason(skip_reasons, REASON_TOTAL_ROW)
                 continue
 
-            raw_date = _col(row, cols, "date")
-            dt = parse_date_value(raw_date)
-            tzs = parse_amount(_col(row, cols, "tzs"))
-            usd = parse_amount(_col(row, cols, "usd")) if "usd" in cols else None
-            amount, amount_usd, currency = pack_money(tzs, usd)
-            serial = _parse_serial(_col(row, cols, "serial"))
-            notes = cell_str(_col(row, cols, "notes"))
-            truck = cell_str(_col(row, cols, "truck")).upper()
-            lpo = cell_str(_col(row, cols, "lpo")).upper()
-            do_no = cell_str(_col(row, cols, "do")).upper()
-            memo = cell_str(_col(row, cols, "memo")).upper()
-            receipt = cell_str(_col(row, cols, "receipt"))
-            ownership = cell_str(_col(row, cols, "ownership")).upper()
-            approver = cell_str(_col(row, cols, "approver")).upper()
             desc_u = desc.upper()
 
             if dt is None:
@@ -524,20 +559,77 @@ def _refresh_date_allocation(preview: DailyImportPreview) -> None:
     preview.outlier_count = outliers
 
 
-async def absorb_import_problems(preview: DailyImportPreview) -> None:
-    """Move fixed problem rows into ``preview.rows``; count explicit skips.
+def problem_to_skipped_draft_entry(
+    problem: DailyImportProblemRow,
+    preview: DailyImportPreview,
+) -> dict:
+    """Build a local-draft Skipped entry from a user-skipped problem row."""
+    from tahmeed.services.register_draft_service import (
+        cells_for_json,
+        new_client_row_id,
+        serialize_pending_meta,
+    )
+    from tahmeed.ui.cashier.register_delegates import (
+        COL_DATE,
+        COL_DESC,
+        COL_RECEIPT,
+        COL_TRUCK,
+        COL_TZS,
+        COL_USD,
+        format_register_date,
+    )
 
-    Call after the user has assigned a date or marked skip on each problem.
-    Recomputes description mappings and register-date allocation.
+    cells: dict[int, str] = {}
+    if problem.date is not None:
+        cells[COL_DATE] = format_register_date(problem.date)
+    if problem.description:
+        cells[COL_DESC] = problem.description
+    if problem.truck_number:
+        cells[COL_TRUCK] = problem.truck_number
+    if problem.currency == "USD" and problem.amount:
+        cells[COL_USD] = f"{problem.amount:,.2f}"
+    elif problem.amount:
+        cells[COL_TZS] = f"{problem.amount:,.0f}"
+    if problem.amount_usd:
+        cells[COL_USD] = f"{problem.amount_usd:,.2f}"
+    if problem.receipt_status:
+        cells[COL_RECEIPT] = problem.receipt_status
+
+    rid = new_client_row_id()
+    reason_key = f"{problem.reason}_user_skip"
+    meta = {
+        "skipped": True,
+        "skip_reason": reason_key,
+        "client_row_id": rid,
+        "daily_import_id": preview.upload_id,
+        "daily_import_source": preview.source_filename,
+        "excel_row": problem.excel_row,
+    }
+    return {
+        "client_row_id": rid,
+        "cells": cells_for_json(cells),
+        "pending_meta": serialize_pending_meta(meta),
+    }
+
+
+async def absorb_import_problems(preview: DailyImportPreview) -> None:
+    """Move fixed problem rows into ``preview.rows``; keep skips for Skipped tab.
+
+    Call after the user has assigned a date/description or marked skip on
+    each problem. Recomputes description mappings and register-date allocation.
     """
     kept: List[DailyImportProblemRow] = []
     promoted: List[DailyImportRow] = []
     for problem in preview.problem_rows:
         if problem.skipped:
             preview.skipped_blank += 1
-            _bump_reason(preview.skip_reasons, f"{problem.reason}_user_skip")
+            reason_key = f"{problem.reason}_user_skip"
+            _bump_reason(preview.skip_reasons, reason_key)
+            preview.skipped_rows.append(
+                problem_to_skipped_draft_entry(problem, preview)
+            )
             continue
-        if problem.date is None:
+        if problem.date is None or not (problem.description or "").strip():
             kept.append(problem)
             continue
         promoted.append(problem_to_import_row(problem))

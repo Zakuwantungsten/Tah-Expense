@@ -71,7 +71,7 @@ async def run_daily_to_master_flow(
             busy.update(
                 f"Matched descriptions · {len(preview.rows):,} row(s) found…"
                 + (
-                    f" · {len(preview.problem_rows):,} need dates"
+                    f" · {len(preview.problem_rows):,} need fixes"
                     if preview.problem_rows
                     else ""
                 )
@@ -86,7 +86,7 @@ async def run_daily_to_master_flow(
         )
         return None
 
-    # ── Missing / invalid dates (flag to fix or explicit skip) ────────────
+    # ── Missing date / blank description (flag to fix or explicit skip) ───
     if not await prompt_import_problems(preview, parent):
         return None
 

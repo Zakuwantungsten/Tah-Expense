@@ -13,10 +13,12 @@ from tahmeed.services.daily_import_service import (
     preview_daily_import,
     skip_all_unmapped,
 )
+from tahmeed.ui.async_utils import pause_background_polls
 from tahmeed.ui.dialogs.daily_import_preview_dialog import DailyImportPreviewDialog
 from tahmeed.ui.dialogs.daily_reimport_dialog import DailyReimportDialog
 from tahmeed.ui.dialogs.date_outlier_dialog import resolve_import_date_policy
 from tahmeed.ui.dialogs.import_problem_rows_dialog import prompt_import_problems
+from tahmeed.ui.widgets.export_runner import await_ui
 from tahmeed.ui.widgets.upload_busy import UploadBusy, UploadCancelled
 
 _IMPORT_TITLE = "Importing Daily Register"
@@ -24,12 +26,15 @@ _IMPORT_TITLE = "Importing Daily Register"
 
 async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]:
     """Pick a file, resolve mappings + dates, confirm preview (or None)."""
-    path, _ = QFileDialog.getOpenFileName(
-        parent,
-        "Import daily Excel transactions",
-        "",
-        "Excel files (*.xlsx *.xls);;All files (*)",
-    )
+    with pause_background_polls(parent):
+        path, _ = await await_ui(
+            lambda: QFileDialog.getOpenFileName(
+                parent,
+                "Import daily Excel transactions",
+                "",
+                "Excel files (*.xlsx *.xls);;All files (*)",
+            )
+        )
     if not path:
         return None
 
@@ -53,31 +58,37 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
             await busy.tick()
             detail = f"{len(preview.rows):,} row(s) ready"
             if preview.problem_rows:
-                detail += f" · {len(preview.problem_rows):,} need dates"
+                detail += f" · {len(preview.problem_rows):,} need fixes"
             busy.update(detail, value=100, maximum=100)
             await busy.tick()
     except (UploadCancelled, DailyImportCancelled):
         return None
     except Exception as exc:
-        QMessageBox.critical(
-            parent,
-            "Import Rejected",
-            f"Could not import this file:\n\n{exc}",
-        )
+        with pause_background_polls(parent):
+            await await_ui(
+                lambda: QMessageBox.critical(
+                    parent,
+                    "Import Rejected",
+                    f"Could not import this file:\n\n{exc}",
+                )
+            )
         return None
 
-    # ── Missing / invalid dates (flag to fix or explicit skip) ────────────
+    # ── Missing date / blank description (flag to fix or explicit skip) ───
     if not await prompt_import_problems(preview, parent):
         return None
 
     if not preview.rows:
-        QMessageBox.information(
-            parent,
-            "Import",
-            "No transaction rows were found in that file.\n\n"
-            "Check that it is a Daily Register / MATUMIZI Excel with "
-            "Date and Description columns.",
-        )
+        with pause_background_polls(parent):
+            await await_ui(
+                lambda: QMessageBox.information(
+                    parent,
+                    "Import",
+                    "No transaction rows were found in that file.\n\n"
+                    "Check that it is a Daily Register / MATUMIZI Excel with "
+                    "Date and Description columns.",
+                )
+            )
         return None
 
     # ── Unmapped descriptions → Day Issues (no one-by-one dialog) ─────────
@@ -86,17 +97,23 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
     unmapped_n = len(preview.unmapped) if preview.unmapped else 0
     if unmapped_n:
         skip_all_unmapped(preview)
-        QMessageBox.information(
-            parent,
-            "Day Issues",
-            f"{unmapped_n:,} description(s) still need Payee + Item mapping.\n\n"
-            "They will be imported without a mapping. Open Day Issues to map "
-            "them in bulk before Submit.",
-        )
+        with pause_background_polls(parent):
+            await await_ui(
+                lambda: QMessageBox.information(
+                    parent,
+                    "Day Issues",
+                    f"{unmapped_n:,} description(s) still need Payee + Item mapping.\n\n"
+                    "They will be imported without a mapping. Open Day Issues to map "
+                    "them in bulk before Submit.",
+                )
+            )
 
     # ── One reconciled date for the whole upload ──────────────────────────
-    if not resolve_import_date_policy(preview, parent=parent):
-        return None
+    with pause_background_polls(parent):
+        if not await await_ui(
+            lambda: resolve_import_date_policy(preview, parent=parent)
+        ):
+            return None
 
     # ── Reimport gate — same filename / exact content already uploaded ───
     try:
@@ -119,18 +136,26 @@ async def run_daily_import_flow(parent: QWidget) -> Optional[DailyImportPreview]
         prior = []
 
     if prior:
-        reimport = DailyReimportDialog(
-            prior,
-            source_filename=preview.source_filename,
-            row_count=len(preview.rows),
-            parent=parent,
-        )
-        if reimport.exec() != DailyReimportDialog.Accepted:
-            return None
+        def _reimport() -> bool:
+            reimport = DailyReimportDialog(
+                prior,
+                source_filename=preview.source_filename,
+                row_count=len(preview.rows),
+                parent=parent,
+            )
+            return reimport.exec() == DailyReimportDialog.Accepted
+
+        with pause_background_polls(parent):
+            if not await await_ui(_reimport):
+                return None
 
     # ── Confirm preview before staging into the table ─────────────────────
-    confirm = DailyImportPreviewDialog(preview, parent=parent)
-    if confirm.exec() != DailyImportPreviewDialog.Accepted:
-        return None
+    def _confirm() -> bool:
+        confirm = DailyImportPreviewDialog(preview, parent=parent)
+        return confirm.exec() == DailyImportPreviewDialog.Accepted
+
+    with pause_background_polls(parent):
+        if not await await_ui(_confirm):
+            return None
 
     return preview

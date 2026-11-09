@@ -80,6 +80,8 @@ class QbTxnToolbar(QFrame):
     filter_clicked = Signal()
     fix_parked_trucks_clicked = Signal()
     clear_parked_clicked = Signal()
+    revive_skipped_clicked = Signal()
+    discard_skipped_clicked = Signal()
 
     def __init__(
         self,
@@ -273,11 +275,15 @@ class QbTxnToolbar(QFrame):
         self._btn_import: Optional[QToolButton] = None
         self._btn_fix_parked: Optional[QToolButton] = None
         self._btn_clear_parked: Optional[QToolButton] = None
+        self._btn_revive_skipped: Optional[QToolButton] = None
+        self._btn_discard_skipped: Optional[QToolButton] = None
         self._btn_today: Optional[QToolButton] = None
         self._btn_edit: Optional[QToolButton] = None
         self._btn_submit: Optional[QToolButton] = None
         self._parked_mode = False
+        self._skipped_mode = False
         self._parked_count = 0
+        self._skipped_count = 0
 
         if register_actions:
             self._btn_export = self._tool_btn(
@@ -343,6 +349,26 @@ class QbTxnToolbar(QFrame):
             )
             self._btn_clear_parked.clicked.connect(self.clear_parked_clicked.emit)
             lay.addWidget(self._btn_clear_parked)
+
+            self._btn_revive_skipped = self._tool_btn(
+                "mdi.restore",
+                "Revive",
+                "Skipped tab — move skipped rows back onto My entries",
+            )
+            self._btn_revive_skipped.clicked.connect(
+                self.revive_skipped_clicked.emit
+            )
+            lay.addWidget(self._btn_revive_skipped)
+
+            self._btn_discard_skipped = self._tool_btn(
+                "mdi.delete-outline",
+                "Discard",
+                "Skipped tab — permanently drop skipped rows from this device",
+            )
+            self._btn_discard_skipped.clicked.connect(
+                self.discard_skipped_clicked.emit
+            )
+            lay.addWidget(self._btn_discard_skipped)
             self._refresh_parked_actions()
 
             self._btn_today = self._tool_btn(
@@ -606,40 +632,68 @@ class QbTxnToolbar(QFrame):
                 self._btn_fix_parked.setEnabled(False)
             if self._btn_clear_parked is not None:
                 self._btn_clear_parked.setEnabled(False)
+            if self._btn_revive_skipped is not None:
+                self._btn_revive_skipped.setEnabled(False)
+            if self._btn_discard_skipped is not None:
+                self._btn_discard_skipped.setEnabled(False)
         else:
             self._refresh_parked_actions()
 
     def set_parked_mode(self, mode: str) -> None:
-        """Enable Parked tools only while the Parked tab is active."""
+        """Enable Parked / Skipped tools only while those tabs are active."""
         if isinstance(mode, bool):
             mode = "merged" if mode else "my"
         self._parked_mode = mode == "parked"
+        self._skipped_mode = mode == "skipped"
         self._refresh_parked_actions()
 
     def set_parked_count(self, count: int) -> None:
         self._parked_count = max(0, int(count or 0))
         self._refresh_parked_actions()
 
+    def set_skipped_count(self, count: int) -> None:
+        self._skipped_count = max(0, int(count or 0))
+        self._refresh_parked_actions()
+
     def _refresh_parked_actions(self) -> None:
-        if self._btn_fix_parked is None or self._btn_clear_parked is None:
-            return
         on = bool(self._parked_mode)
-        self._btn_fix_parked.setEnabled(on)
-        self._btn_clear_parked.setEnabled(on and self._parked_count > 0)
-        # Dim icons off the Parked tab (same blue family as the rest of the strip).
-        fix_color = _BLUE if on else _MUTED
-        clear_color = "#B91C1C" if on and self._parked_count > 0 else _MUTED
-        fix_icon = self._colored_icon(
-            fix_color,
-            "mdi.truck-check-outline",
-            "mdi.truck-outline",
-            "mdi.truck",
-            "fa5s.truck",
-        )
-        if fix_icon is not None:
-            self._btn_fix_parked.setIcon(fix_icon)
-        clear_icon = self._colored_icon(
-            clear_color, "mdi.parking", "fa5s.parking"
-        )
-        if clear_icon is not None:
-            self._btn_clear_parked.setIcon(clear_icon)
+        skipped_on = bool(self._skipped_mode)
+        has_skipped = self._skipped_count > 0
+        if self._btn_fix_parked is not None and self._btn_clear_parked is not None:
+            self._btn_fix_parked.setEnabled(on)
+            self._btn_clear_parked.setEnabled(on and self._parked_count > 0)
+            # Dim icons off the Parked tab (same blue family as the rest of the strip).
+            fix_color = _BLUE if on else _MUTED
+            clear_color = "#B91C1C" if on and self._parked_count > 0 else _MUTED
+            fix_icon = self._colored_icon(
+                fix_color,
+                "mdi.truck-check-outline",
+                "mdi.truck-outline",
+                "mdi.truck",
+                "fa5s.truck",
+            )
+            if fix_icon is not None:
+                self._btn_fix_parked.setIcon(fix_icon)
+            clear_icon = self._colored_icon(
+                clear_color, "mdi.parking", "fa5s.parking"
+            )
+            if clear_icon is not None:
+                self._btn_clear_parked.setIcon(clear_icon)
+        if (
+            self._btn_revive_skipped is not None
+            and self._btn_discard_skipped is not None
+        ):
+            self._btn_revive_skipped.setEnabled(skipped_on and has_skipped)
+            self._btn_discard_skipped.setEnabled(skipped_on and has_skipped)
+            revive_color = _BLUE if skipped_on and has_skipped else _MUTED
+            discard_color = "#B91C1C" if skipped_on and has_skipped else _MUTED
+            revive_icon = self._colored_icon(
+                revive_color, "mdi.restore", "fa5s.undo"
+            )
+            if revive_icon is not None:
+                self._btn_revive_skipped.setIcon(revive_icon)
+            discard_icon = self._colored_icon(
+                discard_color, "mdi.delete-outline", "fa5s.trash"
+            )
+            if discard_icon is not None:
+                self._btn_discard_skipped.setIcon(discard_icon)

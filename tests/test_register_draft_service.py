@@ -191,3 +191,60 @@ def test_load_register_draft_stamps_missing_client_row_ids(draft_dir):
     assert loaded is not None
     assert loaded["schema_version"] == drafts.SCHEMA_VERSION
     assert drafts.entry_client_row_id(loaded["new_rows"][0])
+
+
+def test_skipped_rows_roundtrip_and_keeps_draft_nonempty(draft_dir):
+    user_id = ObjectId()
+    d = date(2026, 8, 8)
+    skipped = [{
+        "client_row_id": "skip-1",
+        "cells": {"3": "SKIP ME", "7": "100.00"},
+        "pending_meta": {
+            "skipped": True,
+            "skip_reason": "duplicate_deferred",
+            "client_row_id": "skip-1",
+        },
+    }]
+    payload = drafts.build_draft_payload(
+        user_id=user_id,
+        username="aisha",
+        register_date=d,
+        merged=False,
+        edit_mode=False,
+        dirty_saved=[],
+        new_rows=[],
+        skipped_rows=skipped,
+    )
+    assert payload["schema_version"] == 5
+    assert not drafts.draft_is_empty(payload)
+    path = drafts.save_register_draft(payload)
+    assert path.is_file()
+
+    loaded = drafts.load_register_draft(user_id, d, merged=False)
+    assert loaded is not None
+    assert loaded["schema_version"] == drafts.SCHEMA_VERSION
+    rows = drafts.draft_skipped_rows(loaded)
+    assert len(rows) == 1
+    assert drafts.entry_client_row_id(rows[0]) == "skip-1"
+    assert drafts.entry_is_skipped(rows[0])
+
+
+def test_ensure_draft_client_row_ids_stamps_skipped_rows():
+    payload = {
+        "schema_version": 4,
+        "new_rows": [],
+        "parked_rows": [],
+        "skipped_rows": [
+            {
+                "cells": {"3": "BLANK DESC"},
+                "pending_meta": {"skipped": True, "skip_reason": "empty_description_user_skip"},
+            }
+        ],
+        "dirty_saved": [],
+    }
+    drafts.ensure_draft_client_row_ids(payload)
+    assert payload["schema_version"] == 5
+    rid = drafts.entry_client_row_id(payload["skipped_rows"][0])
+    assert rid
+    assert payload["skipped_rows"][0]["client_row_id"] == rid
+    assert drafts.entry_is_skipped(payload["skipped_rows"][0])

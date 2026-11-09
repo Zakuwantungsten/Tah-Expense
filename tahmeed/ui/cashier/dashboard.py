@@ -17,12 +17,15 @@ import asyncio
 from datetime import date
 from typing import Optional
 
+import qtawesome as qta
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
     QFrame, QLabel, QLineEdit, QPushButton, QDialog, QMessageBox,
     QSizePolicy, QDateEdit,
 )
-from PySide6.QtCore import Qt, Signal, QDate, QEvent, QPoint, QTimer
+from PySide6.QtCore import Qt, Signal, QDate, QSize, QTimer
+from PySide6.QtGui import QKeySequence, QShortcut
 
 from tahmeed.config import APP_NAME, APP_VERSION, COMPANY_NAME
 from tahmeed.models.user import User
@@ -53,7 +56,9 @@ _T1     = "#111827"
 _T2     = "#6B7280"
 _BTN_H  = 30  # slim professional control height
 _BADGE_RED = "#DC2626"  # same red as the sidebar / Import tab badges
-_PARKED_BADGE_H = 16
+_TAB_H = 32
+_TAB_BADGE_H = 18
+_SEARCH_H = 34
 
 # ── Button styles ────────────────────────────────────────────────────────────────
 # Filled primary (Save), outlined secondaries, warm cancel, gold submit.
@@ -527,20 +532,163 @@ def _qb_inline_date_field(label: str) -> tuple[QWidget, QDateEdit]:
     return wrap, edit
 
 
+# ── Mode tab (icon + label + count badge + active underline) ─────────────────
+
+class _ModeTab(QFrame):
+    """Single Daily Register mode tab matching the icon-pill mock."""
+
+    clicked = Signal()
+
+    def __init__(self, label: str, icon_names: tuple[str, ...], parent=None):
+        super().__init__(parent)
+        self.setObjectName("modeTab")
+        self.setCursor(Qt.PointingHandCursor)
+        # Maximum: never absorb leftover bar width (Preferred was stretching My).
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self._active = False
+        self._count = 0
+        self._icon_names = icon_names
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(3)
+        root.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        self._chip = QFrame()
+        self._chip.setObjectName("modeTabChip")
+        self._chip.setFixedHeight(_TAB_H)
+        self._chip.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        chip_hl = QHBoxLayout(self._chip)
+        chip_hl.setContentsMargins(12, 0, 10, 0)
+        chip_hl.setSpacing(7)
+
+        self._icon = QLabel()
+        self._icon.setFixedSize(16, 16)
+        self._icon.setAlignment(Qt.AlignCenter)
+        self._icon.setAttribute(Qt.WA_TransparentForMouseEvents)
+        chip_hl.addWidget(self._icon, 0, Qt.AlignVCenter)
+
+        self._label = QLabel(label)
+        self._label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self._label.setStyleSheet(
+            "QLabel{background:transparent;border:none;padding:0;"
+            "font-family:'Segoe UI',sans-serif;font-size:12px;font-weight:600;}"
+        )
+        chip_hl.addWidget(self._label, 0, Qt.AlignVCenter)
+
+        self._badge = QLabel("0")
+        self._badge.setAlignment(Qt.AlignCenter)
+        self._badge.setFixedHeight(_TAB_BADGE_H)
+        self._badge.setMinimumWidth(_TAB_BADGE_H)
+        self._badge.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self._badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+        chip_hl.addWidget(self._badge, 0, Qt.AlignVCenter)
+
+        root.addWidget(self._chip, 0, Qt.AlignLeft)
+
+        self._underline = QFrame()
+        self._underline.setFixedHeight(3)
+        self._underline.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._underline.setStyleSheet(
+            f"QFrame{{background:{_BLUE};border:none;border-radius:1px;}}"
+        )
+        self._underline.hide()
+        root.addWidget(self._underline, 0, Qt.AlignLeft)
+
+        self._apply_style()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def set_active(self, active: bool) -> None:
+        active = bool(active)
+        if self._active == active:
+            return
+        self._active = active
+        self._apply_style()
+
+    def set_count(self, count: int) -> None:
+        self._count = max(0, int(count or 0))
+        if self._count <= 0:
+            self._badge.hide()
+        else:
+            self._badge.setText(
+                f"{self._count:,}" if self._count < 1000 else "999+"
+            )
+            self._badge.adjustSize()
+            self._badge.setMinimumWidth(
+                max(_TAB_BADGE_H, self._badge.sizeHint().width() + 2)
+            )
+            self._badge.show()
+        self._apply_style()
+        self._sync_underline_width()
+        self.updateGeometry()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._sync_underline_width()
+
+    def _sync_underline_width(self) -> None:
+        w = max(24, self._chip.sizeHint().width())
+        self._underline.setFixedWidth(w)
+
+    def _qta_icon(self, color: str):
+        for name in self._icon_names:
+            try:
+                return qta.icon(name, color=color)
+            except Exception:
+                continue
+        return None
+
+    def _apply_style(self) -> None:
+        if self._active:
+            fg = "#FFFFFF"
+            chip_bg = _NAVY
+            badge_bg = "#FFFFFF"
+            badge_fg = _NAVY
+            self._underline.show()
+        else:
+            fg = _NAVY
+            chip_bg = "transparent"
+            badge_bg = "#E5E7EB"
+            badge_fg = _NAVY
+            self._underline.hide()
+        self._chip.setStyleSheet(
+            f"QFrame#modeTabChip{{background:{chip_bg};border:none;"
+            f"border-radius:{_TAB_H // 2}px;}}"
+        )
+        self._label.setStyleSheet(
+            f"QLabel{{background:transparent;border:none;padding:0;color:{fg};"
+            "font-family:'Segoe UI',sans-serif;font-size:12px;font-weight:600;}"
+        )
+        self._badge.setStyleSheet(
+            f"QLabel{{background:{badge_bg};color:{badge_fg};"
+            f"border-radius:{_TAB_BADGE_H // 2}px;padding:0 5px;"
+            "font-family:'Segoe UI',sans-serif;font-size:10px;font-weight:700;}"
+        )
+        icon = self._qta_icon(fg)
+        if icon is not None:
+            self._icon.setPixmap(icon.pixmap(QSize(16, 16)))
+        self._sync_underline_width()
+
+
 # ── Action bar (mode / search / cheque) ─────────────────────────────────────
 
 class _ActionBar(QFrame):
-    """Search → pills (My entries / Parked / Merged); Reconciled Date / Cheque on the right."""
+    """Search → icon tabs (My / Parked / Skipped / Merged); date / cheque on the right."""
 
     search_changed = Signal(str)
-    mode_changed = Signal(str)  # "my" | "parked" | "merged"
+    mode_changed = Signal(str)  # "my" | "parked" | "skipped" | "merged"
     cheque_edited  = Signal(str)
     reconciled_date_changed = Signal(object)  # date
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("registerActionBar")
-        self.setFixedHeight(44)
+        self.setFixedHeight(52)
         self.setStyleSheet(
             "QFrame#registerActionBar {"
             f"  background: {_WHITE}; border-bottom: 1px solid {_BORDER};"
@@ -548,113 +696,121 @@ class _ActionBar(QFrame):
         )
 
         hl = QHBoxLayout(self)
-        hl.setContentsMargins(16, 6, 16, 6)
-        hl.setSpacing(8)
+        hl.setContentsMargins(16, 6, 16, 4)
+        hl.setSpacing(10)
 
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("Search entries…")
-        self._search.setFixedWidth(220)
-        self._search.setFixedHeight(_BTN_H)
-        self._search.setClearButtonEnabled(True)
-        self._search.setStyleSheet(
-            "QLineEdit {"
-            "  border: 1px solid #D1D5DB; border-radius: 5px;"
-            "  padding: 0 10px; font-size: 12px;"
-            "  color: #111827; background: #F9FAFB;"
-            "}"
-            "QLineEdit:focus {"
-            "  border-color: #0077C5; background: #ffffff;"
+        # Pill search: magnifier | field | Ctrl+K
+        search_wrap = QFrame()
+        search_wrap.setObjectName("registerSearchPill")
+        search_wrap.setFixedHeight(_SEARCH_H)
+        search_wrap.setFixedWidth(250)
+        search_wrap.setStyleSheet(
+            "QFrame#registerSearchPill {"
+            "  background:#F3F4F6; border:1px solid #E5E7EB;"
+            f"  border-radius:{_SEARCH_H // 2}px;"
             "}"
         )
-        hl.addWidget(self._search, 0, Qt.AlignVCenter)
+        self._search_wrap = search_wrap
+        sw = QHBoxLayout(search_wrap)
+        sw.setContentsMargins(12, 0, 8, 0)
+        sw.setSpacing(6)
 
-        self._search_clear_btn = QPushButton("Search")
-        self._search_clear_btn.setFixedHeight(_BTN_H)
-        self._search_clear_btn.setFixedWidth(68)
-        self._search_clear_btn.setCursor(Qt.PointingHandCursor)
-        self._search_clear_btn.setStyleSheet(_BTN_STYLES["secondary"])
-        self._search_clear_btn.setToolTip("Clear the table search filter")
+        search_icon = QLabel()
+        search_icon.setFixedSize(16, 16)
+        search_icon.setAttribute(Qt.WA_TransparentForMouseEvents)
+        try:
+            search_icon.setPixmap(
+                qta.icon("fa5s.search", color="#9CA3AF").pixmap(QSize(14, 14))
+            )
+        except Exception:
+            pass
+        sw.addWidget(search_icon, 0, Qt.AlignVCenter)
 
-        self._search.textChanged.connect(self._on_search_text_changed)
-        self._search_clear_btn.clicked.connect(self._on_search_clear_clicked)
-        hl.addWidget(self._search_clear_btn, 0, Qt.AlignVCenter)
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search entries...")
+        self._search.setClearButtonEnabled(True)
+        self._search.setFrame(False)
+        self._search.setStyleSheet(
+            "QLineEdit {"
+            "  border:none; background:transparent; padding:0;"
+            "  font-size:12px; color:#111827;"
+            "  font-family:'Segoe UI',sans-serif;"
+            "}"
+        )
+        self._search.textChanged.connect(self.search_changed.emit)
+        sw.addWidget(self._search, 1)
 
-        # My / Parked / Merged segmented toggle (after search)
+        shortcut_badge = QLabel("Ctrl + K")
+        shortcut_badge.setAlignment(Qt.AlignCenter)
+        shortcut_badge.setFixedHeight(20)
+        shortcut_badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+        shortcut_badge.setStyleSheet(
+            "QLabel{background:#E5E7EB;color:#6B7280;border-radius:6px;"
+            "padding:0 6px;font-size:10px;font-weight:600;"
+            "font-family:'Segoe UI',sans-serif;}"
+        )
+        sw.addWidget(shortcut_badge, 0, Qt.AlignVCenter)
+        hl.addWidget(search_wrap, 0, Qt.AlignVCenter)
+
+        def _vsep() -> QFrame:
+            sep = QFrame()
+            sep.setFrameShape(QFrame.VLine)
+            sep.setFixedHeight(22)
+            sep.setStyleSheet("QFrame{color:#E5E7EB;background:#E5E7EB;max-width:1px;}")
+            return sep
+
+        hl.addWidget(_vsep(), 0, Qt.AlignVCenter)
+
         toggle = QFrame()
         toggle.setObjectName("modeToggle")
+        toggle.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         toggle.setStyleSheet(
             "QFrame#modeToggle{background:transparent;border:none;}"
         )
         tg = QHBoxLayout(toggle)
         tg.setContentsMargins(0, 0, 0, 0)
-        tg.setSpacing(0)
+        tg.setSpacing(4)
+        tg.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
-        _toggle_ss = (
-            "QPushButton{"
-            " background:#FFFFFF;border:1px solid #D1D5DB;"
-            " padding:0 14px;font-size:12px;font-weight:600;color:#6B7280;"
-            f" min-height:{_BTN_H}px;"
-            "}"
-            f"QPushButton:checked{{background:{_NAVY};border-color:{_NAVY};color:#FFFFFF;}}"
-            "QPushButton:hover:!checked{background:#F9FAFB;color:#374151;}"
+        self._my_btn = _ModeTab(
+            "My entries",
+            ("mdi.file-document-outline", "fa5s.file-alt"),
         )
-        self._my_btn = QPushButton("My entries")
-        self._parked_btn = QPushButton("Parked")
-        self._merged_btn = QPushButton("Merged")
-        for btn in (self._my_btn, self._parked_btn, self._merged_btn):
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(_BTN_H)
-        self._my_btn.setStyleSheet(
-            _toggle_ss
-            + "QPushButton{"
-            " border-top-left-radius:5px;border-bottom-left-radius:5px;"
-            " border-top-right-radius:0;border-bottom-right-radius:0;"
-            "}"
+        self._parked_btn = _ModeTab(
+            "Parked",
+            ("mdi.bookmark-outline", "mdi.bookmark", "fa5s.bookmark"),
         )
-        self._parked_btn.setStyleSheet(
-            _toggle_ss
-            + "QPushButton{"
-            " border-radius:0; border-left:none;"
-            "}"
+        self._skipped_btn = _ModeTab(
+            "Skipped",
+            ("mdi.skip-next-circle-outline", "mdi.skip-forward", "fa5s.forward"),
         )
-        self._merged_btn.setStyleSheet(
-            _toggle_ss
-            + "QPushButton{"
-            " border-top-left-radius:0;border-bottom-left-radius:0;"
-            " border-top-right-radius:5px;border-bottom-right-radius:5px;"
-            " border-left:none;"
-            "}"
+        self._merged_btn = _ModeTab(
+            "Merged",
+            ("mdi.call-split", "mdi.source-merge", "fa5s.code-branch"),
         )
-        self._my_btn.setChecked(True)
+        self._my_btn.set_active(True)
         self._my_btn.clicked.connect(lambda: self._set_mode("my"))
         self._parked_btn.clicked.connect(lambda: self._set_mode("parked"))
+        self._skipped_btn.clicked.connect(lambda: self._set_mode("skipped"))
         self._merged_btn.clicked.connect(lambda: self._set_mode("merged"))
         self._parked_btn.setToolTip(
             "Incorrect truck rows parked for follow-up (not saved) — "
             "fix the truck here, then Save to move them to My entries"
         )
-        self._parked_count = 0
-        tg.addWidget(self._my_btn)
-        tg.addWidget(self._parked_btn)
-        tg.addWidget(self._merged_btn)
-        hl.addWidget(toggle, 0, Qt.AlignVCenter)
-
-        # Red count bubble over the Parked pill's top-right corner. Parented to
-        # the bar (not the pill) so it can overhang the pill's edges.
-        self._parked_badge = QLabel("", self)
-        self._parked_badge.setAlignment(Qt.AlignCenter)
-        self._parked_badge.setFixedHeight(_PARKED_BADGE_H)
-        self._parked_badge.setMinimumWidth(_PARKED_BADGE_H)
-        self._parked_badge.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self._parked_badge.setStyleSheet(
-            f"QLabel{{background:{_BADGE_RED};color:#FFFFFF;"
-            f"border-radius:{_PARKED_BADGE_H // 2}px;padding:0 4px;"
-            "font-family:'Segoe UI';font-size:10px;font-weight:700;}"
+        self._skipped_btn.setToolTip(
+            "Rows skipped on import or Move to Skipped from duplicates — "
+            "Revive onto My entries or Discard"
         )
-        self._parked_badge.hide()
-        toggle.installEventFilter(self)
-        self._parked_btn.installEventFilter(self)
+        self._tabs = {
+            "my": self._my_btn,
+            "parked": self._parked_btn,
+            "skipped": self._skipped_btn,
+            "merged": self._merged_btn,
+        }
+        for tab in self._tabs.values():
+            tg.addWidget(tab, 0, Qt.AlignVCenter)
+        hl.addWidget(toggle, 0, Qt.AlignVCenter)
+        hl.addWidget(_vsep(), 0, Qt.AlignVCenter)
 
         self._status = QLabel("")
         self._status.setStyleSheet(
@@ -686,20 +842,13 @@ class _ActionBar(QFrame):
 
         hl.addWidget(fields, 0, Qt.AlignVCenter)
 
-    def _on_search_text_changed(self, text: str) -> None:
-        self.search_changed.emit(text)
-        has_text = bool((text or "").strip())
-        self._search_clear_btn.setText("Clear" if has_text else "Search")
-        self._search_clear_btn.setStyleSheet(
-            _BTN_STYLES["active"] if has_text else _BTN_STYLES["secondary"]
-        )
+        self._search_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        self._search_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._search_shortcut.activated.connect(self.focus_search)
 
-    def _on_search_clear_clicked(self) -> None:
-        if self._search.text():
-            # clear() emits textChanged → set_search("") on the register.
-            self._search.clear()
-        else:
-            self._search.setFocus()
+    def focus_search(self) -> None:
+        self._search.setFocus(Qt.ShortcutFocusReason)
+        self._search.selectAll()
 
     def _on_reconciled_date(self, qd: QDate) -> None:
         if not qd.isValid() or qd == _RECONCILED_DATE_UNSET:
@@ -736,56 +885,34 @@ class _ActionBar(QFrame):
         self._cheque.blockSignals(False)
 
     def _set_mode(self, mode: str) -> None:
-        mode = mode if mode in ("my", "parked", "merged") else "my"
-        self._my_btn.setChecked(mode == "my")
-        self._parked_btn.setChecked(mode == "parked")
-        self._merged_btn.setChecked(mode == "merged")
+        mode = mode if mode in self._tabs else "my"
+        self._apply_mode(mode)
         self.mode_changed.emit(mode)
+
+    def _apply_mode(self, mode: str) -> None:
+        for key, tab in self._tabs.items():
+            tab.set_active(key == mode)
 
     def sync_mode(self, mode) -> None:
         """Reflect register mode without emitting (e.g. after cancel)."""
         if isinstance(mode, bool):
             mode = "merged" if mode else "my"
-        mode = mode if mode in ("my", "parked", "merged") else "my"
-        for btn in (self._my_btn, self._parked_btn, self._merged_btn):
-            btn.blockSignals(True)
-        self._my_btn.setChecked(mode == "my")
-        self._parked_btn.setChecked(mode == "parked")
-        self._merged_btn.setChecked(mode == "merged")
-        for btn in (self._my_btn, self._parked_btn, self._merged_btn):
-            btn.blockSignals(False)
+        mode = mode if mode in self._tabs else "my"
+        self._apply_mode(mode)
+
+    def set_my_count(self, count: int) -> None:
+        self._my_btn.set_count(count)
 
     def set_parked_count(self, count: int) -> None:
-        """Badge the Parked pill with how many rows need truck follow-up."""
-        self._parked_count = max(0, int(count or 0))
-        if not self._parked_count:
-            self._parked_badge.hide()
-            return
-        n = self._parked_count
-        self._parked_badge.setText(f"{n:,}" if n < 1000 else "999+")
-        self._parked_badge.adjustSize()
-        self._place_parked_badge()
-        self._parked_badge.show()
-        self._parked_badge.raise_()
+        """Badge the Parked tab with how many rows need truck follow-up."""
+        self._parked_btn.set_count(count)
 
-    def _place_parked_badge(self) -> None:
-        btn = self._parked_btn
-        top_right = btn.mapTo(self, QPoint(btn.width(), 0))
-        badge = self._parked_badge
-        x = top_right.x() - badge.width() + _PARKED_BADGE_H // 2
-        y = max(0, top_right.y() - _PARKED_BADGE_H // 2)
-        badge.move(x, y)
+    def set_skipped_count(self, count: int) -> None:
+        """Badge the Skipped tab with how many local skipped rows exist."""
+        self._skipped_btn.set_count(count)
 
-    def eventFilter(self, obj, event):  # noqa: N802
-        if event.type() in (QEvent.Move, QEvent.Resize, QEvent.Show):
-            if not self._parked_badge.isHidden():
-                self._place_parked_badge()
-        return super().eventFilter(obj, event)
-
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        if not self._parked_badge.isHidden():
-            self._place_parked_badge()
+    def set_merged_count(self, count: int) -> None:
+        self._merged_btn.set_count(count)
 
     def set_edit_state(self, active: bool, dirty_count: int = 0) -> None:
         """Show edit-mode status pill next to search."""
@@ -921,13 +1048,22 @@ class _TablePage(QWidget):
                 mode == "merged" if isinstance(mode, str) else bool(mode)
             )
         )
+        register.stats_updated.connect(self._sync_mode_tab_counts)
         register.parked_count_changed.connect(self._action_bar.set_parked_count)
         register.parked_count_changed.connect(self._qb_toolbar.set_parked_count)
+        register.skipped_count_changed.connect(self._action_bar.set_skipped_count)
+        register.skipped_count_changed.connect(self._qb_toolbar.set_skipped_count)
         register.mode_changed.connect(self._qb_toolbar.set_parked_mode)
         self._qb_toolbar.fix_parked_trucks_clicked.connect(
             register.open_parked_truck_correction
         )
         self._qb_toolbar.clear_parked_clicked.connect(register.clear_parked_bucket)
+        self._qb_toolbar.revive_skipped_clicked.connect(
+            lambda: register.revive_skipped_rows(all_rows=True)
+        )
+        self._qb_toolbar.discard_skipped_clicked.connect(
+            self._on_discard_skipped
+        )
         register.active_cheque_changed.connect(self._action_bar.set_cheque_value)
         register.stats_updated.connect(self._sync_reconciled_date)
         self._action_bar.set_reconciled_date(register.current_date())
@@ -942,6 +1078,33 @@ class _TablePage(QWidget):
 
     def _sync_reconciled_date(self, *_args) -> None:
         self._action_bar.set_reconciled_date(self._register.current_date())
+
+    def _sync_mode_tab_counts(self, *_args) -> None:
+        """Keep My tab badge aligned with the live My money bucket."""
+        try:
+            my = self._register._my_money_bucket()
+            self._action_bar.set_my_count(int(my.get("n") or 0))
+        except Exception:
+            pass
+
+    def _on_discard_skipped(self) -> None:
+        """Confirm then discard all local Skipped rows for the open day."""
+        n = len(getattr(self._register, "_local_skipped", []) or [])
+        if n <= 0:
+            return
+        from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
+
+        if not ask_confirm(
+            self,
+            title="Discard skipped?",
+            heading=f"Discard {n} skipped row{'s' if n != 1 else ''}?",
+            body="They will be removed from this device only. This cannot be undone.",
+            accept_label="Discard",
+            cancel_label="Cancel",
+            destructive=True,
+        ):
+            return
+        self._register.discard_skipped_rows(all_rows=True)
 
     def _on_reconciled_date(self, d) -> None:
         if not self._register.navigate_to_date(d):

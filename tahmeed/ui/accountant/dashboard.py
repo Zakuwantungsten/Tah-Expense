@@ -777,13 +777,20 @@ class AccountantDashboard(QWidget):
 
     def pause_notification_polling(self) -> None:
         """Stop badge stream and connectivity polls during nested Qt dialogs."""
+        from tahmeed.ui.async_utils import in_running_task
+
         self._notification_live = False
         self._notification_timer.stop()
         task = getattr(self, "_notification_poll_task", None)
-        if task is not None and not task.done():
-            task.cancel()
         self._notification_poll_task = None
         self._notification_poll_in_flight = False
+        if task is not None and not task.done():
+            # Cancelling while another Task is current (import / save) makes
+            # Python 3.14 + qasync raise on task_wakeup. Defer the cancel.
+            if in_running_task():
+                QTimer.singleShot(0, task.cancel)
+            else:
+                task.cancel()
         from tahmeed.services.connectivity_service import connectivity_monitor
 
         connectivity_monitor.pause()
