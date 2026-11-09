@@ -19,7 +19,7 @@ from tahmeed.config import APP_VERSION
 from tahmeed.ui.branding import is_dark_theme, load_brand_logo
 from tahmeed.ui.widgets.brand_loader import DOT_CYCLE, strip_loader_ellipsis
 
-# Match LoginWindow logo width exactly.
+# Match LoginWindow brand-panel logo width.
 _LOGIN_LOGO_WIDTH = 200
 
 # Light mode — dark ink on a pale panel (won't wash out on light desktops).
