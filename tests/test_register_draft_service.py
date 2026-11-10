@@ -87,6 +87,87 @@ def test_cells_json_roundtrip():
     assert drafts.cells_from_json(raw)[4] == "FUEL"
 
 
+def test_cells_for_json_omits_blank_values():
+    raw = drafts.cells_for_json({
+        1: "08 Aug",
+        2: "",
+        3: "   ",
+        4: "FUEL",
+        5: None,  # type: ignore[dict-item]
+    })
+    assert raw == {"1": "08 Aug", "4": "FUEL"}
+    # Sparse maps still hydrate; missing keys simply absent.
+    assert 2 not in drafts.cells_from_json(raw)
+
+
+def test_compact_draft_drops_duplicate_client_row_id():
+    rid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    payload = drafts.build_draft_payload(
+        user_id=ObjectId(),
+        username="aisha",
+        register_date=date(2026, 8, 8),
+        merged=False,
+        edit_mode=False,
+        dirty_saved=[],
+        new_rows=[{
+            "client_row_id": rid,
+            "cells": {"3": "DIESEL", "4": "", "7": "1,000.00"},
+            "pending_meta": {
+                "client_row_id": rid,
+                "currency": "TZS",
+                "notes": "",
+            },
+        }],
+    )
+    drafts.compact_draft_payload(payload)
+    entry = payload["new_rows"][0]
+    assert entry["cells"] == {"3": "DIESEL", "7": "1,000.00"}
+    assert entry["pending_meta"] == {"currency": "TZS"}
+    assert drafts.entry_client_row_id(entry) == rid
+
+
+def test_prune_draft_new_rows_by_client_ids(draft_dir):
+    user_id = ObjectId()
+    d = date(2026, 8, 8)
+    keep = "keep-id"
+    drop = "drop-id"
+    drafts.save_register_draft(
+        drafts.build_draft_payload(
+            user_id=user_id,
+            username="aisha",
+            register_date=d,
+            merged=False,
+            edit_mode=False,
+            dirty_saved=[],
+            new_rows=[
+                {
+                    "client_row_id": drop,
+                    "cells": {"3": "GONE"},
+                    "pending_meta": {"client_row_id": drop},
+                },
+                {
+                    "client_row_id": keep,
+                    "cells": {"3": "STAY"},
+                    "pending_meta": {"client_row_id": keep},
+                },
+            ],
+            parked_rows=[{
+                "client_row_id": "parked-1",
+                "cells": {"3": "PARKED"},
+                "pending_meta": {"parked": True, "client_row_id": "parked-1"},
+            }],
+        )
+    )
+    dropped = drafts.prune_draft_new_rows_by_client_ids(user_id, d, {drop})
+    assert dropped == 1
+    loaded = drafts.load_register_draft(user_id, d, merged=False)
+    assert loaded is not None
+    assert len(loaded["new_rows"]) == 1
+    assert drafts.entry_client_row_id(loaded["new_rows"][0]) == keep
+    # Parked bucket untouched.
+    assert len(loaded["parked_rows"]) == 1
+
+
 def test_pending_meta_objectid_roundtrip():
     cid = ObjectId()
     meta = {

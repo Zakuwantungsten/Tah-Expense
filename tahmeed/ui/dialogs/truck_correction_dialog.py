@@ -51,7 +51,6 @@ from tahmeed.ui.dialog_theme import (
     show_info,
     show_question,
     show_warning,
-    style_message_box,
 )
 from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
@@ -2081,27 +2080,27 @@ class TruckCorrectionDialog(QDialog):
 
     def _ask_registry_kind(self, number: str) -> Optional[str]:
         """Ask which fleet collection to use. Returns collection path or None."""
-        box = QMessageBox(self)
-        box.setWindowTitle("Add to registry")
-        box.setIcon(QMessageBox.Question)
-        box.setText(f'Add "{number}" to which registry?')
-        box.setInformativeText(
-            "Truck / Trailer require plate format T688 EAF.\n"
-            "Motorcycle/Car accepts other registration styles."
+        from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_choice
+
+        choice = ask_choice(
+            self,
+            title="Add to registry",
+            text=(
+                f'Add "{number}" to which registry?\n\n'
+                "Truck / Trailer require plate format T688 EAF.\n"
+                "Motorcycle/Car accepts other registration styles."
+            ),
+            actions=(
+                DialogAction("cancel", "Cancel", "cancel"),
+                DialogAction("motor_vehicles", "Motorcycle/Car", "secondary"),
+                DialogAction("trailers", "Trailer", "secondary"),
+                DialogAction("trucks", "Truck", "primary"),
+            ),
+            badge="question",
+            default_action_id="trucks",
         )
-        truck_btn = box.addButton("Truck", QMessageBox.AcceptRole)
-        trailer_btn = box.addButton("Trailer", QMessageBox.AcceptRole)
-        motor_btn = box.addButton("Motorcycle/Car", QMessageBox.AcceptRole)
-        box.addButton("Cancel", QMessageBox.RejectRole)
-        style_message_box(box)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is truck_btn:
-            return "trucks"
-        if clicked is trailer_btn:
-            return "trailers"
-        if clicked is motor_btn:
-            return "motor_vehicles"
+        if choice in ("trucks", "trailers", "motor_vehicles"):
+            return choice
         return None
 
     def _confirm_registry_add(self, number: str, kind: str) -> bool:

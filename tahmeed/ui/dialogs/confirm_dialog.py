@@ -1,13 +1,14 @@
-"""Fluent-style confirmation dialog (Clear Table mockup).
+"""Fluent-style confirmation / alert dialogs (Clear Table mockup).
 
-Custom chrome with title bar, warning badge, footer actions, parent dimming,
-and light/dark variants. Escape and the close button always cancel.
+Custom chrome with title bar, status badge, footer actions, parent dimming,
+and light/dark variants. Escape and the close button always cancel / dismiss.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, List, Literal, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QKeyEvent, QPainter, QPen, QPolygonF
@@ -31,6 +32,18 @@ _DESTRUCTIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+BadgeKind = Literal["warning", "info", "error", "question"]
+ActionRole = Literal["primary", "destructive", "secondary", "cancel"]
+
+
+@dataclass(frozen=True)
+class DialogAction:
+    """One footer button for ``ask_choice`` / Fluent message dialogs."""
+
+    id: str
+    label: str
+    role: ActionRole = "secondary"
+
 
 def _split_message(text: str) -> Tuple[str, str, str]:
     """Split message box text into heading / body / note."""
@@ -53,11 +66,18 @@ def _is_destructive(title: str, text: str, accept_label: str) -> bool:
     return bool(_DESTRUCTIVE_RE.search(blob))
 
 
-class _WarningBadge(QWidget):
-    """32px circle with a ~18px warning triangle (matches QMessageBox icon scale)."""
+class _StatusBadge(QWidget):
+    """32px status circle matching QMessageBox icon scale."""
 
-    def __init__(self, *, dark: bool, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        *,
+        kind: BadgeKind = "warning",
+        dark: bool,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
+        self._kind = kind
         self._dark = dark
         self.setFixedSize(32, 32)
 
@@ -65,13 +85,24 @@ class _WarningBadge(QWidget):
         del event
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        kind = self._kind
+        if kind == "info":
+            self._paint_info(p)
+        elif kind == "error":
+            self._paint_error(p)
+        elif kind == "question":
+            self._paint_question(p)
+        else:
+            self._paint_warning(p)
+        p.end()
+
+    def _paint_warning(self, p: QPainter) -> None:
         circle = QColor("#433519" if self._dark else "#FFF4CE")
         tri = QColor("#FCE100" if self._dark else "#9D5D00")
         p.setPen(Qt.NoPen)
         p.setBrush(circle)
         p.drawEllipse(0, 0, 32, 32)
 
-        # ~18px triangle centered in the 32px circle
         cx, cy = 16.0, 16.5
         half_w, height = 8.5, 15.0
         top = QPointF(cx, cy - height / 2)
@@ -93,12 +124,51 @@ class _WarningBadge(QWidget):
             p.drawPolygon(poly)
             mark = tri
 
-        # Exclamation mark
         p.setPen(Qt.NoPen)
         p.setBrush(mark)
         p.drawRoundedRect(QRectF(cx - 0.9, cy - 4.5, 1.8, 6.0), 0.8, 0.8)
         p.drawEllipse(QPointF(cx, cy + 4.0), 1.2, 1.2)
-        p.end()
+
+    def _paint_info(self, p: QPainter) -> None:
+        circle = QColor("#0C3B5E" if self._dark else "#E8F4FC")
+        mark = QColor("#479EF5" if self._dark else "#0077C5")
+        p.setPen(Qt.NoPen)
+        p.setBrush(circle)
+        p.drawEllipse(0, 0, 32, 32)
+        p.setBrush(mark)
+        p.drawEllipse(QPointF(16.0, 10.0), 1.6, 1.6)
+        p.drawRoundedRect(QRectF(14.4, 14.0, 3.2, 10.5), 1.0, 1.0)
+
+    def _paint_error(self, p: QPainter) -> None:
+        circle = QColor("#5C1A16" if self._dark else "#FDE7E9")
+        mark = QColor("#FF99A4" if self._dark else "#C42B1C")
+        p.setPen(Qt.NoPen)
+        p.setBrush(circle)
+        p.drawEllipse(0, 0, 32, 32)
+        # X mark
+        pen = QPen(mark, 2.4)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPointF(11.0, 11.0), QPointF(21.0, 21.0))
+        p.drawLine(QPointF(21.0, 11.0), QPointF(11.0, 21.0))
+
+    def _paint_question(self, p: QPainter) -> None:
+        circle = QColor("#0C3B5E" if self._dark else "#E8F4FC")
+        mark = QColor("#479EF5" if self._dark else "#0077C5")
+        p.setPen(Qt.NoPen)
+        p.setBrush(circle)
+        p.drawEllipse(0, 0, 32, 32)
+        p.setPen(QPen(mark, 2.0))
+        p.setBrush(Qt.NoBrush)
+        # Simplified "?"
+        p.drawArc(QRectF(10.5, 8.0, 11.0, 10.0), 30 * 16, 240 * 16)
+        p.setPen(Qt.NoPen)
+        p.setBrush(mark)
+        p.drawEllipse(QPointF(16.0, 23.0), 1.5, 1.5)
+
+
+# Back-compat alias used by older tests / imports.
+_WarningBadge = _StatusBadge
 
 
 class _FocusRingHost(QWidget):
@@ -121,9 +191,6 @@ class _FocusRingHost(QWidget):
         button.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        # Guard: resurrected / tearing-down wrappers must never raise here —
-        # an exception cascades through Qt as nested eventFilter failures and
-        # can surface as "Failed to load" on the register.
         button = getattr(self, "_button", None)
         if button is not None and watched is button and event.type() in (
             QEvent.Type.FocusIn,
@@ -148,14 +215,13 @@ class _FocusRingHost(QWidget):
         pen = QPen(self._ring, 2.0)
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
-        # Button geometry is inset by 4px; ring at 2px offset → 2px from host edge.
         r = QRectF(button.geometry()).adjusted(-2.0, -2.0, 2.0, 2.0)
         p.drawRoundedRect(r, 6.0, 6.0)
         p.end()
 
 
-class ConfirmDialog(QDialog):
-    """Modal confirm matching the Clear Table Fluent mockup."""
+class FluentMessageDialog(QDialog):
+    """Frameless Fluent card with status badge + flexible footer actions."""
 
     def __init__(
         self,
@@ -165,20 +231,31 @@ class ConfirmDialog(QDialog):
         heading: str,
         body: str = "",
         note: str = "",
-        accept_label: str = "Yes",
-        cancel_label: str = "Cancel",
-        destructive: bool = True,
-        default_cancel: bool = True,
+        actions: Sequence[DialogAction],
+        badge: BadgeKind = "warning",
+        default_action_id: Optional[str] = None,
+        dismiss_id: Optional[str] = None,
     ) -> None:
         super().__init__(parent)
+        if not actions:
+            raise ValueError("FluentMessageDialog requires at least one action")
         self._dark = is_dark_theme()
         self._overlay: Optional[QWidget] = None
+        self._chosen_id: Optional[str] = None
+        self._actions = list(actions)
+        # Escape / ✕ map here — prefer explicit dismiss, else cancel-role, else first.
+        self._cancel_id = (
+            dismiss_id
+            or next((a.id for a in self._actions if a.role == "cancel"), None)
+            or self._actions[0].id
+        )
         self.setObjectName("fluentConfirmDialog")
         self.setModal(True)
         self.setWindowTitle(title)
         self.setWindowFlags(
             Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowSystemMenuHint
         )
+        # Frameless root needs translucency for rounded shadow; card itself is opaque.
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self._build_ui(
@@ -186,11 +263,13 @@ class ConfirmDialog(QDialog):
             heading=heading,
             body=body,
             note=note,
-            accept_label=accept_label,
-            cancel_label=cancel_label,
-            destructive=destructive,
-            default_cancel=default_cancel,
+            actions=self._actions,
+            badge=badge,
+            default_action_id=default_action_id,
         )
+
+    def chosen_id(self) -> Optional[str]:
+        return self._chosen_id
 
     def _colors(self) -> dict[str, str]:
         if self._dark:
@@ -229,6 +308,40 @@ class ConfirmDialog(QDialog):
             "accept_primary": "#0F6CBD",
         }
 
+    def _button_style(self, role: ActionRole, c: dict[str, str]) -> str:
+        if role in ("primary", "destructive"):
+            bg = c["accept"] if role == "destructive" else c["accept_primary"]
+            return f"""
+            QPushButton {{
+                background: {bg};
+                color: #FFFFFF;
+                border: 1px solid {bg};
+                border-radius: 5px;
+                padding: 0 16px;
+                font-size: 13px;
+                font-weight: 600;
+                font-family: {_FONT};
+            }}
+            QPushButton:hover {{
+                background: {bg};
+            }}
+            """
+        return f"""
+        QPushButton {{
+            background: {c['cancel_bg']};
+            color: {c['cancel_fg']};
+            border: 1px solid {c['cancel_border']};
+            border-radius: 5px;
+            padding: 0 16px;
+            font-size: 13px;
+            font-weight: 600;
+            font-family: {_FONT};
+        }}
+        QPushButton:hover {{
+            background: {c['close_hover']};
+        }}
+        """
+
     def _build_ui(
         self,
         *,
@@ -236,21 +349,21 @@ class ConfirmDialog(QDialog):
         heading: str,
         body: str,
         note: str,
-        accept_label: str,
-        cancel_label: str,
-        destructive: bool,
-        default_cancel: bool,
+        actions: List[DialogAction],
+        badge: BadgeKind,
+        default_action_id: Optional[str],
     ) -> None:
         c = self._colors()
         outer = QVBoxLayout(self)
-        # Room for drop shadow around the card
         outer.setContentsMargins(16, 12, 16, 18)
         outer.setSpacing(0)
 
         card = QWidget(self)
         card.setObjectName("confirmCard")
-        # Compact width — closer to standard QMessageBox (Import Complete).
-        card.setFixedWidth(380)
+        card.setAttribute(Qt.WA_TranslucentBackground, False)
+        card.setAttribute(Qt.WA_NativeWindow, False)
+        # Wider when 3+ long labels so buttons stay one row.
+        card.setFixedWidth(420 if len(actions) >= 3 else 380)
         card.setStyleSheet(
             f"""
             QWidget#confirmCard {{
@@ -316,7 +429,7 @@ class ConfirmDialog(QDialog):
             }}
             """
         )
-        close_btn.clicked.connect(self.reject)
+        close_btn.clicked.connect(self._on_dismiss)
         title_row.addWidget(close_btn, 0, Qt.AlignTop)
         card_layout.addWidget(title_bar)
 
@@ -327,13 +440,16 @@ class ConfirmDialog(QDialog):
         body_row.setContentsMargins(16, 6, 16, 14)
         body_row.setSpacing(12)
 
-        body_row.addWidget(_WarningBadge(dark=self._dark, parent=body_wrap), 0, Qt.AlignTop)
+        body_row.addWidget(
+            _StatusBadge(kind=badge, dark=self._dark, parent=body_wrap),
+            0,
+            Qt.AlignTop,
+        )
 
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(4)
 
-        # Match QMessageBox / Import Complete text scale (13px).
         heading_lbl = QLabel(heading, body_wrap)
         heading_lbl.setWordWrap(True)
         heading_lbl.setStyleSheet(
@@ -379,77 +495,67 @@ class ConfirmDialog(QDialog):
         footer_row.setSpacing(6)
         footer_row.addStretch(1)
 
-        cancel_btn = QPushButton(cancel_label, footer)
-        cancel_btn.setCursor(Qt.PointingHandCursor)
-        cancel_btn.setFixedHeight(28)
-        cancel_btn.setMinimumWidth(72)
-        cancel_btn.setFocusPolicy(Qt.StrongFocus)
-        cancel_btn.setStyleSheet(
-            f"""
-            QPushButton {{
-                background: {c['cancel_bg']};
-                color: {c['cancel_fg']};
-                border: 1px solid {c['cancel_border']};
-                border-radius: 5px;
-                padding: 0 16px;
-                font-size: 13px;
-                font-weight: 600;
-                font-family: {_FONT};
-            }}
-            QPushButton:hover {{
-                background: {c['close_hover']};
-            }}
-            """
-        )
-        cancel_btn.clicked.connect(self.reject)
-        # Keep a Python ref so the event-filter wrapper cannot be GC'd mid-dialog.
-        self._cancel_ring_host = _FocusRingHost(
-            cancel_btn, ring=c["ring"], parent=footer
-        )
-        footer_row.addWidget(self._cancel_ring_host)
+        self._buttons: dict[str, QPushButton] = {}
+        self._cancel_btn: Optional[QPushButton] = None
+        self._accept_btn: Optional[QPushButton] = None
+        self._cancel_ring_host: Optional[_FocusRingHost] = None
 
-        accept_bg = c["accept"] if destructive else c["accept_primary"]
-        accept_btn = QPushButton(accept_label, footer)
-        accept_btn.setCursor(Qt.PointingHandCursor)
-        accept_btn.setFixedHeight(28)
-        accept_btn.setMinimumWidth(72)
-        accept_btn.setStyleSheet(
-            f"""
-            QPushButton {{
-                background: {accept_bg};
-                color: #FFFFFF;
-                border: 1px solid {accept_bg};
-                border-radius: 5px;
-                padding: 0 16px;
-                font-size: 13px;
-                font-weight: 600;
-                font-family: {_FONT};
-            }}
-            QPushButton:hover {{
-                background: {accept_bg};
-            }}
-            """
-        )
-        accept_btn.clicked.connect(self.accept)
-        footer_row.addWidget(accept_btn)
+        default_id = default_action_id
+        if default_id is None:
+            cancel_actions = [a for a in actions if a.role == "cancel"]
+            default_id = cancel_actions[0].id if cancel_actions else actions[-1].id
+
+        for action in actions:
+            btn = QPushButton(action.label, footer)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(28)
+            btn.setMinimumWidth(72)
+            btn.setFocusPolicy(Qt.StrongFocus)
+            btn.setStyleSheet(self._button_style(action.role, c))
+            btn.clicked.connect(self._make_chooser(action.id))
+            self._buttons[action.id] = btn
+            if action.role == "cancel":
+                self._cancel_btn = btn
+                self._cancel_ring_host = _FocusRingHost(
+                    btn, ring=c["ring"], parent=footer
+                )
+                footer_row.addWidget(self._cancel_ring_host)
+            else:
+                if action.role in ("primary", "destructive"):
+                    self._accept_btn = btn
+                footer_row.addWidget(btn)
 
         card_layout.addWidget(footer)
         outer.addWidget(card)
 
-        if default_cancel:
-            cancel_btn.setDefault(True)
-            cancel_btn.setFocus(Qt.TabFocusReason)
-        else:
-            accept_btn.setDefault(True)
-            accept_btn.setFocus(Qt.TabFocusReason)
-
-        self._cancel_btn = cancel_btn
-        self._accept_btn = accept_btn
+        default_btn = self._buttons.get(default_id) or next(iter(self._buttons.values()))
+        default_btn.setDefault(True)
+        default_btn.setFocus(Qt.TabFocusReason)
         self.adjustSize()
+
+    def _make_chooser(self, action_id: str) -> Callable[[], None]:
+        def _choose() -> None:
+            self._chosen_id = action_id
+            role = next(
+                (a.role for a in self._actions if a.id == action_id),
+                "secondary",
+            )
+            # Cancel-role closes as Rejected; every other action is Accepted so
+            # callers can read chosen_id even when dismiss_id == primary OK.
+            if role == "cancel":
+                self.reject()
+            else:
+                self.accept()
+
+        return _choose
+
+    def _on_dismiss(self) -> None:
+        self._chosen_id = self._cancel_id
+        self.reject()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if event.key() == Qt.Key_Escape:
-            self.reject()
+            self._on_dismiss()
             return
         super().keyPressEvent(event)
 
@@ -463,6 +569,8 @@ class ConfirmDialog(QDialog):
         overlay = QWidget(host)
         overlay.setObjectName("confirmDimOverlay")
         overlay.setAttribute(Qt.WA_StyledBackground, True)
+        overlay.setAttribute(Qt.WA_TranslucentBackground, False)
+        overlay.setAttribute(Qt.WA_NativeWindow, False)
         overlay.setStyleSheet("background-color: rgba(0, 0, 0, 71);")
         overlay.setGeometry(0, 0, host.width(), host.height())
         overlay.show()
@@ -481,6 +589,39 @@ class ConfirmDialog(QDialog):
             return super().exec()
         finally:
             self._hide_overlay()
+
+
+class ConfirmDialog(FluentMessageDialog):
+    """Modal confirm matching the Clear Table Fluent mockup (2-button)."""
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        title: str,
+        heading: str,
+        body: str = "",
+        note: str = "",
+        accept_label: str = "Yes",
+        cancel_label: str = "Cancel",
+        destructive: bool = True,
+        default_cancel: bool = True,
+    ) -> None:
+        accept_role: ActionRole = "destructive" if destructive else "primary"
+        actions = (
+            DialogAction("cancel", cancel_label, "cancel"),
+            DialogAction("accept", accept_label, accept_role),
+        )
+        super().__init__(
+            parent,
+            title=title,
+            heading=heading,
+            body=body,
+            note=note,
+            actions=actions,
+            badge="warning",
+            default_action_id="cancel" if default_cancel else "accept",
+        )
 
 
 def ask_confirm(
@@ -510,6 +651,65 @@ def ask_confirm(
     return dlg.exec() == QDialog.DialogCode.Accepted
 
 
+def ask_alert(
+    parent: Optional[QWidget],
+    *,
+    title: str,
+    text: str,
+    level: BadgeKind = "info",
+    ok_label: str = "OK",
+) -> bool:
+    """Fluent OK-only alert (info / warning / error / question).
+
+    Returns ``True`` when OK is clicked; Escape / close also dismisses (``False``
+    is rare for patched ``QMessageBox.information`` which always maps to Ok).
+    """
+    heading, body, note = _split_message(text)
+    dlg = FluentMessageDialog(
+        parent,
+        title=title,
+        heading=heading or title,
+        body=body,
+        note=note,
+        actions=(DialogAction("ok", ok_label, "primary"),),
+        badge=level,
+        default_action_id="ok",
+    )
+    result = dlg.exec()
+    return result == QDialog.DialogCode.Accepted or dlg.chosen_id() == "ok"
+
+
+def ask_choice(
+    parent: Optional[QWidget],
+    *,
+    title: str,
+    text: str = "",
+    heading: str = "",
+    body: str = "",
+    note: str = "",
+    actions: Sequence[DialogAction],
+    badge: BadgeKind = "question",
+    default_action_id: Optional[str] = None,
+    dismiss_id: Optional[str] = None,
+) -> Optional[str]:
+    """Fluent multi-action dialog. Returns the chosen action ``id``, or dismiss id."""
+    if text and not (heading or body or note):
+        heading, body, note = _split_message(text)
+    dlg = FluentMessageDialog(
+        parent,
+        title=title,
+        heading=heading or title,
+        body=body,
+        note=note,
+        actions=actions,
+        badge=badge,
+        default_action_id=default_action_id,
+        dismiss_id=dismiss_id,
+    )
+    dlg.exec()
+    return dlg.chosen_id()
+
+
 def ask_standard_question(
     parent: Optional[QWidget],
     title: str,
@@ -530,11 +730,18 @@ def ask_standard_question(
     no = QMessageBox.StandardButton.No
     cancel = QMessageBox.StandardButton.Cancel
     discard = QMessageBox.StandardButton.Discard
+    ok = QMessageBox.StandardButton.Ok
 
     has_yes = bool(buttons & yes)
     has_no = bool(buttons & no)
     has_cancel = bool(buttons & cancel)
     has_discard = bool(buttons & discard)
+    has_ok = bool(buttons & ok)
+
+    # OK-only → alert chrome.
+    if has_ok and not (has_yes or has_no or has_cancel or has_discard):
+        ask_alert(parent, title=title, text=text, level="question")
+        return int(ok)
 
     # Only handle simple two-button confirms with this chrome.
     simple = (
@@ -576,7 +783,7 @@ def ask_standard_question(
         body=body,
         note=note,
         accept_label=accept_label,
-        cancel_label="Cancel",
+        cancel_label="Cancel" if has_cancel or has_discard else ("No" if has_no else "Cancel"),
         destructive=destructive,
         default_cancel=default_cancel,
     )

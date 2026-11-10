@@ -23,6 +23,7 @@ from PySide6.QtGui import QColor, QFont
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
 from tahmeed.models.category import Category
+from tahmeed.ui.widgets.circuit_geometry import CircuitChromeFrame
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.widgets.checkable_multi_combo import CheckableMultiCombo
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
@@ -369,9 +370,13 @@ class _FilterBar(QFrame):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("verifyFilterBar")
         self.setFixedHeight(52)
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
         self.setStyleSheet(
-            f"QFrame{{background:{_WHITE};border-bottom:1px solid {_BORDER};}}"
+            "QFrame#verifyFilterBar{"
+            f"background:transparent;border-bottom:1px solid {_BORDER};}}"
         )
         self._bulk_mode = "new"  # "new" | "edited" | "rejected" | "issues" | "deleted"
         self._build()
@@ -1006,9 +1011,13 @@ class _SubTabBar(QFrame):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("verifySubTabBar")
         self.setFixedHeight(42)
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
         self.setStyleSheet(
-            f"QFrame{{background:{_WHITE};border-bottom:1px solid {_BORDER};}}"
+            "QFrame#verifySubTabBar{"
+            f"background:transparent;border-bottom:1px solid {_BORDER};}}"
         )
         self._current = 0
         self._labels = ["New", "Edited", "Rejected", "Issues", "Deleted", "Restore"]
@@ -1109,10 +1118,12 @@ class VerifyInboxWidget(QWidget):
         root.setSpacing(0)
 
         # Title bar
-        title_bar = QFrame()
-        title_bar.setFixedHeight(52)
-        title_bar.setStyleSheet(
-            f"QFrame{{background:{_WHITE};border-bottom:1px solid {_BORDER};}}"
+        title_bar = CircuitChromeFrame(
+            "verify",
+            bg=_WHITE,
+            border=_BORDER,
+            object_name="verifyTitleBar",
+            fixed_height=52,
         )
         tbl = QHBoxLayout(title_bar)
         tbl.setContentsMargins(20, 0, 20, 0)
@@ -2683,21 +2694,26 @@ class VerifyInboxWidget(QWidget):
         more: str,
     ) -> bool:
         """Warn that approve is blocked; offer navigation to Day Issues."""
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle("Item and Payee required")
-        box.setText(
-            f"{n:,} selected entr{'y' if n == 1 else 'ies'} still missing "
-            f"Item and/or Payee ({unique_count:,} unique description(s)):\n\n"
-            f"{lines}{more}\n\n"
-            "Approve is blocked until every selected row has both fields.\n"
-            "Open Day Issues to map them, then approve again."
+        from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_choice
+
+        choice = ask_choice(
+            self,
+            title="Item and Payee required",
+            text=(
+                f"{n:,} selected entr{'y' if n == 1 else 'ies'} still missing "
+                f"Item and/or Payee ({unique_count:,} unique description(s)):\n\n"
+                f"{lines}{more}\n\n"
+                "Approve is blocked until every selected row has both fields.\n"
+                "Open Day Issues to map them, then approve again."
+            ),
+            actions=(
+                DialogAction("close", "Close", "cancel"),
+                DialogAction("open", "Open Day Issues", "primary"),
+            ),
+            badge="warning",
+            default_action_id="open",
         )
-        open_btn = box.addButton("Open Day Issues", QMessageBox.AcceptRole)
-        box.addButton("Close", QMessageBox.RejectRole)
-        box.setDefaultButton(open_btn)
-        box.exec()
-        return box.clickedButton() is open_btn
+        return choice == "open"
 
     async def _prepare_transactions_for_approval(
         self,

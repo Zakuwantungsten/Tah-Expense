@@ -21,7 +21,7 @@ from tahmeed.ui.accountant.master_ledger_table import _TABLE_SS as _MASTER_TABLE
 from tahmeed.ui.accountant.separate_expenses import (
     _finish_table_row, _make_table, _stripe_bg, _table_cell_font,
 )
-from tahmeed.ui.dialog_theme import show_critical, show_info, show_warning
+from tahmeed.ui.dialog_theme import show_critical, show_info, show_question, show_warning
 from tahmeed.ui.dialogs.item_dialog import ItemDialog
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
@@ -341,18 +341,13 @@ class _MappingEditorDialog(QDialog):
         if self._payees and payee not in set(self._payees):
             tip = next((p for p in self._payees if payee in p or p in payee), "")
             extra = f"\nDid you mean: {tip}?" if tip else ""
-            box = QMessageBox(self)
-            box.setWindowTitle("Payee not in list")
-            box.setIcon(QMessageBox.Question)
-            box.setText(
+            if show_question(
+                self,
+                "Payee not in list",
                 f"Payee {payee!r} was not found in the Payee list.{extra}\n\n"
-                "Save anyway?"
-            )
-            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            box.setDefaultButton(QMessageBox.No)
-            from tahmeed.ui.dialog_theme import style_message_box
-            style_message_box(box)
-            if box.exec() != QMessageBox.Yes:
+                "Save anyway?",
+                default_no=True,
+            ) != QMessageBox.Yes:
                 return None
         return payee
 
@@ -886,15 +881,12 @@ class DescriptionMapsWidget(QWidget):
         if len(entries) == 1:
             self._confirm_delete(entries[0])
             return
-        box = QMessageBox(self)
-        box.setWindowTitle("Delete Mappings")
-        box.setIcon(QMessageBox.Question)
-        box.setText(f"Delete {len(entries):,} selected mapping(s)?")
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.setDefaultButton(QMessageBox.No)
-        from tahmeed.ui.dialog_theme import style_message_box
-        style_message_box(box)
-        if box.exec() != QMessageBox.Yes:
+        if show_question(
+            self,
+            "Delete Mappings",
+            f"Delete {len(entries):,} selected mapping(s)?",
+            default_no=True,
+        ) != QMessageBox.Yes:
             return
         asyncio.ensure_future(self._do_delete_many(entries))
 
@@ -983,18 +975,13 @@ class DescriptionMapsWidget(QWidget):
         if len(entries) > 1:
             name = dlg.result_assignment.item_name
             payee = dlg.result_assignment.payee_name
-            box = QMessageBox(self)
-            box.setWindowTitle("Re-assign Mappings")
-            box.setIcon(QMessageBox.Question)
-            box.setText(
+            if show_question(
+                self,
+                "Re-assign Mappings",
                 f'Re-assign {len(entries):,} mapping(s) to '
-                f'Payee "{payee}" + Item "{name}"?'
-            )
-            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            box.setDefaultButton(QMessageBox.Yes)
-            from tahmeed.ui.dialog_theme import style_message_box
-            style_message_box(box)
-            if box.exec() != QMessageBox.Yes:
+                f'Payee "{payee}" + Item "{name}"?',
+                default_no=False,
+            ) != QMessageBox.Yes:
                 return
         await self._save_assignment(descriptions, dlg.result_assignment)
 
@@ -1038,20 +1025,15 @@ class DescriptionMapsWidget(QWidget):
         await self._load()
 
     def _confirm_delete(self, entry: DescriptionMapping) -> None:
-        box = QMessageBox(self)
-        box.setWindowTitle("Delete Mapping")
-        box.setIcon(QMessageBox.Question)
         payee = (entry.payee or "").strip() or "—"
-        box.setText(
+        if show_question(
+            self,
+            "Delete Mapping",
             f'Delete mapping for "{entry.description}"?\n\n'
             f"Payee: {payee}\n"
-            f"Item: {entry.category_name}"
-        )
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.setDefaultButton(QMessageBox.No)
-        from tahmeed.ui.dialog_theme import style_message_box
-        style_message_box(box)
-        if box.exec() != QMessageBox.Yes:
+            f"Item: {entry.category_name}",
+            default_no=True,
+        ) != QMessageBox.Yes:
             return
         asyncio.ensure_future(self._do_delete(entry))
 
@@ -1145,19 +1127,14 @@ class DescriptionMapsWidget(QWidget):
     def _confirm_clear_all(self) -> None:
         if self._deleting:
             return
-        box = QMessageBox(self)
-        box.setWindowTitle("Clear All Mappings")
-        box.setIcon(QMessageBox.Warning)
-        box.setText(
+        if show_question(
+            self,
+            "Clear All Mappings",
             "Delete ALL description → Payee + Item mappings?\n\n"
             "Day Issues and auto-fill will no longer use these maps.\n"
-            "This cannot be undone."
-        )
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.setDefaultButton(QMessageBox.No)
-        from tahmeed.ui.dialog_theme import style_message_box
-        style_message_box(box)
-        if box.exec() != QMessageBox.Yes:
+            "This cannot be undone.",
+            default_no=True,
+        ) != QMessageBox.Yes:
             return
         asyncio.ensure_future(self._do_clear_all())
 

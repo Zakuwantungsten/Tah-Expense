@@ -61,6 +61,7 @@ PARKING_CONGO_SORT_ALLOWED = frozenset(
         "vehicle_no",
         "direction",
         "gate_in",
+        "gate_in_dt",
         "transaction_details",
         "import_date",
         "sn",
@@ -154,6 +155,8 @@ COMESA_SORT_ALLOWED = frozenset(
         "card_no",
         "valid_from",
         "valid_to",
+        "valid_from_dt",
+        "valid_to_dt",
         "truck_reg",
         "premium",
         "month",
@@ -185,6 +188,9 @@ _IMPORT_UPPER_SKIP = frozenset(
         "created_at",
         "transaction_date",
         "expense_date",
+        "gate_in_dt",
+        "valid_from_dt",
+        "valid_to_dt",
         "expense_type",
         "row_index",
         "_id",
@@ -640,6 +646,9 @@ _DISPLAY_DATE_SORT_ALIASES = {
     "sales_date": "transaction_date",
     "date": "transaction_date",
     "date_str": "expense_date",
+    "gate_in": "gate_in_dt",
+    "valid_from": "valid_from_dt",
+    "valid_to": "valid_to_dt",
 }
 
 
@@ -1056,6 +1065,13 @@ def prepare_imported_feed_doc(
         normalize_date_fields(doc, "toll_date", store_as="transaction_date")
     elif feed_type == "parking_congo":
         normalize_date_fields(doc, "payment_date", store_as="transaction_date")
+        # Keep DD/MM/YYYY gate display; still store a real datetime for sorts.
+        normalize_date_fields(
+            doc,
+            "gate_in",
+            store_as="gate_in_dt",
+            rewrite_display=False,
+        )
         tt = str(doc.get("transaction_type", "") or "").strip().lower()
         if tt == "deposit" or doc.get("is_deposit"):
             doc["is_deposit"] = True
@@ -1071,6 +1087,19 @@ def prepare_imported_feed_doc(
             normalize_date_fields(
                 doc, "date", "transaction_date", store_as="transaction_date"
             )
+    elif feed_type == "comesa":
+        normalize_date_fields(
+            doc,
+            "valid_from",
+            store_as="valid_from_dt",
+            display_fmt="%d %b %y",
+        )
+        normalize_date_fields(
+            doc,
+            "valid_to",
+            store_as="valid_to_dt",
+            display_fmt="%d %b %y",
+        )
     elif feed_type.startswith("diesel_"):
         normalize_date_fields(doc, "date", store_as="transaction_date")
         apply_diesel_computed_fields(doc)

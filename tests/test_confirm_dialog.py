@@ -14,8 +14,12 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton
 
 from tahmeed.ui.dialogs.confirm_dialog import (
     ConfirmDialog,
+    DialogAction,
+    FluentMessageDialog,
     _FocusRingHost,
     _split_message,
+    ask_alert,
+    ask_choice,
     ask_confirm,
     ask_standard_question,
 )
@@ -179,3 +183,122 @@ def test_focus_ring_host_event_filter_tolerates_missing_button(qapp):
     host.paintEvent(QEvent(QEvent.Type.Paint))
     btn.deleteLater()
     host.deleteLater()
+
+
+def test_ask_alert_ok_only(qapp, monkeypatch):
+    monkeypatch.setattr(
+        FluentMessageDialog,
+        "exec",
+        lambda self: QDialog.DialogCode.Accepted,
+    )
+    assert ask_alert(None, title="Import Complete", text="Done.", level="info") is True
+
+
+def test_ask_choice_three_actions(qapp, monkeypatch):
+    def _fake_exec(self):
+        self._chosen_id = "save"
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(FluentMessageDialog, "exec", _fake_exec)
+    choice = ask_choice(
+        None,
+        title="Unsaved changes",
+        text="Save as draft before leaving?",
+        actions=(
+            DialogAction("cancel", "Cancel", "cancel"),
+            DialogAction("discard", "Discard", "secondary"),
+            DialogAction("save", "Save as Draft", "primary"),
+        ),
+        default_action_id="save",
+    )
+    assert choice == "save"
+
+
+def test_ask_choice_dismiss_id(qapp, monkeypatch):
+    def _fake_exec(self):
+        self._on_dismiss()
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(FluentMessageDialog, "exec", _fake_exec)
+    choice = ask_choice(
+        None,
+        title="Moved to Trash",
+        text="Moved.",
+        actions=(
+            DialogAction("undo", "Undo", "secondary"),
+            DialogAction("ok", "OK", "primary"),
+        ),
+        default_action_id="ok",
+        dismiss_id="ok",
+    )
+    assert choice == "ok"
+
+
+def test_fluent_message_dialog_card_opaque(qapp, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QWidget
+
+    monkeypatch.setattr(
+        "tahmeed.ui.dialogs.confirm_dialog.is_dark_theme",
+        lambda: False,
+    )
+    host = QWidget()
+    host.resize(640, 480)
+    host.show()
+    dlg = FluentMessageDialog(
+        host,
+        title="Info",
+        heading="Hello",
+        actions=(DialogAction("ok", "OK", "primary"),),
+        badge="info",
+    )
+    card = _find_card(dlg)
+    assert card is not None
+    assert not card.testAttribute(Qt.WA_TranslucentBackground)
+    assert not card.testAttribute(Qt.WA_NativeWindow)
+    dlg.close()
+    host.close()
+
+
+def test_patched_information_routes_to_fluent(qapp, monkeypatch):
+    from tahmeed.ui.dialog_theme import install_dialog_theme
+
+    install_dialog_theme(qapp)
+    called = {}
+
+    def _fake_alert(parent, *, title, text, level="info", ok_label="OK"):
+        called["title"] = title
+        called["text"] = text
+        called["level"] = level
+        return True
+
+    monkeypatch.setattr(
+        "tahmeed.ui.dialogs.confirm_dialog.ask_alert",
+        _fake_alert,
+    )
+    result = QMessageBox.information(None, "Export complete", "File saved.")
+    assert result == int(QMessageBox.Ok)
+    assert called == {
+        "title": "Export complete",
+        "text": "File saved.",
+        "level": "info",
+    }
+
+
+def test_patched_critical_routes_to_error_alert(qapp, monkeypatch):
+    from tahmeed.ui.dialog_theme import install_dialog_theme
+
+    install_dialog_theme(qapp)
+    levels = []
+
+    def _fake_alert(parent, *, title, text, level="info", ok_label="OK"):
+        levels.append(level)
+        return True
+
+    monkeypatch.setattr(
+        "tahmeed.ui.dialogs.confirm_dialog.ask_alert",
+        _fake_alert,
+    )
+    QMessageBox.critical(None, "Error", "Failed.")
+    QMessageBox.warning(None, "Warning", "Careful.")
+    assert levels == ["error", "warning"]

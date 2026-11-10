@@ -139,6 +139,10 @@ class BrandLoaderPanel(QWidget):
         self.setObjectName("brandLoaderPanel")
         self._opaque = bool(opaque)
         # Stay a child widget — never a native / top-level window.
+        # Parentless construction (tests) still becomes a window if shown; callers
+        # must parent the panel under a host before show().
+        if parent is not None:
+            self.setWindowFlags(Qt.Widget)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setAttribute(Qt.WA_NativeWindow, False)
         if self._opaque:

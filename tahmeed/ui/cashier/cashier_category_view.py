@@ -16,6 +16,7 @@ from PySide6.QtGui import QFont, QColor, QBrush
 from tahmeed.models.transaction import Transaction
 from tahmeed.models.user import User
 from tahmeed.services.cashier_service import get_transactions_by_category
+from tahmeed.ui.widgets.circuit_geometry import CircuitChromeFrame
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 # ── Design tokens (match accountant palette) ──────────────────────────────────────
@@ -96,6 +97,7 @@ class CashierCategoryView(QWidget):
     ) -> None:
         super().__init__(parent)
         self._user = user
+        self._key = category_key              # sidebar / geometry seed key
         self._name = category_name            # DB filter (parent item / category)
         self._title = title or category_name  # header display text
         self._icon_name = icon_name
@@ -105,20 +107,20 @@ class CashierCategoryView(QWidget):
 
     def _build(self) -> None:
         self.setObjectName("cashierCatView")
-        self.setStyleSheet(f"QWidget#cashierCatView {{ background: {_BG}; }}")
+        self.setStyleSheet(f"QWidget#cashierCatView {{ background: transparent; }}")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        seed = f"item::{self._key or self._name}"
         # ── Page header ───────────────────────────────────────────────────────
-        header = QFrame()
-        header.setObjectName("catViewHeader")
-        header.setFixedHeight(60)
-        header.setStyleSheet(
-            f"QFrame#catViewHeader {{"
-            f"  background: {_WHITE}; border-bottom: 1px solid {_BORDER};"
-            f"}}"
+        header = CircuitChromeFrame(
+            seed,
+            bg=_WHITE,
+            border=_BORDER,
+            object_name="catViewHeader",
+            fixed_height=60,
         )
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 0, 20, 0)
@@ -183,13 +185,14 @@ class CashierCategoryView(QWidget):
         root.addWidget(self._table, 1)
 
         # ── Footer ────────────────────────────────────────────────────────────
-        footer = QFrame()
-        footer.setObjectName("catViewFooter")
-        footer.setFixedHeight(36)
-        footer.setStyleSheet(
-            f"QFrame#catViewFooter {{"
-            f"  background: {_WHITE}; border-top: 1px solid {_BORDER};"
-            f"}}"
+        footer = CircuitChromeFrame(
+            f"{seed}::footer",
+            bg=_WHITE,
+            border=_BORDER,
+            border_bottom=False,
+            border_top=True,
+            object_name="catViewFooter",
+            fixed_height=36,
         )
         fl = QHBoxLayout(footer)
         fl.setContentsMargins(20, 0, 20, 0)

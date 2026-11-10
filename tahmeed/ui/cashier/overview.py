@@ -31,6 +31,7 @@ from tahmeed.services.cashier_service import (
     get_overview_stats,
 )
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
+from tahmeed.ui.widgets.overview_geometry import OverviewGeometryContent
 
 # ── Design tokens (aligned with accountant Overview) ─────────────────────────
 _WHITE = "#FFFFFF"
@@ -627,8 +628,7 @@ class CashierOverview(QWidget):
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
         )
 
-        content = QWidget()
-        content.setStyleSheet(f"background: {_BG};")
+        content = OverviewGeometryContent()
         cl = QVBoxLayout(content)
         cl.setContentsMargins(28, 24, 28, 28)
         cl.setSpacing(16)

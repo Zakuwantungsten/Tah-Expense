@@ -2768,22 +2768,25 @@ class DayIssuesWidget(QWidget):
         if self._last_mapping_undo is None:
             QMessageBox.information(self, "Mappings saved", message)
             return False
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Information)
-        box.setWindowTitle("Mappings saved")
-        box.setText(message)
-        box.setInformativeText(
-            "Undo reverses Description Maps and clears Payee + Item on the "
-            "matching Table / register rows from this action."
+        from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_choice
+
+        choice = ask_choice(
+            self,
+            title="Mappings saved",
+            text=(
+                f"{message}\n\n"
+                "Undo reverses Description Maps and clears Payee + Item on the "
+                "matching Table / register rows from this action."
+            ),
+            actions=(
+                DialogAction("undo", "Undo", "secondary"),
+                DialogAction("ok", "OK", "primary"),
+            ),
+            badge="info",
+            default_action_id="ok",
+            dismiss_id="ok",
         )
-        undo_btn = box.addButton("Undo", QMessageBox.ActionRole)
-        box.addButton(QMessageBox.Ok)
-        # Ok is default so Enter dismisses; Undo is an explicit choice.
-        ok_btn = box.button(QMessageBox.Ok)
-        if ok_btn is not None:
-            box.setDefaultButton(ok_btn)
-        box.exec()
-        return box.clickedButton() is undo_btn
+        return choice == "undo"
 
     async def _undo_last_mapping(self) -> None:
         """Reverse the last successful Map / Save Filled commit."""

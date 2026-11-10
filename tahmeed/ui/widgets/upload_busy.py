@@ -42,8 +42,11 @@ class _BusyDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setWindowModality(Qt.WindowModal)
+        # Size before first show so Windows never paints a tiny empty title-bar
+        # frame (min/max/close) for one frame while the layout settles.
         self.setMinimumWidth(420)
         self.setMinimumHeight(220)
+        self.resize(440, 260)
         self.setStyleSheet(
             "QDialog { background: #FFFFFF; color: #111827; }"
             "QPushButton {"
@@ -241,6 +244,10 @@ class UploadBusy:
         safe_process_events()
 
     def __enter__(self) -> "UploadBusy":
+        # Layout + size first, then show — avoids a one-frame tiny HWND flash.
+        self._dlg.adjustSize()
+        if self._dlg.width() < 420 or self._dlg.height() < 220:
+            self._dlg.resize(440, 260)
         self._dlg.show()
         self._pump()
         return self

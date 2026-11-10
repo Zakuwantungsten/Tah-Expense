@@ -18,6 +18,9 @@ from tahmeed.ui.admin.security_tab import SecurityTab
 from tahmeed.ui.admin.settings_tab import SettingsTab
 from tahmeed.ui.admin.sidebar import AdminSidebar
 from tahmeed.ui.admin.users_tab import UsersTab
+from tahmeed.ui.widgets.circuit_geometry import wrap_circuit_page
+
+_ADMIN_BG = "#F8FAFC"
 
 
 class AdminDashboard(QWidget):
@@ -65,9 +68,10 @@ class AdminDashboard(QWidget):
 
         self._stack = QStackedWidget()
         from tahmeed.ui.widgets.combo_styles import with_combo_popup
+        # Do not force every descendant QWidget opaque — that would hide the
+        # circuit page canvas. Style concrete controls instead.
         self._stack.setStyleSheet(with_combo_popup(
             "QStackedWidget{background:#F8FAFC;}"
-            "QWidget{background:#F8FAFC;color:#111827;}"
             "QLabel{color:#111827;}"
             "QLineEdit,QComboBox,QSpinBox,QTextEdit,QPlainTextEdit{"
             "background:#FFFFFF;color:#111827;border:1px solid #D1D5DB;"
@@ -89,12 +93,25 @@ class AdminDashboard(QWidget):
         self._backups = BackupTab()
         self._backups.logout_requested.connect(self.logout_requested)
 
+        # Keep direct refs for signal wiring; stack holds circuit hosts.
         self._pages: dict[str, tuple[QWidget, str]] = {
-            "users": (self._users, "Users"),
-            "settings": (self._settings, "Settings"),
-            "security": (self._security, "Security"),
-            "audit": (self._audit, "Audit Log"),
-            "backups": (self._backups, "Backups"),
+            "users": (wrap_circuit_page(self._users, seed="users", bg=_ADMIN_BG), "Users"),
+            "settings": (
+                wrap_circuit_page(self._settings, seed="settings", bg=_ADMIN_BG),
+                "Settings",
+            ),
+            "security": (
+                wrap_circuit_page(self._security, seed="security", bg=_ADMIN_BG),
+                "Security",
+            ),
+            "audit": (
+                wrap_circuit_page(self._audit, seed="audit", bg=_ADMIN_BG),
+                "Audit Log",
+            ),
+            "backups": (
+                wrap_circuit_page(self._backups, seed="backups", bg=_ADMIN_BG),
+                "Backups",
+            ),
         }
         for key, (widget, _) in self._pages.items():
             self._stack.addWidget(widget)

@@ -37,6 +37,7 @@ from PySide6.QtGui import QFont, QColor, QBrush
 from tahmeed.app_state import app_state
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.category_service import item_key
+from tahmeed.ui.widgets.circuit_geometry import CircuitChromeFrame
 from tahmeed.ui.accountant.date_filters import (
     add_from_to_editors, read_from_to, sync_from_to,
 )
@@ -278,11 +279,15 @@ class CategoryTableWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        seed = f"item::{item_key(self._category)}"
+
         # ── Title bar ──────────────────────────────────────────────────────
-        title_bar = QFrame()
-        title_bar.setFixedHeight(52)
-        title_bar.setStyleSheet(
-            f"QFrame {{ background: {_WHITE}; border-bottom: 1px solid {_BORDER}; }}"
+        title_bar = CircuitChromeFrame(
+            seed,
+            bg=_WHITE,
+            border=_BORDER,
+            object_name="categoryTitleBar",
+            fixed_height=52,
         )
         tb = QHBoxLayout(title_bar)
         tb.setContentsMargins(20, 0, 20, 0)
@@ -332,10 +337,12 @@ class CategoryTableWidget(QWidget):
         root.addWidget(title_bar)
 
         # ── Filter bar ─────────────────────────────────────────────────────
-        filter_bar = QFrame()
-        filter_bar.setFixedHeight(52)
-        filter_bar.setStyleSheet(
-            f"QFrame {{ background: {_WHITE}; border-bottom: 1px solid {_BORDER}; }}"
+        filter_bar = CircuitChromeFrame(
+            f"{seed}::filters",
+            bg=_WHITE,
+            border=_BORDER,
+            object_name="categoryFilterBar",
+            fixed_height=52,
         )
         fl = QHBoxLayout(filter_bar)
         fl.setContentsMargins(16, 0, 16, 0)
@@ -427,10 +434,14 @@ class CategoryTableWidget(QWidget):
         root.addWidget(self._table, 1)
 
         # ── Footer totals ──────────────────────────────────────────────────
-        footer = QFrame()
-        footer.setFixedHeight(40)
-        footer.setStyleSheet(
-            f"QFrame {{ background: {_WHITE}; border-top: 2px solid {_BORDER}; }}"
+        footer = CircuitChromeFrame(
+            f"{seed}::footer",
+            bg=_WHITE,
+            border=_BORDER,
+            border_bottom=False,
+            border_top=True,
+            object_name="categoryFooter",
+            fixed_height=40,
         )
         fol = QHBoxLayout(footer)
         fol.setContentsMargins(16, 0, 16, 0)

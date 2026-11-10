@@ -72,46 +72,50 @@ def confirm_move_uploads_to_trash(
 
 def _show_trashed_with_undo(parent: QWidget, *, filename: str, deleted: int) -> bool:
     """Success dialog with Undo. Returns True when the user chooses Undo."""
+    from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_choice
+
     name = (filename or "").strip() or "Upload"
-    box = QMessageBox(parent)
-    box.setIcon(QMessageBox.Information)
-    box.setWindowTitle("Moved to Trash")
-    box.setText(
-        f'"{name}" moved to Uploads Trash '
-        f"({deleted:,} record{'s' if deleted != 1 else ''})."
+    choice = ask_choice(
+        parent,
+        title="Moved to Trash",
+        text=(
+            f'"{name}" moved to Uploads Trash '
+            f"({deleted:,} record{'s' if deleted != 1 else ''}).\n\n"
+            "Undo restores it immediately. Or open Uploads Trash later to restore."
+        ),
+        actions=(
+            DialogAction("undo", "Undo", "secondary"),
+            DialogAction("ok", "OK", "primary"),
+        ),
+        badge="info",
+        default_action_id="ok",
+        dismiss_id="ok",
     )
-    box.setInformativeText(
-        "Undo restores it immediately. Or open Uploads Trash later to restore."
-    )
-    undo_btn = box.addButton("Undo", QMessageBox.ActionRole)
-    box.addButton(QMessageBox.Ok)
-    ok_btn = box.button(QMessageBox.Ok)
-    if ok_btn is not None:
-        box.setDefaultButton(ok_btn)
-    box.exec()
-    return box.clickedButton() is undo_btn
+    return choice == "undo"
 
 
 def _show_bulk_trashed_with_undo(
     parent: QWidget, *, upload_count: int, deleted: int
 ) -> bool:
-    box = QMessageBox(parent)
-    box.setIcon(QMessageBox.Information)
-    box.setWindowTitle("Moved to Trash")
-    box.setText(
-        f"{upload_count:,} upload{'s' if upload_count != 1 else ''} moved to "
-        f"Uploads Trash ({deleted:,} record{'s' if deleted != 1 else ''})."
+    from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_choice
+
+    choice = ask_choice(
+        parent,
+        title="Moved to Trash",
+        text=(
+            f"{upload_count:,} upload{'s' if upload_count != 1 else ''} moved to "
+            f"Uploads Trash ({deleted:,} record{'s' if deleted != 1 else ''}).\n\n"
+            "Undo restores them immediately. Or open Uploads Trash later to restore."
+        ),
+        actions=(
+            DialogAction("undo", "Undo", "secondary"),
+            DialogAction("ok", "OK", "primary"),
+        ),
+        badge="info",
+        default_action_id="ok",
+        dismiss_id="ok",
     )
-    box.setInformativeText(
-        "Undo restores them immediately. Or open Uploads Trash later to restore."
-    )
-    undo_btn = box.addButton("Undo", QMessageBox.ActionRole)
-    box.addButton(QMessageBox.Ok)
-    ok_btn = box.button(QMessageBox.Ok)
-    if ok_btn is not None:
-        box.setDefaultButton(ok_btn)
-    box.exec()
-    return box.clickedButton() is undo_btn
+    return choice == "undo"
 
 
 async def soft_delete_upload_with_undo(

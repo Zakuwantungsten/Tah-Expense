@@ -2085,6 +2085,8 @@ class _TollAllEntries(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
 
     async def _reload_years_and_data(self) -> None:
         from tahmeed.services import accountant_service as svc
+        # Overlay before the years query so the tab never looks idle/blank.
+        self._begin_feed_loading()
         try:
             years = await svc.get_toll_plaza_available_years()
         except Exception:
@@ -2577,12 +2579,14 @@ class TollPlazaWidget(_FeedRibbonPageMixin, QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Dashboard shows this shell first, then schedule_call(refresh) so the
+        # tab switch is instant — do not load data inside __init__.
         self._build()
-        self.refresh()
 
     def _build(self) -> None:
         from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
 
+        # Canvas watermark comes from CircuitGeometryPage wrap at dashboard mount.
         self.setStyleSheet(f"background:{_BG};")
         vl = QVBoxLayout(self)
         vl.setContentsMargins(16, 12, 16, 12)
@@ -2606,57 +2610,79 @@ class TollPlazaWidget(_FeedRibbonPageMixin, QWidget):
         self._main_stack = QStackedWidget()
         self._main_stack.setStyleSheet("background:transparent;")
 
+        # Eager: default All Entries only. Uploads / Skipped build on first visit.
         self._all_entries = _TollAllEntries()
         self._main_stack.addWidget(self._all_entries)
 
-        upload_host = QWidget()
-        upload_host.setStyleSheet("background:transparent;")
-        upload_vl = QVBoxLayout(upload_host)
-        upload_vl.setContentsMargins(0, 0, 0, 0)
-        upload_vl.setSpacing(0)
+        self._upload_host = QWidget()
+        self._upload_host.setStyleSheet("background:transparent;")
+        self._upload_host_vl = QVBoxLayout(self._upload_host)
+        self._upload_host_vl.setContentsMargins(0, 0, 0, 0)
+        self._upload_host_vl.setSpacing(0)
+        self._upload_stack: QStackedWidget | None = None
+        self._browse = None
+        self._detail = None
+        self._main_stack.addWidget(self._upload_host)
 
-        self._upload_stack = QStackedWidget()
-        self._upload_stack.setStyleSheet("background:transparent;")
-
-        self._browse = _TollUploadBrowse()
-        self._browse.upload_clicked.connect(self._show_detail)
-        self._browse.delete_clicked.connect(self._on_delete_upload)
-        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
-        self._upload_stack.addWidget(self._browse)
-
-        self._detail = _TollUploadDetail()
-        self._detail.back_requested.connect(self._show_browse)
-        self._detail.delete_requested.connect(self._on_delete_upload)
-        self._upload_stack.addWidget(self._detail)
-
-        upload_vl.addWidget(self._upload_stack, 1)
-        self._main_stack.addWidget(upload_host)
-
-        from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
-        self._skipped = SkippedTrucksTab("toll_plaza")
-        self._main_stack.addWidget(self._skipped)
+        self._skipped_host = QWidget()
+        self._skipped_host.setStyleSheet("background:transparent;")
+        self._skipped_host_vl = QVBoxLayout(self._skipped_host)
+        self._skipped_host_vl.setContentsMargins(0, 0, 0, 0)
+        self._skipped = None
+        self._main_stack.addWidget(self._skipped_host)
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
         self._sync_chrome_for_tab(0)
 
+    def _ensure_uploads(self) -> None:
+        if self._browse is not None:
+            return
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
+        self._browse = _TollUploadBrowse()
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
+        self._upload_stack.addWidget(self._browse)
+        self._detail = _TollUploadDetail()
+        self._detail.back_requested.connect(self._show_browse)
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
+        self._upload_host_vl.addWidget(self._upload_stack, 1)
+
+    def _ensure_skipped(self) -> None:
+        if self._skipped is not None:
+            return
+        from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
+        self._skipped = SkippedTrucksTab("toll_plaza")
+        self._skipped_host_vl.addWidget(self._skipped, 1)
+
     def _on_main_tab(self, idx: int) -> None:
+        if idx == 1:
+            self._ensure_uploads()
+        elif idx == 2:
+            self._ensure_skipped()
         self._main_stack.setCurrentIndex(idx)
         self._sync_chrome_for_tab(idx)
-        if idx == 2:
+        if idx == 1:
+            self._show_browse()
+        elif idx == 2 and self._skipped is not None:
             self._skipped.refresh()
 
     def refresh(self) -> None:
+        # Only the visible default pane — other tabs load on first visit.
         self._all_entries.refresh()
-        self._show_browse()
-        if hasattr(self, "_skipped"):
-            self._skipped.refresh()
 
     def _show_browse(self) -> None:
+        self._ensure_uploads()
+        assert self._upload_stack is not None and self._browse is not None
         self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._ensure_uploads()
+        assert self._upload_stack is not None and self._detail is not None
         self._tabs.set_index(1, emit=False)
         self._main_stack.setCurrentIndex(1)
         self._upload_stack.setCurrentIndex(1)
@@ -2707,8 +2733,10 @@ class TollPlazaWidget(_FeedRibbonPageMixin, QWidget):
         self._all_entries.refresh()
         self._show_browse()
         if skipped:
+            self._ensure_skipped()
             self._tabs.set_index(2)
-            self._skipped.refresh()
+            if self._skipped is not None:
+                self._skipped.refresh()
         else:
             self._tabs.set_index(1)
 
@@ -2909,6 +2937,8 @@ class _ParkingCongoAllEntries(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
 
     async def _reload_years_and_data(self) -> None:
         from tahmeed.services import accountant_service as svc
+        # Overlay before the years query so the tab never looks idle/blank.
+        self._begin_feed_loading()
         try:
             years = await svc.get_parking_congo_available_years()
         except Exception:
@@ -3547,8 +3577,9 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Dashboard shows this shell first, then schedule_call(refresh) so the
+        # tab switch is instant — do not load data inside __init__.
         self._build()
-        self.refresh()
 
     def _build(self) -> None:
         from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
@@ -3579,62 +3610,92 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
         self._all_entries = _ParkingCongoAllEntries()
         self._main_stack.addWidget(self._all_entries)
 
-        upload_host = QWidget()
-        upload_host.setStyleSheet("background:transparent;")
-        upload_vl = QVBoxLayout(upload_host)
-        upload_vl.setContentsMargins(0, 0, 0, 0)
-        upload_vl.setSpacing(0)
+        self._upload_host = QWidget()
+        self._upload_host.setStyleSheet("background:transparent;")
+        self._upload_host_vl = QVBoxLayout(self._upload_host)
+        self._upload_host_vl.setContentsMargins(0, 0, 0, 0)
+        self._upload_host_vl.setSpacing(0)
+        self._upload_stack: QStackedWidget | None = None
+        self._browse = None
+        self._detail = None
+        self._main_stack.addWidget(self._upload_host)
 
-        self._upload_stack = QStackedWidget()
-        self._upload_stack.setStyleSheet("background:transparent;")
+        self._deposited_host = QWidget()
+        self._deposited_host.setStyleSheet("background:transparent;")
+        self._deposited_host_vl = QVBoxLayout(self._deposited_host)
+        self._deposited_host_vl.setContentsMargins(0, 0, 0, 0)
+        self._deposited = None
+        self._main_stack.addWidget(self._deposited_host)
 
-        self._browse = _ParkingCongoUploadBrowse()
-        self._browse.upload_clicked.connect(self._show_detail)
-        self._browse.delete_clicked.connect(self._on_delete_upload)
-        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
-        self._upload_stack.addWidget(self._browse)
-
-        self._detail = _ParkingCongoUploadDetail()
-        self._detail.back_requested.connect(self._show_browse)
-        self._detail.delete_requested.connect(self._on_delete_upload)
-        self._upload_stack.addWidget(self._detail)
-
-        upload_vl.addWidget(self._upload_stack, 1)
-        self._main_stack.addWidget(upload_host)
-
-        self._deposited = _ParkingCongoDeposited()
-        self._deposited.open_upload.connect(self._open_deposit_upload)
-        self._main_stack.addWidget(self._deposited)
-
-        from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
-        self._skipped = SkippedTrucksTab("parking_congo")
-        self._main_stack.addWidget(self._skipped)
+        self._skipped_host = QWidget()
+        self._skipped_host.setStyleSheet("background:transparent;")
+        self._skipped_host_vl = QVBoxLayout(self._skipped_host)
+        self._skipped_host_vl.setContentsMargins(0, 0, 0, 0)
+        self._skipped = None
+        self._main_stack.addWidget(self._skipped_host)
 
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
         self._sync_chrome_for_tab(0)
 
+    def _ensure_uploads(self) -> None:
+        if self._browse is not None:
+            return
+        self._upload_stack = QStackedWidget()
+        self._upload_stack.setStyleSheet("background:transparent;")
+        self._browse = _ParkingCongoUploadBrowse()
+        self._browse.upload_clicked.connect(self._show_detail)
+        self._browse.delete_clicked.connect(self._on_delete_upload)
+        self._browse.bulk_delete_clicked.connect(self._on_bulk_delete_uploads)
+        self._upload_stack.addWidget(self._browse)
+        self._detail = _ParkingCongoUploadDetail()
+        self._detail.back_requested.connect(self._show_browse)
+        self._detail.delete_requested.connect(self._on_delete_upload)
+        self._upload_stack.addWidget(self._detail)
+        self._upload_host_vl.addWidget(self._upload_stack, 1)
+
+    def _ensure_deposited(self) -> None:
+        if self._deposited is not None:
+            return
+        self._deposited = _ParkingCongoDeposited()
+        self._deposited.open_upload.connect(self._open_deposit_upload)
+        self._deposited_host_vl.addWidget(self._deposited, 1)
+
+    def _ensure_skipped(self) -> None:
+        if self._skipped is not None:
+            return
+        from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
+        self._skipped = SkippedTrucksTab("parking_congo")
+        self._skipped_host_vl.addWidget(self._skipped, 1)
+
     def _on_main_tab(self, idx: int) -> None:
+        if idx == 1:
+            self._ensure_uploads()
+        elif idx == 2:
+            self._ensure_deposited()
+        elif idx == 3:
+            self._ensure_skipped()
         self._main_stack.setCurrentIndex(idx)
         self._sync_chrome_for_tab(idx)
-        if idx == 2:
+        if idx == 1:
+            self._show_browse()
+        elif idx == 2 and self._deposited is not None:
             self._deposited.refresh()
-        elif idx == 3:
+        elif idx == 3 and self._skipped is not None:
             self._skipped.refresh()
 
     def refresh(self) -> None:
         self._all_entries.refresh()
-        self._show_browse()
-        if hasattr(self, "_deposited"):
-            self._deposited.refresh()
-        if hasattr(self, "_skipped"):
-            self._skipped.refresh()
 
     def _show_browse(self) -> None:
+        self._ensure_uploads()
+        assert self._upload_stack is not None and self._browse is not None
         self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
 
     def _show_detail(self, upload_doc: dict) -> None:
+        self._ensure_uploads()
+        assert self._upload_stack is not None and self._detail is not None
         self._tabs.set_index(1, emit=False)
         self._main_stack.setCurrentIndex(1)
         self._upload_stack.setCurrentIndex(1)
@@ -3709,11 +3770,15 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
             msg += f"\n{skipped:,} parked in Skipped for follow-up."
         QMessageBox.information(self, "Import Complete", msg)
         self._all_entries.refresh()
-        self._deposited.refresh()
+        self._ensure_deposited()
+        if self._deposited is not None:
+            self._deposited.refresh()
         self._show_browse()
-        if skipped and hasattr(self, "_skipped"):
+        if skipped:
+            self._ensure_skipped()
             self._tabs.set_index(3)
-            self._skipped.refresh()
+            if self._skipped is not None:
+                self._skipped.refresh()
         else:
             self._tabs.set_index(1)
 
@@ -3733,7 +3798,9 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
 
         def _done() -> None:
             self._all_entries.refresh()
-            self._deposited.refresh()
+            self._ensure_deposited()
+            if self._deposited is not None:
+                self._deposited.refresh()
             self._show_browse()
 
         await soft_delete_upload_with_undo(
@@ -3748,7 +3815,9 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
     def _on_bulk_delete_uploads(self, docs: list) -> None:
         def _done() -> None:
             self._all_entries.refresh()
-            self._deposited.refresh()
+            self._ensure_deposited()
+            if self._deposited is not None:
+                self._deposited.refresh()
             self._show_browse()
 
         _start_bulk_upload_delete(
@@ -4113,6 +4182,8 @@ class _CongoEntriesBase(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
 
     async def _reload_years_and_data(self) -> None:
         from tahmeed.services import accountant_service as svc
+        # Overlay before the years query so the tab never looks idle/blank.
+        self._begin_feed_loading()
         try:
             years = await svc.get_congo_available_years()
         except Exception:
@@ -4854,8 +4925,9 @@ class CongoExpensesWidget(_FeedRibbonPageMixin, QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Dashboard shows this shell first, then schedule_call(refresh) so the
+        # tab switch is instant — do not load data inside __init__.
         self._build()
-        self.refresh()
 
     def _build(self) -> None:
         from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
@@ -4928,16 +5000,18 @@ class CongoExpensesWidget(_FeedRibbonPageMixin, QWidget):
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
         self._sync_chrome_for_tab(idx)
-        if idx == 4:
+        if idx == 1:
+            self._money_in.refresh()
+        elif idx == 2:
+            self._called_out.refresh()
+        elif idx == 3:
+            self._show_browse()
+        elif idx == 4:
             self._skipped.refresh()
 
     def refresh(self) -> None:
+        # Default pane only — other tabs refresh on first visit via _on_main_tab.
         self._all_entries.refresh()
-        self._money_in.refresh()
-        self._called_out.refresh()
-        self._show_browse()
-        if hasattr(self, "_skipped"):
-            self._skipped.refresh()
 
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)
@@ -6021,6 +6095,8 @@ class _KimviEntriesBase(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
 
     async def _reload_years_and_data(self) -> None:
         from tahmeed.services import accountant_service as svc
+        # Overlay before the years query so the tab never looks idle/blank.
+        self._begin_feed_loading()
         try:
             years = await svc.get_kimvi_available_years()
         except Exception:
@@ -6540,8 +6616,9 @@ class AhmedKimviWidget(_FeedRibbonPageMixin, QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Dashboard shows this shell first, then schedule_call(refresh) so the
+        # tab switch is instant — do not load data inside __init__.
         self._build()
-        self.refresh()
 
     def _build(self) -> None:
         from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
@@ -6614,16 +6691,18 @@ class AhmedKimviWidget(_FeedRibbonPageMixin, QWidget):
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
         self._sync_chrome_for_tab(idx)
-        if idx == 4:
+        if idx == 1:
+            self._money_in.refresh()
+        elif idx == 2:
+            self._called_out.refresh()
+        elif idx == 3:
+            self._show_browse()
+        elif idx == 4:
             self._skipped.refresh()
 
     def refresh(self) -> None:
+        # Default pane only — other tabs refresh on first visit via _on_main_tab.
         self._all_entries.refresh()
-        self._money_in.refresh()
-        self._called_out.refresh()
-        self._show_browse()
-        if hasattr(self, "_skipped"):
-            self._skipped.refresh()
 
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)
@@ -7075,6 +7154,8 @@ class _ZambiaParkingEntriesBase(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
 
     async def _reload_years_and_data(self) -> None:
         from tahmeed.services import accountant_service as svc
+        # Overlay before the years query so the tab never looks idle/blank.
+        self._begin_feed_loading()
         try:
             years = await svc.get_zambia_parking_available_years()
         except Exception:
@@ -7882,8 +7963,9 @@ class ZambiaParkingWidget(_FeedRibbonPageMixin, QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Dashboard shows this shell first, then schedule_call(refresh) so the
+        # tab switch is instant — do not load data inside __init__.
         self._build()
-        self.refresh()
 
     def _build(self) -> None:
         from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
@@ -7952,15 +8034,16 @@ class ZambiaParkingWidget(_FeedRibbonPageMixin, QWidget):
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
         self._sync_chrome_for_tab(idx)
-        if idx == 3:
+        if idx == 1:
+            self._money_in.refresh()
+        elif idx == 2:
+            self._show_browse()
+        elif idx == 3:
             self._skipped.refresh()
 
     def refresh(self) -> None:
+        # Default pane only — other tabs refresh on first visit via _on_main_tab.
         self._all_entries.refresh()
-        self._money_in.refresh()
-        self._show_browse()
-        if hasattr(self, "_skipped"):
-            self._skipped.refresh()
 
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)
@@ -9298,6 +9381,8 @@ class _AfritrackAllEntries(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
 
     async def _reload_years_and_data(self) -> None:
         from tahmeed.services import accountant_service as svc
+        # Overlay before the years query so the tab never looks idle/blank.
+        self._begin_feed_loading()
         try:
             years = await svc.get_afritrack_available_years()
         except Exception:
@@ -9821,8 +9906,9 @@ class AfritrackWidget(_FeedRibbonPageMixin, QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Dashboard shows this shell first, then schedule_call(refresh) so the
+        # tab switch is instant — do not load data inside __init__.
         self._build()
-        self.refresh()
 
     def _build(self) -> None:
         from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
@@ -9893,10 +9979,8 @@ class AfritrackWidget(_FeedRibbonPageMixin, QWidget):
             self._skipped.refresh()
 
     def refresh(self) -> None:
+        # Default pane only — Uploads/Skipped refresh on first visit.
         self._all_entries.refresh()
-        self._show_browse()
-        if hasattr(self, "_skipped"):
-            self._skipped.refresh()
 
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)
@@ -10640,8 +10724,9 @@ class ComesaWidget(_FeedRibbonPageMixin, _LiftedFiltersMixin, _FeedExportMixin, 
         self._total     = 0
         self._search    = ""
         self._month     = ""
+        # Dashboard shows this shell first, then schedule_call(refresh) so the
+        # tab switch is instant — do not load data inside __init__.
         self._build()
-        self.refresh()
 
     def _ribbon_page(self, idx: int):
         # The All Entries list lives on this widget itself.
@@ -10893,8 +10978,9 @@ class ThirdPartyWidget(_FeedRibbonPageMixin, _LiftedFiltersMixin, _FeedExportMix
         self._search    = ""
         self._month     = ""
         self._status    = ""
+        # Dashboard shows this shell first, then schedule_call(refresh) so the
+        # tab switch is instant — do not load data inside __init__.
         self._build()
-        self.refresh()
 
     def _ribbon_page(self, idx: int):
         # The All Entries list lives on this widget itself.
@@ -11341,6 +11427,8 @@ class _RahnTechAllEntries(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
 
     async def _reload_years_and_data(self) -> None:
         from tahmeed.services import accountant_service as svc
+        # Overlay before the years query so the tab never looks idle/blank.
+        self._begin_feed_loading()
         try:
             years = await svc.get_rahntech_available_years()
         except Exception:
@@ -11776,8 +11864,9 @@ class RahnTechWidget(_FeedRibbonPageMixin, QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Dashboard shows this shell first, then schedule_call(refresh) so the
+        # tab switch is instant — do not load data inside __init__.
         self._build()
-        self.refresh()
 
     def _build(self) -> None:
         from tahmeed.ui.widgets.feed_ribbon_toolbar import FeedRibbonToolbar
@@ -11842,14 +11931,14 @@ class RahnTechWidget(_FeedRibbonPageMixin, QWidget):
     def _on_main_tab(self, idx: int) -> None:
         self._main_stack.setCurrentIndex(idx)
         self._sync_chrome_for_tab(idx)
-        if idx == 2:
+        if idx == 1:
+            self._show_browse()
+        elif idx == 2:
             self._skipped.refresh()
 
     def refresh(self) -> None:
+        # Default pane only — Uploads/Skipped refresh on first visit.
         self._all_entries.refresh()
-        self._show_browse()
-        if hasattr(self, "_skipped"):
-            self._skipped.refresh()
 
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)

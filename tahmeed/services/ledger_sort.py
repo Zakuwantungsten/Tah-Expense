@@ -19,6 +19,18 @@ TRUCK_SORT_FIELDS: Set[str] = frozenset({
     "truck",
 })
 
+# Display-string date fields → BSON datetime fields (keep in sync with backend).
+_DISPLAY_DATE_SORT_ALIASES = {
+    "payment_date": "transaction_date",
+    "toll_date": "transaction_date",
+    "sales_date": "transaction_date",
+    "date": "transaction_date",
+    "date_str": "expense_date",
+    "gate_in": "gate_in_dt",
+    "valid_from": "valid_from_dt",
+    "valid_to": "valid_to_dt",
+}
+
 
 def ledger_sort_clauses(
     sort_field: str,
@@ -30,6 +42,9 @@ def ledger_sort_clauses(
 ) -> SortClauses:
     """Build a whitelisted Mongo sort list with stable tie-breakers."""
     field = sort_field if sort_field in allowed else default
+    alias = _DISPLAY_DATE_SORT_ALIASES.get(field)
+    if alias is not None and alias in allowed:
+        field = alias
     direction = 1 if sort_asc else -1
     clauses: SortClauses = []
     if field in TRUCK_SORT_FIELDS:
@@ -50,13 +65,10 @@ def default_desc_clauses(
     tie_break: Sequence[Tuple[str, int]],
 ) -> SortClauses:
     """Like ledger_sort_clauses but default sort is descending (newest first)."""
-    field = sort_field if sort_field in allowed else default
-    direction = 1 if sort_asc else -1
-    clauses: SortClauses = []
-    if field in TRUCK_SORT_FIELDS:
-        clauses.append(("truck_sort_key", direction))
-    clauses.append((field, direction))
-    for tb_field, tb_dir in tie_break:
-        if tb_field not in {c[0] for c in clauses}:
-            clauses.append((tb_field, tb_dir))
-    return clauses
+    return ledger_sort_clauses(
+        sort_field,
+        sort_asc,
+        allowed,
+        default=default,
+        tie_break=tie_break,
+    )

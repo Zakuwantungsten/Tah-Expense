@@ -30,6 +30,26 @@ def test_parse_excel_date_common_forms() -> None:
     assert parse_excel_date("n/a") is None
 
 
+def test_parse_excel_date_uppercase_with_time() -> None:
+    """Toll / Parking Congo display strings after import uppercasing."""
+    parsed = parse_excel_date("03 JUN 2026 12:12")
+    assert parsed == datetime(2026, 6, 3, 12, 12)
+    assert parse_excel_date("06 MAY 2026 13:57") == datetime(2026, 5, 6, 13, 57)
+    assert parse_excel_date("06/05/2026 11:19:24") == datetime(2026, 5, 6, 11, 19, 24)
+    assert parse_excel_date("15 Oct 26").date() == date(2026, 10, 15)
+    assert parse_excel_date("3 Jun 2026 5:21") == datetime(2026, 6, 3, 5, 21)
+
+
+def test_normalize_preserves_gate_in_display() -> None:
+    doc = {"gate_in": "06/05/2026 11:19:24"}
+    parsed = normalize_date_fields(
+        doc, "gate_in", store_as="gate_in_dt", rewrite_display=False
+    )
+    assert parsed == datetime(2026, 5, 6, 11, 19, 24)
+    assert doc["gate_in"] == "06/05/2026 11:19:24"
+    assert doc["gate_in_dt"] == parsed
+
+
 def test_serial_range_rejects_small_ints() -> None:
     assert excel_serial_to_datetime(1) is None
     assert excel_serial_to_datetime(100) is None

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from tahmeed.app_state import app_state
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
+from tahmeed.ui.widgets.overview_geometry import OverviewGeometryContent
 
 # ── Design tokens (minimal dashboard) ────────────────────────────────────────
 _WHITE   = "#FFFFFF"
@@ -903,11 +904,7 @@ class OverviewWidget(QWidget):
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
         )
 
-        content = QWidget()
-        content.setObjectName("overviewContent")
-        content.setStyleSheet(
-            f"QWidget#overviewContent {{ background: {_BG}; border: none; }}"
-        )
+        content = OverviewGeometryContent()
         vl = QVBoxLayout(content)
         vl.setContentsMargins(28, 24, 28, 28)
         vl.setSpacing(20)

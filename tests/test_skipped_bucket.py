@@ -167,6 +167,68 @@ def test_move_rows_to_skipped_extracts_from_my(register):
     assert "TOLLS" in (skipped[0].get("cells") or {}).values()
 
 
+def test_skipped_tab_keep_alive_avoids_full_draft_reload(register, monkeypatch):
+    """My↔Skipped and Skipped↔Parked must keep My mounted and not re-parse draft JSON."""
+    from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_TZS
+
+    register._table.blockSignals(True)
+    try:
+        register._put(0, COL_DESC, "DIESEL")
+        register._put(0, COL_TZS, "1,000.00")
+    finally:
+        register._table.blockSignals(False)
+    register._local_skipped = [{
+        "client_row_id": "skip-1",
+        "cells": {"1": "TOLLS", "5": "500"},
+        "pending_meta": {"skipped": True, "client_row_id": "skip-1"},
+    }]
+
+    loads = {"n": 0}
+
+    def _boom(*_a, **_k):
+        loads["n"] += 1
+        raise AssertionError("tab switch must not reload the full draft file")
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.load_register_draft",
+        _boom,
+    )
+    flushes = {"n": 0}
+    monkeypatch.setattr(
+        register,
+        "_flush_local_draft",
+        lambda *a, **k: flushes.__setitem__("n", flushes["n"] + 1),
+    )
+    scheduled = {"n": 0}
+    monkeypatch.setattr(
+        register,
+        "_schedule_draft_autosave",
+        lambda *a, **k: scheduled.__setitem__("n", scheduled["n"] + 1),
+    )
+
+    register.set_view_mode("skipped")
+    assert register._view_mode == "skipped"
+    assert register._my_session is not None
+    assert loads["n"] == 0
+    assert flushes["n"] == 0
+
+    register.set_view_mode("parked")
+    assert register._view_mode == "parked"
+    assert register._my_session is not None
+    assert loads["n"] == 0
+
+    register.set_view_mode("skipped")
+    assert register._view_mode == "skipped"
+    assert register._my_session is not None
+
+    register.set_view_mode("my")
+    assert register._view_mode == "my"
+    assert register._my_session is None
+    assert loads["n"] == 0
+    assert flushes["n"] == 0
+    assert scheduled["n"] >= 1
+
+
 @pytest.mark.asyncio
 async def test_absorb_empty_description_skip_builds_skipped_rows(monkeypatch):
     from tahmeed.services.daily_import_service import (

@@ -299,7 +299,14 @@ class DuplicateReviewDialog(QDialog):
 
         ex = item.existing
         self._table.setItem(
-            r, 1, _cell("Existing", bg=bg, bold=True, align=Qt.AlignCenter)
+            r,
+            1,
+            _cell(
+                item.existing_label or "Existing",
+                bg=bg,
+                bold=True,
+                align=Qt.AlignCenter,
+            ),
         )
         self._table.setItem(r, 2, _cell("—", bg=bg, align=Qt.AlignCenter))
         self._table.setItem(

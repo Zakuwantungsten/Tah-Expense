@@ -142,14 +142,17 @@ def draft_path(user_id: ObjectId | str, register_date: date, *, merged: bool) ->
     return drafts_root() / f"{uid}_{register_date.isoformat()}_{mode}.json"
 
 
-def _atomic_json(path: Path, payload: dict) -> None:
+def _atomic_json(path: Path, payload: dict, *, durable: bool = True) -> None:
+    """Write *payload* atomically. ``durable=False`` skips fsync (faster autosave)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            # sort_keys=False: large import drafts serialize much faster.
+            json.dump(payload, handle, sort_keys=False, separators=(",", ":"))
             handle.flush()
-            os.fsync(handle.fileno())
+            if durable:
+                os.fsync(handle.fileno())
         os.replace(temp_name, path)
     finally:
         try:
@@ -163,6 +166,10 @@ def serialize_pending_meta(meta: Optional[dict]) -> Optional[dict]:
         return None
     out: dict[str, Any] = {}
     for key, value in meta.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
         if isinstance(value, ObjectId):
             out[key] = str(value)
         elif isinstance(value, datetime):
@@ -171,7 +178,48 @@ def serialize_pending_meta(meta: Optional[dict]) -> Optional[dict]:
             out[key] = value.isoformat()
         else:
             out[key] = value
-    return out
+    return out or None
+
+
+def compact_draft_entry(entry: dict | None) -> dict | None:
+    """Drop blank cells + redundant meta keys from one draft row (in place)."""
+    if not isinstance(entry, dict):
+        return entry
+    cells = entry.get("cells")
+    if isinstance(cells, dict):
+        entry["cells"] = {
+            str(k): ("" if v is None else str(v))
+            for k, v in cells.items()
+            if v is not None and str(v).strip() != ""
+        }
+    meta = entry.get("pending_meta")
+    if isinstance(meta, dict):
+        compact_meta = {
+            k: v
+            for k, v in meta.items()
+            if v is not None and not (isinstance(v, str) and not str(v).strip())
+        }
+        top_rid = str(entry.get("client_row_id") or "").strip()
+        meta_rid = str(compact_meta.get("client_row_id") or "").strip()
+        # Top-level id wins; don't store the same UUID twice.
+        if top_rid and meta_rid == top_rid:
+            compact_meta.pop("client_row_id", None)
+        entry["pending_meta"] = compact_meta or None
+    return entry
+
+
+def compact_draft_payload(payload: dict | None) -> dict | None:
+    """Shrink draft JSON before write (blank cells, duplicate ids). Mutates."""
+    if not isinstance(payload, dict):
+        return payload
+    for section in ("new_rows", "dirty_saved", "parked_rows", "skipped_rows"):
+        rows = payload.get(section)
+        if not isinstance(rows, list):
+            continue
+        payload[section] = [
+            compact_draft_entry(e) if isinstance(e, dict) else e for e in rows
+        ]
+    return payload
 
 
 def hydrate_pending_meta(meta: Optional[dict]) -> Optional[dict]:
@@ -194,7 +242,16 @@ def hydrate_pending_meta(meta: Optional[dict]) -> Optional[dict]:
 
 
 def cells_for_json(values: dict[int, str]) -> dict[str, str]:
-    return {str(int(col)): str(text) for col, text in values.items()}
+    """Serialize cell map. Blank / whitespace-only values are omitted (smaller drafts)."""
+    out: dict[str, str] = {}
+    for col, text in values.items():
+        if text is None:
+            continue
+        s = str(text)
+        if not s.strip():
+            continue
+        out[str(int(col))] = s
+    return out
 
 
 def cells_from_json(raw: dict | None) -> dict[int, str]:
@@ -389,17 +446,56 @@ def apply_mapping_to_draft_payload(
     return updated
 
 
-def save_register_draft(payload: dict) -> Path:
-    """Write or replace the draft file. Empty drafts delete the file."""
+def save_register_draft(payload: dict, *, durable: bool = True) -> Path:
+    """Write or replace the draft file. Empty drafts delete the file.
+
+    ``durable=False`` skips fsync — use for debounced typing autosave.
+    Critical moments (import done, Save/outbox, discard) should pass
+    ``durable=True`` (default).
+    """
     user_id = payload["user_id"]
     register_date = date.fromisoformat(payload["register_date"])
     merged = bool(payload.get("merged"))
     path = draft_path(user_id, register_date, merged=merged)
+    compact_draft_payload(payload)
     if draft_is_empty(payload):
         clear_register_draft(user_id, register_date, merged=merged)
         return path
-    _atomic_json(path, payload)
+    _atomic_json(path, payload, durable=durable)
     return path
+
+
+def prune_draft_new_rows_by_client_ids(
+    user_id: ObjectId | str,
+    register_date: date,
+    client_ids: set[str] | list[str] | tuple[str, ...],
+    *,
+    durable: bool = True,
+) -> int:
+    """Remove ACK'd ``new_rows`` from the on-disk draft by ``client_row_id``.
+
+    Leaves dirty/parked/skipped alone. Returns how many new_rows were dropped.
+    No-op when the file is missing or *client_ids* is empty.
+    """
+    ids = {str(x).strip() for x in (client_ids or ()) if str(x).strip()}
+    if not ids:
+        return 0
+    draft = load_register_draft(user_id, register_date, merged=False)
+    if not draft:
+        return 0
+    before = list(draft.get("new_rows") or [])
+    if not before:
+        return 0
+    kept = [
+        e for e in before
+        if not isinstance(e, dict) or entry_client_row_id(e) not in ids
+    ]
+    dropped = len(before) - len(kept)
+    if dropped <= 0:
+        return 0
+    draft["new_rows"] = kept
+    save_register_draft(draft, durable=durable)
+    return dropped
 
 
 def load_register_draft(

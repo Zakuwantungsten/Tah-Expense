@@ -211,6 +211,122 @@ async def backfill_register_status(db: Any) -> int:
     return found
 
 
+# Display string → BSON datetime targets for imported feed / separate expense rows.
+_FEED_DATE_BACKFILLS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("toll_plaza", ("toll_date",), "transaction_date"),
+    ("parking_congo", ("payment_date",), "transaction_date"),
+    ("parking_congo", ("gate_in",), "gate_in_dt"),
+    ("rahntech", ("sales_date",), "transaction_date"),
+    ("zambia_parking", ("date", "transaction_date"), "transaction_date"),
+    ("comesa", ("valid_from",), "valid_from_dt"),
+    ("comesa", ("valid_to",), "valid_to_dt"),
+    ("diesel_infinity", ("date",), "transaction_date"),
+    ("diesel_lake_zambia", ("date",), "transaction_date"),
+    ("diesel_lake_tunduma", ("date",), "transaction_date"),
+    ("diesel_gbp", ("date",), "transaction_date"),
+)
+
+_SEPARATE_DATE_BACKFILLS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("ahmed_kimvi", ("date_str", "expense_date"), "expense_date"),
+    ("congo_expenses", ("date_str", "expense_date"), "expense_date"),
+)
+
+
+async def backfill_feed_datetimes(db: Any) -> int:
+    """Parse display date strings into BSON datetimes used for sort/filter.
+
+    Rows imported before ``HH:MM`` (no seconds) parsing worked often have empty
+    ``transaction_date`` / ``expense_date``. Sorting then falls through to the
+    display string and groups by day-of-month (all 3rds, then all 4ths, …).
+    """
+    from ..excel_dates import normalize_date_fields
+
+    updated = 0
+    feeds = db.imported_feeds
+    for feed_type, sources, store_as in _FEED_DATE_BACKFILLS:
+        query = {
+            "feed_type": feed_type,
+            "$or": [
+                {store_as: {"$exists": False}},
+                {store_as: None},
+                {store_as: {"$type": "string"}},
+            ],
+        }
+        cursor = feeds.find(query, projection={src: 1 for src in sources} | {"_id": 1})
+        async for doc in cursor:
+            patch = {src: doc.get(src) for src in sources if src in doc}
+            if not patch:
+                continue
+            # gate_in keeps its DD/MM/YYYY display text.
+            rewrite = store_as != "gate_in_dt"
+            display_fmt = (
+                "%d %b %y"
+                if store_as in {"valid_from_dt", "valid_to_dt"}
+                else "%d %b %Y"
+            )
+            parsed = normalize_date_fields(
+                patch,
+                *sources,
+                store_as=store_as,
+                display_fmt=display_fmt,
+                rewrite_display=rewrite,
+            )
+            if not isinstance(parsed, datetime):
+                continue
+            set_doc = {store_as: parsed}
+            if rewrite:
+                for src in sources:
+                    if src in patch and isinstance(patch.get(src), str):
+                        set_doc[src] = patch[src]
+            await feeds.update_one({"_id": doc["_id"]}, {"$set": set_doc})
+            updated += 1
+
+    separate = db.separate_expenses
+    for expense_type, sources, store_as in _SEPARATE_DATE_BACKFILLS:
+        query = {
+            "expense_type": expense_type,
+            "$or": [
+                {store_as: {"$exists": False}},
+                {store_as: None},
+                {store_as: {"$type": "string"}},
+            ],
+        }
+        cursor = separate.find(
+            query, projection={src: 1 for src in sources} | {"_id": 1}
+        )
+        async for doc in cursor:
+            patch = {src: doc.get(src) for src in sources if src in doc}
+            if not patch:
+                continue
+            parsed = normalize_date_fields(
+                patch, *sources, store_as=store_as, display_fmt="%d %b %Y"
+            )
+            if not isinstance(parsed, datetime):
+                continue
+            set_doc = {store_as: parsed}
+            if isinstance(patch.get("date_str"), str):
+                set_doc["date_str"] = patch["date_str"]
+            await separate.update_one({"_id": doc["_id"]}, {"$set": set_doc})
+            updated += 1
+
+    print(f"Feed/separate expense datetime backfill updated {updated} row(s).")
+    await db.schema_migrations.update_one(
+        {"_id": "0005_feed_datetime_backfill"},
+        {
+            "$set": {
+                "description": (
+                    "Backfill transaction_date/expense_date/gate_in_dt/"
+                    "valid_*_dt from display strings for chronological sort"
+                ),
+                "applied_at": datetime.now(timezone.utc),
+                "updated_rows": updated,
+            }
+        },
+        upsert=True,
+    )
+    return updated
+
+
 async def migrate(check_only: bool) -> int:
     settings = get_settings()
     client = AsyncMongoClient(settings.mongodb_uri, appname="tahmeed-migrate")
@@ -226,6 +342,7 @@ async def migrate(check_only: bool) -> int:
             print("No conflicts found; check-only mode made no changes.")
             return 0
         await backfill_register_status(db)
+        await backfill_feed_datetimes(db)
         await create_indexes(db)
         from ..badge_counters import repair_badge_counters
 

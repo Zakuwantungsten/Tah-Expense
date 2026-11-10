@@ -28,6 +28,7 @@ Save:
 import asyncio
 import copy
 import csv
+import threading
 import time
 from datetime import datetime, date
 from typing import List, Optional
@@ -92,6 +93,7 @@ from tahmeed.services.register_draft_service import (
     local_draft_dates,
     new_client_row_id,
     normalize_sync_status,
+    prune_draft_new_rows_by_client_ids,
     save_register_draft,
     serialize_pending_meta,
 )
@@ -105,6 +107,7 @@ from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
     format_amount_label,
     format_new_date,
+    within_table_duplicate_items,
 )
 from tahmeed.services.register_metrics import log_register_event, timed_op
 
@@ -177,6 +180,28 @@ def _display_money_cells(tx: Transaction) -> tuple[str, str]:
     tzs, usd = tx.money_parts()
     tzs_txt = f"{tzs:,.2f}" if tzs else ""
     usd_txt = f"{usd:,.2f}" if usd else ""
+    return tzs_txt, usd_txt
+
+
+def _staged_import_money_cells(data: dict) -> tuple[str, str]:
+    """Format TZS/USD cells from a staged import payload — no Transaction alloc."""
+    cur = (data.get("currency") or "TZS").upper()
+    amt = float(data.get("amount") or 0.0)
+    amount_usd = data.get("amount_usd")
+    if amount_usd is not None:
+        usd = float(amount_usd or 0.0)
+        if cur == "USD" and abs(amt - usd) < 1e-9:
+            tzs, usd_v = 0.0, usd
+        elif cur == "USD":
+            tzs, usd_v = amt, usd
+        else:
+            tzs, usd_v = amt, usd
+    elif cur == "USD":
+        tzs, usd_v = 0.0, amt
+    else:
+        tzs, usd_v = amt, 0.0
+    tzs_txt = f"{tzs:,.2f}" if tzs else ""
+    usd_txt = f"{usd_v:,.2f}" if usd_v else ""
     return tzs_txt, usd_txt
 
 
@@ -1055,6 +1080,10 @@ class DailyRegister(QWidget):
 
     def __init__(self, user: User, categories: List[Category], parent=None):
         super().__init__(parent)
+        # Transparent so page-level circuit flows under ribbon / grid chrome.
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("DailyRegister { background: transparent; border: none; }")
         self._user        = user
         self._categories  = categories
         self._table_font_pt = _load_table_font_pt()
@@ -1183,7 +1212,13 @@ class DailyRegister(QWidget):
         self._draft_timer = QTimer(self)
         self._draft_timer.setSingleShot(True)
         self._draft_timer.setInterval(1_500)
-        self._draft_timer.timeout.connect(self._flush_local_draft)
+        # Typing autosave: skip fsync so large drafts don't freeze the UI.
+        self._draft_timer.timeout.connect(self._autosave_local_draft)
+        # Large post-import drafts: capture on UI thread, json write off-thread.
+        self._draft_write_in_flight = False
+        self._pending_draft_payload: dict | None = None
+        self._pending_draft_durable = True
+        self._draft_write_task = None
         # Debounce row-height recompute while wrapping + column resize.
         self._wrap_height_timer = QTimer(self)
         self._wrap_height_timer.setSingleShot(True)
@@ -1305,6 +1340,7 @@ class DailyRegister(QWidget):
         self._merged_table = self._make_register_table()
         self._table = self._my_table
         self._table_stack = QStackedWidget(self)
+        self._table_stack.setStyleSheet("background: transparent;")
         self._table_stack.addWidget(self._my_table)
         self._table_stack.addWidget(self._parked_table)
         self._table_stack.addWidget(self._skipped_table)
@@ -1316,32 +1352,126 @@ class DailyRegister(QWidget):
         self._apply_column_visibility(show_cashier=False)
 
         self._table_host = QWidget(self)
+        self._table_host.setStyleSheet("background: transparent;")
         host_lay = QVBoxLayout(self._table_host)
         host_lay.setContentsMargins(0, 0, 0, 0)
         host_lay.setSpacing(0)
         host_lay.addWidget(self._table_stack)
         root.addWidget(self._table_host, 1)
-        self._loading = LoadingOverlay(self._table_host, "Loading…")
+        # show_progress=True so crash-recovery can paint a real % bar; normal
+        # day loads stay indeterminate until a maximum is set.
+        self._loading = LoadingOverlay(
+            self._table_host, "Loading…", show_progress=True
+        )
 
-        # ── Footer — one table-row tall (Excel / WPS style) ─────────────
+        # ── Footer — one band, three centered groups (Refund | USD | Total)
         footer = QWidget()
-        footer.setFixedHeight(DEFAULT_ROW_HEIGHT)
+        footer.setObjectName("registerTotalsFooter")
+        footer.setFixedHeight(56)
+        footer.setAttribute(Qt.WA_StyledBackground, False)
+        footer.setAutoFillBackground(False)
         footer.setStyleSheet(
-            "background: #f5f6f7;"
-            "border-top: 1px solid #d1d5db;"
+            "QWidget#registerTotalsFooter {"
+            "  background: transparent;"
+            "  border-top: 1px solid #D1D5DB;"
+            "}"
         )
         fl = QHBoxLayout(footer)
-        fl.setContentsMargins(8, 0, 10, 0)
-        fl.setSpacing(4)
+        fl.setContentsMargins(10, 3, 10, 3)
+        fl.setSpacing(0)
 
-        fl.addStretch()
-
-        self._totals_label = QLabel("0 entries")
-        self._totals_label.setStyleSheet(
-            "color: #374151; font-size: 11px; font-weight: 500;"
-            "font-family: 'Segoe UI';"
+        self._footer_meta = QLabel("0 entries")
+        self._footer_meta.setStyleSheet(
+            "color: #6B7280; font-size: 10px; font-weight: 600;"
+            "font-family: 'Segoe UI'; background: transparent; padding-right: 8px;"
         )
-        fl.addWidget(self._totals_label)
+        fl.addWidget(self._footer_meta, 0, Qt.AlignVCenter)
+
+        def _footer_vsep() -> QFrame:
+            sep = QFrame()
+            sep.setFrameShape(QFrame.VLine)
+            sep.setStyleSheet("color: #E5E7EB; background: #E5E7EB; max-width: 1px;")
+            sep.setFixedWidth(1)
+            return sep
+
+        def _footer_metric_cell(
+            caption: str, k_color: str, v_color: str, fw: str
+        ) -> tuple[QWidget, QLabel]:
+            cell = QWidget()
+            cell.setStyleSheet("background: transparent;")
+            cv = QVBoxLayout(cell)
+            cv.setContentsMargins(6, 0, 6, 0)
+            cv.setSpacing(0)
+            k = QLabel(caption)
+            k.setAlignment(Qt.AlignHCenter | Qt.AlignBottom)
+            k.setStyleSheet(
+                f"font-size: 9px; color: {k_color}; font-weight: 600;"
+                " font-family: 'Segoe UI'; background: transparent;"
+            )
+            v = QLabel("—")
+            v.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            v.setMinimumWidth(118)
+            v.setStyleSheet(
+                f"font-size: 13px; color: {v_color}; font-weight: {fw};"
+                " font-family: 'Segoe UI'; background: transparent;"
+            )
+            cv.addWidget(k)
+            cv.addWidget(v)
+            return cell, v
+
+        def _footer_group(
+            title: str, title_color: str
+        ) -> tuple[QWidget, dict[str, QLabel]]:
+            """Centered title over Totals / P. totals / Combined amount cells."""
+            tile = QWidget()
+            tile.setStyleSheet("background: transparent;")
+            tv = QVBoxLayout(tile)
+            tv.setContentsMargins(10, 0, 10, 0)
+            tv.setSpacing(1)
+
+            hdr = QLabel(title)
+            hdr.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+            hdr.setStyleSheet(
+                f"font-size: 10px; color: {title_color}; font-weight: 700;"
+                " letter-spacing: 0.5px; font-family: 'Segoe UI';"
+                " background: transparent;"
+            )
+            tv.addWidget(hdr)
+
+            row = QWidget()
+            row.setStyleSheet("background: transparent;")
+            rh = QHBoxLayout(row)
+            rh.setContentsMargins(0, 0, 0, 0)
+            rh.setSpacing(2)
+            rh.setAlignment(Qt.AlignHCenter)
+
+            labels: dict[str, QLabel] = {}
+            for key, caption, k_color, v_color, fw in (
+                ("totals", "Totals", "#6B7280", "#111827", "600"),
+                ("parked", "P. totals", "#B45309", "#B45309", "600"),
+                ("combined", "Combined", "#0077C5", "#111827", "700"),
+            ):
+                cell, val = _footer_metric_cell(caption, k_color, v_color, fw)
+                rh.addWidget(cell, 0, Qt.AlignTop)
+                labels[key] = val
+            tv.addWidget(row)
+            return tile, labels
+
+        refund_tile, self._footer_refund = _footer_group(
+            "REFUND TO FLOAT", "#EA580C"
+        )
+        usd_tile, self._footer_usd = _footer_group("TOTAL USD", "#6B7280")
+        tzs_tile, self._footer_tzs = _footer_group("TOTAL", "#6B7280")
+
+        fl.addWidget(_footer_vsep())
+        fl.addWidget(refund_tile, 1)
+        fl.addWidget(_footer_vsep())
+        fl.addWidget(usd_tile, 1)
+        fl.addWidget(_footer_vsep())
+        fl.addWidget(tzs_tile, 1)
+
+        # Back-compat alias used by older call sites / tests
+        self._totals_label = self._footer_meta
 
         root.addWidget(footer)
 
@@ -1588,15 +1718,34 @@ class DailyRegister(QWidget):
     # Load data
     # ------------------------------------------------------------------
 
-    def _show_register_loading(self, message: str = "Loading…") -> None:
+    def _show_register_loading(
+        self,
+        message: str = "Loading…",
+        *,
+        value: int | None = None,
+        maximum: int | None = None,
+    ) -> None:
         overlay = getattr(self, "_loading", None)
         if overlay is not None:
-            overlay.show_loading(message)
+            overlay.show_loading(message, value=value, maximum=maximum)
 
     def _hide_register_loading(self) -> None:
         overlay = getattr(self, "_loading", None)
         if overlay is not None:
             overlay.hide_loading()
+
+    def _tick_restore_progress(self, done: int, total: int) -> None:
+        """Update recovery % without accepting clicks (avoids re-entrant dialogs)."""
+        total = max(1, int(total or 0))
+        done = max(0, min(total, int(done or 0)))
+        pct = int(round(100.0 * done / total))
+        self._show_register_loading(
+            f"Recovering entries… {pct}%",
+            value=done,
+            maximum=total,
+        )
+        # Paint only — ExcludeUserInputEvents keeps truck/modals from nesting.
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
 
     def _invalidate_day_tx_cache(self) -> None:
         self._day_tx_cache = None
@@ -1824,6 +1973,7 @@ class DailyRegister(QWidget):
         self._view_mode = "merged"
         self._merged_mode = True
         self._parked_mode = False
+        self._skipped_mode = False
         self.mode_changed.emit("merged")
         self._draft_restore_policy = "off"
         if blank:
@@ -1851,6 +2001,7 @@ class DailyRegister(QWidget):
         self._view_mode = "my"
         self._merged_mode = False
         self._parked_mode = False
+        self._skipped_mode = False
         self.mode_changed.emit("my")
         self._draft_restore_policy = "silent"
         self._apply_column_visibility(show_cashier=False)
@@ -2738,15 +2889,151 @@ class DailyRegister(QWidget):
         status, _value = self._resolve_truck_text(raw, row=row)
         return status == "ok"
 
+    def _peek_draft_recovery_counts(self) -> tuple[int, int]:
+        """Count dirty + My new rows that cold-recover would put back on the grid.
+
+        Parked/Skipped bucket rows are not counted — they stay on their tabs.
+        """
+        if self._current_date is None:
+            return 0, 0
+        try:
+            draft = load_register_draft(
+                self._user._id, self._current_date, merged=self._merged_mode
+            )
+        except Exception:
+            return 0, 0
+        if draft is None or draft_is_empty(draft):
+            return 0, 0
+        dirty_n = len([
+            e for e in (draft.get("dirty_saved") or []) if isinstance(e, dict)
+        ])
+        new_n = 0
+        for entry in draft.get("new_rows") or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry_is_parked(entry) or entry_is_skipped(entry):
+                continue
+            new_n += 1
+        return dirty_n, new_n
+
+    def _prompt_draft_recovery(self, dirty_n: int, new_n: int) -> str:
+        """Ask before cold-recover. Returns ``recover`` | ``discard`` | ``later``."""
+        parts = []
+        if dirty_n:
+            parts.append(
+                f"{dirty_n} edited row{'s' if dirty_n != 1 else ''}"
+            )
+        if new_n:
+            parts.append(
+                f"{new_n} new entr{'ies' if new_n != 1 else 'y'}"
+            )
+        detail = " and ".join(parts) if parts else "unsaved work"
+        from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_choice
+
+        choice = ask_choice(
+            self,
+            title="Recover unsaved entries?",
+            text=(
+                f"Found {detail} from before the app closed.\n\n"
+                "Recover them onto My entries?\n\n"
+                "Discard removes only unsaved My rows from this computer. "
+                "Parked and Skipped buckets are kept. "
+                "Not now leaves them for the next time you open this day."
+            ),
+            actions=(
+                DialogAction("later", "Not now", "cancel"),
+                DialogAction("discard", "Discard", "secondary"),
+                DialogAction("recover", "Recover", "primary"),
+            ),
+            badge="question",
+            default_action_id="recover",
+        )
+        if choice == "recover":
+            return "recover"
+        if choice == "discard":
+            return "discard"
+        return "later"
+
+    def _discard_recoverable_draft_rows(self) -> None:
+        """Drop dirty/new My recovery rows; keep Parked + Skipped buckets."""
+        if self._current_date is None or self._merged_mode:
+            return
+        try:
+            draft = load_register_draft(
+                self._user._id, self._current_date, merged=False
+            )
+        except Exception:
+            draft = None
+        parked = list(self._local_parked)
+        skipped = list(self._local_skipped)
+        if draft:
+            parked = draft_parked_rows(draft) or parked
+            skipped = draft_skipped_rows(draft) or skipped
+            for entry in draft.get("new_rows") or []:
+                if not isinstance(entry, dict):
+                    continue
+                if entry_is_parked(entry):
+                    rid = entry_client_row_id(entry)
+                    if rid and any(entry_client_row_id(e) == rid for e in parked):
+                        continue
+                    parked.append(entry)
+                elif entry_is_skipped(entry):
+                    rid = entry_client_row_id(entry)
+                    if rid and any(entry_client_row_id(e) == rid for e in skipped):
+                        continue
+                    skipped.append(entry)
+        self._local_parked = parked
+        self._local_skipped = skipped
+        self._emit_parked_count()
+        self._emit_skipped_count()
+        try:
+            if parked or skipped:
+                save_register_draft(
+                    build_draft_payload(
+                        user_id=self._user._id,
+                        username=getattr(self._user, "username", "") or "",
+                        register_date=self._current_date,
+                        merged=False,
+                        edit_mode=False,
+                        dirty_saved=[],
+                        new_rows=[],
+                        parked_rows=parked,
+                        skipped_rows=skipped,
+                    )
+                )
+            else:
+                clear_register_draft(
+                    self._user._id, self._current_date, merged=False
+                )
+        except Exception:
+            pass
+
     def _maybe_restore_draft_after_populate(self) -> None:
         """Apply local draft per policy. Parked/Merged never restore."""
         policy = "off" if self._skip_draft_restore else self._draft_restore_policy
-        if self._parked_mode or self._merged_mode:
+        if self._parked_mode or self._merged_mode or self._skipped_mode:
             policy = "off"
         try:
             if policy == "off":
                 return
-            restored = self._restore_local_draft()
+            dirty_n, new_n = self._peek_draft_recovery_counts()
+            if policy == "notify" and (dirty_n or new_n):
+                # Hide indeterminate Loading so the prompt is the focus.
+                self._hide_register_loading()
+                choice = self._prompt_draft_recovery(dirty_n, new_n)
+                if choice == "later":
+                    return
+                if choice == "discard":
+                    self._discard_recoverable_draft_rows()
+                    return
+                # recover — fall through with progress-capable restore
+            elif dirty_n == 0 and new_n == 0:
+                # May still migrate parked/skipped flags out of legacy new_rows.
+                self._restore_local_draft()
+                return
+            restored = self._restore_local_draft(
+                show_progress=(policy == "notify" and (dirty_n + new_n) >= 20)
+            )
             if restored and policy == "notify":
                 self._show_draft_restored_notice(*restored)
         finally:
@@ -2923,6 +3210,14 @@ class DailyRegister(QWidget):
         if prev == "merged" and mode == "my":
             if self._flip_to_my_from_merged():
                 return
+        # Side tabs ↔ each other: keep My mounted; never sync-rewrite the draft.
+        if (
+            prev in ("parked", "skipped", "merged")
+            and mode in ("parked", "skipped", "merged")
+            and prev != mode
+        ):
+            if self._flip_side_surface(mode):
+                return
 
         self._draft_timer.stop()
         self._commit_open_editor()
@@ -2939,7 +3234,9 @@ class DailyRegister(QWidget):
                 or self._local_parked
                 or self._local_skipped
             ):
-                self._flush_local_draft()
+                # Defer disk write — sync fsync of a large post-import draft
+                # freezes the UI thread (Windows "Not Responding").
+                self._schedule_draft_autosave()
         self._ensure_my_surface_active()
         self._view_mode = mode
         self._merged_mode = mode == "merged"
@@ -2965,6 +3262,9 @@ class DailyRegister(QWidget):
             self._activate_table_surface(self._skipped_table)
             self._reset_parked_surface_maps()
             self._populate([])
+            self._append_local_skipped_rows()
+            self._emit_skipped_count()
+            return
         # After delete/discard, never reuse a stale in-memory day cache.
         if not self._day_tx_stale and self._try_apply_cached_view():
             return
@@ -2972,6 +3272,87 @@ class DailyRegister(QWidget):
         self._view_load_task = asyncio.ensure_future(
             self._load_date(self._current_date)
         )
+
+    def _capture_side_bucket_from_active_table(self) -> None:
+        """Pull Parked/Skipped edits off the visible side grid into memory."""
+        if self._parked_mode and self._table is self._parked_table:
+            self._local_parked = self._table_parked_entries()
+        if self._skipped_mode and self._table is self._skipped_table:
+            self._local_skipped = self._table_skipped_entries()
+
+    def _paint_skipped_surface(self) -> None:
+        """Show in-memory skipped rows — never re-parse the whole draft file."""
+        self._activate_table_surface(self._skipped_table)
+        self._reset_parked_surface_maps()
+        self._populate([])
+        self._append_local_skipped_rows()
+        self._emit_skipped_count()
+        self._apply_column_visibility(show_cashier=True)
+
+    def _paint_parked_surface_from_cache(self) -> None:
+        """Show parked from day cache + local bucket (My keep-alive stays put)."""
+        self._activate_table_surface(self._parked_table)
+        self._reset_parked_surface_maps()
+        blank = self._current_date is None
+        if blank:
+            self._apply_txs_to_view([], upload_id="", reload_local_parked=False)
+            return
+        day_key = self._make_day_cache_key(
+            self._current_date, merged=False, upload_id=""
+        )
+        if self._day_tx_cache is not None and self._day_tx_cache_key == day_key:
+            self._apply_txs_to_view(
+                list(self._day_tx_cache),
+                upload_id="",
+                reload_local_parked=False,
+            )
+        else:
+            self._apply_txs_to_view(
+                [], upload_id="", reload_local_parked=False
+            )
+            self._show_register_loading("Loading…")
+            self._view_load_task = asyncio.ensure_future(
+                self._load_date(self._current_date)
+            )
+
+    def _flip_side_surface(self, mode: str) -> bool:
+        """Parked ↔ Skipped ↔ Merged without tearing down the My keep-alive."""
+        if mode not in ("parked", "skipped", "merged"):
+            return False
+        if mode == "parked" and self._parked_table is None:
+            return False
+        if mode == "skipped" and self._skipped_table is None:
+            return False
+        if mode == "merged" and self._merged_table is None:
+            return False
+        blank = self._current_date is None
+        if not blank and self._load_in_flight and mode in ("parked", "merged"):
+            return False
+        self._draft_timer.stop()
+        self._commit_open_editor()
+        self._capture_side_bucket_from_active_table()
+        self._view_mode = mode
+        self._merged_mode = mode == "merged"
+        self._parked_mode = mode == "parked"
+        self._skipped_mode = mode == "skipped"
+        self.mode_changed.emit(mode)
+        self._draft_restore_policy = "off"
+        if mode == "skipped":
+            self._paint_skipped_surface()
+        elif mode == "parked":
+            self._paint_parked_surface_from_cache()
+        else:
+            self._activate_table_surface(self._merged_table)
+            if blank:
+                self._merged_painted_key = None
+                self._populate([])
+                self._apply_column_visibility(show_cashier=True)
+            elif not self._show_cached_merged_rows():
+                self._show_register_loading("Loading…")
+                asyncio.ensure_future(self._load_date(self._current_date))
+        # Persist side-bucket edits without blocking on a full My draft rewrite.
+        self._schedule_draft_autosave()
+        return True
 
     def _flip_to_skipped_keep_my(self) -> bool:
         """My → Skipped without flush/wipe/restore. Returns False if unavailable."""
@@ -2983,18 +3364,15 @@ class DailyRegister(QWidget):
         self._draft_timer.stop()
         self._commit_open_editor()
         self._my_session = self._snapshot_grid_session()
-        self._activate_table_surface(self._skipped_table)
-        self._reset_parked_surface_maps()
         self._view_mode = "skipped"
         self._merged_mode = False
         self._parked_mode = False
         self._skipped_mode = True
         self.mode_changed.emit("skipped")
         self._draft_restore_policy = "off"
-        self._load_local_skipped_from_disk()
-        self._populate([])
-        self._append_local_skipped_rows()
-        self._emit_skipped_count()
+        # Use in-memory skipped rows. Reloading the draft JSON after a large
+        # import re-parses every My row on the UI thread and freezes the app.
+        self._paint_skipped_surface()
         return True
 
     def _flip_to_my_from_skipped(self) -> bool:
@@ -3015,7 +3393,9 @@ class DailyRegister(QWidget):
         self._skipped_mode = False
         self.mode_changed.emit("my")
         self._draft_restore_policy = "notify"
-        self._flush_local_draft()
+        # Match Parked→My: never sync-write the full draft here. A post-import
+        # draft can be huge; json+fsync on the UI thread hangs Windows.
+        self._schedule_draft_autosave()
         self._emit_skipped_count()
         self._update_footer()
         self.edit_state_changed.emit(
@@ -3321,9 +3701,11 @@ class DailyRegister(QWidget):
         self._saved_ids   = {}
         self._saved_txs   = {}
 
-        # Merged / Parked are not blank-entry surfaces — only My has a typed pad.
+        # Merged / Parked / Skipped are not blank-entry surfaces — only My has a typed pad.
         editable_tail = (
-            0 if (self._merged_mode or self._parked_mode) else DEFAULT_EDITABLE_ROWS
+            0
+            if (self._merged_mode or self._parked_mode or self._skipped_mode)
+            else DEFAULT_EDITABLE_ROWS
         )
         total_rows = self._saved_count + editable_tail
         self._table.setRowCount(total_rows)
@@ -3675,22 +4057,73 @@ class DailyRegister(QWidget):
         local = self._money_bucket_from_local_parked(self._local_parked)
         return self._add_money_buckets(server, local)
 
+    @staticmethod
+    def _fmt_footer_tzs(amount: float) -> str:
+        return f"TZS {amount:,.0f}" if amount else "—"
+
+    @staticmethod
+    def _fmt_footer_usd(amount: float) -> str:
+        return f"USD {amount:,.2f}" if amount else "—"
+
+    def _set_footer_stack(
+        self,
+        stack: dict,
+        my_amount: float,
+        parked_amount: float,
+        *,
+        fmt,
+    ) -> None:
+        combined = float(my_amount or 0.0) + float(parked_amount or 0.0)
+        stack["totals"].setText(fmt(float(my_amount or 0.0)))
+        stack["parked"].setText(fmt(float(parked_amount or 0.0)))
+        stack["combined"].setText(fmt(combined))
+
     def _update_footer(self) -> None:
-        """Recompute My / Parked / Combined money KPIs and the grid footer strip."""
+        """Recompute My / Parked / Combined money KPIs into the sticky footer only."""
         my = self._my_money_bucket()
         parked = self._parked_money_bucket()
         combined = self._add_money_buckets(my, parked)
 
-        # Footer strip stays scoped to the visible surface (current tab).
         if self._parked_mode:
             view = parked
+            mode_tag = "Parked"
+        elif getattr(self, "_view_mode", "my") == "skipped":
+            view = my
+            mode_tag = "Skipped"
+        elif self._merged_mode:
+            view = combined
+            mode_tag = "Merged"
         else:
             view = my
-        amount_str = f"TZS {view['tzs']:,.0f}" if view["tzs"] else "—"
-        usd_str = f"USD {view['usd']:,.2f}" if view["usd"] else "—"
-        self._totals_label.setText(
-            f"{view['n']} entr{'y' if view['n'] == 1 else 'ies'}"
-            f"   ·   {usd_str}   ·   {amount_str}"
+            mode_tag = "My"
+
+        day = self._current_date
+        if day is None:
+            day_txt = "—"
+        else:
+            d = day.date() if hasattr(day, "date") else day
+            day_txt = d.strftime("%a %d %b %Y")
+        self._footer_meta.setText(
+            f"{mode_tag}  ·  {view['n']} entr"
+            f"{'y' if view['n'] == 1 else 'ies'}  ·  {day_txt}"
+        )
+        self._set_footer_stack(
+            self._footer_refund,
+            float(my["refund"]),
+            float(parked["refund"]),
+            fmt=self._fmt_footer_tzs,
+        )
+        self._set_footer_stack(
+            self._footer_usd,
+            float(my["usd"]),
+            float(parked["usd"]),
+            fmt=self._fmt_footer_usd,
+        )
+        self._set_footer_stack(
+            self._footer_tzs,
+            float(my["tzs"]),
+            float(parked["tzs"]),
+            fmt=self._fmt_footer_tzs,
         )
         self.stats_updated.emit(
             int(combined["n"]),
@@ -4725,7 +5158,9 @@ class DailyRegister(QWidget):
         start = self._table.rowCount()
         self._table.setRowCount(start + n)
         self._init_editable_rows(start, start + n)
-        self._renumber()
+        # Bulk import pre-sizes then renumbers once at the end.
+        if not self._bulk_mutating:
+            self._renumber()
 
     # ------------------------------------------------------------------
     # Keyboard navigation
@@ -6578,8 +7013,10 @@ class DailyRegister(QWidget):
             skipped_n = self._merge_local_skipped_entries(
                 list(getattr(preview, "skipped_rows", None) or [])
             )
-            if skipped_n:
-                self._flush_local_draft()
+            # Always persist recovery draft after import — not only when there
+            # are skipped rows. Otherwise a freeze/kill before the 1.5s autosave
+            # loses the whole staged batch.
+            self._flush_local_draft()
             note = ""
             if skipped_n:
                 note = (
@@ -6712,18 +7149,43 @@ class DailyRegister(QWidget):
 
     @staticmethod
     def _import_progress_due(r: int, total: int) -> bool:
-        return r == 0 or r + 1 == total or (r + 1) % 25 == 0
+        """Report progress often enough to feel live, rarely enough to stay fast.
+
+        Each await paints the busy dialog; for 500+ rows every-25th was the
+        main slowdown (not DB work — this stage is pure Qt cell writes).
+        """
+        if r == 0 or r + 1 == total:
+            return True
+        if total <= 100:
+            step = 25
+        elif total <= 400:
+            step = 50
+        else:
+            step = 100
+        return (r + 1) % step == 0
 
     def _begin_staged_import(self, payloads: list) -> dict:
         """Lock the grid for a bulk import; returns loop state for ``_stage_import_row``."""
         self._draft_timer.stop()
         self._bulk_mutating = True
+        start = self._first_empty_editable_row()
+        total = len(payloads)
+        prev_block = self._table.blockSignals(True)
+        prev_updates = self._table.updatesEnabled()
+        self._table.setUpdatesEnabled(False)
+        # Pre-grow once so the per-row loop never calls setRowCount/renumber.
+        needed = start + total - self._table.rowCount()
+        if needed > 0 and not self._merged_mode and not self._parked_mode:
+            end = self._table.rowCount()
+            self._table.setRowCount(end + needed)
+            self._init_editable_rows(end, end + needed)
         return {
-            "start": self._first_empty_editable_row(),
-            "prev_block": self._table.blockSignals(True),
+            "start": start,
+            "prev_block": prev_block,
+            "prev_updates": prev_updates,
             "truck_cells": [],
             "loaded_rows": set(),
-            "total": len(payloads),
+            "total": total,
         }
 
     def _stage_import_row(self, state: dict, r: int, data: dict) -> None:
@@ -6787,19 +7249,7 @@ class DailyRegister(QWidget):
             )
 
         # Split amount into TZS / USD columns (legacy USD-only rows land in USD).
-        staged = Transaction(
-            date=data.get("date") or datetime.utcnow(),
-            description=data.get("description") or "",
-            truck_number=data.get("truck_number") or "",
-            amount=float(data.get("amount") or 0),
-            currency=data.get("currency") or "TZS",
-            amount_usd=(
-                float(data["amount_usd"])
-                if data.get("amount_usd") is not None
-                else None
-            ),
-        )
-        tzs_txt, usd_txt = _display_money_cells(staged)
+        tzs_txt, usd_txt = _staged_import_money_cells(data)
         self._table.setItem(target, COL_TZS, _money_item(tzs_txt))
         self._table.setItem(target, COL_USD, _money_item(usd_txt))
 
@@ -6826,6 +7276,7 @@ class DailyRegister(QWidget):
                 self._sync_row_date(row)
         finally:
             self._table.blockSignals(state["prev_block"])
+            self._table.setUpdatesEnabled(state.get("prev_updates", True))
             self._bulk_mutating = False
         self._renumber()
         self._finalize_truck_cells(state["truck_cells"])
@@ -7090,7 +7541,8 @@ class DailyRegister(QWidget):
         hdr_px = max(9, int(round(11 * font_pt / _TABLE_FONT_PT_DEFAULT)))
         return f"""
             QTableWidget {{
-                background: #ffffff;
+                background: transparent;
+                alternate-background-color: rgba(249, 250, 251, 210);
                 gridline-color: #e5e7eb;
                 border: none;
                 font-family: Calibri;
@@ -7344,18 +7796,20 @@ class DailyRegister(QWidget):
         self._commit_open_editor()
         if self.has_unsaved_work():
             if self._current_date is None:
-                box = QMessageBox(self)
-                box.setIcon(QMessageBox.Warning)
-                box.setWindowTitle("Unsaved changes")
-                box.setText(
-                    "This blank table has unsaved entries but no Reconciled Date.\n\n"
-                    "Set Reconciled Date to save as draft, or discard this work."
-                )
-                discard_btn = box.addButton("Discard", QMessageBox.DestructiveRole)
-                cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
-                box.setDefaultButton(cancel_btn)
-                box.exec()
-                if box.clickedButton() != discard_btn:
+                from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
+
+                if not ask_confirm(
+                    self,
+                    title="Unsaved changes",
+                    heading=(
+                        "This blank table has unsaved entries but no Reconciled Date."
+                    ),
+                    body="Set Reconciled Date to save as draft, or discard this work.",
+                    accept_label="Discard",
+                    cancel_label="Cancel",
+                    destructive=True,
+                    default_cancel=True,
+                ):
                     return
             else:
                 choice = self._prompt_unsaved_work(
@@ -8842,27 +9296,42 @@ class DailyRegister(QWidget):
                         self._set_row_sync_status(row, SYNC_FAILED)
 
                 drained_parked_ids: set[str] = set()
+                acked_client_ids: set[str] = set()
                 for i in sorted(success_idxs, reverse=True):
                     row, tx = to_save[i]
-                    if (getattr(tx, "register_status", "") or "") == "parked":
-                        rid = (
-                            getattr(tx, "client_row_id", None)
-                            or (self._pending_row_meta.get(row) or {}).get(
-                                "client_row_id"
-                            )
+                    rid = (
+                        getattr(tx, "client_row_id", None)
+                        or (self._pending_row_meta.get(row) or {}).get(
+                            "client_row_id"
                         )
+                    )
+                    if rid:
+                        acked_client_ids.add(str(rid))
+                    if (getattr(tx, "register_status", "") or "") == "parked":
                         if rid:
                             drained_parked_ids.add(str(rid))
                     self._mark_new_row_saved(row, flush=False)
                 if drained_parked_ids:
                     self._drop_local_parked_by_client_ids(drained_parked_ids)
+                # Drop ACK'd ids from disk before the full rewrite so a crash
+                # between mark and flush cannot re-offer already-saved rows.
+                if acked_client_ids and self._current_date is not None:
+                    try:
+                        prune_draft_new_rows_by_client_ids(
+                            self._user._id,
+                            self._current_date,
+                            acked_client_ids,
+                            durable=True,
+                        )
+                    except Exception:
+                        pass
 
                 meta["synced"] = synced
                 meta["already_exists"] = already_exists
                 meta["failed"] = int(any_fail)
                 meta["cancelled"] = int(cancelled)
                 meta["total"] = total
-                self._flush_local_draft()
+                self._flush_local_draft_after_ack()
                 if synced:
                     self.drafts_changed.emit()
                     self.rows_saved.emit(synced)
@@ -8949,17 +9418,121 @@ class DailyRegister(QWidget):
             return
         self._draft_timer.start()
 
-    def _flush_local_draft(self, *, include_dirty: bool = True) -> None:
+    def _autosave_local_draft(self) -> None:
+        """Debounced typing save — compact JSON, no fsync."""
+        self._flush_local_draft(durable=False)
+
+    @staticmethod
+    def _draft_payload_row_count(payload: dict | None) -> int:
+        if not payload:
+            return 0
+        return (
+            len(payload.get("new_rows") or [])
+            + len(payload.get("dirty_saved") or [])
+            + len(payload.get("parked_rows") or [])
+            + len(payload.get("skipped_rows") or [])
+        )
+
+    def _persist_draft_payload(
+        self, payload: dict, *, blocking: bool, durable: bool = True
+    ) -> None:
+        """Write a captured draft. Large payloads go on a daemon thread.
+
+        Uses ``threading`` (not ``asyncio.ensure_future``) so a flush during
+        daily import cannot nest asyncio tasks under qasync / Python 3.14 —
+        that crashed with ``Cannot enter into task while another task…``.
+        """
+        if blocking or self._draft_payload_row_count(payload) < 80:
+            try:
+                save_register_draft(payload, durable=durable)
+            except Exception:
+                pass
+            return
+        self._pending_draft_payload = payload
+        if self._draft_write_in_flight:
+            # Once any coalesced write needs durability, keep fsync for that batch.
+            self._pending_draft_durable = bool(
+                getattr(self, "_pending_draft_durable", False) or durable
+            )
+            return
+        self._draft_write_in_flight = True
+        self._pending_draft_durable = bool(durable)
+        threading.Thread(
+            target=self._draft_write_worker,
+            name="register-draft-write",
+            daemon=True,
+        ).start()
+
+    def _draft_write_worker(self) -> None:
+        """Background coalesce loop for large draft JSON writes."""
+        try:
+            while True:
+                payload = self._pending_draft_payload
+                durable = bool(getattr(self, "_pending_draft_durable", True))
+                self._pending_draft_payload = None
+                self._pending_draft_durable = False
+                if payload is None:
+                    break
+                try:
+                    save_register_draft(payload, durable=durable)
+                except TypeError:
+                    try:
+                        save_register_draft(payload)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                if self._pending_draft_payload is None:
+                    break
+        finally:
+            self._draft_write_in_flight = False
+            if self._pending_draft_payload is not None:
+                self._draft_write_in_flight = True
+                threading.Thread(
+                    target=self._draft_write_worker,
+                    name="register-draft-write",
+                    daemon=True,
+                ).start()
+
+    def _flush_local_draft(
+        self, *, include_dirty: bool = True, durable: bool = True
+    ) -> None:
         """Persist current unsaved grid state to disk (or clear if empty)."""
         if self._restoring_draft or self._current_date is None:
             return
         try:
             self._commit_open_editor()
             payload = self._capture_local_draft(include_dirty=include_dirty)
-            save_register_draft(payload)
+            self._persist_draft_payload(
+                payload, blocking=False, durable=durable
+            )
         except Exception:
             # Local draft must never break typing / save.
             pass
+
+    def _flush_local_draft_after_ack(self) -> None:
+        """After outbox ACK: clear file cheaply when nothing remains, else rewrite."""
+        if self._current_date is None:
+            return
+        # Fast path: no dirty / typed / parked / skipped left → delete file.
+        if (
+            not self._dirty_rows
+            and not self._local_parked
+            and not self._local_skipped
+            and not self._merged_mode
+            and not any(
+                self._row_has_data(row)
+                for row in range(self._saved_count, self._table.rowCount())
+            )
+        ):
+            try:
+                clear_register_draft(
+                    self._user._id, self._current_date, merged=False
+                )
+            except Exception:
+                pass
+            return
+        self._flush_local_draft(durable=True)
 
     def _clear_local_draft(self, *, both_modes: bool = False) -> None:
         """Drop typed / dirty recovery rows. Parked + Skipped buckets survive."""
@@ -9147,10 +9720,11 @@ class DailyRegister(QWidget):
             skipped_rows=skipped_rows,
         )
 
-    def _restore_local_draft(self) -> Optional[tuple]:
+    def _restore_local_draft(self, *, show_progress: bool = False) -> Optional[tuple]:
         """Apply a saved draft onto the freshly populated grid.
 
         Returns ``(dirty_count, new_count)`` when anything was restored, else None.
+        ``show_progress`` paints a % bar for large cold recovers (Phase 2/3).
         """
         if self._current_date is None:
             return None
@@ -9193,6 +9767,44 @@ class DailyRegister(QWidget):
                 self._flush_local_draft()
             return None
 
+        # Pre-reconcile new rows so the progress total matches work done.
+        to_restore: list = []
+        if (
+            new_entries
+            and not self._merged_mode
+            and not self._parked_mode
+            and not self._skipped_mode
+        ):
+            known_ids = self._saved_client_row_ids()
+            saved_fps = self._saved_expense_fingerprint_counts()
+            reconcile_id = 0
+            reconcile_fp = 0
+            for entry in new_entries:
+                rid = entry_client_row_id(entry)
+                if rid and rid in known_ids:
+                    reconcile_id += 1
+                    continue
+                values = cells_from_json(entry.get("cells"))
+                fp = self._expense_fingerprint_from_cells(values)
+                if claim_fingerprint(saved_fps, fp):
+                    reconcile_fp += 1
+                    continue
+                to_restore.append((entry, values, rid))
+            if reconcile_id or reconcile_fp:
+                log_register_event(
+                    "draft_reconcile",
+                    skipped_by_id=reconcile_id,
+                    skipped_by_fingerprint=reconcile_fp,
+                    restored=len(to_restore),
+                    day=str(self._current_date or ""),
+                )
+
+        progress_total = len(dirty_entries) + len(to_restore)
+        progress_done = 0
+        use_progress = bool(show_progress and progress_total >= 20)
+        if use_progress:
+            self._tick_restore_progress(0, progress_total)
+
         self._restoring_draft = True
         self._bulk_mutating = True
         dirty_applied = 0
@@ -9218,7 +9830,10 @@ class DailyRegister(QWidget):
             for entry in dirty_entries:
                 tx_id = str(entry.get("tx_id") or "")
                 row = id_to_row.get(tx_id)
+                progress_done += 1
                 if row is None:
+                    if use_progress and progress_done % 25 == 0:
+                        self._tick_restore_progress(progress_done, progress_total)
                     continue
                 values = cells_from_json(entry.get("cells"))
                 truck_cells.extend(self._write_row_values(row, values))
@@ -9228,77 +9843,64 @@ class DailyRegister(QWidget):
                     if it is not None:
                         it.setBackground(QBrush(DIRTY_BG))
                 dirty_applied += 1
+                if use_progress and (
+                    dirty_applied == 1
+                    or dirty_applied % 25 == 0
+                    or progress_done >= progress_total
+                ):
+                    self._tick_restore_progress(progress_done, progress_total)
 
             # Never restore typed new rows onto Merged / Parked / Skipped.
-            # Prefer client_row_id match (Phase 1); fall back to content fingerprint
-            # (Phase 0) so legacy drafts without ids still cannot inflate totals.
-            if (
-                new_entries
-                and not self._merged_mode
-                and not self._parked_mode
-                and not self._skipped_mode
-            ):
-                known_ids = self._saved_client_row_ids()
-                saved_fps = self._saved_expense_fingerprint_counts()
-                to_restore: list = []
-                reconcile_id = 0
-                reconcile_fp = 0
-                for entry in new_entries:
-                    rid = entry_client_row_id(entry)
-                    if rid and rid in known_ids:
-                        reconcile_id += 1
+            if to_restore:
+                start = self._first_empty_editable_row()
+                needed = start + len(to_restore) - self._table.rowCount()
+                if needed > 0:
+                    self._append_editable_rows(needed + 5)
+                for offset, (entry, values, rid) in enumerate(to_restore):
+                    row = start + offset
+                    progress_done += 1
+                    if row < self._saved_count:
+                        if use_progress and progress_done % 25 == 0:
+                            self._tick_restore_progress(
+                                progress_done, progress_total
+                            )
                         continue
-                    values = cells_from_json(entry.get("cells"))
-                    fp = self._expense_fingerprint_from_cells(values)
-                    if claim_fingerprint(saved_fps, fp):
-                        reconcile_fp += 1
-                        continue
-                    to_restore.append((entry, values, rid))
-                if reconcile_id or reconcile_fp:
-                    log_register_event(
-                        "draft_reconcile",
-                        skipped_by_id=reconcile_id,
-                        skipped_by_fingerprint=reconcile_fp,
-                        restored=len(to_restore),
-                        day=str(self._current_date or ""),
+                    allow = (entry.get("allow_anyway") or "").strip()
+                    if allow:
+                        self._truck_allow_anyway[row] = allow
+                    truck_cells.extend(self._write_row_values(row, values))
+                    meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
+                    if rid:
+                        meta["client_row_id"] = rid
+                    elif not meta.get("client_row_id"):
+                        meta["client_row_id"] = new_client_row_id()
+                    raw_sync = (
+                        meta.get("sync_status") or entry.get("sync_status") or ""
                     )
-                if to_restore:
-                    start = self._first_empty_editable_row()
-                    needed = start + len(to_restore) - self._table.rowCount()
-                    if needed > 0:
-                        self._append_editable_rows(needed + 5)
-                    for offset, (entry, values, rid) in enumerate(to_restore):
-                        row = start + offset
-                        if row < self._saved_count:
-                            continue
-                        allow = (entry.get("allow_anyway") or "").strip()
-                        if allow:
-                            self._truck_allow_anyway[row] = allow
-                        truck_cells.extend(self._write_row_values(row, values))
-                        meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
-                        if rid:
-                            meta["client_row_id"] = rid
-                        elif not meta.get("client_row_id"):
-                            meta["client_row_id"] = new_client_row_id()
-                        raw_sync = (
-                            meta.get("sync_status") or entry.get("sync_status") or ""
-                        )
-                        raw_sync = str(raw_sync).strip().upper()
-                        if raw_sync in (SYNC_PENDING, SYNC_FAILED, SYNC_IN_FLIGHT):
-                            # Crash mid-flight → PENDING so reconnect can retry.
-                            meta["sync_status"] = normalize_sync_status(raw_sync)
-                        else:
-                            meta.pop("sync_status", None)
-                        self._pending_row_meta[row] = meta
-                        self._activate_row(row)
-                        self._sync_row_date(row)
-                        if meta.get("sync_status"):
-                            self._apply_row_sync_tint(row)
-                        new_applied += 1
+                    raw_sync = str(raw_sync).strip().upper()
+                    if raw_sync in (SYNC_PENDING, SYNC_FAILED, SYNC_IN_FLIGHT):
+                        # Crash mid-flight → PENDING so reconnect can retry.
+                        meta["sync_status"] = normalize_sync_status(raw_sync)
+                    else:
+                        meta.pop("sync_status", None)
+                    self._pending_row_meta[row] = meta
+                    self._activate_row(row)
+                    self._sync_row_date(row)
+                    if meta.get("sync_status"):
+                        self._apply_row_sync_tint(row)
+                    new_applied += 1
+                    if use_progress and (
+                        new_applied == 1
+                        or new_applied % 25 == 0
+                        or progress_done >= progress_total
+                    ):
+                        self._tick_restore_progress(progress_done, progress_total)
         finally:
             self._table.blockSignals(prev)
             self._bulk_mutating = False
             self._restoring_draft = False
+            if use_progress:
+                self._hide_register_loading()
 
         self._renumber()
         self._finalize_truck_cells(truck_cells)
@@ -9356,19 +9958,23 @@ class DailyRegister(QWidget):
 
     def _prompt_unsaved_work(self, message: str) -> str:
         """Return ``save``, ``discard``, or ``cancel`` for unsaved register work."""
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("Unsaved changes")
-        box.setText(message)
-        save_btn = box.addButton("Save as Draft", QMessageBox.AcceptRole)
-        discard_btn = box.addButton("Discard", QMessageBox.DestructiveRole)
-        cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
-        box.setDefaultButton(save_btn)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked == save_btn:
+        from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_choice
+
+        choice = ask_choice(
+            self,
+            title="Unsaved changes",
+            text=message,
+            actions=(
+                DialogAction("cancel", "Cancel", "cancel"),
+                DialogAction("discard", "Discard", "secondary"),
+                DialogAction("save", "Save as Draft", "primary"),
+            ),
+            badge="question",
+            default_action_id="save",
+        )
+        if choice == "save":
             return "save"
-        if clicked == discard_btn:
+        if choice == "discard":
             return "discard"
         return "cancel"
 
@@ -9417,18 +10023,18 @@ class DailyRegister(QWidget):
             return True
         self._flush_local_draft()
         if self._current_date is None:
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Warning)
-            box.setWindowTitle("Unsaved changes")
-            box.setText(
-                "You have unsaved entries but no Reconciled Date.\n\n"
-                "Set Reconciled Date to save as draft, or discard before leaving."
-            )
-            discard_btn = box.addButton("Discard", QMessageBox.DestructiveRole)
-            cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
-            box.setDefaultButton(cancel_btn)
-            box.exec()
-            if box.clickedButton() != discard_btn:
+            from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
+
+            if not ask_confirm(
+                self,
+                title="Unsaved changes",
+                heading="You have unsaved entries but no Reconciled Date.",
+                body="Set Reconciled Date to save as draft, or discard before leaving.",
+                accept_label="Discard",
+                cancel_label="Cancel",
+                destructive=True,
+                default_cancel=True,
+            ):
                 return False
             self._clear_local_draft()
             return True
@@ -9768,6 +10374,15 @@ class DailyRegister(QWidget):
                         existing=dupes[0],
                         date_label=format_new_date(tx.date),
                     ))
+
+            # Also flag identical drafts against earlier rows in this same save
+            # (DB soft-dup only sees already-persisted expenses).
+            duplicate_items.extend(
+                within_table_duplicate_items(
+                    draft_inserts,
+                    already_flagged_rows={item.row for item in duplicate_items},
+                )
+            )
 
             save_anyway: set[int] = set()
             save_anyway_match_by_id: dict = {}

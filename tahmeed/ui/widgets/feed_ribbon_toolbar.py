@@ -59,10 +59,13 @@ class FeedRibbonToolbar(QFrame):
         super().__init__(parent)
         self.setObjectName("feedRibbonToolbar")
         self.setFixedHeight(86)
+        # Transparent so the page-level circuit flows through continuously.
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
         self.setStyleSheet(
             f"""
             QFrame#feedRibbonToolbar {{
-                background: {_BG};
+                background: transparent;
                 border: 1px solid {_BORDER};
                 border-radius: 6px;
             }}

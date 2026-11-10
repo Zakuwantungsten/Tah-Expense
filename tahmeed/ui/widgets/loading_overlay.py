@@ -5,13 +5,20 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Qt, QEvent, QObject
+from PySide6.QtGui import QColor, QPainter, QPaintEvent
 from PySide6.QtWidgets import QFrame, QVBoxLayout, QWidget
 
 from tahmeed.ui.widgets.brand_loader import BrandLoaderPanel
 
 
 class LoadingOverlay(QFrame):
-    """Covers ``parent`` while async work is in progress."""
+    """Covers ``parent`` while async work is in progress.
+
+    Must stay an embedded child widget. On Windows, stylesheet ``rgba()``
+    backgrounds (and ``WA_TranslucentBackground``) promote a native HWND and
+    briefly flash a tiny top-level window with the app title + min/max/close.
+    The dim fill is therefore painted in ``paintEvent`` onto the parent surface.
+    """
 
     def __init__(
         self,
@@ -22,15 +29,10 @@ class LoadingOverlay(QFrame):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("loadingOverlay")
-        # Must remain an embedded child — never a top-level HWND flash.
-        self.setWindowFlags(Qt.Widget)
-        self.setAttribute(Qt.WA_TranslucentBackground, False)
-        self.setAttribute(Qt.WA_NativeWindow, False)
+        self._ensure_child_widget()
+        # No rgba()/translucent stylesheet — that is what flashed the HWND.
         self.setStyleSheet(
-            "QFrame#loadingOverlay {"
-            "  background: rgba(255, 255, 255, 0.55);"
-            "  border: none;"
-            "}"
+            "QFrame#loadingOverlay { background: transparent; border: none; }"
         )
         self.hide()
 
@@ -46,6 +48,12 @@ class LoadingOverlay(QFrame):
 
         parent.installEventFilter(self)
 
+    def _ensure_child_widget(self) -> None:
+        """Force embedded-child chrome — never a top-level title-bar window."""
+        self.setWindowFlags(Qt.Widget)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WA_NativeWindow, False)
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[name-defined]
         if watched is self.parentWidget() and event.type() == QEvent.Type.Resize:
             self._sync_geometry()
@@ -56,6 +64,12 @@ class LoadingOverlay(QFrame):
         if parent is not None:
             self.setGeometry(parent.rect())
 
+    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802
+        # Soft white veil without native translucency / layered HWND.
+        painter = QPainter(self)
+        painter.fillRect(event.rect(), QColor(255, 255, 255, 140))
+        painter.end()
+
     def show_loading(
         self,
         message: Optional[str] = None,
@@ -63,12 +77,21 @@ class LoadingOverlay(QFrame):
         value: Optional[int] = None,
         maximum: Optional[int] = None,
     ) -> None:
+        self._ensure_child_widget()
         if message:
             self._panel.set_message(message)
         self._panel.set_progress(value=value, maximum=maximum)
         self._sync_geometry()
         self.show()
         self.raise_()
+        # If Windows still promoted us, yank back under the parent immediately.
+        if self.isWindow() and self.parentWidget() is not None:
+            parent = self.parentWidget()
+            self.setParent(parent)
+            self._ensure_child_widget()
+            self._sync_geometry()
+            self.show()
+            self.raise_()
         self._panel.start()
         # Paint now without pumping the event queue: processEvents() here ran
         # queued timers re-entrantly (e.g. a modal truck dialog mid-navigation).

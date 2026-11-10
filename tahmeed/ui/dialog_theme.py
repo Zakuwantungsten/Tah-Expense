@@ -153,8 +153,35 @@ def apply_readable_dialog_styles(app: QApplication) -> None:
     app.setStyleSheet(existing + "\n" + _DIALOG_CONTRAST_SS)
 
 
+def _is_ok_only(buttons: QMessageBox.StandardButton) -> bool:
+    ok = QMessageBox.StandardButton.Ok
+    yes = QMessageBox.StandardButton.Yes
+    no = QMessageBox.StandardButton.No
+    cancel = QMessageBox.StandardButton.Cancel
+    discard = QMessageBox.StandardButton.Discard
+    abort = QMessageBox.StandardButton.Abort
+    retry = QMessageBox.StandardButton.Retry
+    ignore = QMessageBox.StandardButton.Ignore
+    close = QMessageBox.StandardButton.Close
+    extras = yes | no | cancel | discard | abort | retry | ignore | close
+    return bool(buttons & ok) and not bool(buttons & extras)
+
+
+def _fluent_alert(
+    parent: Optional[QWidget],
+    title: str,
+    text: str,
+    *,
+    level: str,
+) -> int:
+    from tahmeed.ui.dialogs.confirm_dialog import ask_alert
+
+    ask_alert(parent, title=title, text=text, level=level)  # type: ignore[arg-type]
+    return int(QMessageBox.StandardButton.Ok)
+
+
 def _patch_message_box_statics() -> None:
-    """Ensure ``QMessageBox.information`` and friends always style the box."""
+    """Route standard message boxes through Fluent chrome where possible."""
 
     def _information(
         parent: Optional[QWidget],
@@ -163,10 +190,11 @@ def _patch_message_box_statics() -> None:
         buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
         defaultButton: QMessageBox.StandardButton = QMessageBox.StandardButton.NoButton,
     ) -> int:
-        box = QMessageBox(QMessageBox.Icon.Information, title, text, buttons, parent)
-        if defaultButton != QMessageBox.StandardButton.NoButton:
-            box.setDefaultButton(defaultButton)
-        return _style_dialog_surface(box).exec()
+        if _is_ok_only(buttons):
+            return _fluent_alert(parent, title, text, level="info")
+        from tahmeed.ui.dialogs.confirm_dialog import ask_standard_question
+
+        return ask_standard_question(parent, title, text, buttons, defaultButton)
 
     def _warning(
         parent: Optional[QWidget],
@@ -194,6 +222,8 @@ def _patch_message_box_statics() -> None:
                 defaultButton,
                 destructive=True,
             )
+        if _is_ok_only(buttons):
+            return _fluent_alert(parent, title, text, level="warning")
         box = QMessageBox(QMessageBox.Icon.Warning, title, text, buttons, parent)
         if defaultButton != QMessageBox.StandardButton.NoButton:
             box.setDefaultButton(defaultButton)
@@ -206,10 +236,13 @@ def _patch_message_box_statics() -> None:
         buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
         defaultButton: QMessageBox.StandardButton = QMessageBox.StandardButton.NoButton,
     ) -> int:
-        box = QMessageBox(QMessageBox.Icon.Critical, title, text, buttons, parent)
-        if defaultButton != QMessageBox.StandardButton.NoButton:
-            box.setDefaultButton(defaultButton)
-        return _style_dialog_surface(box).exec()
+        if _is_ok_only(buttons):
+            return _fluent_alert(parent, title, text, level="error")
+        from tahmeed.ui.dialogs.confirm_dialog import ask_standard_question
+
+        return ask_standard_question(
+            parent, title, text, buttons, defaultButton, destructive=True
+        )
 
     def _question(
         parent: Optional[QWidget],
@@ -265,7 +298,37 @@ def show_message(
     buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
     default_button: Optional[QMessageBox.StandardButton] = None,
 ) -> int:
-    """Show a contrast-safe message box and return the clicked button."""
+    """Show a Fluent (or contrast-safe) message box and return the clicked button."""
+    if _is_ok_only(buttons):
+        level = "info"
+        if icon == QMessageBox.Icon.Warning:
+            level = "warning"
+        elif icon == QMessageBox.Icon.Critical:
+            level = "error"
+        elif icon == QMessageBox.Icon.Question:
+            level = "question"
+        return _fluent_alert(parent, title, text, level=level)
+
+    yes = QMessageBox.StandardButton.Yes
+    no = QMessageBox.StandardButton.No
+    cancel = QMessageBox.StandardButton.Cancel
+    discard = QMessageBox.StandardButton.Discard
+    confirm_set = (
+        (bool(buttons & yes) and bool(buttons & (no | cancel)))
+        or (bool(buttons & discard) and bool(buttons & cancel))
+    )
+    if confirm_set:
+        from tahmeed.ui.dialogs.confirm_dialog import ask_standard_question
+
+        return ask_standard_question(
+            parent,
+            title,
+            text,
+            buttons,
+            default_button or QMessageBox.StandardButton.NoButton,
+            destructive=(icon in (QMessageBox.Icon.Warning, QMessageBox.Icon.Critical)),
+        )
+
     box = QMessageBox(icon, title, text, buttons, parent)
     if default_button is not None:
         box.setDefaultButton(default_button)
@@ -273,15 +336,15 @@ def show_message(
 
 
 def show_warning(parent: Optional[QWidget], title: str, text: str) -> int:
-    return show_message(parent, title, text, icon=QMessageBox.Icon.Warning)
+    return _fluent_alert(parent, title, text, level="warning")
 
 
 def show_info(parent: Optional[QWidget], title: str, text: str) -> int:
-    return show_message(parent, title, text, icon=QMessageBox.Icon.Information)
+    return _fluent_alert(parent, title, text, level="info")
 
 
 def show_critical(parent: Optional[QWidget], title: str, text: str) -> int:
-    return show_message(parent, title, text, icon=QMessageBox.Icon.Critical)
+    return _fluent_alert(parent, title, text, level="error")
 
 
 def show_question(

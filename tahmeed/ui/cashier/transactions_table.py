@@ -238,7 +238,11 @@ class TransactionBrowser(QWidget):
         can_manage_uploads: bool = True,
     ):
         super().__init__(parent)
-        self.setStyleSheet("QWidget { background: #ffffff; }")
+        self.setObjectName("transactionBrowser")
+        # Scoped root fill — do not force every descendant QWidget opaque.
+        self.setStyleSheet(
+            "QWidget#transactionBrowser { background: transparent; }"
+        )
         self._user = user
         # True (accountant): delete any upload. False (cashier): delete own only.
         self._can_manage_uploads = bool(can_manage_uploads)
@@ -300,8 +304,10 @@ class TransactionBrowser(QWidget):
     def _build_filter_panel(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("filterPanel")
+        panel.setAttribute(Qt.WA_StyledBackground, False)
+        panel.setAutoFillBackground(False)
         panel.setStyleSheet(
-            "QWidget#filterPanel{background:#f9fafb;border-bottom:1px solid #e5e7eb;}"
+            "QWidget#filterPanel{background:transparent;border-bottom:1px solid #e5e7eb;}"
         )
         vl = QVBoxLayout(panel)
         vl.setContentsMargins(16, 8, 16, 8)
@@ -602,7 +608,9 @@ class TransactionBrowser(QWidget):
     def _build_table_stack(self) -> QWidget:
         wrap = QWidget()
         wrap.setObjectName("browserTableWrap")
-        wrap.setStyleSheet("QWidget#browserTableWrap{background:#ffffff;}")
+        wrap.setAttribute(Qt.WA_StyledBackground, False)
+        wrap.setAutoFillBackground(False)
+        wrap.setStyleSheet("QWidget#browserTableWrap{background:transparent;}")
         lay = QVBoxLayout(wrap)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)

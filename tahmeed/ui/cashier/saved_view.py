@@ -33,6 +33,7 @@ from tahmeed.ui.accountant.separate_expenses import (
 )
 from tahmeed.ui.cashier.draft_submit import submit_draft_day_with_gates
 from tahmeed.ui.cashier.register_delegates import _is_refund_float
+from tahmeed.ui.widgets.circuit_geometry import CircuitChromeFrame
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
@@ -301,8 +302,12 @@ class SavedView(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        header = QFrame()
-        header.setStyleSheet(f"background:{_WHITE};border-bottom:1px solid {_BORDER};")
+        header = CircuitChromeFrame(
+            "saved",
+            bg=_WHITE,
+            border=_BORDER,
+            object_name="savedHeader",
+        )
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 14, 20, 14)
         hl.setSpacing(12)
@@ -335,8 +340,12 @@ class SavedView(QWidget):
         hl.addWidget(self._btn_refresh)
         root.addWidget(header)
 
-        search_bar = QFrame()
-        search_bar.setStyleSheet(f"background:{_WHITE};border-bottom:1px solid {_BORDER};")
+        search_bar = CircuitChromeFrame(
+            "saved::search",
+            bg=_WHITE,
+            border=_BORDER,
+            object_name="savedSearchBar",
+        )
         sl = QHBoxLayout(search_bar)
         sl.setContentsMargins(20, 10, 20, 10)
         sl.setSpacing(10)
@@ -359,8 +368,13 @@ class SavedView(QWidget):
         sl.addWidget(self._hint, 1)
         root.addWidget(search_bar)
 
-        body = QFrame()
-        body.setStyleSheet(f"background:{_BG};")
+        body = CircuitChromeFrame(
+            "saved::body",
+            bg=_BG,
+            border=_BORDER,
+            border_bottom=False,
+            object_name="savedBody",
+        )
         body_vl = QVBoxLayout(body)
         body_vl.setContentsMargins(16, 16, 16, 16)
         body_vl.setSpacing(0)

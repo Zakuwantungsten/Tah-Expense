@@ -33,6 +33,7 @@ from PySide6.QtGui import QColor, QAction
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.app_state import app_state
+from tahmeed.ui.widgets.circuit_geometry import CircuitChromeFrame
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.widgets.split_export_button import make_export_menu_btn
 from tahmeed.ui.widgets.export_runner import (
@@ -381,9 +382,13 @@ class _MonthTabBar(QFrame):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("masterMonthTabBar")
         self.setFixedHeight(44)
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
         self.setStyleSheet(
-            f"QFrame {{ background: {_WHITE}; border-bottom: 1px solid {_BORDER}; }}"
+            "QFrame#masterMonthTabBar {"
+            f" background: transparent; border-bottom: 1px solid {_BORDER}; }}"
         )
         self._active_month = 0
         self._buttons: Dict[int, QPushButton] = {}
@@ -466,10 +471,14 @@ class _FilterBar(QFrame):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("masterFilterBar")
         self._sync_year = 0
         self._sync_month = 0
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
         self.setStyleSheet(
-            f"QFrame {{ background: {_WHITE}; border-bottom: 1px solid {_BORDER}; }}"
+            "QFrame#masterFilterBar {"
+            f" background: transparent; border-bottom: 1px solid {_BORDER}; }}"
         )
         self._build()
 
@@ -753,10 +762,12 @@ class MasterExpensesWidget(QWidget):
         root.setSpacing(0)
 
         # ── Title bar ────────────────────────────────────────────────────
-        title_bar = QFrame()
-        title_bar.setFixedHeight(52)
-        title_bar.setStyleSheet(
-            f"QFrame {{ background: {_WHITE}; border-bottom: 1px solid {_BORDER}; }}"
+        title_bar = CircuitChromeFrame(
+            "master_expenses",
+            bg=_WHITE,
+            border=_BORDER,
+            object_name="masterTitleBar",
+            fixed_height=52,
         )
         tb = QHBoxLayout(title_bar)
         tb.setContentsMargins(20, 0, 20, 0)

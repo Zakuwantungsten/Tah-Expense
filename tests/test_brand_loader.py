@@ -55,8 +55,11 @@ def test_mark_has_transparent_corners() -> None:
 
 
 def test_brand_loader_cycles_dots() -> None:
+    from PySide6.QtWidgets import QWidget
+
     _app()
-    panel = BrandLoaderPanel(None, "Loading items…")
+    host = QWidget()
+    panel = BrandLoaderPanel(host, "Loading items…")
     assert panel.base_message() == "Loading items"
     assert panel.display_text() == f"Loading items{DOT_CYCLE[0]}"
     panel._tick_dots()
@@ -66,11 +69,15 @@ def test_brand_loader_cycles_dots() -> None:
     panel._tick_dots()
     assert panel.display_text() == f"Loading items{DOT_CYCLE[0]}"
     panel.stop()
+    host.close()
 
 
 def test_brand_loader_progress_shows_percent() -> None:
+    from PySide6.QtWidgets import QWidget
+
     _app()
-    panel = BrandLoaderPanel(None, "Importing…", show_progress=True)
+    host = QWidget()
+    panel = BrandLoaderPanel(host, "Importing…", show_progress=True)
     # isHidden() is reliable before the widget is shown; isVisible() is not.
     assert not panel._bar.isHidden()
     panel.set_progress(value=0, maximum=100)
@@ -84,11 +91,15 @@ def test_brand_loader_progress_shows_percent() -> None:
     assert not panel._bar.isHidden()
     assert panel.percent_text() == ""
     panel.stop()
+    host.close()
 
 
 def test_brand_loader_fade_pulse_changes_opacity() -> None:
+    from PySide6.QtWidgets import QWidget
+
     _app()
-    panel = BrandLoaderPanel(None, "Loading…")
+    host = QWidget()
+    panel = BrandLoaderPanel(host, "Loading…")
     panel.start()
     before = panel.fade_opacity()
     for _ in range(12):
@@ -99,16 +110,22 @@ def test_brand_loader_fade_pulse_changes_opacity() -> None:
     panel.stop()
     assert panel.fade_opacity() == pytest.approx(1.0)
     assert panel._horse.graphicsEffect() is None
+    host.close()
 
 
 def test_loading_overlay_uses_brand_panel() -> None:
+    from PySide6.QtWidgets import QWidget
+
     _app()
-    host = BrandLoaderPanel(None)  # any QWidget host
+    # Must be a plain host — BrandLoaderPanel(None).show() is itself a tiny HWND.
+    host = QWidget()
+    host.resize(400, 300)
     host.show()
     overlay = LoadingOverlay(host, "Loading payees…")
     overlay.show_loading("Loading payees…")
     assert overlay._panel.base_message() == "Loading payees"
     assert overlay.isVisible()
+    assert not overlay.isWindow()
     # Overlay path: horse + message only — no progress chrome.
     assert overlay._panel._bar.isHidden()
     assert overlay._panel._pct.isHidden()
@@ -124,6 +141,7 @@ def test_brand_loader_opaque_for_dialogs() -> None:
     _app()
     dlg = QDialog()
     dlg.setWindowTitle("Importing Daily Register")
+    dlg.resize(440, 260)
     lay = QVBoxLayout(dlg)
     panel = BrandLoaderPanel(
         dlg, "Opening import date…", show_progress=True, opaque=True
@@ -132,6 +150,7 @@ def test_brand_loader_opaque_for_dialogs() -> None:
     panel.set_progress(value=20, maximum=100)
     dlg.show()
     assert panel._opaque is True
+    assert not panel.isWindow()
     assert not panel.testAttribute(Qt.WA_TranslucentBackground)
     assert not panel._horse.pixmap().isNull()
     assert not panel._bar.isHidden()
@@ -159,5 +178,28 @@ def test_brand_loader_and_overlay_never_use_translucent_hwnd() -> None:
     assert overlay._panel._horse.graphicsEffect() is None
     assert overlay._panel._bar.isHidden()
     assert overlay.parentWidget() is host
+    # Stylesheet rgba() used to promote a native HWND — keep paint-path veil.
+    assert "rgba(" not in (overlay.styleSheet() or "")
     overlay.hide_loading()
+    host.close()
+
+
+def test_upload_busy_sized_before_show() -> None:
+    """Busy dialog must not open as a tiny title-bar-only frame."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QWidget
+
+    from tahmeed.ui.widgets.upload_busy import UploadBusy
+
+    _app()
+    host = QWidget()
+    host.resize(640, 480)
+    host.show()
+    with UploadBusy(host, "Importing…", title="Upload") as busy:
+        dlg = busy._dlg
+        assert dlg.isVisible()
+        assert dlg.width() >= 420
+        assert dlg.height() >= 220
+        assert not dlg._panel.isWindow()
+        assert not dlg._panel.testAttribute(Qt.WA_TranslucentBackground)
     host.close()

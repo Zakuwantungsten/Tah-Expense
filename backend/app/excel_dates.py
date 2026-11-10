@@ -1,7 +1,15 @@
-"""Parse Excel / spreadsheet date cells into Python datetimes (Phase 8.1)."""
+"""Parse Excel / spreadsheet date cells into Python datetimes (Phase 8.1).
+
+Must stay in sync with ``tahmeed.services.excel_dates``. Feed imports store a
+BSON datetime on ``transaction_date`` / ``expense_date`` for sort and filter;
+display strings like ``"03 JUN 2026 12:12"`` must parse or those fields stay
+empty and Mongo string-sorts by day-of-month.
+"""
 
 from __future__ import annotations
 
+import calendar
+import re
 from datetime import date, datetime, timedelta
 from typing import Optional, Union
 
@@ -17,16 +25,55 @@ _DATE_FORMATS = (
     "%d/%m/%Y %H:%M",
     "%d/%m/%Y",
     "%d-%m-%Y %H:%M:%S",
+    "%d-%m-%Y %H:%M",
     "%d-%m-%Y",
+    "%d.%m.%Y %H:%M:%S",
+    "%d.%m.%Y %H:%M",
     "%d.%m.%Y",
     "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
     "%m/%d/%Y",
     "%d %b %Y %H:%M:%S",
+    "%d %b %Y %H:%M",
     "%d %b %Y",
+    "%d %B %Y %H:%M:%S",
+    "%d %B %Y %H:%M",
     "%d %B %Y",
+    "%d %b %y %H:%M:%S",
+    "%d %b %y %H:%M",
     "%d %b %y",
+    "%d %B %y %H:%M:%S",
+    "%d %B %y %H:%M",
+    "%d %B %y",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
     "%Y/%m/%d",
 )
+
+_FLEX_DATE = re.compile(
+    r"""
+    ^\s*
+    (?P<day>\d{1,2})
+    [/\-.\s]+
+    (?P<month>[A-Za-z]{3,9}|\d{1,2})
+    [/\-.\s]+
+    (?P<year>\d{2,4})
+    (?:[ T]+(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2}))?)?
+    \s*$
+    """,
+    re.VERBOSE,
+)
+
+_MONTH_NAME = {
+    name.lower(): index
+    for index, name in enumerate(calendar.month_name)
+    if name
+}
+_MONTH_ABBR = {
+    name.lower(): index
+    for index, name in enumerate(calendar.month_abbr)
+    if name
+}
 
 ScalarDate = Union[None, datetime, date, int, float, str]
 
@@ -41,6 +88,50 @@ def excel_serial_to_datetime(serial: float) -> Optional[datetime]:
     try:
         return _EXCEL_EPOCH + timedelta(days=n)
     except (OverflowError, ValueError, OSError):
+        return None
+
+
+def _month_number(token: str) -> Optional[int]:
+    raw = token.strip().lower()
+    if raw.isdigit():
+        month = int(raw)
+        return month if 1 <= month <= 12 else None
+    if raw in _MONTH_ABBR:
+        return _MONTH_ABBR[raw]
+    if raw in _MONTH_NAME:
+        return _MONTH_NAME[raw]
+    if len(raw) >= 3 and raw[:3] in _MONTH_ABBR:
+        return _MONTH_ABBR[raw[:3]]
+    return None
+
+
+def _year_number(token: str) -> Optional[int]:
+    try:
+        year = int(token)
+    except ValueError:
+        return None
+    if year < 100:
+        year += 2000 if year < 70 else 1900
+    if 1990 <= year <= 2100:
+        return year
+    return None
+
+
+def _parse_flex_date(text: str) -> Optional[datetime]:
+    match = _FLEX_DATE.match(text)
+    if not match:
+        return None
+    day = int(match.group("day"))
+    month = _month_number(match.group("month"))
+    year = _year_number(match.group("year"))
+    if month is None or year is None:
+        return None
+    hour = int(match.group("hour") or 0)
+    minute = int(match.group("minute") or 0)
+    second = int(match.group("second") or 0)
+    try:
+        return datetime(year, month, day, hour, minute, second)
+    except ValueError:
         return None
 
 
@@ -74,6 +165,10 @@ def parse_excel_date(val: ScalarDate) -> Optional[datetime]:
             except ValueError:
                 continue
 
+    flex = _parse_flex_date(s) or _parse_flex_date(titled)
+    if flex is not None:
+        return flex
+
     try:
         num = float(s.replace(",", ""))
     except ValueError:
@@ -104,6 +199,7 @@ def normalize_date_fields(
     *field_names: str,
     display_fmt: str = "%d %b %Y",
     store_as: str = "transaction_date",
+    rewrite_display: bool = True,
 ) -> Optional[datetime]:
     parsed: Optional[datetime] = None
     source_key: Optional[str] = None
@@ -130,6 +226,10 @@ def normalize_date_fields(
         return parse_excel_date(existing)
 
     doc[store_as] = parsed
-    if source_key is not None and not isinstance(doc.get(source_key), datetime):
+    if (
+        rewrite_display
+        and source_key is not None
+        and not isinstance(doc.get(source_key), datetime)
+    ):
         doc[source_key] = format_excel_date(parsed, display_fmt)
     return parsed

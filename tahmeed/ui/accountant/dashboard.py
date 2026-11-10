@@ -19,6 +19,7 @@ from tahmeed.ui.accountant.menu_bar import AccountantMenuBar
 from tahmeed.ui.accountant.sidebar import SidebarWidget
 from tahmeed.ui.accountant.title_bar import AccountantTitleBar
 from tahmeed.ui.accountant.overview import OverviewWidget
+from tahmeed.ui.widgets.circuit_geometry import wrap_circuit_page
 
 _APP_BG = "#F4F6F8"
 
@@ -59,6 +60,20 @@ _LAZY_PAGE_KEYS = frozenset({
     "manage_users",
     "table",
     "browse",
+})
+
+# Separate Expenses feeds: heavy first-build — show a loader shell first so
+# sidebar navigation never sits on the previous page with no feedback.
+_SEPARATE_EXPENSE_KEYS = frozenset({
+    "toll_plaza",
+    "parking_congo",
+    "congo_exp",
+    "ahmed_kimvi",
+    "zambia_parking",
+    "afritrack",
+    "third_party",
+    "comesa",
+    "rahntech",
 })
 
 # Long-poll wait; reconnects immediately when system_counters change.
@@ -217,14 +232,101 @@ class AccountantDashboard(QWidget):
 
     # ── Lazy page factories ─────────────────────────────────────────────────
 
+    def _mount_page(self, key: str, widget: QWidget) -> QWidget:
+        """Wrap non-overview pages in the seeded circuit canvas host."""
+        return wrap_circuit_page(widget, seed=key, bg=_APP_BG)
+
     def _ensure_page(self, key: str) -> QWidget:
         """Create and cache a dedicated page the first time it is opened."""
         if key in self._pages:
             return self._pages[key]
-        widget = self._create_page(key)
+        widget = self._mount_page(key, self._create_page(key))
         self._page_indices[key] = self._stack.addWidget(widget)
         self._pages[key] = widget
         return widget
+
+    def _activate_page(self, key: str) -> QWidget:
+        """Show a cached page by widget identity — stack indices shift when shells are removed."""
+        widget = self._pages[key]
+        self._stack.setCurrentWidget(widget)
+        self._page_indices[key] = self._stack.indexOf(widget)
+        return widget
+
+    def _open_separate_expense_first(self, key: str) -> None:
+        """Switch to a loader shell now; build the real feed page on next tick."""
+        from tahmeed.ui.async_utils import schedule_call
+        from tahmeed.ui.widgets.loading_overlay import show_widget_loading
+
+        if key in self._pages:
+            widget = self._activate_page(key)
+            refresh = getattr(widget, "refresh", None)
+            if callable(refresh):
+                schedule_call(refresh)
+            return
+
+        # Re-show the existing Opening… shell if this feed is already building.
+        opening = getattr(self, "_separate_expense_opening", None)
+        if opening is None:
+            self._separate_expense_opening = {}
+            opening = self._separate_expense_opening
+        pending = opening.get(key)
+        if pending is not None:
+            idx = self._stack.indexOf(pending)
+            if idx >= 0:
+                self._stack.setCurrentIndex(idx)
+                return
+            opening.pop(key, None)
+
+        host = QWidget()
+        host.setObjectName("separateExpenseOpening")
+        host.setStyleSheet("background:#F4F6F8;")
+        show_widget_loading(host, "Opening…")
+        opening[key] = host
+        opening_idx = self._stack.addWidget(host)
+        self._stack.setCurrentIndex(opening_idx)
+
+        def _build_and_swap(k: str = key, placeholder: QWidget = host) -> None:
+            try:
+                if k not in self._pages:
+                    widget = self._mount_page(k, self._create_page(k))
+                    # Replace Opening… in-place. addWidget+removeWidget left a hole and
+                    # shifted every later stack index, so going back showed the wrong page.
+                    ph_idx = self._stack.indexOf(placeholder)
+                    if ph_idx >= 0:
+                        self._stack.insertWidget(ph_idx, widget)
+                        self._page_indices[k] = ph_idx
+                    else:
+                        self._page_indices[k] = self._stack.addWidget(widget)
+                    self._pages[k] = widget
+                else:
+                    widget = self._pages[k]
+                # Stale first-open must not steal the stack after the user left.
+                if getattr(self, "_nav_key", None) == k:
+                    self._activate_page(k)
+                    refresh = getattr(widget, "refresh", None)
+                    if callable(refresh):
+                        schedule_call(refresh)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Unable to open page",
+                    f"Failed to open this page:\n{exc}",
+                )
+            finally:
+                opening.pop(k, None)
+                try:
+                    self._stack.removeWidget(placeholder)
+                    placeholder.deleteLater()
+                except RuntimeError:
+                    pass
+                # Keep cached indices honest if anything else shifted.
+                for pk, pw in self._pages.items():
+                    ix = self._stack.indexOf(pw)
+                    if ix >= 0:
+                        self._page_indices[pk] = ix
+
+        # Always defer one tick so the Opening… shell paints before __init__.
+        QTimer.singleShot(0, _build_and_swap)
 
     def _create_page(self, key: str) -> QWidget:
         # Imports are deferred so login does not pay for every heavy module.
@@ -959,10 +1061,21 @@ class AccountantDashboard(QWidget):
         if key in _LAZY_PAGE_KEYS:
             from tahmeed.ui.async_utils import in_running_task
 
+            # First Separate Expenses open: paint a loader shell immediately,
+            # then build the real page on the next tick (avoids "dead" nav).
+            if key in _SEPARATE_EXPENSE_KEYS and key not in self._pages:
+                self._open_separate_expense_first(key)
+                return
+
             def _open_lazy(k: str = key) -> None:
                 try:
+                    # Deferred opens must not override a newer sidebar click.
+                    if getattr(self, "_nav_key", None) != k:
+                        if k not in self._pages:
+                            self._ensure_page(k)
+                        return
                     widget = self._ensure_page(k)
-                    self._stack.setCurrentIndex(self._page_indices[k])
+                    self._activate_page(k)
                     if k == "table":
                         assert self._register is not None
                         self._register.reload_settings()
@@ -1089,7 +1202,10 @@ class AccountantDashboard(QWidget):
                 self._stack.setCurrentIndex(self._placeholder_index)
                 return
             title, icon, label = d
-            widget = CategoryTableWidget(category_name=title, title=label, icon_name=icon)
+            widget = self._mount_page(
+                key,
+                CategoryTableWidget(category_name=title, title=label, icon_name=icon),
+            )
             self._category_indices[key] = self._stack.addWidget(widget)
         idx = self._category_indices[key]
         self._stack.setCurrentIndex(idx)
@@ -1102,7 +1218,8 @@ class AccountantDashboard(QWidget):
             from tahmeed.ui.accountant.reconciliation import (
                 RPAScheduleWidget, BondsWidget,
             )
-            widget = BondsWidget() if match == "bonds" else RPAScheduleWidget()
+            raw = BondsWidget() if match == "bonds" else RPAScheduleWidget()
+            widget = self._mount_page(f"sm_burhani::{match}", raw)
             self._recon_indices[match] = self._stack.addWidget(widget)
         idx = self._recon_indices[match]
         self._stack.setCurrentIndex(idx)
@@ -1121,11 +1238,14 @@ class AccountantDashboard(QWidget):
             d = self._sidebar.item_def(parent_key)
             icon = d[1] if d else "mdi.tag-outline"
             parent_label = d[2] if d else parent_category
-            widget = CategoryTableWidget(
-                category_name=parent_category,
-                title=f"{parent_label} · {name}",
-                icon_name=icon,
-                description_filter=match or name,
+            widget = self._mount_page(
+                cache_key,
+                CategoryTableWidget(
+                    category_name=parent_category,
+                    title=f"{parent_label} · {name}",
+                    icon_name=icon,
+                    description_filter=match or name,
+                ),
             )
             self._subtable_indices[cache_key] = self._stack.addWidget(widget)
         idx = self._subtable_indices[cache_key]

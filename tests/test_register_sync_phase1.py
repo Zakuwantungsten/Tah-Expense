@@ -268,3 +268,78 @@ def test_duplicate_dialog_keep_for_later_api(qapp):
     assert dlg.kept_for_later() is True
     assert dlg.save_anyway_rows() == set()
     assert dlg.deferred_duplicate_rows() == {2}
+
+
+@pytest.mark.asyncio
+async def test_within_table_duplicates_open_review_dialog(
+    register, monkeypatch
+):
+    """Identical new drafts (no DB hit) still open Possible duplicates."""
+    from tahmeed.ui.cashier.register_delegates import (
+        COL_DESC, COL_ITEM, COL_TZS, COL_TRUCK,
+    )
+    from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
+
+    register._table.blockSignals(True)
+    try:
+        for row in (0, 1):
+            register._put(row, COL_ITEM, "MILEAGE MBALA")
+            register._put(row, COL_DESC, "T849 EKS")
+            register._put(row, COL_TZS, "(300,000.00)")
+            register._put(row, COL_TRUCK, "")
+    finally:
+        register._table.blockSignals(False)
+
+    monkeypatch.setattr(register, "_api_is_online", lambda: True)
+    monkeypatch.setattr(register, "_rows_missing_required_truck", lambda: [])
+
+    async def fake_next_day_order(_d):
+        return 1
+
+    async def fake_dup_bulk(candidates, *_a, **_k):
+        # No already-saved matches — within-table check must still fire.
+        return [[] for _ in candidates]
+
+    async def inline_await_ui(fn):
+        # pytest-asyncio does not pump Qt; skip QTimer.singleShot.
+        return fn()
+
+    seen_labels: list[str] = []
+
+    class _KeepDlg(DuplicateReviewDialog):
+        def __init__(self, items, *a, **k):
+            super().__init__(items, *a, **k)
+            seen_labels.extend(item.existing_label for item in items)
+
+        def exec(self):  # noqa: A003
+            self._accept_keep_for_later()
+            return QDialog.Accepted
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.next_day_order",
+        fake_next_day_order,
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.check_for_duplicates_bulk",
+        fake_dup_bulk,
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.DuplicateReviewDialog",
+        _KeepDlg,
+    )
+    monkeypatch.setattr(
+        "tahmeed.ui.widgets.export_runner.await_ui",
+        inline_await_ui,
+    )
+
+    meta: dict = {}
+    ok = await register._do_save_body(meta)
+    assert ok is True
+    assert seen_labels == ["Same table"]
+    assert meta.get("deferred_dups") == 1
+    # First occurrence stays on My (queued/saved); later twin moves to Skipped.
+    assert "T849 EKS" in [
+        (register._table.item(r, COL_DESC).text() if register._table.item(r, COL_DESC) else "")
+        for r in range(register._table.rowCount())
+    ]
+    assert len(register._local_skipped) == 1

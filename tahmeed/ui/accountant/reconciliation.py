@@ -47,6 +47,7 @@ from tahmeed.ui.accountant.separate_expenses import (
 )
 from tahmeed.models.reconciliation import ReconciliationEntry
 from tahmeed.services import reconciliation_service as recon_svc
+from tahmeed.services.excel_dates import parse_excel_date
 from tahmeed.ui.dialog_theme import show_question
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
@@ -224,16 +225,7 @@ def _to_int(v) -> Optional[int]:
 
 
 def _to_dt(v) -> Optional[datetime]:
-    if isinstance(v, datetime):
-        return v
-    if v in (None, ""):
-        return None
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%b-%Y", "%d %b %Y"):
-        try:
-            return datetime.strptime(str(v).strip()[:19], fmt)
-        except ValueError:
-            continue
-    return None
+    return parse_excel_date(v)
 
 
 def _cell_at(row: tuple, idx: Optional[int]) -> object:

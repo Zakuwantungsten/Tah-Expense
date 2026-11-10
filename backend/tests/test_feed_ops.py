@@ -99,6 +99,14 @@ def test_ledger_sort_remaps_display_date_fields() -> None:
         "expense_date",
         -1,
     )
+    allowed_gate = frozenset({"gate_in", "gate_in_dt", "valid_from", "valid_from_dt"})
+    assert ledger_sort_clauses("gate_in", True, allowed_gate, default="gate_in_dt")[0] == (
+        "gate_in_dt",
+        1,
+    )
+    assert ledger_sort_clauses(
+        "valid_from", False, allowed_gate, default="valid_from_dt"
+    )[0] == ("valid_from_dt", -1)
 
 
 def test_and_not_trashed_wraps_query() -> None:
@@ -134,6 +142,18 @@ def test_prepare_toll_doc_normalizes_date() -> None:
     assert doc["truck_sort_key"].startswith("1|") or doc["truck_sort_key"].startswith(
         "2|"
     )
+
+
+def test_prepare_toll_doc_parses_uppercase_time() -> None:
+    doc = prepare_imported_feed_doc(
+        {
+            "feed_type": "toll_plaza",
+            "toll_date": "03 JUN 2026 12:12",
+            "vehicle_reg": "T604 EDD",
+        },
+        now=datetime(2026, 10, 9),
+    )
+    assert doc["transaction_date"] == datetime(2026, 6, 3, 12, 12)
 
 
 def test_prepare_parking_deposit_flags() -> None:

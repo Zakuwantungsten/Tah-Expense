@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Sequence, Set, Tuple
 
 from tahmeed.models.transaction import Transaction
+
+# Soft-dup identity: same fields the DB check uses (truck, amount, item, description).
+SoftDupKey = Tuple[str, float, str, str]
 
 
 @dataclass
@@ -22,6 +25,88 @@ class DuplicateReviewItem:
     amount_label: str
     existing: Transaction
     date_label: str = ""
+    # Cream-row badge in the dialog — "Existing" (DB) or "Same table".
+    existing_label: str = "Existing"
+
+
+def soft_dup_key(
+    *,
+    truck_number: str = "",
+    amount: float = 0.0,
+    item: str = "",
+    description: str = "",
+) -> SoftDupKey:
+    """Case-insensitive soft-dup fingerprint (truck + amount + item + description)."""
+    try:
+        amt = float(amount or 0.0)
+    except (TypeError, ValueError):
+        amt = 0.0
+    return (
+        (truck_number or "").strip().casefold(),
+        amt,
+        (item or "").strip().casefold(),
+        (description or "").strip().casefold(),
+    )
+
+
+def soft_dup_key_for_tx(tx: Transaction) -> SoftDupKey:
+    return soft_dup_key(
+        truck_number=tx.truck_number or "",
+        amount=tx.amount,
+        item=tx.item or "",
+        description=tx.description or "",
+    )
+
+
+def soft_dup_key_is_meaningful(key: SoftDupKey) -> bool:
+    """Skip empty twin drafts — need description or item (or truck + amount)."""
+    truck, amount, item, description = key
+    if description or item:
+        return True
+    return bool(truck) and amount != 0.0
+
+
+def within_table_duplicate_items(
+    draft_inserts: Sequence[tuple[int, Transaction]],
+    *,
+    already_flagged_rows: Optional[Set[int]] = None,
+) -> List[DuplicateReviewItem]:
+    """Flag later draft rows that match an earlier draft in the same save.
+
+    The first occurrence of each soft-dup key is treated as the original; later
+    identical rows become review items (cream row = that earlier draft). Rows
+    already flagged by the DB soft-dup scan are left alone.
+    """
+    flagged = set(already_flagged_rows or ())
+    first_by_key: dict[SoftDupKey, tuple[int, Transaction]] = {}
+    items: List[DuplicateReviewItem] = []
+
+    for row, tx in draft_inserts:
+        key = soft_dup_key_for_tx(tx)
+        if not soft_dup_key_is_meaningful(key):
+            continue
+        prior = first_by_key.get(key)
+        if prior is None:
+            first_by_key[key] = (row, tx)
+            continue
+        if row in flagged:
+            continue
+        _prior_row, prior_tx = prior
+        items.append(
+            DuplicateReviewItem(
+                row=row,
+                row_display=row + 1,
+                description=tx.description or "—",
+                truck_number=tx.truck_number or "",
+                item=tx.item or "",
+                amount=float(tx.amount or 0.0),
+                amount_label=format_amount_label(tx),
+                existing=prior_tx,
+                date_label=format_new_date(tx.date),
+                existing_label="Same table",
+            )
+        )
+    return items
 
 
 def format_amount_label(tx: Transaction) -> str:

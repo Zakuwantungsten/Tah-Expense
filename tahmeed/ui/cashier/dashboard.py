@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QDateEdit,
 )
 from PySide6.QtCore import Qt, Signal, QDate, QSize, QTimer
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QFont, QFontMetrics, QKeySequence, QShortcut
 
 from tahmeed.config import APP_NAME, APP_VERSION, COMPANY_NAME
 from tahmeed.models.user import User
@@ -45,6 +45,7 @@ from tahmeed.ui.cashier.drafts_view import DraftsView, fetch_draft_badge_count
 from tahmeed.ui.cashier.saved_view import SavedView
 from tahmeed.ui.cashier.day_issues import DayIssuesWidget
 from tahmeed.ui.cashier.trash import CashierTrashWidget
+from tahmeed.ui.widgets.circuit_geometry import wrap_circuit_page
 
 _APP_BG = "#F4F6F8"
 _BORDER = "#E5E7EB"
@@ -577,12 +578,15 @@ class _ModeTab(QFrame):
         )
         chip_hl.addWidget(self._label, 0, Qt.AlignVCenter)
 
-        self._badge = QLabel("0")
+        self._badge = QLabel("")
         self._badge.setAlignment(Qt.AlignCenter)
         self._badge.setFixedHeight(_TAB_BADGE_H)
-        self._badge.setMinimumWidth(_TAB_BADGE_H)
-        self._badge.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        # Fixed: Preferred/Maximum + sizeHint/adjustSize was letting this pill
+        # absorb leftover bar width after import (empty gray sausage).
+        self._badge.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._badge.setFixedWidth(_TAB_BADGE_H)
         self._badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._badge.hide()
         chip_hl.addWidget(self._badge, 0, Qt.AlignVCenter)
 
         root.addWidget(self._chip, 0, Qt.AlignLeft)
@@ -610,18 +614,28 @@ class _ModeTab(QFrame):
         self._active = active
         self._apply_style()
 
+    @staticmethod
+    def _badge_text(count: int) -> str:
+        return f"{count:,}" if count < 1000 else "999+"
+
+    def _fit_badge_width(self, text: str) -> None:
+        """Size the count pill to the digits only — never to leftover bar width."""
+        font = QFont("Segoe UI", 10)
+        font.setBold(True)
+        # padding:0 5px on each side from the badge stylesheet
+        width = QFontMetrics(font).horizontalAdvance(text) + 12
+        self._badge.setFixedWidth(max(_TAB_BADGE_H, min(width, 48)))
+
     def set_count(self, count: int) -> None:
         self._count = max(0, int(count or 0))
         if self._count <= 0:
+            self._badge.clear()
             self._badge.hide()
+            self._badge.setFixedWidth(_TAB_BADGE_H)
         else:
-            self._badge.setText(
-                f"{self._count:,}" if self._count < 1000 else "999+"
-            )
-            self._badge.adjustSize()
-            self._badge.setMinimumWidth(
-                max(_TAB_BADGE_H, self._badge.sizeHint().width() + 2)
-            )
+            text = self._badge_text(self._count)
+            self._badge.setText(text)
+            self._fit_badge_width(text)
             self._badge.show()
         self._apply_style()
         self._sync_underline_width()
@@ -689,9 +703,12 @@ class _ActionBar(QFrame):
         super().__init__(parent)
         self.setObjectName("registerActionBar")
         self.setFixedHeight(52)
+        # Transparent — page-level circuit shows through (no local motif).
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
         self.setStyleSheet(
             "QFrame#registerActionBar {"
-            f"  background: {_WHITE}; border-bottom: 1px solid {_BORDER};"
+            f"  background: transparent; border-bottom: 1px solid {_BORDER};"
             "}"
         )
 
@@ -914,8 +931,35 @@ class _ActionBar(QFrame):
     def set_merged_count(self, count: int) -> None:
         self._merged_btn.set_count(count)
 
+    def set_register_status(self, draft_count: int, submitted_count: int) -> None:
+        """Quiet draft/submitted hint next to mode tabs (replaces old doc-header badge)."""
+        if getattr(self, "_edit_active", False):
+            return
+        parts = []
+        if draft_count:
+            parts.append(f"{draft_count} draft")
+        if submitted_count:
+            parts.append(f"{submitted_count} submitted")
+        if parts:
+            self._status.setText(" · ".join(parts))
+            self._status.setStyleSheet(
+                "QLabel{background:transparent;color:#B45309;border:1px solid #FCD34D;"
+                "border-radius:5px;padding:2px 10px;font-size:10px;font-weight:700;"
+                "font-family:'Segoe UI',sans-serif;}"
+            )
+            self._status.show()
+        else:
+            # Don't hide if a transient flash is showing
+            if self._status.isVisible() and self._status.text().startswith("Edit mode"):
+                return
+            timer = getattr(self, "_transient_timer", None)
+            if timer is not None and timer.isActive():
+                return
+            self._status.hide()
+
     def set_edit_state(self, active: bool, dirty_count: int = 0) -> None:
         """Show edit-mode status pill next to search."""
+        self._edit_active = bool(active)
         self._clear_transient_status()
         if active:
             plural = "" if dirty_count == 1 else "s"
@@ -962,7 +1006,7 @@ class _ActionBar(QFrame):
 
 
 class _TablePage(QWidget):
-    """QB icon toolbar → Daily Register totals → My/Merged/Search/Cheque → grid."""
+    """Register ribbon → My/Parked/Search/Cheque → grid (totals in grid footer)."""
 
     def __init__(self, register: DailyRegister, parent=None):
         super().__init__(parent)
@@ -970,12 +1014,8 @@ class _TablePage(QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(0)
 
-        self._doc_header = _QBDocHeader()
-        register.stats_updated.connect(self._doc_header.update_stats)
-        register.register_status_updated.connect(self._doc_header.set_register_status)
-
-        from tahmeed.ui.widgets.qb_txn_toolbar import QbTxnToolbar
-        self._qb_toolbar = QbTxnToolbar(register_actions=True)
+        from tahmeed.ui.widgets.register_ribbon_toolbar import RegisterRibbonToolbar
+        self._qb_toolbar = RegisterRibbonToolbar()
         self._qb_toolbar.undo_clicked.connect(register.toolbar_undo)
         self._qb_toolbar.redo_clicked.connect(register.toolbar_redo)
         self._qb_toolbar.find_prev.connect(lambda: register.toolbar_find(-1))
@@ -1043,11 +1083,7 @@ class _TablePage(QWidget):
         register.edit_state_changed.connect(self._action_bar.set_edit_state)
         register.transient_status.connect(self._action_bar.flash_transient_status)
         register.mode_changed.connect(self._action_bar.sync_mode)
-        register.mode_changed.connect(
-            lambda mode: self._doc_header.set_merged(
-                mode == "merged" if isinstance(mode, str) else bool(mode)
-            )
-        )
+        register.register_status_updated.connect(self._action_bar.set_register_status)
         register.stats_updated.connect(self._sync_mode_tab_counts)
         register.parked_count_changed.connect(self._action_bar.set_parked_count)
         register.parked_count_changed.connect(self._qb_toolbar.set_parked_count)
@@ -1068,11 +1104,8 @@ class _TablePage(QWidget):
         register.stats_updated.connect(self._sync_reconciled_date)
         self._action_bar.set_reconciled_date(register.current_date())
 
-        # 1) Icon toolbar (incl. Export/Import/Today/Edit/Submit)
-        # 2) Daily Register + totals
-        # 3) My/Merged + Search  ···  Reconciled Date / Cheque
+        # 1) Excel-style ribbon  2) Search / mode tabs  3) Grid (+ footer totals)
         vl.addWidget(self._qb_toolbar)
-        vl.addWidget(self._doc_header)
         vl.addWidget(self._action_bar)
         vl.addWidget(register, 1)
 
@@ -1111,7 +1144,7 @@ class _TablePage(QWidget):
             self._action_bar.set_reconciled_date(self._register.current_date())
 
     def set_chrome_maximized(self, maximized: bool) -> None:
-        """Show toolbar labels only when the host window is maximized."""
+        """Ribbon keeps labels; overflow handles narrow widths (sidebar open)."""
         self._qb_toolbar.set_compact(not bool(maximized))
 
 
@@ -1131,6 +1164,10 @@ class CashierDashboard(QWidget):
         self._build_ui()
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._load_categories())
+
+    def _mount_page(self, key: str, widget: QWidget) -> QWidget:
+        """Wrap non-overview pages in the seeded circuit canvas host."""
+        return wrap_circuit_page(widget, seed=key, bg=_APP_BG)
 
     def _build_ui(self) -> None:
         self.setObjectName("cashierDashboard")
@@ -1201,26 +1238,26 @@ class CashierDashboard(QWidget):
             f"QStackedWidget#contentStack {{ background: {_APP_BG}; }}"
         )
 
-        # index 0 — Overview
+        # index 0 — Overview (keeps its own lattice; do not wrap)
         self._overview = CashierOverview(user=self._user)
         self._stack.addWidget(self._overview)
 
         # index 1 — Table (action bar + DailyRegister)
         self._register = DailyRegister(user=self._user, categories=[])
         self._table_page = _TablePage(self._register)
-        self._stack.addWidget(self._table_page)
+        self._stack.addWidget(self._mount_page("table", self._table_page))
 
         # index 2 — Entry Form
         self._form = EntryForm(user=self._user)
-        self._stack.addWidget(self._form)
+        self._stack.addWidget(self._mount_page("form", self._form))
 
         # index 3 — Drafts inbox
         self._drafts_view = DraftsView(user=self._user, show_all_cashiers=False)
-        self._stack.addWidget(self._drafts_view)
+        self._stack.addWidget(self._mount_page("drafts", self._drafts_view))
 
         # index 4 — Saved (flat saved-but-not-submitted list)
         self._saved_view = SavedView(user=self._user, show_all_cashiers=False)
-        self._stack.addWidget(self._saved_view)
+        self._stack.addWidget(self._mount_page("saved", self._saved_view))
 
         # index 5 — Day Issues
         self._day_issues = DayIssuesWidget(
@@ -1235,11 +1272,11 @@ class CashierDashboard(QWidget):
             self._register.set_auto_fill_from_maps
         )
         # Badge updates via issues_changed after map; do not re-collect.
-        self._stack.addWidget(self._day_issues)
+        self._stack.addWidget(self._mount_page("day_issues", self._day_issues))
 
         # index 6 — Rejected entries
         self._rejected_view = RejectedView(user=self._user)
-        self._stack.addWidget(self._rejected_view)
+        self._stack.addWidget(self._mount_page("rejected", self._rejected_view))
 
         # index 7 — Browse (embedded)
         self._browser = TransactionBrowser(
@@ -1248,7 +1285,7 @@ class CashierDashboard(QWidget):
         )
         self._browser.go_to_date.connect(self._on_go_to_date)
         self._browser.go_to_upload.connect(self._on_go_to_upload)
-        self._stack.addWidget(self._browser)
+        self._stack.addWidget(self._mount_page("browse", self._browser))
 
         # index 8 — Trash (own soft-trash + accountant-confirmed)
         self._trash_view = CashierTrashWidget(user=self._user)
@@ -1256,7 +1293,7 @@ class CashierDashboard(QWidget):
         self._trash_view.open_register_after_restore.connect(
             self._on_trash_open_register
         )
-        self._stack.addWidget(self._trash_view)
+        self._stack.addWidget(self._mount_page("trash", self._trash_view))
 
         self._stack.setCurrentIndex(0)
         body_hl.addWidget(self._stack, 1)
@@ -1451,12 +1488,15 @@ class CashierDashboard(QWidget):
             if d is None:
                 return
             name, icon, label = d
-            widget = CashierCategoryView(
-                user=self._user,
-                category_key=key,
-                category_name=name,
-                icon_name=icon,
-                title=label,
+            widget = self._mount_page(
+                key,
+                CashierCategoryView(
+                    user=self._user,
+                    category_key=key,
+                    category_name=name,
+                    icon_name=icon,
+                    title=label,
+                ),
             )
             self._category_indices[key] = self._stack.addWidget(widget)
         idx = self._category_indices[key]

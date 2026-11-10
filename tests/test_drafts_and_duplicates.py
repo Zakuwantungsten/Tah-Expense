@@ -13,6 +13,9 @@ from tahmeed.services.duplicate_review import (
     format_existing_date,
     format_new_date,
     rows_to_save_with_duplicate_flags,
+    soft_dup_key,
+    soft_dup_key_is_meaningful,
+    within_table_duplicate_items,
 )
 from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
 
@@ -121,3 +124,77 @@ def test_duplicate_review_dialog_reimport_hint_when_most_rows_match():
         )
     dlg = DuplicateReviewDialog(items, dup_days=5, pending_total=4)
     assert dlg._looks_like_reimport() is True
+
+
+def _tx(**kwargs) -> Transaction:
+    base = dict(
+        date=datetime(2026, 6, 11),
+        description="T849 EKS",
+        truck_number="",
+        amount=-300000.0,
+        item="MILEAGE MBALA",
+    )
+    base.update(kwargs)
+    return Transaction(**base)
+
+
+def test_soft_dup_key_normalizes_case_and_whitespace():
+    a = soft_dup_key(
+        truck_number=" t101 aaa ",
+        amount=-300000,
+        item="Mileage Mbala",
+        description="T849 EKS",
+    )
+    b = soft_dup_key(
+        truck_number="T101 AAA",
+        amount=-300000.0,
+        item="MILEAGE MBALA",
+        description="t849 eks",
+    )
+    assert a == b
+    assert soft_dup_key_is_meaningful(a) is True
+
+
+def test_soft_dup_key_blank_twins_not_meaningful():
+    key = soft_dup_key(truck_number="", amount=0.0, item="", description="")
+    assert soft_dup_key_is_meaningful(key) is False
+
+
+def test_within_table_duplicate_items_flags_later_identical_rows():
+    first = _tx()
+    second = _tx()
+    third = _tx(description="OTHER")
+    items = within_table_duplicate_items(
+        [(0, first), (1, second), (2, third)]
+    )
+    assert len(items) == 1
+    assert items[0].row == 1
+    assert items[0].existing is first
+    assert items[0].existing_label == "Same table"
+
+
+def test_within_table_duplicate_items_skips_already_flagged_rows():
+    first = _tx()
+    second = _tx()
+    items = within_table_duplicate_items(
+        [(0, first), (1, second)],
+        already_flagged_rows={1},
+    )
+    assert items == []
+
+
+def test_within_table_no_truck_still_matches_on_desc_item_amount():
+    a = _tx(truck_number="")
+    b = _tx(truck_number="")
+    items = within_table_duplicate_items([(3, a), (5, b)])
+    assert len(items) == 1
+    assert items[0].row == 5
+    assert items[0].truck_number == ""
+
+
+def test_duplicate_review_dialog_same_table_label():
+    _app()
+    item = _sample_item()
+    item.existing_label = "Same table"
+    dlg = DuplicateReviewDialog([item], dup_days=5)
+    assert dlg._table.item(1, 1).text() == "Same table"

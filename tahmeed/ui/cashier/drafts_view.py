@@ -33,6 +33,7 @@ from tahmeed.ui.widgets.column_persistence import (
     apply_pending_column_autofit,
     bind_column_width_persistence,
 )
+from tahmeed.ui.widgets.circuit_geometry import CircuitChromeFrame
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
 # Date | Saved | Parked | Total | Cashiers — Cashiers stretch
@@ -186,8 +187,12 @@ class DraftsView(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        header = QFrame()
-        header.setStyleSheet(f"background:{_WHITE};border-bottom:1px solid {_BORDER};")
+        header = CircuitChromeFrame(
+            "drafts",
+            bg=_WHITE,
+            border=_BORDER,
+            object_name="draftsHeader",
+        )
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 14, 20, 14)
         hl.setSpacing(12)
@@ -220,8 +225,13 @@ class DraftsView(QWidget):
         split = QSplitter(Qt.Horizontal)
         split.setStyleSheet(f"background:{_BG};")
 
-        left = QFrame()
-        left.setStyleSheet(f"background:{_WHITE};")
+        left = CircuitChromeFrame(
+            "drafts::days",
+            bg=_WHITE,
+            border=_BORDER,
+            border_bottom=False,
+            object_name="draftsDaysPanel",
+        )
         left_vl = QVBoxLayout(left)
         left_vl.setContentsMargins(12, 12, 12, 12)
         left_vl.setSpacing(8)
@@ -258,8 +268,13 @@ class DraftsView(QWidget):
         self._days_table.itemSelectionChanged.connect(self._on_day_selected)
         left_vl.addWidget(self._days_table, 1)
 
-        right = QFrame()
-        right.setStyleSheet(f"background:{_WHITE};")
+        right = CircuitChromeFrame(
+            "drafts::detail",
+            bg=_WHITE,
+            border=_BORDER,
+            border_bottom=False,
+            object_name="draftsDetailPanel",
+        )
         right_vl = QVBoxLayout(right)
         right_vl.setContentsMargins(12, 12, 12, 12)
         right_vl.setSpacing(8)
@@ -560,22 +575,26 @@ class DraftsView(QWidget):
             )
         ):
             # Qt often leaves one row selected; ask before deleting only that row.
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Warning)
-            box.setWindowTitle("Discard drafts")
-            box.setText(
-                "One draft row is selected.\n\n"
-                "Discard only that row, or the whole draft day?"
+            from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_choice
+
+            choice = ask_choice(
+                self,
+                title="Discard drafts",
+                text=(
+                    "One draft row is selected.\n\n"
+                    "Discard only that row, or the whole draft day?"
+                ),
+                actions=(
+                    DialogAction("cancel", "Cancel", "cancel"),
+                    DialogAction("row", "This row only", "secondary"),
+                    DialogAction("whole", "Whole day", "destructive"),
+                ),
+                badge="warning",
+                default_action_id="whole",
             )
-            whole_btn = box.addButton("Whole day", QMessageBox.AcceptRole)
-            row_btn = box.addButton("This row only", QMessageBox.ActionRole)
-            cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
-            box.setDefaultButton(whole_btn)
-            box.exec()
-            clicked = box.clickedButton()
-            if clicked == cancel_btn or clicked is None:
+            if choice in (None, "cancel"):
                 return
-            if clicked == whole_btn:
+            if choice == "whole":
                 whole_day = True
             else:
                 asyncio.ensure_future(self._do_discard_ids(list(selected)))

@@ -145,12 +145,54 @@ async def test_async_import_staging_yields_progress_between_slices(register):
     assert register._table.item(0, register._COL_DESC).text() == "IMPORT 0"
     assert register._table.item(59, register._COL_DESC).text() == "IMPORT 59"
     assert register._first_empty_editable_row() == 60
-    # First row, every 25th, and the last row report progress.
+    # First row, every 25th (≤100 rows), and the last row report progress.
     assert progress[0] == (1, 60)
     assert (25, 60) in progress and (50, 60) in progress
     assert progress[-1] == (60, 60)
     assert register._bulk_mutating is False
     assert not register._table.signalsBlocked()
+
+
+def test_import_progress_step_grows_with_batch_size():
+    from tahmeed.ui.cashier.excel_grid import DailyRegister
+
+    # ≤100 → every 25
+    assert DailyRegister._import_progress_due(24, 60) is True
+    assert DailyRegister._import_progress_due(11, 60) is False
+    # 101–400 → every 50
+    assert DailyRegister._import_progress_due(49, 200) is True
+    assert DailyRegister._import_progress_due(24, 200) is False
+    # 401+ → every 100 (matches the 560-row import screenshot case)
+    assert DailyRegister._import_progress_due(49, 560) is False
+    assert DailyRegister._import_progress_due(99, 560) is True
+    assert DailyRegister._import_progress_due(559, 560) is True
+
+
+def test_staged_import_money_cells_match_transaction_path():
+    from datetime import datetime
+
+    from tahmeed.models.transaction import Transaction
+    from tahmeed.ui.cashier.excel_grid import (
+        _display_money_cells,
+        _staged_import_money_cells,
+    )
+
+    cases = [
+        {"amount": 1000.0, "currency": "TZS"},
+        {"amount": 25.5, "currency": "USD"},
+        {"amount": 1000.0, "currency": "TZS", "amount_usd": 5.0},
+    ]
+    for data in cases:
+        staged = _staged_import_money_cells(data)
+        tx = Transaction(
+            date=datetime(2026, 8, 8),
+            description="x",
+            truck_number="",
+            amount=float(data["amount"]),
+            currency=data.get("currency") or "TZS",
+            amount_usd=data.get("amount_usd"),
+        )
+        assert staged == _display_money_cells(tx)
 
 
 def test_skip_draft_restore_flag_prevents_restore(register, monkeypatch):

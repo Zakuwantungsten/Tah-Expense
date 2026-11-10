@@ -40,7 +40,8 @@ PARKING_CONGO_DETAIL_SORT: List[ColumnSpec] = [
     ("CASHIER", "cashier", "text"),
     ("VEHICLE #", "vehicle_no", "truck"),
     ("DIRECTION", "direction", "text"),
-    ("GATE IN", "gate_in", "text"),
+    # gate_in is a DD/MM/YYYY display string; sort on parsed gate_in_dt.
+    ("GATE IN", "gate_in_dt", "date"),
     ("TRANSACTION DETAILS", "transaction_details", "text"),
 ]
 
@@ -101,8 +102,9 @@ COMESA_SORT: List[ColumnSpec] = [
     ("S/NO", None, "text"),
     ("NAME", "name", "text"),
     ("CARD NO.", "card_no", "text"),
-    ("VALID FROM", "valid_from", "text"),
-    ("VALID TO", "valid_to", "text"),
+    # valid_from/valid_to are "%d %b %y" display strings; sort on datetimes.
+    ("VALID FROM", "valid_from_dt", "date"),
+    ("VALID TO", "valid_to_dt", "date"),
     ("TRUCK REG", "truck_reg", "truck"),
     ("PREMIUM", "premium", "number"),
     ("MONTH", "month", "text"),

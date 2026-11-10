@@ -105,7 +105,6 @@ from tahmeed.ui.dialog_theme import (
     show_question,
     show_warning,
     style_input_dialog,
-    style_message_box,
 )
 from tahmeed.ui.dialogs.import_session_dialogs import (
     FinishSessionDialog,
@@ -167,16 +166,29 @@ def _scope_combo(default_day: bool = False) -> QComboBox:
 
 def _push_report_box(parent: QWidget, text: str, *, warning: bool, can_open: bool) -> bool:
     """Push result message; True when the user picks Open in Master Expenses."""
-    icon = QMessageBox.Icon.Warning if warning else QMessageBox.Icon.Information
-    box = QMessageBox(icon, "Push to Master", text, QMessageBox.StandardButton.NoButton, parent)
-    open_btn = None
-    if can_open:
-        open_btn = box.addButton("Open in Master Expenses", QMessageBox.ButtonRole.ActionRole)
-    ok = box.addButton(QMessageBox.StandardButton.Ok)
-    box.setDefaultButton(ok)
-    style_message_box(box)
-    box.exec()
-    return open_btn is not None and box.clickedButton() is open_btn
+    from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_alert, ask_choice
+
+    if not can_open:
+        ask_alert(
+            parent,
+            title="Push to Master",
+            text=text,
+            level="warning" if warning else "info",
+        )
+        return False
+    choice = ask_choice(
+        parent,
+        title="Push to Master",
+        text=text,
+        actions=(
+            DialogAction("ok", "OK", "cancel"),
+            DialogAction("open", "Open in Master Expenses", "primary"),
+        ),
+        badge="warning" if warning else "info",
+        default_action_id="ok",
+        dismiss_id="ok",
+    )
+    return choice == "open"
 
 
 def _label(text: str = "", *, muted: bool = False) -> QLabel:
@@ -1053,23 +1065,23 @@ class ImportDailyMasterWidget(QWidget):
             f"(for example from the single-file import):\n{clash_listing}\n\n"
             "Pushing those days again may duplicate their rows."
         )
-        box = QMessageBox(
-            QMessageBox.Icon.Warning,
-            "Push to Master",
-            text,
-            QMessageBox.StandardButton.NoButton,
+        from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_choice
+
+        choice = ask_choice(
             self,
+            title="Push to Master",
+            text=text,
+            actions=(
+                DialogAction("cancel", "Cancel", "cancel"),
+                DialogAction("push_all", "Push All", "destructive"),
+                DialogAction("skip", "Skip Those Days", "primary"),
+            ),
+            badge="warning",
+            default_action_id="skip",
         )
-        skip = box.addButton("Skip Those Days", QMessageBox.ButtonRole.AcceptRole)
-        push_all = box.addButton("Push All", QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(skip)
-        style_message_box(box)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is push_all:
+        if choice == "push_all":
             return groups
-        if clicked is skip:
+        if choice == "skip":
             kept = [g for g in groups if g.batch_date not in clashes]
             if not kept:
                 show_info(self, "Push to Master", "Nothing left to push.")

@@ -182,6 +182,11 @@ async def test_cold_my_load_still_notifies(register, monkeypatch):
         "_show_draft_restored_notice",
         lambda *a: notices.append(a),
     )
+    monkeypatch.setattr(
+        register,
+        "_prompt_draft_recovery",
+        lambda *_a, **_k: "recover",
+    )
 
     async def fake_get(_d, **_k):
         return []
@@ -199,6 +204,104 @@ async def test_cold_my_load_still_notifies(register, monkeypatch):
 
     assert len(notices) == 1
     assert notices[0][1] >= 1  # new_count
+
+
+@pytest.mark.asyncio
+async def test_cold_my_load_discard_skips_restore(register, monkeypatch):
+    """Discard clears recoverable My rows and does not paint them back."""
+    from tahmeed.services.register_draft_service import load_register_draft
+    from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_TRUCK, COL_TZS
+
+    register._table.blockSignals(True)
+    try:
+        register._put(0, COL_DESC, "DIESEL")
+        register._put(0, COL_TZS, "1,000.00")
+        register._put(0, COL_TRUCK, "YARD")
+    finally:
+        register._table.blockSignals(False)
+    register._flush_local_draft()
+    register._populate([])
+
+    notices: list = []
+    monkeypatch.setattr(
+        register,
+        "_show_draft_restored_notice",
+        lambda *a: notices.append(a),
+    )
+    monkeypatch.setattr(
+        register,
+        "_prompt_draft_recovery",
+        lambda *_a, **_k: "discard",
+    )
+
+    async def fake_get(_d, **_k):
+        return []
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.get_transactions_by_date",
+        fake_get,
+    )
+    register._draft_restore_policy = "notify"
+    register._view_mode = "my"
+    register._parked_mode = False
+    register._merged_mode = False
+
+    await register._load_date_body(register._current_date)
+
+    assert notices == []
+    assert not register.has_unsaved_work()
+    assert load_register_draft(
+        register._user._id, register._current_date, merged=False
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_cold_my_load_later_keeps_draft_file(register, monkeypatch):
+    """Not now leaves the draft on disk and does not restore onto the grid."""
+    from tahmeed.services.register_draft_service import load_register_draft
+    from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_TRUCK, COL_TZS
+
+    register._table.blockSignals(True)
+    try:
+        register._put(0, COL_DESC, "DIESEL")
+        register._put(0, COL_TZS, "1,000.00")
+        register._put(0, COL_TRUCK, "YARD")
+    finally:
+        register._table.blockSignals(False)
+    register._flush_local_draft()
+    register._populate([])
+
+    notices: list = []
+    monkeypatch.setattr(
+        register,
+        "_show_draft_restored_notice",
+        lambda *a: notices.append(a),
+    )
+    monkeypatch.setattr(
+        register,
+        "_prompt_draft_recovery",
+        lambda *_a, **_k: "later",
+    )
+
+    async def fake_get(_d, **_k):
+        return []
+
+    monkeypatch.setattr(
+        "tahmeed.ui.cashier.excel_grid.get_transactions_by_date",
+        fake_get,
+    )
+    register._draft_restore_policy = "notify"
+    register._view_mode = "my"
+    register._parked_mode = False
+    register._merged_mode = False
+
+    await register._load_date_body(register._current_date)
+
+    assert notices == []
+    assert not register.has_unsaved_work()
+    assert load_register_draft(
+        register._user._id, register._current_date, merged=False
+    ) is not None
 
 
 @pytest.mark.asyncio
