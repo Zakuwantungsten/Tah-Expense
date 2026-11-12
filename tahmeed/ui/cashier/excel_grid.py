@@ -1517,6 +1517,7 @@ class DailyRegister(QWidget):
             for t in (
                 self._my_table,
                 self._parked_table,
+                self._skipped_table,
                 self._merged_table,
                 self._table,
             )
@@ -7840,6 +7841,7 @@ class DailyRegister(QWidget):
             for t in (
                 self._my_table,
                 self._parked_table,
+                self._skipped_table,
                 self._merged_table,
                 self._table,
             )

@@ -262,8 +262,9 @@ def _bind_feed_columns(table: QTableWidget, key: str) -> None:
 
 
 class _UploadBrowseChromeMixin:
-    """Checkbox + Action column + bulk Delete selected for upload browse tables.
+    """Checkbox + Action column for upload browse tables.
 
+    Bulk delete is driven by the feed ribbon ENTRY → Delete button.
     Host must define ``upload_clicked``, ``delete_clicked``, ``bulk_delete_clicked``,
     ``self._uploads``, and ``self._table``.
     """
@@ -273,11 +274,19 @@ class _UploadBrowseChromeMixin:
     def _action_col(self) -> int:
         return max(0, self._table.columnCount() - 1)
 
+    def summary_widget(self) -> QWidget | None:
+        """Browse totals parked on the ribbon far-right (Congo-style slot)."""
+        return getattr(self, "_chrome_summary_widget", None)
+
+    def _park_browse_totals(self, totals: QWidget) -> None:
+        """Keep totals for updates, but show them on the ribbon — not in-tab."""
+        self._totals = totals
+        self._chrome_summary_widget = totals
+
     def _add_upload_browse_toolbar(self, layout: QVBoxLayout) -> None:
         from tahmeed.ui.accountant.feed_upload_actions import make_upload_browse_toolbar
 
-        bar, self._bulk_delete_btn = make_upload_browse_toolbar(
-            on_delete_selected=self._emit_bulk_delete,
+        bar = make_upload_browse_toolbar(
             on_select_all=lambda: self._set_all_upload_checks(True),
             on_clear=lambda: self._set_all_upload_checks(False),
         )
@@ -334,13 +343,13 @@ class _UploadBrowseChromeMixin:
             self._sync_bulk_delete_btn()
 
     def _sync_bulk_delete_btn(self) -> None:
-        btn = getattr(self, "_bulk_delete_btn", None)
-        if btn is not None:
-            n = len(self._selected_uploads())
-            btn.setEnabled(n > 0)
-            btn.setText(
-                "Delete selected" if n <= 0 else f"Delete selected ({n})"
-            )
+        """Refresh ribbon Delete enablement + pin chk / Action columns."""
+        w = self
+        while w is not None:
+            if hasattr(w, "_sync_ribbon_upload_delete"):
+                w._sync_ribbon_upload_delete()
+                break
+            w = w.parent()
         # Keep chk / Action pinned after autofit on first data load.
         if getattr(self, "_table", None) is not None and self._table.columnCount() > 1:
             self._finish_upload_browse_columns()
@@ -382,7 +391,9 @@ def _start_bulk_upload_delete(
         parent, upload_count=len(docs), record_count=records
     ):
         return
-    asyncio.ensure_future(
+    from tahmeed.ui.async_utils import schedule_coro
+
+    schedule_coro(
         soft_delete_uploads_with_undo(
             parent,
             feed_slug=feed_slug,
@@ -846,35 +857,70 @@ class _PaginationBar(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _TotalsBar(QFrame):
-    def __init__(self, labels: List[Tuple[str, str]], parent: QWidget | None = None) -> None:
-        """labels = [(key, display_prefix), ...]  e.g. [("usd", "USD"), ("kwacha", "ZMW")]"""
-        super().__init__(parent)
-        self.setFixedHeight(38)
-        self.setStyleSheet(
-            f"QFrame{{background:{_HDR_BG};border-top:1px solid {_BORDER};"
-            f"border-bottom-left-radius:6px;border-bottom-right-radius:6px;}}"
-        )
-        hl = QHBoxLayout(self)
-        hl.setContentsMargins(16, 0, 16, 0)
-        hl.setSpacing(32)
+    def __init__(
+        self,
+        labels: List[Tuple[str, str]],
+        parent: QWidget | None = None,
+        *,
+        chrome: bool = False,
+    ) -> None:
+        """labels = [(key, display_prefix), ...]  e.g. [("usd", "USD"), ("kwacha", "ZMW")]
 
+        ``chrome=True`` parks a compact vertical stack on the ribbon far-right
+        (same slot as Congo In/Out/Bal). In-tab grey strip is the default.
+        """
+        super().__init__(parent)
+        self._chrome = chrome
+        self._captions: Dict[str, str] = {k: (p or "") for k, p in labels}
         self._lbl_map: Dict[str, QLabel] = {}
-        for key, prefix in labels:
-            sub = QWidget()
-            sub.setStyleSheet("background:transparent;")
-            sub_hl = QHBoxLayout(sub)
-            sub_hl.setContentsMargins(0, 0, 0, 0)
-            sub_hl.setSpacing(4)
-            sub_hl.addWidget(_lbl("TOTAL:", size=11, weight=600, color=_T2))
-            val = _lbl("—", size=12, weight=700, color=_T1)
-            sub_hl.addWidget(val)
-            self._lbl_map[key] = val
-            hl.addWidget(sub)
-        hl.addStretch()
+
+        if chrome:
+            self.setStyleSheet("QFrame{background:transparent;border:none;}")
+            self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+            vl = QVBoxLayout(self)
+            vl.setContentsMargins(8, 2, 4, 2)
+            vl.setSpacing(2)
+            for key, _prefix in labels:
+                val = QLabel("—")
+                val.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                val.setStyleSheet(
+                    f"color:{_T1};font-size:11px;font-weight:700;"
+                    "font-family:'Segoe UI';background:transparent;padding:0;margin:0;"
+                )
+                self._lbl_map[key] = val
+                vl.addWidget(val)
+        else:
+            self.setFixedHeight(38)
+            self.setStyleSheet(
+                f"QFrame{{background:{_HDR_BG};border-top:1px solid {_BORDER};"
+                f"border-bottom-left-radius:6px;border-bottom-right-radius:6px;}}"
+            )
+            hl = QHBoxLayout(self)
+            hl.setContentsMargins(16, 0, 16, 0)
+            hl.setSpacing(32)
+
+            for key, _prefix in labels:
+                sub = QWidget()
+                sub.setStyleSheet("background:transparent;")
+                sub_hl = QHBoxLayout(sub)
+                sub_hl.setContentsMargins(0, 0, 0, 0)
+                sub_hl.setSpacing(4)
+                sub_hl.addWidget(_lbl("TOTAL:", size=11, weight=600, color=_T2))
+                val = _lbl("—", size=12, weight=700, color=_T1)
+                sub_hl.addWidget(val)
+                self._lbl_map[key] = val
+                hl.addWidget(sub)
+            hl.addStretch()
 
     def set_total(self, key: str, value: float, prefix: str = "") -> None:
-        if key in self._lbl_map:
-            self._lbl_map[key].setText(_fmt_num(value, prefix=prefix))
+        if key not in self._lbl_map:
+            return
+        num = _fmt_num(value, prefix=prefix)
+        if self._chrome and not prefix:
+            cap = self._captions.get(key, "")
+            self._lbl_map[key].setText(f"{cap}{num}" if cap else num)
+        else:
+            self._lbl_map[key].setText(num)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1819,6 +1865,7 @@ class _FeedRibbonPageMixin:
         r.clear_filters_clicked.connect(self._on_ribbon_clear_filters)
         r.recalculate_clicked.connect(self._on_ribbon_recalculate)
         r.columns_clicked.connect(self._on_ribbon_columns)
+        r.delete_clicked.connect(self._on_ribbon_delete)
         if hasattr(self, "_open_import"):
             r.import_clicked.connect(self._open_import)
         elif hasattr(self, "_do_import"):
@@ -1832,10 +1879,52 @@ class _FeedRibbonPageMixin:
         """Widget for tab ``idx`` (override when the list page is the shell itself)."""
         return self._main_stack.widget(idx)
 
+    def _uploads_browse_active(self) -> bool:
+        """True when the Uploads tab is showing the browse list (not detail)."""
+        uploads_tab = getattr(self, "_ribbon_uploads_tab", 1)
+        if self._tabs.current_index() != uploads_tab:
+            return False
+        browse = getattr(self, "_browse", None)
+        if browse is None:
+            return False
+        stack = getattr(self, "_upload_stack", None)
+        return stack is None or stack.currentIndex() == 0
+
+    def _sync_ribbon_upload_delete(self) -> None:
+        """Enable ENTRY → Delete only when Uploads browse has checked rows."""
+        if not hasattr(self, "_ribbon"):
+            return
+        n = 0
+        if self._uploads_browse_active():
+            browse = getattr(self, "_browse", None)
+            if browse is not None and hasattr(browse, "_selected_uploads"):
+                n = len(browse._selected_uploads())
+        self._ribbon.set_entry_actions_enabled(delete=n > 0)
+        tip = (
+            "Delete selected uploads"
+            if self._uploads_browse_active()
+            else "Delete selected entry (coming later)"
+        )
+        self._ribbon.set_delete_tooltip(tip)
+
+    def _on_ribbon_delete(self) -> None:
+        if not self._uploads_browse_active():
+            return
+        browse = getattr(self, "_browse", None)
+        if browse is not None and hasattr(browse, "_emit_bulk_delete"):
+            browse._emit_bulk_delete()
+
+    def _sync_upload_chrome(self) -> None:
+        """Re-park browse totals / Delete after browse ↔ detail switches."""
+        if hasattr(self, "_tabs"):
+            self._sync_chrome_for_tab(self._tabs.current_index())
+
     def _sync_chrome_for_tab(self, idx: int) -> None:
         page = self._ribbon_page(idx)
         widgets: List[QWidget] = []
         summary = None
+        on_uploads_browse = False
+        uploads_tab = getattr(self, "_ribbon_uploads_tab", 1)
         if idx in getattr(self, "_ribbon_filter_tab_indexes", {0}):
             if hasattr(page, "filter_widgets"):
                 widgets = list(page.filter_widgets())
@@ -1845,11 +1934,23 @@ class _FeedRibbonPageMixin:
                 widgets = list(self._all_entries.filter_widgets())
             if hasattr(page, "summary_widget"):
                 summary = page.summary_widget()
+        elif idx == uploads_tab:
+            browse = getattr(self, "_browse", None)
+            stack = getattr(self, "_upload_stack", None)
+            if browse is not None and (stack is None or stack.currentIndex() == 0):
+                on_uploads_browse = True
+                if hasattr(browse, "summary_widget"):
+                    summary = browse.summary_widget()
         _chrome_set_filters(self._chrome_filters, widgets)
         # Totals live on the ribbon far-right (not the chrome filter bar).
         if hasattr(self, "_ribbon") and hasattr(self._ribbon, "set_summary_widget"):
             self._ribbon.set_summary_widget(summary)
         self._ribbon.set_filter_actions_enabled(bool(widgets))
+        if on_uploads_browse:
+            self._sync_ribbon_upload_delete()
+        else:
+            self._ribbon.set_entry_actions_enabled(delete=False)
+            self._ribbon.set_delete_tooltip("Delete selected entry (coming later)")
 
     def _ribbon_active_list_page(self):
         """Page that owns list filters / export (All Entries or similar)."""
@@ -2268,9 +2369,9 @@ class _TollUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        # Totals strip
-        self._totals = _TotalsBar([("zmw", "ZMW "), ("count", "Total records: ")])
-        vl.addWidget(self._totals)
+        self._park_browse_totals(_TotalsBar(
+            [("zmw", "ZMW "), ("count", "Total records: ")], chrome=True,
+        ))
 
         self._table = _make_table(_TOLL_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -2290,7 +2391,7 @@ class _TollUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click a row to open it · use Action or Delete selected to trash uploads.",
+            "Click a row to open it · use Action or ribbon Delete to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -2680,6 +2781,7 @@ class TollPlazaWidget(_FeedRibbonPageMixin, QWidget):
         assert self._upload_stack is not None and self._browse is not None
         self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
+        self._sync_upload_chrome()
 
     def _show_detail(self, upload_doc: dict) -> None:
         self._ensure_uploads()
@@ -2688,6 +2790,7 @@ class TollPlazaWidget(_FeedRibbonPageMixin, QWidget):
         self._main_stack.setCurrentIndex(1)
         self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
+        self._sync_upload_chrome()
 
     def _download_template(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -2750,7 +2853,8 @@ class TollPlazaWidget(_FeedRibbonPageMixin, QWidget):
         count = int(upload_doc.get("record_count", 0))
         if not confirm_move_upload_to_trash(self, filename=filename, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id, filename))
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._delete_upload(upload_id, filename))
 
     async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
         from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
@@ -3123,7 +3227,7 @@ class _ParkingCongoUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click a row to open it · use Action or Delete selected to trash uploads.",
+            "Click a row to open it · use Action or ribbon Delete to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -3693,6 +3797,7 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
         assert self._upload_stack is not None and self._browse is not None
         self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
+        self._sync_upload_chrome()
 
     def _show_detail(self, upload_doc: dict) -> None:
         self._ensure_uploads()
@@ -3701,6 +3806,7 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
         self._main_stack.setCurrentIndex(1)
         self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
+        self._sync_upload_chrome()
 
     def _open_deposit_upload(self, deposit_rec: dict) -> None:
         upload_id = str(deposit_rec.get("upload_id") or "")
@@ -3792,7 +3898,8 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
         count = int(upload_doc.get("record_count", 0))
         if not confirm_move_upload_to_trash(self, filename=filename, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id, filename))
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._delete_upload(upload_id, filename))
 
     async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
         from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
@@ -4609,11 +4716,10 @@ class _CongoExpUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        self._totals = _TotalsBar([
+        self._park_browse_totals(_TotalsBar([
             ("balance", "Balance USD "),
             ("count",   "Total records: "),
-        ])
-        vl.addWidget(self._totals)
+        ], chrome=True))
 
         self._table = _make_kimvi_table(_CONGO_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -4633,7 +4739,7 @@ class _CongoExpUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click a row to open it · use Action or Delete selected to trash uploads.",
+            "Click a row to open it · use Action or ribbon Delete to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -5017,12 +5123,14 @@ class CongoExpensesWidget(_FeedRibbonPageMixin, QWidget):
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
+        self._sync_upload_chrome()
 
     def _show_detail(self, upload_doc: dict) -> None:
         self._tabs.set_index(3, emit=False)
         self._main_stack.setCurrentIndex(3)
         self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
+        self._sync_upload_chrome()
 
     def _download_template(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -5126,7 +5234,8 @@ class CongoExpensesWidget(_FeedRibbonPageMixin, QWidget):
         label = f'{filename} / {sheet_label}'
         if not confirm_move_upload_to_trash(self, filename=label, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id, label))
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._delete_upload(upload_id, label))
 
     async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
         from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
@@ -6294,11 +6403,10 @@ class _KimviUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        self._totals = _TotalsBar([
+        self._park_browse_totals(_TotalsBar([
             ("balance", "Balance USD "),
             ("count",   "Total records: "),
-        ])
-        vl.addWidget(self._totals)
+        ], chrome=True))
 
         self._table = _make_kimvi_table(_KIMVI_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -6318,7 +6426,7 @@ class _KimviUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click a row to open it · use Action or Delete selected to trash uploads.",
+            "Click a row to open it · use Action or ribbon Delete to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -6708,12 +6816,14 @@ class AhmedKimviWidget(_FeedRibbonPageMixin, QWidget):
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
+        self._sync_upload_chrome()
 
     def _show_detail(self, upload_doc: dict) -> None:
         self._tabs.set_index(3, emit=False)
         self._main_stack.setCurrentIndex(3)
         self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
+        self._sync_upload_chrome()
 
     def _download_template(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -6817,7 +6927,8 @@ class AhmedKimviWidget(_FeedRibbonPageMixin, QWidget):
         label = f'{filename} / {sheet_label}'
         if not confirm_move_upload_to_trash(self, filename=label, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id, label))
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._delete_upload(upload_id, label))
 
     async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
         from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
@@ -7646,11 +7757,10 @@ class _ZambiaParkingUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        self._totals = _TotalsBar([
+        self._park_browse_totals(_TotalsBar([
             ("balance", "Closing bal: ZMW "),
             ("count",   "Total records: "),
-        ])
-        vl.addWidget(self._totals)
+        ], chrome=True))
 
         self._table = _make_table(_ZAMBIA_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -7670,7 +7780,7 @@ class _ZambiaParkingUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click a row to open it · use Action or Delete selected to trash uploads.",
+            "Click a row to open it · use Action or ribbon Delete to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -8049,12 +8159,14 @@ class ZambiaParkingWidget(_FeedRibbonPageMixin, QWidget):
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
+        self._sync_upload_chrome()
 
     def _show_detail(self, upload_doc: dict) -> None:
         self._tabs.set_index(2, emit=False)
         self._main_stack.setCurrentIndex(2)
         self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
+        self._sync_upload_chrome()
 
     def _download_template(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -8144,7 +8256,8 @@ class ZambiaParkingWidget(_FeedRibbonPageMixin, QWidget):
         label = f'{filename} / {sheet_label}'
         if not confirm_move_upload_to_trash(self, filename=label, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id, label))
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._delete_upload(upload_id, label))
 
     async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
         from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
@@ -9622,13 +9735,12 @@ class _AfritrackUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         self._add_upload_browse_toolbar(vl)
         vl.addWidget(self._table, 1)
 
-        self._totals = _TotalsBar([
+        self._park_browse_totals(_TotalsBar([
             ("t", "Tahmeed "),
             ("i", "Invoice "),
             ("v", "Variance "),
             ("c", "Rows "),
-        ])
-        vl.addWidget(self._totals)
+        ], chrome=True))
 
     def refresh(self) -> None:
         asyncio.ensure_future(self._load())
@@ -9986,12 +10098,14 @@ class AfritrackWidget(_FeedRibbonPageMixin, QWidget):
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
+        self._sync_upload_chrome()
 
     def _show_detail(self, upload_doc: dict) -> None:
         self._tabs.set_index(1, emit=False)
         self._main_stack.setCurrentIndex(1)
         self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
+        self._sync_upload_chrome()
 
     def _download_template(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -10124,7 +10238,8 @@ class AfritrackWidget(_FeedRibbonPageMixin, QWidget):
         count = int(upload_doc.get("record_count", 0))
         if not confirm_move_upload_to_trash(self, filename=filename, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id, filename))
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._delete_upload(upload_id, filename))
 
     async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
         from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo
@@ -11585,8 +11700,7 @@ class _RahnTechUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        self._totals = _TotalsBar([("count", "Total records: ")])
-        vl.addWidget(self._totals)
+        self._park_browse_totals(_TotalsBar([("count", "Total records: ")], chrome=True))
 
         self._table = _make_table(_RAHNTECH_BROWSE_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -11605,7 +11719,7 @@ class _RahnTechUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         vl.addWidget(self._table, 1)
 
         hint = _lbl(
-            "Click a row to open it · use Action or Delete selected to trash uploads.",
+            "Click a row to open it · use Action or ribbon Delete to trash uploads.",
             size=11, color=_TM,
         )
         hint.setAlignment(Qt.AlignCenter)
@@ -11944,12 +12058,14 @@ class RahnTechWidget(_FeedRibbonPageMixin, QWidget):
     def _show_browse(self) -> None:
         self._upload_stack.setCurrentIndex(0)
         self._browse.refresh()
+        self._sync_upload_chrome()
 
     def _show_detail(self, upload_doc: dict) -> None:
         self._tabs.set_index(1, emit=False)
         self._main_stack.setCurrentIndex(1)
         self._upload_stack.setCurrentIndex(1)
         self._detail.load_upload(upload_doc)
+        self._sync_upload_chrome()
 
     def _download_template(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -12006,7 +12122,8 @@ class RahnTechWidget(_FeedRibbonPageMixin, QWidget):
         count = int(upload_doc.get("record_count", 0))
         if not confirm_move_upload_to_trash(self, filename=filename, count=count):
             return
-        asyncio.ensure_future(self._delete_upload(upload_id, filename))
+        from tahmeed.ui.async_utils import schedule_coro
+        schedule_coro(self._delete_upload(upload_id, filename))
 
     async def _delete_upload(self, upload_id: str, filename: str = "") -> None:
         from tahmeed.ui.accountant.feed_upload_actions import soft_delete_upload_with_undo

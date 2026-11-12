@@ -126,8 +126,18 @@ async def soft_delete_upload_with_undo(
     filename: str = "",
     on_done: Optional[Callable[[], None]] = None,
 ) -> None:
-    """Soft-delete via API, offer Undo, then refresh the caller."""
+    """Soft-delete via API, offer Undo, then refresh the caller.
+
+    Dialogs use ``await_ui`` and ``on_done`` is ``schedule_call``'d so Python
+    3.14 + qasync does not stall the Uploads browse refresh after trash.
+    """
     from tahmeed.services import feed_service as feeds
+    from tahmeed.ui.async_utils import pause_background_polls, schedule_call
+    from tahmeed.ui.widgets.export_runner import await_ui
+
+    def _finish() -> None:
+        if on_done is not None:
+            schedule_call(on_done)
 
     uid = (upload_id or "").strip()
     if not uid:
@@ -135,32 +145,40 @@ async def soft_delete_upload_with_undo(
     try:
         deleted = await feeds.delete_upload(feed_slug, uid)
     except Exception as exc:
-        QMessageBox.critical(parent, "Delete Error", str(exc))
+        with pause_background_polls(parent):
+            await await_ui(lambda: QMessageBox.critical(parent, "Delete Error", str(exc)))
         return
     if deleted <= 0:
-        QMessageBox.warning(
-            parent, "Move to Trash", "No records were moved to trash."
-        )
+        with pause_background_polls(parent):
+            await await_ui(lambda: QMessageBox.warning(
+                parent, "Move to Trash", "No records were moved to trash.",
+            ))
         return
 
-    if _show_trashed_with_undo(parent, filename=filename, deleted=deleted):
+    with pause_background_polls(parent):
+        undo = await await_ui(
+            lambda: _show_trashed_with_undo(parent, filename=filename, deleted=deleted)
+        )
+    if undo:
         try:
             restored = await feeds.restore_upload(feed_slug, uid)
         except Exception as exc:
-            QMessageBox.critical(parent, "Undo Failed", str(exc))
+            with pause_background_polls(parent):
+                await await_ui(
+                    lambda: QMessageBox.critical(parent, "Undo Failed", str(exc))
+                )
         else:
-            if restored > 0:
-                QMessageBox.information(
-                    parent,
-                    "Restored",
-                    f'"{(filename or "Upload").strip() or "Upload"}" was restored.',
-                )
-            else:
-                QMessageBox.warning(
-                    parent, "Undo Failed", "Could not restore this upload."
-                )
-    if on_done is not None:
-        on_done()
+            name = (filename or "Upload").strip() or "Upload"
+            with pause_background_polls(parent):
+                if restored > 0:
+                    await await_ui(lambda: QMessageBox.information(
+                        parent, "Restored", f'"{name}" was restored.',
+                    ))
+                else:
+                    await await_ui(lambda: QMessageBox.warning(
+                        parent, "Undo Failed", "Could not restore this upload.",
+                    ))
+    _finish()
 
 
 async def soft_delete_uploads_with_undo(
@@ -170,8 +188,18 @@ async def soft_delete_uploads_with_undo(
     uploads: List[dict],
     on_done: Optional[Callable[[], None]] = None,
 ) -> None:
-    """Soft-delete many uploads, then one Undo that restores all of them."""
+    """Soft-delete many uploads, then one Undo that restores all of them.
+
+    Dialogs use ``await_ui`` and ``on_done`` is ``schedule_call``'d so Python
+    3.14 + qasync does not stall the Uploads browse refresh after trash.
+    """
     from tahmeed.services import feed_service as feeds
+    from tahmeed.ui.async_utils import pause_background_polls, schedule_call
+    from tahmeed.ui.widgets.export_runner import await_ui
+
+    def _finish() -> None:
+        if on_done is not None:
+            schedule_call(on_done)
 
     items: List[tuple[str, str]] = []
     for up in uploads:
@@ -194,22 +222,24 @@ async def soft_delete_uploads_with_undo(
                 deleted_total += deleted
                 done_ids.append((uid, _label))
     except Exception as exc:
-        QMessageBox.critical(parent, "Delete Error", str(exc))
-        if on_done is not None:
-            on_done()
+        with pause_background_polls(parent):
+            await await_ui(lambda: QMessageBox.critical(parent, "Delete Error", str(exc)))
+        _finish()
         return
 
     if not done_ids:
-        QMessageBox.warning(
-            parent, "Move to Trash", "No records were moved to trash."
-        )
-        if on_done is not None:
-            on_done()
+        with pause_background_polls(parent):
+            await await_ui(lambda: QMessageBox.warning(
+                parent, "Move to Trash", "No records were moved to trash.",
+            ))
+        _finish()
         return
 
-    if _show_bulk_trashed_with_undo(
-        parent, upload_count=len(done_ids), deleted=deleted_total
-    ):
+    with pause_background_polls(parent):
+        undo = await await_ui(lambda: _show_bulk_trashed_with_undo(
+            parent, upload_count=len(done_ids), deleted=deleted_total,
+        ))
+    if undo:
         failed = 0
         for uid, _label in done_ids:
             try:
@@ -218,20 +248,21 @@ async def soft_delete_uploads_with_undo(
                 restored = 0
             if restored <= 0:
                 failed += 1
-        if failed:
-            QMessageBox.warning(
-                parent,
-                "Undo Failed",
-                f"Could not restore {failed:,} of {len(done_ids):,} upload(s).",
-            )
-        else:
-            QMessageBox.information(
-                parent,
-                "Restored",
-                f"{len(done_ids):,} upload{'s' if len(done_ids) != 1 else ''} restored.",
-            )
-    if on_done is not None:
-        on_done()
+        with pause_background_polls(parent):
+            if failed:
+                await await_ui(lambda: QMessageBox.warning(
+                    parent,
+                    "Undo Failed",
+                    f"Could not restore {failed:,} of {len(done_ids):,} upload(s).",
+                ))
+            else:
+                n = len(done_ids)
+                await await_ui(lambda: QMessageBox.information(
+                    parent,
+                    "Restored",
+                    f"{n:,} upload{'s' if n != 1 else ''} restored.",
+                ))
+    _finish()
 
 
 def make_upload_check_item() -> QTableWidgetItem:
@@ -272,11 +303,10 @@ def make_upload_delete_button(on_click: Callable[[], None]) -> QWidget:
 
 def make_upload_browse_toolbar(
     *,
-    on_delete_selected: Callable[[], None],
     on_select_all: Callable[[], None],
     on_clear: Callable[[], None],
-) -> tuple[QWidget, QPushButton]:
-    """Toolbar with Select all / Clear / Delete selected. Returns (bar, delete_btn)."""
+) -> QWidget:
+    """Toolbar with Select all / Clear on the right (bulk delete lives on the ribbon)."""
     bar = QWidget()
     bar.setStyleSheet("background:transparent;")
     lay = QHBoxLayout(bar)
@@ -294,6 +324,8 @@ def make_upload_browse_toolbar(
         )
         return b
 
+    lay.addStretch(1)
+
     sel = _secondary("Select all")
     sel.clicked.connect(on_select_all)
     lay.addWidget(sel)
@@ -302,23 +334,4 @@ def make_upload_browse_toolbar(
     clear.clicked.connect(on_clear)
     lay.addWidget(clear)
 
-    lay.addStretch(1)
-
-    delete_btn = QPushButton("Delete selected")
-    delete_btn.setCursor(Qt.PointingHandCursor)
-    delete_btn.setFixedHeight(28)
-    delete_btn.setEnabled(False)
-    try:
-        delete_btn.setIcon(qta.icon("mdi.trash-can-outline", color="#FFF"))
-        delete_btn.setIconSize(QSize(14, 14))
-    except Exception:
-        pass
-    delete_btn.setStyleSheet(
-        f"QPushButton{{background:{_RED};color:#FFF;border:none;border-radius:5px;"
-        f"font-size:12px;font-weight:600;padding:0 12px;}}"
-        f"QPushButton:hover{{background:#B91C1C;}}"
-        "QPushButton:disabled{background:#FCA5A5;}"
-    )
-    delete_btn.clicked.connect(on_delete_selected)
-    lay.addWidget(delete_btn)
-    return bar, delete_btn
+    return bar

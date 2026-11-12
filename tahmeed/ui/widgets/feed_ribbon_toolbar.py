@@ -149,6 +149,7 @@ class FeedRibbonToolbar(QFrame):
             "mdi.delete-outline", "Delete", "Delete selected entry (coming later)",
             color=_DELETE,
         )
+        self._btn_delete.clicked.connect(self.delete_clicked.emit)
         self._btn_copy = self._tool_btn(
             "mdi.content-copy", "Create a\nCopy", "Duplicate entry (coming later)",
         )
@@ -345,6 +346,9 @@ class FeedRibbonToolbar(QFrame):
         self._set_btn_enabled(self._btn_save, save)
         self._set_btn_enabled(self._btn_delete, delete)
         self._set_btn_enabled(self._btn_copy, copy)
+
+    def set_delete_tooltip(self, tip: str) -> None:
+        self._btn_delete.setToolTip(tip)
 
     def set_filter_actions_enabled(self, enabled: bool) -> None:
         self._set_btn_enabled(self._btn_clear, enabled)
