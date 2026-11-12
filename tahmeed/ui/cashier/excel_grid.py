@@ -141,7 +141,7 @@ from tahmeed.ui.cashier.excel_row_header import (
     MIN_ROW_HEIGHT,
     sync_row_header_labels,
 )
-from tahmeed.ui.widgets.popup_styles import apply_light_menu
+from tahmeed.ui.widgets.popup_styles import apply_light_menu, with_light_popups
 
 _TABLE_FONT_PT_DEFAULT = 11
 _TABLE_FONT_PT_MIN = 8
@@ -7755,7 +7755,8 @@ class DailyRegister(QWidget):
 
     def _table_stylesheet(self, font_pt: int) -> str:
         hdr_px = max(9, int(round(11 * font_pt / _TABLE_FONT_PT_DEFAULT)))
-        return f"""
+        # Item color + OS dark tooltips → black-on-black without QToolTip rules.
+        return with_light_popups(f"""
             QTableWidget {{
                 background: transparent;
                 alternate-background-color: rgba(249, 250, 251, 210);
@@ -7810,7 +7811,7 @@ class DailyRegister(QWidget):
                 font-family: Calibri;
                 font-size: {font_pt}pt;
             }}
-        """
+        """)
 
     def _row_height_for_font(self, font_pt: int) -> int:
         scaled = int(round(DEFAULT_ROW_HEIGHT * font_pt / _TABLE_FONT_PT_DEFAULT))

@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tahmeed.ui.widgets.popup_styles import with_light_popups
 from tahmeed.ui.widgets.qb_txn_toolbar import _font_size_icon
 
 _BG = "#F8FAFC"
@@ -68,7 +69,7 @@ class RegisterRibbonToolbar(QFrame):
         self.setAttribute(Qt.WA_StyledBackground, False)
         self.setAutoFillBackground(False)
         self.setStyleSheet(
-            f"""
+            with_light_popups(f"""
             QFrame#registerRibbonToolbar {{
                 background: transparent;
                 border: 1px solid {_BORDER};
@@ -126,7 +127,7 @@ class RegisterRibbonToolbar(QFrame):
                 font-size: 18px;
                 padding: 0 2px;
             }}
-            """
+            """)
         )
 
         self._parked_mode = False

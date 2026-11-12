@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
+from tahmeed.ui.widgets.popup_styles import with_light_popups
+
 
 _BG = "#F0F0F0"
 _BORDER = "#D0D0D0"
@@ -98,7 +100,7 @@ class QbTxnToolbar(QFrame):
         self.setObjectName("qbTxnToolbar")
         self.setFixedHeight(40)
         self.setStyleSheet(
-            f"""
+            with_light_popups(f"""
             QFrame#qbTxnToolbar {{
                 background: {_BG};
                 border-bottom: 1px solid {_BORDER};
@@ -147,7 +149,7 @@ class QbTxnToolbar(QFrame):
             QCheckBox:disabled {{
                 color: {_MUTED};
             }}
-            """
+            """)
         )
 
         lay = QHBoxLayout(self)

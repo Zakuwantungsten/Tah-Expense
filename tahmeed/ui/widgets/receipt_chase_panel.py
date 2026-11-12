@@ -84,11 +84,13 @@ _STRIPE = "#F1F5F9"
 _ROW_EVEN = "#FFFFFF"
 
 _PAGE_SS = f"QWidget {{ background: {_BG}; }}"
+# Tab pages: QWidget background alone makes OS-dark QToolTip black-on-black.
+_PAGE_CARD_SS = with_light_popups(f"QWidget {{ background: {_CARD}; }}")
 _CARD_SS = (
     f"QFrame#kpiCard {{ background:{_CARD}; border:1px solid {_BORDER}; "
     f"border-radius:8px; }}"
 )
-_TABLE_SS = f"""
+_TABLE_SS = with_light_popups(f"""
 QTableWidget {{
   background:{_CARD}; border:1px solid {_BORDER}; border-radius:6px;
   gridline-color:#F3F4F6; font-family:"Segoe UI"; font-size:12px; color:{_TEXT};
@@ -100,7 +102,7 @@ QHeaderView::section {{
   border:none; border-bottom:1px solid {_BORDER}; border-right:1px solid #F3F4F6;
   padding:6px 8px;
 }}
-"""
+""")
 
 
 def _stripe_bg(row_idx: int) -> QColor:
@@ -132,22 +134,22 @@ QPushButton {{
 }}
 QPushButton:hover {{ background:{hover}; }}
 """
-_BTN_GHOST = f"""
+_BTN_GHOST = with_light_popups(f"""
 QPushButton {{
   background:{_CARD}; color:{_TEXT}; border:1px solid {_BORDER};
   border-radius:4px; padding:5px 10px; font:600 12px 'Segoe UI';
 }}
 QPushButton:hover {{ background:#F8FAFC; }}
 QPushButton:disabled {{ color:#9CA3AF; }}
-"""
-_BTN_PRIMARY = f"""
+""")
+_BTN_PRIMARY = with_light_popups(f"""
 QPushButton {{
   background:{_ACCENT}; color:#FFFFFF; border:none;
   border-radius:4px; padding:5px 12px; font:600 12px 'Segoe UI';
 }}
 QPushButton:hover {{ background:#005EA3; }}
 QPushButton:disabled {{ background:#93C5FD; }}
-"""
+""")
 
 _REQUEST_PRESETS: tuple[tuple[str, str], ...] = (
     ("Today", "today"),
@@ -409,9 +411,11 @@ def _row_action_btn(text: str, icon: str) -> QPushButton:
     btn.setCursor(Qt.PointingHandCursor)
     btn.setFixedHeight(_ROW_BTN_H)
     btn.setStyleSheet(
-        f"QPushButton{{background:{_CARD};color:{_TEXT};border:1px solid {_BORDER};"
-        "border-radius:3px;padding:0 6px;font:600 11px 'Segoe UI';}}"
-        "QPushButton:hover{background:#F8FAFC;}"
+        with_light_popups(
+            f"QPushButton{{background:{_CARD};color:{_TEXT};border:1px solid {_BORDER};"
+            "border-radius:3px;padding:0 6px;font:600 11px 'Segoe UI';}}"
+            "QPushButton:hover{background:#F8FAFC;}"
+        )
     )
     return btn
 
@@ -606,7 +610,7 @@ class ReceiptChasePanel(QWidget):
 
     def _build_main_tab(self) -> QWidget:
         page = QWidget()
-        page.setStyleSheet(f"QWidget{{background:{_CARD};}}")
+        page.setStyleSheet(_PAGE_CARD_SS)
         lay = QVBoxLayout(page)
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
@@ -836,7 +840,7 @@ class ReceiptChasePanel(QWidget):
 
     def _build_view_all_tab(self) -> QWidget:
         page = QWidget()
-        page.setStyleSheet(f"QWidget{{background:{_CARD};}}")
+        page.setStyleSheet(_PAGE_CARD_SS)
         lay = QVBoxLayout(page)
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(0)
@@ -1921,7 +1925,7 @@ class ReceiptChasePanel(QWidget):
 
     def _build_requests_tab(self) -> QWidget:
         page = QWidget()
-        page.setStyleSheet(f"QWidget{{background:{_CARD};}}")
+        page.setStyleSheet(_PAGE_CARD_SS)
         lay = QVBoxLayout(page)
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
@@ -2030,7 +2034,7 @@ class ReceiptChasePanel(QWidget):
 
     def _build_chase_tab(self) -> QWidget:
         page = QWidget()
-        page.setStyleSheet(f"QWidget{{background:{_CARD};}}")
+        page.setStyleSheet(_PAGE_CARD_SS)
         lay = QVBoxLayout(page)
         lay.setContentsMargins(12, 12, 12, 12)
         hint = QLabel("Grouped by ownership — who still owes paper.")
@@ -2056,7 +2060,7 @@ class ReceiptChasePanel(QWidget):
 
     def _build_inbox_tab(self) -> QWidget:
         page = QWidget()
-        page.setStyleSheet(f"QWidget{{background:{_CARD};}}")
+        page.setStyleSheet(_PAGE_CARD_SS)
         lay = QVBoxLayout(page)
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(0)
@@ -2134,7 +2138,7 @@ class ReceiptChasePanel(QWidget):
 
     def _build_library_tab(self) -> QWidget:
         page = QWidget()
-        page.setStyleSheet(f"QWidget{{background:{_CARD};}}")
+        page.setStyleSheet(_PAGE_CARD_SS)
         lay = QVBoxLayout(page)
         lay.setContentsMargins(12, 12, 12, 12)
 
@@ -2228,7 +2232,7 @@ class ReceiptChasePanel(QWidget):
 
     def _build_link_tab(self) -> QWidget:
         page = QWidget()
-        page.setStyleSheet(f"QWidget{{background:{_CARD};}}")
+        page.setStyleSheet(_PAGE_CARD_SS)
         lay = QVBoxLayout(page)
         lay.setContentsMargins(12, 12, 12, 12)
         self._link_file_hint = QLabel(
@@ -2295,7 +2299,7 @@ class ReceiptChasePanel(QWidget):
 
     def _build_export_tab(self) -> QWidget:
         page = QWidget()
-        page.setStyleSheet(f"QWidget{{background:{_CARD};}}")
+        page.setStyleSheet(_PAGE_CARD_SS)
         lay = QVBoxLayout(page)
         lay.setContentsMargins(12, 12, 12, 12)
         form = QHBoxLayout()
