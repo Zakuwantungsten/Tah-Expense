@@ -19,6 +19,13 @@ from .attachment_ops import (
 )
 from .dependencies import Authenticated, Manager, require_roles
 from .errors import ApiError
+from .receipt_backup import mirror_attachment
+from .receipt_ops import (
+    register_receipt_file_for_attachment,
+    sync_receipt_status_after_attach,
+    sync_receipt_status_after_detach,
+)
+from .receipt_storage import resolve_attachments_directory
 from .security import utcnow
 from .serialization import json_safe, object_id
 
@@ -32,8 +39,10 @@ def _database(request: Request) -> Any:
     return request.app.state.database.db
 
 
-def _attachments_dir(request: Request) -> Path:
-    return Path(request.app.state.settings.attachments_directory)
+async def _attachments_dir(request: Request) -> Path:
+    return await resolve_attachments_directory(
+        request.app.state.settings, _database(request)
+    )
 
 
 def _valid_id(value: str) -> ObjectId:
@@ -101,7 +110,7 @@ async def cleanup_orphans(
 ) -> dict[str, Any]:
     result = await cleanup_attachment_orphans(
         _database(request),
-        _attachments_dir(request),
+        await _attachments_dir(request),
         max_age_hours=max_age_hours,
         dry_run=dry_run,
     )
@@ -139,7 +148,7 @@ async def download_attachment(
     meta = find_attachment_meta(doc, attachment_id.strip())
     if meta is None:
         raise ApiError(404, "attachment_not_found", "Attachment not found")
-    path = resolve_attachment_path(_attachments_dir(request), oid, meta)
+    path = resolve_attachment_path(await _attachments_dir(request), oid, meta)
     if path is None:
         raise ApiError(404, "file_missing", "Attachment file is missing on the server")
     filename = str(meta.get("filename") or path.name)
@@ -167,10 +176,11 @@ async def upload_attachment(
     finally:
         await file.close()
 
+    attachments_dir = await _attachments_dir(request)
     try:
         meta = await add_attachment_bytes(
             _database(request),
-            _attachments_dir(request),
+            attachments_dir,
             oid,
             filename=filename,
             content=content,
@@ -182,6 +192,31 @@ async def upload_attachment(
         raise ApiError(422, "invalid_attachment", str(exc)) from None
     except OSError as exc:
         raise ApiError(500, "storage_error", "Failed to store attachment") from exc
+
+    # Local rename already committed. A failed cloud copy must not roll it back.
+    s3_key = await mirror_attachment(
+        request.app.state.settings,
+        _database(request),
+        oid,
+        attachments_dir,
+        meta,
+    )
+    if s3_key:
+        meta["s3_key"] = s3_key
+
+    db = _database(request)
+    try:
+        await register_receipt_file_for_attachment(
+            db,
+            tx_id=oid,
+            meta=meta,
+            base=attachments_dir,
+            source="desktop",
+            actor_id=_actor_id(actor),
+        )
+        await sync_receipt_status_after_attach(db, oid)
+    except Exception:
+        pass
 
     await _audit(
         request,
@@ -213,12 +248,17 @@ async def delete_attachment(
 
     removed = await remove_attachment(
         _database(request),
-        _attachments_dir(request),
+        await _attachments_dir(request),
         oid,
         attachment_id,
     )
     if removed is None:
         raise ApiError(404, "attachment_not_found", "Attachment not found")
+
+    try:
+        await sync_receipt_status_after_detach(_database(request), oid)
+    except Exception:
+        pass
 
     await _audit(
         request,

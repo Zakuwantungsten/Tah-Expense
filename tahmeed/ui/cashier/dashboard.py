@@ -1295,6 +1295,12 @@ class CashierDashboard(QWidget):
         )
         self._stack.addWidget(self._mount_page("trash", self._trash_view))
 
+        # index 9 — Receipts (chase / inbox / manual link)
+        from tahmeed.ui.widgets.receipt_chase_panel import ReceiptChasePanel
+
+        self._receipts = ReceiptChasePanel()
+        self._stack.addWidget(self._mount_page("receipts", self._receipts))
+
         self._stack.setCurrentIndex(0)
         body_hl.addWidget(self._stack, 1)
 
@@ -1479,6 +1485,9 @@ class CashierDashboard(QWidget):
         elif key == "trash":
             self._stack.setCurrentIndex(8)
             self._trash_view.refresh()
+        elif key == "receipts":
+            self._stack.setCurrentIndex(9)
+            asyncio.ensure_future(self._receipts.refresh_all())
         elif self._sidebar.item_def(key) is not None:
             self._show_category(key)
 

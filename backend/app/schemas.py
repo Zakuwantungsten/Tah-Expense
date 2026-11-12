@@ -159,11 +159,19 @@ class FleetWrite(StrictModel):
 class PeopleWrite(StrictModel):
     name: str = Field(min_length=1, max_length=120)
     active: bool = True
+    phone: str = ""
+    receives_receipt_requests: bool = True
+    user_id: str | None = None
 
     @field_validator("name")
     @classmethod
     def normalize_name(cls, value: str) -> str:
         return " ".join(value.upper().split())
+
+    @field_validator("phone")
+    @classmethod
+    def normalize_phone(cls, value: str) -> str:
+        return (value or "").strip()
 
 
 class PatchDocument(StrictModel):

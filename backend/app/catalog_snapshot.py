@@ -2,7 +2,7 @@
 
 The JSON lives on this process. ``catalog_version`` lives in ``system_counters``
 and increases when a catalog write commits, so a matching ``If-None-Match``
-can return 304 without reading items, payees, or fleet.
+can return 304 without reading items, payees, people, or fleet.
 """
 
 from __future__ import annotations
@@ -110,6 +110,11 @@ async def build_catalog_snapshot(db: Any, version: int) -> dict[str, Any]:
         {"active": True},
         [("name", 1), ("_id", 1)],
     )
+    people = await _active_docs(
+        db.people,
+        {"active": {"$ne": False}},
+        [("name", 1), ("_id", 1)],
+    )
     trucks = await _active_docs(
         db.trucks,
         {"active": True},
@@ -131,6 +136,7 @@ async def build_catalog_snapshot(db: Any, version: int) -> dict[str, Any]:
         "catalog_version": int(version),
         "categories": json_safe(categories),
         "payees": json_safe(payees),
+        "people": json_safe(people),
         "trucks": json_safe(trucks),
         "trailers": json_safe(trailers),
         "motor_vehicles": json_safe(motor_vehicles),

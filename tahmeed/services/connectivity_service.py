@@ -188,17 +188,16 @@ class ConnectivityMonitor(QObject):
     def pause(self) -> None:
         """Stop probes for a dialog or a save/import/verify batch.
 
-        Nested callers each pair pause with resume. Cancelling the in-flight
-        probe does not publish a new status, so the light stays Connected.
+        Nested callers each pair pause with resume. Soft-stop the in-flight
+        probe (do not cancel): cancelling under Python 3.14 + qasync while
+        another Task is in a nested Qt loop raises ``task_wakeup``.
         """
         self._busy_depth += 1
         self._paused = True
         self._timer.stop()
-        task = self._task
-        if task is not None and not task.done():
-            task.cancel()
-        self._task = None
         self._in_flight = False
+        # Keep ``self._task`` so an in-flight probe can finish quietly; ticks
+        # stay suppressed via ``_paused`` until resume.
 
     def resume(self) -> None:
         if self._busy_depth > 0:
@@ -214,6 +213,10 @@ class ConnectivityMonitor(QObject):
 
     def _on_tick(self) -> None:
         if self._paused or not self._started or not self._timer.isActive():
+            return
+        # Previous soft-paused probe may still be finishing — don't stack another.
+        task = self._task
+        if task is not None and not task.done():
             return
         if self._in_flight:
             return

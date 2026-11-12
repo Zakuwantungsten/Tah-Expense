@@ -192,6 +192,75 @@ async def create_indexes(db: Any) -> None:
             IndexModel([("entity_ids", ASCENDING)], name="entity_ids"),
         ]
     )
+    await db.receipt_requests.create_indexes(
+        [
+            IndexModel(
+                [("transaction_id", ASCENDING)],
+                unique=True,
+                name="uniq_receipt_request_tx",
+            ),
+            IndexModel(
+                [("status", ASCENDING), ("asked_of_name", ASCENDING), ("opened_at", ASCENDING)],
+                name="receipt_chase_by_owner",
+            ),
+            IndexModel(
+                [("status", ASCENDING), ("last_reminded_at", ASCENDING), ("opened_at", ASCENDING)],
+                name="receipt_reminders",
+            ),
+            IndexModel(
+                [("asked_of_person_id", ASCENDING), ("status", ASCENDING)],
+                name="receipt_by_person",
+            ),
+        ]
+    )
+    await db.receipt_files.create_indexes(
+        [
+            IndexModel([("uploaded_at", DESCENDING)], name="receipt_files_uploaded"),
+            IndexModel(
+                [("inbox_status", ASCENDING), ("uploaded_at", DESCENDING)],
+                name="receipt_inbox",
+            ),
+            IndexModel([("request_id", ASCENDING)], name="receipt_files_request"),
+            IndexModel([("transaction_ids", ASCENDING)], name="receipt_files_tx_ids"),
+            IndexModel([("stored_path", ASCENDING)], name="receipt_files_stored_path"),
+            IndexModel(
+                [("materialized_paths", ASCENDING)],
+                name="receipt_files_materialized",
+            ),
+            IndexModel(
+                [("quarantine_path", ASCENDING)],
+                name="receipt_files_quarantine_path",
+                sparse=True,
+            ),
+            IndexModel(
+                [("original_filename", ASCENDING)],
+                name="receipt_files_original_name",
+            ),
+            IndexModel([("sha256", ASCENDING)], name="receipt_files_sha256"),
+            IndexModel(
+                [("s3_key", ASCENDING)],
+                name="receipt_files_pending_s3",
+                partialFilterExpression={"s3_key": {"$in": [None, ""]}},
+            ),
+        ]
+    )
+    await db.receipt_exports.create_indexes(
+        [
+            IndexModel(
+                [("created_at", DESCENDING)],
+                name="receipt_exports_created",
+            ),
+            IndexModel(
+                [("kind", ASCENDING), ("created_at", DESCENDING)],
+                name="receipt_exports_kind",
+            ),
+        ]
+    )
+    await db.people.create_index(
+        [("user_id", ASCENDING)],
+        name="people_user_id",
+        sparse=True,
+    )
 
 
 async def backfill_register_status(db: Any) -> int:

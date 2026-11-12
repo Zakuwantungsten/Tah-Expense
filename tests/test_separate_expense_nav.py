@@ -1,4 +1,4 @@
-"""Separate Expenses: instant tab switch then async load."""
+"""Instant tab switch (Opening… shell) then async page build / load."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication, QStackedWidget, QWidget
 
 from tahmeed.ui.accountant.dashboard import (
+    _LAZY_PAGE_KEYS,
     _SEPARATE_EXPENSE_KEYS,
+    _SHELL_FIRST_KEYS,
     AccountantDashboard,
 )
 from tahmeed.ui.accountant.separate_expenses import TollPlazaWidget
@@ -29,6 +31,14 @@ def test_separate_expense_keys_cover_feeds() -> None:
     assert "toll_plaza" in _SEPARATE_EXPENSE_KEYS
     assert "parking_congo" in _SEPARATE_EXPENSE_KEYS
     assert "rahntech" in _SEPARATE_EXPENSE_KEYS
+
+
+def test_shell_first_covers_all_lazy_pages() -> None:
+    assert _SHELL_FIRST_KEYS == _LAZY_PAGE_KEYS
+    assert "verify" in _SHELL_FIRST_KEYS
+    assert "master_expenses" in _SHELL_FIRST_KEYS
+    assert "table" in _SHELL_FIRST_KEYS
+    assert "toll_plaza" in _SHELL_FIRST_KEYS
 
 
 def test_toll_plaza_init_does_not_refresh(qapp, monkeypatch) -> None:
@@ -81,6 +91,7 @@ def test_open_separate_expense_first_shows_placeholder(qapp, monkeypatch) -> Non
             self._pages: dict = {}
             self._page_indices: dict = {}
             self._nav_key = "toll_plaza"
+            self._register = None
 
         def _mount_page(self, key: str, widget: QWidget) -> QWidget:
             return AccountantDashboard._mount_page(self, key, widget)
@@ -94,6 +105,9 @@ def test_open_separate_expense_first_shows_placeholder(qapp, monkeypatch) -> Non
 
         def _activate_page(self, key: str) -> QWidget:
             return AccountantDashboard._activate_page(self, key)
+
+        def _after_lazy_activated(self, key: str, widget: QWidget) -> None:
+            AccountantDashboard._after_lazy_activated(self, key, widget)
 
     dash = _Dash()
     # Bind the real method onto our lightweight stand-in.
@@ -141,6 +155,7 @@ def test_stale_separate_expense_build_does_not_steal_stack(qapp) -> None:
             self._pages: dict = {}
             self._page_indices: dict = {}
             self._nav_key = "overview"
+            self._register = None
 
         def _mount_page(self, key: str, widget: QWidget) -> QWidget:
             return AccountantDashboard._mount_page(self, key, widget)
@@ -154,6 +169,9 @@ def test_stale_separate_expense_build_does_not_steal_stack(qapp) -> None:
 
         def _activate_page(self, key: str) -> QWidget:
             return AccountantDashboard._activate_page(self, key)
+
+        def _after_lazy_activated(self, key: str, widget: QWidget) -> None:
+            AccountantDashboard._after_lazy_activated(self, key, widget)
 
     dash = _Dash()
     dash._nav_key = "parking_congo"
@@ -175,6 +193,63 @@ def test_stale_separate_expense_build_does_not_steal_stack(qapp) -> None:
     host.close()
 
 
+def test_open_lazy_first_shows_shell_for_verify(qapp) -> None:
+    """Non-feed lazy tabs (Verify) also get an Opening… shell on first open."""
+    host = QWidget()
+    host.resize(800, 600)
+    stack = QStackedWidget(host)
+    stack.addWidget(QWidget())
+    host.show()
+    qapp.processEvents()
+
+    created = {"n": 0}
+
+    class _Dash:
+        def __init__(self) -> None:
+            self._stack = stack
+            self._pages: dict = {}
+            self._page_indices: dict = {}
+            self._nav_key = "verify"
+            self._register = None
+
+        def _mount_page(self, key: str, widget: QWidget) -> QWidget:
+            return AccountantDashboard._mount_page(self, key, widget)
+
+        def _create_page(self, key: str) -> QWidget:
+            created["n"] += 1
+            stub = QWidget()
+            stub.setObjectName(f"stub_{key}")
+            stub.refresh = lambda: None  # type: ignore[attr-defined]
+            return stub
+
+        def _activate_page(self, key: str) -> QWidget:
+            return AccountantDashboard._activate_page(self, key)
+
+        def _after_lazy_activated(self, key: str, widget: QWidget) -> None:
+            AccountantDashboard._after_lazy_activated(self, key, widget)
+
+    dash = _Dash()
+    AccountantDashboard._open_lazy_first(dash, "verify")
+
+    assert created["n"] == 0
+    current = stack.currentWidget()
+    assert current is not None
+    assert current.objectName() == "lazyPageOpening"
+    overlay = getattr(current, "_loading_overlay", None)
+    assert overlay is not None
+    assert overlay.isVisible()
+
+    for _ in range(30):
+        if "verify" in dash._pages:
+            break
+        qapp.processEvents()
+
+    assert "verify" in dash._pages
+    assert created["n"] == 1
+    assert stack.currentWidget() is dash._pages["verify"]
+    host.close()
+
+
 def test_revisit_after_second_feed_uses_widget_not_stale_index(qapp) -> None:
     """Opening shell removal must not make going back show the other feed."""
     host = QWidget()
@@ -190,6 +265,7 @@ def test_revisit_after_second_feed_uses_widget_not_stale_index(qapp) -> None:
             self._pages: dict = {}
             self._page_indices: dict = {}
             self._nav_key = "toll_plaza"
+            self._register = None
 
         def _mount_page(self, key: str, widget: QWidget) -> QWidget:
             return AccountantDashboard._mount_page(self, key, widget)
@@ -202,6 +278,9 @@ def test_revisit_after_second_feed_uses_widget_not_stale_index(qapp) -> None:
 
         def _activate_page(self, key: str) -> QWidget:
             return AccountantDashboard._activate_page(self, key)
+
+        def _after_lazy_activated(self, key: str, widget: QWidget) -> None:
+            AccountantDashboard._after_lazy_activated(self, key, widget)
 
     dash = _Dash()
     AccountantDashboard._open_separate_expense_first(dash, "toll_plaza")

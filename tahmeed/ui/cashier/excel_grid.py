@@ -130,6 +130,7 @@ from tahmeed.ui.cashier.register_delegates import (  # noqa: E402
     _parse_optional_amount_text, _ReceiptDelegate,
     _ItemDelegate, _CurrencyLineEdit, _TZSDelegate,
     _RCPT_COLORS, _RCPT_LABEL, _RECEIPT_OPTS, _RCPT_OPT_KEY, _RCPT_NORM, _VALID_RCPT,
+    _AMBIGUOUS_RCPT,
     _CELL_H_INSET,
 )
 
@@ -1093,6 +1094,8 @@ class DailyRegister(QWidget):
         self._locked_subitems: dict = {}   # item name (lower) -> [sub-item names]
         self._restrict_items: bool = False
         self._restrict_payees: bool = False
+        # Ownership / APR BY must match People Registry so receipt notify can resolve.
+        self._restrict_people: bool = True
         self._export_restrict_surfaces: set = set()
         self._defer_item_to_verify: bool = False
         # When True, typed/pasted descriptions fill blank Item/Payee from maps.
@@ -1102,7 +1105,7 @@ class DailyRegister(QWidget):
         self._fleet_numbers: set = set()   # uppercased valid fleet numbers
         self._fleet_kinds: dict = {}       # number → "truck" | "trailer" | "motor_vehicle"
         self._allowed_truck_labels: set = set(DEFAULT_PLACE_LABELS)
-        self._people_names: list = []      # Ownership / APR BY suggestions (unrestricted)
+        self._people_names: list = []      # Ownership / APR BY (People Registry)
         self._payee_names: list = []       # Payee catalog suggestions
         # Guards QuickBooks-style not-in-list prompts (row, col) while modal is open.
         self._not_in_list_prompting: set = set()
@@ -3668,15 +3671,20 @@ class DailyRegister(QWidget):
         self.ensure_fresh_day_view()
 
     def update_people(self, names: list) -> None:
-        """Refresh Ownership / APR BY suggestion list (free text still allowed)."""
-        self._people_names = [str(n).strip().upper() for n in (names or []) if str(n).strip()]
+        """Refresh Ownership / APR BY suggestion list from People Registry."""
+        self._people_names = sorted({
+            str(n).strip().upper() for n in (names or []) if str(n).strip()
+        })
 
     async def _load_people_names(self) -> None:
         try:
-            from tahmeed.services.people_service import get_people_names
+            from tahmeed.services.people_service import get_people_names, invalidate_people_cache
+            invalidate_people_cache()
             self.update_people(await get_people_names())
         except Exception:
-            self._people_names = []
+            # Keep any catalog-loaded names; only clear when we had none.
+            if not self._people_names:
+                self._people_names = []
 
     def update_payees(self, names: list) -> None:
         """Refresh Payee column suggestion list (free text still allowed)."""
@@ -4177,7 +4185,13 @@ class DailyRegister(QWidget):
             _parse_optional_amount_text(raw_usd),
         )
 
-        rcpt_status = txt(COL_RECEIPT).strip()
+        rcpt_raw = txt(COL_RECEIPT).strip()
+        rcpt_status = _RCPT_OPT_KEY.get(
+            rcpt_raw.lower(),
+            _RCPT_NORM.get(rcpt_raw.lower(), rcpt_raw.lower() or "pending"),
+        )
+        if rcpt_status not in _VALID_RCPT:
+            rcpt_status = "pending"  # ambiguous — resolved before save
 
         item_name = txt(COL_ITEM)
         meta = self._pending_row_meta.get(row) or {}
@@ -4206,6 +4220,23 @@ class DailyRegister(QWidget):
                 payee_name = payee_name.upper()
         else:
             payee_name = payee_name.upper()
+
+        ownership = " ".join(txt(COL_OWN).upper().split())
+        if ownership and self._restrict_people and self._people_names:
+            known_own = self._lookup_person_name(ownership)
+            if known_own is None:
+                raise ValueError(
+                    f'"{ownership}" is not in the People list (Ownership).'
+                )
+            ownership = known_own
+        approver = " ".join(txt(COL_APR).upper().split())
+        if approver and self._restrict_people and self._people_names:
+            known_apr = self._lookup_person_name(approver)
+            if known_apr is None:
+                raise ValueError(
+                    f'"{approver}" is not in the People list (APR BY).'
+                )
+            approver = known_apr
 
         if cat is not None and getattr(cat, "lock_description", False):
             allowed = self._locked_subitems.get(item_name.lower(), [])
@@ -4322,8 +4353,8 @@ class DailyRegister(QWidget):
             receipt_status=rcpt_status,
             ref_float=ref_text,
             notes_flag=_is_refund_float(ref_text),
-            ownership=txt(COL_OWN).upper(),
-            approver=txt(COL_APR).upper(),
+            ownership=ownership,
+            approver=approver,
             payee=payee_name,
             cheque=txt(COL_CHEQUE).upper(),
             cashier_id=self._user._id,
@@ -4532,6 +4563,185 @@ class DailyRegister(QWidget):
             "import_primary_date": tx.import_primary_date,
             "register_status": tx.register_status or "draft",
         }
+
+    def _row_receipt_key(self, row: int) -> str:
+        raw = self._cell_text(row, COL_RECEIPT).strip()
+        if not raw:
+            return ""
+        key = _RCPT_OPT_KEY.get(
+            raw.lower(),
+            _RCPT_NORM.get(raw.lower(), raw.lower()),
+        )
+        return key if key in _VALID_RCPT else raw.lower()
+
+    async def _preflight_people_for_save(self, *, parked_only: bool = False) -> bool:
+        """Ensure Ownership/APR are in People Registry before write. False = abort."""
+        if not self._restrict_people:
+            return True
+        if not self._people_names:
+            # Catalog/people API may still be cold — try once, then allow save.
+            await self._load_people_names()
+            if not self._people_names:
+                return True
+
+        unknown: list[tuple[int, str, str]] = []  # row, column label, name
+        for row in range(self._table.rowCount()):
+            if not self._row_has_data(row):
+                continue
+            if parked_only and not self._row_marked_parked(row):
+                continue
+            will_write = (
+                row in self._dirty_rows
+                or (row >= self._saved_count and self._row_has_data(row))
+            )
+            if not will_write:
+                continue
+            for col, label in ((COL_OWN, "Ownership"), (COL_APR, "APR BY")):
+                name = " ".join(self._cell_text(row, col).upper().split())
+                if not name:
+                    continue
+                if self._lookup_person_name(name) is None:
+                    unknown.append((row, label, name))
+
+        if not unknown:
+            return True
+
+        # Deduplicate names for a single prompt.
+        names = sorted({n for _r, _l, n in unknown})
+        from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
+
+        preview = ", ".join(names[:8])
+        if len(names) > 8:
+            preview += f", … (+{len(names) - 8})"
+        if not ask_confirm(
+            self,
+            title="People Registry",
+            heading="Add missing people so receipt notify can resolve?",
+            body=(
+                f"Not in the People list:\n{preview}\n\n"
+                "Add them now, or Cancel and pick a listed name."
+            ),
+            accept_label="Add people",
+            cancel_label="Cancel save",
+            destructive=False,
+            default_cancel=True,
+        ):
+            return False
+
+        from tahmeed.services.people_service import add_person, get_people_names
+
+        try:
+            for name in names:
+                await add_person(name)
+            self.update_people(await get_people_names())
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "People Registry",
+                f"Could not add people:\n{exc}\n\n"
+                "Save cancelled — pick Ownership/APR BY from the list.",
+            )
+            return False
+
+        # Canonicalize cells to registry names.
+        prev = self._table.blockSignals(True)
+        try:
+            for row, _label, name in unknown:
+                known = self._lookup_person_name(name) or name
+                col = COL_OWN if _label == "Ownership" else COL_APR
+                it = self._table.item(row, col)
+                if it is not None and it.text() != known:
+                    it.setText(known)
+                if row < self._saved_count:
+                    self._dirty_rows.add(row)
+        finally:
+            self._table.blockSignals(prev)
+        return True
+
+    def _apply_receipt_key(self, row: int, key: str) -> None:
+        """Write a canonical receipt key into the cell without firing itemChanged."""
+        it = self._table.item(row, COL_RECEIPT)
+        if it is None:
+            it = QTableWidgetItem(key)
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            self._table.setItem(row, COL_RECEIPT, it)
+        else:
+            it.setText(key)
+        if row < self._saved_count:
+            self._dirty_rows.add(row)
+
+    def _resolve_ambiguous_receipt_statuses(self, *, parked_only: bool = False) -> bool:
+        """Normalize receipt before save. False only if user cancels PENDING/MISSING.
+
+        Blank cells auto-pick: Ownership set → RECEIPT (notify), else NO RECEIPT.
+        Explicit PENDING / MISSING still ask which of the two types was meant.
+        """
+        blank_rows: list[int] = []
+        legacy_rows: list[int] = []
+        for row in range(self._table.rowCount()):
+            if not self._row_has_data(row):
+                continue
+            if parked_only and not self._row_marked_parked(row):
+                continue
+            will_write = (
+                row in self._dirty_rows
+                or (row >= self._saved_count and self._row_has_data(row))
+            )
+            if not will_write:
+                continue
+            key = self._row_receipt_key(row)
+            if key == "":
+                blank_rows.append(row)
+            elif key in ("pending", "missing"):
+                legacy_rows.append(row)
+
+        prev = self._table.blockSignals(True)
+        try:
+            for row in blank_rows:
+                ownership = " ".join(self._cell_text(row, COL_OWN).upper().split())
+                self._apply_receipt_key(
+                    row, "receipt" if ownership else "no_receipt"
+                )
+        finally:
+            self._table.blockSignals(prev)
+
+        if not legacy_rows:
+            return True
+
+        from tahmeed.ui.dialogs.confirm_dialog import DialogAction, ask_choice
+
+        labels = sorted({
+            (_RCPT_LABEL.get(self._row_receipt_key(r), "PENDING") or "PENDING").upper()
+            for r in legacy_rows
+        })
+        choice = ask_choice(
+            self,
+            title="Receipt type",
+            heading="Choose RECEIPT or NO RECEIPT",
+            body=(
+                f"{len(legacy_rows)} row(s) still say {', '.join(labels)}.\n\n"
+                "RECEIPT = requires a receipt (notify owner).\n"
+                "NO RECEIPT = no receipt needed (do not notify)."
+            ),
+            note="PENDING and MISSING are legacy — pick one of the two types.",
+            actions=(
+                DialogAction("receipt", "RECEIPT", "primary"),
+                DialogAction("no_receipt", "NO RECEIPT", "secondary"),
+                DialogAction("cancel", "Cancel", "cancel"),
+            ),
+            default_action_id="receipt",
+            dismiss_id="cancel",
+        )
+        if choice not in ("receipt", "no_receipt"):
+            return False
+
+        prev = self._table.blockSignals(True)
+        try:
+            for row in legacy_rows:
+                self._apply_receipt_key(row, choice)
+        finally:
+            self._table.blockSignals(prev)
+        return True
 
     # ------------------------------------------------------------------
     # Export
@@ -4972,6 +5182,8 @@ class DailyRegister(QWidget):
                 self._validate_item_cell(row, item)
             elif col == COL_PAYEE:
                 self._validate_payee_cell(row, item)
+            elif col in (COL_OWN, COL_APR):
+                self._validate_people_cell(row, item)
             elif col == COL_DESC and item.text().strip():
                 self._validate_locked_description(row, item)
             elif col == COL_TRUCK and item.text().strip():
@@ -5004,11 +5216,13 @@ class DailyRegister(QWidget):
             self._sync_row_date(row)
             self._table.blockSignals(False)
 
-        # Item / Payee / Description / Truck validation (canonicalise, restrict, locked)
+        # Item / Payee / People / Description / Truck validation
         if col == COL_ITEM:
             self._validate_item_cell(row, item)
         elif col == COL_PAYEE:
             self._validate_payee_cell(row, item)
+        elif col in (COL_OWN, COL_APR):
+            self._validate_people_cell(row, item)
         elif col == COL_DESC and item.text().strip():
             from tahmeed.services.cashier_service import remember_description
             remember_description(item.text())
@@ -8312,6 +8526,9 @@ class DailyRegister(QWidget):
         Unsaved parked rows (local bucket or still on the Parked grid) count as
         unsaved work — Save persists them as ``register_status=parked``.
 
+        Outbox rows already marked PENDING / IN_FLIGHT after Save are durable
+        locally and must not trip the leave dialog (drain owns them).
+
         While Parked is showing, also inspect the keep-alive My table/session so
         navigation prompts still see leftover My entries. Pass
         ``include_stashed_my=False`` for Parked-surface Save outcomes that must
@@ -8325,6 +8542,12 @@ class DailyRegister(QWidget):
         for row in range(self._saved_count, self._table.rowCount()):
             if not self._row_has_data(row):
                 continue
+            # Only skip rows Save already queued into the outbox (explicit status).
+            raw_sync = (self._pending_row_meta.get(row) or {}).get("sync_status")
+            if raw_sync:
+                status = normalize_sync_status(raw_sync)
+                if status in (SYNC_PENDING, SYNC_IN_FLIGHT):
+                    continue
             return True
         if include_stashed_my and self._parked_mode:
             return self._stashed_my_has_work()
@@ -9234,6 +9457,7 @@ class DailyRegister(QWidget):
 
                 def _progress(done: int, tot: int) -> None:
                     # Phase 2/3 — status only (no overlay / toolbar lock).
+                    # Concurrent chunk workers report completed count (not serial ranges).
                     if nested_busy or tot <= 0:
                         return
                     esc = " · Esc to cancel" if tot > 1 else ""
@@ -9244,12 +9468,12 @@ class DailyRegister(QWidget):
                         )
                         return
                     if done <= 0:
-                        lo, hi = 1, min(BULK_CREATE_CHUNK, tot)
-                    else:
-                        hi = min(done, tot)
-                        lo = ((hi - 1) // BULK_CREATE_CHUNK) * BULK_CREATE_CHUNK + 1
+                        self.transient_status.emit(
+                            f"Syncing 0 of {tot}…{esc}"
+                        )
+                        return
                     self.transient_status.emit(
-                        f"Syncing {lo}–{hi} of {tot}…{esc}"
+                        f"Syncing {min(done, tot)} of {tot}…{esc}"
                     )
 
                 try:
@@ -10121,6 +10345,12 @@ class DailyRegister(QWidget):
             )
             return False
 
+        if not self._resolve_ambiguous_receipt_statuses(parked_only=parked_only):
+            return False
+
+        if not await self._preflight_people_for_save(parked_only=parked_only):
+            return False
+
         missing_truck_rows = [
             row for row in self._rows_missing_required_truck()
             if not (self._pending_row_meta.get(row) or {}).get("parked")
@@ -10562,11 +10792,20 @@ class DailyRegister(QWidget):
                 if parked_saved_ids:
                     self._drop_local_parked_by_client_ids(parked_saved_ids)
 
+            # Receipt-required rows sync immediately so chase + push fire on Save
+            # (outbox would leave the day looking "unsaved" until drain finishes).
+            needs_receipt_sync = any(
+                (getattr(tx, "receipt_status", "") or "").strip().lower()
+                in ("receipt", "pending", "missing")
+                and str(getattr(tx, "ownership", "") or "").strip()
+                for _row, tx in draft_to_save
+            )
             use_async_outbox = (
                 bool(draft_to_save)
                 and not self._submit_in_flight
                 and not self._merged_mode
                 and not self._parked_mode
+                and not needs_receipt_sync
             )
             if use_async_outbox:
                 queued = self._enqueue_inserts_for_outbox(draft_to_save)
@@ -10819,6 +11058,16 @@ class DailyRegister(QWidget):
             if isinstance(document, dict) and str(document.get("name") or "").strip()
         ]
         self.update_payees(names)
+        people_names = [
+            str(document.get("name") or "").strip().upper()
+            for document in snapshot.get("people") or []
+            if isinstance(document, dict) and str(document.get("name") or "").strip()
+        ]
+        if people_names:
+            self.update_people(people_names)
+        else:
+            # Older servers may omit people from catalog — fall back to /people.
+            asyncio.ensure_future(self._load_people_names())
 
     def _apply_catalog_settings(self, snapshot, setting_from_snapshot, normalize_export_surfaces) -> None:
         self._restrict_items = bool(setting_from_snapshot(snapshot, "restrict_items", False))
@@ -11089,11 +11338,25 @@ class DailyRegister(QWidget):
             f'"{text}" is not in the Payee list. Cancel to clear, or Add Payee.'
         )
 
+    def _flag_unknown_person(self, item: QTableWidgetItem, text: str) -> None:
+        item.setForeground(QBrush(NEG_COLOR))
+        item.setToolTip(
+            f'"{text}" is not in the People list. Cancel to clear, or Add Person.'
+        )
+
     def _clear_catalog_flag(self, row: int, item: QTableWidgetItem) -> None:
         tip = item.toolTip() or ""
-        if "is not in the Item list" not in tip and "is not in the Payee list" not in tip:
+        if (
+            "is not in the Item list" not in tip
+            and "is not in the Payee list" not in tip
+            and "is not in the People list" not in tip
+        ):
             # Legacy flag wording from older builds.
-            if "is not a known item" not in tip and "is not a known payee" not in tip:
+            if (
+                "is not a known item" not in tip
+                and "is not a known payee" not in tip
+                and "is not a known person" not in tip
+            ):
                 return
         item.setToolTip("")
         item.setForeground(QBrush())
@@ -11182,6 +11445,40 @@ class DailyRegister(QWidget):
             0, lambda r=row, t=text: self._offer_add_unknown_payee(r, t)
         )
 
+    def _lookup_person_name(self, text: str) -> str | None:
+        needle = " ".join((text or "").strip().upper().split())
+        if not needle:
+            return None
+        return next((p for p in self._people_names if p == needle), None)
+
+    def _validate_people_cell(self, row: int, item: QTableWidgetItem) -> None:
+        """Ownership / APR BY — must match People Registry when restrict is on."""
+        text = item.text().strip()
+        if not text:
+            self._clear_catalog_flag(row, item)
+            return
+        known = self._lookup_person_name(text)
+        if known is not None:
+            if item.text() != known:
+                self._table.blockSignals(True)
+                item.setText(known)
+                self._table.blockSignals(False)
+            self._clear_catalog_flag(row, item)
+            return
+        if not self._restrict_people:
+            self._clear_catalog_flag(row, item)
+            return
+        if not self._people_names:
+            # List not loaded yet — don't paint everything red.
+            return
+        self._flag_unknown_person(item, text)
+        if self._bulk_mutating:
+            return
+        col = item.column()
+        QTimer.singleShot(
+            0, lambda r=row, c=col, t=text: self._offer_add_unknown_person(r, c, t)
+        )
+
     def _offer_add_unknown_item(self, row: int, text: str) -> None:
         key = (row, COL_ITEM, text)
         if key in self._not_in_list_prompting:
@@ -11242,6 +11539,48 @@ class DailyRegister(QWidget):
             )
         finally:
             self._not_in_list_prompting.discard(key)
+
+    def _offer_add_unknown_person(self, row: int, col: int, text: str) -> None:
+        key = (row, col, text)
+        if key in self._not_in_list_prompting:
+            return
+        it = self._table.item(row, col)
+        if it is None or it.text().strip() != text:
+            return
+        if self._lookup_person_name(text) is not None:
+            return
+        if not self._restrict_people or self._bulk_mutating:
+            return
+        self._not_in_list_prompting.add(key)
+        try:
+            from tahmeed.ui.dialogs.not_in_list_dialog import ask_not_in_list
+
+            if not ask_not_in_list(self, entity="Person", name=text):
+                self._clear_catalog_cell(row, col)
+                return
+            asyncio.ensure_future(self._finish_add_person_from_prompt(row, col, text))
+        finally:
+            self._not_in_list_prompting.discard(key)
+
+    async def _finish_add_person_from_prompt(
+        self, row: int, col: int, text: str
+    ) -> None:
+        from tahmeed.services.people_service import add_person, get_people_names
+
+        name = " ".join((text or "").strip().upper().split())
+        if not name:
+            self._clear_catalog_cell(row, col)
+            return
+        try:
+            await add_person(name)
+            self.update_people(await get_people_names())
+        except Exception as exc:
+            QMessageBox.warning(self, "Add Person", f"Could not add person:\n{exc}")
+            self._clear_catalog_cell(row, col)
+            return
+        self._set_catalog_cell_text(row, col, name)
+        if row < self._saved_count:
+            self._mark_dirty(row)
 
     async def _finish_add_item_from_prompt(self, row: int, data: dict) -> None:
         from tahmeed.services.mapping_assignment_service import create_item_for_mapping

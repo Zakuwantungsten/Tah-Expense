@@ -58,12 +58,14 @@ _LAZY_PAGE_KEYS = frozenset({
     "manage_people",
     "manage_payees",
     "manage_users",
+    "receipt_disk",
+    "receipts",
+    "receipt_browse",
     "table",
     "browse",
 })
 
-# Separate Expenses feeds: heavy first-build — show a loader shell first so
-# sidebar navigation never sits on the previous page with no feedback.
+# Separate Expenses feeds (subset of lazy pages) — warm-imported after login.
 _SEPARATE_EXPENSE_KEYS = frozenset({
     "toll_plaza",
     "parking_congo",
@@ -75,6 +77,10 @@ _SEPARATE_EXPENSE_KEYS = frozenset({
     "comesa",
     "rahntech",
 })
+
+# Every first-open lazy tab uses an Opening… shell so the stack flips before
+# heavy __init__ (Verify, Master, Table, Separate Expenses, manage pages, …).
+_SHELL_FIRST_KEYS = _LAZY_PAGE_KEYS
 
 # Long-poll wait; reconnects immediately when system_counters change.
 _NOTIFICATION_WAIT_S = 25.0
@@ -127,14 +133,22 @@ class AccountantDashboard(QWidget):
         self._notification_timer.start()
         self._start_notification_stream()
         schedule_coro(self._refresh_day_issues_badge())
-        # Preload the heavy separate-expenses module after the UI is up so the
-        # first sidebar click into those tabs does not stall on cold import.
-        QTimer.singleShot(0, self._warm_import_separate_expenses)
+        # Preload heavy modules after the UI is up so first sidebar clicks
+        # spend time on widget build, not cold import.
+        QTimer.singleShot(0, self._warm_import_heavy_pages)
 
     @staticmethod
     def _warm_import_separate_expenses() -> None:
+        """Compat shim — prefer ``_warm_import_heavy_pages``."""
+        AccountantDashboard._warm_import_heavy_pages()
+
+    @staticmethod
+    def _warm_import_heavy_pages() -> None:
         try:
             import tahmeed.ui.accountant.separate_expenses  # noqa: F401
+            import tahmeed.ui.accountant.verify_inbox  # noqa: F401
+            import tahmeed.ui.accountant.master_expenses  # noqa: F401
+            import tahmeed.ui.cashier.excel_grid  # noqa: F401
         except Exception:
             pass
 
@@ -230,6 +244,49 @@ class AccountantDashboard(QWidget):
             )
         )
 
+        # Bottom-right toast — click feedback while tab chrome / data catches up.
+        from tahmeed.ui.widgets.nav_toast import NavToast
+
+        self._nav_toast = NavToast(self)
+
+    # ── Nav toast helpers ───────────────────────────────────────────────────
+
+    def _nav_toast_label(self, key: str) -> str:
+        """Human label for a sidebar / stack key."""
+        from tahmeed.ui.accountant.sidebar import _SECTIONS
+
+        for _section, items in _SECTIONS:
+            for item_key, label, *_rest in items:
+                if item_key == key:
+                    return str(label)
+        d = self._sidebar.item_def(key)
+        if d is not None:
+            # Dynamic ITEMS: (name, icon, sidebar_label)
+            if len(d) >= 3 and d[2]:
+                return str(d[2])
+            if d[0]:
+                return str(d[0])
+        if "::" in key:
+            return key.split("::")[-1].replace("_", " ").strip().title() or key
+        return key.replace("_", " ").strip().title() or "page"
+
+    def _toast_opening(self, key: str) -> None:
+        toast = getattr(self, "_nav_toast", None)
+        if toast is None:
+            return
+        toast.show_opening(AccountantDashboard._nav_toast_label(self, key))
+
+    def _toast_loading(self, key: str) -> None:
+        toast = getattr(self, "_nav_toast", None)
+        if toast is None:
+            return
+        toast.show_loading(AccountantDashboard._nav_toast_label(self, key))
+
+    def _toast_dismiss(self) -> None:
+        toast = getattr(self, "_nav_toast", None)
+        if toast is not None:
+            toast.dismiss()
+
     # ── Lazy page factories ─────────────────────────────────────────────────
 
     def _mount_page(self, key: str, widget: QWidget) -> QWidget:
@@ -252,38 +309,94 @@ class AccountantDashboard(QWidget):
         self._page_indices[key] = self._stack.indexOf(widget)
         return widget
 
-    def _open_separate_expense_first(self, key: str) -> None:
-        """Switch to a loader shell now; build the real feed page on next tick."""
+    def _after_lazy_activated(self, key: str, widget: QWidget) -> None:
+        """Kick page-specific load after the stack already shows ``widget``."""
         from tahmeed.ui.async_utils import schedule_call
+
+        # Page is visible — toast shifts to Loading… (covers network lag).
+        AccountantDashboard._toast_loading(self, key)
+
+        if key == "table":
+            assert self._register is not None
+            self._register.reload_settings()
+            return
+        if key == "day_issues":
+            from datetime import date as _date
+
+            target = _date.today()
+            if self._register is not None and getattr(
+                self._register, "_current_date", None
+            ):
+                target = self._register._current_date
+            # Keep Verify VALUE filter / All-days / date on tab return.
+            if hasattr(widget, "on_page_shown"):
+                widget.on_page_shown(target)
+                return
+            if hasattr(widget, "open_for_date"):
+                widget.open_for_date(target)
+                return
+            if hasattr(widget, "set_date"):
+                widget.set_date(target)
+                return
+        refresh = getattr(widget, "refresh", None)
+        if callable(refresh):
+            schedule_call(refresh)
+
+    def _open_lazy_first(self, key: str) -> None:
+        """Switch to a loader shell now; build the real page on next tick.
+
+        Used for every heavy first-open (Separate Expenses, Verify, Master,
+        Daily Register, manage pages, …) so sidebar clicks never sit on the
+        previous page with no feedback.
+        """
         from tahmeed.ui.widgets.loading_overlay import show_widget_loading
 
         if key in self._pages:
             widget = self._activate_page(key)
-            refresh = getattr(widget, "refresh", None)
-            if callable(refresh):
-                schedule_call(refresh)
+            self._after_lazy_activated(key, widget)
             return
 
-        # Re-show the existing Opening… shell if this feed is already building.
-        opening = getattr(self, "_separate_expense_opening", None)
+        # First open — toast + Opening… shell while __init__ is deferred.
+        AccountantDashboard._toast_opening(self, key)
+
+        # Re-show the existing Opening… shell if this page is already building.
+        opening = getattr(self, "_lazy_opening", None)
         if opening is None:
-            self._separate_expense_opening = {}
-            opening = self._separate_expense_opening
+            # Keep legacy attr name in sync for any external peekers/tests.
+            self._lazy_opening = {}
+            self._separate_expense_opening = self._lazy_opening
+            opening = self._lazy_opening
         pending = opening.get(key)
         if pending is not None:
             idx = self._stack.indexOf(pending)
             if idx >= 0:
                 self._stack.setCurrentIndex(idx)
+                pending.repaint()
                 return
             opening.pop(key, None)
 
         host = QWidget()
-        host.setObjectName("separateExpenseOpening")
-        host.setStyleSheet("background:#F4F6F8;")
-        show_widget_loading(host, "Opening…")
+        # separateExpenseOpening kept for Separate Expenses tests; others share
+        # the same instant-shell behavior under lazyPageOpening.
+        host.setObjectName(
+            "separateExpenseOpening"
+            if key in _SEPARATE_EXPENSE_KEYS
+            else "lazyPageOpening"
+        )
+        host.setStyleSheet(f"background:{_APP_BG};")
+        overlay = show_widget_loading(host, "Opening…")
         opening[key] = host
         opening_idx = self._stack.addWidget(host)
         self._stack.setCurrentIndex(opening_idx)
+        # Paint the shell before returning from the click handler so the user
+        # sees Opening… immediately (build still waits for the next tick).
+        try:
+            host.repaint()
+            if overlay is not None:
+                overlay.repaint()
+            self._stack.repaint()
+        except RuntimeError:
+            pass
 
         def _build_and_swap(k: str = key, placeholder: QWidget = host) -> None:
             try:
@@ -303,9 +416,7 @@ class AccountantDashboard(QWidget):
                 # Stale first-open must not steal the stack after the user left.
                 if getattr(self, "_nav_key", None) == k:
                     self._activate_page(k)
-                    refresh = getattr(widget, "refresh", None)
-                    if callable(refresh):
-                        schedule_call(refresh)
+                    self._after_lazy_activated(k, widget)
             except Exception as exc:
                 QMessageBox.critical(
                     self,
@@ -327,6 +438,10 @@ class AccountantDashboard(QWidget):
 
         # Always defer one tick so the Opening… shell paints before __init__.
         QTimer.singleShot(0, _build_and_swap)
+
+    def _open_separate_expense_first(self, key: str) -> None:
+        """Compat alias for tests — same instant-shell path as all lazy tabs."""
+        AccountantDashboard._open_lazy_first(self, key)
 
     def _create_page(self, key: str) -> QWidget:
         # Imports are deferred so login does not pay for every heavy module.
@@ -492,6 +607,21 @@ class AccountantDashboard(QWidget):
         if key == "manage_users":
             from tahmeed.ui.admin.users_tab import UsersTab
             return UsersTab()
+
+        if key == "receipt_disk":
+            from tahmeed.ui.widgets.receipt_storage_panel import ReceiptStoragePanel
+            return ReceiptStoragePanel()
+
+        if key == "receipts":
+            # Same desk as cashier (Requests / Chase / Inbox / Link / Library),
+            # plus accountant Evidence pack for TRA/KRA handoff.
+            from tahmeed.ui.widgets.receipt_chase_panel import ReceiptChasePanel
+            return ReceiptChasePanel(can_export=True)
+
+        if key == "receipt_browse":
+            # Folder/bucket explorer + pack/download (not the chase desk).
+            from tahmeed.ui.widgets.receipt_browser_panel import ReceiptBrowserPanel
+            return ReceiptBrowserPanel()
 
         if key == "table":
             from tahmeed.ui.cashier.excel_grid import DailyRegister
@@ -878,21 +1008,16 @@ class AccountantDashboard(QWidget):
         self._on_nav(key)
 
     def pause_notification_polling(self) -> None:
-        """Stop badge stream and connectivity polls during nested Qt dialogs."""
-        from tahmeed.ui.async_utils import in_running_task
+        """Stop badge stream and connectivity polls during nested Qt dialogs.
 
+        Soft-stop only: clear the live flag and leave the long-poll Task alone.
+        Cancelling it (even deferred) while Save/Import runs nested Qt loops
+        makes Python 3.14 + qasync raise ``task_wakeup`` / CancelScope errors.
+        The loop exits itself after the current wait returns.
+        """
         self._notification_live = False
         self._notification_timer.stop()
-        task = getattr(self, "_notification_poll_task", None)
-        self._notification_poll_task = None
         self._notification_poll_in_flight = False
-        if task is not None and not task.done():
-            # Cancelling while another Task is current (import / save) makes
-            # Python 3.14 + qasync raise on task_wakeup. Defer the cancel.
-            if in_running_task():
-                QTimer.singleShot(0, task.cancel)
-            else:
-                task.cancel()
         from tahmeed.services.connectivity_service import connectivity_monitor
 
         connectivity_monitor.pause()
@@ -1002,7 +1127,11 @@ class AccountantDashboard(QWidget):
 
         while self._notification_live:
             try:
-                payload = await wait_notification_counts(timeout=_NOTIFICATION_WAIT_S)
+                # Short waits so soft-pause (_notification_live=False) is noticed
+                # quickly without cancelling the Task mid-flight.
+                payload = await wait_notification_counts(
+                    timeout=min(float(_NOTIFICATION_WAIT_S), 5.0)
+                )
                 if not self._notification_live:
                     break
                 self._apply_notification_counts(payload)
@@ -1052,72 +1181,20 @@ class AccountantDashboard(QWidget):
             self._register.note_catalog_return()
 
         if key == "overview":
+            self._toast_loading("overview")
             self._stack.setCurrentIndex(self._page_indices["overview"])
             refresh = getattr(self._overview, "refresh", None)
             if callable(refresh):
                 schedule_call(refresh)
             return
 
-        if key in _LAZY_PAGE_KEYS:
-            from tahmeed.ui.async_utils import in_running_task
-
-            # First Separate Expenses open: paint a loader shell immediately,
-            # then build the real page on the next tick (avoids "dead" nav).
-            if key in _SEPARATE_EXPENSE_KEYS and key not in self._pages:
-                self._open_separate_expense_first(key)
-                return
-
-            def _open_lazy(k: str = key) -> None:
-                try:
-                    # Deferred opens must not override a newer sidebar click.
-                    if getattr(self, "_nav_key", None) != k:
-                        if k not in self._pages:
-                            self._ensure_page(k)
-                        return
-                    widget = self._ensure_page(k)
-                    self._activate_page(k)
-                    if k == "table":
-                        assert self._register is not None
-                        self._register.reload_settings()
-                        return
-                    if k == "day_issues":
-                        from datetime import date as _date
-                        target = _date.today()
-                        if self._register is not None and getattr(
-                            self._register, "_current_date", None
-                        ):
-                            target = self._register._current_date
-                        # Keep Verify VALUE filter / All-days / date on tab return.
-                        if hasattr(widget, "on_page_shown"):
-                            widget.on_page_shown(target)
-                            return
-                        if hasattr(widget, "open_for_date"):
-                            widget.open_for_date(target)
-                            return
-                        if hasattr(widget, "set_date"):
-                            widget.set_date(target)
-                            return
-                    refresh = getattr(widget, "refresh", None)
-                    if callable(refresh):
-                        schedule_call(refresh)
-                except Exception as exc:
-                    from PySide6.QtWidgets import QMessageBox
-
-                    QMessageBox.critical(
-                        self,
-                        "Unable to open page",
-                        f"Failed to open this page:\n{exc}",
-                    )
-
-            # First-time page __init__ may schedule coroutines; building while
-            # another Task is current crashes under Python 3.14 + qasync.
-            if in_running_task() and key not in self._pages:
-                schedule_call(_open_lazy)
-            else:
-                _open_lazy()
+        if key in _SHELL_FIRST_KEYS:
+            # Instant Opening… shell on first visit; cached pages activate now.
+            self._open_lazy_first(key)
             return
 
         if self._sidebar.item_def(key) is not None:
+            self._toast_opening(key)
             self._show_category(key)
         elif key == "sm_burhani":
             # Parent click is handled by the sidebar (expand + first sub-item).
@@ -1193,36 +1270,165 @@ class AccountantDashboard(QWidget):
         except Exception:
             pass
 
+    def _drop_stale_receipt_subtables(self) -> None:
+        """Remove mistaken category shells cached before Chase/Storage routing."""
+        stale = [k for k in self._subtable_indices if k.startswith("receipts::")]
+        for cache_key in stale:
+            idx = self._subtable_indices.pop(cache_key, None)
+            if idx is None:
+                continue
+            w = self._stack.widget(idx)
+            if w is not None:
+                self._stack.removeWidget(w)
+                w.deleteLater()
+
+    def _open_dynamic_first(
+        self,
+        cache_key: str,
+        index_map: dict,
+        factory,
+        *,
+        nav_token: str,
+    ) -> None:
+        """Instant Opening… shell for first-open category / recon / sub-table."""
+        from tahmeed.ui.async_utils import schedule_call
+        from tahmeed.ui.widgets.loading_overlay import show_widget_loading
+
+        if cache_key in index_map:
+            idx = index_map[cache_key]
+            self._stack.setCurrentIndex(idx)
+            AccountantDashboard._toast_loading(self, nav_token)
+            w = self._stack.widget(idx)
+            if w is not None and callable(getattr(w, "refresh", None)):
+                schedule_call(w.refresh)
+            return
+
+        AccountantDashboard._toast_opening(self, nav_token)
+
+        opening = getattr(self, "_lazy_opening", None)
+        if opening is None:
+            self._lazy_opening = {}
+            self._separate_expense_opening = self._lazy_opening
+            opening = self._lazy_opening
+        pending = opening.get(cache_key)
+        if pending is not None:
+            idx = self._stack.indexOf(pending)
+            if idx >= 0:
+                self._stack.setCurrentIndex(idx)
+                pending.repaint()
+                return
+            opening.pop(cache_key, None)
+
+        host = QWidget()
+        host.setObjectName("lazyPageOpening")
+        host.setStyleSheet(f"background:{_APP_BG};")
+        overlay = show_widget_loading(host, "Opening…")
+        opening[cache_key] = host
+        opening_idx = self._stack.addWidget(host)
+        self._stack.setCurrentIndex(opening_idx)
+        try:
+            host.repaint()
+            if overlay is not None:
+                overlay.repaint()
+            self._stack.repaint()
+        except RuntimeError:
+            pass
+
+        def _build_and_swap(
+            ck: str = cache_key,
+            placeholder: QWidget = host,
+            token: str = nav_token,
+        ) -> None:
+            try:
+                if ck not in index_map:
+                    widget = factory()
+                    ph_idx = self._stack.indexOf(placeholder)
+                    if ph_idx >= 0:
+                        self._stack.insertWidget(ph_idx, widget)
+                    else:
+                        self._stack.addWidget(widget)
+                    index_map[ck] = self._stack.indexOf(widget)
+                else:
+                    widget = self._stack.widget(index_map[ck])
+                    if widget is None:
+                        return
+                # Stale build must not override a newer sidebar click.
+                if getattr(self, "_nav_key", None) == token:
+                    self._stack.setCurrentWidget(widget)
+                    index_map[ck] = self._stack.indexOf(widget)
+                    AccountantDashboard._toast_loading(self, token)
+                    if callable(getattr(widget, "refresh", None)):
+                        schedule_call(widget.refresh)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Unable to open page",
+                    f"Failed to open this page:\n{exc}",
+                )
+            finally:
+                opening.pop(ck, None)
+                try:
+                    self._stack.removeWidget(placeholder)
+                    placeholder.deleteLater()
+                except RuntimeError:
+                    pass
+
+        QTimer.singleShot(0, _build_and_swap)
+
     def _show_category(self, key: str) -> None:
         """Lazily create (and cache) the item table for this dynamic sidebar key."""
         if key not in self._category_indices:
-            from tahmeed.ui.accountant.category_tables import CategoryTableWidget
             d = self._sidebar.item_def(key)
             if d is None:
                 self._stack.setCurrentIndex(self._placeholder_index)
                 return
             title, icon, label = d
-            widget = self._mount_page(
-                key,
-                CategoryTableWidget(category_name=title, title=label, icon_name=icon),
+
+            def _factory(
+                k: str = key,
+                cat: str = title,
+                ic: str = icon,
+                lab: str = label,
+            ) -> QWidget:
+                from tahmeed.ui.accountant.category_tables import CategoryTableWidget
+
+                return self._mount_page(
+                    k,
+                    CategoryTableWidget(
+                        category_name=cat, title=lab, icon_name=ic
+                    ),
+                )
+
+            self._open_dynamic_first(
+                key, self._category_indices, _factory, nav_token=key
             )
-            self._category_indices[key] = self._stack.addWidget(widget)
+            return
         idx = self._category_indices[key]
         self._stack.setCurrentIndex(idx)
+        self._toast_loading(key)
         from tahmeed.ui.async_utils import schedule_call
         schedule_call(self._stack.widget(idx).refresh)
 
     def _show_recon(self, match: str) -> None:
         """Lazily create (and cache) an SM Burhani reconciliation view."""
         if match not in self._recon_indices:
-            from tahmeed.ui.accountant.reconciliation import (
-                RPAScheduleWidget, BondsWidget,
+            token = f"sm_burhani::{match}"
+
+            def _factory(m: str = match) -> QWidget:
+                from tahmeed.ui.accountant.reconciliation import (
+                    RPAScheduleWidget, BondsWidget,
+                )
+                raw = BondsWidget() if m == "bonds" else RPAScheduleWidget()
+                return self._mount_page(f"sm_burhani::{m}", raw)
+
+            self._nav_key = token
+            self._open_dynamic_first(
+                match, self._recon_indices, _factory, nav_token=token
             )
-            raw = BondsWidget() if match == "bonds" else RPAScheduleWidget()
-            widget = self._mount_page(f"sm_burhani::{match}", raw)
-            self._recon_indices[match] = self._stack.addWidget(widget)
+            return
         idx = self._recon_indices[match]
         self._stack.setCurrentIndex(idx)
+        self._toast_loading(f"sm_burhani::{match}")
         from tahmeed.ui.async_utils import schedule_call
         schedule_call(self._stack.widget(idx).refresh)
 
@@ -1232,24 +1438,48 @@ class AccountantDashboard(QWidget):
         if parent_key == "sm_burhani":
             self._show_recon(match)
             return
+        # Legacy Receipts→Chase/Storage children (removed from sidebar) → real pages.
+        if parent_key == "receipts":
+            route = (match or name or "").strip().lower()
+            self._drop_stale_receipt_subtables()
+            if route in ("receipt_browse", "storage"):
+                self._on_nav("receipt_browse")
+                return
+            self._on_nav("receipts")
+            return
         cache_key = f"{parent_key}::{name}"
         if cache_key not in self._subtable_indices:
-            from tahmeed.ui.accountant.category_tables import CategoryTableWidget
             d = self._sidebar.item_def(parent_key)
             icon = d[1] if d else "mdi.tag-outline"
             parent_label = d[2] if d else parent_category
-            widget = self._mount_page(
-                cache_key,
-                CategoryTableWidget(
-                    category_name=parent_category,
-                    title=f"{parent_label} · {name}",
-                    icon_name=icon,
-                    description_filter=match or name,
-                ),
+
+            def _factory(
+                ck: str = cache_key,
+                cat: str = parent_category,
+                lab: str = f"{parent_label} · {name}",
+                ic: str = icon,
+                desc: str = match or name,
+            ) -> QWidget:
+                from tahmeed.ui.accountant.category_tables import CategoryTableWidget
+
+                return self._mount_page(
+                    ck,
+                    CategoryTableWidget(
+                        category_name=cat,
+                        title=lab,
+                        icon_name=ic,
+                        description_filter=desc,
+                    ),
+                )
+
+            self._nav_key = cache_key
+            self._open_dynamic_first(
+                cache_key, self._subtable_indices, _factory, nav_token=cache_key
             )
-            self._subtable_indices[cache_key] = self._stack.addWidget(widget)
+            return
         idx = self._subtable_indices[cache_key]
         self._stack.setCurrentIndex(idx)
+        self._toast_loading(cache_key)
         from tahmeed.ui.async_utils import schedule_call
         schedule_call(self._stack.widget(idx).refresh)
 

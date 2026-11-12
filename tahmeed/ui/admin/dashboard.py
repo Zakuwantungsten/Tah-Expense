@@ -19,6 +19,7 @@ from tahmeed.ui.admin.settings_tab import SettingsTab
 from tahmeed.ui.admin.sidebar import AdminSidebar
 from tahmeed.ui.admin.users_tab import UsersTab
 from tahmeed.ui.widgets.circuit_geometry import wrap_circuit_page
+from tahmeed.ui.widgets.receipt_storage_panel import ReceiptStoragePanel
 
 _ADMIN_BG = "#F8FAFC"
 
@@ -88,6 +89,7 @@ class AdminDashboard(QWidget):
 
         self._users = UsersTab()
         self._settings = SettingsTab()
+        self._receipts = ReceiptStoragePanel()
         self._security = SecurityTab()
         self._audit = AuditTab()
         self._backups = BackupTab()
@@ -99,6 +101,10 @@ class AdminDashboard(QWidget):
             "settings": (
                 wrap_circuit_page(self._settings, seed="settings", bg=_ADMIN_BG),
                 "Settings",
+            ),
+            "receipts": (
+                wrap_circuit_page(self._receipts, seed="receipts", bg=_ADMIN_BG),
+                "Receipt disk",
             ),
             "security": (
                 wrap_circuit_page(self._security, seed="security", bg=_ADMIN_BG),

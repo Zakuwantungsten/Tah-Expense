@@ -126,22 +126,24 @@ _SAVED_BG = QColor("#fff8f0")
 _NEG_COL  = QColor("#dc2626")
 
 _RCPT_COLORS = {
-    "received": ("#dcfce7", "#16a34a"),
-    "pending":  ("#fff7ed", "#ea580c"),
-    "missing":  ("#fef2f2", "#dc2626"),
+    "receipt":    ("#fff7ed", "#ea580c"),
+    "received":   ("#dcfce7", "#16a34a"),
+    "pending":    ("#fef3c7", "#b45309"),
+    "missing":    ("#fef2f2", "#dc2626"),
     "no_receipt": ("#f3f4f6", "#6b7280"),
 }
 _RCPT_LABEL = {
-    "received": "RECEIPT",
+    "receipt": "RECEIPT",
+    "received": "RECEIVED",
     "pending": "PENDING",
     "missing": "MISSING",
     "no_receipt": "NO RECEIPT",
 }
 _RCPT_FORM_OPTS = [
-    ("PENDING", "pending"),
-    ("RECEIPT", "received"),
-    ("MISSING", "missing"),
+    ("RECEIPT", "receipt"),
     ("NO RECEIPT", "no_receipt"),
+    ("PENDING", "pending"),
+    ("MISSING", "missing"),
 ]
 
 
@@ -281,12 +283,17 @@ class EntryForm(QWidget):
         asyncio.ensure_future(self._load_config())
 
     def update_people(self, names: List[str]) -> None:
-        self._people_names = [str(n).strip().upper() for n in (names or []) if str(n).strip()]
+        self._people_names = sorted({
+            str(n).strip().upper() for n in (names or []) if str(n).strip()
+        })
         for ed in (getattr(self, "_ownership", None), getattr(self, "_approver", None)):
             if ed is None:
                 continue
-            ed._values = list(self._people_names)
-            ed._model.setStringList(ed._values)
+            if hasattr(ed, "set_values"):
+                ed.set_values(list(self._people_names))
+            else:
+                ed._values = list(self._people_names)
+                ed._model.setStringList(ed._values)
 
     async def _fetch_cat_names(self, prefix: str) -> List[str]:
         """Autocomplete fetch_fn for the Category TruckLineEdit."""
@@ -559,17 +566,19 @@ class EntryForm(QWidget):
 
         lay.addSpacing(10)
         lay.addWidget(_lbl("Ownership"))
-        self._ownership = CompleterLineEdit(list(self._people_names))
-        self._ownership.setPlaceholderText("Owner / department")
-        self._ownership._completer.setFilterMode(Qt.MatchStartsWith)
+        self._ownership = CompleterLineEdit(
+            list(self._people_names), ranked_contains=True
+        )
+        self._ownership.setPlaceholderText("People Registry — type to search")
         self._ownership.setStyleSheet(_INPUT)
         lay.addWidget(self._ownership)
 
         lay.addSpacing(10)
         lay.addWidget(_lbl("APR BY"))
-        self._approver = CompleterLineEdit(list(self._people_names))
-        self._approver.setPlaceholderText("Approver name")
-        self._approver._completer.setFilterMode(Qt.MatchStartsWith)
+        self._approver = CompleterLineEdit(
+            list(self._people_names), ranked_contains=True
+        )
+        self._approver.setPlaceholderText("People Registry — type to search")
         self._approver.setStyleSheet(_INPUT)
         lay.addWidget(self._approver)
 
@@ -960,6 +969,34 @@ class EntryForm(QWidget):
             possible_dup = True
             matched_id = getattr(dupes[0], "_id", None)
 
+        ownership = (
+            self._ownership.canonical(self._ownership.text().strip())
+            or self._ownership.text().strip()
+        ).upper().strip()
+        approver = (
+            self._approver.canonical(self._approver.text().strip())
+            or self._approver.text().strip()
+        ).upper().strip()
+        if self._people_names:
+            if ownership and ownership not in self._people_names:
+                QMessageBox.warning(
+                    self,
+                    "People Registry",
+                    f'"{ownership}" is not in the People list.\n'
+                    "Pick Ownership from the suggestions so receipt notify can resolve.",
+                )
+                self._ownership.setFocus()
+                return
+            if approver and approver not in self._people_names:
+                QMessageBox.warning(
+                    self,
+                    "People Registry",
+                    f'"{approver}" is not in the People list.\n'
+                    "Pick APR BY from the suggestions.",
+                )
+                self._approver.setFocus()
+                return
+
         primary_day = tx_date.date() if hasattr(tx_date, "date") else tx_date
         tx = Transaction(
             date=tx_date,
@@ -973,14 +1010,8 @@ class EntryForm(QWidget):
             memo=self._memo.text().strip(),
             receipt_status=self._receipt.currentData() or "pending",
             notes_flag=self._notes.isChecked(),
-            ownership=(
-                self._ownership.canonical(self._ownership.text().strip())
-                or self._ownership.text().strip()
-            ).upper(),
-            approver=(
-                self._approver.canonical(self._approver.text().strip())
-                or self._approver.text().strip()
-            ).upper(),
+            ownership=ownership,
+            approver=approver,
             cashier_id=self._user._id,
             possible_duplicate=possible_dup,
             duplicate_of_id=matched_id if possible_dup else None,

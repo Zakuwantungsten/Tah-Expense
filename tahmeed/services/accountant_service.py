@@ -6,7 +6,20 @@ import hashlib
 import json
 import re
 from datetime import datetime, date, timedelta
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 from urllib.parse import quote
 
 from bson import ObjectId
@@ -2028,13 +2041,21 @@ async def bulk_update_master_transactions(
     return int(payload.get("updated") or 0)
 
 
+# Master dirty Save: chunk + concurrent workers (API max 500 per request).
+MASTER_BULK_PATCH_CHUNK = 300
+MASTER_BULK_PATCH_CONCURRENCY = 3
+
+
 async def bulk_patch_master_transactions(
     items: Sequence[Tuple[ObjectId, dict]],
     accountant_id: Optional[ObjectId] = None,
+    *,
+    on_progress: Optional[Callable[[int, int], Union[None, Awaitable[None]]]] = None,
 ) -> dict:
-    """Apply heterogeneous Master dirty-row edits in one bulk-patch call.
+    """Apply heterogeneous Master dirty-row edits via bulk-patch.
 
-    Each item is ``(tx_id, updates)``. Returns ``{updated, matched, requested}``.
+    Large dirty sets are split into disjoint id chunks and patched concurrently
+    so Save stays fast. Returns ``{updated, matched, requested}``.
     """
     _ = accountant_id
     if not items:
@@ -2049,15 +2070,60 @@ async def bulk_patch_master_transactions(
         body_items.append({"id": str(tx_id), "updates": prepared})
     if not body_items:
         return {"updated": 0, "matched": 0, "requested": 0}
-    payload = await api_client.request(
-        "POST",
-        "v1/accountant/master/bulk-patch",
-        json={"items": body_items},
-    )
+
+    total = len(body_items)
+    size = max(1, min(MASTER_BULK_PATCH_CHUNK, 500))
+
+    async def _emit(done: int) -> None:
+        if on_progress is None:
+            return
+        result = on_progress(done, total)
+        if asyncio.iscoroutine(result):
+            await result
+
+    await _emit(0)
+
+    if total <= size:
+        payload = await api_client.request(
+            "POST",
+            "v1/accountant/master/bulk-patch",
+            json={"items": body_items},
+        )
+        await _emit(total)
+        return {
+            "updated": int(payload.get("updated") or 0),
+            "matched": int(payload.get("matched") or 0),
+            "requested": int(payload.get("requested") or total),
+        }
+
+    chunks = [
+        body_items[offset : offset + size]
+        for offset in range(0, total, size)
+    ]
+    sem = asyncio.Semaphore(max(1, MASTER_BULK_PATCH_CONCURRENCY))
+    updated = matched = 0
+    done_count = 0
+    lock = asyncio.Lock()
+
+    async def _one(chunk: list[dict]) -> None:
+        nonlocal updated, matched, done_count
+        async with sem:
+            payload = await api_client.request(
+                "POST",
+                "v1/accountant/master/bulk-patch",
+                json={"items": chunk},
+            )
+            async with lock:
+                updated += int(payload.get("updated") or 0)
+                matched += int(payload.get("matched") or 0)
+                done_count += len(chunk)
+                await _emit(min(total, done_count))
+
+    await asyncio.gather(*(_one(chunk) for chunk in chunks))
     return {
-        "updated": int(payload.get("updated") or 0),
-        "matched": int(payload.get("matched") or 0),
-        "requested": int(payload.get("requested") or len(body_items)),
+        "updated": updated,
+        "matched": matched,
+        "requested": total,
     }
 
 

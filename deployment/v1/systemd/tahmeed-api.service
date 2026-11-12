@@ -26,6 +26,8 @@ ProcSubset=pid
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+# Leading "-" keeps the API up when the receipt disk is not mounted yet.
+ReadWritePaths=-/mnt/tahmeed-receipts
 UMask=0027
 
 [Install]

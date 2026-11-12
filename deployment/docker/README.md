@@ -85,6 +85,36 @@ repository using a dedicated `signed-by` keyring. It does not install or start
 MongoDB server. Review the selected `MONGODB_REPO_SERIES` build argument when
 upgrading tool major versions.
 
+### Receipt disk
+
+Receipt files are the primary copy. They must live on a host path that survives
+container recreate, not in the container layer and not in the `tahmeed-api-backups`
+volume. Mount the disk first, then create the directory as the container user
+(UID/GID 10001) before the first `docker compose up`:
+
+```bash
+# Mount the disk at this path first. If the directory is created while the
+# disk is absent, that empty directory hides the disk when it is mounted later.
+sudo install -d -o 10001 -g 10001 -m 0750 /mnt/tahmeed-receipts
+```
+
+`tahmeed-api.env` (already in the example):
+
+```dotenv
+ATTACHMENTS_DIRECTORY=/mnt/tahmeed-receipts
+RECEIPT_S3_PREFIX=receipts
+```
+
+Compose bind-mounts `ATTACHMENTS_HOST_PATH` (default `/mnt/tahmeed-receipts`)
+into the API and the scheduler at that same path. The in-container path and
+`ATTACHMENTS_DIRECTORY` must stay aligned. After a local upload, S3 gets a
+second copy at `receipts/<file id>` with SHA-256 metadata. A failed upload
+leaves `s3_key` empty; the scheduler and `tahmeed-backup retry` try again and
+do not delete the local file.
+
+Restart check: upload a receipt, `docker compose restart api`, download it
+again. The bytes are on the host mount.
+
 ## 3. Duplicate/index and backup preflight
 
 Build a versioned image, check duplicates, then apply indexes in an approved
@@ -252,4 +282,6 @@ Troubleshooting:
 
 Back up the named volume before destructive Docker maintenance. `docker compose
 down` keeps it; `docker compose down --volumes` deletes local backups and must
-not be used in production.
+not be used in production. Receipt files are on the host mount
+(`/mnt/tahmeed-receipts` by default), not in that volume: removing the volume
+does not delete them.

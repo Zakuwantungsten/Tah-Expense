@@ -59,6 +59,8 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("master_expenses", "Master Expenses",   "mdi.table-multiple",               {}),
         ("trash",           "Trash",             "mdi.delete-outline",               {}),
         ("import_daily",    "Import Daily",      "mdi.file-upload-outline",          {}),
+        ("receipts",        "Receipts",          "mdi.receipt",                      {}),
+        ("receipt_browse",  "Receipt storage",   "mdi.folder-open-outline",          {}),
     ]),
     # ITEMS are loaded dynamically from the DB (accountant-managed). The header
     # is rendered statically; the rows below it are built by _load_items().
@@ -94,6 +96,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("manage_trailers",   "Trailers",         "mdi.truck-trailer",   {}),
         ("manage_motor_vehicles", "Motorcycles & Cars", "mdi.car",        {}),
         ("manage_users",      "Users",            "mdi.account-multiple-outline", {}),
+        ("receipt_disk",      "Receipt disk",     "mdi.harddisk",        {}),
     ]),
 ]
 

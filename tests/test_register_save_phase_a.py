@@ -21,8 +21,10 @@ def qapp():
     return app
 
 
-def test_bulk_create_chunk_matches_api_max():
-    assert BULK_CREATE_CHUNK == 100
+def test_bulk_create_chunk_within_api_max():
+    # API bulk-create allows 500; workers use 300 with concurrent drains.
+    assert 1 <= BULK_CREATE_CHUNK <= 500
+    assert BULK_CREATE_CHUNK == 300
 
 
 def test_action_bar_flash_transient_status(qapp):

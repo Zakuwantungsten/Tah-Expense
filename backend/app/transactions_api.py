@@ -78,6 +78,27 @@ _REGISTER_ROLES = ("admin", "cashier", "accountant")
 RegisterActor = Annotated[dict[str, Any], Depends(require_roles(*_REGISTER_ROLES))]
 _ALL_DESCRIPTIONS_TTL_S = 300.0
 
+
+async def _schedule_tx_receipt_effects(
+    request: Request, tx_ids: list[ObjectId]
+) -> None:
+    """Background notify + rematerialize after register save / Day Issues map."""
+    if not tx_ids:
+        return
+    try:
+        from .receipt_ops import schedule_receipt_side_effects
+        from .receipt_storage import resolve_attachments_directory
+
+        db = _database(request)
+        settings = request.app.state.settings
+        try:
+            base = await resolve_attachments_directory(settings, db)
+        except Exception:
+            base = None
+        schedule_receipt_side_effects(settings, db, base, tx_ids)
+    except Exception as exc:
+        _log.warning("schedule receipt side effects failed: %s", exc)
+
 _client_row_index_ensured = False
 
 
@@ -203,6 +224,10 @@ def _coerce_write_fields(values: dict[str, Any]) -> dict[str, Any]:
                 raise ApiError(
                     422, "invalid_datetime", f"Invalid datetime for {field}"
                 ) from exc
+    if "receipt_status" in out:
+        from .receipt_ops import normalize_receipt_status
+
+        out["receipt_status"] = normalize_receipt_status(out.get("receipt_status"))
     return out
 
 
@@ -1742,6 +1767,13 @@ async def _create_one_transaction_doc(
 
     doc["_id"] = result.inserted_id
     await note_transition(db, None, doc)
+    try:
+        from .receipt_ops import ensure_receipt_request
+
+        await ensure_receipt_request(db, doc)
+        await _schedule_tx_receipt_effects(request, [doc["_id"]])
+    except Exception:
+        pass
     if record_event:
         await record_operation_event(
             db,
@@ -1936,6 +1968,21 @@ async def bulk_create_transactions(
 
     if created_docs:
         await note_many(db, [(None, doc) for doc in created_docs])
+        try:
+            from .receipt_ops import ensure_receipt_request
+
+            for doc in created_docs:
+                await ensure_receipt_request(db, doc)
+            await _schedule_tx_receipt_effects(
+                request,
+                [
+                    doc["_id"]
+                    for doc in created_docs
+                    if isinstance(doc.get("_id"), ObjectId)
+                ],
+            )
+        except Exception:
+            pass
 
     if created_ids:
         await record_operation_event(
@@ -2199,6 +2246,33 @@ async def bulk_patch_transactions(
             after.update(values)
             pairs.append((before, after))
         await note_many(db, pairs)
+    receipt_touch = {
+        "ownership",
+        "category_id",
+        "category_name",
+        "item",
+        "attachments",
+        "receipt_status",
+    }
+    if any(receipt_touch.intersection(item.values or {}) for item in body.items):
+        try:
+            from .receipt_ops import ensure_receipt_request
+
+            docs = await db.transactions.find({"_id": {"$in": ids}}).to_list(
+                length=len(ids)
+            )
+            for doc in docs or []:
+                await ensure_receipt_request(db, doc)
+            await _schedule_tx_receipt_effects(request, ids)
+        except Exception:
+            pass
+    elif any(
+        {"item", "payee", "category_name", "category_id", "date"}.intersection(
+            item.values or {}
+        )
+        for item in body.items
+    ):
+        await _schedule_tx_receipt_effects(request, ids)
     await record_operation_event(
         db,
         action="txn.bulk_update",
@@ -2324,6 +2398,9 @@ async def apply_description_mapping(
             "dates": [day.isoformat() for day in parsed_dates][:40],
         },
     )
+    # Day Issues / description maps stamp item+payee → relocate unmapped browse copies.
+    if ids:
+        await _schedule_tx_receipt_effects(request, ids)
     return {"updated": updated, "matched": matched}
 
 
@@ -2342,6 +2419,23 @@ async def patch_transaction(
         raise ApiError(404, "not_found", "Transaction not found")
     await apply_remembered(db, before, values, int(result.modified_count))
     doc = await db.transactions.find_one({"_id": oid})
+    if doc is not None and {
+        "ownership",
+        "category_id",
+        "category_name",
+        "item",
+        "payee",
+        "attachments",
+        "receipt_status",
+        "date",
+    }.intersection(values):
+        try:
+            from .receipt_ops import ensure_receipt_request
+
+            await ensure_receipt_request(db, doc)
+            await _schedule_tx_receipt_effects(request, [oid])
+        except Exception:
+            pass
     await record_operation_event(
         db,
         action="txn.update",

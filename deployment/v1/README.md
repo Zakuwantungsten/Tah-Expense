@@ -41,6 +41,29 @@ sudo systemctl enable --now tahmeed-upload-retry.timer
 curl --fail http://127.0.0.1:8000/health/ready
 ```
 
+### Receipt disk
+
+`tahmeed-api.service` runs with `ProtectSystem=strict`. Receipt writes are
+allowed only on `ReadWritePaths=-/mnt/tahmeed-receipts` (the leading `-` ignores
+the path when it does not exist, so a host without the disk still boots). Mount
+the disk before creating the directory, then point the env file at it:
+
+```bash
+sudo install -d -o tahmeed-api -g tahmeed-api -m 0750 /mnt/tahmeed-receipts
+```
+
+```dotenv
+ATTACHMENTS_DIRECTORY=/mnt/tahmeed-receipts
+RECEIPT_S3_PREFIX=receipts
+```
+
+The primary copy is that directory. After the local rename, the API uploads a
+second copy to `receipts/<file id>` and stores `s3_key` and `sha256` on the
+attachment. A failed upload leaves `s3_key` empty. `tahmeed-upload-retry.service`
+(`tahmeed-backup retry`) and the scheduler maintenance slot upload those files
+later. They only need to read the mount. Restart check: upload a receipt,
+`sudo systemctl restart tahmeed-api.service`, download it again.
+
 Releases live under `/opt/tahmeed-api/releases/<version>`. `current` and
 `previous` are atomic symlinks. Updates build a fresh virtualenv and roll back
 automatically if backup preflight or readiness does not pass. Every release
@@ -206,7 +229,9 @@ it is not continuous PITR.
 Daily and weekly jobs create a local archive and JSON manifest first. The Mongo
 URI is passed through a temporary mode-0600 mongodump config file, never process
 arguments. S3 failure cannot invalidate the local files; a separate 30-minute
-retry uploads pending jobs. Upload success requires `HeadObject` size and
+retry uploads pending jobs and receipt files whose `s3_key` is still empty.
+Receipt objects use `RECEIPT_S3_PREFIX` (`receipts/<file id>`), not the
+mongodump prefix, and backup prune does not delete them. Upload success requires `HeadObject` size and
 SHA-256 metadata checks for both object and manifest. The manifest records
 database, cadence, consistency mode, archive checksum/size, tool version,
 completion time, and archive version ID. Mongo metadata additionally records

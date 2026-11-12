@@ -154,10 +154,12 @@ async def test_bulk_save_replays_chunk_on_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_bulk_save_chunks_at_api_max(monkeypatch):
-    """Client posts at most BULK_CREATE_CHUNK (= API max 100) items per request."""
+    """Client posts at most BULK_CREATE_CHUNK items per request (≤ API max 500)."""
     from tahmeed.services import cashier_service as svc
 
-    assert svc.BULK_CREATE_CHUNK == 100
+    assert 1 <= svc.BULK_CREATE_CHUNK <= 500
+    monkeypatch.setattr(svc, "BULK_CREATE_CHUNK", 100)
+    monkeypatch.setattr(svc, "BULK_CREATE_CONCURRENCY", 2)
     sizes: list[int] = []
 
     async def fake_request(method, path, **kwargs):
@@ -204,7 +206,7 @@ async def test_bulk_save_chunks_at_api_max(monkeypatch):
     outcomes = await svc.bulk_save_transactions(txs)
     assert len(outcomes) == 150
     assert all(o[0] == "created" for o in outcomes)
-    assert sizes == [100, 50]
+    assert sorted(sizes) == [50, 100]
 
 
 @pytest.mark.asyncio

@@ -55,6 +55,7 @@ services:
     stop_grace_period: 30s
     volumes:
       - tahmeed-backups:/var/lib/tahmeed
+      - ${ATTACHMENTS_HOST_PATH:-/mnt/tahmeed-receipts}:/mnt/tahmeed-receipts
 
   scheduler:
     <<: *security
@@ -67,6 +68,7 @@ services:
       - tahmeed-scheduler
     volumes:
       - tahmeed-backups:/var/lib/tahmeed
+      - ${ATTACHMENTS_HOST_PATH:-/mnt/tahmeed-receipts}:/mnt/tahmeed-receipts
     healthcheck:
       disable: true
     stop_grace_period: 2m

@@ -594,6 +594,12 @@ async def resolve_keep_count(settings: Settings, db: Any) -> int:
 
 
 async def prune(settings: Settings, db: Any) -> int:
+    """Drop old mongodump archives only.
+
+    Receipt object keys live under ``receipt_s3_prefix`` (default ``receipts/``)
+    and are never listed on ``backup_jobs``, so this keep-N rule cannot delete
+    receipt evidence bytes.
+    """
     if not settings.backup_s3_bucket:
         return 0
     keep_count = await resolve_keep_count(settings, db)
@@ -811,7 +817,14 @@ async def execute(command: str, cadence: str = "daily") -> None:
                     archive = await create_local_backup(settings, db, cadence)
                     print(f"Created local {cadence} backup: {archive}")
                 if command in {"retry", "all"}:
+                    from ..receipt_backup import retry_pending_receipt_backups
+
                     print(f"Uploaded {await upload_pending(settings, db)} backup(s).")
+                    print(
+                        "Uploaded "
+                        f"{await retry_pending_receipt_backups(settings, db, limit=None)} "
+                        "receipt file(s)."
+                    )
                 if command in {"prune", "all"}:
                     print(f"Pruned {await prune(settings, db)} backup(s).")
     finally:

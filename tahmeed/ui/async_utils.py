@@ -29,11 +29,25 @@ def safe_process_events() -> None:
 
 
 def schedule_call(fn: Callable[[], Any]) -> None:
-    """Run *fn* now, or on the next Qt tick if an asyncio Task is current."""
+    """Run *fn* now, or on the next Qt tick if an asyncio Task is current.
+
+    If *fn* returns a coroutine / awaitable, schedule it on the asyncio loop
+    (avoids ``RuntimeWarning: coroutine was never awaited``).
+    """
+
+    def _run() -> None:
+        result = fn()
+        if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+            schedule_coro(result)  # type: ignore[arg-type]
+            return
+        # async def methods bound as ``widget.refresh`` return a coroutine.
+        if hasattr(result, "__await__"):
+            schedule_coro(result)  # type: ignore[arg-type]
+
     if in_running_task():
-        QTimer.singleShot(0, fn)
+        QTimer.singleShot(0, _run)
     else:
-        fn()
+        _run()
 
 
 def create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:

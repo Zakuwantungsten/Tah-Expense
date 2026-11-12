@@ -120,9 +120,10 @@ _EDITABLE_COLS: Set[int] = {
 _TX_ID_ROLE = Qt.UserRole
 
 _RECEIPT_EDIT_OPTIONS = [
+    ("receipt", "Receipt"),
+    ("no_receipt", "No Receipt"),
     ("received", "Received"),
     ("pending", "Pending"),
-    ("no_receipt", "No Receipt"),
 ]
 
 _FILTERABLE_COLS: Set[int] = set(range(len(_COLS))) - {0}
@@ -141,9 +142,10 @@ _MONTHS = [
 ]
 
 _RECEIPT_MAP = {
+    "receipt":    ("Receipt",    _AMBER),
     "received":   ("Received",   _GREEN),
     "pending":    ("Pending",    _AMBER),
-    "missing":    ("No Receipt", _RED),
+    "missing":    ("Missing",    _RED),
     "no_receipt": ("No Receipt", _RED),
 }
 
@@ -222,12 +224,14 @@ def _normalize_receipt(status: str) -> str:
     s = (status or "pending").strip().lower().replace(" ", "_")
     if s in ("no_receipt", "no", "n/a", "none"):
         return "no_receipt"
+    if s in ("receipt", "required", "needs_receipt", "yes", "1"):
+        return "receipt"
     if s in _RECEIPT_MAP:
         return s
-    if "received" in s or s in ("yes", "receipt", "rcvd"):
+    if "received" in s or s in ("rcvd", "have_receipt"):
         return "received"
-    if "missing" in s or "no receipt" in s:
-        return "no_receipt"
+    if "missing" in s:
+        return "missing"
     return "pending"
 
 
@@ -1199,10 +1203,24 @@ class MasterExpensesWidget(QWidget):
             return
 
         self._edit_in_flight = True
-        self._loading_overlay.show_loading(f"Saving {len(patches)} row(s)…")
+        total_patches = len(patches)
+        self._loading_overlay.show_loading(f"Saving {total_patches} row(s)…")
+
+        def _on_save_progress(done: int, tot: int) -> None:
+            if tot <= 0:
+                return
+            if done <= 0:
+                self._loading_overlay.show_loading(f"Saving {tot} row(s)…")
+                return
+            self._loading_overlay.show_loading(
+                f"Saving {min(done, tot)} of {tot}…"
+            )
+
         try:
             result = await bulk_patch_master_transactions(
-                patches, self._accountant_id(),
+                patches,
+                self._accountant_id(),
+                on_progress=_on_save_progress,
             )
             matched = int(result.get("matched") or 0)
             if matched < len(patches):

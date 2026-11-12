@@ -1,0 +1,68 @@
+{
+  "expo": {
+    "name": "Tahmeed Receipts",
+    "slug": "tahmeed-receipts",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "scheme": "tahmeed-receipts",
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Take a photo of the receipt.",
+        "NSPhotoLibraryUsageDescription": "Choose receipt photos from your library.",
+        "NSMicrophoneUsageDescription": "Not used; required by the camera module."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "permissions": [
+        "CAMERA",
+        "READ_MEDIA_IMAGES",
+        "READ_EXTERNAL_STORAGE",
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE",
+        "POST_NOTIFICATIONS",
+        "WAKE_LOCK",
+        "USE_FULL_SCREEN_INTENT"
+      ],
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-file-system",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Choose receipt photos from your library.",
+          "cameraPermission": "Take a photo of the receipt."
+        }
+      ],
+      [
+        "expo-document-picker",
+        {
+          "iCloudContainerEnvironment": "Production"
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "sounds": [],
+          "mode": "production"
+        }
+      ]
+    ],
+    "extra": {
+      "apiBaseUrl": "https://api.meedexpe.com"
+    }
+  }
+}

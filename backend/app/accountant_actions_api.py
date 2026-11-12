@@ -113,6 +113,16 @@ async def _reject_if_missing_item_or_payee(
         )
 
 
+async def _reject_if_needed_receipts(request: Request, ids: list[ObjectId]) -> None:
+    """Verify refuses rows whose required receipt request is still needed."""
+    from .receipt_ops import reject_if_needed_receipts
+
+    try:
+        await reject_if_needed_receipts(_database(request), ids)
+    except ValueError as exc:
+        raise ApiError(400, "receipt_needed", str(exc)) from None
+
+
 @actions.post("/bulk-approve")
 async def bulk_approve(
     body: BulkIdsRequest, request: Request, manager: Manager
@@ -121,6 +131,7 @@ async def bulk_approve(
     if not ids:
         return {"updated": 0}
     await _reject_if_missing_item_or_payee(request, ids)
+    await _reject_if_needed_receipts(request, ids)
     actor_id = _actor_oid(manager)
     now = utcnow().replace(tzinfo=None)
     db = _database(request)
@@ -201,6 +212,7 @@ async def bulk_re_approve(
     if not ids:
         return {"updated": 0}
     await _reject_if_missing_item_or_payee(request, ids)
+    await _reject_if_needed_receipts(request, ids)
     db = _database(request)
     docs = await db.transactions.find(
         {"_id": {"$in": ids}, "verified": False},
@@ -268,6 +280,7 @@ async def approve_transaction(
 ) -> dict:
     oid = _valid_id(tx_id)
     await _reject_if_missing_item_or_payee(request, [oid])
+    await _reject_if_needed_receipts(request, [oid])
     actor_id = _actor_oid(manager)
     now = utcnow().replace(tzinfo=None)
     db = _database(request)
@@ -423,6 +436,7 @@ async def re_approve_transaction(
 ) -> dict:
     oid = _valid_id(tx_id)
     await _reject_if_missing_item_or_payee(request, [oid])
+    await _reject_if_needed_receipts(request, [oid])
     ok = await _re_approve_one(request, oid, _actor_oid(manager), manager)
     return {"ok": ok}
 

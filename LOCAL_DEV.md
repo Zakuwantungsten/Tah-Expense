@@ -36,7 +36,24 @@ Backend must use loopback Mongo and a **dev** database name (`backend/.env`):
 MONGODB_URI=mongodb://127.0.0.1:27017/?directConnection=true
 DB_NAME=tahmeed_expense_dev
 JWT_SECRET=…  # ≥32 chars — see backend/.env.example
+# Optional local receipt disk (absolute path). Leave unset to use ./var/attachments.
+# Or set it in the desktop: Admin / Accountant → Receipt disk.
+ATTACHMENTS_DIRECTORY=C:\Users\Tungsten\Desktop\tahmeed-expense\var\attachments
 ```
+
+### Local receipt-disk check
+
+1. Start the API (`.\scripts\dev_api.ps1`) and desktop against `http://127.0.0.1:8000`.
+2. Sign in as admin or accountant → **Receipt disk**.
+3. Confirm the host is your PC, pick a drive (or type an absolute folder), **Test write**, then **Apply path**.
+4. Attach a file on a register row, restart the API, open the attachment again — it must still download from that folder.
+
+### Local Expo receipt app
+
+1. API running and reachable from the phone (LAN IP, not `127.0.0.1`).
+2. `cd mobile` → copy `.env.example` to `.env` → set `EXPO_PUBLIC_API_BASE_URL=http://YOUR_LAN_IP:8000`.
+3. `npm start` and open in Expo Go.
+4. Sign in as a user linked to an ownership person that has an open `needed` receipt request.
 
 Dev startup refuses Tailscale CGNAT (`100.64.0.0/10`) and `*.ts.net` Mongo/API hosts unless you explicitly set `TAHMEED_ALLOW_REMOTE_DB=1` (emergency only).
 

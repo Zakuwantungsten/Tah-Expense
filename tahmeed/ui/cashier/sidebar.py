@@ -56,6 +56,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("day_issues", "Day Issues", "mdi.alert-decagram-outline",     {"badge": True}),
         ("rejected",   "Rejected",   "mdi.alert-circle-outline",       {}),
         ("trash",      "Trash",      "mdi.delete-outline",             {"badge": True}),
+        ("receipts",   "Receipts",   "mdi.receipt",                    {}),
     ]),
     ("ITEMS", []),
 ]

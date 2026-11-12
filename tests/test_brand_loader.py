@@ -75,11 +75,14 @@ def test_brand_loader_cycles_dots() -> None:
 def test_brand_loader_progress_shows_percent() -> None:
     from PySide6.QtWidgets import QWidget
 
+    from tahmeed.ui.widgets.sleek_progress_bar import SleekProgressBar
+
     _app()
     host = QWidget()
     panel = BrandLoaderPanel(host, "Importing…", show_progress=True)
     # isHidden() is reliable before the widget is shown; isVisible() is not.
     assert not panel._bar.isHidden()
+    assert isinstance(panel._bar, SleekProgressBar)
     panel.set_progress(value=0, maximum=100)
     assert panel.percent_text() == "0%"
     panel.set_progress(value=42, maximum=100)
@@ -87,10 +90,32 @@ def test_brand_loader_progress_shows_percent() -> None:
     panel.set_progress(value=3, maximum=4)
     assert panel.percent_text() == "75%"
     panel.reset_progress()
-    # Reset keeps the bar visible (never blank) but clears the percent label.
+    # Reset keeps the bar visible (shimmer) but clears the percent label.
     assert not panel._bar.isHidden()
     assert panel.percent_text() == ""
+    assert panel._bar.is_indeterminate()
     panel.stop()
+    host.close()
+
+
+def test_sleek_progress_bar_never_uses_native_qprogressbar() -> None:
+    """Regression: QProgressBar promoted a tiny meedexpe HWND on Windows."""
+    from PySide6.QtWidgets import QProgressBar, QWidget
+
+    from tahmeed.ui.widgets.sleek_progress_bar import SleekProgressBar
+
+    _app()
+    host = QWidget()
+    host.resize(400, 200)
+    host.show()
+    bar = SleekProgressBar(host)
+    bar.set_progress(value=0, maximum=100)
+    assert bar.percent_text() == "0%"
+    bar.set_progress(value=100, maximum=100)
+    assert bar.percent_text() == "100%"
+    assert not bar.isWindow()
+    assert not isinstance(bar, QProgressBar)
+    assert bar.findChildren(QProgressBar) == []
     host.close()
 
 

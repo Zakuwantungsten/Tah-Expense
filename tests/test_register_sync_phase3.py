@@ -222,7 +222,9 @@ async def test_drain_large_batch_shows_range_progress(register, monkeypatch):
 
     await register._drain_register_outbox()
 
-    range_msgs = [m for m in progress_msgs if " of " in m and "–" in m]
+    # Concurrent workers report "done of total" (not serial lo–hi ranges).
+    range_msgs = [m for m in progress_msgs if " of " in m and "Syncing" in m]
     assert range_msgs, progress_msgs
     assert any(f"of {n}" in m for m in range_msgs)
+    assert any(f"{BULK_CREATE_CHUNK} of {n}" in m for m in range_msgs)
     assert register._saved_count == n

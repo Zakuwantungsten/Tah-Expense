@@ -31,6 +31,7 @@ COLLAPSED_W = 64
 _NAV: list[tuple[str, str, str]] = [
     ("users", "Users", "mdi.account-multiple-outline"),
     ("settings", "Settings", "mdi.cog-outline"),
+    ("receipts", "Receipt disk", "mdi.harddisk"),
     ("security", "Security", "mdi.shield-lock-outline"),
     ("audit", "Audit Log", "mdi.clipboard-text-outline"),
     ("backups", "Backups", "mdi.cloud-upload-outline"),

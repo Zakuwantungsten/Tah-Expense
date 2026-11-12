@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 import uuid
@@ -22,6 +23,8 @@ _ALLOWED_EXT = {
     ".bmp",
     ".tif",
     ".tiff",
+    ".heic",
+    ".heif",
     ".doc",
     ".docx",
     ".xls",
@@ -53,8 +56,12 @@ def safe_name(name: str) -> str:
 
 
 def allowed_extension(filename: str) -> bool:
+    """True when the final suffix is on the receipt/attachment allowlist."""
     ext = Path(filename).suffix.lower()
-    return not ext or ext in _ALLOWED_EXT
+    return bool(ext) and ext in _ALLOWED_EXT
+
+
+ALLOWED_ATTACHMENT_EXTENSIONS = frozenset(_ALLOWED_EXT)
 
 
 def find_attachment_meta(doc: dict[str, Any] | None, attachment_id: str) -> dict | None:
@@ -69,16 +76,34 @@ def find_attachment_meta(doc: dict[str, Any] | None, attachment_id: str) -> dict
 def resolve_attachment_path(
     base: Path, tx_id: ObjectId | str, meta: dict[str, Any]
 ) -> Path | None:
-    stored = meta.get("stored_name") or ""
-    if not stored:
-        return None
-    path = tx_dir(base, tx_id) / stored
-    # Reject path traversal via stored_name.
-    try:
-        path.resolve().relative_to(tx_dir(base, tx_id).resolve())
-    except ValueError:
-        return None
-    return path if path.is_file() else None
+    """Resolve on-disk bytes for tx-folder or ``files/`` layout paths."""
+    root = attachments_root(base).resolve()
+    stored = str(meta.get("stored_name") or "").replace("\\", "/")
+    stored_path = str(meta.get("stored_path") or "").replace("\\", "/")
+    candidates: list[Path] = []
+    for raw in (stored_path, stored):
+        if not raw:
+            continue
+        if raw.startswith("files/"):
+            candidates.append(attachments_root(base) / raw)
+        elif "/" in raw:
+            # e.g. ``<tx_id>/<stored>`` recorded on receipt_files.
+            candidates.append(attachments_root(base) / raw)
+        else:
+            candidates.append(tx_dir(base, tx_id) / raw)
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        if path.is_file():
+            return path
+    return None
 
 
 def purge_stale_staging(base: Path, *, max_age_hours: float = 24.0) -> int:
@@ -185,16 +210,15 @@ async def add_attachment_bytes(
     actor_id: ObjectId | None = None,
 ) -> dict[str, Any]:
     """Two-phase attach: stage bytes → Mongo $push → finalize with os.replace."""
-    original_name = Path(filename).name or "file"
-    if not allowed_extension(original_name):
-        raise ValueError(
-            f"Unsupported file type '{Path(original_name).suffix.lower()}'. "
-            "Allowed: PDF, images, Office docs, CSV, TXT."
-        )
-    if len(content) > MAX_ATTACHMENT_BYTES:
-        raise ValueError(
-            f"File exceeds maximum size of {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB."
-        )
+    from .receipt_upload_security import UploadSecurityError, validate_receipt_upload
+
+    try:
+        checked = validate_receipt_upload(filename, content)
+    except UploadSecurityError as exc:
+        raise ValueError(str(exc)) from exc
+
+    original_name = checked["filename"]
+    content = checked["content"]
 
     att_id = uuid.uuid4().hex
     stored_name = f"{att_id}_{safe_name(original_name)}"
@@ -218,7 +242,11 @@ async def add_attachment_bytes(
         "filename": original_name,
         "stored_name": stored_name,
         "size": staging.stat().st_size,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        # Empty until the S3 second copy is verified. Retry fills this in.
+        "s3_key": "",
         "uploaded_at": utcnow(),
+        "content_type": checked["content_type"],
     }
     if actor_id is not None:
         meta["uploaded_by"] = actor_id

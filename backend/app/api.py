@@ -85,6 +85,8 @@ from .accountant_truck_overview_api import (
 from .feeds_api import feeds as feeds_router
 from .imports_api import imports as imports_router
 from .reconciliation_api import reconciliation as reconciliation_router
+from .mobile_api import mobile as mobile_router
+from .receipts_api import receipts as receipts_router
 from .transactions_api import transactions as transactions_router
 
 api = APIRouter(prefix="/v1")
@@ -1625,8 +1627,11 @@ async def list_people(
     query: dict[str, Any] = {}
     if search:
         query["name"] = {"$regex": re.escape(search), "$options": "i"}
-    if active is not None:
-        query["active"] = active
+    # Missing ``active`` counts as active (legacy people rows).
+    if active is True:
+        query["active"] = {"$ne": False}
+    elif active is False:
+        query["active"] = False
     collection = database(request)["people"]
     total = await collection.count_documents(query)
     docs = (
@@ -1662,12 +1667,22 @@ async def upsert_person(name: str, body: PeopleWrite, request: Request, manager:
     if normalized != body.name:
         raise ApiError(422, "name_mismatch", "Path and body names must match")
     db = database(request)
+    payload = body.model_dump()
+    raw_user_id = payload.get("user_id")
+    if raw_user_id in (None, ""):
+        payload["user_id"] = None
+    else:
+        try:
+            payload["user_id"] = object_id(str(raw_user_id))
+        except ValueError as exc:
+            raise ApiError(422, "invalid_user_id", "user_id must be a valid id") from exc
     doc = await db["people"].find_one_and_update(
         {"name": body.name},
-        {"$set": body.model_dump()},
+        {"$set": payload},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
+    await bump_catalog_version(request)
     await record_operation_event(
         db,
         action="people.upsert",
@@ -1685,6 +1700,7 @@ async def delete_person(name: str, request: Request, manager: Manager) -> Respon
     normalized = " ".join(name.upper().split())
     db = database(request)
     await db["people"].delete_one({"name": normalized})
+    await bump_catalog_version(request)
     await record_operation_event(
         db,
         action="people.delete",
@@ -1931,6 +1947,8 @@ for router in (
     audit_api,
     sessions_router,
     transactions_router,
+    receipts_router,
+    mobile_router,
     reconciliation_router,
     imports_router,
     feeds_router,

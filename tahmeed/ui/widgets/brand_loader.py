@@ -11,11 +11,12 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QLabel,
-    QProgressBar,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
+
+from tahmeed.ui.widgets.sleek_progress_bar import SleekProgressBar
 
 _BLUE = "#0077C5"
 _FADE_MS = 40
@@ -190,31 +191,15 @@ class BrandLoaderPanel(QWidget):
         self._label.setMinimumWidth(280)
         layout.addWidget(self._label, alignment=Qt.AlignCenter)
 
-        self._pct = QLabel("")
-        self._pct.setAlignment(Qt.AlignCenter)
-        self._pct.setStyleSheet(
-            f"color: {_BLUE}; font-size: 20px; font-weight: 700;"
-            f" font-family:'Segoe UI'; background: transparent; border: none;"
-        )
-        self._pct.setMinimumWidth(280)
-        self._pct.hide()
-        layout.addWidget(self._pct, alignment=Qt.AlignCenter)
-
-        self._bar = QProgressBar()
-        self._bar.setFixedWidth(280)
-        self._bar.setFixedHeight(12)
-        self._bar.setTextVisible(False)
-        self._bar.setRange(0, 0)
-        self._bar.setStyleSheet(
-            "QProgressBar {"
-            "  background: #E5E7EB; border: none; border-radius: 6px;"
-            "}"
-            "QProgressBar::chunk {"
-            f"  background: {_BLUE}; border-radius: 6px;"
-            "}"
-        )
+        # Custom-painted bar (never QProgressBar) — avoids the tiny Windows
+        # title-bar HWND that used to flash before the horse + % appeared.
+        self._bar = SleekProgressBar(self, show_percent=True, bar_width=300)
+        self._pct = self._bar.percent_label()  # compat for tests / callers
         self._show_progress = show_progress
         self._bar.setVisible(bool(show_progress))
+        if show_progress:
+            # Soft shimmer until a real total arrives (UploadBusy sets 0/100).
+            self._bar.set_progress(value=None, maximum=0)
         layout.addWidget(self._bar, alignment=Qt.AlignCenter)
 
         self._fade_timer = QTimer(self)
@@ -249,41 +234,24 @@ class BrandLoaderPanel(QWidget):
     ) -> None:
         if not self._show_progress:
             self._bar.hide()
-            self._pct.hide()
             return
         self._bar.show()
-        if maximum is not None and maximum > 0:
-            maximum = int(maximum)
-            current = max(0, min(maximum, int(value or 0)))
-            self._bar.setRange(0, maximum)
-            self._bar.setValue(current)
-            pct = int(round(100.0 * current / maximum)) if maximum else 0
-            self._pct.setText(f"{pct}%")
-            self._pct.show()
-        elif value is not None and self._bar.maximum() > 0:
-            maximum = self._bar.maximum()
-            current = max(0, min(maximum, int(value)))
-            self._bar.setValue(current)
-            pct = int(round(100.0 * current / maximum)) if maximum else 0
-            self._pct.setText(f"{pct}%")
-            self._pct.show()
-        elif maximum is not None:
-            # Indeterminate busy — keep the bar visible so the dialog is never empty.
-            self._bar.setRange(0, 0)
-            self._pct.setText("")
-            self._pct.hide()
+        if value is None and maximum is None:
+            # Keep a live shimmer so table opens never paint an empty bar frame.
+            self._bar.set_progress(value=None, maximum=0)
+            return
+        self._bar.set_progress(value=value, maximum=maximum)
 
     def reset_progress(self) -> None:
-        self._bar.setRange(0, 0)
-        self._pct.setText("")
-        self._pct.hide()
+        self._bar.reset()
         if self._show_progress:
+            self._bar.set_progress(value=None, maximum=0)
             self._bar.show()
         else:
             self._bar.hide()
 
     def percent_text(self) -> str:
-        return (self._pct.text() or "").strip()
+        return self._bar.percent_text()
 
     def start(self) -> None:
         if self._running:
@@ -295,6 +263,8 @@ class BrandLoaderPanel(QWidget):
         if not self._dot_timer.isActive():
             self._dot_timer.start()
         self._apply_fade()
+        if self._show_progress:
+            self._bar.start()
 
     def fade_opacity(self) -> float:
         """Current horse fade opacity (for tests)."""
@@ -306,6 +276,8 @@ class BrandLoaderPanel(QWidget):
         self._dot_timer.stop()
         self._fade_opacity = 1.0
         self._horse.setPixmap(self._mark)
+        if self._show_progress:
+            self._bar.stop()
 
     def _apply_fade(self) -> None:
         # Smooth sine pulse: ~0.35 (faded) ↔ 1.0 (full color).

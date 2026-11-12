@@ -537,34 +537,40 @@ class _RefFloatDelegate(_ExcelCellDelegate):
 
 
 _RCPT_COLORS = {
-    "received":   ("#dcfce7", "#16a34a"),
-    "pending":    ("#fff7ed", "#ea580c"),
-    "missing":    ("#fef2f2", "#dc2626"),
-    "no_receipt": ("#f3f4f6", "#6b7280"),
+    "receipt":    ("#fff7ed", "#ea580c"),  # requires upload / chase
+    "received":   ("#dcfce7", "#16a34a"),  # paper already attached
+    "pending":    ("#fef3c7", "#b45309"),  # legacy ambiguous
+    "missing":    ("#fef2f2", "#dc2626"),  # legacy ambiguous
+    "no_receipt": ("#f3f4f6", "#6b7280"),  # does not require
 }
-# Display labels are uppercase (RECEIPT, not Received).
+# Two primary types: RECEIPT (requires) / NO RECEIPT (skip).
+# RECEIVED = file on hand (system). PENDING/MISSING kept for paste/legacy.
 _RCPT_LABEL = {
-    "received": "RECEIPT",
+    "receipt": "RECEIPT",
+    "received": "RECEIVED",
     "pending": "PENDING",
     "missing": "MISSING",
     "no_receipt": "NO RECEIPT",
 }
-_RECEIPT_OPTS = ["PENDING", "RECEIPT", "MISSING", "NO RECEIPT"]
+_RECEIPT_OPTS = ["RECEIPT", "NO RECEIPT", "PENDING", "MISSING"]
 # Display label (lowercased) -> stored status key
 _RCPT_OPT_KEY = {
-    "pending": "pending",
-    "receipt": "received",
+    "receipt": "receipt",
     "received": "received",
+    "pending": "pending",
     "missing": "missing",
     "no receipt": "no_receipt",
 }
 # Any incoming text (paste / import) -> stored status key
 _RCPT_NORM = {
+    "receipt": "receipt",
+    "required": "receipt",
+    "needs receipt": "receipt",
+    "1": "receipt",
+    "yes": "receipt",
     "received": "received",
-    "receipt": "received",
-    "1": "received",
-    "yes": "received",
     "rcvd": "received",
+    "have receipt": "received",
     "missing": "missing",
     "pending": "pending",
     "0": "pending",
@@ -574,7 +580,8 @@ _RCPT_NORM = {
     "n/a": "no_receipt",
     "na": "no_receipt",
 }
-_VALID_RCPT = {"pending", "received", "missing", "no_receipt"}
+_VALID_RCPT = {"receipt", "pending", "received", "missing", "no_receipt"}
+_AMBIGUOUS_RCPT = {"", "pending", "missing"}
 
 
 def _norm_receipt_text(raw: str) -> str:
@@ -624,7 +631,12 @@ class _ReceiptDelegate(_ExcelCellDelegate):
 
     def setModelData(self, editor, model, index):
         disp = editor.canonical(editor.text().strip()) or editor.text().strip()
-        model.setData(index, disp)
+        # Store canonical keys (receipt / no_receipt / …) — paint() shows labels.
+        key = _RCPT_OPT_KEY.get(disp.lower(), _RCPT_NORM.get(disp.lower(), disp.lower()))
+        if key in _VALID_RCPT:
+            model.setData(index, key)
+        else:
+            model.setData(index, disp)
 
     def updateEditorGeometry(self, editor, option, index):
         editor.setGeometry(option.rect)

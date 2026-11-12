@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,7 +82,19 @@ def settings(tmp_path: Path) -> Settings:
         mongodb_uri="mongodb://localhost:27017",
         jwt_secret="a-test-secret-that-is-definitely-32-characters",
         attachments_directory=tmp_path,
+        backup_s3_bucket="",
     )
+
+
+class _AsyncNullColl:
+    async def find_one(self, *_a, **_k):
+        return None
+
+    async def update_one(self, *_a, **_k) -> SimpleNamespace:
+        return SimpleNamespace(matched_count=0, modified_count=0)
+
+    async def insert_one(self, document: dict) -> SimpleNamespace:
+        return SimpleNamespace(inserted_id=document.get("_id") or ObjectId())
 
 
 def _app(collection: FakeTransactions, tmp_path: Path):
@@ -89,6 +102,9 @@ def _app(collection: FakeTransactions, tmp_path: Path):
         db=SimpleNamespace(
             transactions=collection,
             operation_events=FakeOperationEvents(),
+            receipt_files=_AsyncNullColl(),
+            receipt_requests=_AsyncNullColl(),
+            categories=_AsyncNullColl(),
         )
     )
     return create_app(settings=settings(tmp_path), database=database)
@@ -260,6 +276,8 @@ def test_upload_attachment(tmp_path: Path) -> None:
     assert body["size"] == len(b"%PDF-upload")
     assert body["id"]
     assert body["stored_name"].startswith(body["id"])
+    assert body["sha256"] == hashlib.sha256(b"%PDF-upload").hexdigest()
+    assert body["s3_key"] == ""
     assert len(collection.documents[0]["attachments"]) == 1
     stored = tmp_path / str(tx_id) / body["stored_name"]
     assert stored.is_file()
@@ -271,6 +289,14 @@ def test_upload_attachment(tmp_path: Path) -> None:
         )
     assert downloaded.status_code == 200
     assert downloaded.content == b"%PDF-upload"
+
+    # A new process with the same directory is an API restart: the file is on disk.
+    restarted = _app(collection, tmp_path)
+    restarted.dependency_overrides[current_user] = lambda: user
+    with TestClient(restarted) as client:
+        again = client.get(f"/v1/transactions/{tx_id}/attachments/{body['id']}/file")
+    assert again.status_code == 200
+    assert again.content == b"%PDF-upload"
 
 
 def test_upload_rejects_bad_extension(tmp_path: Path) -> None:

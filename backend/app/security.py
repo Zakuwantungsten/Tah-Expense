@@ -37,10 +37,16 @@ def hash_refresh_secret(secret: str) -> str:
 
 
 def create_access_token(
-    settings: Settings, *, user_id: str, role: str, session_id: str
+    settings: Settings,
+    *,
+    user_id: str,
+    role: str,
+    session_id: str,
+    minutes: int | None = None,
 ) -> tuple[str, datetime]:
     now = utcnow()
-    expires = now + timedelta(minutes=settings.access_token_minutes)
+    ttl = int(minutes) if minutes is not None else int(settings.access_token_minutes)
+    expires = now + timedelta(minutes=max(1, ttl))
     payload = {
         "sub": user_id,
         "role": role,

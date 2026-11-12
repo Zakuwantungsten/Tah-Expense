@@ -80,8 +80,14 @@ class LoadingOverlay(QFrame):
         self._ensure_child_widget()
         if message:
             self._panel.set_message(message)
+        # Progress + geometry BEFORE show — first paint must be full-size overlay
+        # (never a zero-size / title-bar-only HWND flash).
         self._panel.set_progress(value=value, maximum=maximum)
         self._sync_geometry()
+        parent = self.parentWidget()
+        if parent is not None and (self.width() <= 1 or self.height() <= 1):
+            self.setGeometry(parent.rect())
+        self._panel.start()
         self.show()
         self.raise_()
         # If Windows still promoted us, yank back under the parent immediately.
@@ -92,10 +98,10 @@ class LoadingOverlay(QFrame):
             self._sync_geometry()
             self.show()
             self.raise_()
-        self._panel.start()
         # Paint now without pumping the event queue: processEvents() here ran
         # queued timers re-entrantly (e.g. a modal truck dialog mid-navigation).
         self.repaint()
+        self._panel.repaint()
 
     def hide_loading(self) -> None:
         self._panel.reset_progress()

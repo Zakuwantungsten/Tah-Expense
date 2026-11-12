@@ -106,9 +106,10 @@ _GREEN = "#16A34A"
 _HDR_BG = "#F1F5F9"
 
 _RECEIPT_MAP = {
+    "receipt": ("Receipt", _AMBER),
     "received": ("Received", _GREEN),
     "pending": ("Pending", _AMBER),
-    "missing": ("No Receipt", _RED),
+    "missing": ("Missing", _RED),
     "no_receipt": ("No Receipt", _RED),
 }
 
@@ -155,12 +156,16 @@ _TABLE_SS = (
 
 def _normalize_receipt(status: str) -> str:
     s = (status or "pending").strip().lower().replace(" ", "_")
-    if s in ("no_receipt", "no", "n/a", "none", "missing"):
+    if s in ("no_receipt", "no", "n/a", "none"):
         return "no_receipt"
+    if s in ("receipt", "required", "needs_receipt", "yes", "1"):
+        return "receipt"
     if s in _RECEIPT_MAP:
         return s
-    if "received" in s or s in ("yes", "receipt", "rcvd"):
+    if "received" in s or s in ("rcvd", "have_receipt"):
         return "received"
+    if s == "missing":
+        return "missing"
     return "pending"
 
 

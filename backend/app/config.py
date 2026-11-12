@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     jwt_audience: str = "tahmeed-clients"
     access_token_minutes: int = Field(15, ge=1, le=120)
     refresh_token_days: int = Field(30, ge=1, le=365)
+    # Mobile "sign in once" — long-lived refresh; access still short + auto-refreshed.
+    mobile_refresh_token_days: int = Field(180, ge=7, le=365)
+    mobile_access_token_minutes: int = Field(60, ge=15, le=720)
     cors_origins: list[str] = []
 
     mongodump_path: str = "mongodump"
@@ -38,6 +41,13 @@ class Settings(BaseSettings):
     backup_directory: Path = Path("./var/backups")
     backup_lock_file: Path = Path("./var/backup.lock")
     attachments_directory: Path = Path("./var/attachments")
+    # Second copy of receipt bytes. Kept off the mongodump prefix so backup
+    # prune cannot delete evidence objects.
+    receipt_s3_prefix: str = "receipts"
+    receipt_reminder_hours: int = Field(24, ge=1, le=168)
+    # Mobile upload ingress (Phase E). 0 disables the in-process limiter.
+    receipt_mobile_uploads_per_hour: int = Field(60, ge=0, le=5000)
+    receipt_mobile_max_files_per_request: int = Field(10, ge=1, le=50)
     backup_s3_bucket: str = ""
     backup_s3_region: str = ""
     backup_s3_endpoint_url: str = ""
@@ -106,6 +116,14 @@ class Settings(BaseSettings):
         if not 0 <= hour <= 23 or not 0 <= minute <= 59:
             raise ValueError("must be HH:MM in UTC")
         return f"{hour:02d}:{minute:02d}"
+
+    @field_validator("receipt_s3_prefix")
+    @classmethod
+    def validate_receipt_s3_prefix(cls, value: str) -> str:
+        cleaned = value.strip().strip("/")
+        if not cleaned or ".." in cleaned.split("/") or "\\" in cleaned:
+            raise ValueError("must be a relative S3 prefix")
+        return cleaned
 
     @field_validator("backup_schedule_mode")
     @classmethod

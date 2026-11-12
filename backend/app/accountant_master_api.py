@@ -36,6 +36,8 @@ from .schemas import (
     BulkMasterUpdateRequest,
     MasterPatchRequest,
 )
+from .receipt_ops import schedule_receipt_side_effects
+from .receipt_storage import resolve_attachments_directory
 from .security import utcnow
 from .serialization import json_safe, object_id
 from .mongo_async import aggregate_list
@@ -44,9 +46,36 @@ master = APIRouter(prefix="/master", tags=["accountant"])
 
 Manager = Annotated[dict[str, Any], Depends(require_roles("admin", "accountant"))]
 
+_RECEIPT_SIDE_EFFECT_FIELDS = frozenset(
+    {
+        "ownership",
+        "category_id",
+        "category_name",
+        "item",
+        "payee",
+        "receipt_status",
+        "attachments",
+        "date",
+    }
+)
+
 
 def _database(request: Request) -> Any:
     return request.app.state.database.db
+
+
+async def _schedule_master_receipt_effects(
+    request: Request, tx_ids: list[ObjectId], fields: set[str] | frozenset[str]
+) -> None:
+    if not tx_ids or not _RECEIPT_SIDE_EFFECT_FIELDS.intersection(fields):
+        return
+    db = _database(request)
+    settings = request.app.state.settings
+    try:
+        base = await resolve_attachments_directory(settings, db)
+    except Exception:
+        base = None
+    schedule_receipt_side_effects(settings, db, base, tx_ids)
 
 
 def _parse_optional_dt(value: datetime | None) -> datetime | None:
@@ -750,6 +779,9 @@ async def bulk_update_master(
                 "fields": sorted(str(k) for k in prepared.keys()),
             },
         )
+        await _schedule_master_receipt_effects(
+            request, ids, set(prepared.keys())
+        )
     return {"updated": n}
 
 
@@ -762,11 +794,13 @@ async def bulk_patch_master(
     edited_at = utcnow().replace(tzinfo=None)
     ops: list[UpdateOne] = []
     ids: list[ObjectId] = []
+    touched_fields: set[str] = set()
     for item in body.items:
         oid = _valid_id(str(item.id).strip())
         prepared = prepare_master_updates(dict(item.updates or {}))
         if not prepared:
             continue
+        touched_fields.update(str(k) for k in prepared.keys())
         prepared["last_edited_at"] = edited_at
         prepared["last_edited_by"] = actor_oid
         ops.append(
@@ -798,6 +832,7 @@ async def bulk_patch_master(
                 "requested": len(body.items),
             },
         )
+        await _schedule_master_receipt_effects(request, ids, touched_fields)
     return {
         "updated": updated,
         "matched": matched,
@@ -827,5 +862,8 @@ async def update_master(
             actor=manager,
             entity_ids=[oid],
             details={"fields": sorted(str(k) for k in prepared.keys())},
+        )
+        await _schedule_master_receipt_effects(
+            request, [oid], set(prepared.keys())
         )
     return {"ok": ok}

@@ -13,8 +13,11 @@ from tahmeed.models.transaction import Transaction
 from tahmeed.services.api_client import ApiConnectionError, ApiError, api_client
 from tahmeed.services.api_models import desktop_document, jsonable_document
 
-# Draft saves stay in groups of 100. A parked save sends the whole set (API max 500).
-BULK_CREATE_CHUNK = 100
+# Draft sync: chunk size per worker; several workers run concurrently (API max 500).
+BULK_CREATE_CHUNK = 300
+BULK_CREATE_CONCURRENCY = 3
+BULK_PATCH_CHUNK = 300
+BULK_PATCH_CONCURRENCY = 3
 _BULK_CREATE_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 _BULK_DUP_TIMEOUT = httpx.Timeout(45.0, connect=5.0)
 # Back-compat alias for older imports / tests.
@@ -183,31 +186,55 @@ async def update_transaction(
 async def bulk_update_transactions(
     items: Sequence[Tuple[ObjectId, dict]],
 ) -> int:
-    """Patch many saved rows in one ``POST /v1/transactions/bulk-patch``.
+    """Patch many saved rows via ``POST /v1/transactions/bulk-patch``.
 
-    Each item is ``(tx_id, updates)``. Returns the server ``updated`` count.
+    Large dirty sets are split into disjoint chunks and patched concurrently
+    (bounded workers) so Save stays responsive. Returns total ``updated``.
     """
-    if not items:
+    body_items = [
+        {
+            "id": str(tx_id),
+            "values": jsonable_document(dict(updates)),
+        }
+        for tx_id, updates in items
+        if tx_id and updates
+    ]
+    if not body_items:
         return 0
-    body = {
-        "items": [
-            {
-                "id": str(tx_id),
-                "values": jsonable_document(dict(updates)),
-            }
-            for tx_id, updates in items
-            if tx_id and updates
-        ]
-    }
-    if not body["items"]:
-        return 0
-    payload = await api_client.request(
-        "POST",
-        "v1/transactions/bulk-patch",
-        json=body,
-        timeout=_BULK_CREATE_TIMEOUT,
-    )
-    return int(payload.get("updated") or 0)
+
+    size = max(1, min(BULK_PATCH_CHUNK, 500))
+    if len(body_items) <= size:
+        payload = await api_client.request(
+            "POST",
+            "v1/transactions/bulk-patch",
+            json={"items": body_items},
+            timeout=_BULK_CREATE_TIMEOUT,
+        )
+        return int(payload.get("updated") or 0)
+
+    chunks = [
+        body_items[offset : offset + size]
+        for offset in range(0, len(body_items), size)
+    ]
+    sem = asyncio.Semaphore(max(1, BULK_PATCH_CONCURRENCY))
+    updated = 0
+    lock = asyncio.Lock()
+
+    async def _one(chunk: list[dict]) -> None:
+        nonlocal updated
+        async with sem:
+            payload = await api_client.request(
+                "POST",
+                "v1/transactions/bulk-patch",
+                json={"items": chunk},
+                timeout=_BULK_CREATE_TIMEOUT,
+            )
+            n = int(payload.get("updated") or 0)
+            async with lock:
+                updated += n
+
+    await asyncio.gather(*(_one(chunk) for chunk in chunks))
+    return updated
 
 
 async def apply_description_mapping_bulk(
@@ -1468,16 +1495,15 @@ async def bulk_save_transactions(
     on_progress: Optional[BulkCreateProgress] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
 ) -> List[Tuple[str, Optional[Transaction], Optional[str]]]:
-    """Create many drafts via ``/bulk-create`` (chunked).
+    """Create many drafts via ``/bulk-create`` (chunked, concurrent workers).
 
     Returns one ``(status, transaction|None, error|None)`` per input tx, where
     status is ``created``, ``already_exists``, or ``error``.
 
-    ``on_progress(done_through, total)`` is invoked after each chunk (and once
-    at the start with ``done_through=0``) so UIs can show ``1–100 of 360``.
-
-    ``should_cancel()`` is checked before each chunk; when True, remaining
-    items stay ``("error", None, "cancelled")`` so callers can re-queue them.
+    Disjoint index ranges are posted in parallel (bounded by
+    ``BULK_CREATE_CONCURRENCY``) so large syncs finish faster without clashing
+    on the same rows. ``on_progress(done, total)`` reports completed count.
+    ``should_cancel()`` stops starting new chunks; in-flight chunks still finish.
     """
     if not txs:
         return []
@@ -1500,68 +1526,108 @@ async def bulk_save_transactions(
     size = min(len(txs), 500) if _bulk_save_one_request.get() else BULK_CREATE_CHUNK
     if size <= 0:
         size = BULK_CREATE_CHUNK
-    for offset in range(0, total, size):
-        if should_cancel is not None and should_cancel():
-            for i in range(offset, total):
-                outcomes[i] = ("error", None, "cancelled")
-            break
-        chunk = list(txs[offset : offset + size])
-        body = {"items": [_tx_create_body(tx) for tx in chunk]}
+    size = min(size, 500)
 
-        async def _post_once() -> dict:
-            return await api_client.request(
-                "POST",
-                "v1/transactions/bulk-create",
-                json=body,
-                timeout=_BULK_CREATE_TIMEOUT,
+    chunk_specs: list[tuple[int, list[Transaction]]] = [
+        (offset, list(txs[offset : offset + size]))
+        for offset in range(0, total, size)
+    ]
+    # Single chunk → keep the simple sequential path (also used by parked one-shot).
+    if len(chunk_specs) == 1 or _bulk_save_one_request.get():
+        for offset, chunk in chunk_specs:
+            if should_cancel is not None and should_cancel():
+                for i in range(offset, total):
+                    outcomes[i] = ("error", None, "cancelled")
+                break
+            await _bulk_create_one_chunk(
+                txs, outcomes, offset, chunk, _BULK_CREATE_TIMEOUT
             )
+            await _emit(min(total, offset + len(chunk)))
+        return outcomes
 
-        try:
-            payload = await _post_once()
-        except ApiConnectionError as exc:
-            # Timeout with client_row_ids: safe to replay (server idempotent).
-            if getattr(exc, "code", None) == "timeout" and all(
-                tx.client_row_id for tx in chunk
-            ):
-                try:
-                    payload = await _post_once()
-                except Exception as exc2:
-                    for i, _tx in enumerate(chunk):
-                        outcomes[offset + i] = ("error", None, str(exc2))
-                    await _emit(min(total, offset + len(chunk)))
-                    continue
+    sem = asyncio.Semaphore(max(1, BULK_CREATE_CONCURRENCY))
+    done_count = 0
+    progress_lock = asyncio.Lock()
+    cancel_rest = False
+
+    async def _worker(offset: int, chunk: list[Transaction]) -> None:
+        nonlocal done_count, cancel_rest
+        async with sem:
+            if cancel_rest or (should_cancel is not None and should_cancel()):
+                cancel_rest = True
+                for i in range(len(chunk)):
+                    outcomes[offset + i] = ("error", None, "cancelled")
             else:
+                await _bulk_create_one_chunk(
+                    txs, outcomes, offset, chunk, _BULK_CREATE_TIMEOUT
+                )
+            async with progress_lock:
+                done_count += len(chunk)
+                await _emit(min(total, done_count))
+
+    await asyncio.gather(
+        *(_worker(offset, chunk) for offset, chunk in chunk_specs)
+    )
+    return outcomes
+
+
+async def _bulk_create_one_chunk(
+    txs: Sequence[Transaction],
+    outcomes: List[Tuple[str, Optional[Transaction], Optional[str]]],
+    offset: int,
+    chunk: list[Transaction],
+    timeout: httpx.Timeout,
+) -> None:
+    """POST one bulk-create chunk and write results into ``outcomes[offset:]``."""
+    body = {"items": [_tx_create_body(tx) for tx in chunk]}
+
+    async def _post_once() -> dict:
+        return await api_client.request(
+            "POST",
+            "v1/transactions/bulk-create",
+            json=body,
+            timeout=timeout,
+        )
+
+    try:
+        payload = await _post_once()
+    except ApiConnectionError as exc:
+        # Timeout with client_row_ids: safe to replay (server idempotent).
+        if getattr(exc, "code", None) == "timeout" and all(
+            tx.client_row_id for tx in chunk
+        ):
+            try:
+                payload = await _post_once()
+            except Exception as exc2:
                 for i, _tx in enumerate(chunk):
-                    outcomes[offset + i] = ("error", None, str(exc))
-                await _emit(min(total, offset + len(chunk)))
-                continue
-        except Exception as exc:
+                    outcomes[offset + i] = ("error", None, str(exc2))
+                return
+        else:
             for i, _tx in enumerate(chunk):
                 outcomes[offset + i] = ("error", None, str(exc))
-            await _emit(min(total, offset + len(chunk)))
+            return
+    except Exception as exc:
+        for i, _tx in enumerate(chunk):
+            outcomes[offset + i] = ("error", None, str(exc))
+        return
+
+    for row in payload.get("results") or []:
+        try:
+            idx = int(row.get("index"))
+        except (TypeError, ValueError):
             continue
-
-        for row in payload.get("results") or []:
-            try:
-                idx = int(row.get("index"))
-            except (TypeError, ValueError):
-                continue
-            absolute = offset + idx
-            if absolute < 0 or absolute >= len(outcomes):
-                continue
-            status_key = str(row.get("status") or "error")
-            err = row.get("error")
-            raw = row.get("transaction")
-            saved = _tx_from_api(raw) if isinstance(raw, dict) else None
-            if saved is not None and absolute < len(txs):
-                txs[absolute]._id = saved._id
-                if saved.client_row_id and not txs[absolute].client_row_id:
-                    txs[absolute].client_row_id = saved.client_row_id
-            outcomes[absolute] = (status_key, saved, str(err) if err else None)
-
-        await _emit(min(total, offset + len(chunk)))
-
-    return outcomes
+        absolute = offset + idx
+        if absolute < 0 or absolute >= len(outcomes):
+            continue
+        status_key = str(row.get("status") or "error")
+        err = row.get("error")
+        raw = row.get("transaction")
+        saved = _tx_from_api(raw) if isinstance(raw, dict) else None
+        if saved is not None and absolute < len(txs):
+            txs[absolute]._id = saved._id
+            if saved.client_row_id and not txs[absolute].client_row_id:
+                txs[absolute].client_row_id = saved.client_row_id
+        outcomes[absolute] = (status_key, saved, str(err) if err else None)
 
 
 async def count_draft_transactions(
