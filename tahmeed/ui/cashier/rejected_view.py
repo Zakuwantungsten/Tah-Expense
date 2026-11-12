@@ -42,6 +42,7 @@ from tahmeed.services.category_service import get_payment_target_categories
 from tahmeed.services.subtable_service import get_subtables
 from tahmeed.ui.cashier.excel_row_header import ExcelRowHeaderView, ROW_HEADER_QSS, sync_row_header_labels
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 # ── Design tokens ────────────────────────────────────────────────────────────
 _WHITE = "#FFFFFF"
@@ -943,12 +944,12 @@ class RejectedView(QWidget):
     # ── Context menu ─────────────────────────────────────────────────────────
 
     def _show_context_menu(self, pos) -> None:
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         self._populate_context_menu(menu)
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
     def _show_row_header_context_menu(self, global_pos) -> None:
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         self._populate_context_menu(menu)
         menu.exec(global_pos)
 

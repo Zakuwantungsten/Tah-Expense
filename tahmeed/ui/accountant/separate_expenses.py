@@ -61,6 +61,7 @@ from tahmeed.ui.widgets.export_runner import (
     show_export_busy,
 )
 from tahmeed.ui.widgets.split_export_button import make_export_menu_btn
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 # ── openpyxl (optional — fallback to csv-only if missing) ──────────────────────
 try:
@@ -2347,7 +2348,7 @@ class _TollUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         row = self._table.rowAt(pos.y())
         if not (0 <= row < len(self._uploads)):
             return
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         act = menu.addAction("Delete this upload")
         if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
             self.delete_clicked.emit(self._uploads[row])
@@ -3171,7 +3172,7 @@ class _ParkingCongoUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         row = self._table.rowAt(pos.y())
         if not (0 <= row < len(self._uploads)):
             return
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         act = menu.addAction("Delete this upload")
         if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
             self.delete_clicked.emit(self._uploads[row])
@@ -4703,7 +4704,7 @@ class _CongoExpUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         row = self._table.rowAt(pos.y())
         if not (0 <= row < len(self._uploads)):
             return
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         act = menu.addAction("Delete this upload")
         if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
             self.delete_clicked.emit(self._uploads[row])
@@ -6388,7 +6389,7 @@ class _KimviUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         row = self._table.rowAt(pos.y())
         if not (0 <= row < len(self._uploads)):
             return
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         act = menu.addAction("Delete this upload")
         if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
             self.delete_clicked.emit(self._uploads[row])
@@ -7737,7 +7738,7 @@ class _ZambiaParkingUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         row = self._table.rowAt(pos.y())
         if not (0 <= row < len(self._uploads)):
             return
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         act = menu.addAction("Delete this upload")
         if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
             self.delete_clicked.emit(self._uploads[row])
@@ -9683,7 +9684,7 @@ class _AfritrackUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         row = self._table.rowAt(pos.y())
         if not (0 <= row < len(self._uploads)):
             return
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         act = menu.addAction("Delete this upload")
         if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
             self.delete_clicked.emit(self._uploads[row])
@@ -11657,7 +11658,7 @@ class _RahnTechUploadBrowse(_UploadBrowseChromeMixin, QWidget):
         row = self._table.rowAt(pos.y())
         if not (0 <= row < len(self._uploads)):
             return
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         act = menu.addAction("Delete this upload")
         if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
             self.delete_clicked.emit(self._uploads[row])

@@ -1153,6 +1153,494 @@ async def list_receipt_requests(
     return items
 
 
+def tx_register_calendar_day(tx: dict[str, Any]) -> date | None:
+    """Register calendar day for a transaction (import primary, else Excel date)."""
+    raw = tx.get("import_primary_date") or tx.get("date")
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    return None
+
+
+def classify_receipt_day_bucket(
+    tx: dict[str, Any],
+    *,
+    needed_tx_ids: set[Any],
+) -> str:
+    """Bucket a row for Main day counts: ``needed`` | ``no_receipt`` | ``other``.
+
+    Rules (Phase 1 Main):
+    - **no_receipt** — ``normalize_receipt_status`` is ``no_receipt``.
+    - **needed** — open chase request (``receipt_requests.status=needed``) for this
+      tx, **or** explicit ``receipt_status=receipt`` (Requested ≡ Needed). Partial
+      rows stay Needed while their request remains ``needed``.
+    - **other** — received, waived/missing, bare pending without a needed request, etc.
+    """
+    status = normalize_receipt_status(tx.get("receipt_status"))
+    if status == "no_receipt":
+        return "no_receipt"
+    tx_id = tx.get("_id")
+    if tx_id is not None and tx_id in needed_tx_ids:
+        return "needed"
+    if status == "receipt":
+        return "needed"
+    return "other"
+
+
+def _tx_attachment_file_ids(tx: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for att in tx.get("attachments") or []:
+        if not isinstance(att, dict):
+            continue
+        fid = att.get("file_id") or att.get("id")
+        if fid is None:
+            continue
+        text = str(fid).strip()
+        if text:
+            ids.append(text)
+    return ids
+
+
+def _tx_is_multi_file(tx: dict[str, Any]) -> bool:
+    """One entry tied to many receipt files."""
+    return len(_tx_attachment_file_ids(tx)) > 1
+
+
+def _shared_file_tx_ids(docs: list[dict[str, Any]]) -> set[Any]:
+    """Tx ids that share at least one file with another scanned entry."""
+    file_to_txs: dict[str, set[Any]] = {}
+    for tx in docs:
+        tx_id = tx.get("_id")
+        if tx_id is None:
+            continue
+        for fid in _tx_attachment_file_ids(tx):
+            file_to_txs.setdefault(fid, set()).add(tx_id)
+    shared: set[Any] = set()
+    for tids in file_to_txs.values():
+        if len(tids) > 1:
+            shared.update(tids)
+    return shared
+
+
+async def list_receipt_day_summaries(
+    db: Any,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    cashier_id: ObjectId | None = None,
+    limit: int = 120,
+    offset: int = 0,
+    scan_limit: int = 20000,
+) -> dict[str, Any]:
+    """One summary row per register day for the Receipts Main tab.
+
+    Returns ``{items, total, offset, limit, has_more}`` — newest days first.
+    Each item includes:
+    ``date``, ``entries_count``, ``needed_count``, ``partial_count``,
+    ``collected_count``, ``waived_count``, ``no_receipt_count``,
+    ``multi_file_count``, ``shared_file_count``, ``cashier_ids``.
+
+    **Partial** is smart: counted in ``partial_count`` and also in
+    ``needed_count`` (still owes a complete receipt).
+
+    **Multi-file** = one entry with many attached files.
+    **Shared file** = entry whose file is also linked to another entry.
+
+    Scope matches the rest of the Receipts desk by default (all cashiers). Pass
+    ``cashier_id`` to narrow. Date bounds use the register calendar day
+    (``import_primary_date`` else ``date``), not upload day.
+    """
+    day_limit = max(1, min(int(limit or 120), 500))
+    day_offset = max(0, int(offset or 0))
+    row_cap = max(day_limit + day_offset, min(int(scan_limit or 20000), 50000))
+
+    req_rows = await db.receipt_requests.find(
+        {},
+        {
+            "transaction_id": 1,
+            "status": 1,
+            "partial_receipt": 1,
+            "partial_note": 1,
+        },
+    ).to_list(length=row_cap)
+    req_by_tx: dict[Any, dict[str, Any]] = {}
+    needed_tx_ids: set[Any] = set()
+    for row in req_rows:
+        tid = row.get("transaction_id")
+        if tid is None:
+            continue
+        if tid not in req_by_tx:
+            req_by_tx[tid] = row
+        if str(row.get("status") or "").strip().lower() == "needed":
+            needed_tx_ids.add(tid)
+
+    query: dict[str, Any] = {
+        "trashed": {"$ne": True},
+        "discarded": {"$ne": True},
+        "deletion_requested": {"$ne": True},
+    }
+    if cashier_id is not None:
+        query["cashier_id"] = cashier_id
+
+    cursor = db.transactions.find(
+        query,
+        {
+            "date": 1,
+            "import_primary_date": 1,
+            "receipt_status": 1,
+            "receipt_partial_note": 1,
+            "attachments": 1,
+            "cashier_id": 1,
+        },
+    )
+    docs = await cursor.to_list(length=row_cap)
+    shared_tx_ids = _shared_file_tx_ids(docs)
+
+    buckets: dict[date, dict[str, Any]] = {}
+    for tx in docs:
+        day = tx_register_calendar_day(tx)
+        if day is None:
+            continue
+        if date_from is not None and day < date_from:
+            continue
+        if date_to is not None and day > date_to:
+            continue
+        slot = buckets.get(day)
+        if slot is None:
+            slot = {
+                "date": day,
+                "entries_count": 0,
+                "needed_count": 0,
+                "partial_count": 0,
+                "collected_count": 0,
+                "waived_count": 0,
+                "no_receipt_count": 0,
+                "multi_file_count": 0,
+                "shared_file_count": 0,
+                "cashier_ids": set(),
+            }
+            buckets[day] = slot
+        slot["entries_count"] += 1
+
+        req = req_by_tx.get(tx.get("_id"))
+        status_key = receipt_display_status_key(tx, req)
+        # Legacy needed-bucket still used when display is bare pending+label.
+        legacy = classify_receipt_day_bucket(tx, needed_tx_ids=needed_tx_ids)
+
+        if status_key == "no_receipt":
+            slot["no_receipt_count"] += 1
+        elif status_key == "waived":
+            slot["waived_count"] += 1
+        elif status_key == "partial":
+            slot["partial_count"] += 1
+            slot["needed_count"] += 1  # partial stays Needed until complete
+        elif status_key == "needed" or legacy == "needed":
+            slot["needed_count"] += 1
+        elif status_key == "received":
+            slot["collected_count"] += 1
+
+        if _tx_is_multi_file(tx):
+            slot["multi_file_count"] += 1
+        if tx.get("_id") in shared_tx_ids:
+            slot["shared_file_count"] += 1
+
+        cid = tx.get("cashier_id")
+        if cid is not None:
+            slot["cashier_ids"].add(cid)
+
+    ordered = sorted(buckets.values(), key=lambda row: row["date"], reverse=True)
+    total = len(ordered)
+    page = ordered[day_offset : day_offset + day_limit]
+    items: list[dict[str, Any]] = []
+    for row in page:
+        items.append(
+            {
+                "date": row["date"].isoformat(),
+                "entries_count": int(row["entries_count"]),
+                "needed_count": int(row["needed_count"]),
+                "partial_count": int(row["partial_count"]),
+                "collected_count": int(row["collected_count"]),
+                "waived_count": int(row["waived_count"]),
+                "no_receipt_count": int(row["no_receipt_count"]),
+                "multi_file_count": int(row["multi_file_count"]),
+                "shared_file_count": int(row["shared_file_count"]),
+                "cashier_ids": list(row["cashier_ids"]),
+            }
+        )
+    return {
+        "items": items,
+        "total": total,
+        "offset": day_offset,
+        "limit": day_limit,
+        "has_more": (day_offset + len(items)) < total,
+    }
+
+
+# Display keys for day-drill / View-all status column + filters.
+RECEIPT_DISPLAY_NEEDED = "needed"
+RECEIPT_DISPLAY_RECEIVED = "received"
+RECEIPT_DISPLAY_PARTIAL = "partial"
+RECEIPT_DISPLAY_WAIVED = "waived"
+RECEIPT_DISPLAY_NO_RECEIPT = "no_receipt"
+RECEIPT_DISPLAY_PENDING = "pending"
+
+_RECEIPT_DISPLAY_LABELS: dict[str, str] = {
+    RECEIPT_DISPLAY_NEEDED: "Needed",
+    RECEIPT_DISPLAY_RECEIVED: "Received",
+    RECEIPT_DISPLAY_PARTIAL: "Partial",
+    RECEIPT_DISPLAY_WAIVED: "Waived",
+    RECEIPT_DISPLAY_NO_RECEIPT: "No receipt",
+    RECEIPT_DISPLAY_PENDING: "Pending",
+}
+
+_RECEIPT_ENTRY_PROJECTION: dict[str, int] = {
+    "date": 1,
+    "import_primary_date": 1,
+    "amount": 1,
+    "currency": 1,
+    "item": 1,
+    "category_name": 1,
+    "payee": 1,
+    "ownership": 1,
+    "description": 1,
+    "truck_number": 1,
+    "receipt_status": 1,
+    "receipt_partial_note": 1,
+    "attachments": 1,
+    "cashier_id": 1,
+}
+
+
+def receipt_display_status_key(
+    tx: dict[str, Any],
+    request: dict[str, Any] | None = None,
+) -> str:
+    """Single status key for entry tables (Phase 2).
+
+    Priority: No receipt → Waived → Partial → Received → Needed → Pending.
+    Requested ≡ Needed. Partial is a normal row; attachment refs carry the file.
+    """
+    req = request or {}
+    req_status = str(req.get("status") or "").strip().lower()
+    raw_status = str(tx.get("receipt_status") or "").strip().lower()
+    status = normalize_receipt_status(tx.get("receipt_status"))
+
+    if status == "no_receipt":
+        return RECEIPT_DISPLAY_NO_RECEIPT
+    if req_status == "waived" or status == "missing":
+        return RECEIPT_DISPLAY_WAIVED
+    if (
+        raw_status == "partial"
+        or status == "partial"
+        or bool(req.get("partial_receipt"))
+        or any(bool(att.get("partial")) for att in (tx.get("attachments") or []) if isinstance(att, dict))
+    ):
+        return RECEIPT_DISPLAY_PARTIAL
+    if req_status == "received" or status == "received":
+        return RECEIPT_DISPLAY_RECEIVED
+    if req_status == "needed" or status == "receipt":
+        return RECEIPT_DISPLAY_NEEDED
+    return RECEIPT_DISPLAY_PENDING
+
+
+def receipt_display_status_label(key: str) -> str:
+    """Human label for ``receipt_display_status_key``."""
+    return _RECEIPT_DISPLAY_LABELS.get(
+        (key or "").strip().lower(), (key or "Pending").strip().title() or "Pending"
+    )
+
+
+def _attachment_refs(tx: dict[str, Any]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for att in tx.get("attachments") or []:
+        if not isinstance(att, dict):
+            continue
+        att_id = att.get("id") or att.get("file_id")
+        file_id = att.get("file_id") or att.get("id")
+        if att_id is None and file_id is None:
+            continue
+        refs.append(
+            {
+                "attachment_id": str(att_id) if att_id is not None else None,
+                "file_id": str(file_id) if file_id is not None else None,
+                "filename": str(att.get("filename") or "file"),
+                "partial": bool(att.get("partial")),
+                "partial_note": str(att.get("partial_note") or ""),
+                "content_type": str(att.get("content_type") or ""),
+                "size": int(att.get("size") or 0),
+            }
+        )
+    return refs
+
+
+def serialize_receipt_entry_row(
+    tx: dict[str, Any],
+    request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Entry row for day drill / View all (one display status + openable refs)."""
+    req = request or {}
+    day = tx_register_calendar_day(tx)
+    status_key = receipt_display_status_key(tx, req)
+    attachments = _attachment_refs(tx)
+    partial_note = str(
+        req.get("partial_note")
+        or tx.get("receipt_partial_note")
+        or next((a["partial_note"] for a in attachments if a.get("partial_note")), "")
+        or ""
+    )
+    primary = next((a for a in attachments if a.get("file_id")), None)
+    if primary is None and attachments:
+        primary = attachments[0]
+    raw_receipt = str(tx.get("receipt_status") or "").strip().lower()
+    stored_receipt = (
+        "partial"
+        if raw_receipt == "partial"
+        else normalize_receipt_status(tx.get("receipt_status"))
+    )
+    return {
+        "id": str(tx.get("_id")) if tx.get("_id") is not None else None,
+        "date": day.isoformat() if day else None,
+        "amount": float(tx.get("amount") or 0.0),
+        "currency": str(tx.get("currency") or "TZS"),
+        "item": str(tx.get("item") or tx.get("category_name") or ""),
+        "payee": str(tx.get("payee") or ""),
+        "ownership": str(tx.get("ownership") or ""),
+        "truck_number": str(tx.get("truck_number") or "").strip(),
+        "description": str(tx.get("description") or ""),
+        "cashier_id": str(tx["cashier_id"]) if tx.get("cashier_id") is not None else None,
+        "receipt_status": stored_receipt,
+        "request_status": str(req.get("status") or "") or None,
+        "request_id": str(req["_id"]) if req.get("_id") is not None else None,
+        "display_status": receipt_display_status_label(status_key),
+        "display_status_key": status_key,
+        "partial": status_key == RECEIPT_DISPLAY_PARTIAL,
+        "partial_note": partial_note,
+        "attachment_count": len(attachments),
+        "attachments": attachments,
+        "primary_file_id": (primary or {}).get("file_id"),
+        "primary_attachment_id": (primary or {}).get("attachment_id"),
+        "primary_filename": (primary or {}).get("filename"),
+    }
+
+
+async def _requests_by_transaction_ids(
+    db: Any, tx_ids: list[Any]
+) -> dict[Any, dict[str, Any]]:
+    if not tx_ids:
+        return {}
+    rows = await db.receipt_requests.find(
+        {"transaction_id": {"$in": tx_ids}}
+    ).to_list(length=max(len(tx_ids) * 2, 50))
+    by_tx: dict[Any, dict[str, Any]] = {}
+    for row in rows:
+        tid = row.get("transaction_id")
+        if tid is None or tid in by_tx:
+            continue
+        by_tx[tid] = row
+    return by_tx
+
+
+def _visible_tx_query(cashier_id: ObjectId | None = None) -> dict[str, Any]:
+    query: dict[str, Any] = {
+        "trashed": {"$ne": True},
+        "discarded": {"$ne": True},
+        "deletion_requested": {"$ne": True},
+    }
+    if cashier_id is not None:
+        query["cashier_id"] = cashier_id
+    return query
+
+
+async def list_receipt_day_entries(
+    db: Any,
+    *,
+    day: date,
+    cashier_id: ObjectId | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Entries for one register day (Main drill). Newest amount order not required;
+    stable by date then id.
+    """
+    row_cap = max(1, min(int(limit or 500), 2000))
+    docs = await db.transactions.find(
+        _visible_tx_query(cashier_id), _RECEIPT_ENTRY_PROJECTION
+    ).to_list(length=max(row_cap * 5, 2000))
+    matched = [
+        tx
+        for tx in docs
+        if tx_register_calendar_day(tx) == day
+    ][:row_cap]
+    matched.sort(
+        key=lambda tx: (
+            tx_register_calendar_day(tx) or date.min,
+            str(tx.get("_id") or ""),
+        ),
+        reverse=True,
+    )
+    req_map = await _requests_by_transaction_ids(
+        db, [tx["_id"] for tx in matched if tx.get("_id") is not None]
+    )
+    return [
+        serialize_receipt_entry_row(tx, req_map.get(tx.get("_id")))
+        for tx in matched
+    ]
+
+
+async def list_receipt_entries(
+    db: Any,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    status: str = "all",
+    cashier_id: ObjectId | None = None,
+    limit: int = 500,
+    scan_limit: int = 20000,
+) -> list[dict[str, Any]]:
+    """Flat entry list for View all — same row shape as day entries.
+
+    ``status`` filters on ``display_status_key`` (needed / received / partial /
+    waived / no_receipt / pending) or ``all``.
+    """
+    row_cap = max(1, min(int(limit or 500), 2000))
+    scan_cap = max(row_cap, min(int(scan_limit or 20000), 50000))
+    status_key = (status or "all").strip().lower()
+    docs = await db.transactions.find(
+        _visible_tx_query(cashier_id), _RECEIPT_ENTRY_PROJECTION
+    ).to_list(length=scan_cap)
+
+    filtered: list[dict[str, Any]] = []
+    for tx in docs:
+        day = tx_register_calendar_day(tx)
+        if day is None:
+            continue
+        if date_from is not None and day < date_from:
+            continue
+        if date_to is not None and day > date_to:
+            continue
+        filtered.append(tx)
+
+    filtered.sort(
+        key=lambda tx: (
+            tx_register_calendar_day(tx) or date.min,
+            str(tx.get("_id") or ""),
+        ),
+        reverse=True,
+    )
+    req_map = await _requests_by_transaction_ids(
+        db, [tx["_id"] for tx in filtered if tx.get("_id") is not None]
+    )
+    items: list[dict[str, Any]] = []
+    for tx in filtered:
+        row = serialize_receipt_entry_row(tx, req_map.get(tx.get("_id")))
+        if status_key not in {"", "all"} and row["display_status_key"] != status_key:
+            continue
+        items.append(row)
+        if len(items) >= row_cap:
+            break
+    return items
+
+
 async def receipt_compliance_summary(
     db: Any,
     *,

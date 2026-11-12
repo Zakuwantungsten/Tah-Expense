@@ -50,6 +50,7 @@ from tahmeed.services import reconciliation_service as recon_svc
 from tahmeed.services.excel_dates import parse_excel_date
 from tahmeed.ui.dialog_theme import show_question
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 try:
     import openpyxl
@@ -1222,7 +1223,7 @@ class _ReconUploadBrowse(QWidget):
         row = self._table_w.rowAt(pos.y())
         if not (0 <= row < len(self._uploads)):
             return
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         act = menu.addAction("Delete this upload")
         if menu.exec(self._table_w.viewport().mapToGlobal(pos)) == act:
             self.delete_clicked.emit(self._uploads[row])

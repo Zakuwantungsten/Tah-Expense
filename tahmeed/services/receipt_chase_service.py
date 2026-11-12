@@ -45,6 +45,76 @@ async def get_compliance(
     )
 
 
+async def list_receipt_day_summaries(
+    *,
+    date_from: str = "",
+    date_to: str = "",
+    cashier_id: str = "",
+    limit: int = 40,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Main tab day rows page: ``items``, ``total``, ``has_more``, ``offset``."""
+    params: dict[str, Any] = {
+        "limit": max(1, min(int(limit or 40), 500)),
+        "offset": max(0, int(offset or 0)),
+    }
+    if date_from.strip():
+        params["date_from"] = date_from.strip()
+    if date_to.strip():
+        params["date_to"] = date_to.strip()
+    if cashier_id.strip():
+        params["cashier_id"] = cashier_id.strip()
+    payload = await api_client.request(
+        "GET", "v1/receipts/day-summaries", params=params
+    )
+    return dict(payload or {})
+
+
+async def list_receipt_day_entries(
+    *,
+    day: str,
+    cashier_id: str = "",
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Main drill: entries for one register day (status + attachment refs)."""
+    day_key = (day or "").strip()
+    if not day_key:
+        raise ValueError("day is required (YYYY-MM-DD)")
+    params: dict[str, Any] = {
+        "day": day_key,
+        "limit": max(1, min(int(limit or 500), 2000)),
+    }
+    if cashier_id.strip():
+        params["cashier_id"] = cashier_id.strip()
+    payload = await api_client.request(
+        "GET", "v1/receipts/day-entries", params=params
+    )
+    return list(payload.get("items") or [])
+
+
+async def list_receipt_entries(
+    *,
+    date_from: str = "",
+    date_to: str = "",
+    status: str = "all",
+    cashier_id: str = "",
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """View all: flat entries across a date range with optional status filter."""
+    params: dict[str, Any] = {
+        "status": (status or "all").strip() or "all",
+        "limit": max(1, min(int(limit or 500), 2000)),
+    }
+    if date_from.strip():
+        params["date_from"] = date_from.strip()
+    if date_to.strip():
+        params["date_to"] = date_to.strip()
+    if cashier_id.strip():
+        params["cashier_id"] = cashier_id.strip()
+    payload = await api_client.request("GET", "v1/receipts/entries", params=params)
+    return list(payload.get("items") or [])
+
+
 async def list_inbox(
     *, status: str = "parked", unmatched_only: bool = False
 ) -> list[dict[str, Any]]:

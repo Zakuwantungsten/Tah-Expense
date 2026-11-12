@@ -36,6 +36,7 @@ from tahmeed.ui.cashier.register_delegates import (
     _receipt_paste_value,
     _norm_receipt_text, _VALID_RCPT, format_register_date,
 )
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 # ── Column layout (must match master_expenses._COLS) ─────────────────────────
 _COLS = [
@@ -1068,7 +1069,7 @@ class MasterLedgerTable(QFrame):
                 self._mark_dirty(row)
 
     def _show_context_menu(self, pos) -> None:
-        menu = QMenu(self._tbl)
+        menu = apply_light_menu(QMenu(self._tbl))
         menu.addAction("Copy", self._copy)
         if self._edit_mode:
             menu.addAction("Cut", self._cut)

@@ -25,6 +25,7 @@ from tahmeed.ui.accountant.separate_expenses import (
 )
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 _WHITE   = "#FFFFFF"
 _BG      = "#F4F6F8"
@@ -413,7 +414,7 @@ class PeopleRegistryWidget(QWidget):
         active = entry.get("active", True)
         name = entry.get("name", "")
 
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         toggle_act = menu.addAction("Deactivate" if active else "Activate")
         menu.addSeparator()
         delete_act = menu.addAction("Delete")

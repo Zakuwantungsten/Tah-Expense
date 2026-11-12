@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from tahmeed.config import APP_NAME
 from tahmeed.ui.accountant.menu_bar import _style_menu_bar
 from tahmeed.ui.cashier.sidebar import _SECTIONS
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 _BLUE = "#0077C5"
 
@@ -92,7 +93,7 @@ class CashierMenuBar(QMenuBar):
         hl.setContentsMargins(4, 0, 8, 0)
         hl.setSpacing(4)
 
-        menu = QMenu(wrap)
+        menu = apply_light_menu(QMenu(wrap))
         change_pw = menu.addAction(
             qta.icon("mdi.lock-reset", color="#6B7280"), "Change Password…"
         )

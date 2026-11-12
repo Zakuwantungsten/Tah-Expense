@@ -72,6 +72,7 @@ from tahmeed.ui.accountant.fuel_sort_helpers import diesel_columns_sort
 from tahmeed.ui.accountant.feed_sort_helpers import (
     wire_feed_table_sort, sort_kw, reset_feed_sort, clear_upload_detail_filters,
 )
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 # ── Design tokens ──────────────────────────────────────────────────────────────
 _WHITE   = "#FFFFFF"
@@ -1802,7 +1803,7 @@ class _DieselUploadBrowse(QWidget):
         row = self._table.rowAt(pos.y())
         if not (0 <= row < len(self._uploads)):
             return
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         act = menu.addAction("Delete this upload")
         if menu.exec(self._table.viewport().mapToGlobal(pos)) == act:
             self.delete_clicked.emit(self._uploads[row])

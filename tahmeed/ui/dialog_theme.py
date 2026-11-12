@@ -147,10 +147,19 @@ class _DialogContrastFilter(QObject):
 
 def apply_readable_dialog_styles(app: QApplication) -> None:
     """Append contrast rules so confirm / input / progress dialogs stay readable."""
+    from tahmeed.ui.widgets.popup_styles import LIGHT_POPUP_SS
+
     existing = app.styleSheet() or ""
-    if "QMessageBox QLabel" in existing:
+    parts: list[str] = []
+    if "QMessageBox QLabel" not in existing:
+        parts.append(_DIALOG_CONTRAST_SS)
+    # Tooltips / menus: Fusion + OS dark mode (or leaked parent backgrounds)
+    # otherwise render black-on-black in white UI chrome.
+    if "QToolTip {" not in existing:
+        parts.append(LIGHT_POPUP_SS)
+    if not parts:
         return
-    app.setStyleSheet(existing + "\n" + _DIALOG_CONTRAST_SS)
+    app.setStyleSheet(existing + "\n" + "\n".join(parts))
 
 
 def _is_ok_only(buttons: QMessageBox.StandardButton) -> bool:
@@ -268,6 +277,7 @@ def _patch_message_box_statics() -> None:
 def install_dialog_theme(app: QApplication) -> None:
     """Install global hooks so every standard dialog stays readable."""
     global _hooks_installed
+    apply_readable_dialog_styles(app)
     if not _hooks_installed:
         _patch_message_box_statics()
         app.installEventFilter(_DialogContrastFilter(app))

@@ -25,6 +25,7 @@ from tahmeed.ui.dialog_theme import show_critical, show_info, show_question, sho
 from tahmeed.ui.dialogs.item_dialog import ItemDialog
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -898,7 +899,7 @@ class DescriptionMapsWidget(QWidget):
         if not self._table.selectionModel().isRowSelected(row, self._table.rootIndex()):
             self._table.selectRow(row)
         entry = self._rows[row]
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         selected = self._selected_entries()
         if len(selected) > 1:
             reassign_act = menu.addAction(

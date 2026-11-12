@@ -26,6 +26,9 @@ from .receipt_ops import (
     get_receipt_file_open_meta,
     list_inbox_files,
     list_quarantine_files,
+    list_receipt_day_entries,
+    list_receipt_day_summaries,
+    list_receipt_entries,
     list_receipt_library,
     list_receipt_requests,
     list_storage_objects,
@@ -287,6 +290,115 @@ async def get_receipt_compliance(
         reminder_threshold=reminder_threshold,
     )
     return json_safe(summary)
+
+
+@receipts.get("/day-summaries")
+async def get_receipt_day_summaries(
+    request: Request,
+    _user: DeskActor,
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    cashier_id: str | None = Query(None),
+    limit: int = Query(40, ge=1, le=500),
+    offset: int = Query(0, ge=0, le=100000),
+) -> dict[str, Any]:
+    """Main tab: one row per register day with receipt progress counts.
+
+    Counts: Needed, Partial, Collected, Waived, No receipt, Multi-file, Shared.
+    Supports ``offset`` / ``limit`` for infinite-scroll pagination.
+
+    **Needed** — open request ``needed`` or ``receipt_status=receipt``.
+    **Partial** also increments Needed (still incomplete) plus ``partial_count``.
+    **Collected** — received / linked complete.
+    **Multi-file** — one entry with many attached files.
+    **Shared** — entry whose file is also linked to another entry.
+
+    Day key is register calendar day (``import_primary_date`` else ``date``).
+    Default scope is all cashiers (same as chase/compliance); pass
+    ``cashier_id`` to narrow.
+    """
+    owner: ObjectId | None = None
+    if cashier_id and str(cashier_id).strip():
+        try:
+            owner = object_id(str(cashier_id).strip())
+        except Exception as exc:
+            raise ApiError(422, "invalid_cashier_id", "Invalid cashier_id") from exc
+    payload = await list_receipt_day_summaries(
+        _database(request),
+        date_from=date_from,
+        date_to=date_to,
+        cashier_id=owner,
+        limit=limit,
+        offset=offset,
+    )
+    return json_safe(payload)
+
+
+@receipts.get("/day-entries")
+async def get_receipt_day_entries(
+    request: Request,
+    _user: DeskActor,
+    day: date = Query(..., description="Register calendar day YYYY-MM-DD"),
+    cashier_id: str | None = Query(None),
+    limit: int = Query(500, ge=1, le=2000),
+) -> dict[str, Any]:
+    """Main drill: expense rows for one register day with one display status.
+
+    Each item includes ``display_status`` / ``display_status_key`` and
+    attachment refs (``primary_file_id``, ``attachments[]``) for the shared
+    viewer. Open path is unchanged — client uses existing file open routes.
+    """
+    owner: ObjectId | None = None
+    if cashier_id and str(cashier_id).strip():
+        try:
+            owner = object_id(str(cashier_id).strip())
+        except Exception as exc:
+            raise ApiError(422, "invalid_cashier_id", "Invalid cashier_id") from exc
+    items = await list_receipt_day_entries(
+        _database(request),
+        day=day,
+        cashier_id=owner,
+        limit=limit,
+    )
+    return json_safe({"items": items, "total": len(items), "day": day.isoformat()})
+
+
+@receipts.get("/entries")
+async def get_receipt_entries(
+    request: Request,
+    _user: DeskActor,
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    status: str = Query("all"),
+    cashier_id: str | None = Query(None),
+    limit: int = Query(500, ge=1, le=2000),
+) -> dict[str, Any]:
+    """View all: flat entry list across a date range (same row shape as day-entries).
+
+    ``status`` filters ``display_status_key``: all | needed | received | partial |
+    waived | no_receipt | pending.
+    """
+    owner: ObjectId | None = None
+    if cashier_id and str(cashier_id).strip():
+        try:
+            owner = object_id(str(cashier_id).strip())
+        except Exception as exc:
+            raise ApiError(422, "invalid_cashier_id", "Invalid cashier_id") from exc
+    items = await list_receipt_entries(
+        _database(request),
+        date_from=date_from,
+        date_to=date_to,
+        status=status,
+        cashier_id=owner,
+        limit=limit,
+    )
+    return json_safe(
+        {
+            "items": items,
+            "total": len(items),
+            "status": (status or "all").strip().lower() or "all",
+        }
+    )
 
 
 @receipts.get("/inbox")

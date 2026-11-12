@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtGui import QIcon
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 # ── Design tokens ─────────────────────────────────────────────────────────────
 
@@ -486,7 +487,7 @@ class _SubNavItem(QWidget):
         super().mousePressEvent(event)
 
     def _menu(self, pos) -> None:
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         act = menu.addAction("Delete sub-table")
         chosen = menu.exec(self.mapToGlobal(pos))
         if chosen == act:

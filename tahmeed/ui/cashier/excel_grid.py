@@ -141,6 +141,7 @@ from tahmeed.ui.cashier.excel_row_header import (
     MIN_ROW_HEIGHT,
     sync_row_header_labels,
 )
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 _TABLE_FONT_PT_DEFAULT = 11
 _TABLE_FONT_PT_MIN = 8
@@ -982,7 +983,7 @@ class _FilterHeaderView(QHeaderView):
             span_hidden = self._hidden_between(min(selected), max(selected))
         unhide_targets = list(dict.fromkeys(gap_hidden + span_hidden))
 
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         if len(hide_targets) > 1:
             act_hide = menu.addAction(f"Hide Columns ({len(hide_targets)})")
         else:
@@ -6877,12 +6878,12 @@ class DailyRegister(QWidget):
             menu.addAction("Redo", self._redo)
 
     def _show_context_menu(self, pos) -> None:
-        menu = QMenu(self._table)
+        menu = apply_light_menu(QMenu(self._table))
         self._populate_context_menu(menu)
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
     def _show_row_header_context_menu(self, global_pos) -> None:
-        menu = QMenu(self._table)
+        menu = apply_light_menu(QMenu(self._table))
         self._populate_context_menu(menu)
         menu.exec(global_pos)
 

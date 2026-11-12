@@ -42,6 +42,7 @@ from tahmeed.services.user_service import (
     unban_user,
     update_user,
 )
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 
 def _editable_roles(user: Optional[User]) -> list[str]:
@@ -300,7 +301,7 @@ class UsersTab(QWidget):
         menu_btn = QToolButton()
         menu_btn.setText("Actions")
         menu_btn.setPopupMode(QToolButton.InstantPopup)
-        menu = QMenu(menu_btn)
+        menu = apply_light_menu(QMenu(menu_btn))
         menu.addAction("Edit…", lambda u=user: self._on_edit(u))
         menu.addAction("Reset password…", lambda u=user: self._on_reset_password(u))
         menu.addSeparator()

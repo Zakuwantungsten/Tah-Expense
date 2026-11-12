@@ -33,6 +33,7 @@ from tahmeed.ui.async_utils import pause_background_polls, schedule_call, schedu
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.combo_styles import with_combo_popup
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
+from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 _WHITE   = "#FFFFFF"
 _BG      = "#F4F6F8"
@@ -716,7 +717,7 @@ class ManagePayeesWidget(QWidget):
         name = entry.get("name", "")
         currency = entry.get("currency") or "TZS"
 
-        menu = QMenu(self)
+        menu = apply_light_menu(QMenu(self))
         open_act = menu.addAction("Open report")
         menu.addSeparator()
         toggle_act = menu.addAction("Deactivate" if active else "Activate")
