@@ -280,6 +280,17 @@ class _UploadBrowseChromeMixin:
 
     def _park_browse_totals(self, totals: QWidget) -> None:
         """Keep totals for updates, but show them on the ribbon — not in-tab."""
+        totals.setAttribute(Qt.WA_NativeWindow, False)
+        # Own under this page so ribbon clear never leaves a parentless HWND.
+        if totals.parentWidget() is None:
+            stash = getattr(self, "_chrome_stash_host", None)
+            if stash is None:
+                stash = QWidget(self)
+                stash.hide()
+                stash.setAttribute(Qt.WA_NativeWindow, False)
+                self._chrome_stash_host = stash
+            totals.setParent(stash)
+            totals.hide()
         self._totals = totals
         self._chrome_summary_widget = totals
 
@@ -1831,11 +1842,17 @@ def _make_feed_chrome_bar(tabs: _SegmentTabBar) -> Tuple[QFrame, QHBoxLayout]:
 
 
 def _chrome_clear_host(host_hl: QHBoxLayout) -> None:
+    """Remove widgets from a chrome host layout without promoting Windows HWNDs.
+
+    ``setParent(None)`` turns a visible QWidget into a top-level window on
+    Windows (taskbar previews for Search / All Years / Money In·Out·Bal, etc.).
+    Hide and leave the parent alone — ``addWidget`` reparents when parked again.
+    """
     while host_hl.count():
         item = host_hl.takeAt(0)
         w = item.widget()
         if w is not None:
-            w.setParent(None)
+            w.hide()
 
 
 def _chrome_set_filters(filter_hl: QHBoxLayout, widgets: List[QWidget]) -> None:
@@ -1843,6 +1860,7 @@ def _chrome_set_filters(filter_hl: QHBoxLayout, widgets: List[QWidget]) -> None:
     _chrome_clear_host(filter_hl)
     for w in widgets:
         filter_hl.addWidget(w, 0, Qt.AlignVCenter)
+        w.show()
 
 
 class _FeedRibbonPageMixin:
@@ -1890,6 +1908,14 @@ class _FeedRibbonPageMixin:
         stack = getattr(self, "_upload_stack", None)
         return stack is None or stack.currentIndex() == 0
 
+    def _uploads_detail_active(self) -> bool:
+        """True when the Uploads tab is showing a single-upload detail page."""
+        uploads_tab = getattr(self, "_ribbon_uploads_tab", 1)
+        if self._tabs.current_index() != uploads_tab:
+            return False
+        stack = getattr(self, "_upload_stack", None)
+        return stack is not None and stack.currentIndex() == 1
+
     def _sync_ribbon_upload_delete(self) -> None:
         """Enable ENTRY → Delete only when Uploads browse has checked rows."""
         if not hasattr(self, "_ribbon"):
@@ -1908,6 +1934,11 @@ class _FeedRibbonPageMixin:
         self._ribbon.set_delete_tooltip(tip)
 
     def _on_ribbon_delete(self) -> None:
+        if self._uploads_detail_active():
+            detail = getattr(self, "_detail", None)
+            if detail is not None and hasattr(detail, "_request_delete"):
+                detail._request_delete()
+            return
         if not self._uploads_browse_active():
             return
         browse = getattr(self, "_browse", None)
@@ -1915,7 +1946,7 @@ class _FeedRibbonPageMixin:
             browse._emit_bulk_delete()
 
     def _sync_upload_chrome(self) -> None:
-        """Re-park browse totals / Delete after browse ↔ detail switches."""
+        """Re-park browse/detail totals / Delete after browse ↔ detail switches."""
         if hasattr(self, "_tabs"):
             self._sync_chrome_for_tab(self._tabs.current_index())
 
@@ -1924,6 +1955,7 @@ class _FeedRibbonPageMixin:
         widgets: List[QWidget] = []
         summary = None
         on_uploads_browse = False
+        on_uploads_detail = False
         uploads_tab = getattr(self, "_ribbon_uploads_tab", 1)
         if idx in getattr(self, "_ribbon_filter_tab_indexes", {0}):
             if hasattr(page, "filter_widgets"):
@@ -1936,8 +1968,13 @@ class _FeedRibbonPageMixin:
                 summary = page.summary_widget()
         elif idx == uploads_tab:
             browse = getattr(self, "_browse", None)
+            detail = getattr(self, "_detail", None)
             stack = getattr(self, "_upload_stack", None)
-            if browse is not None and (stack is None or stack.currentIndex() == 0):
+            if stack is not None and stack.currentIndex() == 1 and detail is not None:
+                on_uploads_detail = True
+                if hasattr(detail, "summary_widget"):
+                    summary = detail.summary_widget()
+            elif browse is not None and (stack is None or stack.currentIndex() == 0):
                 on_uploads_browse = True
                 if hasattr(browse, "summary_widget"):
                     summary = browse.summary_widget()
@@ -1945,9 +1982,13 @@ class _FeedRibbonPageMixin:
         # Totals live on the ribbon far-right (not the chrome filter bar).
         if hasattr(self, "_ribbon") and hasattr(self._ribbon, "set_summary_widget"):
             self._ribbon.set_summary_widget(summary)
-        self._ribbon.set_filter_actions_enabled(bool(widgets))
+        # Detail keeps Find/Clear useful even though filters are not in chrome.
+        self._ribbon.set_filter_actions_enabled(bool(widgets) or on_uploads_detail)
         if on_uploads_browse:
             self._sync_ribbon_upload_delete()
+        elif on_uploads_detail:
+            self._ribbon.set_entry_actions_enabled(delete=True)
+            self._ribbon.set_delete_tooltip("Delete this upload")
         else:
             self._ribbon.set_entry_actions_enabled(delete=False)
             self._ribbon.set_delete_tooltip("Delete selected entry (coming later)")
@@ -1960,6 +2001,11 @@ class _FeedRibbonPageMixin:
         return getattr(self, "_all_entries", None)
 
     def _on_ribbon_find(self) -> None:
+        if self._uploads_detail_active():
+            detail = getattr(self, "_detail", None)
+            if detail is not None and hasattr(detail, "focus_search"):
+                detail.focus_search()
+            return
         indexes = getattr(self, "_ribbon_filter_tab_indexes", {0})
         if self._tabs.current_index() not in indexes:
             self._tabs.set_index(min(indexes))
@@ -2032,6 +2078,11 @@ class _FeedRibbonPageMixin:
         table.render(printer)
 
     def _on_ribbon_clear_filters(self) -> None:
+        if self._uploads_detail_active():
+            detail = getattr(self, "_detail", None)
+            if detail is not None:
+                _clear_upload_detail_filters(detail)
+            return
         indexes = getattr(self, "_ribbon_filter_tab_indexes", {0})
         if self._tabs.current_index() not in indexes:
             self._tabs.set_index(min(indexes))
@@ -2097,11 +2148,130 @@ class _LiftedFiltersMixin:
         if table is not None:
             table.resizeColumnsToContents()
 
+    def _chrome_stash(self) -> QWidget:
+        """Hidden child that owns lifted chrome widgets when they are not parked."""
+        stash = getattr(self, "_chrome_stash_host", None)
+        if stash is None:
+            stash = QWidget(self)
+            stash.hide()
+            stash.setAttribute(Qt.WA_NativeWindow, False)
+            self._chrome_stash_host = stash
+        return stash
+
+    def _park_on_stash(self, widget: QWidget) -> None:
+        """Keep ``widget`` as a non-window child until the chrome bar claims it."""
+        widget.setAttribute(Qt.WA_NativeWindow, False)
+        widget.setParent(self._chrome_stash())
+        widget.hide()
+
     def _register_chrome_filters(self, *widgets: QWidget) -> None:
-        self._chrome_filter_widgets = [w for w in widgets if w is not None]
+        kept: List[QWidget] = []
+        for w in widgets:
+            if w is None:
+                continue
+            self._park_on_stash(w)
+            kept.append(w)
+        self._chrome_filter_widgets = kept
 
     def _register_chrome_summary(self, widget: QWidget | None) -> None:
+        if widget is not None:
+            self._park_on_stash(widget)
         self._chrome_summary_widget = widget
+
+
+class _UploadDetailChromeMixin:
+    """Compact upload-detail chrome shared by all Separate Expenses feeds.
+
+    Ribbon owns Delete / Export / Money KPI. Page keeps ← All Uploads + crumb,
+    then one row: Search + Clear (left) · sheet meta (right).
+    """
+
+    def summary_widget(self) -> QWidget | None:
+        return getattr(self, "_chrome_summary_widget", None)
+
+    def focus_search(self) -> None:
+        edit = getattr(self, "_search_edit", None)
+        if edit is not None:
+            edit.setFocus(Qt.ShortcutFocusReason)
+            edit.selectAll()
+
+    def _chrome_stash(self) -> QWidget:
+        stash = getattr(self, "_chrome_stash_host", None)
+        if stash is None:
+            stash = QWidget(self)
+            stash.hide()
+            stash.setAttribute(Qt.WA_NativeWindow, False)
+            self._chrome_stash_host = stash
+        return stash
+
+    def _park_on_stash(self, widget: QWidget) -> None:
+        widget.setAttribute(Qt.WA_NativeWindow, False)
+        widget.setParent(self._chrome_stash())
+        widget.hide()
+
+    def _register_chrome_summary(self, widget: QWidget | None) -> None:
+        if widget is not None:
+            self._park_on_stash(widget)
+        self._chrome_summary_widget = widget
+
+    def _add_upload_detail_nav(self, layout: QVBoxLayout) -> None:
+        """Back + breadcrumb only — Delete/Export live on the ribbon."""
+        nav = QWidget()
+        nav.setStyleSheet("background:transparent;")
+        navl = QHBoxLayout(nav)
+        navl.setContentsMargins(0, 0, 0, 0)
+        navl.setSpacing(8)
+        back_btn = _btn("← All Uploads", primary=False, height=30)
+        back_btn.clicked.connect(self.back_requested)
+        navl.addWidget(back_btn)
+        self._crumb_lbl = _lbl("", size=12, color=_T2)
+        navl.addWidget(self._crumb_lbl)
+        navl.addStretch()
+        layout.addWidget(nav)
+
+    def _add_upload_detail_filter_row(
+        self,
+        layout: QVBoxLayout,
+        *,
+        placeholder: str,
+        on_search,
+        search_width: int = 300,
+    ) -> None:
+        """Search + Clear on the left; sheet meta label on the right."""
+        tb = QWidget()
+        tb.setStyleSheet("background:transparent;")
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(0, 0, 0, 0)
+        tbl.setSpacing(8)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText(placeholder)
+        self._search_edit.setFixedWidth(search_width)
+        self._search_edit.setStyleSheet(_input_ss())
+        self._search_edit.textChanged.connect(on_search)
+        tbl.addWidget(self._search_edit)
+
+        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
+        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
+        tbl.addWidget(clear_btn)
+        tbl.addStretch(1)
+
+        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
+        self._info_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        tbl.addWidget(self._info_lbl, 0, Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(tb)
+
+    def _park_detail_money_kpi(
+        self, currency: str = "USD",
+    ) -> Tuple[QWidget, QLabel, QLabel, QLabel]:
+        """Ribbon far-right In/Out/Bal stack (not laid out in the page body)."""
+        frame, in_lbl, out_lbl, bal_lbl = _make_chrome_money_kpi(currency)
+        self._register_chrome_summary(frame)
+        return frame, in_lbl, out_lbl, bal_lbl
+
+    def _request_delete(self) -> None:
+        if getattr(self, "_upload_doc", None):
+            self.delete_requested.emit(self._upload_doc)
 
 
 class _TollAllEntries(_LiftedFiltersMixin, _FeedExportMixin, QWidget):
@@ -2459,7 +2629,7 @@ class _TollUploadBrowse(_UploadBrowseChromeMixin, QWidget):
 #  Upload Detail sub-widget — all records for one import batch
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _TollUploadDetail(_FeedExportMixin, QWidget):
+class _TollUploadDetail(_UploadDetailChromeMixin, _FeedExportMixin, QWidget):
     """Full record table for a single Toll Plaza upload batch."""
 
     _export_title = "Toll Plaza Upload"
@@ -2488,49 +2658,12 @@ class _TollUploadDetail(_FeedExportMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        # ── Breadcrumb / back row ──────────────────────────────────────────
-        nav = QWidget()
-        nav.setStyleSheet("background:transparent;")
-        navl = QHBoxLayout(nav)
-        navl.setContentsMargins(0, 0, 0, 0)
-        navl.setSpacing(8)
-
-        back_btn = _btn("← All Uploads", primary=False, height=30)
-        back_btn.clicked.connect(self.back_requested)
-        navl.addWidget(back_btn)
-
-        self._crumb_lbl = _lbl("", size=12, color=_T2)
-        navl.addWidget(self._crumb_lbl)
-        navl.addStretch()
-
-        self._add_export_btn(navl, height=30)
-        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
-        delete_btn.clicked.connect(self._request_delete)
-        navl.addWidget(delete_btn)
-        vl.addWidget(nav)
-
-        # ── Info strip ────────────────────────────────────────────────────
-        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
-        vl.addWidget(self._info_lbl)
-
-        # ── Toolbar ───────────────────────────────────────────────────────
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search vehicle, plaza, receipt, cashier…")
-        self._search_edit.setFixedWidth(300)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
-        tbl.addWidget(clear_btn)
-        tbl.addStretch()
-        vl.addWidget(tb)
+        self._add_upload_detail_nav(vl)
+        self._add_upload_detail_filter_row(
+            vl,
+            placeholder="Search vehicle, plaza, receipt, cashier…",
+            on_search=self._on_search,
+        )
 
         # ── Full record table ─────────────────────────────────────────────
         self._table = _make_table(_TOLL_DETAIL_HEADERS)
@@ -2574,10 +2707,6 @@ class _TollUploadDetail(_FeedExportMixin, QWidget):
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
         self._reset_and_load()
-
-    def _request_delete(self) -> None:
-        if self._upload_doc:
-            self.delete_requested.emit(self._upload_doc)
 
     def _reset_and_load(self) -> None:
         self._loaded = 0
@@ -3286,7 +3415,7 @@ class _ParkingCongoUploadBrowse(_UploadBrowseChromeMixin, QWidget):
 #  Upload Detail sub-widget — all records for one import batch
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _ParkingCongoUploadDetail(_FeedExportMixin, QWidget):
+class _ParkingCongoUploadDetail(_UploadDetailChromeMixin, _FeedExportMixin, QWidget):
     _export_title = "Parking Congo Upload"
     _export_filename = "ParkingCongo_Upload"
     _export_headers = _PCONGO_DETAIL_HEADERS
@@ -3315,46 +3444,13 @@ class _ParkingCongoUploadDetail(_FeedExportMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        nav = QWidget()
-        nav.setStyleSheet("background:transparent;")
-        navl = QHBoxLayout(nav)
-        navl.setContentsMargins(0, 0, 0, 0)
-        navl.setSpacing(8)
-
-        back_btn = _btn("← All Uploads", primary=False, height=30)
-        back_btn.clicked.connect(self.back_requested)
-        navl.addWidget(back_btn)
-
-        self._crumb_lbl = _lbl("", size=12, color=_T2)
-        navl.addWidget(self._crumb_lbl)
-        navl.addStretch()
-
-        self._add_export_btn(navl, height=30)
-        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
-        delete_btn.clicked.connect(self._request_delete)
-        navl.addWidget(delete_btn)
-        vl.addWidget(nav)
-
-        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
-        vl.addWidget(self._info_lbl)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search vehicle, ledger ID, type, cashier…")
-        self._search_edit.setFixedWidth(320)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
-        tbl.addWidget(clear_btn)
-        tbl.addStretch()
-        vl.addWidget(tb)
+        self._add_upload_detail_nav(vl)
+        self._add_upload_detail_filter_row(
+            vl,
+            placeholder="Search vehicle, ledger ID, type, cashier…",
+            on_search=self._on_search,
+            search_width=320,
+        )
 
         self._table = _make_table(_PCONGO_DETAIL_HEADERS)
         self._sort_state = wire_feed_table_sort(
@@ -3395,10 +3491,6 @@ class _ParkingCongoUploadDetail(_FeedExportMixin, QWidget):
         self._search_edit.blockSignals(False)
         self._page = 1
         asyncio.ensure_future(self._load())
-
-    def _request_delete(self) -> None:
-        if self._upload_doc:
-            self.delete_requested.emit(self._upload_doc)
 
     async def _load(self) -> None:
         from tahmeed.services import accountant_service as svc
@@ -4096,26 +4188,6 @@ def _congo_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     ))
     _apply_row_bg(t, r, row_bg)
     t.setRowHeight(r, _ROW_H)
-
-
-def _make_congo_summary_cards() -> Tuple[QFrame, QLabel, QLabel, QLabel]:
-    """Money In / Money Out / Balance strip for upload-detail views (full card)."""
-    frame = QFrame()
-    frame.setStyleSheet(
-        f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
-        "border-radius:6px;padding:8px;}"
-    )
-    sl = QHBoxLayout(frame)
-    sl.setContentsMargins(12, 8, 12, 8)
-    sl.setSpacing(24)
-    in_lbl  = _lbl("Money In: —", size=12, weight=600, color=_GREEN)
-    out_lbl = _lbl("Money Out: —", size=12, color=_T2)
-    bal_lbl = _lbl("Balance: —", size=12, weight=600, color=_T1)
-    sl.addWidget(in_lbl)
-    sl.addWidget(out_lbl)
-    sl.addWidget(bal_lbl)
-    sl.addStretch()
-    return frame, in_lbl, out_lbl, bal_lbl
 
 
 _RIBBON_KPI_ICON = 20  # match ribbon tool icons (~22px)
@@ -4816,7 +4888,7 @@ class _CongoExpUploadBrowse(_UploadBrowseChromeMixin, QWidget):
             self.delete_clicked.emit(self._uploads[row])
 
 
-class _CongoExpUploadDetail(_FeedExportMixin, QWidget):
+class _CongoExpUploadDetail(_UploadDetailChromeMixin, _FeedExportMixin, QWidget):
     _export_title = "Congo Expenses Upload"
     _export_filename = "CongoExpenses_Upload"
     _export_headers = _CONGO_HEADERS
@@ -4843,51 +4915,15 @@ class _CongoExpUploadDetail(_FeedExportMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        nav = QWidget()
-        nav.setStyleSheet("background:transparent;")
-        navl = QHBoxLayout(nav)
-        navl.setContentsMargins(0, 0, 0, 0)
-        navl.setSpacing(8)
-
-        back_btn = _btn("← All Uploads", primary=False, height=30)
-        back_btn.clicked.connect(self.back_requested)
-        navl.addWidget(back_btn)
-
-        self._crumb_lbl = _lbl("", size=12, color=_T2)
-        navl.addWidget(self._crumb_lbl)
-        navl.addStretch()
-
-        self._add_export_btn(navl, height=30)
-        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
-        delete_btn.clicked.connect(self._request_delete)
-        navl.addWidget(delete_btn)
-        vl.addWidget(nav)
-
-        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
-        vl.addWidget(self._info_lbl)
-
+        self._add_upload_detail_nav(vl)
         self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
-            _make_congo_summary_cards()
+            self._park_detail_money_kpi("USD")
         )
-        vl.addWidget(self._summary_frame)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search LPO, truck, description, date…")
-        self._search_edit.setFixedWidth(300)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
-        tbl.addWidget(clear_btn)
-        tbl.addStretch()
-        vl.addWidget(tb)
+        self._add_upload_detail_filter_row(
+            vl,
+            placeholder="Search LPO, truck, description, date…",
+            on_search=self._on_search,
+        )
 
         self._table = _make_kimvi_table(_CONGO_HEADERS)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -4933,10 +4969,6 @@ class _CongoExpUploadDetail(_FeedExportMixin, QWidget):
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
         self._reset_and_load()
-
-    def _request_delete(self) -> None:
-        if self._upload_doc:
-            self.delete_requested.emit(self._upload_doc)
 
     def _reset_and_load(self) -> None:
         self._loaded = 0
@@ -6503,7 +6535,7 @@ class _KimviUploadBrowse(_UploadBrowseChromeMixin, QWidget):
             self.delete_clicked.emit(self._uploads[row])
 
 
-class _KimviUploadDetail(_FeedExportMixin, QWidget):
+class _KimviUploadDetail(_UploadDetailChromeMixin, _FeedExportMixin, QWidget):
     _export_title = "Ahmed Kimvi Upload"
     _export_filename = "AhmedKimvi_Upload"
     _export_headers = _KIMVI_HEADERS
@@ -6532,51 +6564,15 @@ class _KimviUploadDetail(_FeedExportMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        nav = QWidget()
-        nav.setStyleSheet("background:transparent;")
-        navl = QHBoxLayout(nav)
-        navl.setContentsMargins(0, 0, 0, 0)
-        navl.setSpacing(8)
-
-        back_btn = _btn("← All Uploads", primary=False, height=30)
-        back_btn.clicked.connect(self.back_requested)
-        navl.addWidget(back_btn)
-
-        self._crumb_lbl = _lbl("", size=12, color=_T2)
-        navl.addWidget(self._crumb_lbl)
-        navl.addStretch()
-
-        self._add_export_btn(navl, height=30)
-        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
-        delete_btn.clicked.connect(self._request_delete)
-        navl.addWidget(delete_btn)
-        vl.addWidget(nav)
-
-        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
-        vl.addWidget(self._info_lbl)
-
+        self._add_upload_detail_nav(vl)
         self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
-            _make_congo_summary_cards()
+            self._park_detail_money_kpi("USD")
         )
-        vl.addWidget(self._summary_frame)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search truck, particulars, date…")
-        self._search_edit.setFixedWidth(300)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
-        tbl.addWidget(clear_btn)
-        tbl.addStretch()
-        vl.addWidget(tb)
+        self._add_upload_detail_filter_row(
+            vl,
+            placeholder="Search truck, particulars, date…",
+            on_search=self._on_search,
+        )
 
         self._table = _make_kimvi_table(_KIMVI_HEADERS)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -6621,10 +6617,6 @@ class _KimviUploadDetail(_FeedExportMixin, QWidget):
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
         self._reset_and_load()
-
-    def _request_delete(self) -> None:
-        if self._upload_doc:
-            self.delete_requested.emit(self._upload_doc)
 
     def _reset_and_load(self) -> None:
         self._loaded = 0
@@ -7134,26 +7126,6 @@ def _zambia_fill_row(t: QTableWidget, r: int, rec: dict) -> None:
     ))
     t.setItem(r, 7, _cell(rec.get("heading_to", "")))
     _finish_table_row(t, r, row_bg)
-
-
-def _make_zambia_summary_cards() -> Tuple[QFrame, QLabel, QLabel, QLabel]:
-    """Money In / Out / Balance strip for Zambia upload-detail views (full card)."""
-    frame = QFrame()
-    frame.setStyleSheet(
-        f"QFrame{{background:{_BLUE_L};border:1px solid #BFDBFE;"
-        "border-radius:6px;padding:8px;}"
-    )
-    sl = QHBoxLayout(frame)
-    sl.setContentsMargins(12, 8, 12, 8)
-    sl.setSpacing(24)
-    in_lbl  = _lbl("Money In: —", size=12, weight=600, color=_GREEN)
-    out_lbl = _lbl("Money Out: —", size=12, color=_T2)
-    bal_lbl = _lbl("Balance: —", size=12, weight=600, color=_T1)
-    sl.addWidget(in_lbl)
-    sl.addWidget(out_lbl)
-    sl.addWidget(bal_lbl)
-    sl.addStretch()
-    return frame, in_lbl, out_lbl, bal_lbl
 
 
 def _set_zambia_summary(
@@ -7854,7 +7826,7 @@ class _ZambiaParkingUploadBrowse(_UploadBrowseChromeMixin, QWidget):
             self.delete_clicked.emit(self._uploads[row])
 
 
-class _ZambiaParkingUploadDetail(_FeedExportMixin, QWidget):
+class _ZambiaParkingUploadDetail(_UploadDetailChromeMixin, _FeedExportMixin, QWidget):
     _export_title = "Zambia Parking Upload"
     _export_filename = "ZambiaParking_Upload"
     _export_headers = _ZAMBIA_PARK_HEADERS
@@ -7881,51 +7853,15 @@ class _ZambiaParkingUploadDetail(_FeedExportMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        nav = QWidget()
-        nav.setStyleSheet("background:transparent;")
-        navl = QHBoxLayout(nav)
-        navl.setContentsMargins(0, 0, 0, 0)
-        navl.setSpacing(8)
-
-        back_btn = _btn("← All Uploads", primary=False, height=30)
-        back_btn.clicked.connect(self.back_requested)
-        navl.addWidget(back_btn)
-
-        self._crumb_lbl = _lbl("", size=12, color=_T2)
-        navl.addWidget(self._crumb_lbl)
-        navl.addStretch()
-
-        self._add_export_btn(navl, height=30)
-        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
-        delete_btn.clicked.connect(self._request_delete)
-        navl.addWidget(delete_btn)
-        vl.addWidget(nav)
-
-        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
-        vl.addWidget(self._info_lbl)
-
+        self._add_upload_detail_nav(vl)
         self._summary_frame, self._in_lbl, self._out_lbl, self._bal_lbl = (
-            _make_zambia_summary_cards()
+            self._park_detail_money_kpi("ZMW")
         )
-        vl.addWidget(self._summary_frame)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search plate, ticket, destination…")
-        self._search_edit.setFixedWidth(300)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
-        tbl.addWidget(clear_btn)
-        tbl.addStretch()
-        vl.addWidget(tb)
+        self._add_upload_detail_filter_row(
+            vl,
+            placeholder="Search plate, ticket, destination…",
+            on_search=self._on_search,
+        )
 
         self._table = _make_table(_ZAMBIA_PARK_HEADERS)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -7972,10 +7908,6 @@ class _ZambiaParkingUploadDetail(_FeedExportMixin, QWidget):
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
         self._reset_and_load()
-
-    def _request_delete(self) -> None:
-        if self._upload_doc:
-            self.delete_requested.emit(self._upload_doc)
 
     def _reset_and_load(self) -> None:
         self._loaded = 0
@@ -9802,7 +9734,7 @@ class _AfritrackUploadBrowse(_UploadBrowseChromeMixin, QWidget):
             self.delete_clicked.emit(self._uploads[row])
 
 
-class _AfritrackUploadDetail(_FeedExportMixin, QWidget):
+class _AfritrackUploadDetail(_UploadDetailChromeMixin, _FeedExportMixin, QWidget):
     _export_title = "Afritrack Upload"
     _export_filename = "Afritrack_Upload"
     _export_headers = _AF_DETAIL_HEADERS
@@ -9829,42 +9761,13 @@ class _AfritrackUploadDetail(_FeedExportMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        nav = QWidget()
-        nav.setStyleSheet("background:transparent;")
-        nh = QHBoxLayout(nav)
-        nh.setContentsMargins(0, 0, 0, 0)
-        nh.setSpacing(8)
-        back_btn = _btn("← All Uploads", primary=False, height=30)
-        back_btn.clicked.connect(self.back_requested)
-        nh.addWidget(back_btn)
-        self._crumb_lbl = _lbl("", size=12, color=_T2)
-        nh.addWidget(self._crumb_lbl)
-        nh.addStretch()
-        self._add_export_btn(nh, height=30)
-        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
-        delete_btn.clicked.connect(self._request_delete)
-        nh.addWidget(delete_btn)
-        vl.addWidget(nav)
-
-        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
-        vl.addWidget(self._info_lbl)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tl = QHBoxLayout(tb)
-        tl.setContentsMargins(0, 0, 0, 0)
-        tl.setSpacing(8)
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search truck or remarks…")
-        self._search_edit.setFixedWidth(280)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tl.addWidget(self._search_edit)
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
-        tl.addWidget(clear_btn)
-        tl.addStretch()
-        vl.addWidget(tb)
+        self._add_upload_detail_nav(vl)
+        self._add_upload_detail_filter_row(
+            vl,
+            placeholder="Search truck or remarks…",
+            on_search=self._on_search,
+            search_width=280,
+        )
 
         self._table = _make_table(_AF_DETAIL_HEADERS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -9915,10 +9818,6 @@ class _AfritrackUploadDetail(_FeedExportMixin, QWidget):
         _apply_afritrack_statement_footer(self._footer, doc)
         self._footer.sync_columns(self._table)
         self._footer.show()
-
-    def _request_delete(self) -> None:
-        if self._upload_doc:
-            self.delete_requested.emit(self._upload_doc)
 
     def _reset_and_load(self) -> None:
         self._loaded = 0
@@ -11778,7 +11677,7 @@ class _RahnTechUploadBrowse(_UploadBrowseChromeMixin, QWidget):
             self.delete_clicked.emit(self._uploads[row])
 
 
-class _RahnTechUploadDetail(_FeedExportMixin, QWidget):
+class _RahnTechUploadDetail(_UploadDetailChromeMixin, _FeedExportMixin, QWidget):
     _export_title = "RahnTech Upload"
     _export_filename = "RahnTech_Upload"
     _export_headers = _RAHNTECH_HEADERS
@@ -11807,42 +11706,12 @@ class _RahnTechUploadDetail(_FeedExportMixin, QWidget):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(8)
 
-        nav = QWidget()
-        nav.setStyleSheet("background:transparent;")
-        navl = QHBoxLayout(nav)
-        navl.setContentsMargins(0, 0, 0, 0)
-        navl.setSpacing(8)
-        back_btn = _btn("← All Uploads", primary=False, height=30)
-        back_btn.clicked.connect(self.back_requested)
-        navl.addWidget(back_btn)
-        self._crumb_lbl = _lbl("", size=12, color=_T2)
-        navl.addWidget(self._crumb_lbl)
-        navl.addStretch()
-        self._add_export_btn(navl, height=30)
-        delete_btn = _btn("Delete Upload", "mdi.trash-can-outline", danger=True, height=30)
-        delete_btn.clicked.connect(self._request_delete)
-        navl.addWidget(delete_btn)
-        vl.addWidget(nav)
-
-        self._info_lbl = _lbl("", size=12, weight=600, color=_T1)
-        vl.addWidget(self._info_lbl)
-
-        tb = QWidget()
-        tb.setStyleSheet("background:transparent;")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(0, 0, 0, 0)
-        tbl.setSpacing(8)
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search truck, driver, trip, device…")
-        self._search_edit.setFixedWidth(300)
-        self._search_edit.setStyleSheet(_input_ss())
-        self._search_edit.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search_edit)
-        clear_btn = _btn("Clear", "mdi.filter-remove-outline", primary=False)
-        clear_btn.clicked.connect(lambda: _clear_upload_detail_filters(self))
-        tbl.addWidget(clear_btn)
-        tbl.addStretch()
-        vl.addWidget(tb)
+        self._add_upload_detail_nav(vl)
+        self._add_upload_detail_filter_row(
+            vl,
+            placeholder="Search truck, driver, trip, device…",
+            on_search=self._on_search,
+        )
 
         self._table = _make_table(_RAHNTECH_HEADERS)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -11882,10 +11751,6 @@ class _RahnTechUploadDetail(_FeedExportMixin, QWidget):
         self._search_edit.setText("")
         self._search_edit.blockSignals(False)
         self._reset_and_load()
-
-    def _request_delete(self) -> None:
-        if self._upload_doc:
-            self.delete_requested.emit(self._upload_doc)
 
     def _reset_and_load(self) -> None:
         self._loaded = 0

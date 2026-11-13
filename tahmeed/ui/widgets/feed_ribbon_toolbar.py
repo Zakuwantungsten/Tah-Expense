@@ -355,11 +355,17 @@ class FeedRibbonToolbar(QFrame):
         self._set_btn_enabled(self._btn_find, enabled)
 
     def set_summary_widget(self, widget: Optional[QWidget]) -> None:
-        """Park a compact KPI stack on the far right (or clear it)."""
+        """Park a compact KPI stack on the far right (or clear it).
+
+        Never ``setParent(None)`` — on Windows that promotes a visible child into
+        its own top-level meedexpe HWND (taskbar preview for In/Out/Bal alone).
+        """
         while self._summary_hl.count():
             item = self._summary_hl.takeAt(0)
             w = item.widget()
             if w is not None:
-                w.setParent(None)
+                w.hide()
         if widget is not None:
+            widget.setAttribute(Qt.WA_NativeWindow, False)
             self._summary_hl.addWidget(widget, 0, Qt.AlignRight | Qt.AlignVCenter)
+            widget.show()
