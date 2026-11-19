@@ -1088,6 +1088,7 @@ class OverviewWidget(QWidget):
             ("Verify inbox", "verify"),
             ("Master expenses", "master_expenses"),
             ("Truck overview", "truck_overview"),
+            ("Paperwork", "paperwork"),
             ("Browse all", "browse"),
         ):
             btn = QPushButton(label)

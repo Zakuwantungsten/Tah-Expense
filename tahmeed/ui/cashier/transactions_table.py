@@ -1,7 +1,8 @@
 """
 TransactionBrowser — embedded browse page (Simple / Advanced / Smart Search / Uploads).
 
-Simple       — daily summary (one row per day): Date | TXN ID | Entries | Refund to Float | Total
+Simple       — daily summary (one row per day): SN | Date | TXN ID | Entries | … | money cols
+               + QB-style TOTAL row (double underline) for USD / Refund / Total Amount
                Year + Month filters; keyword searches description OR truck OR memo
 Advanced     — individual transaction rows with full register columns
                Year + Month + multi-select Item / Description filters
@@ -128,13 +129,16 @@ def _seg_style(position: str) -> str:
 
 # ── Column indices — Simple (summary) ─────────────────────────────────────────
 
-_S_COL_DATE    = 0
-_S_COL_TXN_ID  = 1
-_S_COL_ENTRIES = 2
-_S_COL_STATUS  = 3
-_S_COL_USD     = 4
-_S_COL_REFUND  = 5
-_S_COL_TOTAL   = 6
+_S_COL_SN      = 0
+_S_COL_DATE    = 1
+_S_COL_TXN_ID  = 2
+_S_COL_ENTRIES = 3
+_S_COL_STATUS  = 4
+_S_COL_USD     = 5
+_S_COL_REFUND  = 6
+_S_COL_TOTAL   = 7
+_S_COL_COUNT   = 8
+_QB_TOTAL_BG   = "#F3F4F6"
 
 # ── Column indices — Advanced (individual) ────────────────────────────────────
 
@@ -660,18 +664,19 @@ class TransactionBrowser(QWidget):
 
     def _build_simple_table(self) -> QTableWidget:
         t = QTableWidget()
-        t.setColumnCount(7)
+        t.setColumnCount(_S_COL_COUNT)
         t.setHorizontalHeaderLabels(
-            ["Date", "Transaction ID", "Entries", "Merged / Status",
+            ["SN", "Date", "Transaction ID", "Entries", "Merged / Status",
              "Total USD", "Refund to Float", "Total Amount"]
         )
         t.setStyleSheet(_TABLE_SS)
         t.setAlternatingRowColors(False)
         hh = t.horizontalHeader()
-        for i in range(7):
+        for i in range(_S_COL_COUNT):
             hh.setSectionResizeMode(i, QHeaderView.Interactive)
         hh.setStretchLastSection(False)
         hh.setSectionResizeMode(_S_COL_STATUS, QHeaderView.Stretch)
+        t.setColumnWidth(_S_COL_SN,       44)
         t.setColumnWidth(_S_COL_DATE,    130)
         t.setColumnWidth(_S_COL_TXN_ID,  150)
         t.setColumnWidth(_S_COL_ENTRIES,  70)
@@ -1500,11 +1505,18 @@ class TransactionBrowser(QWidget):
 
     def _populate_simple(self, rows: List[dict]) -> None:
         t = self._simple_table
-        t.setRowCount(len(rows))
+        n = len(rows)
+        # Drop leftover TOTAL cell widgets from a prior populate.
+        t.setRowCount(0)
+        t.setRowCount(n + (1 if n else 0))
         names = getattr(self, "_user_names", {}) or {}
+        sum_usd = 0.0
+        sum_refund = 0.0
+        sum_tzs = 0.0
         for i, s in enumerate(rows):
             row_bg = _stripe_bg(i)
             d = s["date"]
+            t.setItem(i, _S_COL_SN, _ro(str(i + 1), Qt.AlignCenter, bg=row_bg))
             t.setItem(i, _S_COL_DATE, _ro(d.strftime("%a, %d %b %Y"), bg=row_bg))
 
             txn = _ro(f"TXN-{d.strftime('%Y%m%d')}", bg=row_bg)
@@ -1523,6 +1535,7 @@ class TransactionBrowser(QWidget):
             t.setItem(i, _S_COL_STATUS, status_it)
 
             usd = float(s.get("total_usd") or 0)
+            sum_usd += usd
             usd_it = _ro(
                 f"USD {usd:,.2f}" if usd else "—",
                 Qt.AlignRight | Qt.AlignVCenter,
@@ -1532,7 +1545,8 @@ class TransactionBrowser(QWidget):
                 usd_it.setForeground(QColor("#dc2626"))
             t.setItem(i, _S_COL_USD, usd_it)
 
-            refund = s["total_refund"]
+            refund = float(s.get("total_refund") or 0)
+            sum_refund += refund
             ref_it = _ro(
                 f"TZS {refund:,.0f}" if refund else "—",
                 Qt.AlignRight | Qt.AlignVCenter,
@@ -1542,7 +1556,8 @@ class TransactionBrowser(QWidget):
                 ref_it.setForeground(QColor("#EA580C"))
             t.setItem(i, _S_COL_REFUND, ref_it)
 
-            total = s["total_tzs"]
+            total = float(s.get("total_tzs") or 0)
+            sum_tzs += total
             tot_it = _ro(
                 f"TZS {total:,.0f}" if total else "—",
                 Qt.AlignRight | Qt.AlignVCenter,
@@ -1553,9 +1568,67 @@ class TransactionBrowser(QWidget):
             t.setItem(i, _S_COL_TOTAL, tot_it)
             _finish_table_row(t, i, row_bg)
 
-        n = len(rows)
+        if n:
+            self._populate_simple_totals_row(n, sum_usd, sum_refund, sum_tzs)
+
         self._count_label.setText(f"Days shown: {n}")
         self._export_btn.setEnabled(n > 0)
+
+    def _populate_simple_totals_row(
+        self,
+        data_rows: int,
+        sum_usd: float,
+        sum_refund: float,
+        sum_tzs: float,
+    ) -> None:
+        """QB-style TOTAL footer: bold label + double-underline money cells."""
+        t = self._simple_table
+        r = data_rows
+        bg = _QB_TOTAL_BG
+
+        for col in range(_S_COL_COUNT):
+            t.setCellWidget(r, col, None)
+            t.setItem(r, col, None)
+
+        blank = _ro("", bg=bg)
+        blank.setFlags(Qt.ItemIsEnabled)
+        t.setItem(r, _S_COL_SN, blank)
+
+        total_lbl = _ro("TOTAL", bg=bg)
+        total_lbl.setFont(_table_cell_font(bold=True))
+        total_lbl.setFlags(Qt.ItemIsEnabled)
+        t.setItem(r, _S_COL_DATE, total_lbl)
+
+        for col in (_S_COL_TXN_ID, _S_COL_ENTRIES, _S_COL_STATUS):
+            it = _ro("", bg=bg)
+            it.setFlags(Qt.ItemIsEnabled)
+            t.setItem(r, col, it)
+
+        t.setCellWidget(
+            r, _S_COL_USD,
+            _qb_double_total_label(
+                f"USD {sum_usd:,.2f}" if sum_usd else "USD 0.00",
+            ),
+        )
+        t.setCellWidget(
+            r, _S_COL_REFUND,
+            _qb_double_total_label(
+                f"TZS {sum_refund:,.0f}" if sum_refund else "TZS 0",
+            ),
+        )
+        t.setCellWidget(
+            r, _S_COL_TOTAL,
+            _qb_double_total_label(
+                f"TZS {sum_tzs:,.0f}" if sum_tzs else "TZS 0",
+            ),
+        )
+        # Placeholder items so row bg / height helpers still see cells.
+        for col in (_S_COL_USD, _S_COL_REFUND, _S_COL_TOTAL):
+            pad = _ro("", bg=bg)
+            pad.setFlags(Qt.ItemIsEnabled)
+            t.setItem(r, col, pad)
+        _finish_table_row(t, r, bg)
+        t.setRowHeight(r, _ROW_H + 2)
 
     @staticmethod
     def _simple_status_text(summary: dict, names: dict) -> str:
@@ -1783,8 +1856,11 @@ class TransactionBrowser(QWidget):
         if self._current_mode == _MODE_UPLOADS:
             self._goto_btn.setEnabled(self._uploads_table.currentRow() >= 0)
             return
+        if self._current_mode == _MODE_SIMPLE:
+            row = self._simple_table.currentRow()
+            self._goto_btn.setEnabled(0 <= row < len(self._results_simple))
+            return
         active = {
-            _MODE_SIMPLE: self._simple_table,
             _MODE_SMART: self._smart_table,
         }.get(self._current_mode, self._adv_table)
         self._goto_btn.setEnabled(bool(active.selectedItems()))
@@ -1868,19 +1944,36 @@ class TransactionBrowser(QWidget):
         elif self._current_mode == _MODE_SIMPLE:
             names = getattr(self, "_user_names", {}) or {}
             lines = [
-                "Date\tTransaction ID\tEntries\tMerged / Status"
+                "SN\tDate\tTransaction ID\tEntries\tMerged / Status"
                 "\tTotal USD\tRefund to Float (TZS)\tTotal Amount (TZS)"
             ]
-            for s in self._results_simple:
+            sum_usd = 0.0
+            sum_refund = 0.0
+            sum_tzs = 0.0
+            for sn, s in enumerate(self._results_simple, start=1):
                 d = s["date"]
+                usd = float(s.get("total_usd") or 0)
+                refund = float(s.get("total_refund") or 0)
+                tzs = float(s.get("total_tzs") or 0)
+                sum_usd += usd
+                sum_refund += refund
+                sum_tzs += tzs
                 lines.append("\t".join([
+                    str(sn),
                     d.strftime("%d/%m/%Y"),
                     f"TXN-{d.strftime('%Y%m%d')}",
                     str(s["entries_count"]),
                     self._simple_status_text(s, names),
-                    f"{float(s.get('total_usd') or 0):.2f}",
-                    f"{s['total_refund']:.0f}" if s["total_refund"] else "0",
-                    f"{s['total_tzs']:.0f}"    if s["total_tzs"]    else "0",
+                    f"{usd:.2f}",
+                    f"{refund:.0f}",
+                    f"{tzs:.0f}",
+                ]))
+            if self._results_simple:
+                lines.append("\t".join([
+                    "", "TOTAL", "", "", "",
+                    f"{sum_usd:.2f}",
+                    f"{sum_refund:.0f}",
+                    f"{sum_tzs:.0f}",
                 ]))
             n = len(self._results_simple)
         elif self._current_mode == _MODE_SMART:
@@ -1959,6 +2052,25 @@ def _ro(
     if bg:
         it.setBackground(QColor(bg))
     return it
+
+
+def _qb_double_total_label(text: str) -> QLabel:
+    """Money cell with QuickBooks-style double underline under the amount."""
+    lbl = QLabel(text)
+    lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    lbl.setStyleSheet(
+        "QLabel {"
+        "  font-family: 'Segoe UI';"
+        f"  font-size: {_CELL_FONT_PT}pt;"
+        "  font-weight: 700;"
+        "  color: #111827;"
+        f"  background: {_QB_TOTAL_BG};"
+        "  border: none;"
+        "  border-bottom: 3px double #111827;"
+        "  padding: 1px 6px 2px 6px;"
+        "}"
+    )
+    return lbl
 
 
 def _receipt_item(receipt_status: Optional[str], bg: str) -> QTableWidgetItem:

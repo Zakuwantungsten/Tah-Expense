@@ -60,7 +60,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("master_expenses", "Master Expenses",   "mdi.table-multiple",               {}),
         ("trash",           "Trash",             "mdi.delete-outline",               {}),
         ("import_daily",    "Import Daily",      "mdi.file-upload-outline",          {}),
-        ("receipts",        "Receipts",          "mdi.receipt",                      {}),
+        ("paperwork",       "Paperwork",         "mdi.file-cabinet",                 {}),
         ("receipt_browse",  "Receipt storage",   "mdi.folder-open-outline",          {}),
     ]),
     # ITEMS are loaded dynamically from the DB (accountant-managed). The header
@@ -111,6 +111,11 @@ _FIXED_CHILDREN: dict[str, list[tuple[str, str, str]]] = {
     "sm_burhani": [
         ("RPA Schedule", "rpa_schedule", "mdi.file-table-outline"),
         ("Bonds",        "bonds",        "mdi.bank-outline"),
+    ],
+    # Paperwork umbrella: chase desk + company paper store (no expense row required).
+    "paperwork": [
+        ("Receipts", "receipts", "mdi.receipt"),
+        ("Records",  "records",  "mdi.folder-multiple-outline"),
     ],
 }
 

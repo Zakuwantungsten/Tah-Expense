@@ -60,6 +60,7 @@ _LAZY_PAGE_KEYS = frozenset({
     "manage_users",
     "receipt_disk",
     "receipts",
+    "records",
     "receipt_browse",
     "table",
     "browse",
@@ -615,8 +616,14 @@ class AccountantDashboard(QWidget):
         if key == "receipts":
             # Same desk as cashier (Requests / Chase / Inbox / Link / Library),
             # plus accountant Evidence pack for TRA/KRA handoff.
+            # Opened via Paperwork → Receipts (sidebar fixed child).
             from tahmeed.ui.widgets.receipt_chase_panel import ReceiptChasePanel
             return ReceiptChasePanel(can_export=True)
+
+        if key == "records":
+            # Paperwork → Records: company paper (Phase 1 placeholder; Phase 3 UI).
+            from tahmeed.ui.widgets.receipt_records_panel import ReceiptRecordsPanel
+            return ReceiptRecordsPanel()
 
         if key == "receipt_browse":
             # Folder/bucket explorer + pack/download (not the chase desk).
@@ -1004,6 +1011,18 @@ class AccountantDashboard(QWidget):
         self._on_drafts_open_register(d)
 
     def _on_overview_nav(self, key: str) -> None:
+        # Paperwork is an expandable parent — open Receipts (or Records) child.
+        if key in ("paperwork", "receipts", "records"):
+            match = "records" if key == "records" else "receipts"
+            name = "Records" if match == "records" else "Receipts"
+            self._sidebar.select("paperwork")
+            expanded = getattr(self._sidebar, "_expanded", set())
+            if "paperwork" not in expanded:
+                toggle = getattr(self._sidebar, "_on_toggle", None)
+                if callable(toggle):
+                    toggle("paperwork")
+            self._show_subtable("paperwork", "Paperwork", name, match)
+            return
         self._sidebar.select(key)
         self._on_nav(key)
 
@@ -1196,7 +1215,7 @@ class AccountantDashboard(QWidget):
         if self._sidebar.item_def(key) is not None:
             self._toast_opening(key)
             self._show_category(key)
-        elif key == "sm_burhani":
+        elif key in ("sm_burhani", "paperwork"):
             # Parent click is handled by the sidebar (expand + first sub-item).
             pass
         else:
@@ -1438,12 +1457,23 @@ class AccountantDashboard(QWidget):
         if parent_key == "sm_burhani":
             self._show_recon(match)
             return
+        # Paperwork → Receipts | Records (fixed children).
+        if parent_key == "paperwork":
+            route = (match or name or "").strip().lower()
+            if route in ("records", "record"):
+                self._on_nav("records")
+                return
+            self._on_nav("receipts")
+            return
         # Legacy Receipts→Chase/Storage children (removed from sidebar) → real pages.
         if parent_key == "receipts":
             route = (match or name or "").strip().lower()
             self._drop_stale_receipt_subtables()
             if route in ("receipt_browse", "storage"):
                 self._on_nav("receipt_browse")
+                return
+            if route in ("records", "record"):
+                self._on_nav("records")
                 return
             self._on_nav("receipts")
             return

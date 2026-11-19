@@ -15,6 +15,11 @@ from tahmeed.ui.cashier.transactions_table import (
     _MODE_SMART,
     _MODE_UPLOADS,
     _M_COL_PAYEE,
+    _S_COL_DATE,
+    _S_COL_REFUND,
+    _S_COL_SN,
+    _S_COL_TOTAL,
+    _S_COL_USD,
     _U_COL_CASHIER,
     _U_COL_SN,
     _U_COL_TOTAL,
@@ -410,7 +415,7 @@ def test_simple_table_shows_usd_total_before_refund_and_total() -> None:
     browser = _browser()
     rows = [
         {"date": date(2026, 5, 2), "entries_count": 4, "total_tzs": 3070,
-         "total_usd": 100.5, "total_refund": 0, "cashier_ids": []},
+         "total_usd": 100.5, "total_refund": 50, "cashier_ids": []},
         {"date": date(2026, 5, 3), "entries_count": 1, "total_tzs": 700,
          "total_refund": 0, "cashier_ids": []},
     ]
@@ -418,7 +423,16 @@ def test_simple_table_shows_usd_total_before_refund_and_total() -> None:
     browser._populate_simple(rows)
     t = browser._simple_table
     headers = [t.horizontalHeaderItem(c).text() for c in range(t.columnCount())]
+    assert headers[0] == "SN"
     assert headers[-3:] == ["Total USD", "Refund to Float", "Total Amount"]
-    assert t.item(0, 4).text() == "USD 100.50"
-    assert t.item(1, 4).text() == "—"
-    assert t.item(0, 6).text() == "TZS 3,070"
+    assert t.item(0, _S_COL_SN).text() == "1"
+    assert t.item(1, _S_COL_SN).text() == "2"
+    assert t.item(0, _S_COL_USD).text() == "USD 100.50"
+    assert t.item(1, _S_COL_USD).text() == "—"
+    assert t.item(0, _S_COL_TOTAL).text() == "TZS 3,070"
+    # QB-style TOTAL footer under the day rows
+    assert t.rowCount() == 3
+    assert t.item(2, _S_COL_DATE).text() == "TOTAL"
+    assert t.cellWidget(2, _S_COL_USD).text() == "USD 100.50"
+    assert t.cellWidget(2, _S_COL_REFUND).text() == "TZS 50"
+    assert t.cellWidget(2, _S_COL_TOTAL).text() == "TZS 3,770"

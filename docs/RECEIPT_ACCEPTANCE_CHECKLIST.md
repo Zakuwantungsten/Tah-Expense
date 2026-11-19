@@ -19,7 +19,8 @@ Use one **accountant** desk login and one **ownership** Expo Go user on the same
 
 ### Accountant
 
-- [ ] Open **Receipts** — lands on **Main**; KPIs load
+- [ ] Open **Paperwork → Receipts** (or Overview **Paperwork**) — lands on **Main**; KPIs load
+- [ ] **Paperwork → Records** browse / upload / Download ZIP (see [`PAPERWORK_RECORDS_ACCEPTANCE.md`](PAPERWORK_RECORDS_ACCEPTANCE.md))
 - [ ] **Main**: one row per register day with Entries / Needed / No receipt
 - [ ] Open a day → entries with one **Status** column; Open receipt uses shared viewer
 - [ ] Partial row opens linked file; status/tooltip shows partial note

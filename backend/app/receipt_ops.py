@@ -72,7 +72,7 @@ PARKED_STATUSES = (INBOX_UNMATCHED, INBOX_MATCHED)
 
 
 def ensure_receipt_workspace(base: Path) -> dict[str, Path]:
-    """Create canonical + parked / quarantine / approved folders under the disk root."""
+    """Create canonical + parked / quarantine / approved / records folders."""
     root = attachments_root(base)
     paths = {
         "root": root,
@@ -82,6 +82,7 @@ def ensure_receipt_workspace(base: Path) -> dict[str, Path]:
         "parked_unmapped": root / "parked" / "unmapped",
         "quarantine": root / "quarantine",
         "approved": root / "approved",
+        "records": root / "records",
     }
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -1762,7 +1763,11 @@ async def list_inbox_files(
     unmatched_only: bool = False,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """List receipt files. ``parked`` = unmatched + matched (not yet permanent)."""
+    """List receipt files. ``parked`` = unmatched + matched (not yet permanent).
+
+    Paperwork → Records filings (``record`` set) are excluded — they have their
+    own browse API and must not clutter chase Inbox.
+    """
     key = (status or "parked").strip().lower()
     if unmatched_only:
         key = INBOX_UNMATCHED
@@ -1778,6 +1783,8 @@ async def list_inbox_files(
         query = {"inbox_status": key}
     else:
         query = {"inbox_status": {"$in": list(PARKED_STATUSES)}}
+    if key != "quarantine":
+        query["record"] = {"$exists": False}
     cursor = db.receipt_files.find(query).sort("uploaded_at", -1).limit(limit)
     docs = await cursor.to_list(length=limit)
     items: list[dict[str, Any]] = []
@@ -1928,12 +1935,15 @@ async def list_receipt_library(
     query: dict[str, Any] = {
         "uploaded_at": {"$gte": start, "$lte": end},
         "security_rejected": {"$ne": True},
+        # Records filings belong under Paperwork → Records, not Library.
+        "record": {"$exists": False},
     }
     key = (status or "all").strip().lower()
     if key == "parked":
         query["inbox_status"] = {"$in": list(PARKED_STATUSES)}
     elif key == "quarantine":
         query.pop("security_rejected", None)
+        query.pop("record", None)
         query["security_rejected"] = True
     elif key in INBOX_STATUSES:
         query["inbox_status"] = key
@@ -2037,19 +2047,19 @@ async def list_receipt_library(
     return items
 
 
-_STORAGE_TOP_LEVEL = frozenset({"files", "approved", "quarantine", "parked"})
+_STORAGE_TOP_LEVEL = frozenset({"files", "approved", "quarantine", "parked", "records"})
 _HEX32 = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 
 
 def normalize_storage_prefix(prefix: str) -> str:
-    """Jail browse prefixes to files/ | approved/ | quarantine/ | parked/."""
+    """Jail browse prefixes to files/ | approved/ | quarantine/ | parked/ | records/."""
     raw = (prefix or "").replace("\\", "/").strip()
     parts = [p for p in raw.split("/") if p and p != "."]
     if any(p == ".." for p in parts):
         raise ValueError("Invalid storage prefix")
     if parts and parts[0] not in _STORAGE_TOP_LEVEL:
         raise ValueError(
-            "Prefix must be under files/, approved/, quarantine/, or parked/"
+            "Prefix must be under files/, approved/, quarantine/, parked/, or records/"
         )
     return "/".join(parts)
 
@@ -2093,7 +2103,7 @@ async def list_storage_tree(db: Any, base: Path, *, prefix: str = "") -> dict[st
             "prefix": "",
             "folders": [
                 {"name": name, "prefix": name}
-                for name in ("files", "approved", "quarantine", "parked")
+                for name in ("files", "approved", "quarantine", "parked", "records")
             ],
         }
     target = _storage_dir(base, norm)

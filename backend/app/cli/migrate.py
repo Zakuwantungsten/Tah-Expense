@@ -242,6 +242,38 @@ async def create_indexes(db: Any) -> None:
                 name="receipt_files_pending_s3",
                 partialFilterExpression={"s3_key": {"$in": [None, ""]}},
             ),
+            IndexModel(
+                [
+                    ("record.kind", ASCENDING),
+                    ("record.ref_key", ASCENDING),
+                    ("uploaded_at", DESCENDING),
+                ],
+                name="receipt_files_records_kind",
+                partialFilterExpression={"record": {"$exists": True}},
+            ),
+            IndexModel(
+                [("record.folder_id", ASCENDING), ("uploaded_at", DESCENDING)],
+                name="receipt_files_records_folder",
+                partialFilterExpression={"record.folder_id": {"$type": "string"}},
+            ),
+        ]
+    )
+    await db.receipt_record_folders.create_indexes(
+        [
+            IndexModel(
+                [("kind", ASCENDING), ("slug", ASCENDING)],
+                unique=True,
+                name="uniq_record_folder_kind_slug",
+                partialFilterExpression={"deleted_at": None},
+            ),
+            IndexModel(
+                [("kind", ASCENDING), ("label", ASCENDING)],
+                name="record_folders_label",
+            ),
+            IndexModel(
+                [("updated_at", DESCENDING)],
+                name="record_folders_updated",
+            ),
         ]
     )
     await db.receipt_exports.create_indexes(

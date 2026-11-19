@@ -110,7 +110,8 @@ class ReceiptBrowserPanel(QWidget):
         root.addWidget(title)
         hint = QLabel(
             "Browse the API receipt disk like a folder / bucket (files · approved · "
-            "quarantine · parked). Pack & download ships filtered or selected receipts."
+            "quarantine · parked · records). Pack & download ships filtered or "
+            "selected chase receipts; company paper under records/ is also browsable."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color:{_MUTED}; font:12px 'Segoe UI'; background:transparent;")

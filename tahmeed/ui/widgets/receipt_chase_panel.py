@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateEdit,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -41,6 +42,7 @@ from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.widgets.combo_styles import with_combo_popup
 from tahmeed.ui.widgets.popup_styles import apply_light_menu, with_light_popups
 
+from tahmeed.services.api_client import ApiError
 from tahmeed.services.receipt_chase_service import (
     approve_files,
     download_consolidate_pack,
@@ -59,6 +61,11 @@ from tahmeed.services.receipt_chase_service import (
     reject_files,
     search_link_candidates,
     upload_parked_files,
+)
+from tahmeed.services.receipt_records_service import upload_record_files
+from tahmeed.ui.dialogs.receipt_upload_destination_dialog import (
+    ReceiptUploadDestinationDialog,
+    UploadDestinationChoice,
 )
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.excel_column_filter import (
@@ -510,9 +517,10 @@ class ReceiptChasePanel(QWidget):
             "Main: one row per register day — Needed, Partial, Collected, Waived, "
             "No receipt, Multi-file, Shared. View all and chase tools stay on other tabs."
             + (
-                " Evidence pack + TRA/KRA consolidate under Receipt storage."
+                " Upload files to Receipts inbox or Records. "
+                "Evidence pack + TRA/KRA consolidate under Receipt storage."
                 if self._can_export
-                else ""
+                else " Upload parks files in the inbox."
             )
         )
         sub.setStyleSheet(f"color:{_MUTED}; font:12px 'Segoe UI'; background:transparent;")
@@ -682,6 +690,23 @@ class ReceiptChasePanel(QWidget):
         btn_row.addWidget(reset_btn)
         btn_col.addLayout(btn_row)
         toolbar.addLayout(btn_col)
+
+        upload_btn = _primary_btn("Upload…", "mdi.file-upload-outline")
+        upload_btn.setFixedHeight(28)
+        upload_btn.setToolTip(
+            "Upload files — park in Receipts inbox or file to Records."
+            if self._can_export
+            else "Upload files into the Receipts inbox (park)."
+        )
+        upload_btn.clicked.connect(
+            lambda: asyncio.ensure_future(self._main_upload())
+        )
+        upload_col = QVBoxLayout()
+        upload_col.setContentsMargins(0, 0, 0, 0)
+        upload_col.setSpacing(2)
+        upload_col.addWidget(_main_filter_label(""))
+        upload_col.addWidget(upload_btn)
+        toolbar.addLayout(upload_col)
 
         export_btn = _ghost_btn("Export", "mdi.download-outline")
         export_btn.setFixedHeight(28)
@@ -2546,6 +2571,80 @@ class ReceiptChasePanel(QWidget):
             await self._load_compliance()
         except Exception as exc:
             QMessageBox.critical(self, "Park failed", str(exc))
+
+    async def _main_upload(self) -> None:
+        """Main-tab multi-upload: park in Receipts and/or file to Records."""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Upload files",
+            "",
+            "Documents (*.pdf *.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff "
+            "*.heic *.heif *.doc *.docx *.xls *.xlsx *.csv *.txt);;All files (*.*)",
+        )
+        if not paths:
+            return
+
+        allow_records = bool(self._can_export)
+        if allow_records:
+            dlg = ReceiptUploadDestinationDialog(
+                self, file_count=len(paths), allow_records=True
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            choice = dlg.result_choice()
+            if choice is None:
+                return
+        else:
+            choice = UploadDestinationChoice(mode="park")
+
+        show_widget_loading(self, f"Uploading {len(paths)} file(s)…")
+        try:
+            if choice.mode == "park":
+                result = await upload_parked_files(paths)
+                total = int(result.get("total") or len(paths))
+                self._status.setText(f"Parked {total} file(s) in Receipts inbox")
+                self._inbox_status = "parked"
+                if hasattr(self, "_inbox_chip_buttons"):
+                    self._on_inbox_status("parked")
+                else:
+                    await self._load_inbox()
+                await self._load_compliance()
+                # Jump to Inbox so the user sees the parked files.
+                for i in range(self._tabs.count()):
+                    if self._tabs.tabText(i).strip().lower() == "inbox":
+                        self._tabs.setCurrentIndex(i)
+                        break
+                return
+
+            result = await upload_record_files(
+                paths,
+                kind=choice.kind,
+                ref_key=choice.ref_key,
+                folder_id=choice.folder_id,
+                note=choice.note,
+            )
+            total = int(result.get("total") or len(paths))
+            dest = choice.label or choice.ref_key or choice.kind
+            note_bit = ""
+            if choice.note and result.get("note_file"):
+                note_bit = "\nA upload-note .txt was saved in that folder."
+            elif choice.note:
+                note_bit = "\n(Note was sent; check the folder if the .txt is present.)"
+            self._status.setText(
+                f"Filed {total} file(s) to Records · {choice.kind} · {dest}"
+            )
+            QMessageBox.information(
+                self,
+                "Filed to Records",
+                f"Uploaded to Records under “{dest}”.{note_bit}\n\n"
+                "Open Paperwork → Records to browse them.",
+            )
+        except ApiError as exc:
+            QMessageBox.warning(self, "Upload failed", str(exc))
+        except Exception as exc:
+            QMessageBox.critical(self, "Upload failed", str(exc))
+        finally:
+            hide_widget_loading(self)
 
     async def _load_candidates(self) -> None:
         self._refresh_link_file_hint()

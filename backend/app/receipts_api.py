@@ -6,7 +6,16 @@ from datetime import date, datetime
 from typing import Annotated, Any
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, File, Query, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
@@ -42,6 +51,18 @@ from .receipt_ops import (
     rematerialize_approved_for_transaction,
     search_link_transactions,
     store_receipt_file_bytes,
+)
+from .receipt_records_ops import (
+    build_records_pack,
+    create_custom_folder,
+    delete_custom_folder,
+    ensure_records_workspace,
+    list_custom_folders,
+    list_record_destinations,
+    list_record_files,
+    rename_custom_folder,
+    resolve_record_destination,
+    store_record_file_bytes,
 )
 from .receipt_storage import (
     SETTING_KEY,
@@ -115,6 +136,23 @@ class ReceiptRejectBody(BaseModel):
 class ReceiptRematerializeBody(BaseModel):
     file_ids: list[str] = Field(default_factory=list)
     transaction_id: str = ""
+
+
+class RecordFolderCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=120)
+
+
+class RecordFolderRename(BaseModel):
+    label: str = Field(min_length=1, max_length=120)
+
+
+class RecordsPackBody(BaseModel):
+    kind: str = ""
+    ref_key: str = ""
+    folder_id: str = ""
+    q: str = ""
+    date_from: date | None = None
+    date_to: date | None = None
 
 
 def _database(request: Request) -> Any:
@@ -879,3 +917,279 @@ async def get_evidence_exports(
 ) -> dict[str, Any]:
     items = await list_evidence_exports(_database(request), limit=limit)
     return {"items": json_safe(items), "total": len(items)}
+
+
+# ── Paperwork → Records (Manager only) ───────────────────────────────────────
+
+
+@receipts.get("/records/destinations")
+async def get_record_destinations(request: Request, _user: Manager) -> dict[str, Any]:
+    """Items, suppliers, separate-expense keys, and reusable custom folders."""
+    return json_safe(await list_record_destinations(_database(request)))
+
+
+@receipts.get("/records/folders")
+async def get_record_folders(request: Request, _user: Manager) -> dict[str, Any]:
+    items = await list_custom_folders(_database(request))
+    return {"items": json_safe(items), "total": len(items)}
+
+
+@receipts.post("/records/folders", status_code=status.HTTP_201_CREATED)
+async def post_record_folder(
+    body: RecordFolderCreate, request: Request, actor: Manager
+) -> dict[str, Any]:
+    db = _database(request)
+    try:
+        folder = await create_custom_folder(
+            db, label=body.label, actor_id=_actor_oid(actor)
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_folder", str(exc)) from None
+    await record_operation_event(
+        db,
+        action="records.folder.create",
+        actor=actor,
+        request=request,
+        entity_type="receipt_record_folder",
+        entity_ids=[folder["id"]],
+        details={"label": folder.get("label"), "slug": folder.get("slug")},
+    )
+    return json_safe(folder)
+
+
+@receipts.patch("/records/folders/{folder_id}")
+async def patch_record_folder(
+    folder_id: str,
+    body: RecordFolderRename,
+    request: Request,
+    actor: Manager,
+) -> dict[str, Any]:
+    try:
+        oid = object_id(folder_id)
+    except ValueError as exc:
+        raise ApiError(422, "invalid_id", "Invalid folder id") from exc
+    db = _database(request)
+    try:
+        folder = await rename_custom_folder(db, oid, label=body.label)
+    except ValueError as exc:
+        raise ApiError(422, "invalid_folder", str(exc)) from None
+    await record_operation_event(
+        db,
+        action="records.folder.rename",
+        actor=actor,
+        request=request,
+        entity_type="receipt_record_folder",
+        entity_ids=[folder["id"]],
+        details={"label": folder.get("label"), "slug": folder.get("slug")},
+    )
+    return json_safe(folder)
+
+
+@receipts.delete("/records/folders/{folder_id}")
+async def delete_record_folder_route(
+    folder_id: str, request: Request, actor: Manager
+) -> dict[str, Any]:
+    try:
+        oid = object_id(folder_id)
+    except ValueError as exc:
+        raise ApiError(422, "invalid_id", "Invalid folder id") from exc
+    db = _database(request)
+    try:
+        result = await delete_custom_folder(db, oid)
+    except ValueError as exc:
+        raise ApiError(422, "invalid_folder", str(exc)) from None
+    await record_operation_event(
+        db,
+        action="records.folder.delete",
+        actor=actor,
+        request=request,
+        entity_type="receipt_record_folder",
+        entity_ids=[folder_id],
+        details=result,
+    )
+    return json_safe(result)
+
+
+@receipts.get("/records/files")
+async def get_record_files(
+    request: Request,
+    _user: Manager,
+    kind: str = Query(""),
+    ref_key: str = Query(""),
+    folder_id: str = Query(""),
+    q: str = Query(""),
+    date_from: date | None = None,
+    date_to: date | None = None,
+    limit: int = Query(200, ge=1, le=500),
+) -> dict[str, Any]:
+    try:
+        items = await list_record_files(
+            _database(request),
+            kind=kind,
+            ref_key=ref_key,
+            folder_id=folder_id,
+            q=q,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_filter", str(exc)) from None
+    return {"items": json_safe(items), "total": len(items)}
+
+
+@receipts.post("/records/upload", status_code=status.HTTP_201_CREATED)
+async def post_records_upload(
+    request: Request,
+    actor: Manager,
+    files: list[UploadFile] = File(...),
+    kind: str = Form(...),
+    ref_key: str = Form(""),
+    folder_id: str = Form(""),
+    note: str = Form(""),
+) -> dict[str, Any]:
+    """Bulk file into Records under Item / Supplier / Separate / Custom."""
+    if not files:
+        raise ApiError(422, "files_required", "At least one file is required")
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    ensure_records_workspace(base)
+    try:
+        destination = await resolve_record_destination(
+            db, kind=kind, ref_key=ref_key, folder_id=folder_id
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_destination", str(exc)) from None
+
+    actor_id = _actor_oid(actor)
+    note_clean = " ".join((note or "").split())[:2000]
+    saved: list[dict[str, Any]] = []
+    for upload in files:
+        filename = upload.filename or "file"
+        try:
+            content = await upload.read()
+        except Exception as exc:
+            raise ApiError(400, "read_failed", "Could not read uploaded file") from exc
+        finally:
+            await upload.close()
+        try:
+            meta = await store_record_file_bytes(
+                db,
+                base,
+                filename=filename,
+                content=content,
+                destination=destination,
+                actor_id=actor_id,
+                note="",
+                claimed_content_type=upload.content_type,
+            )
+        except ValueError as exc:
+            raise ApiError(422, "invalid_attachment", str(exc)) from None
+        except OSError as exc:
+            raise ApiError(500, "storage_error", "Failed to store attachment") from exc
+        saved.append(meta)
+
+    note_file: dict[str, Any] | None = None
+    if note_clean:
+        from .security import utcnow
+
+        stamp = utcnow().strftime("%Y%m%d_%H%M%S")
+        note_name = f"upload-note_{stamp}.txt"
+        note_body = (
+            "Tahmeed Records — upload note\n"
+            f"Destination: {destination.get('label') or destination.get('ref_key') or ''}\n"
+            f"Type: {destination.get('kind') or ''}\n"
+            f"Files in this upload: {len(saved)}\n"
+            "-----\n"
+            f"{note_clean}\n"
+        ).encode("utf-8")
+        try:
+            note_file = await store_record_file_bytes(
+                db,
+                base,
+                filename=note_name,
+                content=note_body,
+                destination=destination,
+                actor_id=actor_id,
+                note=note_clean[:500],
+                claimed_content_type="text/plain",
+            )
+            saved.append(note_file)
+        except (ValueError, OSError):
+            # Files already stored — do not fail the whole upload for a note miss.
+            note_file = None
+
+    await record_operation_event(
+        db,
+        action="records.upload",
+        actor=actor,
+        request=request,
+        entity_type="receipt_file",
+        entity_ids=[str(m.get("id")) for m in saved][:40],
+        details={
+            "files": len(saved),
+            "kind": destination.get("kind"),
+            "ref_key": destination.get("ref_key"),
+            "folder_id": destination.get("folder_id"),
+            "label": destination.get("label"),
+            "note_file": bool(note_file),
+            "has_note": bool(note_clean),
+        },
+    )
+    return {
+        "files": json_safe(saved),
+        "total": len(saved),
+        "destination": json_safe(destination),
+        "note_file": json_safe(note_file) if note_file else None,
+    }
+
+
+@receipts.post("/records/pack")
+async def post_records_pack(
+    body: RecordsPackBody, request: Request, actor: Manager
+) -> Response:
+    """Accountant/admin: ZIP Records filings for destination / date filters."""
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    try:
+        payload, summary = await build_records_pack(
+            db,
+            base,
+            kind=body.kind,
+            ref_key=body.ref_key,
+            folder_id=body.folder_id,
+            q=body.q,
+            date_from=body.date_from,
+            date_to=body.date_to,
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_pack", str(exc)) from None
+
+    await record_operation_event(
+        db,
+        action="records.pack",
+        actor=actor,
+        request=request,
+        entity_type="receipt_record_pack",
+        entity_ids=[],
+        details={
+            "sha256": summary.get("sha256"),
+            "file_count": summary.get("file_count"),
+            "missing": summary.get("missing"),
+            "kind": summary.get("kind"),
+            "ref_key": summary.get("ref_key"),
+            "folder_id": summary.get("folder_id"),
+            "filename": summary.get("filename"),
+        },
+    )
+    filename = str(summary.get("filename") or "tahmeed-records.zip")
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Pack-Sha256": str(summary.get("sha256") or ""),
+            "X-Pack-Files": str(summary.get("file_count") or 0),
+            "X-Pack-Missing": str(summary.get("missing") or 0),
+        },
+    )
