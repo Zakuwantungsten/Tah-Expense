@@ -11,6 +11,11 @@ async def get_storage_status() -> dict[str, Any]:
     return await api_client.request("GET", "v1/receipts/storage")
 
 
+async def get_storage_health() -> dict[str, Any]:
+    """Light health probe for sidebar badges and degraded-mode banners."""
+    return await api_client.request("GET", "v1/receipts/storage/health")
+
+
 async def probe_storage(path: str, *, create: bool = False) -> dict[str, Any]:
     return await api_client.request(
         "POST",

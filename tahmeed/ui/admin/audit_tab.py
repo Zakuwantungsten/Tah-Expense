@@ -21,13 +21,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 import qtawesome as qta
 
 from tahmeed.services.audit_log_service import AuditEvent, list_audit_events
+from tahmeed.ui.widgets.table_contrast import apply_light_table_contrast, light_table_item
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 # Preset chips: label → action substring passed to the API regex filter.
@@ -150,18 +150,30 @@ class AuditTab(QWidget):
             ["When", "Action", "Actor", "Role", "Outcome", "Entity", "Details"]
         )
         header = self._table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        # Interactive/Stretch — ResizeToContents remeasures every cell on each
+        # setItem and makes Refresh feel hung behind the loading overlay.
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.Interactive)
         header.setSectionResizeMode(6, QHeaderView.Stretch)
+        self._table.setColumnWidth(0, 150)
+        self._table.setColumnWidth(1, 160)
+        self._table.setColumnWidth(2, 110)
+        self._table.setColumnWidth(3, 90)
+        self._table.setColumnWidth(4, 80)
+        self._table.setColumnWidth(5, 160)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(28)
         self._table.setAlternatingRowColors(True)
+        self._table.setWordWrap(False)
+        self._table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        apply_light_table_contrast(self._table)
         root.addWidget(self._table, 1)
 
         self._empty = QLabel("No audit events match the current filters.")
@@ -211,7 +223,7 @@ class AuditTab(QWidget):
         self._overlay.show_loading("Loading audit log…")
         try:
             self._events = await list_audit_events(
-                limit=200,
+                limit=100,
                 action=self._action_filter(),
                 actor=self._actor.text().strip() or None,
                 outcome=self._outcome.currentData() or None,
@@ -226,37 +238,42 @@ class AuditTab(QWidget):
             self._overlay.hide_loading()
 
     def _render(self) -> None:
-        self._table.setRowCount(len(self._events))
-        for row, event in enumerate(self._events):
-            when = (
-                event.ts.astimezone().strftime("%d %b %Y  %H:%M:%S")
-                if event.ts
-                else ""
-            )
-            entity = event.entity_type
-            if event.entity_ids:
-                entity = f"{entity} ({', '.join(event.entity_ids[:3])})"
-            details = event.error or ""
-            if event.details:
-                try:
-                    details = (details + " " if details else "") + json.dumps(
-                        event.details, default=str
-                    )
-                except TypeError:
-                    details = str(event.details)
-            values = [
-                when,
-                event.action,
-                event.actor_username,
-                event.actor_role,
-                event.outcome,
-                entity.strip(),
-                details[:500],
-            ]
-            for col, value in enumerate(values):
-                self._table.setItem(row, col, QTableWidgetItem(value))
-        self._empty.setVisible(not self._events)
-        self._table.setVisible(bool(self._events))
+        events = self._events
+        self._table.setUpdatesEnabled(False)
+        try:
+            self._table.clearContents()
+            self._table.setRowCount(len(events))
+            for row, event in enumerate(events):
+                when = (
+                    event.ts.astimezone().strftime("%d %b %Y  %H:%M:%S")
+                    if event.ts
+                    else ""
+                )
+                entity = event.entity_type or ""
+                if event.entity_ids:
+                    entity = f"{entity} ({', '.join(event.entity_ids[:3])})".strip()
+                details = event.error or ""
+                if event.details:
+                    try:
+                        dumped = json.dumps(event.details, default=str, separators=(",", ":"))
+                    except TypeError:
+                        dumped = str(event.details)
+                    details = f"{details} {dumped}".strip() if details else dumped
+                values = (
+                    when,
+                    event.action,
+                    event.actor_username,
+                    event.actor_role,
+                    event.outcome,
+                    entity,
+                    details[:240],
+                )
+                for col, value in enumerate(values):
+                    self._table.setItem(row, col, light_table_item(value))
+        finally:
+            self._table.setUpdatesEnabled(True)
+        self._empty.setVisible(not events)
+        self._table.setVisible(bool(events))
 
     def _export_csv(self) -> None:
         if not self._events:

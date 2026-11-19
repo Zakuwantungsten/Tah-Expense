@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QTableWidget,
-    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -33,6 +32,7 @@ from tahmeed.services.session_service import (
     revoke_user_sessions,
 )
 from tahmeed.services.settings_service import get_all_settings, set_setting
+from tahmeed.ui.widgets.table_contrast import apply_light_table_contrast, light_table_item
 from tahmeed.ui.async_utils import schedule_call, schedule_coro
 
 
@@ -269,6 +269,7 @@ class SecurityTab(QWidget):
         self._sess_table.verticalHeader().setVisible(False)
         self._sess_table.setAlternatingRowColors(True)
         self._sess_table.setMinimumHeight(220)
+        apply_light_table_contrast(self._sess_table)
         sessions_layout.addWidget(self._sess_table)
 
         self._sess_empty = QLabel("No active sessions.")
@@ -434,7 +435,7 @@ class SecurityTab(QWidget):
                 _fmt_dt(session.last_used_at),
             ]
             for col, value in enumerate(values):
-                self._sess_table.setItem(i, col, QTableWidgetItem(value))
+                self._sess_table.setItem(i, col, light_table_item(value))
             self._sess_table.setCellWidget(i, 7, self._session_actions(session))
         self._sess_empty.setVisible(not rows)
         self._sess_table.setVisible(bool(rows))

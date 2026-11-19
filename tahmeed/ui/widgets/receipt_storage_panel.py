@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -27,6 +26,7 @@ from tahmeed.services.receipt_storage_service import (
     probe_storage,
     set_storage_path,
 )
+from tahmeed.ui.widgets.table_contrast import apply_light_table_contrast, light_table_item
 
 
 class ReceiptStoragePanel(QWidget):
@@ -47,6 +47,15 @@ class ReceiptStoragePanel(QWidget):
         heading = QLabel("Receipt disk")
         heading.setStyleSheet("color:#111827; font:700 18px 'Segoe UI';")
         root.addWidget(heading)
+
+        self._health_banner = QLabel("")
+        self._health_banner.setWordWrap(True)
+        self._health_banner.setVisible(False)
+        self._health_banner.setStyleSheet(
+            "background:#FEF2F2;color:#991B1B;border:1px solid #FECACA;"
+            "border-radius:8px;padding:10px 12px;font:600 13px 'Segoe UI';"
+        )
+        root.addWidget(self._health_banner)
 
         hint = QLabel(
             "Receipt files are stored on the API server, not on this PC. "
@@ -161,6 +170,7 @@ class ReceiptStoragePanel(QWidget):
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
+        apply_light_table_contrast(self._table)
         self._table.cellClicked.connect(self._on_row_clicked)
         root.addWidget(self._table, 1)
 
@@ -231,10 +241,27 @@ class ReceiptStoragePanel(QWidget):
                 "Yes" if item.get("writable") else "No",
             ]
             for col, value in enumerate(values):
-                cell = QTableWidgetItem(value)
+                cell = light_table_item(value)
                 cell.setData(Qt.UserRole, item)
                 self._table.setItem(row, col, cell)
         self._table.resizeColumnsToContents()
+        self._apply_health_banner(status.get("health") or {})
+
+    def _apply_health_banner(self, health: dict[str, Any]) -> None:
+        unhealthy = bool(health.get("degraded") or not health.get("healthy", True))
+        if not unhealthy:
+            self._health_banner.setVisible(False)
+            self._health_banner.setText("")
+            return
+        message = str(
+            health.get("message")
+            or "Receipt disk is unavailable — uploads are blocked until it is remounted."
+        )
+        reason = health.get("reason")
+        if reason:
+            message = f"{message} ({reason})"
+        self._health_banner.setText(message)
+        self._health_banner.setVisible(True)
 
     async def refresh(self) -> None:
         if self._busy:

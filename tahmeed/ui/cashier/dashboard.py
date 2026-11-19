@@ -1342,7 +1342,25 @@ class CashierDashboard(QWidget):
         schedule_coro(self._refresh_draft_badge())
         schedule_coro(self._refresh_day_issues_badge())
         schedule_coro(self._refresh_trash_badge())
+        schedule_coro(self._refresh_receipt_storage_badge())
+        self._storage_health_timer = QTimer(self)
+        self._storage_health_timer.setInterval(30_000)
+        self._storage_health_timer.timeout.connect(
+            lambda: schedule_coro(self._refresh_receipt_storage_badge())
+        )
+        self._storage_health_timer.start()
 
+
+    async def _refresh_receipt_storage_badge(self) -> None:
+        from tahmeed.services.receipt_storage_service import get_storage_health
+
+        try:
+            health = await get_storage_health()
+        except Exception:
+            return
+        down = 0 if health.get("healthy", True) else 1
+        if hasattr(self._sidebar, "set_receipts_storage_badge"):
+            self._sidebar.set_receipts_storage_badge(down)
 
     def _on_import(self) -> None:
         self._on_nav("table")

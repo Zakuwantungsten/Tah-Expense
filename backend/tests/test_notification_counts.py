@@ -94,30 +94,34 @@ def test_notification_counts_reads_stored_badges(role: str) -> None:
     app.dependency_overrides[current_user] = lambda: {"role": role}
 
     with TestClient(app) as client:
+        badges.queries.clear()
         response = client.get("/v1/accountant/notification-counts")
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "verify": 10,
-        "inbox": 7,
-        "new": 5,
-        "edited": 2,
-        "drafts": 2,
-        "deletion_requests": 3,
-        "restore_requests": 0,
-    }
-    assert response.headers["etag"] == '"0"'
-    assert transactions.queries == []
-    assert badges.queries == [{"_id": "badges"}]
+        assert response.status_code == 200
+        assert response.json() == {
+            "verify": 10,
+            "inbox": 7,
+            "new": 5,
+            "edited": 2,
+            "drafts": 2,
+            "deletion_requests": 3,
+            "restore_requests": 0,
+            "receipt_storage_down": 0,
+        }
+        assert response.headers["etag"] == '"0"'
+        assert transactions.queries == []
+        assert badges.queries == [
+            {"_id": "badges"},
+            {"_id": "receipt_storage_health"},
+        ]
 
-    with TestClient(app) as client:
         same = client.get(
             "/v1/accountant/notification-counts",
             headers={"If-None-Match": '"0"'},
         )
-    assert same.status_code == 304
-    assert same.content == b""
-    assert len(badges.queries) == 2
+        assert same.status_code == 304
+        assert same.content == b""
+        assert len(badges.queries) == 3
 
 def test_notification_counts_wait_returns_payload() -> None:
     badges = FakeBadges(

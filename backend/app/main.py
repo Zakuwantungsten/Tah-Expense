@@ -32,6 +32,16 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
 
             logging.getLogger(__name__).exception("badge counter seed failed")
         try:
+            from .receipt_storage_health import refresh_storage_health
+
+            await refresh_storage_health(
+                app.state.settings, app.state.database.db, force=True
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("receipt storage health seed failed")
+        try:
             yield
         finally:
             if owned:

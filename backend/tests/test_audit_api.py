@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -30,6 +31,11 @@ class FakeCursor:
         return list(self._docs)
 
 
+def _regex_match(value: str, pattern: str, options: str = "") -> bool:
+    flags = re.IGNORECASE if "i" in (options or "") else 0
+    return re.search(pattern, value or "", flags=flags) is not None
+
+
 class FakeOperationEvents:
     def __init__(self) -> None:
         self.documents: list[dict] = []
@@ -46,8 +52,13 @@ class FakeOperationEvents:
         if "action" in query:
             action_q = query["action"]
             if isinstance(action_q, dict) and "$regex" in action_q:
-                needle = str(action_q["$regex"]).lower()
-                docs = [d for d in docs if needle in str(d.get("action", "")).lower()]
+                pattern = str(action_q["$regex"])
+                options = str(action_q.get("$options") or "")
+                docs = [
+                    d
+                    for d in docs
+                    if _regex_match(str(d.get("action", "")), pattern, options)
+                ]
             else:
                 docs = [d for d in docs if d.get("action") == action_q]
         if "outcome" in query:
@@ -55,11 +66,12 @@ class FakeOperationEvents:
         if "actor_username" in query:
             actor_q = query["actor_username"]
             if isinstance(actor_q, dict) and "$regex" in actor_q:
-                needle = str(actor_q["$regex"]).lower()
+                pattern = str(actor_q["$regex"])
+                options = str(actor_q.get("$options") or "")
                 docs = [
                     d
                     for d in docs
-                    if needle in str(d.get("actor_username", "")).lower()
+                    if _regex_match(str(d.get("actor_username", "")), pattern, options)
                 ]
         return FakeCursor(docs)
 

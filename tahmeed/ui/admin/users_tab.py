@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QTableWidget,
-    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -42,6 +41,7 @@ from tahmeed.services.user_service import (
     unban_user,
     update_user,
 )
+from tahmeed.ui.widgets.table_contrast import apply_light_table_contrast, light_table_item
 from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 
@@ -247,6 +247,7 @@ class UsersTab(QWidget):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
         self._table.setAlternatingRowColors(True)
+        apply_light_table_contrast(self._table)
         layout.addWidget(self._table)
 
     async def _load(self) -> None:
@@ -272,11 +273,11 @@ class UsersTab(QWidget):
     def _refresh(self) -> None:
         self._table.setRowCount(len(self._users))
         for i, user in enumerate(self._users):
-            self._table.setItem(i, 0, QTableWidgetItem(user.full_name))
-            self._table.setItem(i, 1, QTableWidgetItem(user.username))
-            self._table.setItem(i, 2, QTableWidgetItem(user.role.title()))
+            self._table.setItem(i, 0, light_table_item(user.full_name))
+            self._table.setItem(i, 1, light_table_item(user.username))
+            self._table.setItem(i, 2, light_table_item(user.role.title()))
 
-            status_item = QTableWidgetItem(user.status_label)
+            status_item = light_table_item(user.status_label)
             status_item.setForeground(self._status_color(user))
             if user.banned and user.ban_reason:
                 status_item.setToolTip(user.ban_reason)
@@ -287,7 +288,7 @@ class UsersTab(QWidget):
                 if user.last_login
                 else "Never"
             )
-            self._table.setItem(i, 4, QTableWidgetItem(last))
+            self._table.setItem(i, 4, light_table_item(last))
             self._table.setCellWidget(i, 5, self._make_actions(user))
 
         self._table.resizeRowsToContents()

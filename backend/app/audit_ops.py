@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Any
@@ -10,6 +11,8 @@ from fastapi import Request
 
 from .security import utcnow
 from .security_policy import client_ip
+
+_SIMPLE_TOKEN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 async def record_operation_event(
@@ -74,9 +77,21 @@ def parse_audit_filters(
 ) -> dict[str, Any]:
     query: dict[str, Any] = {}
     if action:
-        query["action"] = {"$regex": action.strip(), "$options": "i"}
+        token = action.strip()
+        escaped = re.escape(token)
+        # Chip filters are simple prefixes (auth, user, txn…). Anchored,
+        # case-sensitive matches can use action_ts; bare substring + /i cannot.
+        if _SIMPLE_TOKEN.fullmatch(token):
+            query["action"] = {"$regex": f"^{escaped}"}
+        else:
+            query["action"] = {"$regex": escaped, "$options": "i"}
     if actor:
-        query["actor_username"] = {"$regex": actor.strip(), "$options": "i"}
+        token = actor.strip()
+        escaped = re.escape(token)
+        if _SIMPLE_TOKEN.fullmatch(token):
+            query["actor_username"] = {"$regex": f"^{escaped}$", "$options": "i"}
+        else:
+            query["actor_username"] = {"$regex": escaped, "$options": "i"}
     if outcome:
         query["outcome"] = outcome.strip()
     if since or until:

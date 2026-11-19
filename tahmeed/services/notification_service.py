@@ -48,6 +48,7 @@ def _payload_from_json(payload: Any) -> dict[str, int]:
         "drafts": int(data.get("drafts") or 0),
         "deletion_requests": int(data.get("deletion_requests") or 0),
         "restore_requests": int(data.get("restore_requests") or 0),
+        "receipt_storage_down": int(data.get("receipt_storage_down") or 0),
     }
 
 

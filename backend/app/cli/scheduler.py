@@ -16,6 +16,7 @@ from ..config import Settings, get_settings
 from ..receipt_backup import retry_pending_receipt_backups
 from ..receipt_ops import flush_pending_rematerialize, send_receipt_reminders
 from ..receipt_storage import resolve_attachments_directory
+from ..receipt_storage_health import refresh_storage_health
 from .backup import (
     create_local_backup,
     distributed_lease,
@@ -204,6 +205,10 @@ async def execute_slot(settings: Settings, db: Any, slot: ScheduleSlot) -> None:
         await upload_pending(settings, db)
         await retry_pending_receipt_backups(settings, db)
         await send_receipt_reminders(settings, db)
+        try:
+            await refresh_storage_health(settings, db, force=True)
+        except Exception:
+            pass
         try:
             base = await resolve_attachments_directory(settings, db)
             await flush_pending_rematerialize(db, base, limit=200)

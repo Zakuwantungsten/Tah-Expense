@@ -1117,6 +1117,10 @@ class AccountantDashboard(QWidget):
             self._sidebar.set_drafts_badge(count)
             if hasattr(self._sidebar, "set_saved_badge"):
                 self._sidebar.set_saved_badge(count)
+        if hasattr(self._sidebar, "set_receipt_storage_badge"):
+            self._sidebar.set_receipt_storage_badge(
+                int(payload.get("receipt_storage_down") or 0)
+            )
         page = self._pages.get("verify")
         apply = getattr(page, "apply_stored_counts", None) if page is not None else None
         if callable(apply):

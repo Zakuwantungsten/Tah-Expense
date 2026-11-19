@@ -56,7 +56,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("day_issues", "Day Issues", "mdi.alert-decagram-outline",     {"badge": True}),
         ("rejected",   "Rejected",   "mdi.alert-circle-outline",       {}),
         ("trash",      "Trash",      "mdi.delete-outline",             {"badge": True}),
-        ("receipts",   "Receipts",   "mdi.receipt",                    {}),
+        ("receipts",   "Receipts",   "mdi.receipt",                    {"badge": True}),
     ]),
     ("ITEMS", []),
 ]
@@ -611,6 +611,27 @@ class CashierSidebarWidget(QFrame):
     def set_trash_badge(self, count: int) -> None:
         if "trash" in self._items:
             self._items["trash"].set_badge(count)
+
+    def set_receipts_storage_badge(self, count: int) -> None:
+        """Red alert badge when receipt disk is down (0 hides)."""
+        item = self._items.get("receipts")
+        if item is None:
+            return
+        n = max(0, int(count or 0))
+        item.set_badge(n)
+        badge = getattr(item, "_badge_lbl", None)
+        if badge is None:
+            return
+        if n > 0:
+            badge.setStyleSheet(
+                "background:#DC2626;color:#FEF2F2;border-radius:9px;"
+                "font-size:10px;font-weight:700;font-family:'Segoe UI';padding:0 6px;"
+            )
+        else:
+            badge.setStyleSheet(
+                "background:#B45309;color:#FFFBEB;border-radius:9px;"
+                "font-size:10px;font-weight:700;font-family:'Segoe UI';padding:0 6px;"
+            )
 
     # ── Internal: top-level nav ────────────────────────────────────────────────
 

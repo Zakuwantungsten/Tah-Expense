@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from .audit_ops import record_operation_event
-from .dependencies import Manager, require_roles
+from .dependencies import Authenticated, Manager, require_roles
 from .errors import ApiError
 from .receipt_evidence import (
     build_consolidate_pack,
@@ -71,6 +71,14 @@ from .receipt_storage import (
     probe_directory,
     resolve_attachments_directory,
     storage_status,
+)
+from .receipt_storage_health import (
+    StorageUnavailableError,
+    assert_receipt_storage_ready,
+    get_storage_health,
+    on_storage_path_changed,
+    refresh_storage_health,
+    storage_unavailable_error_payload,
 )
 from .serialization import json_safe, object_id
 
@@ -173,10 +181,37 @@ def _actor_oid(user: dict[str, Any]) -> ObjectId | None:
         return None
 
 
+async def _require_receipt_storage(request: Request) -> None:
+    try:
+        await assert_receipt_storage_ready(_settings(request), _database(request))
+    except StorageUnavailableError as exc:
+        raise ApiError(
+            503,
+            "receipt_storage_unavailable",
+            exc.message,
+            details=storage_unavailable_error_payload(exc),
+        ) from None
+
+
 @receipts.get("/storage")
 async def get_receipt_storage(request: Request, _user: Manager) -> dict[str, Any]:
     """Current path, free space, write probe, and candidate drives/mounts."""
-    return json_safe(await storage_status(_settings(request), _database(request)))
+    status = await storage_status(_settings(request), _database(request))
+    health = await refresh_storage_health(
+        _settings(request), _database(request), force=True
+    )
+    status["health"] = health
+    return json_safe(status)
+
+
+@receipts.get("/storage/health")
+async def get_receipt_storage_health(
+    request: Request, _user: Authenticated
+) -> dict[str, Any]:
+    """Light health signal for desktop badges and mobile degraded mode."""
+    return json_safe(
+        await get_storage_health(_settings(request), _database(request), force=False)
+    )
 
 
 @receipts.get("/storage/tree")
@@ -241,6 +276,11 @@ async def put_receipt_storage(
     db = _database(request)
     if body.clear_override:
         await db.system_settings.delete_one({"key": SETTING_KEY})
+        env_path = await resolve_attachments_directory(_settings(request), db)
+        try:
+            await on_storage_path_changed(db, env_path)
+        except Exception:
+            pass
         await record_operation_event(
             db,
             action="receipt_storage.clear",
@@ -250,7 +290,11 @@ async def put_receipt_storage(
             entity_ids=[SETTING_KEY],
             details={},
         )
-        return json_safe(await storage_status(_settings(request), db))
+        status = await storage_status(_settings(request), db)
+        status["health"] = await refresh_storage_health(
+            _settings(request), db, force=True
+        )
+        return json_safe(status)
 
     try:
         path = normalize_directory(body.path)
@@ -272,6 +316,7 @@ async def put_receipt_storage(
         upsert=True,
     )
     ensure_receipt_workspace(path)
+    await on_storage_path_changed(db, path)
     await record_operation_event(
         db,
         action="receipt_storage.update",
@@ -283,6 +328,9 @@ async def put_receipt_storage(
     )
     status = await storage_status(_settings(request), db)
     status["probe"] = probe
+    status["health"] = await refresh_storage_health(
+        _settings(request), db, force=True
+    )
     return json_safe(status)
 
 
@@ -674,6 +722,7 @@ async def post_receipt_files_early_upload(
     """Desk early drop — park unmatched files with no request/tx yet."""
     if not files:
         raise ApiError(422, "files_required", "At least one file is required")
+    await _require_receipt_storage(request)
     db = _database(request)
     base = await resolve_attachments_directory(_settings(request), db)
     ensure_receipt_workspace(base)
@@ -1051,6 +1100,7 @@ async def post_records_upload(
     """Bulk file into Records under Item / Supplier / Separate / Custom."""
     if not files:
         raise ApiError(422, "files_required", "At least one file is required")
+    await _require_receipt_storage(request)
     db = _database(request)
     base = await resolve_attachments_directory(_settings(request), db)
     ensure_records_workspace(base)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import qtawesome as qta
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -47,8 +47,14 @@ class BackupTab(QWidget):
         hint.setStyleSheet("color:#6B7280; font:12px 'Segoe UI';")
         layout.addWidget(hint)
 
-        fields = QHBoxLayout()
-        fields.setSpacing(16)
+        self._jobs = BackupWidget(
+            allow_restore=True, show_chrome=False, show_actions=False
+        )
+        self._jobs.logout_requested.connect(self.logout_requested)
+
+        # Schedule fields + actions share one toolbar row.
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(12)
 
         mode_col = QVBoxLayout()
         mode_col.setSpacing(4)
@@ -59,9 +65,9 @@ class BackupTab(QWidget):
         self._mode.addItem("Hourly", "hourly")
         self._mode.addItem("Daily (at UTC time)", "daily")
         self._mode.addItem("Disabled", "disabled")
-        self._mode.setMinimumWidth(180)
+        self._mode.setMinimumWidth(160)
         mode_col.addWidget(self._mode)
-        fields.addLayout(mode_col)
+        toolbar.addLayout(mode_col)
 
         time_col = QVBoxLayout()
         time_col.setSpacing(4)
@@ -70,9 +76,9 @@ class BackupTab(QWidget):
         time_col.addWidget(time_lbl)
         self._daily_time = QLineEdit()
         self._daily_time.setPlaceholderText("HH:MM UTC, e.g. 00:00")
-        self._daily_time.setFixedWidth(120)
+        self._daily_time.setFixedWidth(110)
         time_col.addWidget(self._daily_time)
-        fields.addLayout(time_col)
+        toolbar.addLayout(time_col)
 
         keep_col = QVBoxLayout()
         keep_col.setSpacing(4)
@@ -81,30 +87,18 @@ class BackupTab(QWidget):
         keep_col.addWidget(keep_lbl)
         self._keep = QSpinBox()
         self._keep.setRange(1, 365)
-        self._keep.setFixedWidth(100)
+        self._keep.setFixedWidth(90)
         keep_col.addWidget(self._keep)
-        fields.addLayout(keep_col)
-
-        fields.addStretch()
-        layout.addLayout(fields)
-
-        self._jobs = BackupWidget(
-            allow_restore=True, show_chrome=False, show_actions=False
-        )
-        self._jobs.logout_requested.connect(self.logout_requested)
-
-        # Save / Backup now / Refresh / Restore share one toolbar row.
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
+        toolbar.addLayout(keep_col)
 
         self._save_btn = QPushButton("Save schedule")
-        self._save_btn.setFixedWidth(130)
+        self._save_btn.setFixedWidth(120)
         self._save_btn.clicked.connect(self._on_save_schedule)
-        actions.addWidget(self._save_btn)
+        toolbar.addWidget(self._save_btn, 0, Qt.AlignBottom)
 
         self._run_btn = QPushButton("Backup now")
         self._run_btn.setIcon(qta.icon("mdi.cloud-upload-outline", color="#FFFFFF"))
-        self._run_btn.setFixedWidth(130)
+        self._run_btn.setFixedWidth(120)
         self._run_btn.setStyleSheet(
             "QPushButton{background:#0077C5;color:#FFFFFF;border:none;"
             "border-radius:6px;padding:6px 14px;font:600 12px 'Segoe UI';}"
@@ -112,21 +106,22 @@ class BackupTab(QWidget):
             "QPushButton:hover:!disabled{background:#005EA3;}"
         )
         self._run_btn.clicked.connect(self._on_run_backup)
-        actions.addWidget(self._run_btn)
+        toolbar.addWidget(self._run_btn, 0, Qt.AlignBottom)
 
-        actions.addWidget(self._jobs.refresh_button)
-        actions.addWidget(self._jobs.restore_button)
+        toolbar.addWidget(self._jobs.refresh_button, 0, Qt.AlignBottom)
+        toolbar.addWidget(self._jobs.restore_button, 0, Qt.AlignBottom)
 
         self._status = QLabel("")
         self._status.setStyleSheet("color:#16A34A; font-size:12px;")
-        actions.addWidget(self._status)
-        actions.addStretch()
-        layout.addLayout(actions)
+        toolbar.addWidget(self._status, 0, Qt.AlignBottom)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
 
         layout.addWidget(self._jobs, 1)
         self._overlay = LoadingOverlay(self, "Creating backup…")
 
         asyncio.ensure_future(self._load_schedule())
+        self._jobs.refresh()
 
     async def _load_schedule(self) -> None:
         try:

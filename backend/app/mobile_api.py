@@ -37,6 +37,12 @@ from .receipt_ops import (
     waive_receipt_request,
 )
 from .receipt_storage import resolve_attachments_directory
+from .receipt_storage_health import (
+    StorageUnavailableError,
+    assert_receipt_storage_ready,
+    get_storage_health,
+    storage_unavailable_error_payload,
+)
 from .receipt_upload_security import UploadSecurityError, check_mobile_upload_rate
 from .schemas import LoginRequest, RefreshRequest
 from .serialization import json_safe, object_id
@@ -55,6 +61,20 @@ class ReceiptWaiveBody(BaseModel):
 
 def _database(request: Request) -> Any:
     return request.app.state.database.db
+
+
+async def _require_receipt_storage(request: Request) -> None:
+    try:
+        await assert_receipt_storage_ready(
+            request.app.state.settings, _database(request)
+        )
+    except StorageUnavailableError as exc:
+        raise ApiError(
+            503,
+            "receipt_storage_unavailable",
+            exc.message,
+            details=storage_unavailable_error_payload(exc),
+        ) from None
 
 
 def _actor_id(user: dict[str, Any]) -> ObjectId | None:
@@ -212,6 +232,18 @@ async def get_my_receipt_request(
     return json_safe(await request_summary(_database(request), doc))
 
 
+@mobile.get("/storage-health")
+async def mobile_storage_health(
+    request: Request, _user: Authenticated
+) -> dict[str, Any]:
+    """Degraded-mode signal for the Expo app (WhatsApp fallback page)."""
+    return json_safe(
+        await get_storage_health(
+            request.app.state.settings, _database(request), force=False
+        )
+    )
+
+
 @mobile.post("/receipt-files", status_code=status.HTTP_201_CREATED)
 async def upload_early_receipt_files(
     request: Request,
@@ -221,6 +253,7 @@ async def upload_early_receipt_files(
     """Early upload with no open request — parks unmatched for desk linking."""
     if not files:
         raise ApiError(422, "files_required", "At least one file is required")
+    await _require_receipt_storage(request)
     _enforce_mobile_upload_limits(request, user, files)
     db = _database(request)
     base = await resolve_attachments_directory(request.app.state.settings, db)
@@ -276,6 +309,7 @@ async def upload_receipt_files(
 ) -> dict[str, Any]:
     if not files:
         raise ApiError(422, "files_required", "At least one file is required")
+    await _require_receipt_storage(request)
     note = " ".join((partial_note or "").strip().split())
     if partial and len(note) < 3:
         raise ApiError(

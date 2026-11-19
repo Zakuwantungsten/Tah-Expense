@@ -48,12 +48,21 @@ def _icon(name: str, color: str):
 class _NavItem(QWidget):
     activated = Signal(str)
 
-    def __init__(self, key: str, label: str, icon_name: str, parent=None):
+    def __init__(
+        self,
+        key: str,
+        label: str,
+        icon_name: str,
+        *,
+        badge: bool = False,
+        parent=None,
+    ):
         super().__init__(parent)
         self._key = key
         self._icon_name = icon_name
         self._active = False
         self._collapsed = False
+        self._badge_count = 0
         self.setFixedHeight(40)
         self.setCursor(Qt.PointingHandCursor)
 
@@ -87,15 +96,37 @@ class _NavItem(QWidget):
         self._text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         lay.addWidget(self._text)
 
+        self._badge_lbl: QLabel | None = None
+        if badge:
+            self._badge_lbl = QLabel("1")
+            self._badge_lbl.setAlignment(Qt.AlignCenter)
+            self._badge_lbl.setFixedHeight(18)
+            self._badge_lbl.setMinimumWidth(24)
+            self._badge_lbl.setStyleSheet(
+                "background:#DC2626;color:#FEF2F2;border-radius:9px;"
+                "font-size:10px;font-weight:700;font-family:'Segoe UI';padding:0 6px;"
+            )
+            self._badge_lbl.setVisible(False)
+            lay.addWidget(self._badge_lbl)
+
         self._paint(hover=False)
 
     def set_active(self, active: bool) -> None:
         self._active = active
         self._paint(hover=False)
 
+    def set_badge(self, count: int) -> None:
+        self._badge_count = max(0, int(count or 0))
+        if self._badge_lbl is None:
+            return
+        self._badge_lbl.setText(str(self._badge_count))
+        self._badge_lbl.setVisible(not self._collapsed and self._badge_count > 0)
+
     def set_collapsed(self, collapsed: bool) -> None:
         self._collapsed = collapsed
         self._text.setVisible(not collapsed)
+        if self._badge_lbl is not None:
+            self._badge_lbl.setVisible(not collapsed and self._badge_count > 0)
         if collapsed:
             self._left_stretch.changeSize(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum)
         else:
@@ -202,7 +233,7 @@ class AdminSidebar(QWidget):
         root.addWidget(self._user)
 
         for key, label, icon_name in _NAV:
-            item = _NavItem(key, label, icon_name)
+            item = _NavItem(key, label, icon_name, badge=(key == "receipts"))
             item.activated.connect(self._on_nav)
             self._items[key] = item
             root.addWidget(item)
@@ -229,6 +260,11 @@ class AdminSidebar(QWidget):
     def set_active(self, key: str) -> None:
         for k, item in self._items.items():
             item.set_active(k == key)
+
+    def set_receipt_storage_badge(self, count: int) -> None:
+        item = self._items.get("receipts")
+        if item is not None:
+            item.set_badge(count)
 
     def _toggle_collapse(self) -> None:
         self._collapsed = not self._collapsed

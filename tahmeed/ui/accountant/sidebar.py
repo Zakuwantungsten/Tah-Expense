@@ -60,8 +60,8 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("master_expenses", "Master Expenses",   "mdi.table-multiple",               {}),
         ("trash",           "Trash",             "mdi.delete-outline",               {}),
         ("import_daily",    "Import Daily",      "mdi.file-upload-outline",          {}),
-        ("paperwork",       "Paperwork",         "mdi.file-cabinet",                 {}),
-        ("receipt_browse",  "Receipt storage",   "mdi.folder-open-outline",          {}),
+        ("paperwork",       "Paperwork",         "mdi.file-cabinet",                 {"badge": True}),
+        ("receipt_browse",  "Receipt storage",   "mdi.folder-open-outline",          {"badge": True}),
     ]),
     # ITEMS are loaded dynamically from the DB (accountant-managed). The header
     # is rendered statically; the rows below it are built by _load_items().
@@ -97,7 +97,7 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
         ("manage_trailers",   "Trailers",         "mdi.truck-trailer",   {}),
         ("manage_motor_vehicles", "Motorcycles & Cars", "mdi.car",        {}),
         ("manage_users",      "Users",            "mdi.account-multiple-outline", {}),
-        ("receipt_disk",      "Receipt disk",     "mdi.harddisk",        {}),
+        ("receipt_disk",      "Receipt disk",     "mdi.harddisk",        {"badge": True}),
     ]),
 ]
 
@@ -749,6 +749,14 @@ class SidebarWidget(QFrame):
     def set_day_issues_badge(self, count: int) -> None:
         if "day_issues" in self._items:
             self._items["day_issues"].set_badge(count)
+
+    def set_receipt_storage_badge(self, count: int) -> None:
+        """Red counter when the receipt disk is unavailable (0 hides)."""
+        n = max(0, int(count or 0))
+        for key in ("paperwork", "receipt_browse", "receipt_disk"):
+            item = self._items.get(key)
+            if item is not None:
+                item.set_badge(n)
 
     # ── Internal: top-level nav ────────────────────────────────────────────
 

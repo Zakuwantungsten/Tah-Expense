@@ -511,12 +511,18 @@ async def accountant_notification_counts(
         read_badges,
     )
 
-    doc = await read_badges(database(request))
+    from .receipt_storage_health import read_stored_health
+
+    db = database(request)
+    doc = await read_badges(db)
     etag = badge_etag(doc)
     headers = {"ETag": etag}
     if badge_etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=304, headers=headers)
-    return JSONResponse(notification_payload(doc), headers=headers)
+    payload = notification_payload(doc)
+    health = await read_stored_health(db)
+    payload["receipt_storage_down"] = 0 if health.get("healthy", True) else 1
+    return JSONResponse(payload, headers=headers)
 
 
 @accountant.get("/notification-counts/wait")
@@ -537,15 +543,21 @@ async def accountant_notification_counts_wait(
         wait_for_badge_change,
     )
 
+    from .receipt_storage_health import read_stored_health
+
     capped = max(1.0, min(float(timeout or 25.0), 55.0))
     raw_etag = (etag or request.headers.get("if-none-match") or "").strip()
+    db = database(request)
     doc = await wait_for_badge_change(
-        database(request),
+        db,
         etag=raw_etag or None,
         timeout=capped,
     )
     current = badge_etag(doc)
-    return JSONResponse(notification_payload(doc), headers={"ETag": current})
+    payload = notification_payload(doc)
+    health = await read_stored_health(db)
+    payload["receipt_storage_down"] = 0 if health.get("healthy", True) else 1
+    return JSONResponse(payload, headers={"ETag": current})
 
 
 @settings_api.get("")
@@ -637,6 +649,16 @@ async def list_audit_events(
         .limit(limit)
         .to_list()
     )
+    # Cap bulky details so the admin grid stays snappy over the wire.
+    for doc in docs:
+        details = doc.get("details")
+        if isinstance(details, dict) and len(details) > 24:
+            keys = list(details.keys())[:24]
+            doc["details"] = {key: details[key] for key in keys}
+            doc["details"]["_truncated"] = True
+        error = doc.get("error")
+        if isinstance(error, str) and len(error) > 500:
+            doc["error"] = error[:500]
     return json_safe(docs)
 
 

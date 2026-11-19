@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+import asyncio
+
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -17,6 +19,7 @@ from tahmeed.ui.admin.backup_tab import BackupTab
 from tahmeed.ui.admin.security_tab import SecurityTab
 from tahmeed.ui.admin.settings_tab import SettingsTab
 from tahmeed.ui.admin.sidebar import AdminSidebar
+from tahmeed.ui.widgets.table_contrast import apply_light_tables_under
 from tahmeed.ui.admin.users_tab import UsersTab
 from tahmeed.ui.widgets.circuit_geometry import wrap_circuit_page
 from tahmeed.ui.widgets.receipt_storage_panel import ReceiptStoragePanel
@@ -81,7 +84,10 @@ class AdminDashboard(QWidget):
             "border-radius:6px;padding:6px 12px;}"
             "QPushButton:hover{background:#F3F4F6;}"
             "QTableWidget{background:#FFFFFF;alternate-background-color:#F9FAFB;"
-            "gridline-color:#E5E7EB;border:1px solid #E5E7EB;}"
+            "color:#111827;gridline-color:#E5E7EB;border:1px solid #E5E7EB;"
+            "selection-background-color:#DBEAFE;selection-color:#111827;}"
+            "QTableWidget::item{color:#111827;}"
+            "QTableWidget::item:selected{background:#DBEAFE;color:#111827;}"
             "QHeaderView::section{background:#F3F4F6;color:#374151;"
             "border:none;border-bottom:1px solid #E5E7EB;padding:6px;}"
             "QCheckBox{color:#111827;}"
@@ -122,6 +128,10 @@ class AdminDashboard(QWidget):
         for key, (widget, _) in self._pages.items():
             self._stack.addWidget(widget)
 
+        # Windows dark mode leaves palette Text white while admin sheets force
+        # light row backgrounds — pin every table under the stack.
+        apply_light_tables_under(self._stack)
+
         right_lay.addWidget(self._stack, 1)
         root.addWidget(right, 1)
 
@@ -130,6 +140,25 @@ class AdminDashboard(QWidget):
 
         self._sidebar.set_active("users")
         self._on_navigate("users")
+
+        self._storage_health_timer = QTimer(self)
+        self._storage_health_timer.setInterval(30_000)
+        self._storage_health_timer.timeout.connect(
+            lambda: asyncio.ensure_future(self._refresh_storage_health())
+        )
+        self._storage_health_timer.start()
+        asyncio.ensure_future(self._refresh_storage_health())
+
+    async def _refresh_storage_health(self) -> None:
+        from tahmeed.services.receipt_storage_service import get_storage_health
+
+        try:
+            health = await get_storage_health()
+        except Exception:
+            return
+        down = 0 if health.get("healthy", True) else 1
+        if hasattr(self._sidebar, "set_receipt_storage_badge"):
+            self._sidebar.set_receipt_storage_badge(down)
 
     def _on_navigate(self, key: str) -> None:
         page = self._pages.get(key)

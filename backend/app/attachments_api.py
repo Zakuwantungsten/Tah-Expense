@@ -26,6 +26,11 @@ from .receipt_ops import (
     sync_receipt_status_after_detach,
 )
 from .receipt_storage import resolve_attachments_directory
+from .receipt_storage_health import (
+    StorageUnavailableError,
+    assert_receipt_storage_ready,
+    storage_unavailable_error_payload,
+)
 from .security import utcnow
 from .serialization import json_safe, object_id
 
@@ -168,6 +173,17 @@ async def upload_attachment(
 ) -> dict[str, Any]:
     oid = _valid_id(tx_id)
     await _require_transaction(request, oid)
+    try:
+        await assert_receipt_storage_ready(
+            request.app.state.settings, _database(request)
+        )
+    except StorageUnavailableError as exc:
+        raise ApiError(
+            503,
+            "receipt_storage_unavailable",
+            exc.message,
+            details=storage_unavailable_error_payload(exc),
+        ) from None
     filename = file.filename or "file"
     try:
         content = await file.read()

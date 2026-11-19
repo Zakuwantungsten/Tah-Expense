@@ -15,13 +15,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from tahmeed.services.api_client import api_client
 from tahmeed.services.backup_service import BackupJob, list_backup_jobs, restore_backup
+from tahmeed.ui.widgets.table_contrast import apply_light_table_contrast, light_table_item
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 
@@ -110,12 +110,14 @@ class BackupWidget(QWidget):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
         self._table.setAlternatingRowColors(True)
+        apply_light_table_contrast(self._table)
         self._table.itemSelectionChanged.connect(self._update_restore_enabled)
         root.addWidget(self._table, 1)
 
-        self._empty = QLabel("Open this page or click Refresh to load backup jobs.")
+        self._empty = QLabel("No backup jobs yet.")
         self._empty.setAlignment(Qt.AlignCenter)
         self._empty.setStyleSheet("color:#9CA3AF; font:13px 'Segoe UI';")
+        self._empty.setVisible(False)
         root.addWidget(self._empty)
         self._overlay = LoadingOverlay(self)
 
@@ -239,12 +241,15 @@ class BackupWidget(QWidget):
     def _render(self) -> None:
         self._table.setRowCount(len(self._jobs))
         for row, job in enumerate(self._jobs):
-            self._table.setItem(row, 0, QTableWidgetItem(job.filename))
-            created = job.created_at.astimezone().strftime("%d %b %Y  %H:%M:%S")
-            self._table.setItem(row, 1, QTableWidgetItem(created))
-            self._table.setItem(row, 2, QTableWidgetItem(job.status.replace("_", " ").title()))
-            self._table.setItem(row, 3, QTableWidgetItem(self._format_size(job.size)))
-            self._table.setItem(row, 4, QTableWidgetItem(job.error))
+            cells = (
+                job.filename,
+                job.created_at.astimezone().strftime("%d %b %Y  %H:%M:%S"),
+                job.status.replace("_", " ").title(),
+                self._format_size(job.size),
+                job.error,
+            )
+            for col, value in enumerate(cells):
+                self._table.setItem(row, col, light_table_item(value))
         self._empty.setVisible(not self._jobs)
         self._table.setVisible(bool(self._jobs))
         self._update_restore_enabled()
