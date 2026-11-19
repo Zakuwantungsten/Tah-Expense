@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 from tahmeed.models.transaction import Transaction
 
 # Soft-dup identity: same fields the DB check uses (truck, amount, item, description).
 SoftDupKey = Tuple[str, float, str, str]
+
+DupSourceKind = Literal["db", "table"]
+DupSourceFilter = Literal["all", "db", "table"]
+
+# Blank truck / item / description facet keys shown in the review dialog.
+NO_TRUCK_LABEL = "No truck"
+EMPTY_ITEM_LABEL = "(no item)"
+EMPTY_DESC_LABEL = "(no description)"
 
 
 @dataclass
@@ -27,6 +36,99 @@ class DuplicateReviewItem:
     date_label: str = ""
     # Cream-row badge in the dialog — "Existing" (DB) or "Same table".
     existing_label: str = "Existing"
+
+
+def dup_source_kind(item: DuplicateReviewItem) -> DupSourceKind:
+    """Classify a review pair as a DB hit or a same-table twin."""
+    if (item.existing_label or "").strip().casefold() == "same table":
+        return "table"
+    return "db"
+
+
+def truck_facet_label(truck_number: str | None) -> str:
+    text = (truck_number or "").strip()
+    return text or NO_TRUCK_LABEL
+
+
+def item_facet_label(item: str | None) -> str:
+    text = (item or "").strip()
+    if not text or text == "—":
+        return EMPTY_ITEM_LABEL
+    return text
+
+
+def description_facet_label(description: str | None) -> str:
+    text = (description or "").strip()
+    if not text or text == "—":
+        return EMPTY_DESC_LABEL
+    return text
+
+
+def group_counts(
+    items: Sequence[DuplicateReviewItem],
+) -> Dict[str, Counter]:
+    """Counters for source / truck / item / description facets."""
+    source = Counter()
+    trucks = Counter()
+    items_c = Counter()
+    descs = Counter()
+    for item in items:
+        kind = dup_source_kind(item)
+        source[kind] += 1
+        trucks[truck_facet_label(item.truck_number)] += 1
+        items_c[item_facet_label(item.item)] += 1
+        descs[description_facet_label(item.description)] += 1
+    return {
+        "source": source,
+        "truck": trucks,
+        "item": items_c,
+        "description": descs,
+    }
+
+
+def filter_duplicate_items(
+    items: Sequence[DuplicateReviewItem],
+    *,
+    source: DupSourceFilter = "all",
+    truck: str | None = None,
+    item: str | None = None,
+    description: str | None = None,
+) -> List[DuplicateReviewItem]:
+    """Filter review pairs by source kind and truck/item/description facets."""
+    out: List[DuplicateReviewItem] = []
+    for entry in items:
+        if source != "all" and dup_source_kind(entry) != source:
+            continue
+        if truck is not None and truck_facet_label(entry.truck_number) != truck:
+            continue
+        if item is not None and item_facet_label(entry.item) != item:
+            continue
+        if (
+            description is not None
+            and description_facet_label(entry.description) != description
+        ):
+            continue
+        out.append(entry)
+    return out
+
+
+def lookback_days_from_unit(value: int, unit: str) -> int:
+    """Convert dialog lookback (days|months) to API ``days`` (1–365)."""
+    n = max(1, int(value or 1))
+    u = (unit or "days").strip().casefold()
+    if u.startswith("month"):
+        return max(1, min(365, n * 30))
+    return max(1, min(365, n))
+
+
+def format_lookback_label(days: int, *, unit: str = "days", value: int | None = None) -> str:
+    """Human window label for titles — e.g. ``last 5 days`` / ``last 2 months``."""
+    u = (unit or "days").strip().casefold()
+    if u.startswith("month"):
+        n = int(value) if value is not None else max(1, (int(days) + 29) // 30)
+        return f"last {n} month" if n == 1 else f"last {n} months"
+    n = int(value) if value is not None else int(days)
+    return f"last {n} day" if n == 1 else f"last {n} days"
 
 
 def soft_dup_key(

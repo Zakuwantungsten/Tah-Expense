@@ -12,7 +12,10 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
-from tahmeed.ui.widgets.popup_styles import with_light_popups
+from tahmeed.ui.widgets.popup_styles import (
+    TRANSPARENT_LIGHT_POPUPS_SS,
+    with_light_popups,
+)
 
 
 _BG = "#F0F0F0"
@@ -220,14 +223,14 @@ class QbTxnToolbar(QFrame):
         self._btn_find_prev.clicked.connect(self.find_prev.emit)
         self._btn_find_next.clicked.connect(self.find_next.emit)
         find_wrap = QWidget()
-        find_wrap.setStyleSheet("background: transparent;")
+        find_wrap.setStyleSheet(TRANSPARENT_LIGHT_POPUPS_SS)
         fl = QHBoxLayout(find_wrap)
         fl.setContentsMargins(0, 0, 0, 0)
         fl.setSpacing(0)
         fl.addWidget(self._btn_find_prev)
         fl.addWidget(self._btn_find_next)
         find_col = QWidget()
-        find_col.setStyleSheet("background: transparent;")
+        find_col.setStyleSheet(TRANSPARENT_LIGHT_POPUPS_SS)
         fc = QHBoxLayout(find_col)
         fc.setContentsMargins(0, 0, 0, 0)
         fc.setSpacing(4)

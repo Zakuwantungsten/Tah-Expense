@@ -208,6 +208,10 @@ async def test_dup_keep_for_later_returns_true_without_sync_pending(
     async def fake_dup_bulk(candidates, *_a, **_k):
         return [[existing] for _ in candidates]
 
+    async def inline_await_ui(fn):
+        # pytest-asyncio does not pump Qt; skip QTimer.singleShot.
+        return fn()
+
     class _KeepDlg(DuplicateReviewDialog):
         def exec(self):  # noqa: A003
             self._accept_keep_for_later()
@@ -225,6 +229,10 @@ async def test_dup_keep_for_later_returns_true_without_sync_pending(
         "tahmeed.ui.cashier.excel_grid.DuplicateReviewDialog",
         _KeepDlg,
     )
+    monkeypatch.setattr(
+        "tahmeed.ui.widgets.export_runner.await_ui",
+        inline_await_ui,
+    )
 
     messages: list[str] = []
     register.transient_status.connect(messages.append)
@@ -234,10 +242,11 @@ async def test_dup_keep_for_later_returns_true_without_sync_pending(
     assert ok is True
     assert meta.get("deferred_only") is True
     assert meta.get("queued", 0) == 0
-    assert register._row_has_data(0)
-    # No sync_status — ordinary unsaved row for a later Save.
-    assert not (register._pending_row_meta.get(0) or {}).get("sync_status")
+    assert meta.get("deferred_dups") == 1
+    # Move to Skipped removes the dup from My entries.
+    assert not register._row_has_data(0)
     assert messages and "possible duplicate" in messages[0].lower()
+    assert "skipped" in messages[0].lower()
 
 
 def test_duplicate_dialog_keep_for_later_api(qapp):

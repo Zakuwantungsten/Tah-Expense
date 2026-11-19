@@ -336,6 +336,16 @@ async def _compute_master_totals(db: Any, query: dict[str, Any]) -> dict[str, fl
                             ]
                         }
                     },
+                    # Same rule as daily Simple summaries (notes_flag rows).
+                    "refund_total": {
+                        "$sum": {
+                            "$cond": [
+                                {"$eq": ["$notes_flag", True]},
+                                "$amount",
+                                0,
+                            ]
+                        }
+                    },
                 }
             },
         ],
@@ -345,8 +355,9 @@ async def _compute_master_totals(db: Any, query: dict[str, Any]) -> dict[str, fl
         return {
             "tzs": float(result[0].get("tzs_total") or 0),
             "usd": float(result[0].get("usd_total") or 0),
+            "refund": float(result[0].get("refund_total") or 0),
         }
-    return {"tzs": 0.0, "usd": 0.0}
+    return {"tzs": 0.0, "usd": 0.0, "refund": 0.0}
 
 
 async def _compute_master_month_totals(db: Any, year: int) -> dict[str, Any]:

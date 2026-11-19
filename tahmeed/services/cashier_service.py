@@ -18,6 +18,8 @@ BULK_CREATE_CHUNK = 300
 BULK_CREATE_CONCURRENCY = 3
 BULK_PATCH_CHUNK = 300
 BULK_PATCH_CONCURRENCY = 3
+BULK_DUP_CHUNK = 100
+BULK_DUP_CONCURRENCY = 4
 _BULK_CREATE_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 _BULK_DUP_TIMEOUT = httpx.Timeout(45.0, connect=5.0)
 # Back-compat alias for older imports / tests.
@@ -1424,7 +1426,7 @@ async def check_for_duplicates_bulk(
     candidates: Sequence[dict],
     days: int,
 ) -> List[List[Transaction]]:
-    """Soft-dup check for many candidates in one request.
+    """Soft-dup check for many candidates (chunked, parallel workers).
 
     Each candidate dict may include truck_number, amount, item, description,
     exclude_id. Returns a list aligned with *candidates* (empty list if no hits).
@@ -1432,44 +1434,67 @@ async def check_for_duplicates_bulk(
     if not candidates:
         return []
     results: List[List[Transaction]] = [[] for _ in candidates]
-    # Chunk to match API max_length=100.
-    for offset in range(0, len(candidates), 100):
-        chunk = list(candidates[offset : offset + 100])
-        body = {
-            "days": int(days),
-            "candidates": [
-                {
-                    "truck_number": (c.get("truck_number") or ""),
-                    "amount": float(c.get("amount") or 0.0),
-                    "item": (c.get("item") or ""),
-                    "description": (c.get("description") or ""),
-                    **(
-                        {"exclude_id": str(c["exclude_id"])}
-                        if c.get("exclude_id") is not None
-                        else {}
-                    ),
-                }
-                for c in chunk
-            ],
-        }
-        payload = await api_client.request(
-            "POST",
-            "v1/transactions/check-duplicates/bulk",
-            json=body,
-            timeout=_BULK_DUP_TIMEOUT,
-        )
-        for row in payload.get("results") or []:
-            try:
-                idx = int(row.get("index"))
-            except (TypeError, ValueError):
-                continue
-            absolute = offset + idx
-            if absolute < 0 or absolute >= len(results):
-                continue
-            results[absolute] = [
-                _tx_from_api(doc) for doc in row.get("items") or []
-            ]
+    size = max(1, min(BULK_DUP_CHUNK, 100))
+    chunks = [
+        (offset, list(candidates[offset : offset + size]))
+        for offset in range(0, len(candidates), size)
+    ]
+    if len(chunks) == 1:
+        offset, chunk = chunks[0]
+        await _check_duplicates_bulk_chunk(chunk, days, offset, results)
+        return results
+
+    sem = asyncio.Semaphore(max(1, BULK_DUP_CONCURRENCY))
+
+    async def _one(offset: int, chunk: list) -> None:
+        async with sem:
+            await _check_duplicates_bulk_chunk(chunk, days, offset, results)
+
+    await asyncio.gather(*(_one(offset, chunk) for offset, chunk in chunks))
     return results
+
+
+async def _check_duplicates_bulk_chunk(
+    chunk: list,
+    days: int,
+    offset: int,
+    results: List[List[Transaction]],
+) -> None:
+    """POST one ≤100-candidate bulk soft-dup chunk into *results* by absolute index."""
+    body = {
+        "days": int(days),
+        "candidates": [
+            {
+                "truck_number": (c.get("truck_number") or ""),
+                "amount": float(c.get("amount") or 0.0),
+                "item": (c.get("item") or ""),
+                "description": (c.get("description") or ""),
+                **(
+                    {"exclude_id": str(c["exclude_id"])}
+                    if c.get("exclude_id") is not None
+                    else {}
+                ),
+            }
+            for c in chunk
+        ],
+    }
+    payload = await api_client.request(
+        "POST",
+        "v1/transactions/check-duplicates/bulk",
+        json=body,
+        timeout=_BULK_DUP_TIMEOUT,
+    )
+    for row in payload.get("results") or []:
+        try:
+            idx = int(row.get("index"))
+        except (TypeError, ValueError):
+            continue
+        absolute = offset + idx
+        if absolute < 0 or absolute >= len(results):
+            continue
+        results[absolute] = [
+            _tx_from_api(doc) for doc in row.get("items") or []
+        ]
 
 
 _bulk_save_one_request: contextvars.ContextVar[bool] = contextvars.ContextVar(

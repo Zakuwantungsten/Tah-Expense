@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 
 import pytest
@@ -259,3 +260,72 @@ async def test_check_for_duplicates_bulk_aligns(monkeypatch):
     assert len(hits[0]) == 1
     assert hits[0][0].description == "DIESEL"
     assert hits[1] == []
+
+
+@pytest.mark.asyncio
+async def test_check_for_duplicates_bulk_parallel_chunks(monkeypatch):
+    """Chunks of 100 run concurrently and merge by absolute candidate index."""
+    from tahmeed.services import cashier_service as svc
+
+    call_sizes: list[int] = []
+    in_flight = 0
+    max_in_flight = 0
+
+    async def fake_request(method, path, **kwargs):
+        nonlocal in_flight, max_in_flight
+        assert path == "v1/transactions/check-duplicates/bulk"
+        cands = (kwargs.get("json") or {}).get("candidates") or []
+        call_sizes.append(len(cands))
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        # Mark first candidate of each chunk as a hit via absolute offset in body size.
+        results = []
+        for i, c in enumerate(cands):
+            if i == 0:
+                results.append(
+                    {
+                        "index": 0,
+                        "items": [
+                            {
+                                "_id": str(ObjectId()),
+                                "date": "2026-08-08T00:00:00",
+                                "description": c.get("description") or "HIT",
+                                "truck_number": c.get("truck_number") or "",
+                                "amount": float(c.get("amount") or 0.0),
+                                "currency": "TZS",
+                                "created_at": "2026-08-08T00:00:00",
+                            }
+                        ],
+                        "total": 1,
+                    }
+                )
+            else:
+                results.append({"index": i, "items": [], "total": 0})
+        return {"results": results, "total": len(cands)}
+
+    monkeypatch.setattr(svc.api_client, "request", fake_request)
+    monkeypatch.setattr(svc, "BULK_DUP_CONCURRENCY", 4)
+    candidates = [
+        {
+            "truck_number": f"T{i}",
+            "amount": float(i),
+            "item": "FUEL",
+            "description": f"DESC-{i}",
+        }
+        for i in range(250)
+    ]
+    hits = await svc.check_for_duplicates_bulk(candidates, days=7)
+    assert len(hits) == 250
+    assert sorted(call_sizes) == [50, 100, 100]
+    assert max_in_flight >= 2
+    # First candidate of each chunk (offsets 0, 100, 200) should hit.
+    assert len(hits[0]) == 1
+    assert hits[0][0].description == "DESC-0"
+    assert len(hits[100]) == 1
+    assert hits[100][0].description == "DESC-100"
+    assert len(hits[200]) == 1
+    assert hits[200][0].description == "DESC-200"
+    assert hits[1] == []
+    assert hits[101] == []

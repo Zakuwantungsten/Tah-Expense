@@ -16,7 +16,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tahmeed.ui.widgets.popup_styles import with_light_popups
+from tahmeed.ui.widgets.popup_styles import (
+    TRANSPARENT_LIGHT_POPUPS_SS,
+    with_light_popups,
+)
 from tahmeed.ui.widgets.qb_txn_toolbar import _font_size_icon
 
 _BG = "#F8FAFC"
@@ -191,7 +194,7 @@ class RegisterRibbonToolbar(QFrame):
         self._btn_find_prev.clicked.connect(self.find_prev.emit)
         self._btn_find_next.clicked.connect(self.find_next.emit)
         find_row = QWidget()
-        find_row.setStyleSheet("background:transparent;")
+        find_row.setStyleSheet(TRANSPARENT_LIGHT_POPUPS_SS)
         fr = QHBoxLayout(find_row)
         fr.setContentsMargins(0, 0, 0, 0)
         fr.setSpacing(0)
@@ -461,13 +464,13 @@ class RegisterRibbonToolbar(QFrame):
 
     def _group(self, caption: str, widgets: list) -> QWidget:
         wrap = QWidget()
-        wrap.setStyleSheet("background:transparent;")
+        wrap.setStyleSheet(TRANSPARENT_LIGHT_POPUPS_SS)
         vl = QVBoxLayout(wrap)
         vl.setContentsMargins(3, 0, 3, 0)
         vl.setSpacing(0)
 
         row = QWidget()
-        row.setStyleSheet("background:transparent;")
+        row.setStyleSheet(TRANSPARENT_LIGHT_POPUPS_SS)
         hl = QHBoxLayout(row)
         hl.setContentsMargins(1, 0, 1, 0)
         hl.setSpacing(1)

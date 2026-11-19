@@ -2,22 +2,28 @@
 
 Each match is shown as a compact pair: the new row on top, the existing
 expense underneath (expense/saved tint) so both can be compared at a glance.
+
+Pills filter by source (All / In system / Same table), truck, and optional
+item/description facets. Lookback days/months can request a rescan.
 """
 
 from __future__ import annotations
 
-from typing import List, Set
+from typing import Dict, List, Set
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -26,8 +32,12 @@ from PySide6.QtWidgets import (
 
 from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
+    filter_duplicate_items,
     format_amount_label,
     format_existing_date,
+    format_lookback_label,
+    group_counts,
+    lookback_days_from_unit,
 )
 
 _WHITE = "#FFFFFF"
@@ -71,6 +81,82 @@ def _cell(
     return item
 
 
+class _FilterPill(QPushButton):
+    """Compact exclusive filter pill with an optional count badge."""
+
+    def __init__(self, label: str, count: int = 0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._base_label = label
+        self._count = int(count)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(26)
+        self._refresh_text()
+        self.toggled.connect(self._apply_style)
+        self._apply_style(False)
+
+    def set_count(self, count: int) -> None:
+        self._count = int(count)
+        self._refresh_text()
+
+    def _refresh_text(self) -> None:
+        if self._count > 0:
+            shown = "999+" if self._count > 999 else str(self._count)
+            self.setText(f"{self._base_label}  {shown}")
+        else:
+            self.setText(self._base_label)
+
+    def _apply_style(self, checked: bool = False) -> None:
+        checked = self.isChecked()
+        if checked:
+            self.setStyleSheet(
+                f"QPushButton{{background:{_BLUE};color:#FFF;border:1px solid {_BLUE};"
+                "border-radius:13px;padding:2px 12px;font-size:11px;font-weight:600;"
+                "font-family:'Segoe UI',sans-serif;}"
+            )
+        else:
+            self.setStyleSheet(
+                f"QPushButton{{background:{_WHITE};color:{_T1};border:1px solid {_BORDER};"
+                "border-radius:13px;padding:2px 12px;font-size:11px;font-weight:600;"
+                "font-family:'Segoe UI',sans-serif;}"
+                f"QPushButton:hover{{background:{_BG};}}"
+            )
+
+
+class _ContextChip(QPushButton):
+    """Toggleable item/description chip with count."""
+
+    def __init__(self, kind: str, label: str, count: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.kind = kind
+        self.facet_value = label
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(22)
+        shown = "999+" if count > 999 else str(count)
+        # Truncate long labels for the chip row.
+        display = label if len(label) <= 28 else label[:27] + "…"
+        self.setText(f"{display} ({shown})")
+        self.setToolTip(f"{kind.title()}: {label} ({count})")
+        self.toggled.connect(self._apply_style)
+        self._apply_style()
+
+    def _apply_style(self, *_args) -> None:
+        if self.isChecked():
+            self.setStyleSheet(
+                f"QPushButton{{background:#E8F1FA;color:{_BLUE};border:1px solid {_BLUE};"
+                "border-radius:3px;padding:1px 8px;font-size:10px;font-weight:600;"
+                "font-family:'Segoe UI',sans-serif;}"
+            )
+        else:
+            self.setStyleSheet(
+                f"QPushButton{{background:{_BG};color:{_T2};border:1px solid {_BORDER};"
+                "border-radius:3px;padding:1px 8px;font-size:10px;"
+                "font-family:'Segoe UI',sans-serif;}"
+                f"QPushButton:hover{{color:{_T1};border-color:#D1D5DB;}}"
+            )
+
+
 class DuplicateReviewDialog(QDialog):
     """Review possible duplicates — new row + matching existing expense."""
 
@@ -81,22 +167,57 @@ class DuplicateReviewDialog(QDialog):
         dup_days: int,
         parent: QWidget | None = None,
         pending_total: int | None = None,
+        initial_checked: Set[int] | None = None,
+        lookback_value: int | None = None,
+        lookback_unit: str = "days",
+        allow_rescan: bool = True,
     ) -> None:
         super().__init__(parent)
         self._items = list(items)
-        self._dup_days = max(1, int(dup_days))
+        self._dup_days = max(1, min(365, int(dup_days)))
+        self._lookback_unit = (
+            "months"
+            if (lookback_unit or "days").strip().casefold().startswith("month")
+            else "days"
+        )
+        if lookback_value is not None:
+            self._lookback_value = max(1, int(lookback_value))
+        elif self._lookback_unit == "months":
+            self._lookback_value = max(1, (self._dup_days + 29) // 30)
+        else:
+            self._lookback_value = self._dup_days
         self._pending_total = (
             int(pending_total)
             if pending_total is not None
             else len(self._items)
         )
+        self._allow_rescan = bool(allow_rescan)
         self._save_anyway_rows: Set[int] = set()
         self._keep_for_later = False
+        self._requested_rescan_days: int | None = None
+        self._checked_by_row: Dict[int, bool] = {
+            item.row: False for item in self._items
+        }
+        if initial_checked:
+            for row in initial_checked:
+                if row in self._checked_by_row:
+                    self._checked_by_row[row] = True
+
+        self._source_filter: str = "all"
+        self._truck_filter: str | None = None
+        self._item_filter: str | None = None
+        self._desc_filter: str | None = None
+        self._visible_items: List[DuplicateReviewItem] = []
+        self._checks: list[QCheckBox] = []
+        self._source_pills: Dict[str, _FilterPill] = {}
+        self._truck_pills: Dict[str, _FilterPill] = {}
+
         self.setWindowTitle("Possible duplicates")
-        self.setMinimumSize(740, 300)
-        self.resize(820, 360)
+        self.setMinimumSize(780, 420)
+        self.resize(900, 480)
         self.setStyleSheet(f"background:{_WHITE}; color:{_T1};")
         self._build()
+        self._rebuild_filters_and_table()
 
     def save_anyway_rows(self) -> Set[int]:
         return set(self._save_anyway_rows)
@@ -110,64 +231,127 @@ class DuplicateReviewDialog(QDialog):
         """True when the cashier chose Keep for later (defer all dups)."""
         return bool(self._keep_for_later)
 
+    def requested_rescan_days(self) -> int | None:
+        """When set, parent should re-scan with this day window and re-open."""
+        return self._requested_rescan_days
+
+    def checked_rows_snapshot(self) -> Set[int]:
+        """Rows currently ticked Save — used to preserve state across rescan."""
+        self._sync_visible_checks_into_map()
+        return {row for row, on in self._checked_by_row.items() if on}
+
+    def lookback_unit(self) -> str:
+        return self._lookback_unit
+
+    def lookback_value(self) -> int:
+        return int(self._lookback_value)
+
     def _looks_like_reimport(self) -> bool:
         n = len(self._items)
         if n < 2:
             return False
         return n >= max(2, int(self._pending_total * 0.8))
 
+    def _window_label(self) -> str:
+        return format_lookback_label(
+            self._dup_days,
+            unit=self._lookback_unit,
+            value=self._lookback_value,
+        )
+
     def _build(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
 
-        n = len(self._items)
-        window = (
-            f"last {self._dup_days} day"
-            if self._dup_days == 1
-            else f"last {self._dup_days} days"
+        self._title = QLabel()
+        self._title.setStyleSheet(
+            f"font-size:14px;font-weight:700;color:{_T1};"
+            "font-family:'Segoe UI',sans-serif;"
         )
-        reimport = self._looks_like_reimport()
-        if reimport:
-            title = QLabel(
-                f"Looks like a reimport — {n} of {self._pending_total} new "
-                f"row{'s' if self._pending_total != 1 else ''} already exist "
-                f"({window})"
-            )
-            title.setStyleSheet(
-                f"font-size:14px;font-weight:700;color:{_AMBER};"
-                "font-family:'Segoe UI',sans-serif;"
-            )
-        else:
-            title = QLabel(
-                f"{n} possible duplicate{'s' if n != 1 else ''} · checked {window}"
-            )
-            title.setStyleSheet(
-                f"font-size:14px;font-weight:700;color:{_T1};"
-                "font-family:'Segoe UI',sans-serif;"
-            )
-        root.addWidget(title)
+        root.addWidget(self._title)
 
-        if reimport:
-            subtitle = QLabel(
-                "Most of these rows already match expenses in the system — "
-                "often from re-importing the same Excel file. Prefer "
-                "Move to Skipped unless you are sure each new row is a separate "
-                "expense. Each pair shows the new row (red) above the existing "
-                "expense (cream)."
-            )
-        else:
-            subtitle = QLabel(
-                "Each pair shows the new row (red) above the existing expense (cream). "
-                "Tick Save to keep the new row anyway — it will be flagged for "
-                "Verify → Issues. Unchecked pairs (or Move to Skipped) go to the "
-                "Skipped tab for Revive or Discard."
-            )
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet(
+        self._subtitle = QLabel()
+        self._subtitle.setWordWrap(True)
+        self._subtitle.setStyleSheet(
             f"font-size:11px;color:{_T2};font-family:'Segoe UI',sans-serif;"
         )
-        root.addWidget(subtitle)
+        root.addWidget(self._subtitle)
+        self._refresh_title_copy()
+
+        # Lookback controls
+        look_row = QHBoxLayout()
+        look_row.setSpacing(6)
+        look_lbl = QLabel("Lookback")
+        look_lbl.setStyleSheet(
+            f"font-size:11px;font-weight:600;color:{_T2};"
+            "font-family:'Segoe UI',sans-serif;"
+        )
+        look_row.addWidget(look_lbl)
+        self._lookback_spin = QSpinBox()
+        self._lookback_spin.setRange(1, 365)
+        self._lookback_spin.setValue(self._lookback_value)
+        self._lookback_spin.setFixedWidth(64)
+        self._lookback_spin.setFixedHeight(26)
+        self._lookback_spin.setStyleSheet(
+            f"QSpinBox{{border:1px solid {_BORDER};border-radius:3px;padding:2px 4px;"
+            "font-size:11px;font-family:'Segoe UI';}"
+        )
+        look_row.addWidget(self._lookback_spin)
+        self._lookback_unit_combo = QComboBox()
+        self._lookback_unit_combo.addItem("Days", "days")
+        self._lookback_unit_combo.addItem("Months", "months")
+        self._lookback_unit_combo.setCurrentIndex(
+            1 if self._lookback_unit == "months" else 0
+        )
+        self._lookback_unit_combo.setFixedHeight(26)
+        self._lookback_unit_combo.setStyleSheet(
+            f"QComboBox{{border:1px solid {_BORDER};border-radius:3px;padding:2px 8px;"
+            "font-size:11px;font-family:'Segoe UI';min-width:84px;}"
+        )
+        look_row.addWidget(self._lookback_unit_combo)
+        self._rescan_btn = QPushButton("Rescan")
+        self._rescan_btn.setCursor(Qt.PointingHandCursor)
+        self._rescan_btn.setFixedHeight(26)
+        self._rescan_btn.setEnabled(self._allow_rescan)
+        self._rescan_btn.setToolTip(
+            "Re-check duplicates with this lookback window"
+            if self._allow_rescan
+            else "Rescan not available for this entry"
+        )
+        self._rescan_btn.setStyleSheet(
+            f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:3px;"
+            "padding:2px 12px;font-size:11px;font-weight:600;font-family:'Segoe UI';}"
+            "QPushButton:hover{background:#005EA3;}"
+            "QPushButton:disabled{background:#93C5E8;color:#EEF6FC;}"
+        )
+        self._rescan_btn.clicked.connect(self._request_rescan)
+        look_row.addWidget(self._rescan_btn)
+        look_row.addStretch()
+        tip = QLabel("Same truck/service on different days can be legitimate.")
+        tip.setStyleSheet(
+            f"font-size:11px;color:{_AMBER};font-family:'Segoe UI',sans-serif;"
+        )
+        look_row.addWidget(tip)
+        root.addLayout(look_row)
+
+        # Source pills
+        self._source_row = QHBoxLayout()
+        self._source_row.setSpacing(6)
+        root.addLayout(self._source_row)
+
+        # Truck pills
+        self._truck_row = QHBoxLayout()
+        self._truck_row.setSpacing(6)
+        root.addLayout(self._truck_row)
+
+        # Context chips (item / description)
+        self._context_frame = QFrame()
+        self._context_frame.setStyleSheet("QFrame{background:transparent;border:none;}")
+        self._context_layout = QVBoxLayout(self._context_frame)
+        self._context_layout.setContentsMargins(0, 0, 0, 0)
+        self._context_layout.setSpacing(4)
+        root.addWidget(self._context_frame)
 
         toggle_row = QHBoxLayout()
         toggle_row.setSpacing(6)
@@ -181,20 +365,19 @@ class DuplicateReviewDialog(QDialog):
                 "border-radius:3px;padding:2px 10px;font-size:11px;font-family:'Segoe UI';}"
                 f"QPushButton:hover{{background:{_BG};}}"
             )
-        self._select_all.clicked.connect(self._check_all)
-        self._select_none.clicked.connect(self._uncheck_all)
+        self._select_all.clicked.connect(self._check_all_visible)
+        self._select_none.clicked.connect(self._uncheck_all_visible)
         toggle_row.addWidget(self._select_all)
         toggle_row.addWidget(self._select_none)
         toggle_row.addStretch()
-        tip = QLabel("Same truck/service on different days can be legitimate.")
-        tip.setStyleSheet(
-            f"font-size:11px;color:{_AMBER};font-family:'Segoe UI',sans-serif;"
+        self._filter_hint = QLabel("")
+        self._filter_hint.setStyleSheet(
+            f"font-size:11px;color:{_T2};font-family:'Segoe UI',sans-serif;"
         )
-        toggle_row.addWidget(tip)
+        toggle_row.addWidget(self._filter_hint)
         root.addLayout(toggle_row)
 
-        table_rows = len(self._items) * 2
-        self._table = QTableWidget(table_rows, len(_HEADERS))
+        self._table = QTableWidget(0, len(_HEADERS))
         self._table.setHorizontalHeaderLabels(list(_HEADERS))
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -217,16 +400,6 @@ class DuplicateReviewDialog(QDialog):
         hdr.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(6, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-
-        self._checks: list[QCheckBox] = []
-        for i, item in enumerate(self._items):
-            new_r = i * 2
-            old_r = new_r + 1
-            self._fill_new_row(new_r, item)
-            self._fill_existing_row(old_r, item)
-            self._table.setRowHeight(new_r, _ROW_H)
-            self._table.setRowHeight(old_r, _ROW_H)
-
         root.addWidget(self._table, 1)
 
         buttons = QDialogButtonBox()
@@ -263,6 +436,223 @@ class DuplicateReviewDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         root.addWidget(buttons)
 
+    def _refresh_title_copy(self) -> None:
+        n = len(self._items)
+        window = self._window_label()
+        reimport = self._looks_like_reimport()
+        if reimport:
+            self._title.setText(
+                f"Looks like a reimport — {n} of {self._pending_total} new "
+                f"row{'s' if self._pending_total != 1 else ''} already exist "
+                f"({window})"
+            )
+            self._title.setStyleSheet(
+                f"font-size:14px;font-weight:700;color:{_AMBER};"
+                "font-family:'Segoe UI',sans-serif;"
+            )
+            self._subtitle.setText(
+                "Most of these rows already match expenses in the system — "
+                "often from re-importing the same Excel file. Prefer "
+                "Move to Skipped unless you are sure each new row is a separate "
+                "expense. Use pills to focus by truck, item, or description. "
+                "Each pair shows the new row (red) above the existing expense (cream)."
+            )
+        else:
+            self._title.setText(
+                f"{n} possible duplicate{'s' if n != 1 else ''} · checked {window}"
+            )
+            self._title.setStyleSheet(
+                f"font-size:14px;font-weight:700;color:{_T1};"
+                "font-family:'Segoe UI',sans-serif;"
+            )
+            self._subtitle.setText(
+                "Each pair shows the new row (red) above the existing expense (cream). "
+                "Filter by source, truck, item, or description. Tick Save to keep the "
+                "new row anyway — it will be flagged for Verify → Issues. Unchecked "
+                "pairs (or Move to Skipped) go to the Skipped tab."
+            )
+
+    def _clear_layout(self, layout: QHBoxLayout | QVBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+            child = item.layout()
+            if child is not None:
+                self._clear_layout(child)
+
+    def _rebuild_filters_and_table(self) -> None:
+        self._sync_visible_checks_into_map()
+        self._rebuild_source_pills()
+        self._rebuild_truck_pills()
+        self._rebuild_context_chips()
+        self._refill_table()
+
+    def _source_base_items(self) -> List[DuplicateReviewItem]:
+        return filter_duplicate_items(self._items, source=self._source_filter)  # type: ignore[arg-type]
+
+    def _rebuild_source_pills(self) -> None:
+        self._clear_layout(self._source_row)
+        self._source_pills.clear()
+        counts = group_counts(self._items)["source"]
+        n_all = len(self._items)
+        n_db = int(counts.get("db", 0))
+        n_table = int(counts.get("table", 0))
+        specs = (
+            ("all", "All", n_all),
+            ("db", "In system", n_db),
+            ("table", "Same table", n_table),
+        )
+        for key, label, count in specs:
+            pill = _FilterPill(label, count)
+            pill.setChecked(self._source_filter == key)
+            pill.clicked.connect(
+                lambda checked=False, k=key: self._on_source_pill(k)
+            )
+            self._source_pills[key] = pill
+            self._source_row.addWidget(pill)
+        self._source_row.addStretch()
+
+    def _rebuild_truck_pills(self) -> None:
+        self._clear_layout(self._truck_row)
+        self._truck_pills.clear()
+        base = self._source_base_items()
+        trucks = group_counts(base)["truck"]
+        if not trucks:
+            self._truck_filter = None
+            return
+        # Reset truck filter if it vanished under the new source filter.
+        if self._truck_filter is not None and self._truck_filter not in trucks:
+            self._truck_filter = None
+
+        all_truck = _FilterPill("All trucks", len(base))
+        all_truck.setChecked(self._truck_filter is None)
+        all_truck.clicked.connect(lambda: self._on_truck_pill(None))
+        self._truck_pills[""] = all_truck
+        self._truck_row.addWidget(all_truck)
+
+        for label, count in sorted(trucks.items(), key=lambda kv: (-kv[1], kv[0].casefold())):
+            pill = _FilterPill(label, int(count))
+            pill.setChecked(self._truck_filter == label)
+            pill.clicked.connect(
+                lambda checked=False, lab=label: self._on_truck_pill(lab)
+            )
+            self._truck_pills[label] = pill
+            self._truck_row.addWidget(pill)
+        self._truck_row.addStretch()
+
+    def _rebuild_context_chips(self) -> None:
+        self._clear_layout(self._context_layout)
+        base = filter_duplicate_items(
+            self._items,
+            source=self._source_filter,  # type: ignore[arg-type]
+            truck=self._truck_filter,
+        )
+        counts = group_counts(base)
+        items_c = counts["item"]
+        descs_c = counts["description"]
+
+        # Drop facet filters that no longer exist under truck/source.
+        if self._item_filter is not None and self._item_filter not in items_c:
+            self._item_filter = None
+        if self._desc_filter is not None and self._desc_filter not in descs_c:
+            self._desc_filter = None
+
+        if not base:
+            self._context_frame.hide()
+            return
+
+        def _add_chip_row(title: str, kind: str, counter) -> None:
+            if not counter:
+                return
+            row = QHBoxLayout()
+            row.setSpacing(4)
+            lbl = QLabel(title)
+            lbl.setStyleSheet(
+                f"font-size:10px;font-weight:600;color:{_T2};"
+                "font-family:'Segoe UI',sans-serif;"
+            )
+            row.addWidget(lbl)
+            active = self._item_filter if kind == "item" else self._desc_filter
+            for label, count in sorted(
+                counter.items(), key=lambda kv: (-kv[1], kv[0].casefold())
+            )[:12]:
+                chip = _ContextChip(kind, label, int(count))
+                chip.setChecked(active == label)
+                chip.clicked.connect(
+                    lambda checked=False, k=kind, lab=label: self._on_context_chip(k, lab)
+                )
+                row.addWidget(chip)
+            row.addStretch()
+            self._context_layout.addLayout(row)
+
+        _add_chip_row("Items", "item", items_c)
+        _add_chip_row("Descriptions", "description", descs_c)
+        self._context_frame.setVisible(self._context_layout.count() > 0)
+
+    def _filtered_items(self) -> List[DuplicateReviewItem]:
+        return filter_duplicate_items(
+            self._items,
+            source=self._source_filter,  # type: ignore[arg-type]
+            truck=self._truck_filter,
+            item=self._item_filter,
+            description=self._desc_filter,
+        )
+
+    def _refill_table(self) -> None:
+        self._visible_items = self._filtered_items()
+        n_vis = len(self._visible_items)
+        n_all = len(self._items)
+        if n_vis == n_all:
+            self._filter_hint.setText(f"Showing all {n_all}")
+        else:
+            self._filter_hint.setText(f"Showing {n_vis} of {n_all}")
+
+        self._table.setRowCount(n_vis * 2)
+        self._checks = []
+        for i, item in enumerate(self._visible_items):
+            new_r = i * 2
+            old_r = new_r + 1
+            self._fill_new_row(new_r, item)
+            self._fill_existing_row(old_r, item)
+            self._table.setRowHeight(new_r, _ROW_H)
+            self._table.setRowHeight(old_r, _ROW_H)
+
+    def _on_source_pill(self, key: str) -> None:
+        if key == self._source_filter:
+            # Keep exclusive — re-check the active pill.
+            pill = self._source_pills.get(key)
+            if pill is not None:
+                pill.setChecked(True)
+            return
+        self._source_filter = key
+        self._truck_filter = None
+        self._item_filter = None
+        self._desc_filter = None
+        self._rebuild_filters_and_table()
+
+    def _on_truck_pill(self, label: str | None) -> None:
+        if label == self._truck_filter or (
+            label is None and self._truck_filter is None
+        ):
+            pill_key = "" if label is None else label
+            pill = self._truck_pills.get(pill_key)
+            if pill is not None:
+                pill.setChecked(True)
+            return
+        self._truck_filter = label
+        self._item_filter = None
+        self._desc_filter = None
+        self._rebuild_filters_and_table()
+
+    def _on_context_chip(self, kind: str, label: str) -> None:
+        if kind == "item":
+            self._item_filter = None if self._item_filter == label else label
+        else:
+            self._desc_filter = None if self._desc_filter == label else label
+        self._rebuild_filters_and_table()
+
     def _fill_new_row(self, r: int, item: DuplicateReviewItem) -> None:
         wrap = QWidget()
         wrap.setStyleSheet(f"background:{_NEW_BG};")
@@ -271,6 +661,12 @@ class DuplicateReviewDialog(QDialog):
         lay.setAlignment(Qt.AlignCenter)
         cb = QCheckBox()
         cb.setToolTip("Save this new row anyway and flag as possible duplicate")
+        cb.setChecked(bool(self._checked_by_row.get(item.row, False)))
+        cb.stateChanged.connect(
+            lambda state, row=item.row: self._checked_by_row.__setitem__(
+                row, int(state) == int(Qt.CheckState.Checked)
+            )
+        )
         lay.addWidget(cb)
         self._checks.append(cb)
         self._table.setCellWidget(r, 0, wrap)
@@ -317,28 +713,53 @@ class DuplicateReviewDialog(QDialog):
         self._table.setItem(r, 6, _cell(format_amount_label(ex), bg=bg))
         self._table.setItem(r, 7, _cell(ex.item or "—", bg=bg))
 
-    def _checked_rows(self) -> Set[int]:
-        rows: Set[int] = set()
-        for cb, item in zip(self._checks, self._items):
-            if cb.isChecked():
-                rows.add(item.row)
-        return rows
+    def _sync_visible_checks_into_map(self) -> None:
+        for cb, item in zip(self._checks, self._visible_items):
+            self._checked_by_row[item.row] = cb.isChecked()
 
-    def _check_all(self) -> None:
+    def _check_all_visible(self) -> None:
         for cb in self._checks:
             cb.setChecked(True)
+        for item in self._visible_items:
+            self._checked_by_row[item.row] = True
 
-    def _uncheck_all(self) -> None:
+    def _uncheck_all_visible(self) -> None:
         for cb in self._checks:
             cb.setChecked(False)
+        for item in self._visible_items:
+            self._checked_by_row[item.row] = False
+
+    def _effective_rescan_days(self) -> int:
+        value = int(self._lookback_spin.value())
+        unit = str(self._lookback_unit_combo.currentData() or "days")
+        return lookback_days_from_unit(value, unit)
+
+    def _request_rescan(self) -> None:
+        if not self._allow_rescan:
+            return
+        self._sync_visible_checks_into_map()
+        self._lookback_value = int(self._lookback_spin.value())
+        self._lookback_unit = str(
+            self._lookback_unit_combo.currentData() or "days"
+        )
+        self._requested_rescan_days = self._effective_rescan_days()
+        self._keep_for_later = False
+        self._save_anyway_rows = set()
+        self.accept()
 
     def _accept_checked(self) -> None:
+        self._sync_visible_checks_into_map()
+        self._requested_rescan_days = None
         self._keep_for_later = False
-        self._save_anyway_rows = self._checked_rows()
+        self._save_anyway_rows = {
+            row for row, on in self._checked_by_row.items() if on
+        }
         self.accept()
 
     def _accept_keep_for_later(self) -> None:
         """Defer all duplicate rows — leave them on the table for a later Save."""
+        self._sync_visible_checks_into_map()
+        self._requested_rescan_days = None
         self._keep_for_later = True
         self._save_anyway_rows = set()
         self.accept()
@@ -346,3 +767,10 @@ class DuplicateReviewDialog(QDialog):
     # Back-compat alias for older callers / tests.
     def _accept_skip_all(self) -> None:
         self._accept_keep_for_later()
+
+    # Back-compat for tests that poked private check helpers.
+    def _check_all(self) -> None:
+        self._check_all_visible()
+
+    def _uncheck_all(self) -> None:
+        self._uncheck_all_visible()

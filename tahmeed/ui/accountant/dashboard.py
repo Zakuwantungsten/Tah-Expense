@@ -647,6 +647,8 @@ class AccountantDashboard(QWidget):
                 lambda _: asyncio.ensure_future(self._refresh_drafts_badge())
             )
             self._register.drafts_submitted.connect(self._note_submitted_drafts)
+            self._register.verify_queue_bumped.connect(self._note_verify_queue_bump)
+            self._register.trash_changed.connect(self._on_register_trash_changed)
             self._register.drafts_changed.connect(self._on_register_drafts_changed)
             self._register.rows_saved.connect(lambda _: self._refresh_saved_page())
             self._register.drafts_changed.connect(self._refresh_saved_page)
@@ -796,11 +798,24 @@ class AccountantDashboard(QWidget):
         # Optimistic Verify bump so the sidebar moves even if /wait is down.
         # Submit runs inside pause_background_polls; a force GET can briefly
         # still see the pre-submit counter — don't let that wipe this bump.
-        if n > 0 and hasattr(self._sidebar, "set_verify_badge"):
-            verify = self._sidebar.verify_badge() if hasattr(self._sidebar, "verify_badge") else 0
-            self._sidebar.set_verify_badge(verify + n)
-            self._protect_verify_badge_until = time.monotonic() + 8.0
-        # After the submit pause resumes (~next tick), pull stored counters.
+        if n > 0:
+            self._note_verify_queue_bump(n)
+        else:
+            QTimer.singleShot(200, self._kick_notification_refresh)
+
+    def _note_verify_queue_bump(self, updated: int) -> None:
+        """Deletion request / pending-edit / submit — light Verify without waiting on poll."""
+        n = int(updated or 0)
+        if n <= 0 or not hasattr(self._sidebar, "set_verify_badge"):
+            return
+        verify = self._sidebar.verify_badge() if hasattr(self._sidebar, "verify_badge") else 0
+        self._sidebar.set_verify_badge(verify + n)
+        self._protect_verify_badge_until = time.monotonic() + 8.0
+        # After pause resumes (~next tick), pull stored counters (Deleted/Edited too).
+        QTimer.singleShot(200, self._kick_notification_refresh)
+
+    def _on_register_trash_changed(self) -> None:
+        """Delete finished — force badge pull even when Verify was not bumped."""
         QTimer.singleShot(200, self._kick_notification_refresh)
 
     def _on_register_drafts_changed(self) -> None:

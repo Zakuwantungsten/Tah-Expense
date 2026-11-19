@@ -144,7 +144,17 @@ class FakeTransactions:
                         for d in docs
                         if str(d.get("currency") or "").upper() == "USD"
                     )
-                    docs = [{"_id": None, "tzs_total": tzs, "usd_total": usd}]
+                    refund = sum(
+                        float(d.get("amount") or 0)
+                        for d in docs
+                        if d.get("notes_flag") is True
+                    )
+                    docs = [{
+                        "_id": None,
+                        "tzs_total": tzs,
+                        "usd_total": usd,
+                        "refund_total": refund,
+                    }]
                 elif isinstance(group.get("_id"), dict) and "$month" in str(
                     group.get("_id")
                 ):
@@ -295,6 +305,14 @@ def test_master_list_count_totals_and_meta() -> None:
             currency="USD",
             category_name="Lube",
         ),
+        _verified(
+            date=datetime(2026, 3, 15),
+            description="Mileage refund",
+            amount=-700.0,
+            currency="TZS",
+            notes_flag=True,
+            category_name="Mileage",
+        ),
         _verified(verified=False, description="Unverified out"),
         _verified(
             date=datetime(2025, 6, 1),
@@ -325,27 +343,30 @@ def test_master_list_count_totals_and_meta() -> None:
         )
 
     assert listed.status_code == 200
-    assert listed.json()["total"] == 2
+    assert listed.json()["total"] == 3
     assert "cashier_names" in listed.json()
-    assert count.json()["count"] == 2
-    assert totals.json()["tzs"] == 100.0
+    assert count.json()["count"] == 3
+    assert totals.json()["tzs"] == -600.0  # 100 + (-700 refund)
     assert totals.json()["usd"] == 50.0
+    assert totals.json()["refund"] == -700.0
     assert trucks.json()["items"] == ["T100 AAA", "T101 BBB"]
     assert "Fuel" in cats.json()["items"]
     assert 2026 in years.json()["items"]
     assert "3" in months.json()["months"]
-    assert months.json()["months"]["3"]["tzs"] == 100.0
+    assert months.json()["months"]["3"]["tzs"] == -600.0
     assert boot.status_code == 200
     body = boot.json()
-    assert body["totals"]["tzs"] == 100.0
+    assert body["totals"]["tzs"] == -600.0
     assert body["totals"]["usd"] == 50.0
+    assert body["totals"]["refund"] == -700.0
     assert body["trucks"] == ["T100 AAA", "T101 BBB"]
     assert "Fuel" in body["categories"]
     assert "3" in body["month_totals"]
-    assert body["month_totals"]["3"]["tzs"] == 100.0
+    assert body["month_totals"]["3"]["tzs"] == -600.0
     assert totals_only.status_code == 200
     slim = totals_only.json()
-    assert slim["totals"]["tzs"] == 100.0
+    assert slim["totals"]["tzs"] == -600.0
+    assert slim["totals"]["refund"] == -700.0
     assert slim["month_totals"] is None
     assert slim["trucks"] is None
     assert slim["categories"] is None

@@ -137,17 +137,36 @@ def _style_dialog_surface(widget: _T) -> _T:
 
 
 class _DialogContrastFilter(QObject):
-    """Apply contrast styling when standard dialogs are shown."""
+    """Apply contrast styling when standard dialogs / tooltips are shown."""
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        if event.type() == QEvent.Type.Show and isinstance(watched, _CONTRAST_DIALOG_TYPES):
+        et = event.type()
+        if et == QEvent.Type.Show and isinstance(watched, _CONTRAST_DIALOG_TYPES):
             _style_dialog_surface(watched)
+        # Windows dark mode paints tip labels black while ribbon text stays dark.
+        # Style the floating tip widget itself on every show/polish.
+        if et in (
+            QEvent.Type.Show,
+            QEvent.Type.ShowToParent,
+            QEvent.Type.Polish,
+            QEvent.Type.PaletteChange,
+        ) and isinstance(watched, QWidget):
+            from tahmeed.ui.widgets.popup_styles import style_tooltip_widget
+
+            style_tooltip_widget(watched)
         return False
 
 
 def apply_readable_dialog_styles(app: QApplication) -> None:
     """Append contrast rules so confirm / input / progress dialogs stay readable."""
-    from tahmeed.ui.widgets.popup_styles import LIGHT_POPUP_SS
+    from tahmeed.ui.widgets.popup_styles import (
+        LIGHT_POPUP_SS,
+        apply_light_tooltip_palette,
+    )
+
+    # Palette beats native Windows dark tooltips when stylesheets are diluted
+    # by child ``background: transparent`` chrome on ribbons / toolbars.
+    apply_light_tooltip_palette(app)
 
     existing = app.styleSheet() or ""
     parts: list[str] = []
@@ -160,7 +179,6 @@ def apply_readable_dialog_styles(app: QApplication) -> None:
     if not parts:
         return
     app.setStyleSheet(existing + "\n" + "\n".join(parts))
-
 
 def _is_ok_only(buttons: QMessageBox.StandardButton) -> bool:
     ok = QMessageBox.StandardButton.Ok

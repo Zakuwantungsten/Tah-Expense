@@ -1077,6 +1077,8 @@ class DailyRegister(QWidget):
     column_filters_state_changed = Signal(bool)
     # Soft-trash / deletion-request changed — refresh Cashier Trash badge
     trash_changed = Signal()
+    # Verified delete / pending-edit → Verify inbox (+N for optimistic sidebar)
+    verify_queue_bumped = Signal(int)
     # Brief non-blocking status (e.g. after Save) — action bar flash pill
     transient_status = Signal(str)
 
@@ -1722,6 +1724,56 @@ class DailyRegister(QWidget):
     # ------------------------------------------------------------------
     # Load data
     # ------------------------------------------------------------------
+
+    async def _scan_soft_duplicates(
+        self,
+        draft_inserts: list[tuple[int, Transaction]],
+        days: int,
+    ) -> list[DuplicateReviewItem]:
+        """DB bulk soft-dup + within-table twins for the given draft inserts."""
+        if not draft_inserts:
+            return []
+        dup_hits: list = [[] for _ in draft_inserts]
+        try:
+            dup_hits = await check_for_duplicates_bulk(
+                [
+                    {
+                        "truck_number": tx.truck_number or "",
+                        "amount": tx.amount,
+                        "item": tx.item or "",
+                        "description": tx.description or "",
+                    }
+                    for _row, tx in draft_inserts
+                ],
+                int(days),
+            )
+        except Exception:
+            dup_hits = [[] for _ in draft_inserts]
+
+        items: list[DuplicateReviewItem] = []
+        for i, (row, tx) in enumerate(draft_inserts):
+            dupes = dup_hits[i] if i < len(dup_hits) else []
+            if dupes:
+                items.append(
+                    DuplicateReviewItem(
+                        row=row,
+                        row_display=row + 1,
+                        description=tx.description or "—",
+                        truck_number=tx.truck_number or "",
+                        item=tx.item or "",
+                        amount=tx.amount,
+                        amount_label=format_amount_label(tx),
+                        existing=dupes[0],
+                        date_label=format_new_date(tx.date),
+                    )
+                )
+        items.extend(
+            within_table_duplicate_items(
+                draft_inserts,
+                already_flagged_rows={item.row for item in items},
+            )
+        )
+        return items
 
     def _show_register_loading(
         self,
@@ -7033,72 +7085,83 @@ class DailyRegister(QWidget):
     async def _do_delete_saved_many(self, tx_ids: list) -> None:
         if not tx_ids:
             return
-        try:
-            cashier_id = getattr(self._user, "_id", None)
-            requested = 0
-            trashed = 0
-            deleted = 0
-            missing = 0
-            forbidden = 0
-            for tx_id in tx_ids:
-                result = await request_or_delete_transaction(tx_id, cashier_id)
-                if result == "not_found":
-                    missing += 1
-                elif result == "forbidden":
-                    forbidden += 1
-                elif result == "deletion_requested":
-                    requested += 1
-                elif result in ("trashed", "already_trashed"):
-                    trashed += 1
-                elif result == "deleted":
-                    deleted += 1
-            if forbidden and not (requested or trashed or deleted):
-                QMessageBox.warning(
-                    self, "Delete",
-                    "You can only delete your own register entries.",
-                )
-            elif missing and not (requested or trashed or deleted or forbidden):
-                QMessageBox.warning(
-                    self, "Not Found",
-                    "Those entries were already removed.",
-                )
-            elif requested or trashed or deleted:
-                parts = []
-                if trashed:
-                    parts.append(
-                        f"{trashed} expense(s) moved to your Trash.\n"
-                        "Open Trash to restore or delete them permanently."
+        from tahmeed.ui.async_utils import pause_background_polls
+
+        # Pause polls around delete confirmations (same discipline as Submit).
+        with pause_background_polls(self):
+            try:
+                cashier_id = getattr(self._user, "_id", None)
+                requested = 0
+                trashed = 0
+                deleted = 0
+                missing = 0
+                forbidden = 0
+                for tx_id in tx_ids:
+                    result = await request_or_delete_transaction(tx_id, cashier_id)
+                    if result == "not_found":
+                        missing += 1
+                    elif result == "forbidden":
+                        forbidden += 1
+                    elif result == "deletion_requested":
+                        requested += 1
+                    elif result in ("trashed", "already_trashed"):
+                        trashed += 1
+                    elif result == "deleted":
+                        deleted += 1
+                if forbidden and not (requested or trashed or deleted):
+                    QMessageBox.warning(
+                        self, "Delete",
+                        "You can only delete your own register entries.",
                     )
-                if requested:
-                    parts.append(
-                        f"{requested} approved expense(s) sent to Verify → Deleted.\n"
-                        "An accountant must confirm (then Trash) or restore to Master."
+                elif missing and not (requested or trashed or deleted or forbidden):
+                    QMessageBox.warning(
+                        self, "Not Found",
+                        "Those entries were already removed.",
                     )
-                if deleted:
-                    parts.append(f"{deleted} pending-edit clone(s) removed.")
-                if forbidden:
-                    parts.append(
-                        f"{forbidden} entr{'y was' if forbidden == 1 else 'ies were'} "
-                        "skipped (not yours)."
+                elif requested or trashed or deleted:
+                    # Light Verify immediately for verified → Deleted requests
+                    # (do not wait on the notification long-poll).
+                    if requested:
+                        self.verify_queue_bumped.emit(int(requested))
+                    # Soft-trash / pending-edit clone removal can change drafts.
+                    if trashed or deleted:
+                        self.drafts_changed.emit()
+                    parts = []
+                    if trashed:
+                        parts.append(
+                            f"{trashed} expense(s) moved to your Trash.\n"
+                            "Open Trash to restore or delete them permanently."
+                        )
+                    if requested:
+                        parts.append(
+                            f"{requested} approved expense(s) sent to Verify → Deleted.\n"
+                            "An accountant must confirm (then Trash) or restore to Master."
+                        )
+                    if deleted:
+                        parts.append(f"{deleted} pending-edit clone(s) removed.")
+                    if forbidden:
+                        parts.append(
+                            f"{forbidden} entr{'y was' if forbidden == 1 else 'ies were'} "
+                            "skipped (not yours)."
+                        )
+                    title = (
+                        "Moved to Trash"
+                        if trashed and not requested
+                        else "Deletion Requested"
+                        if requested
+                        else "Deleted"
                     )
-                title = (
-                    "Moved to Trash"
-                    if trashed and not requested
-                    else "Deletion Requested"
-                    if requested
-                    else "Deleted"
-                )
-                QMessageBox.information(self, title, "\n\n".join(parts))
-            if trashed or requested or deleted:
-                self.trash_changed.emit()
-                # Same invalidate + reload as Drafts discard so My cannot keep
-                # painting deleted rows until a Merged flip.
-                await self._reload_after_server_row_change()
-            elif missing:
-                # Already gone on server — still refresh if the grid is stale.
-                await self._reload_after_server_row_change()
-        except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Failed to delete:\n{exc}")
+                    QMessageBox.information(self, title, "\n\n".join(parts))
+                if trashed or requested or deleted:
+                    self.trash_changed.emit()
+                    # Same invalidate + reload as Drafts discard so My cannot keep
+                    # painting deleted rows until a Merged flip.
+                    await self._reload_after_server_row_change()
+                elif missing:
+                    # Already gone on server — still refresh if the grid is stale.
+                    await self._reload_after_server_row_change()
+            except Exception as exc:
+                QMessageBox.critical(self, "Error", f"Failed to delete:\n{exc}")
 
     # ------------------------------------------------------------------
     # Import from Excel (daily MATUMIZI)
@@ -10487,13 +10550,18 @@ class DailyRegister(QWidget):
                     except Exception as row_exc:
                         errors.append(f"Row {row + 1}: {row_exc}")
 
+        pending_edit_ok = 0
         for row, tx_id, updates in pending_edit_rows:
             try:
                 await insert_pending_edit(tx_id, updates, self._user._id)
                 updated += 1
+                pending_edit_ok += 1
                 self._dirty_rows.discard(row)
             except Exception as exc:
                 errors.append(f"Row {row + 1}: {exc}")
+        # Verified edits land in Verify → Edited; bump sidebar like Submit.
+        if pending_edit_ok:
+            self.verify_queue_bumped.emit(int(pending_edit_ok))
 
         # ── Pass 2: insert brand-new rows (INSERT) — My + parked ───
         pending_inserts: list[tuple[int, Transaction]] = []
@@ -10573,90 +10641,72 @@ class DailyRegister(QWidget):
                 (row, tx) for row, tx in pending_inserts
                 if (getattr(tx, "register_status", "") or "") != "parked"
             ]
-            dup_hits: list = [[] for _ in draft_inserts]
-            if draft_inserts and not parked_only:
-                try:
-                    self._show_register_loading(
-                        f"Checking duplicates ({len(draft_inserts)})…"
-                    )
-                    dup_hits = await check_for_duplicates_bulk(
-                        [
-                            {
-                                "truck_number": tx.truck_number or "",
-                                "amount": tx.amount,
-                                "item": tx.item or "",
-                                "description": tx.description or "",
-                            }
-                            for _row, tx in draft_inserts
-                        ],
-                        dup_days,
-                    )
-                except Exception:
-                    dup_hits = [[] for _ in draft_inserts]
-
-            for i, (row, tx) in enumerate(draft_inserts):
-                dupes = dup_hits[i] if i < len(dup_hits) else []
-                if dupes:
-                    duplicate_items.append(DuplicateReviewItem(
-                        row=row,
-                        row_display=row + 1,
-                        description=tx.description or "—",
-                        truck_number=tx.truck_number or "",
-                        item=tx.item or "",
-                        amount=tx.amount,
-                        amount_label=format_amount_label(tx),
-                        existing=dupes[0],
-                        date_label=format_new_date(tx.date),
-                    ))
-
-            # Also flag identical drafts against earlier rows in this same save
-            # (DB soft-dup only sees already-persisted expenses).
-            duplicate_items.extend(
-                within_table_duplicate_items(
-                    draft_inserts,
-                    already_flagged_rows={item.row for item in duplicate_items},
-                )
-            )
 
             save_anyway: set[int] = set()
             save_anyway_match_by_id: dict = {}
-            if duplicate_items and not parked_only:
+            deferred_dups: set[int] = set()
+            if draft_inserts and not parked_only:
                 from tahmeed.ui.async_utils import pause_background_polls
                 from tahmeed.ui.widgets.export_runner import await_ui
 
-                dlg = DuplicateReviewDialog(
-                    duplicate_items,
-                    dup_days=dup_days,
-                    parent=self,
-                    pending_total=len(draft_inserts),
-                )
-                with pause_background_polls(self):
-                    accepted = await await_ui(
-                        lambda: dlg.exec() == QDialog.Accepted
+                save_checks: set[int] = set()
+                lookback_unit = "days"
+                lookback_value = dup_days
+                while True:
+                    self._show_register_loading(
+                        f"Checking duplicates ({len(draft_inserts)})…"
                     )
-                if not accepted:
-                    self._rollback_materialized_parked_rows(materialized_parked)
-                    self._flush_local_draft()
-                    return False
-                save_anyway = dlg.save_anyway_rows()
-                deferred_dups = dlg.deferred_duplicate_rows()
-                for row in save_anyway:
-                    rid = entry_client_row_id({
-                        "client_row_id": (self._pending_row_meta.get(row) or {}).get(
-                            "client_row_id"
+                    duplicate_items = await self._scan_soft_duplicates(
+                        draft_inserts, dup_days
+                    )
+                    if not duplicate_items:
+                        deferred_dups = set()
+                        break
+                    dlg = DuplicateReviewDialog(
+                        duplicate_items,
+                        dup_days=dup_days,
+                        parent=self,
+                        pending_total=len(draft_inserts),
+                        initial_checked=save_checks,
+                        lookback_value=lookback_value,
+                        lookback_unit=lookback_unit,
+                        allow_rescan=True,
+                    )
+                    with pause_background_polls(self):
+                        accepted = await await_ui(
+                            lambda: dlg.exec() == QDialog.Accepted
                         )
-                    }) or self._ensure_row_client_id(row)
-                    if not rid:
+                    if not accepted:
+                        self._rollback_materialized_parked_rows(materialized_parked)
+                        self._flush_local_draft()
+                        return False
+                    rescan_days = dlg.requested_rescan_days()
+                    if rescan_days is not None:
+                        dup_days = int(rescan_days)
+                        lookback_unit = dlg.lookback_unit()
+                        lookback_value = dlg.lookback_value()
+                        save_checks = dlg.checked_rows_snapshot()
                         continue
-                    matched = next(
-                        (
-                            item.existing for item in duplicate_items
-                            if item.row == row
-                            and getattr(item.existing, "_id", None) is not None
-                        ),
-                        None,
-                    )
-                    save_anyway_match_by_id[rid] = matched
+                    save_anyway = dlg.save_anyway_rows()
+                    deferred_dups = dlg.deferred_duplicate_rows()
+                    for row in save_anyway:
+                        rid = entry_client_row_id({
+                            "client_row_id": (self._pending_row_meta.get(row) or {}).get(
+                                "client_row_id"
+                            )
+                        }) or self._ensure_row_client_id(row)
+                        if not rid:
+                            continue
+                        matched = next(
+                            (
+                                item.existing for item in duplicate_items
+                                if item.row == row
+                                and getattr(item.existing, "_id", None) is not None
+                            ),
+                            None,
+                        )
+                        save_anyway_match_by_id[rid] = matched
+                    break
 
             # Move deferred duplicates into Skipped before index-sensitive save.
             moved_to_skipped = 0

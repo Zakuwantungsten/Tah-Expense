@@ -12,6 +12,11 @@ from PySide6.QtWidgets import (
     QToolButton, QVBoxLayout, QWidget,
 )
 
+from tahmeed.ui.widgets.popup_styles import (
+    TRANSPARENT_LIGHT_POPUPS_SS,
+    with_light_popups,
+)
+
 _BG = "#F8FAFC"
 _BORDER = "#E5E7EB"
 _TEXT = "#1B2B4B"
@@ -63,7 +68,7 @@ class FeedRibbonToolbar(QFrame):
         self.setAttribute(Qt.WA_StyledBackground, False)
         self.setAutoFillBackground(False)
         self.setStyleSheet(
-            f"""
+            with_light_popups(f"""
             QFrame#feedRibbonToolbar {{
                 background: transparent;
                 border: 1px solid {_BORDER};
@@ -122,7 +127,7 @@ class FeedRibbonToolbar(QFrame):
             QCheckBox:disabled {{
                 color: {_MUTED};
             }}
-            """
+            """)
         )
 
         root = QHBoxLayout(self)
@@ -188,7 +193,7 @@ class FeedRibbonToolbar(QFrame):
         import_widgets.append(self._btn_attach)
 
         vat_wrap = QWidget()
-        vat_wrap.setStyleSheet("background:transparent;")
+        vat_wrap.setStyleSheet(TRANSPARENT_LIGHT_POPUPS_SS)
         vat_vl = QVBoxLayout(vat_wrap)
         vat_vl.setContentsMargins(6, 8, 6, 0)
         vat_vl.setSpacing(0)
@@ -260,7 +265,7 @@ class FeedRibbonToolbar(QFrame):
 
         # Far-right totals slot (Money In/Out/Bal, Bonds KPIs, …) — page-owned widget.
         self._summary_host = QWidget()
-        self._summary_host.setStyleSheet("background:transparent;")
+        self._summary_host.setStyleSheet(TRANSPARENT_LIGHT_POPUPS_SS)
         self._summary_host.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         self._summary_hl = QHBoxLayout(self._summary_host)
         self._summary_hl.setContentsMargins(8, 2, 4, 2)
@@ -280,13 +285,13 @@ class FeedRibbonToolbar(QFrame):
 
     def _group(self, caption: str, widgets: list) -> QWidget:
         wrap = QWidget()
-        wrap.setStyleSheet("background:transparent;")
+        wrap.setStyleSheet(TRANSPARENT_LIGHT_POPUPS_SS)
         vl = QVBoxLayout(wrap)
         vl.setContentsMargins(4, 0, 4, 0)
         vl.setSpacing(0)
 
         row = QWidget()
-        row.setStyleSheet("background:transparent;")
+        row.setStyleSheet(TRANSPARENT_LIGHT_POPUPS_SS)
         hl = QHBoxLayout(row)
         hl.setContentsMargins(2, 0, 2, 0)
         hl.setSpacing(2)

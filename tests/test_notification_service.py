@@ -84,8 +84,14 @@ class FakeSidebar:
     def set_verify_badge(self, count: int) -> None:
         self.counts.append(count)
 
+    def verify_badge(self) -> int:
+        return self.counts[-1] if self.counts else 0
+
     def set_drafts_badge(self, count: int) -> None:
         self.drafts.append(count)
+
+    def drafts_badge(self) -> int:
+        return self.drafts[-1] if self.drafts else 0
 
     def set_saved_badge(self, count: int) -> None:
         self.drafts.append(count)
@@ -191,3 +197,50 @@ def test_dashboard_stream_defers_when_nested_task_active(monkeypatch) -> None:
     monkeypatch.setattr("tahmeed.ui.async_utils.in_running_task", lambda: False)
     dashboard._start_notification_stream()
     assert len(created) == 1
+
+
+def test_note_verify_queue_bump_lights_sidebar_and_protects(monkeypatch) -> None:
+    """Deletion request / pending-edit must bump Verify immediately (like Submit)."""
+    from PySide6.QtCore import QTimer
+
+    sidebar = FakeSidebar()
+    sidebar.set_verify_badge(3)
+    kicks: list[object] = []
+    scheduled: list[tuple[int, object]] = []
+
+    dashboard = type("DashboardState", (), {})()
+    dashboard._sidebar = sidebar
+    dashboard._protect_verify_badge_until = 0.0
+    dashboard._kick_notification_refresh = lambda: kicks.append("kick")
+    dashboard._note_verify_queue_bump = (
+        lambda n: AccountantDashboard._note_verify_queue_bump(dashboard, n)
+    )
+    dashboard._apply_notification_counts = (
+        lambda payload: AccountantDashboard._apply_notification_counts(
+            dashboard, payload
+        )
+    )
+    dashboard._pages = {}
+
+    monkeypatch.setattr(
+        QTimer,
+        "singleShot",
+        staticmethod(lambda ms, cb: scheduled.append((ms, cb))),
+    )
+
+    dashboard._note_verify_queue_bump(2)
+    assert sidebar.verify_badge() == 5
+    assert dashboard._protect_verify_badge_until > 0
+    assert len(scheduled) == 1 and scheduled[0][0] == 200
+
+    # Stale lower poll must not wipe the optimistic bump while protected.
+    dashboard._apply_notification_counts({
+        "verify": 3,
+        "inbox": 3,
+        "new": 3,
+        "edited": 0,
+        "drafts": 0,
+        "deletion_requests": 0,
+        "restore_requests": 0,
+    })
+    assert sidebar.verify_badge() == 5

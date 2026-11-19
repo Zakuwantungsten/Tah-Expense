@@ -9,9 +9,14 @@ from PySide6.QtWidgets import QApplication
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
+    dup_source_kind,
+    filter_duplicate_items,
     format_amount_label,
     format_existing_date,
+    format_lookback_label,
     format_new_date,
+    group_counts,
+    lookback_days_from_unit,
     rows_to_save_with_duplicate_flags,
     soft_dup_key,
     soft_dup_key_is_meaningful,
@@ -198,3 +203,88 @@ def test_duplicate_review_dialog_same_table_label():
     item.existing_label = "Same table"
     dlg = DuplicateReviewDialog([item], dup_days=5)
     assert dlg._table.item(1, 1).text() == "Same table"
+
+
+def test_dup_source_kind_and_filters():
+    db_item = _sample_item()
+    table_item = _sample_item()
+    table_item.row = 4
+    table_item.existing_label = "Same table"
+    table_item.truck_number = "T200"
+    table_item.item = "DIESEL"
+    table_item.description = "FUEL STOP"
+
+    assert dup_source_kind(db_item) == "db"
+    assert dup_source_kind(table_item) == "table"
+
+    counts = group_counts([db_item, table_item])
+    assert counts["source"]["db"] == 1
+    assert counts["source"]["table"] == 1
+    assert counts["truck"]["YARD"] == 1
+    assert counts["truck"]["T200"] == 1
+
+    only_table = filter_duplicate_items([db_item, table_item], source="table")
+    assert [i.row for i in only_table] == [4]
+    only_truck = filter_duplicate_items(
+        [db_item, table_item], truck="T200"
+    )
+    assert [i.row for i in only_truck] == [4]
+    only_item = filter_duplicate_items(
+        [db_item, table_item], item="DIESEL"
+    )
+    assert [i.row for i in only_item] == [4]
+
+
+def test_lookback_days_from_unit_and_label():
+    assert lookback_days_from_unit(5, "days") == 5
+    assert lookback_days_from_unit(2, "months") == 60
+    assert lookback_days_from_unit(20, "months") == 365
+    assert format_lookback_label(5, unit="days") == "last 5 days"
+    assert format_lookback_label(60, unit="months", value=2) == "last 2 months"
+
+
+def test_duplicate_review_dialog_pills_filter_and_rescan(qapp=None):
+    _app()
+    db_item = _sample_item()
+    table_item = DuplicateReviewItem(
+        row=5,
+        row_display=6,
+        description="DIESEL FILL",
+        truck_number="T200",
+        item="DIESEL",
+        amount=8000.0,
+        amount_label="TZS 8,000",
+        existing=Transaction(
+            date=datetime(2026, 8, 18),
+            description="DIESEL FILL",
+            truck_number="T200",
+            amount=8000.0,
+            item="DIESEL",
+        ),
+        date_label="23 Aug 2026",
+        existing_label="Same table",
+    )
+    dlg = DuplicateReviewDialog(
+        [db_item, table_item],
+        dup_days=5,
+        lookback_value=2,
+        lookback_unit="months",
+    )
+    assert dlg._table.rowCount() == 4
+    assert "all" in dlg._source_pills
+    assert "db" in dlg._source_pills
+    assert "table" in dlg._source_pills
+    assert dlg._source_pills["all"]._count == 2
+
+    dlg._on_source_pill("table")
+    assert dlg._table.rowCount() == 2
+    assert dlg._table.item(0, 5).text() == "T200"
+
+    dlg._lookback_spin.setValue(3)
+    dlg._lookback_unit_combo.setCurrentIndex(0)  # Days
+    dlg._checks[0].setChecked(True)
+    dlg._request_rescan()
+    assert dlg.requested_rescan_days() == 3
+    assert dlg.checked_rows_snapshot() == {5}
+    assert dlg.lookback_unit() == "days"
+    assert dlg.lookback_value() == 3

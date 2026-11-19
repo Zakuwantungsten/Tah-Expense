@@ -7,7 +7,8 @@ QuickBooks-style full verified ledger with:
     from the approved cashier entry's category
   - Excel-style ▾ header filters (sort / search / multi-select / Apply)
   - ReceiptBadge color pill
-  - Split TZS + USD amount columns + footer totals
+  - Split TZS + USD amount columns + one-row footer
+    (TZS / Refund to Float / USD left · scroll status right; black totals)
   - Ref_Float column (cashier free-text; empty when unset)
   - Export to Excel — Export Filtered (current view) or Export All (FY/month tab)
 """
@@ -670,7 +671,28 @@ class _FilterBar(QFrame):
 _LedgerTable = MasterLedgerTable
 
 
+def _money_lbl(text: str = "") -> QLabel:
+    """Monospace money figure — always black (Simple-tab TOTAL style)."""
+    lbl = _lbl(text, size=13, weight=700, color=_T1)
+    lbl.setStyleSheet(
+        f"color: {_T1}; font-size: 13px; font-weight: 700;"
+        " font-family: 'Cascadia Code', 'Consolas', monospace;"
+        " background: transparent;"
+    )
+    return lbl
+
+
+def _vsep() -> QFrame:
+    sep = QFrame()
+    sep.setFrameShape(QFrame.VLine)
+    sep.setFixedWidth(1)
+    sep.setStyleSheet(f"background: {_BORDER};")
+    return sep
+
+
 class _FooterBar(QFrame):
+    """One row: totals left (TZS / Refund / USD) · status right."""
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedHeight(40)
@@ -679,48 +701,45 @@ class _FooterBar(QFrame):
         )
         hl = QHBoxLayout(self)
         hl.setContentsMargins(16, 0, 16, 0)
-        hl.setSpacing(24)
+        hl.setSpacing(16)
 
         hl.addWidget(_lbl("TOTAL (filtered view)", size=11, weight=700, color=_T2))
-        hl.addSpacing(8)
 
-        self._tzs_lbl = _lbl("TZS  —", size=13, weight=700, color=_T1)
-        self._tzs_lbl.setStyleSheet(
-            f"color: {_T1}; font-size: 13px; font-weight: 700;"
-            " font-family: 'Cascadia Code', 'Consolas', monospace;"
-            " background: transparent;"
-        )
+        self._tzs_lbl = _money_lbl("TZS  —")
         hl.addWidget(self._tzs_lbl)
+        hl.addWidget(_vsep())
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.VLine)
-        sep.setFixedWidth(1)
-        sep.setStyleSheet(f"background: {_BORDER};")
-        hl.addWidget(sep)
+        self._refund_lbl = _money_lbl("Refund  —")
+        hl.addWidget(self._refund_lbl)
+        hl.addWidget(_vsep())
 
-        self._usd_lbl = _lbl("USD  —", size=13, weight=700, color=_T1)
-        self._usd_lbl.setStyleSheet(
-            f"color: {_T1}; font-size: 13px; font-weight: 700;"
-            " font-family: 'Cascadia Code', 'Consolas', monospace;"
-            " background: transparent;"
-        )
+        self._usd_lbl = _money_lbl("USD  —")
         hl.addWidget(self._usd_lbl)
 
         hl.addStretch()
 
-        self._count_lbl = _lbl("", size=11, color=_T2)
-        hl.addWidget(self._count_lbl)
+        self._status_lbl = _lbl("", size=11, color=_T2)
+        self._status_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        hl.addWidget(self._status_lbl)
 
-    def update_totals(self, tzs: float, usd: float, record_count: int) -> None:
+    def update_totals(
+        self,
+        tzs: float,
+        usd: float,
+        refund: float = 0.0,
+        record_count: int = 0,
+    ) -> None:
+        del record_count  # kept for call-site compat; status carries the count
         self._tzs_lbl.setText(f"TZS  {tzs:,.0f}")
-        self._tzs_lbl.setStyleSheet(
-            f"color: {_RED if tzs < 0 else _T1}; font-size: 13px; font-weight: 700;"
-            " font-family: 'Cascadia Code', 'Consolas', monospace;"
-            " background: transparent;"
-        )
+        if refund:
+            self._refund_lbl.setText(f"Refund  TZS {refund:,.0f}")
+        else:
+            self._refund_lbl.setText("Refund  —")
         usd_prefix = "$" if usd != 0 else ""
         self._usd_lbl.setText(f"USD  {usd_prefix}{usd:,.2f}" if usd else "USD  —")
-        self._count_lbl.setText(f"{record_count:,} records")
+
+    def set_status(self, text: str) -> None:
+        self._status_lbl.setText(text)
 
 
 # ── MasterExpensesWidget (public) ─────────────────────────────────────────────
@@ -871,17 +890,9 @@ class MasterExpensesWidget(QWidget):
         self._table.table().verticalScrollBar().valueChanged.connect(self._on_scroll)
         root.addWidget(self._table, 1)
 
-        # ── Footer totals ────────────────────────────────────────────────
+        # ── Footer totals + status (single row) ──────────────────────────
         self._footer = _FooterBar()
         root.addWidget(self._footer)
-
-        self._status_lbl = _lbl("", size=11, color=_TM)
-        self._status_lbl.setAlignment(Qt.AlignCenter)
-        self._status_lbl.setFixedHeight(28)
-        self._status_lbl.setStyleSheet(
-            f"background: {_WHITE}; border-top: 1px solid {_BORDER};"
-        )
-        root.addWidget(self._status_lbl)
 
         self._loading_overlay = LoadingOverlay(self, "Loading master expenses…")
 
@@ -997,17 +1008,21 @@ class MasterExpensesWidget(QWidget):
     def _update_status(self) -> None:
         filtered = bool(self._table.column_filters_for_query())
         if self._total == 0:
-            self._status_lbl.setText(
-                "No records match the current filters." if not self._loading else "Loading…"
+            text = (
+                "No records match the current filters."
+                if not self._loading
+                else "Loading…"
             )
         elif self._loaded >= self._total:
             suffix = " (column filters applied)" if filtered else ""
-            self._status_lbl.setText(f"Showing all {self._total:,} records{suffix}")
+            text = f"Showing all {self._total:,} records{suffix}"
         else:
             extra = "  •  Column filters on full range" if filtered else ""
-            self._status_lbl.setText(
-                f"Showing {self._loaded:,} of {self._total:,}  •  Scroll down for more{extra}"
+            text = (
+                f"Showing {self._loaded:,} of {self._total:,}"
+                f"  •  Scroll down for more{extra}"
             )
+        self._footer.set_status(text)
 
     # ── Event handlers ─────────────────────────────────────────────────────
 
@@ -1316,7 +1331,7 @@ class MasterExpensesWidget(QWidget):
         except Exception as exc:
             if generation == self._reload_generation:
                 self._table.clear_rows()
-                self._status_lbl.setText(f"Failed to load: {exc}")
+                self._footer.set_status(f"Failed to load: {exc}")
         finally:
             self._loading = False
             self._loading_overlay.hide_loading()
@@ -1335,7 +1350,10 @@ class MasterExpensesWidget(QWidget):
                 return
 
             self._footer.update_totals(
-                boot.totals["tzs"], boot.totals["usd"], self._total,
+                float(boot.totals.get("tzs") or 0),
+                float(boot.totals.get("usd") or 0),
+                float(boot.totals.get("refund") or 0),
+                self._total,
             )
             if not self._filters_loaded:
                 if boot.trucks is not None:

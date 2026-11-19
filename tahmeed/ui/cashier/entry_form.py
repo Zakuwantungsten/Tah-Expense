@@ -931,18 +931,24 @@ class EntryForm(QWidget):
 
         possible_dup = False
         matched_id = None
-        try:
-            dupes = await check_for_duplicates(
-                truck_number=truck_number,
-                amount=self._amount.value(),
-                item=self._item.text().strip(),
-                description=description,
-                days=dup_days,
-            )
-        except Exception:
-            dupes = []
+        save_checks: set[int] = set()
+        lookback_unit = "days"
+        lookback_value = dup_days
+        while True:
+            try:
+                dupes = await check_for_duplicates(
+                    truck_number=truck_number,
+                    amount=self._amount.value(),
+                    item=self._item.text().strip(),
+                    description=description,
+                    days=dup_days,
+                )
+            except Exception:
+                dupes = []
 
-        if dupes:
+            if not dupes:
+                break
+
             probe = Transaction(
                 date=tx_date,
                 description=description,
@@ -961,13 +967,29 @@ class EntryForm(QWidget):
                 existing=dupes[0],
                 date_label=format_new_date(tx_date),
             )
-            dlg = DuplicateReviewDialog([item], dup_days=dup_days, parent=self)
+            dlg = DuplicateReviewDialog(
+                [item],
+                dup_days=dup_days,
+                parent=self,
+                initial_checked=save_checks,
+                lookback_value=lookback_value,
+                lookback_unit=lookback_unit,
+                allow_rescan=True,
+            )
             if dlg.exec() != QDialog.Accepted:
                 return
+            rescan_days = dlg.requested_rescan_days()
+            if rescan_days is not None:
+                dup_days = int(rescan_days)
+                lookback_unit = dlg.lookback_unit()
+                lookback_value = dlg.lookback_value()
+                save_checks = dlg.checked_rows_snapshot()
+                continue
             if 0 not in dlg.save_anyway_rows():
                 return
             possible_dup = True
             matched_id = getattr(dupes[0], "_id", None)
+            break
 
         ownership = (
             self._ownership.canonical(self._ownership.text().strip())

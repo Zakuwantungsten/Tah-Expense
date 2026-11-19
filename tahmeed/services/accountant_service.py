@@ -2620,6 +2620,7 @@ async def get_master_totals(
     return {
         "tzs": float(payload.get("tzs") or 0.0),
         "usd": float(payload.get("usd") or 0.0),
+        "refund": float(payload.get("refund") or 0.0),
     }
 
 
@@ -2701,6 +2702,7 @@ async def get_master_bootstrap(
     totals = {
         "tzs": float(totals_raw.get("tzs") or 0.0),
         "usd": float(totals_raw.get("usd") or 0.0),
+        "refund": float(totals_raw.get("refund") or 0.0),
     }
     if not include_year_meta:
         return MasterBootstrap(
