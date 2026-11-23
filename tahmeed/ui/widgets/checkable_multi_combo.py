@@ -94,7 +94,9 @@ class CheckableMultiCombo(QComboBox):
         self._popup_open = False
         self._popup_shown_at = 0.0
         self._block_hide_until = 0.0
-        self._pending_options: Optional[Tuple[Sequence[str], bool, bool]] = None
+        self._pending_options: Optional[
+            Tuple[Sequence[Union[str, Tuple[str, str]]], bool, bool]
+        ] = None
         # Optional lazy distincts (Browse Advanced Item / Sub-Item Phase 2).
         self._options_loader: Optional[
             Callable[[], Union[Awaitable[Sequence[str]], Any]]
@@ -144,6 +146,17 @@ class CheckableMultiCombo(QComboBox):
         emit: bool = True,
     ) -> None:
         """Replace option rows; optionally preserve still-valid selections."""
+        pairs = [(str(label), str(label)) for label in options]
+        self.set_options_with_keys(pairs, keep_selected=keep_selected, emit=emit)
+
+    def set_options_with_keys(
+        self,
+        options: Sequence[Tuple[str, str]],
+        *,
+        keep_selected: bool = True,
+        emit: bool = True,
+    ) -> None:
+        """Replace rows as ``(label, key)`` pairs; selection tracks keys."""
         # Rebuilding the model while the list is open closes it; defer until hide.
         if self._popup_is_open():
             self._pending_options = (list(options), keep_selected, emit)
@@ -152,22 +165,34 @@ class CheckableMultiCombo(QComboBox):
 
     def _apply_options(
         self,
-        options: Sequence[str],
+        options: Sequence[Union[str, Tuple[str, str]]],
         *,
         keep_selected: bool = True,
         emit: bool = True,
     ) -> None:
+        pairs: List[Tuple[str, str]] = []
+        for raw in options:
+            if isinstance(raw, tuple):
+                label, key = raw[0], raw[1]
+            else:
+                label = key = str(raw)
+            label = str(label)
+            key = str(key)
+            if not key:
+                continue
+            pairs.append((label, key))
         prev = set(self.selected_values()) if keep_selected else set()
         self._updating = True
         try:
             while self._model.rowCount() > 1:
                 self._model.removeRow(1)
-            for label in options:
-                item = self._make_item(label, label)
-                if label in prev:
+            for label, key in pairs:
+                item = self._make_item(label, key)
+                if key in prev:
                     item.setCheckState(Qt.Checked)
                 self._model.appendRow(item)
-            kept = [v for v in prev if v in set(options)]
+            valid = {key for _, key in pairs}
+            kept = [v for v in prev if v in valid]
             if kept:
                 self._model.item(0).setCheckState(Qt.Unchecked)
             else:
@@ -383,14 +408,42 @@ class CheckableMultiCombo(QComboBox):
             "selection-background-color:#DBEAFE;selection-color:#111827;"
         )
 
-    def reset_to_all(self, *, emit: bool = True) -> None:
+    def configure(self, *, all_label: str | None = None, noun_plural: str | None = None) -> None:
+        """Update closed-combo copy without rebuilding options."""
+        if all_label is not None:
+            self._all_label = all_label
+            all_item = self._model.item(0)
+            if all_item is not None:
+                all_item.setText(all_label)
+                all_item.setToolTip(all_label)
+        if noun_plural is not None:
+            self._noun_plural = noun_plural
+        self._refresh_label()
+
+    def set_selected_keys(self, keys: Sequence[str], *, emit: bool = True) -> None:
+        """Check the given keys (UserRole); empty → All."""
+        want = {str(k) for k in keys if str(k)}
         self._updating = True
         try:
-            self._model.item(0).setCheckState(Qt.Checked)
-            for row in range(1, self._model.rowCount()):
-                self._model.item(row).setCheckState(Qt.Unchecked)
+            if not want:
+                self._model.item(0).setCheckState(Qt.Checked)
+                for row in range(1, self._model.rowCount()):
+                    self._model.item(row).setCheckState(Qt.Unchecked)
+            else:
+                self._model.item(0).setCheckState(Qt.Unchecked)
+                any_checked = False
+                for row in range(1, self._model.rowCount()):
+                    item = self._model.item(row)
+                    checked = str(item.data(Qt.UserRole) or "") in want
+                    item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                    any_checked = any_checked or checked
+                if not any_checked:
+                    self._model.item(0).setCheckState(Qt.Checked)
         finally:
             self._updating = False
         self._refresh_label()
         if emit:
             self.selectionChanged.emit()
+
+    def reset_to_all(self, *, emit: bool = True) -> None:
+        self.set_selected_keys([], emit=emit)

@@ -898,6 +898,44 @@ async def get_overview_month_totals(year: int) -> Dict:
     }
 
 
+def _overview_sources_payload(raw: dict | None, year: int) -> dict:
+    payload = raw or {}
+    rates = payload.get("rates_to_tzs") or {}
+    items = []
+    for row in payload.get("items") or []:
+        native = row.get("native") or {}
+        items.append(
+            {
+                "key": str(row.get("key") or ""),
+                "label": str(row.get("label") or ""),
+                "amount_tzs": float(row.get("amount_tzs") or 0.0),
+                "currency": str(row.get("currency") or "TZS").upper(),
+                "native_currency": str(row.get("native_currency") or "TZS").upper(),
+                "native": {
+                    "tzs": float(native.get("tzs") or 0.0),
+                    "usd": float(native.get("usd") or 0.0),
+                    "zmw": float(native.get("zmw") or 0.0),
+                },
+            }
+        )
+    return {
+        "year": int(payload.get("year") or year),
+        "display_currency": str(payload.get("display_currency") or "TZS").upper(),
+        "rate_source": str(payload.get("rate_source") or ""),
+        "rates_to_tzs": {
+            "USD": float(rates.get("USD") or 0.0),
+            "ZMW": float(rates.get("ZMW") or 0.0),
+            "TZS": float(rates.get("TZS") or 1.0),
+        },
+        "items": items,
+    }
+
+
+def _overview_fuel_spend_payload(raw: dict | None, year: int) -> dict:
+    """Same shape as Sources — per diesel station / Diesel Cash in TZS."""
+    return _overview_sources_payload(raw, year)
+
+
 async def get_overview_dashboard(year: int) -> dict:
     """All data needed by the accountant Overview tab."""
     payload = await api_client.request(
@@ -925,7 +963,671 @@ async def get_overview_dashboard(year: int) -> dict:
             "year": int(fuel.get("year") or year),
             "series": _deserialize_fuel_liters_series(fuel.get("series")),
         },
+        "fuel_spend": _overview_fuel_spend_payload(payload.get("fuel_spend"), year),
+        "sources": _overview_sources_payload(payload.get("sources"), year),
         "recent": [_tx_from_api(doc) for doc in payload.get("recent") or []],
+    }
+
+
+async def get_analytics_dashboard(
+    year: int,
+    *,
+    period: str = "year",
+    month: int | None = None,
+) -> dict:
+    """Analytics KPIs + charts for a calendar year or a single month."""
+    params: Dict[str, Any] = {
+        "year": int(year),
+        "period": (period or "year").strip().lower(),
+    }
+    if params["period"] == "month" and month is not None:
+        params["month"] = int(month)
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/analytics",
+        params=params,
+    )
+    kpis = dict(payload.get("kpis") or {})
+    avg = dict(kpis.get("avg_per_day") or {})
+    totals = dict(kpis.get("totals") or {})
+    master_totals = dict(kpis.get("master_totals") or {})
+    return {
+        "year": int(payload.get("year") or year),
+        "period": str(payload.get("period") or params["period"]),
+        "month": payload.get("month"),
+        "period_label": str(payload.get("period_label") or year),
+        "days": int(payload.get("days") or 1),
+        "kpis": {
+            "avg_per_day": {
+                "tzs": float(avg.get("tzs") or 0.0),
+                "usd": float(avg.get("usd") or 0.0),
+                "zmw": float(avg.get("zmw") or 0.0),
+            },
+            "totals": {
+                "tzs": float(totals.get("tzs") or 0.0),
+                "usd": float(totals.get("usd") or 0.0),
+                "zmw": float(totals.get("zmw") or 0.0),
+            },
+            "master_totals": {
+                "tzs": float(master_totals.get("tzs") or 0.0),
+                "usd": float(master_totals.get("usd") or 0.0),
+                "zmw": float(master_totals.get("zmw") or 0.0),
+            },
+            "master_count": int(kpis.get("master_count") or 0),
+        },
+        "categories": list(payload.get("categories") or []),
+        "suppliers": list(payload.get("suppliers") or []),
+        "pareto": dict(payload.get("pareto") or {}),
+        "source_mix": dict(payload.get("source_mix") or {}),
+        "month_trend": list(payload.get("month_trend") or []),
+        "prior_month_trend": list(payload.get("prior_month_trend") or []),
+        "separate_feeds": list(payload.get("separate_feeds") or []),
+    }
+
+
+async def get_analytics_trend_sources() -> dict:
+    """Picker catalog for Analytics → Trends."""
+    payload = await api_client.request("GET", "v1/accountant/analytics/trends/sources")
+    return {"groups": list(payload.get("groups") or [])}
+
+
+async def get_analytics_entity_sources() -> dict:
+    """Catalog for Analytics → Entities (Items / Payees / Suppliers)."""
+    payload = await api_client.request("GET", "v1/accountant/analytics/entities/sources")
+    return {"families": list(payload.get("families") or [])}
+
+
+async def get_analytics_data_table(
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict:
+    """Analytics → Data table: one monetary row per source for From–To."""
+    params: Dict[str, Any] = {}
+    if date_from:
+        params["date_from"] = str(date_from)
+    if date_to:
+        params["date_to"] = str(date_to)
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/analytics/data-table",
+        params=params,
+    )
+    sources = []
+    for row in list(payload.get("sources") or []):
+        sources.append(
+            {
+                "key": str(row.get("key") or ""),
+                "label": str(row.get("label") or ""),
+                "group": str(row.get("group") or ""),
+                "tzs": float(row.get("tzs") or 0.0),
+                "usd": float(row.get("usd") or 0.0),
+                "zmw": float(row.get("zmw") or 0.0),
+                "count": int(row.get("count") or 0),
+            }
+        )
+    totals = dict(payload.get("totals") or {})
+    month_trend = []
+    for row in list(payload.get("month_trend") or []):
+        month_trend.append(
+            {
+                "label": str(row.get("label") or ""),
+                "year": int(row.get("year") or 0),
+                "month": int(row.get("month") or 0),
+                "tzs": float(row.get("tzs") or 0.0),
+                "usd": float(row.get("usd") or 0.0),
+                "zmw": float(row.get("zmw") or 0.0),
+            }
+        )
+    chart_year = int(payload.get("chart_year") or 0)
+    if not chart_year and month_trend:
+        chart_year = int(month_trend[0].get("year") or 0)
+    rates_raw = dict(payload.get("rates_to_tzs") or {})
+    return {
+        "ready": bool(payload.get("ready", True)),
+        "date_from": str(payload.get("date_from") or date_from or ""),
+        "date_to": str(payload.get("date_to") or date_to or ""),
+        "period_label": str(payload.get("period_label") or ""),
+        "sources": sources,
+        "totals": {
+            "tzs": float(totals.get("tzs") or 0.0),
+            "usd": float(totals.get("usd") or 0.0),
+            "zmw": float(totals.get("zmw") or 0.0),
+            "count": int(totals.get("count") or 0),
+        },
+        "source_count": int(payload.get("source_count") or len(sources)),
+        "chart_year": chart_year,
+        "month_trend": month_trend,
+        "rates_to_tzs": {
+            "TZS": float(rates_raw.get("TZS") or 1.0),
+            "USD": float(rates_raw.get("USD") or 0.0),
+            "ZMW": float(rates_raw.get("ZMW") or 0.0),
+        },
+        "fx_source": str(payload.get("fx_source") or "fallback"),
+    }
+
+
+async def get_analytics_meetings(
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    dimension: str = "approver",
+    person: str | None = None,
+) -> dict:
+    """Analytics → Meetings: Master people table + trend + FX rates."""
+    params: Dict[str, Any] = {
+        "dimension": (dimension or "approver").strip().lower() or "approver",
+    }
+    if date_from:
+        params["date_from"] = str(date_from)
+    if date_to:
+        params["date_to"] = str(date_to)
+    if person and str(person).strip():
+        params["person"] = str(person).strip()
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/analytics/meetings",
+        params=params,
+    )
+    people = []
+    for row in list(payload.get("people") or []):
+        pct = row.get("compliance_pct")
+        people.append(
+            {
+                "sn": int(row.get("sn") or 0),
+                "key": str(row.get("key") or ""),
+                "name": str(row.get("name") or ""),
+                "count": int(row.get("count") or 0),
+                "tzs": float(row.get("tzs") or 0.0),
+                "usd": float(row.get("usd") or 0.0),
+                "zmw": float(row.get("zmw") or 0.0),
+                "receipts_needed": int(row.get("receipts_needed") or 0),
+                "receipts_received": int(row.get("receipts_received") or 0),
+                "compliance_pct": (
+                    None if pct is None else float(pct)
+                ),
+            }
+        )
+    month_trend = []
+    for row in list(payload.get("month_trend") or []):
+        series_raw = dict(row.get("series") or {})
+        series = {
+            str(k): float(v or 0.0) for k, v in series_raw.items()
+        }
+        month_trend.append(
+            {
+                "label": str(row.get("label") or ""),
+                "year": int(row.get("year") or 0),
+                "month": int(row.get("month") or 0),
+                "series": series,
+            }
+        )
+    totals = dict(payload.get("totals") or {})
+    rates_raw = dict(payload.get("rates_to_tzs") or {})
+    tot_pct = totals.get("compliance_pct")
+    return {
+        "ready": bool(payload.get("ready", True)),
+        "date_from": str(payload.get("date_from") or date_from or ""),
+        "date_to": str(payload.get("date_to") or date_to or ""),
+        "period_label": str(payload.get("period_label") or ""),
+        "dimension": str(payload.get("dimension") or params["dimension"]),
+        "dimension_label": str(payload.get("dimension_label") or "App by"),
+        "person": str(payload.get("person") or person or ""),
+        "people": people,
+        "totals": {
+            "tzs": float(totals.get("tzs") or 0.0),
+            "usd": float(totals.get("usd") or 0.0),
+            "zmw": float(totals.get("zmw") or 0.0),
+            "count": int(totals.get("count") or 0),
+            "receipts_needed": int(totals.get("receipts_needed") or 0),
+            "receipts_received": int(totals.get("receipts_received") or 0),
+            "compliance_pct": None if tot_pct is None else float(tot_pct),
+        },
+        "person_count": int(payload.get("person_count") or len(people)),
+        "chart_people": [str(n) for n in list(payload.get("chart_people") or [])],
+        "chart_year": int(payload.get("chart_year") or 0),
+        "month_trend": month_trend,
+        "rates_to_tzs": {
+            "TZS": float(rates_raw.get("TZS") or 1.0),
+            "USD": float(rates_raw.get("USD") or 0.0),
+            "ZMW": float(rates_raw.get("ZMW") or 0.0),
+        },
+        "fx_source": str(payload.get("fx_source") or "fallback"),
+    }
+
+
+async def get_analytics_trucks_fleet(
+    year: int,
+    *,
+    period: str = "year",
+    month: int | None = None,
+) -> dict:
+    """Analytics → Trucks fleet table (TZS / USD / ZMW per truck)."""
+    params: Dict[str, Any] = {
+        "year": int(year),
+        "period": (period or "year").strip().lower(),
+    }
+    if params["period"] == "month" and month is not None:
+        params["month"] = int(month)
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/analytics/trucks",
+        params=params,
+    )
+    trucks = []
+    for row in list(payload.get("trucks") or []):
+        trucks.append(
+            {
+                "sn": int(row.get("sn") or 0),
+                "truck": str(row.get("truck") or "—"),
+                "tzs": float(row.get("tzs") or 0.0),
+                "usd": float(row.get("usd") or 0.0),
+                "zmw": float(row.get("zmw") or 0.0),
+                "count": int(row.get("count") or 0),
+                "share": float(row.get("share") or 0.0),
+                "mom_pct": float(row.get("mom_pct") or 0.0),
+                "mom_delta": float(row.get("mom_delta") or 0.0),
+                "mom_direction": str(row.get("mom_direction") or "flat"),
+                "vehicle_kind": str(row.get("vehicle_kind") or "unknown"),
+            }
+        )
+    totals = dict(payload.get("totals") or {})
+    kind_counts = dict(payload.get("kind_counts") or {})
+    return {
+        "year": int(payload.get("year") or year),
+        "period": str(payload.get("period") or params["period"]),
+        "month": payload.get("month"),
+        "period_label": str(payload.get("period_label") or year),
+        "ready": bool(payload.get("ready", True)),
+        "trucks": trucks,
+        "totals": {
+            "tzs": float(totals.get("tzs") or 0.0),
+            "usd": float(totals.get("usd") or 0.0),
+            "zmw": float(totals.get("zmw") or 0.0),
+            "count": int(totals.get("count") or 0),
+        },
+        "truck_count": int(payload.get("truck_count") or len(trucks)),
+        "share_basis": str(payload.get("share_basis") or "tzs").lower(),
+        "mom_label": str(payload.get("mom_label") or ""),
+        "prior_period_label": str(payload.get("prior_period_label") or ""),
+        "kind_counts": {
+            "truck": int(kind_counts.get("truck") or 0),
+            "trailer": int(kind_counts.get("trailer") or 0),
+            "motor_vehicle": int(kind_counts.get("motor_vehicle") or 0),
+            "unknown": int(kind_counts.get("unknown") or 0),
+        },
+    }
+
+
+
+async def get_analytics_truck_detail(
+    truck: str,
+    year: int,
+    *,
+    period: str = "year",
+    month: int | None = None,
+) -> dict:
+    """Analytics → Trucks deep-dive for one Master truck."""
+    params: Dict[str, Any] = {
+        "truck": str(truck or "").strip(),
+        "year": int(year),
+        "period": (period or "year").strip().lower(),
+    }
+    if params["period"] == "month" and month is not None:
+        params["month"] = int(month)
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/analytics/trucks/detail",
+        params=params,
+    )
+    return _deserialize_trends_like_payload(payload, year, params["period"])
+
+
+def _entities_keys_param(keys: str | list[str]) -> str:
+    if isinstance(keys, (list, tuple)):
+        return ",".join(str(k).strip() for k in keys if str(k).strip())
+    return str(keys or "").strip()
+
+
+async def get_analytics_entities(
+    family: str,
+    keys: str | list[str],
+    year: int,
+    *,
+    period: str = "year",
+    month: int | None = None,
+) -> dict:
+    """Deep-dive payload for one or more Master-side entities (merged)."""
+    params: Dict[str, Any] = {
+        "family": (family or "items").strip().lower(),
+        "keys": _entities_keys_param(keys),
+        "year": int(year),
+        "period": (period or "year").strip().lower(),
+    }
+    if params["period"] == "month" and month is not None:
+        params["month"] = int(month)
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/analytics/entities",
+        params=params,
+    )
+    return _deserialize_trends_like_payload(payload, year, params["period"])
+
+
+async def get_analytics_entities_compare(
+    family: str,
+    keys: str | list[str],
+    year: int,
+    *,
+    period: str = "year",
+    month: int | None = None,
+) -> dict:
+    """Side-by-side compare payload for 2–4 Entities."""
+    params: Dict[str, Any] = {
+        "family": (family or "items").strip().lower(),
+        "keys": _entities_keys_param(keys),
+        "year": int(year),
+        "period": (period or "year").strip().lower(),
+    }
+    if params["period"] == "month" and month is not None:
+        params["month"] = int(month)
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/analytics/entities/compare",
+        params=params,
+    )
+    series_out = []
+    for row in list(payload.get("series") or []):
+        totals = dict(row.get("totals") or {})
+        prior = dict(row.get("prior_totals") or {})
+        avg = dict(row.get("avg_per_day") or {})
+        series_out.append(
+            {
+                "key": str(row.get("key") or ""),
+                "label": str(row.get("label") or ""),
+                "color": str(row.get("color") or "#0077C5"),
+                "totals": {
+                    "tzs": float(totals.get("tzs") or 0.0),
+                    "usd": float(totals.get("usd") or 0.0),
+                    "zmw": float(totals.get("zmw") or 0.0),
+                },
+                "prior_totals": {
+                    "tzs": float(prior.get("tzs") or 0.0),
+                    "usd": float(prior.get("usd") or 0.0),
+                    "zmw": float(prior.get("zmw") or 0.0),
+                },
+                "avg_per_day": {
+                    "tzs": float(avg.get("tzs") or 0.0),
+                    "usd": float(avg.get("usd") or 0.0),
+                    "zmw": float(avg.get("zmw") or 0.0),
+                },
+                "count": int(row.get("count") or 0),
+                "prior_count": int(row.get("prior_count") or 0),
+                "month_trend": list(row.get("month_trend") or []),
+                "prior_month_trend": list(row.get("prior_month_trend") or []),
+            }
+        )
+    ranked_out = []
+    for row in list(payload.get("ranked") or []):
+        ranked_out.append(
+            {
+                "key": str(row.get("key") or ""),
+                "label": str(row.get("label") or ""),
+                "color": str(row.get("color") or "#0077C5"),
+                "tzs": float(row.get("tzs") or 0.0),
+                "usd": float(row.get("usd") or 0.0),
+                "zmw": float(row.get("zmw") or 0.0),
+                "count": int(row.get("count") or 0),
+            }
+        )
+    return {
+        "mode": "compare",
+        "family": str(payload.get("family") or family),
+        "label": str(payload.get("label") or ""),
+        "ready": bool(payload.get("ready", True)),
+        "sparse": bool(payload.get("sparse")),
+        "message": str(payload.get("message") or ""),
+        "year": int(payload.get("year") or year),
+        "period": str(payload.get("period") or period),
+        "month": payload.get("month"),
+        "period_label": str(payload.get("period_label") or year),
+        "entities": list(payload.get("entities") or []),
+        "series": series_out,
+        "ranked": ranked_out,
+    }
+
+
+def _deserialize_trends_like_payload(
+    payload: dict,
+    year: int,
+    period: str,
+) -> dict:
+    kpis = dict(payload.get("kpis") or {})
+    avg = dict(kpis.get("avg_per_day") or {})
+    totals = dict(kpis.get("totals") or {})
+    prior_totals = dict(kpis.get("prior_totals") or {})
+    return {
+        "source": str(payload.get("source") or ""),
+        "label": str(payload.get("label") or ""),
+        "kind": str(payload.get("kind") or ""),
+        "phase": int(payload.get("phase") or 0),
+        "ready": bool(payload.get("ready", True)),
+        "sparse": bool(payload.get("sparse")),
+        "message": str(payload.get("message") or ""),
+        "category_name": payload.get("category_name"),
+        "category_names": list(payload.get("category_names") or []),
+        "payee": payload.get("payee"),
+        "payees": list(payload.get("payees") or []),
+        "truck": payload.get("truck"),
+        "entities": list(payload.get("entities") or []),
+        "mix_label": str(payload.get("mix_label") or "Spend by Category"),
+        "trucks_label": str(payload.get("trucks_label") or "Spend by Truck"),
+        "slice_label": str(payload.get("slice_label") or ""),
+        "native_currency": str(payload.get("native_currency") or ""),
+        "year": int(payload.get("year") or year),
+        "period": str(payload.get("period") or period),
+        "month": payload.get("month"),
+        "period_label": str(payload.get("period_label") or year),
+        "days": int(payload.get("days") or 1),
+        "kpis": {
+            "totals": {
+                "tzs": float(totals.get("tzs") or 0.0),
+                "usd": float(totals.get("usd") or 0.0),
+                "zmw": float(totals.get("zmw") or 0.0),
+            },
+            "prior_totals": {
+                "tzs": float(prior_totals.get("tzs") or 0.0),
+                "usd": float(prior_totals.get("usd") or 0.0),
+                "zmw": float(prior_totals.get("zmw") or 0.0),
+            },
+            "avg_per_day": {
+                "tzs": float(avg.get("tzs") or 0.0),
+                "usd": float(avg.get("usd") or 0.0),
+                "zmw": float(avg.get("zmw") or 0.0),
+            },
+            "liters": float(kpis.get("liters") or 0.0),
+            "prior_liters": float(kpis.get("prior_liters") or 0.0),
+            "avg_liters_per_day": float(kpis.get("avg_liters_per_day") or 0.0),
+            "money_out": float(kpis.get("money_out") or 0.0),
+            "money_in": float(kpis.get("money_in") or 0.0),
+            "money_in_abs": float(kpis.get("money_in_abs") or 0.0),
+            "balance": float(kpis.get("balance") or 0.0),
+            "count": int(kpis.get("count") or 0),
+            "prior_count": int(kpis.get("prior_count") or 0),
+        },
+        "categories": list(payload.get("categories") or []),
+        "stations": list(payload.get("stations") or []),
+        "trucks": list(payload.get("trucks") or []),
+        "destinations": list(payload.get("destinations") or []),
+        "receipts": dict(payload.get("receipts") or {}),
+        "month_trend": list(payload.get("month_trend") or []),
+        "prior_month_trend": list(payload.get("prior_month_trend") or []),
+        "deltas": dict(payload.get("deltas") or {}),
+    }
+
+
+async def get_analytics_trends_compare(
+    sources: str | list[str],
+    year: int,
+    *,
+    period: str = "year",
+    month: int | None = None,
+) -> dict:
+    """Side-by-side compare payload for 2–4 Trends sources."""
+    if isinstance(sources, (list, tuple)):
+        sources_param = ",".join(str(k).strip() for k in sources if str(k).strip())
+    else:
+        sources_param = str(sources or "").strip()
+    params: Dict[str, Any] = {
+        "sources": sources_param,
+        "year": int(year),
+        "period": (period or "year").strip().lower(),
+    }
+    if params["period"] == "month" and month is not None:
+        params["month"] = int(month)
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/analytics/trends/compare",
+        params=params,
+    )
+    series_out = []
+    for row in list(payload.get("series") or []):
+        totals = dict(row.get("totals") or {})
+        prior = dict(row.get("prior_totals") or {})
+        avg = dict(row.get("avg_per_day") or {})
+        series_out.append(
+            {
+                "key": str(row.get("key") or ""),
+                "label": str(row.get("label") or ""),
+                "kind": str(row.get("kind") or ""),
+                "color": str(row.get("color") or "#0077C5"),
+                "native_currency": str(row.get("native_currency") or ""),
+                "totals": {
+                    "tzs": float(totals.get("tzs") or 0.0),
+                    "usd": float(totals.get("usd") or 0.0),
+                    "zmw": float(totals.get("zmw") or 0.0),
+                },
+                "prior_totals": {
+                    "tzs": float(prior.get("tzs") or 0.0),
+                    "usd": float(prior.get("usd") or 0.0),
+                    "zmw": float(prior.get("zmw") or 0.0),
+                },
+                "avg_per_day": {
+                    "tzs": float(avg.get("tzs") or 0.0),
+                    "usd": float(avg.get("usd") or 0.0),
+                    "zmw": float(avg.get("zmw") or 0.0),
+                },
+                "count": int(row.get("count") or 0),
+                "prior_count": int(row.get("prior_count") or 0),
+                "month_trend": list(row.get("month_trend") or []),
+                "prior_month_trend": list(row.get("prior_month_trend") or []),
+            }
+        )
+    ranked_out = []
+    for row in list(payload.get("ranked") or []):
+        ranked_out.append(
+            {
+                "key": str(row.get("key") or ""),
+                "label": str(row.get("label") or ""),
+                "color": str(row.get("color") or "#0077C5"),
+                "tzs": float(row.get("tzs") or 0.0),
+                "usd": float(row.get("usd") or 0.0),
+                "zmw": float(row.get("zmw") or 0.0),
+                "count": int(row.get("count") or 0),
+            }
+        )
+    return {
+        "mode": "compare",
+        "label": str(payload.get("label") or ""),
+        "ready": bool(payload.get("ready", True)),
+        "sparse": bool(payload.get("sparse")),
+        "message": str(payload.get("message") or ""),
+        "year": int(payload.get("year") or year),
+        "period": str(payload.get("period") or period),
+        "month": payload.get("month"),
+        "period_label": str(payload.get("period_label") or year),
+        "sources": list(payload.get("sources") or []),
+        "series": series_out,
+        "ranked": ranked_out,
+    }
+
+
+async def get_analytics_trends(
+    source: str,
+    year: int,
+    *,
+    period: str = "year",
+    month: int | None = None,
+) -> dict:
+    """Deep-dive Trends payload for one monetary source."""
+    params: Dict[str, Any] = {
+        "source": (source or "master").strip(),
+        "year": int(year),
+        "period": (period or "year").strip().lower(),
+    }
+    if params["period"] == "month" and month is not None:
+        params["month"] = int(month)
+    payload = await api_client.request(
+        "GET",
+        "v1/accountant/analytics/trends",
+        params=params,
+    )
+    kpis = dict(payload.get("kpis") or {})
+    avg = dict(kpis.get("avg_per_day") or {})
+    totals = dict(kpis.get("totals") or {})
+    prior_totals = dict(kpis.get("prior_totals") or {})
+    return {
+        "source": str(payload.get("source") or source),
+        "label": str(payload.get("label") or source),
+        "kind": str(payload.get("kind") or ""),
+        "phase": int(payload.get("phase") or 0),
+        "ready": bool(payload.get("ready")),
+        "sparse": bool(payload.get("sparse")),
+        "message": str(payload.get("message") or ""),
+        "category_name": payload.get("category_name"),
+        "mix_label": str(payload.get("mix_label") or "Spend by Category"),
+        "trucks_label": str(payload.get("trucks_label") or "Spend by Truck"),
+        "slice_label": str(payload.get("slice_label") or ""),
+        "native_currency": str(payload.get("native_currency") or ""),
+        "year": int(payload.get("year") or year),
+        "period": str(payload.get("period") or params["period"]),
+        "month": payload.get("month"),
+        "period_label": str(payload.get("period_label") or year),
+        "days": int(payload.get("days") or 1),
+        "kpis": {
+            "totals": {
+                "tzs": float(totals.get("tzs") or 0.0),
+                "usd": float(totals.get("usd") or 0.0),
+                "zmw": float(totals.get("zmw") or 0.0),
+            },
+            "prior_totals": {
+                "tzs": float(prior_totals.get("tzs") or 0.0),
+                "usd": float(prior_totals.get("usd") or 0.0),
+                "zmw": float(prior_totals.get("zmw") or 0.0),
+            },
+            "avg_per_day": {
+                "tzs": float(avg.get("tzs") or 0.0),
+                "usd": float(avg.get("usd") or 0.0),
+                "zmw": float(avg.get("zmw") or 0.0),
+            },
+            "liters": float(kpis.get("liters") or 0.0),
+            "prior_liters": float(kpis.get("prior_liters") or 0.0),
+            "avg_liters_per_day": float(kpis.get("avg_liters_per_day") or 0.0),
+            "money_out": float(kpis.get("money_out") or 0.0),
+            "money_in": float(kpis.get("money_in") or 0.0),
+            "money_in_abs": float(kpis.get("money_in_abs") or 0.0),
+            "balance": float(kpis.get("balance") or 0.0),
+            "count": int(kpis.get("count") or 0),
+            "prior_count": int(kpis.get("prior_count") or 0),
+        },
+        "categories": list(payload.get("categories") or []),
+        "stations": list(payload.get("stations") or []),
+        "trucks": list(payload.get("trucks") or []),
+        "destinations": list(payload.get("destinations") or []),
+        "receipts": dict(payload.get("receipts") or {}),
+        "month_trend": list(payload.get("month_trend") or []),
+        "prior_month_trend": list(payload.get("prior_month_trend") or []),
+        "deltas": dict(payload.get("deltas") or {}),
     }
 
 

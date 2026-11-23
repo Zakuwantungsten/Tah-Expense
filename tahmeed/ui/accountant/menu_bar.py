@@ -330,6 +330,7 @@ class AccountantMenuBar(QMenuBar):
     def _accountant_menu(self) -> None:
         m = self.addMenu("&Accountant")
         self._add(m, "&Overview", lambda: self._nav("overview"))
+        self._add(m, "&Analytics", lambda: self._nav("analytics"))
         self._add(m, "&Truck Overview", lambda: self._nav("truck_overview"))
         self._add(m, "&Fuel Overview", lambda: self._nav("fuel_overview"))
         m.addSeparator()
@@ -392,6 +393,7 @@ class AccountantMenuBar(QMenuBar):
     def _reports_menu(self) -> None:
         m = self.addMenu("&Reports")
         self._add(m, "&Overview Dashboard", lambda: self._nav("overview"))
+        self._add(m, "&Analytics", lambda: self._nav("analytics"))
         self._add(m, "&Truck Overview", lambda: self._nav("truck_overview"))
         self._add(m, "&Fuel Overview", lambda: self._nav("fuel_overview"))
         self._add(m, "&Master Expenses", lambda: self._nav("master_expenses"))

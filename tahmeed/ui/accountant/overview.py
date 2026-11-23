@@ -56,6 +56,16 @@ _FUEL_SERIES_COLORS = {
     "lake_tunduma": _PURPLE,
     "gbp_diesel": _GREEN,
 }
+_SOURCE_BAR_COLORS = {
+    "master": _GREEN,
+    "fuel": "#38BDF8",
+    "toll_zambia": _PURPLE,
+    "congo": "#EA580C",
+    "afritrack": "#0D9488",
+    "insurance": "#92400E",
+    "sm_burhani": "#CA8A04",
+    "rahntech": "#4F46E5",
+}
 
 # Card chrome is applied only via QFrame#overviewCard — never unscoped,
 # so border does not cascade onto child labels.
@@ -113,6 +123,23 @@ def _fmt_amount(tx) -> str:
     if cur in ("ZMW", "ZMB", "ZK"):
         return f"ZMW {amt:,.0f}"
     return f"TZS {amt:,.0f}"
+
+
+def _fmt_tick(value: float) -> str:
+    if value >= 1_000_000:
+        text = f"{value / 1_000_000:.1f}M"
+        return text.replace(".0M", "M")
+    if value >= 1000:
+        text = f"{value / 1000:.1f}k"
+        return text.replace(".0k", "k")
+    if abs(value - round(value)) < 0.05:
+        return f"{value:.0f}"
+    return f"{value:.1f}"
+
+
+def _fmt_source_bar_label(amount_tzs: float) -> str:
+    """Bar end label — Sources amounts are normalized to TZS."""
+    return f"{_fmt_tick(amount_tzs)} TZS"
 
 
 def _chart_values(currency: str, raw: list[float]) -> tuple[list[float], str]:
@@ -358,6 +385,77 @@ class _BarChartWidget(QWidget):
             tw = fm.horizontalAdvance(m)
             p.drawText(cx - tw // 2, self.height() - 8, m)
 
+        p.end()
+
+
+# ── Sources horizontal bars (money-tab families, TZS-normalized) ──────────────
+
+class _SourcesHBarWidget(QWidget):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        # (key, label, amount_tzs)
+        self._rows: list[tuple[str, str, float]] = []
+        self.setMinimumHeight(220)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def set_data(self, rows: list[tuple[str, str, float]]) -> None:
+        self._rows = [
+            (str(key), str(label), float(amount or 0.0))
+            for key, label, amount in (rows or [])
+        ]
+        n = max(4, len(self._rows))
+        self.setMinimumHeight(max(220, 28 + n * 28))
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if not self._rows or not any(amount > 0 for _, _, amount in self._rows):
+            p.setPen(QColor(_TM))
+            p.setFont(QFont("Segoe UI", 11))
+            p.drawText(self.rect(), Qt.AlignCenter, "No spend yet.")
+            p.end()
+            return
+
+        pl, pr, pt, pb = 108, 72, 8, 22
+        w = max(1, self.width() - pl - pr)
+        h = max(1, self.height() - pt - pb)
+        n = len(self._rows)
+        max_v = max((amount for _, _, amount in self._rows), default=0.0) or 1.0
+        slot = h / n
+        bar_h = min(16.0, slot * 0.55)
+        p.setFont(QFont("Segoe UI", 9))
+        fm = p.fontMetrics()
+
+        # Light axis ticks under the bars.
+        p.setPen(QPen(QColor(_BORDER), 1))
+        for i in range(3):
+            x = int(pl + (i / 2) * w)
+            p.drawLine(x, pt, x, pt + h)
+            p.setPen(QColor(_TM))
+            tick = _fmt_tick(max_v * i / 2)
+            tw = fm.horizontalAdvance(tick)
+            p.drawText(x - tw // 2, self.height() - 6, tick)
+            p.setPen(QPen(QColor(_BORDER), 1))
+
+        for i, (key, label, value) in enumerate(self._rows):
+            cy = pt + i * slot + slot / 2
+            p.setPen(QColor(_T2))
+            text = fm.elidedText(label, Qt.ElideRight, pl - 8)
+            p.drawText(4, int(cy + fm.ascent() / 2 - 2), text)
+            bw = (value / max_v) * w if value > 0 else 0
+            color = _SOURCE_BAR_COLORS.get(key) or _FUEL_SERIES_COLORS.get(key, _BLUE)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(color)))
+            p.drawRoundedRect(
+                int(pl), int(cy - bar_h / 2), max(0, int(bw)), int(bar_h), 3, 3
+            )
+            p.setPen(QColor(_T1))
+            p.drawText(
+                int(pl + bw + 6),
+                int(cy + fm.ascent() / 2 - 2),
+                _fmt_source_bar_label(value),
+            )
         p.end()
 
 
@@ -695,6 +793,7 @@ class OverviewWidget(QWidget):
         self._chart_currency = "TZS"
         self._month_totals: dict = {}
         self._categories: list[dict] = []
+        self._sources: list[dict] = []
         self._kpi_pending: Optional[_KPICard] = None
         self._kpi_master: Optional[_KPICard] = None
         self._kpi_verified: Optional[_KPICard] = None
@@ -707,6 +806,8 @@ class OverviewWidget(QWidget):
         self._bar_subtitle: Optional[QLabel] = None
         self._trend_toggle: Optional[_CurrencyToggle] = None
         self._category_toggle: Optional[_CurrencyToggle] = None
+        self._sources_chart: Optional[_SourcesHBarWidget] = None
+        self._sources_subtitle: Optional[QLabel] = None
         self._donut: Optional[_DonutChart] = None
         self._donut_legend_host: Optional[QVBoxLayout] = None
         self._fuel_period = "year"
@@ -715,6 +816,9 @@ class OverviewWidget(QWidget):
         self._fuel_subtitle: Optional[QLabel] = None
         self._fuel_toggle: Optional[_PeriodToggle] = None
         self._fuel_legend_host: Optional[QVBoxLayout] = None
+        self._fuel_spend: list[dict] = []
+        self._fuel_spend_chart: Optional[_SourcesHBarWidget] = None
+        self._fuel_spend_subtitle: Optional[QLabel] = None
         self._activity_card: Optional[_ActivityCard] = None
         self._fy_btn: Optional[QPushButton] = None
         self.setStyleSheet(
@@ -749,7 +853,11 @@ class OverviewWidget(QWidget):
         kpis = data["kpis"]
         self._month_totals = data["month_totals"]
         self._categories = data["categories"]
+        sources_payload = data.get("sources") or {}
+        self._sources = list(sources_payload.get("items") or [])
         self._fuel_daily = (data.get("fuel_liters") or {}).get("series") or {}
+        fuel_spend_payload = data.get("fuel_spend") or {}
+        self._fuel_spend = list(fuel_spend_payload.get("items") or [])
         recent = data["recent"]
 
         if self._kpi_pending:
@@ -776,8 +884,10 @@ class OverviewWidget(QWidget):
             )
 
         self._refresh_trend_chart()
+        self._refresh_sources_chart(sources_payload)
         self._refresh_category_chart()
         self._refresh_fuel_chart()
+        self._refresh_fuel_spend_chart(fuel_spend_payload)
         if self._activity_card:
             self._activity_card.set_transactions(recent)
 
@@ -798,6 +908,46 @@ class OverviewWidget(QWidget):
             return
         self._fuel_period = period
         self._refresh_fuel_chart()
+
+    def _refresh_sources_chart(self, sources_payload: dict | None = None) -> None:
+        payload = sources_payload or {}
+        items = list(payload.get("items") or self._sources or [])
+        rows = [
+            (
+                str(item.get("key") or ""),
+                str(item.get("label") or ""),
+                float(item.get("amount_tzs") or 0.0),
+            )
+            for item in items
+        ]
+        if self._sources_chart:
+            self._sources_chart.set_data(rows)
+        if self._sources_subtitle:
+            rate_source = str(payload.get("rate_source") or "").strip()
+            suffix = f" · rates {rate_source}" if rate_source else ""
+            self._sources_subtitle.setText(
+                f"Money-tab families converted to TZS{suffix}"
+            )
+
+    def _refresh_fuel_spend_chart(self, spend_payload: dict | None = None) -> None:
+        payload = spend_payload or {}
+        items = list(payload.get("items") or self._fuel_spend or [])
+        rows = [
+            (
+                str(item.get("key") or ""),
+                str(item.get("label") or ""),
+                float(item.get("amount_tzs") or 0.0),
+            )
+            for item in items
+        ]
+        if self._fuel_spend_chart:
+            self._fuel_spend_chart.set_data(rows)
+        if self._fuel_spend_subtitle:
+            rate_source = str(payload.get("rate_source") or "").strip()
+            suffix = f" · rates {rate_source}" if rate_source else ""
+            self._fuel_spend_subtitle.setText(
+                f"Stations + Diesel Cash → TZS{suffix}"
+            )
 
     def _refresh_fuel_chart(self) -> None:
         from tahmeed.services.accountant_service import bucket_daily_fuel_liters
@@ -872,7 +1022,7 @@ class OverviewWidget(QWidget):
                 self._donut_legend_host.addWidget(_donut_legend(slices))
             else:
                 self._donut_legend_host.addWidget(
-                    _lbl(f"No {self._chart_currency} category spend yet.", size=12, color=_TM)
+                    _lbl(f"No {self._chart_currency} source spend yet.", size=12, color=_TM)
                 )
 
     def _update_fy_button(self) -> None:
@@ -1005,7 +1155,7 @@ class OverviewWidget(QWidget):
         kpi_row.addWidget(self._kpi_supplier_usd)
         vl.addLayout(kpi_row)
 
-        # Charts row
+        # Charts row — trend | Sources | category donut
         charts_row = QHBoxLayout()
         charts_row.setSpacing(16)
 
@@ -1024,14 +1174,30 @@ class OverviewWidget(QWidget):
         bar_vl.addWidget(self._bar_subtitle)
         self._bar_chart = _BarChartWidget()
         bar_vl.addWidget(self._bar_chart, 1)
-        charts_row.addWidget(bar_card, 6)
+        charts_row.addWidget(bar_card, 5)
+
+        sources_card = _card()
+        sources_vl = QVBoxLayout(sources_card)
+        sources_vl.setContentsMargins(20, 18, 20, 18)
+        sources_vl.setSpacing(6)
+        sources_header = QHBoxLayout()
+        sources_header.addWidget(_lbl("Sources", size=14, weight=600))
+        sources_header.addStretch()
+        sources_vl.addLayout(sources_header)
+        self._sources_subtitle = _lbl(
+            "Money-tab families converted to TZS", size=12, color=_TM
+        )
+        sources_vl.addWidget(self._sources_subtitle)
+        self._sources_chart = _SourcesHBarWidget()
+        sources_vl.addWidget(self._sources_chart, 1)
+        charts_row.addWidget(sources_card, 4)
 
         pie_card = _card()
         pie_vl = QVBoxLayout(pie_card)
         pie_vl.setContentsMargins(20, 18, 20, 18)
         pie_vl.setSpacing(12)
         pie_header = QHBoxLayout()
-        pie_header.addWidget(_lbl("By category", size=14, weight=600))
+        pie_header.addWidget(_lbl("By source", size=14, weight=600))
         pie_header.addStretch()
         self._category_toggle = _CurrencyToggle()
         self._category_toggle.changed.connect(self._on_currency_changed)
@@ -1044,10 +1210,10 @@ class OverviewWidget(QWidget):
         self._donut_legend_host = QVBoxLayout(legend_wrap)
         self._donut_legend_host.setContentsMargins(0, 0, 0, 0)
         pie_vl.addWidget(legend_wrap)
-        charts_row.addWidget(pie_card, 4)
+        charts_row.addWidget(pie_card, 3)
         vl.addLayout(charts_row)
 
-        # Bottom row — fuel litres over time + recent activity
+        # Bottom row — fuel litres | fuel spend (TZS) | recent activity
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(16)
 
@@ -1072,13 +1238,30 @@ class OverviewWidget(QWidget):
         self._fuel_legend_host = QVBoxLayout(legend_wrap)
         self._fuel_legend_host.setContentsMargins(0, 4, 0, 0)
         fuel_vl.addWidget(legend_wrap)
-        bottom_row.addWidget(fuel_card, 6)
+        bottom_row.addWidget(fuel_card, 5)
+
+        fuel_spend_card = _card()
+        fuel_spend_card.setMinimumHeight(280)
+        fuel_spend_vl = QVBoxLayout(fuel_spend_card)
+        fuel_spend_vl.setContentsMargins(20, 18, 20, 18)
+        fuel_spend_vl.setSpacing(6)
+        fuel_spend_header = QHBoxLayout()
+        fuel_spend_header.addWidget(_lbl("Fuel spend", size=14, weight=600))
+        fuel_spend_header.addStretch()
+        fuel_spend_vl.addLayout(fuel_spend_header)
+        self._fuel_spend_subtitle = _lbl(
+            "Stations + Diesel Cash → TZS", size=12, color=_TM
+        )
+        fuel_spend_vl.addWidget(self._fuel_spend_subtitle)
+        self._fuel_spend_chart = _SourcesHBarWidget()
+        fuel_spend_vl.addWidget(self._fuel_spend_chart, 1)
+        bottom_row.addWidget(fuel_spend_card, 4)
 
         self._activity_card = _ActivityCard()
         self._activity_card.view_all_clicked.connect(
             lambda: self.navigate.emit("master_expenses")
         )
-        bottom_row.addWidget(self._activity_card, 4)
+        bottom_row.addWidget(self._activity_card, 3)
         vl.addLayout(bottom_row)
 
         # Quick actions

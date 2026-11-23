@@ -48,6 +48,7 @@ COLLAPSED_W = 64
 _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     (None, [
         ("overview",        "Overview",          "mdi.view-dashboard-outline", {}),
+        ("analytics",       "Analytics",         "mdi.chart-timeline-variant", {}),
         ("truck_overview",  "Truck Overview",    "mdi.truck-fast-outline",     {}),
     ]),
     ("CASHIER FLOW", [

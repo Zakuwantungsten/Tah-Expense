@@ -25,6 +25,7 @@ _APP_BG = "#F4F6F8"
 
 # Sidebar keys that map to dedicated pages (created on first visit).
 _LAZY_PAGE_KEYS = frozenset({
+    "analytics",
     "truck_overview",
     "verify",
     "drafts",
@@ -446,6 +447,10 @@ class AccountantDashboard(QWidget):
 
     def _create_page(self, key: str) -> QWidget:
         # Imports are deferred so login does not pay for every heavy module.
+        if key == "analytics":
+            from tahmeed.ui.accountant.analytics import AnalyticsWidget
+            return AnalyticsWidget()
+
         if key == "truck_overview":
             from tahmeed.ui.accountant.truck_overview import TruckOverviewWidget
             return TruckOverviewWidget()

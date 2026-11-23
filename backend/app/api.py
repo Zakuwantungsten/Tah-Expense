@@ -72,6 +72,7 @@ from .accountant_inbox_api import inbox as accountant_inbox_router
 from .accountant_diesel_api import diesel_cash as accountant_diesel_router
 from .accountant_master_api import master as accountant_master_router
 from .accountant_overview_api import overview as accountant_overview_router
+from .accountant_analytics_api import analytics as accountant_analytics_router
 from .accountant_rejected_api import rejected as accountant_rejected_router
 from .accountant_reports_api import reports as accountant_reports_router
 from .accountant_restores_api import restores as accountant_restores_router
@@ -111,6 +112,7 @@ accountant.include_router(accountant_master_router)
 accountant.include_router(accountant_reports_router)
 accountant.include_router(accountant_diesel_router)
 accountant.include_router(accountant_overview_router)
+accountant.include_router(accountant_analytics_router)
 accountant.include_router(accountant_truck_overview_router)
 accountant.include_router(accountant_fuel_overview_router)
 settings_api = APIRouter(prefix="/settings", tags=["settings"])
