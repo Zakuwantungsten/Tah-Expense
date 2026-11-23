@@ -128,6 +128,7 @@ class AccountantDashboard(QWidget):
         self._notification_poll_in_flight = False
         self._protect_verify_badge_until = 0.0
         self._notification_poll_task: asyncio.Task | None = None
+        self._notification_pause_event: asyncio.Event | None = None
         # Keep a timer only as a watchdog to restart a dead long-poll loop.
         self._notification_timer = QTimer(self)
         self._notification_timer.setInterval(int(_NOTIFICATION_WAIT_S * 1000) + 5_000)
@@ -1056,20 +1057,27 @@ class AccountantDashboard(QWidget):
     def pause_notification_polling(self) -> None:
         """Stop badge stream and connectivity polls during nested Qt dialogs.
 
-        Soft-stop only: clear the live flag and leave the long-poll Task alone.
-        Cancelling it (even deferred) while Save/Import runs nested Qt loops
-        makes Python 3.14 + qasync raise ``task_wakeup`` / CancelScope errors.
-        The loop exits itself after the current wait returns.
+        Soft-stop: clear the live flag and trip ``_notification_pause_event`` so
+        the long-poll race returns quickly. Do not ``Task.cancel()`` — under
+        Python 3.14 + qasync that raises ``task_wakeup`` while another Task is
+        in a nested Qt loop. Submit paths also ``await_blocking`` modals so a
+        late wait completion cannot nest into this Task mid-dialog.
         """
         self._notification_live = False
         self._notification_timer.stop()
         self._notification_poll_in_flight = False
+        ev = getattr(self, "_notification_pause_event", None)
+        if ev is not None and not ev.is_set():
+            ev.set()
         from tahmeed.services.connectivity_service import connectivity_monitor
 
         connectivity_monitor.pause()
 
     def resume_notification_polling(self) -> None:
         self._notification_live = True
+        ev = getattr(self, "_notification_pause_event", None)
+        if ev is not None and ev.is_set():
+            ev.clear()
         if not self._notification_timer.isActive():
             self._notification_timer.start()
         self._start_notification_stream()
@@ -1162,6 +1170,9 @@ class AccountantDashboard(QWidget):
             get_notification_counts,
             wait_notification_counts,
         )
+        from tahmeed.ui.async_utils import create_task
+
+        self._notification_pause_event = asyncio.Event()
 
         try:
             snap = await get_notification_counts(force=True)
@@ -1174,14 +1185,37 @@ class AccountantDashboard(QWidget):
 
         while self._notification_live:
             try:
-                # Short waits so soft-pause (_notification_live=False) is noticed
-                # quickly without cancelling the Task mid-flight.
-                payload = await wait_notification_counts(
-                    timeout=min(float(_NOTIFICATION_WAIT_S), 5.0)
+                # Race the HTTP wait against pause so soft-stop returns quickly
+                # without Task.cancel() (unsafe under Py3.14 nested Qt loops).
+                pause_ev = self._notification_pause_event
+                if pause_ev is None:
+                    pause_ev = asyncio.Event()
+                    self._notification_pause_event = pause_ev
+                pause_ev.clear()
+                wait_task = create_task(
+                    wait_notification_counts(
+                        timeout=min(float(_NOTIFICATION_WAIT_S), 5.0)
+                    )
                 )
-                if not self._notification_live:
+                pause_task = create_task(pause_ev.wait())
+                done, pending = await asyncio.wait(
+                    {wait_task, pause_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                if not self._notification_live or pause_task in done:
                     break
-                self._apply_notification_counts(payload)
+                if wait_task in done:
+                    payload = wait_task.result()
+                    if self._notification_live:
+                        self._apply_notification_counts(payload)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1194,6 +1228,8 @@ class AccountantDashboard(QWidget):
                     raise
                 except Exception:
                     pass
+                if not self._notification_live:
+                    break
                 await asyncio.sleep(2.0)
 
     async def _poll_notification_counts_async(self) -> None:

@@ -212,6 +212,7 @@ def test_note_verify_queue_bump_lights_sidebar_and_protects(monkeypatch) -> None
     dashboard._sidebar = sidebar
     dashboard._protect_verify_badge_until = 0.0
     dashboard._kick_notification_refresh = lambda: kicks.append("kick")
+    dashboard._apply_draft_badges = lambda _count: None
     dashboard._note_verify_queue_bump = (
         lambda n: AccountantDashboard._note_verify_queue_bump(dashboard, n)
     )

@@ -2,9 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from PySide6.QtWidgets import QApplication, QWidget
 
 from tahmeed.ui import async_utils
+
+
+def test_await_blocking_uses_async_wrap_on_running_loop(monkeypatch) -> None:
+    _app = QApplication.instance() or QApplication([])
+    calls: list[str] = []
+
+    async def fake_wrap(fn, *args, **kwargs):
+        calls.append("wrap")
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr("qasync.asyncWrap", fake_wrap)
+
+    async def _run() -> None:
+        result = await async_utils.await_blocking(lambda: 42)
+        assert result == 42
+
+    asyncio.run(_run())
+    assert calls == ["wrap"]
+    assert _app is not None
 
 
 def test_pause_background_polls_pauses_connectivity_without_dashboard(monkeypatch) -> None:

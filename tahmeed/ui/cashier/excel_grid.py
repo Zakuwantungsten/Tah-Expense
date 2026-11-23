@@ -3919,6 +3919,9 @@ class DailyRegister(QWidget):
 
         try:
             with pause_background_polls(self):
+                # Yield so a just-finished notification wait can exit before
+                # any modal — avoids Py3.14 task_wakeup nesting on submit.
+                await asyncio.sleep(0)
                 await self._submit_for_verify_body()
         finally:
             self._submit_in_flight = False
@@ -3926,20 +3929,26 @@ class DailyRegister(QWidget):
                 self.save_busy_changed.emit(False)
 
     async def _submit_for_verify_body(self) -> None:
+        from tahmeed.ui.async_utils import await_blocking
+
         self._commit_open_editor()
         if self._current_date is None:
-            QMessageBox.warning(
-                self,
-                "Reconciled Date required",
-                "Set Reconciled Date before submitting for verify.",
+            await await_blocking(
+                lambda: QMessageBox.warning(
+                    self,
+                    "Reconciled Date required",
+                    "Set Reconciled Date before submitting for verify.",
+                )
             )
             return
         if self.has_unsaved_work():
-            resp = QMessageBox.question(
-                self, "Unsaved changes",
-                "Save changes before submitting this day for verify?",
-                QMessageBox.Yes | QMessageBox.Cancel,
-                QMessageBox.Yes,
+            resp = await await_blocking(
+                lambda: QMessageBox.question(
+                    self, "Unsaved changes",
+                    "Save changes before submitting this day for verify?",
+                    QMessageBox.Yes | QMessageBox.Cancel,
+                    QMessageBox.Yes,
+                )
             )
             if resp != QMessageBox.Yes:
                 return
@@ -3951,26 +3960,33 @@ class DailyRegister(QWidget):
             return
         if not await self._confirm_day_issues_for_submit(d):
             return
-        resp = QMessageBox.question(
-            self, "Submit for Verify",
-            f"Submit all draft entries for {label} to the Verify inbox?\n\n"
-            "This sends the whole day's transactions (all cashiers).",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+        resp = await await_blocking(
+            lambda: QMessageBox.question(
+                self, "Submit for Verify",
+                f"Submit all draft entries for {label} to the Verify inbox?\n\n"
+                "This sends the whole day's transactions (all cashiers).",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
         )
         if resp != QMessageBox.Yes:
             return
         try:
             n = await submit_day_for_verify(d)
-            QMessageBox.information(
-                self, "Submitted",
-                f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for {label}.",
+            await await_blocking(
+                lambda: QMessageBox.information(
+                    self, "Submitted",
+                    f"{n:,} entr{'y' if n == 1 else 'ies'} sent to Verify for {label}.",
+                )
             )
             self.drafts_submitted.emit(int(n or 0))
             self.drafts_changed.emit()
             await self._load_date(d)
         except Exception as exc:
-            QMessageBox.critical(self, "Submit Failed", str(exc))
+            err = str(exc)
+            await await_blocking(
+                lambda: QMessageBox.critical(self, "Submit Failed", err)
+            )
 
     async def _confirm_parked_trucks_for_submit(self, d: date) -> bool:
         """Block submit while parked incorrect-truck rows remain on this day.
@@ -3978,6 +3994,8 @@ class DailyRegister(QWidget):
         Submit covers every cashier's drafts for the day, so any cashier's
         parked rows block it.
         """
+        from tahmeed.ui.async_utils import await_blocking
+
         if self._parked_mode:
             # Grid is the live copy of the local bucket while Parked is open.
             self._local_parked = self._table_parked_entries()
@@ -4001,15 +4019,17 @@ class DailyRegister(QWidget):
             return True
         label = d.strftime("%d %b %Y")
         plural = "s" if count != 1 else ""
-        resp = QMessageBox.warning(
-            self,
-            "Parked trucks block submit",
-            f"{count} parked truck row{plural} on {label} still need a correct "
-            "fleet number.\n\n"
-            "Open the Parked tab, fix the truck(s), then submit again.\n\n"
-            "Open Parked now?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+        resp = await await_blocking(
+            lambda: QMessageBox.warning(
+                self,
+                "Parked trucks block submit",
+                f"{count} parked truck row{plural} on {label} still need a correct "
+                "fleet number.\n\n"
+                "Open the Parked tab, fix the truck(s), then submit again.\n\n"
+                "Open Parked now?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
         )
         if resp == QMessageBox.Yes:
             self.set_view_mode("parked")
@@ -4019,6 +4039,7 @@ class DailyRegister(QWidget):
         """Block submit when Day Issues remain, unless the accountant setting allows it."""
         from tahmeed.services.day_issues_service import collect_day_issues
         from tahmeed.services.settings_service import get_setting
+        from tahmeed.ui.async_utils import await_blocking
 
         try:
             snap = await collect_day_issues(d)
@@ -4038,26 +4059,36 @@ class DailyRegister(QWidget):
             f"  · {snap.bad_map_count} bad map\n\n"
         )
         if not allow:
-            resp = QMessageBox.warning(
-                self,
-                "Day Issues block submit",
+            block_text = (
                 summary
                 + "Map descriptions on the Day Issues tab before submitting.\n\n"
-                "Open Day Issues now?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
+                "Open Day Issues now?"
+            )
+            resp = await await_blocking(
+                lambda: QMessageBox.warning(
+                    self,
+                    "Day Issues block submit",
+                    block_text,
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
             )
             if resp == QMessageBox.Yes:
                 self.day_issues_requested.emit(d)
             return False
-        resp = QMessageBox.question(
-            self,
-            "Submit with Day Issues?",
+        ask_text = (
             summary
             + "Submit is allowed with issues (accountant setting).\n\n"
-            "Submit anyway?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            "Submit anyway?"
+        )
+        resp = await await_blocking(
+            lambda: QMessageBox.question(
+                self,
+                "Submit with Day Issues?",
+                ask_text,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
         )
         return resp == QMessageBox.Yes
 

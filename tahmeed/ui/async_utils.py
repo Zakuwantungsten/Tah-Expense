@@ -93,6 +93,26 @@ def schedule_coro(coro: Coroutine[Any, Any, Any]) -> None:
         _kick()
 
 
+async def await_blocking(fn: Callable[[], Any]) -> Any:
+    """Run a blocking Qt modal (``QMessageBox``, file dialog) without nesting tasks.
+
+    Modal ``exec()`` pumps Qt events while the caller Task is still marked
+    current. Background Futures (notification long-poll, connectivity) then
+    wake via ``task_wakeup`` and Python 3.14 raises ``Cannot enter into task``.
+
+    ``qasync.asyncWrap`` schedules *fn* on a Qt timer so the modal runs with
+    no asyncio Task current — safe under 3.14. Outside a running loop, *fn*
+    runs inline.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return fn()
+    from qasync import asyncWrap
+
+    return await asyncWrap(fn)
+
+
 def find_poll_pausable(widget: Optional[QWidget]) -> Optional[Any]:
     """Walk parents for an object with ``pause_notification_polling``."""
     w = widget
