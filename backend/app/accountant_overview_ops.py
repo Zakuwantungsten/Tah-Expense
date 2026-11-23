@@ -28,34 +28,24 @@ DIESEL_STATION_FEED_TYPES: tuple[str, ...] = tuple(DIESEL_FEED_SOURCE_GROUP.keys
 
 
 @dataclass(frozen=True)
-class SourceFamilySpec:
+class SourceCoreSpec:
     key: str
     label: str
-    # Hint for bar end-label when a family is mostly one currency before FX.
+    # Hint for bar end-label when a series is mostly one currency before FX.
     display_currency: str
 
 
-SOURCE_FAMILIES: tuple[SourceFamilySpec, ...] = (
-    SourceFamilySpec("master", "Master", "TZS"),
-    SourceFamilySpec("fuel", "Fuel", "TZS"),
-    SourceFamilySpec("toll_zambia", "Toll/Zambia", "ZMW"),
-    SourceFamilySpec("congo", "Congo family", "USD"),
-    SourceFamilySpec("afritrack", "Afritrack", "USD"),
-    SourceFamilySpec("insurance", "Insurance", "TZS"),
-    SourceFamilySpec("sm_burhani", "SM Burhani", "USD"),
-    SourceFamilySpec("rahntech", "RahnTech", "USD"),
+# Master + Fuel stay as overview aggregates; every SEPARATE EXPENSES tab is its
+# own Sources bar (no Congo / Toll / Insurance family folding).
+SOURCE_CORE: tuple[SourceCoreSpec, ...] = (
+    SourceCoreSpec("master", "Master", "TZS"),
+    SourceCoreSpec("fuel", "Fuel", "TZS"),
 )
 
-# Separate-feed keys folded into each family (see SEPARATE_EXPENSE_FEEDS).
-# Covers every SEPARATE EXPENSES sidebar tab (excl. Uploads Trash).
-SOURCE_FAMILY_FEED_KEYS: dict[str, tuple[str, ...]] = {
-    "toll_zambia": ("toll_plaza", "zambia_parking"),
-    "congo": ("parking_congo", "congo_exp", "ahmed_kimvi"),
-    "afritrack": ("afritrack",),
-    "insurance": ("third_party", "comesa"),
-    "sm_burhani": ("sm_burhani",),
-    "rahntech": ("rahntech",),
-}
+# Back-compat aliases (older tests / imports).
+SourceFamilySpec = SourceCoreSpec
+SOURCE_FAMILIES = SOURCE_CORE
+SOURCE_FAMILY_FEED_KEYS: dict[str, tuple[str, ...]] = {}
 
 
 def empty_currency_bucket() -> dict[str, float]:
@@ -108,30 +98,73 @@ def primary_native_currency(bucket: dict[str, float]) -> str:
     return best[0]
 
 
+def _source_row(
+    *,
+    key: str,
+    label: str,
+    native: dict[str, float],
+    rates: dict[str, float],
+    display_currency: str = "TZS",
+) -> dict[str, Any]:
+    amount_tzs = bucket_to_tzs(native, rates)
+    return {
+        "key": key,
+        "label": label,
+        "amount_tzs": float(amount_tzs),
+        "currency": "TZS",
+        "native": {
+            "tzs": float(native.get("tzs") or 0.0),
+            "usd": float(native.get("usd") or 0.0),
+            "zmw": float(native.get("zmw") or 0.0),
+        },
+        "native_currency": primary_native_currency(native) or display_currency,
+    }
+
+
 def build_source_rows(
-    family_buckets: dict[str, dict[str, float]],
+    core_buckets: dict[str, dict[str, float]],
     rates: dict[str, float],
     *,
+    separate_feeds: Sequence[dict[str, Any]] | None = None,
     rate_source: str = "live",
 ) -> list[dict[str, Any]]:
-    """Assemble Overview Sources rows — all amounts converted to TZS for bar length."""
+    """Assemble Overview Sources bars — Master, Fuel, then each separate tab.
+
+    All amounts converted to TZS for bar length. Separate feeds are **not**
+    grouped into families.
+    """
+    _ = rate_source
     rows: list[dict[str, Any]] = []
-    for spec in SOURCE_FAMILIES:
-        native = add_currency_buckets(family_buckets.get(spec.key))
-        amount_tzs = bucket_to_tzs(native, rates)
+    for spec in SOURCE_CORE:
+        native = add_currency_buckets(core_buckets.get(spec.key))
         rows.append(
-            {
-                "key": spec.key,
-                "label": spec.label,
-                "amount_tzs": float(amount_tzs),
-                "currency": "TZS",
-                "native": {
-                    "tzs": float(native.get("tzs") or 0.0),
-                    "usd": float(native.get("usd") or 0.0),
-                    "zmw": float(native.get("zmw") or 0.0),
-                },
-                "native_currency": primary_native_currency(native) or spec.display_currency,
-            }
+            _source_row(
+                key=spec.key,
+                label=spec.label,
+                native=native,
+                rates=rates,
+                display_currency=spec.display_currency,
+            )
+        )
+    for feed in separate_feeds or ():
+        key = str(feed.get("key") or "").strip()
+        if not key:
+            continue
+        label = str(feed.get("label") or key).strip() or key
+        native = empty_currency_bucket()
+        accumulate_currency_amount(
+            native,
+            str(feed.get("currency") or ""),
+            float(feed.get("amount") or 0.0),
+        )
+        rows.append(
+            _source_row(
+                key=key,
+                label=label,
+                native=native,
+                rates=rates,
+                display_currency=str(feed.get("currency") or "TZS").upper() or "TZS",
+            )
         )
     rows.sort(key=lambda row: float(row.get("amount_tzs") or 0.0), reverse=True)
     return rows

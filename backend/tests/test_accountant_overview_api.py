@@ -697,10 +697,13 @@ def test_overview_kpis_categories_receipts_and_dashboard(monkeypatch) -> None:
     assert months.json()["feed_zmw_ytd"] == 30.0
     assert sources.status_code == 200
     source_items = {row["key"]: row for row in sources.json()["items"]}
-    assert source_items["toll_zambia"]["native"]["zmw"] == 30.0
-    assert source_items["congo"]["native"]["usd"] == 25.0
+    # Separate tabs are ungrouped — one bar per sidebar tab.
+    assert source_items["toll_plaza"]["native"]["zmw"] == 30.0
+    assert source_items["congo_exp"]["native"]["usd"] == 25.0
+    assert "congo" not in source_items
+    assert "toll_zambia" not in source_items
     assert source_items["fuel"]["native"]["tzs"] == 80.0 + 200.0
-    assert source_items["congo"]["amount_tzs"] == 25.0 * 2500.0
+    assert source_items["congo_exp"]["amount_tzs"] == 25.0 * 2500.0
     assert dash.status_code == 200
     assert "kpis" in dash.json()
     assert "sources" in dash.json()

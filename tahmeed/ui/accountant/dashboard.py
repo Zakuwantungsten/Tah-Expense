@@ -791,15 +791,24 @@ class AccountantDashboard(QWidget):
         current = self._sidebar.verify_badge() if hasattr(self._sidebar, "verify_badge") else 0
         self._sidebar.set_verify_badge(max(0, current + int(delta or 0)))
 
+    def _apply_draft_badges(self, count: int) -> None:
+        """Sidebar Saved/Drafts + ribbon Submit share the unsubmitted draft count."""
+        n = max(0, int(count or 0))
+        self._sidebar.set_drafts_badge(n)
+        if hasattr(self._sidebar, "set_saved_badge"):
+            self._sidebar.set_saved_badge(n)
+        page = self._pages.get("table")
+        content = getattr(page, "_content", page) if page is not None else None
+        if content is not None and hasattr(content, "set_submit_badge"):
+            content.set_submit_badge(n)
+
     def _note_submitted_drafts(self, updated: int) -> None:
         """Submit already returned the count — update badges without waiting on poll."""
         n = int(updated or 0)
         self._skip_draft_recount = True
         current = self._sidebar.drafts_badge() if hasattr(self._sidebar, "drafts_badge") else 0
         nxt = max(0, current - n)
-        self._sidebar.set_drafts_badge(nxt)
-        if hasattr(self._sidebar, "set_saved_badge"):
-            self._sidebar.set_saved_badge(nxt)
+        self._apply_draft_badges(nxt)
         # Optimistic Verify bump so the sidebar moves even if /wait is down.
         # Submit runs inside pause_background_polls; a force GET can briefly
         # still see the pre-submit counter — don't let that wipe this bump.
@@ -835,9 +844,7 @@ class AccountantDashboard(QWidget):
             count = await fetch_draft_badge_count(self._user, all_cashiers=True)
         except Exception:
             count = 0
-        self._sidebar.set_drafts_badge(count)
-        if hasattr(self._sidebar, "set_saved_badge"):
-            self._sidebar.set_saved_badge(count)
+        self._apply_draft_badges(count)
 
     def _refresh_saved_page(self) -> None:
         widget = self._pages.get("saved")
@@ -1118,10 +1125,7 @@ class AccountantDashboard(QWidget):
             self._protect_verify_badge_until = 0.0
         self._sidebar.set_verify_badge(incoming)
         if "drafts" in payload:
-            count = int(payload.get("drafts") or 0)
-            self._sidebar.set_drafts_badge(count)
-            if hasattr(self._sidebar, "set_saved_badge"):
-                self._sidebar.set_saved_badge(count)
+            self._apply_draft_badges(int(payload.get("drafts") or 0))
         if hasattr(self._sidebar, "set_receipt_storage_badge"):
             self._sidebar.set_receipt_storage_badge(
                 int(payload.get("receipt_storage_down") or 0)

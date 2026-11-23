@@ -74,15 +74,19 @@ class CheckableMultiCombo(QComboBox):
         all_label: str = "All",
         *,
         noun_plural: str = "selected",
+        searchable: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._all_label = all_label
         self._noun_plural = noun_plural
+        self._searchable = bool(searchable)
         self.setEditable(True)
-        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setReadOnly(not self._searchable)
         self.lineEdit().setPlaceholderText(all_label)
-        self.lineEdit().setCursor(Qt.PointingHandCursor)
+        self.lineEdit().setCursor(
+            Qt.IBeamCursor if self._searchable else Qt.PointingHandCursor
+        )
         self.setInsertPolicy(QComboBox.NoInsert)
         self.setMaxVisibleItems(14)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -97,6 +101,8 @@ class CheckableMultiCombo(QComboBox):
         self._pending_options: Optional[
             Tuple[Sequence[Union[str, Tuple[str, str]]], bool, bool]
         ] = None
+        self._all_options: List[Tuple[str, str]] = []
+        self._search_text = ""
         # Optional lazy distincts (Browse Advanced Item / Sub-Item Phase 2).
         self._options_loader: Optional[
             Callable[[], Union[Awaitable[Sequence[str]], Any]]
@@ -112,6 +118,8 @@ class CheckableMultiCombo(QComboBox):
         self.lineEdit().installEventFilter(self)
         self.view().viewport().installEventFilter(self)
         self._model.itemChanged.connect(self._on_item_changed)
+        if self._searchable:
+            self.lineEdit().textEdited.connect(self._on_search_edited)
         self._refresh_label()
 
     @staticmethod
@@ -182,6 +190,8 @@ class CheckableMultiCombo(QComboBox):
                 continue
             pairs.append((label, key))
         prev = set(self.selected_values()) if keep_selected else set()
+        self._all_options = list(pairs)
+        self._search_text = ""
         self._updating = True
         try:
             while self._model.rowCount() > 1:
@@ -199,6 +209,7 @@ class CheckableMultiCombo(QComboBox):
                 self._model.item(0).setCheckState(Qt.Checked)
                 for row in range(1, self._model.rowCount()):
                     self._model.item(row).setCheckState(Qt.Unchecked)
+            self._clear_row_filter()
         finally:
             self._updating = False
         self._options_stale = False
@@ -264,9 +275,19 @@ class CheckableMultiCombo(QComboBox):
         self._popup_shown_at = now
         self._block_hide_until = now + self._hide_guard_seconds()
         self._popup_open = True
+        if self._searchable:
+            # Clear closed-combo summary so typing filters the list.
+            le = self.lineEdit()
+            le.blockSignals(True)
+            le.clear()
+            le.blockSignals(False)
+            self._search_text = ""
+            self._clear_row_filter()
         super().showPopup()
         # Defer width bump — resizing the live popup on Windows can dismiss it.
         QTimer.singleShot(0, lambda w=width: self._ensure_popup_width(w))
+        if self._searchable:
+            QTimer.singleShot(0, self._focus_search_field)
 
     def _ensure_popup_width(self, width: int) -> None:
         if not self._popup_is_open():
@@ -312,6 +333,9 @@ class CheckableMultiCombo(QComboBox):
             return
         self._popup_open = False
         super().hidePopup()
+        if self._searchable:
+            self._search_text = ""
+            self._clear_row_filter()
         self._refresh_label()
         pending = self._pending_options
         self._pending_options = None
@@ -327,7 +351,8 @@ class CheckableMultiCombo(QComboBox):
     def eventFilter(self, obj, event) -> bool:
         if obj is self.lineEdit() and event.type() == QEvent.MouseButtonPress:
             self.showPopup()
-            return True
+            # Searchable: let the line edit keep focus for typing.
+            return not self._searchable
         if obj is self.view().viewport():
             if event.type() == QEvent.MouseButtonPress:
                 index = self.view().indexAt(event.position().toPoint())
@@ -348,6 +373,38 @@ class CheckableMultiCombo(QComboBox):
                         )
                         return True
         return super().eventFilter(obj, event)
+
+    def _focus_search_field(self) -> None:
+        if not self._searchable or not self._popup_is_open():
+            return
+        le = self.lineEdit()
+        le.setFocus(Qt.PopupFocusReason)
+        le.selectAll()
+
+    def _on_search_edited(self, text: str) -> None:
+        if not self._searchable:
+            return
+        self._search_text = str(text or "")
+        if not self._popup_is_open():
+            self.showPopup()
+        self._apply_row_filter(self._search_text)
+
+    def _clear_row_filter(self) -> None:
+        view = self.view()
+        for row in range(self._model.rowCount()):
+            view.setRowHidden(row, False)
+
+    def _apply_row_filter(self, text: str) -> None:
+        needle = str(text or "").strip().casefold()
+        view = self.view()
+        # Always keep the All / Select… row visible.
+        view.setRowHidden(0, False)
+        for row in range(1, self._model.rowCount()):
+            item = self._model.item(row)
+            if item is None:
+                continue
+            label = str(item.text() or "").casefold()
+            view.setRowHidden(row, bool(needle) and needle not in label)
 
     def _on_item_changed(self, item: QStandardItem) -> None:
         if self._updating:
@@ -398,9 +455,14 @@ class CheckableMultiCombo(QComboBox):
         return f"{len(labels)} {self._noun_plural}"
 
     def _refresh_label(self) -> None:
+        # Don't overwrite live search typing while the popup is open.
+        if self._searchable and self._popup_is_open():
+            return
         text = self.summary_text()
         le = self.lineEdit()
+        le.blockSignals(True)
         le.setText(text)
+        le.blockSignals(False)
         le.setToolTip(text)
         # Re-assert contrast after Qt may reset palette on editable combos.
         le.setStyleSheet(

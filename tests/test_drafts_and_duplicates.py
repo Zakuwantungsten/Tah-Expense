@@ -104,6 +104,18 @@ def test_duplicate_review_dialog_pairs_new_and_existing():
     assert dlg.save_anyway_rows() == {3}
 
 
+def test_duplicate_review_dialog_edit_mode_defer_label():
+    _app()
+    item = _sample_item()
+    dlg = DuplicateReviewDialog([item], dup_days=5, review_mode="edit")
+    assert "edited" in dlg.windowTitle().casefold()
+    assert "edited row" in dlg._title.text().casefold()
+    assert "skip for now" in dlg._subtitle.text().casefold()
+    dlg._accept_keep_for_later()
+    assert dlg.kept_for_later() is True
+    assert dlg.deferred_duplicate_rows() == {3}
+
+
 def test_duplicate_review_dialog_reimport_hint_when_most_rows_match():
     _app()
     items = []

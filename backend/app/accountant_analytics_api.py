@@ -696,7 +696,38 @@ async def analytics_dashboard(
 # ── Trends deep-dive (Phase 0 shell + Phase 1 Master) ─────────────────────────
 
 
+def _category_entity_rows(
+    docs: list[dict[str, Any]],
+    *,
+    kind: str,
+    key_prefix: str,
+    phase: int | None = None,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for doc in docs:
+        name = str(doc.get("name") or "").strip()
+        if not name:
+            continue
+        key = item_key_from_name(name)
+        if not key:
+            continue
+        label = str(doc.get("sidebar_label") or name).strip() or name
+        row: dict[str, Any] = {
+            "key": f"{key_prefix}:{key}",
+            "label": label,
+            "ready": True,
+            "kind": kind,
+            "category_name": name,
+        }
+        if phase is not None:
+            row["phase"] = phase
+        out.append(row)
+    out.sort(key=lambda r: str(r.get("label") or "").lower())
+    return out
+
+
 async def _sidebar_item_sources(db: Any) -> list[dict[str, Any]]:
+    """Sidebar-visible items only (Trends / monetary source pickers)."""
     try:
         docs = await db.categories.find(
             {
@@ -708,27 +739,26 @@ async def _sidebar_item_sources(db: Any) -> list[dict[str, Any]]:
         ).to_list(length=None)
     except Exception:
         docs = []
-    out: list[dict[str, Any]] = []
-    for doc in docs:
-        name = str(doc.get("name") or "").strip()
-        if not name:
-            continue
-        key = item_key_from_name(name)
-        if not key:
-            continue
-        label = str(doc.get("sidebar_label") or name).strip() or name
-        out.append(
+    return _category_entity_rows(
+        docs, kind="item", key_prefix="item", phase=2
+    )
+
+
+async def _item_entity_sources(db: Any) -> list[dict[str, Any]]:
+    """All active non-supplier items — full catalog for Entities search."""
+    try:
+        docs = await db.categories.find(
             {
-                "key": f"item:{key}",
-                "label": label,
-                "phase": 2,
-                "ready": True,
-                "kind": "item",
-                "category_name": name,
-            }
-        )
-    out.sort(key=lambda r: str(r.get("label") or "").lower())
-    return out
+                "is_supplier": {"$ne": True},
+                "active": {"$ne": False},
+            },
+            {"name": 1, "sidebar_label": 1},
+        ).to_list(length=None)
+    except Exception:
+        docs = []
+    return _category_entity_rows(
+        docs, kind="item", key_prefix="item", phase=2
+    )
 
 
 async def _master_truck_rows(
@@ -2270,29 +2300,47 @@ async def _supplier_entity_sources(db: Any) -> list[dict[str, Any]]:
         ).to_list(length=None)
     except Exception:
         docs = []
-    out: list[dict[str, Any]] = []
-    for doc in docs:
-        name = str(doc.get("name") or "").strip()
-        if not name:
-            continue
-        key = item_key_from_name(name)
-        if not key:
-            continue
-        label = str(doc.get("sidebar_label") or name).strip() or name
-        out.append(
-            {
-                "key": f"supplier:{key}",
-                "label": label,
-                "ready": True,
-                "kind": "supplier",
-                "category_name": name,
-            }
-        )
-    out.sort(key=lambda r: str(r.get("label") or "").lower())
-    return out
+    return _category_entity_rows(
+        docs, kind="supplier", key_prefix="supplier"
+    )
 
 
 async def _payee_entity_sources(db: Any) -> list[dict[str, Any]]:
+    """Full payee catalog: registry + every distinct payee on verified txs."""
+    by_key: dict[str, dict[str, Any]] = {}
+
+    def _add(name: str, *, count: int = 0) -> None:
+        name = str(name or "").strip()
+        if not name:
+            return
+        key = item_key_from_name(name) or name.casefold().replace(" ", "_")
+        if not key:
+            return
+        full_key = f"payee:{key}"
+        existing = by_key.get(full_key)
+        if existing is None:
+            by_key[full_key] = {
+                "key": full_key,
+                "label": name,
+                "ready": True,
+                "kind": "payee",
+                "payee": name,
+                "count": int(count or 0),
+            }
+            return
+        if count:
+            existing["count"] = max(int(existing.get("count") or 0), int(count))
+
+    try:
+        registry = await db.payees.find(
+            {},
+            {"name": 1},
+        ).to_list(length=None)
+    except Exception:
+        registry = []
+    for doc in registry:
+        _add(str(doc.get("name") or "").strip())
+
     docs = await aggregate_list(
         db.transactions,
         [
@@ -2313,31 +2361,19 @@ async def _payee_entity_sources(db: Any) -> list[dict[str, Any]]:
             {"$match": {"_id": {"$ne": ""}}},
             {"$sort": {"count": -1}},
         ],
-        300,
+        None,
     )
-    out: list[dict[str, Any]] = []
     for doc in docs:
-        name = str(doc.get("_id") or "").strip()
-        if not name:
-            continue
-        key = item_key_from_name(name) or name.casefold().replace(" ", "_")
-        out.append(
-            {
-                "key": f"payee:{key}",
-                "label": name,
-                "ready": True,
-                "kind": "payee",
-                "payee": name,
-                "count": int(doc.get("count") or 0),
-            }
-        )
+        _add(str(doc.get("_id") or "").strip(), count=int(doc.get("count") or 0))
+
+    out = list(by_key.values())
     out.sort(key=lambda r: str(r.get("label") or "").lower())
     return out
 
 
 async def _entity_families_catalog(db: Any) -> list[dict[str, Any]]:
     items, suppliers, payees = await asyncio.gather(
-        _sidebar_item_sources(db),
+        _item_entity_sources(db),
         _supplier_entity_sources(db),
         _payee_entity_sources(db),
     )

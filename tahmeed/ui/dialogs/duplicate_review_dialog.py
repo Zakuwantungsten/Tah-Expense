@@ -171,6 +171,7 @@ class DuplicateReviewDialog(QDialog):
         lookback_value: int | None = None,
         lookback_unit: str = "days",
         allow_rescan: bool = True,
+        review_mode: str = "insert",
     ) -> None:
         super().__init__(parent)
         self._items = list(items)
@@ -192,6 +193,12 @@ class DuplicateReviewDialog(QDialog):
             else len(self._items)
         )
         self._allow_rescan = bool(allow_rescan)
+        # "edit" = saving changes to already-saved rows (defer leaves them dirty).
+        self._review_mode = (
+            "edit"
+            if str(review_mode or "").strip().casefold() == "edit"
+            else "insert"
+        )
         self._save_anyway_rows: Set[int] = set()
         self._keep_for_later = False
         self._requested_rescan_days: int | None = None
@@ -212,7 +219,11 @@ class DuplicateReviewDialog(QDialog):
         self._source_pills: Dict[str, _FilterPill] = {}
         self._truck_pills: Dict[str, _FilterPill] = {}
 
-        self.setWindowTitle("Possible duplicates")
+        self.setWindowTitle(
+            "Possible duplicates (edited rows)"
+            if self._review_mode == "edit"
+            else "Possible duplicates"
+        )
         self.setMinimumSize(780, 420)
         self.resize(900, 480)
         self.setStyleSheet(f"background:{_WHITE}; color:{_T1};")
@@ -404,11 +415,22 @@ class DuplicateReviewDialog(QDialog):
 
         buttons = QDialogButtonBox()
         save_btn = buttons.addButton("Save checked", QDialogButtonBox.AcceptRole)
-        keep_btn = buttons.addButton("Move to Skipped", QDialogButtonBox.ActionRole)
-        keep_btn.setToolTip(
-            "Move these possible duplicates to the Skipped tab. "
-            "Revive them onto My entries later, or Discard."
-        )
+        if self._review_mode == "edit":
+            keep_btn = buttons.addButton(
+                "Skip for now", QDialogButtonBox.ActionRole
+            )
+            keep_btn.setToolTip(
+                "Leave these edited rows unsaved (still dirty). "
+                "Fix them or Save again later."
+            )
+        else:
+            keep_btn = buttons.addButton(
+                "Move to Skipped", QDialogButtonBox.ActionRole
+            )
+            keep_btn.setToolTip(
+                "Move these possible duplicates to the Skipped tab. "
+                "Revive them onto My entries later, or Discard."
+            )
         cancel_btn = buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
         for btn, style in (
             (
@@ -440,6 +462,21 @@ class DuplicateReviewDialog(QDialog):
         n = len(self._items)
         window = self._window_label()
         reimport = self._looks_like_reimport()
+        if self._review_mode == "edit":
+            self._title.setText(
+                f"{n} edited row{'s' if n != 1 else ''} may duplicate "
+                f"past expenses · checked {window}"
+            )
+            self._title.setStyleSheet(
+                f"font-size:14px;font-weight:700;color:{_T1};"
+                "font-family:'Segoe UI',sans-serif;"
+            )
+            self._subtitle.setText(
+                "Each pair shows the edited row (red) above the matching expense "
+                "(cream). Tick Save to keep the edit anyway — it will be flagged "
+                "for Verify → Issues. Skip for now leaves those edits unsaved."
+            )
+            return
         if reimport:
             self._title.setText(
                 f"Looks like a reimport — {n} of {self._pending_total} new "

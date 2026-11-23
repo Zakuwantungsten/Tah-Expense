@@ -1,4 +1,4 @@
-"""Analytics → Entities (earth tab): Items / Payees / Suppliers deep-dive + compare."""
+"""Analytics → Entities (earth tab): Items / Payees / Suppliers deep-dive."""
 
 from __future__ import annotations
 
@@ -23,11 +23,9 @@ from tahmeed.ui.accountant.analytics import (
     _VBarChartWidget, _HBarChartWidget, _DonutChart, _donut_legend,
 )
 
-_COMPARE_MAX = 4
-
 
 class AnalyticsEntitiesPage(QWidget):
-    """Earth-tab shell: pick Items / Payees / Suppliers, then merge or compare."""
+    """Earth-tab shell: bulk-select Items / Payees / Suppliers for combined deep-dive."""
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -37,7 +35,6 @@ class AnalyticsEntitiesPage(QWidget):
         self._month = today.month
         self._family = "items"
         self._entity_keys: list[str] = []
-        self._mode = "merge"  # merge | compare
         self._chart_currency = "TZS"
         self._loading = False
         self._sources_loaded = False
@@ -46,7 +43,6 @@ class AnalyticsEntitiesPage(QWidget):
         self._entities: list[dict] = []
 
         self._family_btns: list[QPushButton] = []
-        self._mode_btns: list[QPushButton] = []
         self._entity_combo: Optional[CheckableMultiCombo] = None
         self._load_timer: Optional[QTimer] = None
         self._year_btn: Optional[QPushButton] = None
@@ -71,11 +67,6 @@ class AnalyticsEntitiesPage(QWidget):
         self._receipts_legend: Optional[QVBoxLayout] = None
         self._receipts_title: Optional[QLabel] = None
         self._currency_toggles: list[_CurrencyToggle] = []
-
-        self._cmp_kpi_row: Optional[QHBoxLayout] = None
-        self._cmp_kpi_cards: list[_KPICard] = []
-        self._cmp_line: Optional[_LineChartWidget] = None
-        self._cmp_rank: Optional[_HBarChartWidget] = None
 
         self.setStyleSheet(
             f"AnalyticsEntitiesPage {{ background: {_BG}; border: none; }}"
@@ -140,71 +131,39 @@ class AnalyticsEntitiesPage(QWidget):
         self._entity_combo.set_selected_keys(keep, emit=False)
         self._entity_keys = list(self._entity_combo.selected_values())
 
-    def _effective_mode(self, keys: list[str] | None = None) -> str:
-        selected = list(keys if keys is not None else self._entity_keys)
-        if self._mode == "compare" and len(selected) >= 2:
-            return "compare"
-        return "merge"
-
     async def _load(self) -> None:
         if self._loading:
             return
         keys = list(self._entity_keys)
-        self._sync_mode_buttons()
         if not keys:
             self._data = {
                 "ready": False,
                 "mode": "merge",
                 "label": self._family_label(),
                 "message": (
-                    f"Select one or more {self._family_label().lower()} "
+                    f"Search and tick one or more {self._family_label().lower()} "
                     "above to begin deep analysis."
                 ),
             }
             self._apply()
             return
-        mode = self._effective_mode(keys)
-        if self._mode == "compare" and len(keys) < 2:
-            self._data = {
-                "ready": False,
-                "mode": "compare",
-                "label": self._family_label(),
-                "message": "Compare needs at least 2 selected entities.",
-            }
-            self._apply()
-            return
         self._loading = True
-        show_widget_loading(
-            self,
-            "Comparing entities…" if mode == "compare" else "Loading entity trends…",
-        )
-        from tahmeed.services.accountant_service import (
-            get_analytics_entities,
-            get_analytics_entities_compare,
-        )
+        show_widget_loading(self, "Loading entity trends…")
+        from tahmeed.services.accountant_service import get_analytics_entities
         try:
             month = self._month if self._period == "month" else None
-            if mode == "compare":
-                self._data = await get_analytics_entities_compare(
-                    self._family,
-                    keys[:_COMPARE_MAX],
-                    self._year,
-                    period=self._period,
-                    month=month,
-                )
-            else:
-                self._data = await get_analytics_entities(
-                    self._family,
-                    keys,
-                    self._year,
-                    period=self._period,
-                    month=month,
-                )
+            self._data = await get_analytics_entities(
+                self._family,
+                keys,
+                self._year,
+                period=self._period,
+                month=month,
+            )
             self._apply()
         except Exception as exc:
             self._data = {
                 "ready": False,
-                "mode": mode,
+                "mode": "merge",
                 "label": ", ".join(keys[:3]),
                 "message": f"Could not load entity trends.\n{exc}",
             }
@@ -242,13 +201,9 @@ class AnalyticsEntitiesPage(QWidget):
                 self._status_lbl.show()
             else:
                 self._status_lbl.hide()
-        mode = str(self._data.get("mode") or self._effective_mode())
-        self._body_stack.setCurrentIndex(2 if mode == "compare" else 1)
+        self._body_stack.setCurrentIndex(1)
         self._update_chrome()
-        if mode == "compare":
-            self._apply_compare()
-        else:
-            self._apply_live()
+        self._apply_live()
 
     def _update_chrome(self) -> None:
         if self._year_btn:
@@ -258,21 +213,18 @@ class AnalyticsEntitiesPage(QWidget):
                 self._period_btn.setText(f"{_MONTH_ABBR[self._month - 1]} only")
             else:
                 self._period_btn.setText("Full year")
-        self._sync_mode_buttons()
         if self._subtitle:
             label = str(self._data.get("label") or "—")
             fam = self._family_label()
             n = len(self._data.get("entities") or self._entity_keys or [])
-            mode = str(self._data.get("mode") or self._effective_mode())
-            if mode == "compare":
+            mix = str(self._data.get("mix_label") or "mix").lower()
+            if n > 1:
                 self._subtitle.setText(
-                    f"{fam} · Compare {n}: {label} — overlay trend + ranked totals."
+                    f"{fam} · {n} selected: {label} — combined deep-dive."
                 )
             else:
-                mix = str(self._data.get("mix_label") or "mix").lower()
-                scope = f"{n} selected" if n > 1 else "deep-dive"
                 self._subtitle.setText(
-                    f"{fam} · {label} — {scope}: {mix}, trucks, YoY deltas, receipts."
+                    f"{fam} · {label} — deep-dive: {mix}, trucks, YoY deltas, receipts."
                 )
 
     def _apply_live(self) -> None:
@@ -457,28 +409,6 @@ class AnalyticsEntitiesPage(QWidget):
             active = str(btn.property("family_key") or "") == self._family
             btn.setChecked(active)
 
-    def _on_mode(self, mode: str) -> None:
-        mode = "compare" if mode == "compare" else "merge"
-        if mode == self._mode:
-            return
-        self._mode = mode
-        self._sync_mode_buttons()
-        from tahmeed.ui.async_utils import schedule_coro
-        schedule_coro(self._load())
-
-    def _sync_mode_buttons(self) -> None:
-        can_compare = len(self._entity_keys) >= 2
-        for btn in self._mode_btns:
-            key = str(btn.property("mode_key") or "")
-            btn.setChecked(key == self._mode)
-            if key == "compare":
-                btn.setEnabled(can_compare or self._mode == "compare")
-                btn.setToolTip(
-                    "Select 2–4 entities to compare"
-                    if not can_compare
-                    else "Overlay trends for selected entities"
-                )
-
     def _on_entity_changed(self) -> None:
         if not self._entity_combo:
             return
@@ -527,91 +457,7 @@ class AnalyticsEntitiesPage(QWidget):
             if toggle.currency() != currency:
                 toggle.set_currency(currency, emit=False)
         if bool(self._data.get("ready")):
-            mode = str(self._data.get("mode") or self._effective_mode())
-            if mode == "compare":
-                self._apply_compare()
-            else:
-                self._apply_live()
-
-    def _apply_compare(self) -> None:
-        series = list(self._data.get("series") or [])
-        ranked = list(self._data.get("ranked") or [])
-        cur = self._chart_currency
-        key = _CURRENCY_KEY.get(cur, "tzs")
-        label = str(self._data.get("period_label") or self._year)
-
-        # KPI strip — one card per entity (cap 4).
-        while self._cmp_kpi_cards and len(self._cmp_kpi_cards) > len(series):
-            card = self._cmp_kpi_cards.pop()
-            if self._cmp_kpi_row is not None:
-                self._cmp_kpi_row.removeWidget(card)
-            card.deleteLater()
-        while len(self._cmp_kpi_cards) < len(series) and self._cmp_kpi_row is not None:
-            card = _KPICard("mdi.circle", _BLUE, _BLUE_L, "—", "Entity")
-            card.period_menu_requested.connect(self._popup_period_menu)
-            self._cmp_kpi_cards.append(card)
-            self._cmp_kpi_row.addWidget(card)
-        for i, row in enumerate(series):
-            if i >= len(self._cmp_kpi_cards):
-                break
-            card = self._cmp_kpi_cards[i]
-            totals = row.get("totals") or {}
-            prior = row.get("prior_totals") or {}
-            amt = float(totals.get(key) or 0.0)
-            prior_amt = float(prior.get(key) or 0.0)
-            delta = amt - prior_amt
-            sign = "+" if delta > 0 else ""
-            card.set_value(_fmt_currency_short(cur, amt))
-            card.set_label(str(row.get("label") or f"Entity {i + 1}"))
-            card.set_period_text(
-                f"{label} · YoY {sign}{_fmt_currency_short(cur, delta)}"
-            )
-
-        # Overlay month trend — one series per entity for the selected year.
-        today = date.today()
-        end_month = today.month if self._year == today.year else 12
-        months = list(_MONTH_ABBR[:end_month])
-        chart_series: list[tuple[str, str, list[float]]] = []
-        for row in series:
-            trend = list(row.get("month_trend") or [])
-            raw = []
-            for m in range(1, end_month + 1):
-                hit = next((r for r in trend if int(r.get("month") or 0) == m), None)
-                raw.append(float((hit or {}).get(key) or 0.0))
-            vals, _ = _chart_values(cur, raw)
-            chart_series.append(
-                (
-                    str(row.get("label") or row.get("key") or "—"),
-                    str(row.get("color") or _BLUE),
-                    vals,
-                )
-            )
-        if self._cmp_line:
-            self._cmp_line.set_data(
-                months,
-                chart_series,
-                empty="No spend for this period.",
-            )
-
-        # Ranked totals bar.
-        rank_rows: list[tuple[str, float]] = []
-        raw_vals: list[float] = []
-        for row in ranked:
-            amt = float(row.get(key) or 0.0)
-            if abs(amt) < 1e-9:
-                continue
-            rank_rows.append((str(row.get("label") or "—"), abs(amt)))
-            raw_vals.append(abs(amt))
-        scaled, _ = _chart_values(cur, raw_vals)
-        scaled_rows = [
-            (lab, scaled[i] if i < len(scaled) else 0.0)
-            for i, (lab, _) in enumerate(rank_rows)
-        ]
-        if self._cmp_rank:
-            self._cmp_rank.set_data(
-                scaled_rows,
-                empty="No totals to rank for this selection.",
-            )
+            self._apply_live()
 
     def _make_currency_toggle(self) -> _CurrencyToggle:
         toggle = _CurrencyToggle()
@@ -671,7 +517,7 @@ class AnalyticsEntitiesPage(QWidget):
         left.setSpacing(4)
         left.addWidget(_lbl("Entities", size=22, weight=700))
         self._subtitle = _lbl(
-            "Deep-dive Items, Payees, or Suppliers from Master spend.",
+            "Search and tick Items, Payees, or Suppliers — multi-select combines into one deep-dive.",
             size=13,
             color=_T2,
         )
@@ -697,33 +543,13 @@ class AnalyticsEntitiesPage(QWidget):
         if self._family_btns:
             self._family_btns[0].setChecked(True)
 
-        for key, label in (("merge", "Merge"), ("compare", "Compare")):
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(34)
-            btn.setProperty("mode_key", key)
-            btn.setStyleSheet(
-                f"QPushButton {{"
-                f"  background: {_WHITE}; border: 1px solid {_BORDER}; border-radius: 8px;"
-                f"  padding: 0 12px; font-size: 13px; font-weight: 600; color: {_T1};"
-                f"}}"
-                f"QPushButton:checked {{ background: {_AMBER_L}; border-color: {_AMBER}; color: {_NAVY}; }}"
-                f"QPushButton:disabled {{ color: {_TM}; background: #F8FAFC; }}"
-            )
-            btn.clicked.connect(lambda _=False, k=key: self._on_mode(k))
-            self._mode_btns.append(btn)
-            header.addWidget(btn)
-        if self._mode_btns:
-            self._mode_btns[0].setChecked(True)
-            self._mode_btns[1].setEnabled(False)
-
         self._entity_combo = CheckableMultiCombo(
             all_label="Select items…",
             noun_plural="items",
+            searchable=True,
             parent=self,
         )
-        self._entity_combo.setMinimumWidth(240)
+        self._entity_combo.setMinimumWidth(280)
         self._entity_combo.setFixedHeight(34)
         self._entity_combo.setStyleSheet(
             f"QComboBox {{"
@@ -773,9 +599,8 @@ class AnalyticsEntitiesPage(QWidget):
         vl.addWidget(self._status_lbl)
 
         self._body_stack = QStackedWidget()
-        self._body_stack.addWidget(self._build_empty())       # 0
-        self._body_stack.addWidget(self._build_live())        # 1 merge
-        self._body_stack.addWidget(self._build_compare())     # 2 compare
+        self._body_stack.addWidget(self._build_empty())  # 0
+        self._body_stack.addWidget(self._build_live())   # 1
         vl.addWidget(self._body_stack, 1)
 
         scroll.setWidget(content)
@@ -792,8 +617,8 @@ class AnalyticsEntitiesPage(QWidget):
         vl = QVBoxLayout(page)
         vl.addStretch()
         msg = _lbl(
-            "Choose Items, Payees, or Suppliers, then tick entities. "
-            "Use Merge for combined analysis, or Compare (2–4) for overlay charts.",
+            "Choose Items, Payees, or Suppliers, then search and tick one or more. "
+            "Multiple selections combine into a single deep-dive.",
             size=14,
             color=_T2,
             wrap=True,
@@ -871,30 +696,6 @@ class AnalyticsEntitiesPage(QWidget):
         rvl.addWidget(legend_wrap)
         row2.addWidget(receipt_card, 1)
         vl.addLayout(row2)
-        return page
-
-    def _build_compare(self) -> QWidget:
-        page = QWidget()
-        page.setStyleSheet(f"background: {_BG}; border: none;")
-        vl = QVBoxLayout(page)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(14)
-
-        self._cmp_kpi_row = QHBoxLayout()
-        self._cmp_kpi_row.setSpacing(10)
-        vl.addLayout(self._cmp_kpi_row)
-
-        row = QHBoxLayout()
-        row.setSpacing(12)
-        self._cmp_line = _LineChartWidget()
-        row.addWidget(
-            self._chart_shell("Spend trend (overlay)", self._cmp_line), 2
-        )
-        self._cmp_rank = _HBarChartWidget()
-        row.addWidget(
-            self._chart_shell("Ranked totals", self._cmp_rank), 1
-        )
-        vl.addLayout(row)
         return page
 
     @staticmethod

@@ -1729,24 +1729,32 @@ class DailyRegister(QWidget):
         self,
         draft_inserts: list[tuple[int, Transaction]],
         days: int,
+        *,
+        exclude_ids: dict[int, object] | None = None,
     ) -> list[DuplicateReviewItem]:
-        """DB bulk soft-dup + within-table twins for the given draft inserts."""
+        """DB bulk soft-dup + within-table twins for the given draft inserts.
+
+        ``exclude_ids`` maps row → transaction id so edited rows do not match
+        themselves when rescanning past records.
+        """
         if not draft_inserts:
             return []
+        exclude_ids = exclude_ids or {}
         dup_hits: list = [[] for _ in draft_inserts]
         try:
-            dup_hits = await check_for_duplicates_bulk(
-                [
-                    {
-                        "truck_number": tx.truck_number or "",
-                        "amount": tx.amount,
-                        "item": tx.item or "",
-                        "description": tx.description or "",
-                    }
-                    for _row, tx in draft_inserts
-                ],
-                int(days),
-            )
+            candidates = []
+            for row, tx in draft_inserts:
+                body = {
+                    "truck_number": tx.truck_number or "",
+                    "amount": tx.amount,
+                    "item": tx.item or "",
+                    "description": tx.description or "",
+                }
+                exclude_id = exclude_ids.get(row)
+                if exclude_id is not None:
+                    body["exclude_id"] = exclude_id
+                candidates.append(body)
+            dup_hits = await check_for_duplicates_bulk(candidates, int(days))
         except Exception:
             dup_hits = [[] for _ in draft_inserts]
 
@@ -1774,6 +1782,101 @@ class DailyRegister(QWidget):
             )
         )
         return items
+
+    async def _review_edit_soft_duplicates(
+        self,
+        edit_rows: list[tuple[int, object, dict]],
+        *,
+        dup_days: int,
+    ) -> set[int] | None:
+        """Rescan soft-dups for dirty saved rows. Returns rows to skip, or None=abort.
+
+        Checked edits proceed (flagged when matching past expenses). Deferred
+        edits stay dirty. Cancel aborts the whole Save.
+        """
+        if not edit_rows:
+            return set()
+        row_txs: list[tuple[int, Transaction]] = []
+        exclude_ids: dict[int, object] = {}
+        updates_by_row: dict[int, dict] = {}
+        for row, tx_id, updates in edit_rows:
+            try:
+                tx = self._build_transaction_from_row(row)
+            except ValueError:
+                continue
+            if tx is None:
+                continue
+            row_txs.append((row, tx))
+            exclude_ids[row] = tx_id
+            updates_by_row[row] = updates
+
+        if not row_txs:
+            return set()
+
+        from tahmeed.ui.async_utils import pause_background_polls
+        from tahmeed.ui.widgets.export_runner import await_ui
+
+        lookback_unit = "days"
+        lookback_value = int(dup_days)
+        save_checks: set[int] = set()
+        while True:
+            self._show_register_loading(
+                f"Checking edited duplicates ({len(row_txs)})…"
+            )
+            duplicate_items = await self._scan_soft_duplicates(
+                row_txs, int(dup_days), exclude_ids=exclude_ids
+            )
+            if not duplicate_items:
+                for body in updates_by_row.values():
+                    body["possible_duplicate"] = False
+                    body["duplicate_of_id"] = None
+                return set()
+            dlg = DuplicateReviewDialog(
+                duplicate_items,
+                dup_days=int(dup_days),
+                parent=self,
+                pending_total=len(row_txs),
+                initial_checked=save_checks,
+                lookback_value=lookback_value,
+                lookback_unit=lookback_unit,
+                allow_rescan=True,
+                review_mode="edit",
+            )
+            with pause_background_polls(self):
+                accepted = await await_ui(lambda: dlg.exec() == QDialog.Accepted)
+            if not accepted:
+                return None
+            rescan_days = dlg.requested_rescan_days()
+            if rescan_days is not None:
+                dup_days = int(rescan_days)
+                lookback_unit = dlg.lookback_unit()
+                lookback_value = dlg.lookback_value()
+                save_checks = dlg.checked_rows_snapshot()
+                continue
+            save_anyway = dlg.save_anyway_rows()
+            deferred = dlg.deferred_duplicate_rows()
+            flagged = {item.row for item in duplicate_items}
+            for row, body in updates_by_row.items():
+                if row not in flagged:
+                    body["possible_duplicate"] = False
+                    body["duplicate_of_id"] = None
+            for item in duplicate_items:
+                row = item.row
+                body = updates_by_row.get(row)
+                if body is None:
+                    continue
+                if row in save_anyway:
+                    body["possible_duplicate"] = True
+                    existing = item.existing
+                    dup_id = getattr(existing, "_id", None)
+                    body["duplicate_of_id"] = dup_id if dup_id is not None else None
+                elif row in deferred:
+                    # Leave dirty — do not clear possible_duplicate here.
+                    pass
+                else:
+                    body["possible_duplicate"] = False
+                    body["duplicate_of_id"] = None
+            return set(deferred)
 
     def _show_register_loading(
         self,
@@ -2750,8 +2853,9 @@ class DailyRegister(QWidget):
         """Move Parked rows with an accepted truck onto My entries immediately.
 
         Used after Fix parked trucks (Allow / Allow all / Apply). Local parked
-        rows are appended to the keep-alive My grid; saved ``register_status=
-        parked`` leftovers are unparked to draft on the server (truck + status).
+        rows are appended to the keep-alive My grid (no soft-dup here — Save
+        scans them). Saved ``register_status=parked`` leftovers are unparked to
+        draft on the server; that path runs a scoped soft-dup for those rows.
         """
         if not self._parked_mode:
             return 0
@@ -3476,6 +3580,335 @@ class DailyRegister(QWidget):
         if self._submit_in_flight or self._save_in_flight:
             return
         asyncio.ensure_future(self._do_submit_for_verify())
+
+    def scan_duplicates(self) -> None:
+        """Ribbon Dupes — soft-dup scan / rescan for the open My day."""
+        if self._submit_in_flight or self._save_in_flight:
+            return
+        asyncio.ensure_future(self._do_scan_duplicates())
+
+    async def _do_scan_duplicates(self) -> None:
+        if self._submit_in_flight or self._save_in_flight:
+            return
+        self._save_in_flight = True
+        self.save_busy_changed.emit(True)
+        from tahmeed.ui.async_utils import pause_background_polls
+
+        try:
+            with pause_background_polls(self):
+                await self._scan_duplicates_body()
+        finally:
+            self._save_in_flight = False
+            if not self._submit_in_flight:
+                self.save_busy_changed.emit(False)
+                self._hide_register_loading()
+
+    def _collect_soft_dup_scan_candidates(
+        self,
+    ) -> tuple[list[tuple[int, Transaction]], dict[int, object]]:
+        """My-surface rows eligible for an on-demand soft-dup scan.
+
+        Includes draft/dirty saved rows (exclude self via tx id) and filled
+        unsaved rows that are not parked.
+        """
+        row_txs: list[tuple[int, Transaction]] = []
+        exclude_ids: dict[int, object] = {}
+        for row in range(self._saved_count):
+            tx_orig = self._saved_txs.get(row)
+            if tx_orig is None:
+                continue
+            status = getattr(tx_orig, "register_status", "") or "submitted"
+            if status == "parked":
+                continue
+            if status != "draft" and row not in self._dirty_rows:
+                continue
+            try:
+                tx = self._build_transaction_from_row(row)
+            except ValueError:
+                continue
+            if tx is None:
+                continue
+            row_txs.append((row, tx))
+            tx_id = self._saved_ids.get(row)
+            if tx_id is not None:
+                exclude_ids[row] = tx_id
+        for row in range(self._saved_count, self._table.rowCount()):
+            if not self._row_has_data(row):
+                continue
+            if self._row_marked_parked(row):
+                continue
+            try:
+                tx = self._build_transaction_from_row(row)
+            except ValueError:
+                continue
+            if tx is None:
+                continue
+            row_txs.append((row, tx))
+        return row_txs, exclude_ids
+
+    def _apply_dup_flag_visual(self, row: int, flagged: bool) -> None:
+        """Tint / clear Description when a possible-duplicate flag changes."""
+        it = self._table.item(row, COL_DESC)
+        if it is None:
+            return
+        if flagged:
+            it.setBackground(QBrush(DUP_BG))
+            it.setToolTip(
+                "Possible duplicate — similar entry found within the check window"
+            )
+        else:
+            tip = it.toolTip() or ""
+            if "Possible duplicate" in tip:
+                it.setToolTip("")
+            it.setBackground(self._item_row_background(row))
+
+    async def _scan_duplicates_body(self) -> None:
+        """Run soft-dup review for current My candidates; apply keep / skip."""
+        self._commit_open_editor()
+        if self._current_date is None:
+            QMessageBox.warning(
+                self,
+                "Reconciled Date required",
+                "Set Reconciled Date before scanning duplicates.",
+            )
+            return
+        if self._parked_mode or self._skipped_mode or self._merged_mode:
+            if not await self._set_view_mode_and_wait("my"):
+                return
+
+        row_txs, exclude_ids = self._collect_soft_dup_scan_candidates()
+        if not row_txs:
+            self.transient_status.emit("No draft or unsaved rows to scan")
+            return
+        await self._soft_dup_review_and_apply(
+            row_txs,
+            exclude_ids,
+            review_mode="insert",
+            empty_toast="No duplicates found",
+        )
+
+    def _collect_soft_dup_candidates_for_tx_ids(
+        self, tx_ids,
+    ) -> tuple[list[tuple[int, Transaction]], dict[int, object]]:
+        """Saved My rows matching *tx_ids* (after unpark / promote)."""
+        wanted = {str(t) for t in (tx_ids or []) if t is not None}
+        if not wanted:
+            return [], {}
+        row_txs: list[tuple[int, Transaction]] = []
+        exclude_ids: dict[int, object] = {}
+        for row in range(self._saved_count):
+            tid = self._saved_ids.get(row)
+            if tid is None or str(tid) not in wanted:
+                continue
+            try:
+                tx = self._build_transaction_from_row(row)
+            except ValueError:
+                continue
+            if tx is None:
+                continue
+            row_txs.append((row, tx))
+            exclude_ids[row] = tid
+        return row_txs, exclude_ids
+
+    async def _scan_duplicates_for_tx_ids(
+        self,
+        tx_ids,
+        *,
+        empty_toast: str | None = None,
+    ) -> None:
+        """Scoped soft-dup for already-saved rows (e.g. after Fix trucks unpark)."""
+        if not tx_ids:
+            return
+        # Unpark may have just flipped/scheduled My — wait so ids are mounted.
+        if self._view_mode != "my":
+            if not await self._set_view_mode_and_wait("my"):
+                return
+        else:
+            task = getattr(self, "_view_load_task", None)
+            if task is not None and not task.done():
+                try:
+                    await task
+                except Exception:
+                    pass
+        row_txs, exclude_ids = self._collect_soft_dup_candidates_for_tx_ids(tx_ids)
+        if not row_txs:
+            # Keep-alive miss: force My reload once, then retry.
+            if not await self._set_view_mode_and_wait("my"):
+                return
+            row_txs, exclude_ids = self._collect_soft_dup_candidates_for_tx_ids(
+                tx_ids
+            )
+        if not row_txs:
+            return
+        await self._soft_dup_review_and_apply(
+            row_txs,
+            exclude_ids,
+            review_mode="edit",
+            empty_toast=empty_toast,
+        )
+
+    async def _soft_dup_review_and_apply(
+        self,
+        row_txs: list[tuple[int, Transaction]],
+        exclude_ids: dict[int, object],
+        *,
+        review_mode: str = "insert",
+        empty_toast: str | None = "No duplicates found",
+    ) -> None:
+        """Shared soft-dup dialog + flag/skip apply for a candidate set."""
+        if not row_txs:
+            return
+        dup_days = int(getattr(self, "_duplicate_check_days", 5) or 5)
+        from tahmeed.ui.async_utils import pause_background_polls
+        from tahmeed.ui.widgets.export_runner import await_ui
+
+        lookback_unit = "days"
+        lookback_value = dup_days
+        save_checks: set[int] = set()
+        while True:
+            self._show_register_loading(
+                f"Scanning duplicates ({len(row_txs)})…"
+            )
+            duplicate_items = await self._scan_soft_duplicates(
+                row_txs, int(dup_days), exclude_ids=exclude_ids
+            )
+            if not duplicate_items:
+                clear_patches: list[tuple] = []
+                for row, _tx in row_txs:
+                    if row in self._saved_ids:
+                        tx = self._saved_txs.get(row)
+                        if tx is not None and getattr(tx, "possible_duplicate", False):
+                            tx.possible_duplicate = False
+                            tx.duplicate_of_id = None
+                            clear_patches.append(
+                                (
+                                    self._saved_ids[row],
+                                    {
+                                        "possible_duplicate": False,
+                                        "duplicate_of_id": None,
+                                    },
+                                )
+                            )
+                            self._apply_dup_flag_visual(row, False)
+                    else:
+                        meta = dict(self._pending_row_meta.get(row) or {})
+                        if meta.pop("possible_duplicate", None) is not None:
+                            meta.pop("duplicate_of_id", None)
+                            self._pending_row_meta[row] = meta
+                            self._apply_dup_flag_visual(row, False)
+                if clear_patches:
+                    try:
+                        await bulk_update_transactions(clear_patches)
+                    except Exception:
+                        pass
+                    self._flush_local_draft()
+                if empty_toast:
+                    self.transient_status.emit(empty_toast)
+                return
+
+            dlg = DuplicateReviewDialog(
+                duplicate_items,
+                dup_days=int(dup_days),
+                parent=self,
+                pending_total=len(row_txs),
+                initial_checked=save_checks,
+                lookback_value=lookback_value,
+                lookback_unit=lookback_unit,
+                allow_rescan=True,
+                review_mode=review_mode,
+            )
+            with pause_background_polls(self):
+                accepted = await await_ui(lambda: dlg.exec() == QDialog.Accepted)
+            if not accepted:
+                return
+            rescan_days = dlg.requested_rescan_days()
+            if rescan_days is not None:
+                dup_days = int(rescan_days)
+                lookback_unit = dlg.lookback_unit()
+                lookback_value = dlg.lookback_value()
+                save_checks = dlg.checked_rows_snapshot()
+                continue
+
+            save_anyway = dlg.save_anyway_rows()
+            deferred = dlg.deferred_duplicate_rows()
+            flagged_rows = {item.row for item in duplicate_items}
+            match_by_row = {
+                item.row: item.existing for item in duplicate_items
+            }
+
+            # Unsaved deferred → Skipped (insert / full-day scan only).
+            unsaved_deferred = {
+                r for r in deferred if r >= self._saved_count
+            }
+            moved = 0
+            if unsaved_deferred and review_mode != "edit":
+                moved = self._move_rows_to_skipped(
+                    sorted(unsaved_deferred), skip_reason="duplicate_deferred"
+                )
+
+            saved_patches: list[tuple] = []
+            for row, _tx in row_txs:
+                if row in unsaved_deferred and review_mode != "edit":
+                    continue
+                matched = match_by_row.get(row) if row in flagged_rows else None
+                keep = row in save_anyway and matched is not None
+                if row in self._saved_ids:
+                    tx = self._saved_txs.get(row)
+                    body = {
+                        "possible_duplicate": bool(keep),
+                        "duplicate_of_id": (
+                            getattr(matched, "_id", None) if keep else None
+                        ),
+                    }
+                    if tx is not None:
+                        tx.possible_duplicate = bool(keep)
+                        tx.duplicate_of_id = body["duplicate_of_id"]
+                    saved_patches.append((self._saved_ids[row], body))
+                    self._apply_dup_flag_visual(row, bool(keep))
+                else:
+                    meta = dict(self._pending_row_meta.get(row) or {})
+                    if keep:
+                        meta["possible_duplicate"] = True
+                        dup_id = getattr(matched, "_id", None)
+                        if dup_id is not None:
+                            meta["duplicate_of_id"] = str(dup_id)
+                        else:
+                            meta.pop("duplicate_of_id", None)
+                    else:
+                        meta.pop("possible_duplicate", None)
+                        meta.pop("duplicate_of_id", None)
+                    self._pending_row_meta[row] = meta
+                    self._apply_dup_flag_visual(row, bool(keep))
+
+            if saved_patches:
+                try:
+                    await bulk_update_transactions(saved_patches)
+                except Exception as exc:
+                    QMessageBox.warning(
+                        self,
+                        "Scan duplicates",
+                        f"Could not update duplicate flags:\n{exc}",
+                    )
+            self._flush_local_draft()
+            parts = []
+            kept = len(save_anyway)
+            if kept:
+                parts.append(
+                    f"{kept} kept as possible duplicate"
+                    f"{'' if kept == 1 else 's'}"
+                )
+            if moved:
+                parts.append(f"{moved} moved to Skipped")
+            deferred_saved = len(deferred - unsaved_deferred)
+            if deferred_saved:
+                parts.append(
+                    f"{deferred_saved} saved match"
+                    f"{'' if deferred_saved == 1 else 'es'} left unflagged"
+                )
+            self.transient_status.emit(
+                " · ".join(parts) if parts else "Duplicate scan complete"
+            )
+            return
 
     async def _do_submit_for_verify(self) -> None:
         if self._submit_in_flight or self._save_in_flight:
@@ -4617,6 +5050,21 @@ class DailyRegister(QWidget):
             "import_primary_date": tx.import_primary_date,
             "register_status": tx.register_status or "draft",
         }
+
+    def _apply_local_edit_status(self, row: int, body: dict) -> None:
+        """Keep in-memory saved txs aligned after an edit save (no reload)."""
+        tx = self._saved_txs.get(row)
+        if tx is None or not isinstance(body, dict):
+            return
+        status = body.get("register_status")
+        if status:
+            tx.register_status = status
+        if "possible_duplicate" in body:
+            tx.possible_duplicate = bool(body.get("possible_duplicate"))
+        if "duplicate_of_id" in body:
+            tx.duplicate_of_id = body.get("duplicate_of_id")
+        if body.get("edited_after_verification"):
+            tx.edited_after_verification = True
 
     def _row_receipt_key(self, row: int) -> str:
         raw = self._cell_text(row, COL_RECEIPT).strip()
@@ -10528,6 +10976,24 @@ class DailyRegister(QWidget):
             else:
                 inplace_updates.append((row, tx_id, updates))
 
+        # Soft-dup rescan for edited saved rows only (exclude self via tx id).
+        if not parked_only and (inplace_updates or pending_edit_rows):
+            dup_days = int(getattr(self, "_duplicate_check_days", 5) or 5)
+            deferred_edits = await self._review_edit_soft_duplicates(
+                [*inplace_updates, *pending_edit_rows],
+                dup_days=dup_days,
+            )
+            if deferred_edits is None:
+                self._flush_local_draft()
+                return False
+            if deferred_edits:
+                inplace_updates = [
+                    t for t in inplace_updates if t[0] not in deferred_edits
+                ]
+                pending_edit_rows = [
+                    t for t in pending_edit_rows if t[0] not in deferred_edits
+                ]
+
         if inplace_updates:
             try:
                 self._show_register_loading(
@@ -10537,9 +11003,10 @@ class DailyRegister(QWidget):
                 await bulk_update_transactions(
                     [(tx_id, body) for _row, tx_id, body in inplace_updates]
                 )
-                for row, _tx_id, _body in inplace_updates:
+                for row, _tx_id, body in inplace_updates:
                     updated += 1
                     self._dirty_rows.discard(row)
+                    self._apply_local_edit_status(row, body)
             except Exception:
                 # Fall back to per-row PATCH so one bad row does not block all.
                 for row, tx_id, body in inplace_updates:
@@ -10547,6 +11014,7 @@ class DailyRegister(QWidget):
                         await update_transaction(tx_id, body)
                         updated += 1
                         self._dirty_rows.discard(row)
+                        self._apply_local_edit_status(row, body)
                     except Exception as row_exc:
                         errors.append(f"Row {row + 1}: {row_exc}")
 
@@ -10557,6 +11025,7 @@ class DailyRegister(QWidget):
                 updated += 1
                 pending_edit_ok += 1
                 self._dirty_rows.discard(row)
+                self._apply_local_edit_status(row, updates)
             except Exception as exc:
                 errors.append(f"Row {row + 1}: {exc}")
         # Verified edits land in Verify → Edited; bump sidebar like Submit.
@@ -10938,6 +11407,22 @@ class DailyRegister(QWidget):
             if parked_only:
                 # Other unsaved (non-parked) rows may remain — do not warn.
                 return True
+            # Soft-dup "Skip for now" on edits — leave dirty, no server write.
+            remaining_edit_dirty = {
+                r for r in self._dirty_rows if r < self._saved_count
+            }
+            if remaining_edit_dirty:
+                self._edit_mode = True
+                self.edit_state_changed.emit(True, len(remaining_edit_dirty))
+                self._emit_active_cheque()
+                self._flush_local_draft()
+                plural = "" if len(remaining_edit_dirty) == 1 else "s"
+                self.transient_status.emit(
+                    f"{len(remaining_edit_dirty)} edited row{plural} left unsaved"
+                )
+                if meta is not None:
+                    meta["deferred_edit_dups"] = len(remaining_edit_dirty)
+                return True
             if self.has_unsaved_work(include_stashed_my=False):
                 # Typed rows that could not become transactions (e.g. no
                 # description) — keep local recovery; do not claim success.
@@ -10968,7 +11453,17 @@ class DailyRegister(QWidget):
                     self.edit_state_changed.emit(False, 0)
                 self._emit_active_cheque()
             else:
-                self._reset_edit_state()
+                remaining_dirty = {
+                    r for r in self._dirty_rows if r < self._saved_count
+                }
+                if remaining_dirty:
+                    self._edit_mode = True
+                    self.edit_state_changed.emit(True, len(remaining_dirty))
+                    self._emit_active_cheque()
+                    self._flush_local_draft()
+                    self._update_footer()
+                else:
+                    self._reset_edit_state()
             if saved or updated:
                 self.rows_saved.emit(saved)
                 self.drafts_changed.emit()
@@ -11011,14 +11506,30 @@ class DailyRegister(QWidget):
                 self.drafts_changed.emit()
             return True
 
-        self._clear_local_draft(both_modes=True)
-        self._reset_edit_state()
+        # Deferred soft-dup edits stay dirty — do not wipe them with a reload.
+        remaining_dirty = {
+            r for r in self._dirty_rows
+            if r < self._saved_count
+        }
+        if remaining_dirty:
+            self._edit_mode = True
+            self.edit_state_changed.emit(True, len(remaining_dirty))
+            self._emit_active_cheque()
+            self._flush_local_draft()
+            # Patch local status for rows that did save so Submit/Saved cues match.
+            self._update_footer()
+        else:
+            self._clear_local_draft(both_modes=True)
+            self._reset_edit_state()
         self.rows_saved.emit(saved)
         self.drafts_changed.emit()
-        # Updates-only: cells already match — skip full reload.
-        # Sync insert path (Submit): reload so Verify sees server state.
-        # Parked: always reload so saved parked / fixed trucks refresh the views.
-        if self._current_date is not None and (saved or self._parked_mode):
+        # Reload so re-drafted edits land in Saved + local submitted/draft hints.
+        # Skip reload when deferred edits remain (would wipe unsaved cell edits).
+        if (
+            self._current_date is not None
+            and not remaining_dirty
+            and (saved or updated or self._parked_mode)
+        ):
             await self._load_date(self._current_date)
         if not self._submit_in_flight:
             parts = []
@@ -11029,6 +11540,11 @@ class DailyRegister(QWidget):
                 parts.append(f"{draft_n} draft")
             if updated:
                 parts.append(f"{updated} updated")
+            if remaining_dirty:
+                parts.append(
+                    f"{len(remaining_dirty)} edit"
+                    f"{'' if len(remaining_dirty) == 1 else 's'} still open"
+                )
             summary = ", ".join(parts) if parts else "saved"
             if self._parked_mode:
                 self.transient_status.emit(
@@ -11036,7 +11552,7 @@ class DailyRegister(QWidget):
                 )
             else:
                 self.transient_status.emit(
-                    f"Saved: {summary} · Open Drafts to submit for Verify"
+                    f"Saved: {summary} · Submit when ready for Verify"
                 )
         return True
 
@@ -12304,12 +12820,17 @@ class DailyRegister(QWidget):
         loading_message: str | None = None,
         status_message: str | None = None,
         error_title: str = "Clear parked",
+        scan_duplicates: bool = True,
     ) -> None:
         """Return saved parked rows to draft on My, persisting truck fixes.
 
         ``patches`` is a list of ``tx_id`` or ``(tx_id, updates)``. Updates should
         include the corrected ``truck_number`` when Fix trucks → Correct ran;
         ``register_status`` is always forced to ``draft``.
+
+        When ``scan_duplicates`` is True (default), runs a scoped soft-dup
+        review for those unparked rows after they land on My. Local-only
+        parked promotes never call this path — Save still owns their scan.
         """
         from tahmeed.services.cashier_service import bulk_update_transactions
 
@@ -12333,9 +12854,11 @@ class DailyRegister(QWidget):
             loading_message
             or f"Clearing {n} parked row{'s' if n != 1 else ''}…"
         )
+        unparked_ids: list = []
         try:
             updated = await bulk_update_transactions(pairs)
             self._release_saved_parked_rows(pairs)
+            unparked_ids = [tx_id for tx_id, _body in pairs]
             count = updated or n
             self.transient_status.emit(
                 status_message
@@ -12344,6 +12867,7 @@ class DailyRegister(QWidget):
                     f"row{'s' if count != 1 else ''} to My entries"
                 )
             )
+            self.drafts_changed.emit()
         except Exception as exc:
             QMessageBox.critical(
                 self,
@@ -12352,6 +12876,13 @@ class DailyRegister(QWidget):
             )
         finally:
             self._hide_register_loading()
+
+        # Soft-dup only for already-saved unparked rows (not local parked).
+        if scan_duplicates and unparked_ids:
+            await self._scan_duplicates_for_tx_ids(
+                unparked_ids,
+                empty_toast=None,  # keep the "Moved to My" status
+            )
 
     async def _persist_parked_after_dialog(self) -> None:
         """Legacy: persist parked flags on already-saved rows, open Parked.

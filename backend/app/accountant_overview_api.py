@@ -26,7 +26,6 @@ from .accountant_overview_ops import (
     DIESEL_FEED_SOURCE_GROUP,
     DIESEL_STATION_FEED_TYPES,
     FUEL_LITERS_SERIES,
-    SOURCE_FAMILY_FEED_KEYS,
     accumulate_currency_amount,
     accumulate_diesel_cash_fuel_liters,
     add_currency_buckets,
@@ -36,7 +35,6 @@ from .accountant_overview_ops import (
     build_source_rows,
     empty_currency_bucket,
     empty_fuel_liters_daily,
-    feed_amounts_to_bucket,
     safe_double,
     serialize_fuel_liters_series,
     subtract_currency_buckets,
@@ -660,16 +658,15 @@ async def _compute_sources(db: Any, year: int) -> dict[str, Any]:
         _separate_feed_amount_rows(db, start, end),
         asyncio.to_thread(get_rates_to_tzs),
     )
-    families = {
+    core = {
         "master": subtract_currency_buckets(master, diesel_cash),
         "fuel": add_currency_buckets(diesel_cash, diesel_stations),
     }
-    for family_key, feed_keys in SOURCE_FAMILY_FEED_KEYS.items():
-        families[family_key] = feed_amounts_to_bucket(feeds, feed_keys)
     rates = dict(fx.get("rates") or {})
     rows = build_source_rows(
-        families,
+        core,
         rates,
+        separate_feeds=feeds,
         rate_source=str(fx.get("source") or "live"),
     )
     return {

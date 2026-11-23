@@ -84,6 +84,31 @@ def test_set_options_deferred_while_popup_open() -> None:
     assert _app is not None
 
 
+def test_searchable_filters_rows_by_substring() -> None:
+    """Entities catalog: type-to-filter keeps All visible and hides non-matches."""
+    _app = QApplication.instance() or QApplication([])
+    combo = CheckableMultiCombo(
+        "Select items…",
+        noun_plural="items",
+        searchable=True,
+    )
+    combo.set_options(["Parking Fee", "Fuel Diesel", "Toll Gate"], emit=False)
+    combo.showPopup()
+    combo._apply_row_filter("fuel")
+    view = combo.view()
+    assert not view.isRowHidden(0)
+    assert view.isRowHidden(1)  # Parking Fee
+    assert not view.isRowHidden(2)  # Fuel Diesel
+    assert view.isRowHidden(3)  # Toll Gate
+    combo._apply_row_filter("")
+    assert not view.isRowHidden(1)
+    assert not view.isRowHidden(2)
+    assert not view.isRowHidden(3)
+    combo._block_hide_until = monotonic() - 1
+    combo.hidePopup()
+    assert _app is not None
+
+
 def test_lazy_options_loader_fills_before_popup() -> None:
     """Phase 2: first ▾ open awaits distincts; later opens use the cache."""
     _app = QApplication.instance() or QApplication([])

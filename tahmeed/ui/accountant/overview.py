@@ -59,10 +59,15 @@ _FUEL_SERIES_COLORS = {
 _SOURCE_BAR_COLORS = {
     "master": _GREEN,
     "fuel": "#38BDF8",
-    "toll_zambia": _PURPLE,
-    "congo": "#EA580C",
+    # One color per SEPARATE EXPENSES tab (no family grouping).
+    "toll_plaza": _PURPLE,
+    "zambia_parking": "#7C3AED",
+    "parking_congo": "#EA580C",
+    "congo_exp": "#C2410C",
+    "ahmed_kimvi": "#F97316",
     "afritrack": "#0D9488",
-    "insurance": "#92400E",
+    "third_party": "#92400E",
+    "comesa": "#B45309",
     "sm_burhani": "#CA8A04",
     "rahntech": "#4F46E5",
 }
@@ -417,7 +422,7 @@ class _SourcesHBarWidget(QWidget):
             p.end()
             return
 
-        pl, pr, pt, pb = 108, 72, 8, 22
+        pl, pr, pt, pb = 128, 72, 8, 22
         w = max(1, self.width() - pl - pr)
         h = max(1, self.height() - pt - pb)
         n = len(self._rows)
@@ -926,7 +931,7 @@ class OverviewWidget(QWidget):
             rate_source = str(payload.get("rate_source") or "").strip()
             suffix = f" · rates {rate_source}" if rate_source else ""
             self._sources_subtitle.setText(
-                f"Money-tab families converted to TZS{suffix}"
+                f"Master, Fuel + each Separate Expenses tab → TZS{suffix}"
             )
 
     def _refresh_fuel_spend_chart(self, spend_payload: dict | None = None) -> None:
@@ -1185,7 +1190,7 @@ class OverviewWidget(QWidget):
         sources_header.addStretch()
         sources_vl.addLayout(sources_header)
         self._sources_subtitle = _lbl(
-            "Money-tab families converted to TZS", size=12, color=_TM
+            "Master, Fuel + each Separate Expenses tab → TZS", size=12, color=_TM
         )
         sources_vl.addWidget(self._sources_subtitle)
         self._sources_chart = _SourcesHBarWidget()

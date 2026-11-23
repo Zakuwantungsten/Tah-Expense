@@ -1037,6 +1037,9 @@ class _TablePage(QWidget):
         )
         self._qb_toolbar.edit_clicked.connect(register.toggle_edit_mode)
         self._qb_toolbar.submit_clicked.connect(register.submit_for_verify)
+        self._qb_toolbar.scan_duplicates_clicked.connect(
+            register.scan_duplicates
+        )
         self._qb_toolbar.font_larger_clicked.connect(register.toolbar_font_larger)
         self._qb_toolbar.font_smaller_clicked.connect(register.toolbar_font_smaller)
         self._qb_toolbar.wrap_clicked.connect(register.toolbar_toggle_wrap)
@@ -1146,6 +1149,10 @@ class _TablePage(QWidget):
     def set_chrome_maximized(self, maximized: bool) -> None:
         """Ribbon keeps labels; overflow handles narrow widths (sidebar open)."""
         self._qb_toolbar.set_compact(not bool(maximized))
+
+    def set_submit_badge(self, count: int) -> None:
+        """Mirror sidebar Saved/Drafts count on the ribbon Submit button."""
+        self._qb_toolbar.set_submit_badge(count)
 
 
 # ── CashierDashboard ─────────────────────────────────────────────────────────────
@@ -1551,15 +1558,22 @@ class CashierDashboard(QWidget):
         self._on_nav("table")
         self._register.navigate_to_date(d, merged=True)
 
+    def _apply_draft_badges(self, count: int) -> None:
+        """Sidebar Saved/Drafts + ribbon Submit share the unsubmitted draft count."""
+        n = max(0, int(count or 0))
+        if hasattr(self._sidebar, "set_drafts_badge"):
+            self._sidebar.set_drafts_badge(n)
+        if hasattr(self._sidebar, "set_saved_badge"):
+            self._sidebar.set_saved_badge(n)
+        if hasattr(self, "_table_page") and hasattr(self._table_page, "set_submit_badge"):
+            self._table_page.set_submit_badge(n)
+
     def _note_submitted_drafts(self, updated: int) -> None:
         """Submit already returned the count. Move the badge by that amount."""
         self._skip_draft_recount = True
         current = self._sidebar.drafts_badge() if hasattr(self._sidebar, "drafts_badge") else 0
         nxt = max(0, current - int(updated or 0))
-        if hasattr(self._sidebar, "set_drafts_badge"):
-            self._sidebar.set_drafts_badge(nxt)
-        if hasattr(self._sidebar, "set_saved_badge"):
-            self._sidebar.set_saved_badge(nxt)
+        self._apply_draft_badges(nxt)
 
     def _on_register_drafts_changed(self) -> None:
         if getattr(self, "_skip_draft_recount", False):
@@ -1590,10 +1604,7 @@ class CashierDashboard(QWidget):
             count = await fetch_draft_badge_count(self._user, all_cashiers=False)
         except Exception:
             count = 0
-        if hasattr(self._sidebar, "set_drafts_badge"):
-            self._sidebar.set_drafts_badge(count)
-        if hasattr(self._sidebar, "set_saved_badge"):
-            self._sidebar.set_saved_badge(count)
+        self._apply_draft_badges(count)
 
     def _on_day_issues_badge(self, count: int) -> None:
         if hasattr(self._sidebar, "set_day_issues_badge"):

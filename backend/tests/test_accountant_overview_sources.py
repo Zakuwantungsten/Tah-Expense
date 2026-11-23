@@ -1,12 +1,11 @@
-"""Overview Sources families + TZS conversion helpers."""
+"""Overview Sources bars — Master/Fuel + each Separate Expenses tab."""
 
 from __future__ import annotations
 
 from app.accountant_analytics_ops import SEPARATE_EXPENSE_FEEDS
 from app.accountant_overview_ops import (
     FUEL_LITERS_SERIES,
-    SOURCE_FAMILIES,
-    SOURCE_FAMILY_FEED_KEYS,
+    SOURCE_CORE,
     accumulate_currency_amount,
     add_currency_buckets,
     build_fuel_spend_rows,
@@ -19,36 +18,71 @@ from app.accountant_overview_ops import (
 from app.fx_rates import clear_fx_cache, convert_to_tzs, get_rates_to_tzs
 
 
-def test_build_source_rows_converts_all_to_tzs_and_sorts() -> None:
+def test_build_source_rows_ungrouped_separate_tabs() -> None:
     rates = {"TZS": 1.0, "USD": 2500.0, "ZMW": 100.0}
+    feeds = [
+        {"key": "toll_plaza", "label": "Toll Plaza", "currency": "ZMW", "amount": 500.0},
+        {"key": "zambia_parking", "label": "Zambia Parking", "currency": "ZMW", "amount": 50.0},
+        {"key": "parking_congo", "label": "Parking Congo", "currency": "USD", "amount": 10.0},
+        {"key": "congo_exp", "label": "Congo Expenses", "currency": "USD", "amount": 30.0},
+        {"key": "ahmed_kimvi", "label": "Ahmed Kimvi", "currency": "USD", "amount": 5.0},
+        {"key": "afritrack", "label": "Afritrack", "currency": "USD", "amount": 12.0},
+        {"key": "third_party", "label": "Third Party Covers", "currency": "TZS", "amount": 40_000.0},
+        {"key": "comesa", "label": "COMESA Covers", "currency": "TZS", "amount": 10_000.0},
+        {"key": "sm_burhani", "label": "SM Burhani", "currency": "USD", "amount": 5.0},
+        {"key": "rahntech", "label": "RahnTech", "currency": "USD", "amount": 8.0},
+    ]
     rows = build_source_rows(
         {
             "master": {"tzs": 1_000_000.0, "usd": 0.0, "zmw": 0.0},
             "fuel": {"tzs": 100_000.0, "usd": 10.0, "zmw": 0.0},
-            "toll_zambia": {"tzs": 0.0, "usd": 0.0, "zmw": 500.0},
-            "congo": {"tzs": 0.0, "usd": 40.0, "zmw": 0.0},
-            "afritrack": {"tzs": 0.0, "usd": 12.0, "zmw": 0.0},
-            "insurance": {"tzs": 50_000.0, "usd": 0.0, "zmw": 0.0},
-            "sm_burhani": {"tzs": 0.0, "usd": 5.0, "zmw": 0.0},
-            "rahntech": {"tzs": 0.0, "usd": 8.0, "zmw": 0.0},
         },
         rates,
+        separate_feeds=feeds,
     )
-    assert {row["key"] for row in rows} == {spec.key for spec in SOURCE_FAMILIES}
+    keys = {row["key"] for row in rows}
+    assert "master" in keys and "fuel" in keys
+    assert "congo" not in keys
+    assert "toll_zambia" not in keys
+    assert "insurance" not in keys
+    assert {spec.key for spec in SEPARATE_EXPENSE_FEEDS} <= keys
     by_key = {row["key"]: row for row in rows}
     assert by_key["master"]["amount_tzs"] == 1_000_000.0
     assert by_key["fuel"]["amount_tzs"] == 100_000.0 + 10.0 * 2500.0
-    assert by_key["toll_zambia"]["amount_tzs"] == 500.0 * 100.0
-    assert by_key["congo"]["amount_tzs"] == 40.0 * 2500.0
-    assert by_key["congo"]["currency"] == "TZS"
-    assert rows[0]["amount_tzs"] >= rows[-1]["amount_tzs"]
+    assert by_key["toll_plaza"]["amount_tzs"] == 500.0 * 100.0
+    assert by_key["parking_congo"]["amount_tzs"] == 10.0 * 2500.0
+    assert by_key["congo_exp"]["amount_tzs"] == 30.0 * 2500.0
+    assert by_key["ahmed_kimvi"]["amount_tzs"] == 5.0 * 2500.0
+    assert by_key["comesa"]["amount_tzs"] == 10_000.0
     assert all(row["currency"] == "TZS" for row in rows)
+    assert rows[0]["amount_tzs"] >= rows[-1]["amount_tzs"]
 
 
-def test_source_families_cover_all_separate_expense_tabs() -> None:
-    covered = {key for keys in SOURCE_FAMILY_FEED_KEYS.values() for key in keys}
-    expected = {spec.key for spec in SEPARATE_EXPENSE_FEEDS}
-    assert covered == expected
+def test_source_core_is_master_and_fuel_only() -> None:
+    assert [spec.key for spec in SOURCE_CORE] == ["master", "fuel"]
+
+
+def test_source_rows_cover_all_separate_expense_tabs() -> None:
+    rates = {"TZS": 1.0, "USD": 1.0, "ZMW": 1.0}
+    feeds = [
+        {
+            "key": spec.key,
+            "label": spec.label,
+            "currency": spec.currency,
+            "amount": 1.0,
+        }
+        for spec in SEPARATE_EXPENSE_FEEDS
+    ]
+    rows = build_source_rows(
+        {
+            "master": empty_currency_bucket(),
+            "fuel": empty_currency_bucket(),
+        },
+        rates,
+        separate_feeds=feeds,
+    )
+    covered = {row["key"] for row in rows} - {"master", "fuel"}
+    assert covered == {spec.key for spec in SEPARATE_EXPENSE_FEEDS}
 
 
 def test_master_minus_diesel_cash_and_feed_buckets() -> None:

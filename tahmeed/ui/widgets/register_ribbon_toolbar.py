@@ -51,6 +51,7 @@ class RegisterRibbonToolbar(QFrame):
     export_clicked = Signal(str)  # "xlsx" | "csv" | "pdf"
     import_clicked = Signal()
     day_issues_clicked = Signal()
+    scan_duplicates_clicked = Signal()
     today_clicked = Signal()
     edit_clicked = Signal()
     submit_clicked = Signal()
@@ -137,6 +138,7 @@ class RegisterRibbonToolbar(QFrame):
         self._skipped_mode = False
         self._parked_count = 0
         self._skipped_count = 0
+        self._submit_badge_count = 0
         self._narrow = False
         self._overflow_keys: list[str] = []
 
@@ -252,15 +254,28 @@ class RegisterRibbonToolbar(QFrame):
         self._btn_submit = self._tool_btn(
             "mdi.send-check-outline", "Submit", "Submit day to Verify"
         )
+        self._submit_badge = QLabel(self._btn_submit)
+        self._submit_badge.setAlignment(Qt.AlignCenter)
+        self._submit_badge.setStyleSheet(
+            "background:#B45309;color:#FFFBEB;border-radius:9px;"
+            "font-size:10px;font-weight:700;font-family:'Segoe UI';padding:0 5px;"
+        )
+        self._submit_badge.hide()
         self._btn_day_issues = self._tool_btn(
             "mdi.alert-decagram-outline",
             "Issues",
             "Map unmapped descriptions (Payee + Item)",
         )
+        self._btn_scan_dups = self._tool_btn(
+            "mdi.content-duplicate",
+            "Dupes",
+            "Scan / rescan possible duplicates for this day",
+        )
         self._btn_today.clicked.connect(self.today_clicked.emit)
         self._btn_edit.clicked.connect(self.edit_clicked.emit)
         self._btn_submit.clicked.connect(self.submit_clicked.emit)
         self._btn_day_issues.clicked.connect(self.day_issues_clicked.emit)
+        self._btn_scan_dups.clicked.connect(self.scan_duplicates_clicked.emit)
         self._grp_day = self._group(
             "DAY",
             [
@@ -268,6 +283,7 @@ class RegisterRibbonToolbar(QFrame):
                 self._btn_edit,
                 self._btn_submit,
                 self._btn_day_issues,
+                self._btn_scan_dups,
             ],
         )
         root.addWidget(self._grp_day)
@@ -421,6 +437,12 @@ class RegisterRibbonToolbar(QFrame):
             ("edit", self._btn_edit, "Edit", self.edit_clicked),
             ("submit", self._btn_submit, "Submit day", self.submit_clicked),
             ("issues", self._btn_day_issues, "Day Issues", self.day_issues_clicked),
+            (
+                "dupes",
+                self._btn_scan_dups,
+                "Scan duplicates",
+                self.scan_duplicates_clicked,
+            ),
             ("print", self._btn_print, "Print", self.print_clicked),
             ("import", self._btn_import, "Import", self.import_clicked),
             ("attach", self._btn_attach, "Attach File", self.attach_clicked),
@@ -572,6 +594,7 @@ class RegisterRibbonToolbar(QFrame):
         super().resizeEvent(event)
         # Sidebar open on laptop widths — collapse secondary groups into More.
         self._apply_narrow(self.width() < 1180)
+        self._position_submit_badge()
 
     def _apply_narrow(self, narrow: bool) -> None:
         self._narrow = bool(narrow)
@@ -600,6 +623,7 @@ class RegisterRibbonToolbar(QFrame):
                     "edit",
                     "submit",
                     "issues",
+                    "dupes",
                     "print",
                     "import",
                     "attach",
@@ -652,6 +676,12 @@ class RegisterRibbonToolbar(QFrame):
             elif key == "edit":
                 act.setText(self._btn_edit.text())
                 act.triggered.connect(lambda *_: self.edit_clicked.emit())
+            elif key == "submit":
+                n = int(self._submit_badge_count or 0)
+                act.setText(
+                    f"Submit day ({n})" if n > 0 else "Submit day"
+                )
+                act.triggered.connect(lambda *_: self.submit_clicked.emit())
             else:
                 act.triggered.connect(lambda *_a, s=signal: s.emit())
             self._more_menu.addAction(act)
@@ -684,6 +714,45 @@ class RegisterRibbonToolbar(QFrame):
             self._attach_badge.show()
         else:
             self._attach_badge.hide()
+
+    def set_submit_badge(self, count: int) -> None:
+        """Amber count/dot on Submit — same cue as sidebar Saved/Drafts."""
+        self._submit_badge_count = max(0, int(count or 0))
+        if self._submit_badge_count > 0:
+            shown = (
+                "999+"
+                if self._submit_badge_count > 999
+                else str(self._submit_badge_count)
+            )
+            self._submit_badge.setText(shown)
+            self._submit_badge.adjustSize()
+            w = max(18, self._submit_badge.sizeHint().width())
+            self._submit_badge.setFixedSize(w, 18)
+            self._position_submit_badge()
+            self._submit_badge.show()
+            self._submit_badge.raise_()
+            plural = "" if self._submit_badge_count == 1 else "s"
+            self._btn_submit.setToolTip(
+                f"Submit day to Verify · {self._submit_badge_count} "
+                f"unsubmitted draft{plural}"
+            )
+        else:
+            self._submit_badge.hide()
+            self._btn_submit.setToolTip("Submit day to Verify")
+        if self._narrow:
+            self._apply_narrow(True)
+
+    def _position_submit_badge(self) -> None:
+        badge = getattr(self, "_submit_badge", None)
+        btn = getattr(self, "_btn_submit", None)
+        if badge is None or btn is None:
+            return
+        if self._submit_badge_count <= 0:
+            return
+        # Top-right corner of the Submit tool button.
+        bw = btn.width() or btn.sizeHint().width()
+        x = max(0, bw - badge.width() - 1)
+        badge.move(x, 1)
 
     def set_edit_state(self, active: bool, dirty_count: int = 0) -> None:
         if active:
@@ -741,6 +810,7 @@ class RegisterRibbonToolbar(QFrame):
         self._btn_submit.setEnabled(not busy)
         self._btn_import.setEnabled(not busy)
         self._btn_edit.setEnabled(not busy)
+        self._btn_scan_dups.setEnabled(not busy)
         if busy:
             self._btn_undo.setEnabled(False)
             self._btn_redo.setEnabled(False)
