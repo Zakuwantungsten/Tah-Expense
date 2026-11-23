@@ -144,5 +144,54 @@ def test_trucks_page_fleet_to_detail_and_back() -> None:
 
     page._on_back()
     assert page._view == "fleet"
+    assert page._selected_truck == ""
+    assert page._detail == {}
     assert page._body_stack.currentIndex() == 1
     assert page._back_btn is not None and page._back_btn.isHidden()
+    # Deep-dive painters cleared so the stack flip stays cheap.
+    assert page._deltas is not None
+    assert page._deltas.minimumHeight() == 220
+    assert page._kpi_total is not None
+    assert page._kpi_total._val_lbl.text() == "—"
+
+    page._fleet_loaded = True
+    page.ensure_loaded()  # revisit must not kick a reload when fleet is warm
+    assert page._view == "fleet"
+
+    # Blank / placeholder plates must not open deep-dive (API 422).
+    page._fleet = {
+        **page._fleet,
+        "trucks": [
+            {
+                "sn": 1,
+                "truck": "—",
+                "tzs": 9_999_000.0,
+                "usd": 100.0,
+                "zmw": 0.0,
+                "count": 50,
+                "share": 0.9,
+                "mom_pct": 1.0,
+                "mom_delta": 1.0,
+                "mom_direction": "up",
+                "vehicle_kind": "unknown",
+            },
+            {
+                "sn": 2,
+                "truck": "T 832 DND",
+                "tzs": 1_000_000.0,
+                "usd": 400.0,
+                "zmw": 0.0,
+                "count": 12,
+                "share": 0.1,
+                "mom_pct": 0.25,
+                "mom_delta": 200_000.0,
+                "mom_direction": "up",
+                "vehicle_kind": "truck",
+            },
+        ],
+    }
+    page._apply_fleet()
+    assert page._table is not None
+    assert page._table.item(0, 1).data(Qt.UserRole) == "T 832 DND"
+    page._on_row_clicked(0, 1)
+    assert page._selected_truck == "T 832 DND"

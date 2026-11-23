@@ -94,6 +94,11 @@ class AnalyticsTrendsPage(QWidget):
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._bootstrap())
 
+    def ensure_loaded(self) -> None:
+        if self._data:
+            return
+        self.refresh()
+
     async def _bootstrap(self) -> None:
         if not self._sources_loaded:
             await self._load_sources()

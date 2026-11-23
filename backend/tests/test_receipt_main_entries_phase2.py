@@ -18,9 +18,14 @@ from app.receipt_ops import (
 
 
 def _matches(doc: dict, query: dict) -> bool:
+    if "$and" in query:
+        return all(_matches(doc, clause) for clause in query["$and"])
+    if "$or" in query:
+        if not any(_matches(doc, clause) for clause in query["$or"]):
+            return False
+        rest = {k: v for k, v in query.items() if k != "$or"}
+        return _matches(doc, rest) if rest else True
     for key, expected in query.items():
-        if key == "$or":
-            return any(_matches(doc, clause) for clause in expected)
         actual = doc.get(key)
         if isinstance(expected, dict):
             if "$ne" in expected and actual == expected["$ne"]:
@@ -37,6 +42,16 @@ def _matches(doc: dict, query: dict) -> bool:
         if actual != expected:
             return False
     return True
+
+
+def _resolve_expr(doc: dict, expr: object) -> object:
+    if isinstance(expr, str) and expr.startswith("$"):
+        return doc.get(expr[1:])
+    if isinstance(expr, dict) and "$ifNull" in expr:
+        left, right = expr["$ifNull"]
+        value = _resolve_expr(doc, left)
+        return value if value is not None else _resolve_expr(doc, right)
+    return expr
 
 
 class _Cursor:
@@ -67,6 +82,48 @@ class FakeColl:
             keep.add("_id")
             matched = [{k: row[k] for k in keep if k in row} for row in matched]
         return _Cursor(matched)
+
+    def aggregate(self, pipeline: list[dict]):
+        docs = [dict(d) for d in self.documents]
+        for stage in pipeline:
+            if "$match" in stage:
+                docs = [doc for doc in docs if _matches(doc, stage["$match"])]
+            elif "$addFields" in stage:
+                for doc in docs:
+                    for key, expr in stage["$addFields"].items():
+                        doc[key] = _resolve_expr(doc, expr)
+            elif "$sort" in stage:
+                keys = list(stage["$sort"].items())
+                for field, direction in reversed(keys):
+                    docs.sort(
+                        key=lambda d, f=field: (d.get(f) is None, d.get(f)),
+                        reverse=direction < 0,
+                    )
+            elif "$limit" in stage:
+                docs = docs[: int(stage["$limit"])]
+            elif "$project" in stage:
+                projected: list[dict] = []
+                for doc in docs:
+                    include_mode = any(
+                        v in (1, True) for v in stage["$project"].values()
+                    )
+                    if include_mode:
+                        row: dict = {"_id": doc.get("_id")}
+                        for key, flag in stage["$project"].items():
+                            if key == "_id" and flag in (0, False):
+                                row.pop("_id", None)
+                                continue
+                            if flag in (1, True) and key in doc:
+                                row[key] = doc[key]
+                        projected.append(row)
+                    else:
+                        row = dict(doc)
+                        for key, flag in stage["$project"].items():
+                            if flag in (0, False):
+                                row.pop(key, None)
+                        projected.append(row)
+                docs = projected
+        return _Cursor(docs)
 
 
 def _db(
@@ -282,3 +339,33 @@ async def test_list_receipt_entries_range_and_status_filter() -> None:
     waived_only = await list_receipt_entries(db, status="waived")
     assert len(waived_only) == 1
     assert waived_only[0]["display_status_key"] == "waived"
+
+
+@pytest.mark.asyncio
+async def test_list_receipt_day_entries_finds_day_beyond_unrelated_prefix() -> None:
+    """Day drill must query by register day — not filter the first N txs in Python."""
+    day = datetime(2026, 5, 10, 8, 0, 0)
+    other = datetime(2026, 1, 1, 8, 0, 0)
+    target = ObjectId()
+    txs = [
+        {
+            "_id": ObjectId(),
+            "date": other,
+            "receipt_status": "received",
+            "amount": 1,
+        }
+        for _ in range(80)
+    ]
+    txs.append(
+        {
+            "_id": target,
+            "date": day,
+            "receipt_status": "no_receipt",
+            "amount": 2,
+        }
+    )
+    db = _db(transactions=txs, requests=[])
+    rows = await list_receipt_day_entries(db, day=date(2026, 5, 10), limit=10)
+    assert len(rows) == 1
+    assert rows[0]["id"] == str(target)
+    assert rows[0]["display_status_key"] == "no_receipt"

@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
     QScrollArea, QPushButton, QMenu, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QStackedWidget, QButtonGroup,
-    QLineEdit, QComboBox,
+    QLineEdit, QComboBox, QToolTip,
 )
 
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
@@ -36,6 +36,9 @@ _KIND_FILTERS = (
     ("trailer", "Trailers"),
     ("motor_vehicle", "Motorcycles & Cars"),
 )
+_BLANK_PLATES = frozenset(
+    {"", "—", "-", "–", "Unknown", "N/A", "n/a", "none", "null"}
+)
 
 
 class AnalyticsTrucksPage(QWidget):
@@ -49,6 +52,8 @@ class AnalyticsTrucksPage(QWidget):
         self._month = today.month
         self._chart_currency = "TZS"
         self._loading = False
+        self._load_gen = 0
+        self._fleet_loaded = False
         self._fleet: dict = {}
         self._detail: dict = {}
         self._selected_truck = ""
@@ -99,60 +104,139 @@ class AnalyticsTrucksPage(QWidget):
         else:
             schedule_coro(self._load_fleet())
 
-    async def _load_fleet(self) -> None:
-        if self._loading:
+    def ensure_loaded(self) -> None:
+        """IconRail revisit: keep current view; only fetch if never loaded."""
+        if self._view == "detail" and self._detail.get("ready"):
             return
+        if self._fleet_loaded and self._view == "fleet":
+            return
+        # Failed / blank detail must not keep re-hitting the API on tab revisit.
+        if self._view == "detail" and not self._is_real_plate(self._selected_truck):
+            self._view = "fleet"
+            self._selected_truck = ""
+            self._detail = {}
+        if self._fleet_loaded:
+            self._view = "fleet"
+            self._apply_fleet()
+            return
+        self.refresh()
+
+    def _is_real_plate(self, plate: str | None) -> bool:
+        text = str(plate or "").strip()
+        return bool(text) and text not in _BLANK_PLATES
+
+    def _invalidate_loads(self) -> None:
+        """Drop in-flight fleet/detail results and hide any loading overlay."""
+        self._load_gen += 1
+        self._loading = False
+        hide_widget_loading(self)
+
+    def _finish_load(self, gen: int) -> None:
+        if gen != self._load_gen:
+            return
+        self._loading = False
+        hide_widget_loading(self)
+
+    async def _load_fleet(self) -> None:
+        self._load_gen += 1
+        gen = self._load_gen
         self._loading = True
         show_widget_loading(self, "Loading fleet…")
         from tahmeed.services.accountant_service import get_analytics_trucks_fleet
         try:
             month = self._month if self._period == "month" else None
-            self._fleet = await get_analytics_trucks_fleet(
+            payload = await get_analytics_trucks_fleet(
                 self._year, period=self._period, month=month
             )
+            if gen != self._load_gen:
+                return
+            self._fleet = payload
+            self._fleet_loaded = True
             self._view = "fleet"
             self._apply_fleet()
         except Exception as exc:
+            if gen != self._load_gen:
+                return
             self._fleet = {
                 "trucks": [],
                 "totals": {},
                 "message": f"Could not load truck fleet.\n{exc}",
             }
+            self._fleet_loaded = True
             self._view = "fleet"
             self._apply_fleet()
         finally:
-            self._loading = False
-            hide_widget_loading(self)
+            self._finish_load(gen)
 
     async def _load_detail(self) -> None:
-        if self._loading or not self._selected_truck:
+        truck = (self._selected_truck or "").strip()
+        if not self._is_real_plate(truck):
+            self._selected_truck = ""
+            self._view = "fleet"
+            if self._fleet_loaded:
+                self._apply_fleet()
             return
+        self._load_gen += 1
+        gen = self._load_gen
+        self._view = "detail"
         self._loading = True
-        show_widget_loading(self, f"Loading {self._selected_truck}…")
+        show_widget_loading(self, f"Loading {truck}…")
         from tahmeed.services.accountant_service import get_analytics_truck_detail
         try:
             month = self._month if self._period == "month" else None
-            self._detail = await get_analytics_truck_detail(
-                self._selected_truck,
+            payload = await get_analytics_truck_detail(
+                truck,
                 self._year,
                 period=self._period,
                 month=month,
             )
-            self._view = "detail"
+            if gen != self._load_gen or self._view != "detail":
+                return
+            self._detail = payload
             self._apply_detail()
         except Exception as exc:
+            if gen != self._load_gen or self._view != "detail":
+                return
             self._detail = {
                 "ready": False,
-                "label": self._selected_truck,
+                "label": truck,
                 "message": f"Could not load truck deep-dive.\n{exc}",
             }
-            self._view = "detail"
             self._apply_detail()
         finally:
-            self._loading = False
-            hide_widget_loading(self)
+            self._finish_load(gen)
+
+    def _clear_detail_charts(self) -> None:
+        """Shrink/clear deep-dive painters so Fleet stack flip is cheap."""
+        if self._line:
+            self._line.set_data([], [], empty="")
+        if self._treemap:
+            self._treemap.set_data([], empty="")
+        if self._desc_bars:
+            self._desc_bars.set_data([], [], empty="")
+        if self._deltas:
+            self._deltas.set_data([], empty="")
+        if self._receipts:
+            self._receipts.set_data([], empty="")
+        if self._receipts_legend:
+            while self._receipts_legend.count():
+                item = self._receipts_legend.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+        if self._kpi_total:
+            self._kpi_total.set_value("—")
+        if self._kpi_avg:
+            self._kpi_avg.set_value("—")
+        if self._kpi_count:
+            self._kpi_count.set_value("—")
+        if self._kpi_yoy:
+            self._kpi_yoy.set_value("—")
 
     def _apply_fleet(self) -> None:
+        # Belt-and-suspenders: never leave "Loading fleet…" over a filled table.
+        hide_widget_loading(self)
+        self._loading = False
         self._update_chrome()
         if self._back_btn:
             self._back_btn.hide()
@@ -190,9 +274,11 @@ class AnalyticsTrucksPage(QWidget):
         kind = (self._fleet_kind or "all").strip().lower()
         rows: list[dict] = []
         for row in list(self._fleet.get("trucks") or []):
+            plate = str(row.get("truck") or "").strip()
+            if not self._is_real_plate(plate):
+                continue
             if kind != "all" and str(row.get("vehicle_kind") or "unknown") != kind:
                 continue
-            plate = str(row.get("truck") or "")
             if needle and needle not in re.sub(r"\s+", "", plate).casefold():
                 continue
             rows.append(dict(row))
@@ -225,6 +311,8 @@ class AnalyticsTrucksPage(QWidget):
         return out, totals
 
     def _apply_detail(self) -> None:
+        hide_widget_loading(self)
+        self._loading = False
         self._update_chrome()
         if self._back_btn:
             self._back_btn.show()
@@ -555,14 +643,21 @@ class AnalyticsTrucksPage(QWidget):
         if item is None:
             return
         truck = str(item.data(Qt.UserRole) or "").strip()
-        if not truck:
+        if not self._is_real_plate(truck):
             return
         self._selected_truck = truck
+        self._view = "detail"
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._load_detail())
 
     def _on_back(self) -> None:
+        # Cancel in-flight detail, shrink charts, then flip to fleet.
+        self._invalidate_loads()
+        QToolTip.hideText()
         self._view = "fleet"
+        self._selected_truck = ""
+        self._detail = {}
+        self._clear_detail_charts()
         self._apply_fleet()
 
     def _on_search_changed(self, text: str) -> None:

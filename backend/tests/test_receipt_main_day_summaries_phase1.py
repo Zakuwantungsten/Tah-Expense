@@ -16,15 +16,25 @@ from app.receipt_ops import (
 
 
 def _matches(doc: dict, query: dict) -> bool:
+    if "$and" in query:
+        return all(_matches(doc, clause) for clause in query["$and"])
+    if "$or" in query:
+        if not any(_matches(doc, clause) for clause in query["$or"]):
+            return False
+        rest = {k: v for k, v in query.items() if k != "$or"}
+        return _matches(doc, rest) if rest else True
     for key, expected in query.items():
-        if key == "$or":
-            return any(_matches(doc, clause) for clause in expected)
         actual = doc.get(key)
         if isinstance(expected, dict):
             if "$ne" in expected and actual == expected["$ne"]:
                 return False
             if "$in" in expected and actual not in expected["$in"]:
                 return False
+            if "$type" in expected:
+                wanted = expected["$type"]
+                if wanted == "date" and not isinstance(actual, (date, datetime)):
+                    return False
+                continue
             if "$gte" in expected or "$lte" in expected:
                 if "$gte" in expected and (actual is None or actual < expected["$gte"]):
                     return False
@@ -35,6 +45,16 @@ def _matches(doc: dict, query: dict) -> bool:
         if actual != expected:
             return False
     return True
+
+
+def _resolve_expr(doc: dict, expr: object) -> object:
+    if isinstance(expr, str) and expr.startswith("$"):
+        return doc.get(expr[1:])
+    if isinstance(expr, dict) and "$ifNull" in expr:
+        left, right = expr["$ifNull"]
+        value = _resolve_expr(doc, left)
+        return value if value is not None else _resolve_expr(doc, right)
+    return expr
 
 
 class _Cursor:
@@ -65,6 +85,48 @@ class FakeColl:
             keep.add("_id")
             matched = [{k: row[k] for k in keep if k in row} for row in matched]
         return _Cursor(matched)
+
+    def aggregate(self, pipeline: list[dict]):
+        docs = [dict(d) for d in self.documents]
+        for stage in pipeline:
+            if "$match" in stage:
+                docs = [doc for doc in docs if _matches(doc, stage["$match"])]
+            elif "$addFields" in stage:
+                for doc in docs:
+                    for key, expr in stage["$addFields"].items():
+                        doc[key] = _resolve_expr(doc, expr)
+            elif "$sort" in stage:
+                # Apply multi-key sort stably from last key to first.
+                for field, direction in reversed(list(stage["$sort"].items())):
+                    docs.sort(
+                        key=lambda d, f=field: (d.get(f) is None, d.get(f)),
+                        reverse=direction < 0,
+                    )
+            elif "$limit" in stage:
+                docs = docs[: int(stage["$limit"])]
+            elif "$project" in stage:
+                projected: list[dict] = []
+                for doc in docs:
+                    row: dict = {}
+                    include_mode = any(
+                        v in (1, True) for v in stage["$project"].values()
+                    )
+                    if include_mode:
+                        row["_id"] = doc.get("_id")
+                        for key, flag in stage["$project"].items():
+                            if key == "_id" and flag in (0, False):
+                                row.pop("_id", None)
+                                continue
+                            if flag in (1, True) and key in doc:
+                                row[key] = doc[key]
+                    else:
+                        row = dict(doc)
+                        for key, flag in stage["$project"].items():
+                            if flag in (0, False):
+                                row.pop(key, None)
+                    projected.append(row)
+                docs = projected
+        return _Cursor(docs)
 
 
 def _db(
@@ -406,3 +468,24 @@ async def test_list_receipt_day_summaries_skips_trashed() -> None:
     assert items[0]["entries_count"] == 1
     assert items[0]["no_receipt_count"] == 1
     assert items[0]["needed_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_list_receipt_day_summaries_prefers_recent_within_scan_cap() -> None:
+    """Large DBs used to miss newest days when the scan was unordered + capped."""
+    older = datetime(2026, 1, 1, 10, 0, 0)
+    newer = datetime(2026, 11, 20, 10, 0, 0)
+    txs = [
+        {"_id": ObjectId(), "date": older, "receipt_status": "received"}
+        for _ in range(30)
+    ]
+    txs.append(
+        {"_id": ObjectId(), "date": newer, "receipt_status": "no_receipt"}
+    )
+    db = _db(transactions=txs, requests=[])
+    # row_cap = max(limit, scan_limit) → 10; without newest-first sort the
+    # Nov row (appended last) would fall outside an insertion-order cap.
+    page = await list_receipt_day_summaries(db, limit=5, scan_limit=10)
+    dates = [row["date"] for row in page["items"]]
+    assert "2026-11-20" in dates
+    assert dates[0] == "2026-11-20"

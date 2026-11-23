@@ -414,6 +414,9 @@ def test_build_truck_fleet_table_multi_currency_and_share() -> None:
             {"truck": "T 832 DND", "tzs": 100.0, "usd": 2.0, "zmw": 0.0, "count": 10},
             {"name": "T 104 FRE", "tzs": 50.0, "usd": 0.0, "zmw": 20.0, "count": 4},
             {"truck": "—", "tzs": 0.0, "usd": 0.0, "zmw": 0.0, "count": 0},
+            # Blank / placeholder plates with real spend must not enter the fleet.
+            {"truck": "—", "tzs": 9_999.0, "usd": 100.0, "zmw": 0.0, "count": 50},
+            {"truck": "", "tzs": 500.0, "usd": 0.0, "zmw": 0.0, "count": 3},
         ],
         kind_lookup={
             "t832dnd": "truck",
@@ -433,6 +436,7 @@ def test_build_truck_fleet_table_multi_currency_and_share() -> None:
     assert table["trucks"][1]["vehicle_kind"] == "trailer"
     assert abs(table["trucks"][0]["share"] - (100.0 / 150.0)) < 1e-9
     assert abs(table["trucks"][1]["share"] - (50.0 / 150.0)) < 1e-9
+    assert all(r["truck"] not in {"—", ""} for r in table["trucks"])
 
 
 def test_fleet_kind_filter_and_search() -> None:

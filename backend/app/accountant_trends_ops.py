@@ -1004,10 +1004,13 @@ def build_truck_fleet_table(
     then ZMW, so all-USD fleets still get meaningful share percentages.
     """
     cleaned: list[dict[str, Any]] = []
+    blank_plates = {"", "—", "-", "–", "Unknown", "N/A", "n/a", "none", "null"}
     for raw in rows or []:
-        truck = str(raw.get("truck") or raw.get("name") or "").strip() or "—"
-        if truck in {"—", "-", "Unknown", "N/A"}:
-            truck = "—"
+        truck = str(raw.get("truck") or raw.get("name") or "").strip()
+        # Blank / placeholder plates are Master rows with no truck_number — not
+        # deep-diveable (detail API 422s) and must not lead the fleet table.
+        if not truck or truck in blank_plates or not _truck_norm_key(truck):
+            continue
         tzs = float(raw.get("tzs") or 0.0)
         usd = float(raw.get("usd") or 0.0)
         zmw = float(raw.get("zmw") or 0.0)

@@ -1214,12 +1214,16 @@ async def get_analytics_trucks_fleet(
         "v1/accountant/analytics/trucks",
         params=params,
     )
+    _blank = {"", "—", "-", "–", "Unknown", "N/A", "n/a", "none", "null"}
     trucks = []
     for row in list(payload.get("trucks") or []):
+        plate = str(row.get("truck") or "").strip()
+        if not plate or plate in _blank:
+            continue
         trucks.append(
             {
                 "sn": int(row.get("sn") or 0),
-                "truck": str(row.get("truck") or "—"),
+                "truck": plate,
                 "tzs": float(row.get("tzs") or 0.0),
                 "usd": float(row.get("usd") or 0.0),
                 "zmw": float(row.get("zmw") or 0.0),

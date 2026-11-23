@@ -1295,6 +1295,12 @@ class AnalyticsWidget(QWidget):
         self._stack.setCurrentIndex(idx)
         if idx in {1, 2, 3, 4, 5}:
             page = self._stack.widget(idx)
+            # Prefer ensure_loaded so revisiting a tab does not force a full
+            # network+chart rebuild (heavy / crashy under rapid rail clicks).
+            ensure = getattr(page, "ensure_loaded", None)
+            if callable(ensure):
+                ensure()
+                return
             refresh = getattr(page, "refresh", None)
             if callable(refresh):
                 refresh()

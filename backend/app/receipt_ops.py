@@ -26,11 +26,17 @@ from .attachment_ops import (
     staging_root,
 )
 from .config import Settings
+from .mongo_async import aggregate_list
 from .receipt_upload_security import (
     UploadSecurityError,
     validate_receipt_upload,
 )
 from .security import utcnow
+from .transaction_ops import (
+    REGISTER_DAY_EXPR,
+    register_day_clause,
+    register_day_range_clause,
+)
 
 logger = logging.getLogger("tahmeed.receipts")
 
@@ -1276,26 +1282,15 @@ async def list_receipt_day_summaries(
         if str(row.get("status") or "").strip().lower() == "needed":
             needed_tx_ids.add(tid)
 
-    query: dict[str, Any] = {
-        "trashed": {"$ne": True},
-        "discarded": {"$ne": True},
-        "deletion_requested": {"$ne": True},
-    }
-    if cashier_id is not None:
-        query["cashier_id"] = cashier_id
-
-    cursor = db.transactions.find(
-        query,
-        {
-            "date": 1,
-            "import_primary_date": 1,
-            "receipt_status": 1,
-            "receipt_partial_note": 1,
-            "attachments": 1,
-            "cashier_id": 1,
-        },
+    query = _receipt_tx_query(
+        cashier_id, date_from=date_from, date_to=date_to
     )
-    docs = await cursor.to_list(length=row_cap)
+    docs = await _scan_txs_newest_register_first(
+        db,
+        query,
+        projection=_RECEIPT_SCAN_PROJECTION,
+        limit=row_cap,
+    )
     shared_tx_ids = _shared_file_tx_ids(docs)
 
     buckets: dict[date, dict[str, Any]] = {}
@@ -1553,6 +1548,63 @@ def _visible_tx_query(cashier_id: ObjectId | None = None) -> dict[str, Any]:
     return query
 
 
+def _receipt_tx_query(
+    cashier_id: ObjectId | None = None,
+    *,
+    day: date | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> dict[str, Any]:
+    """Visible txs, optionally narrowed to a register day or day range in Mongo."""
+    base = _visible_tx_query(cashier_id)
+    if day is not None:
+        return {"$and": [base, register_day_clause(day)]}
+    range_clause = register_day_range_clause(date_from, date_to)
+    if range_clause:
+        return {"$and": [base, range_clause]}
+    return base
+
+
+_RECEIPT_SCAN_PROJECTION: dict[str, int] = {
+    "date": 1,
+    "import_primary_date": 1,
+    "receipt_status": 1,
+    "receipt_partial_note": 1,
+    "attachments": 1,
+    "cashier_id": 1,
+}
+
+
+async def _scan_txs_newest_register_first(
+    db: Any,
+    query: dict[str, Any],
+    *,
+    projection: dict[str, int],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Capped scan ordered by register day (import primary else Excel date).
+
+    Plain ``find().to_list(N)`` is unordered and misses recent days / the
+    selected day once the collection grows past N. Aggregate sorts by the
+    same ``$ifNull`` expression used elsewhere in the register APIs.
+    """
+    row_cap = max(1, int(limit))
+    # Inclusion-only projection (Mongo forbids mixing include/exclude except _id).
+    project: dict[str, Any] = {
+        key: 1 for key, keep in projection.items() if keep and key != "_id"
+    }
+    project["_id"] = 1
+    pipeline: list[dict[str, Any]] = [
+        {"$match": query},
+        {"$addFields": {"_register_day": REGISTER_DAY_EXPR}},
+        {"$match": {"_register_day": {"$ne": None}}},
+        {"$sort": {"_register_day": -1, "_id": -1}},
+        {"$limit": row_cap},
+        {"$project": project},
+    ]
+    return await aggregate_list(db.transactions, pipeline, length=row_cap)
+
+
 async def list_receipt_day_entries(
     db: Any,
     *,
@@ -1565,13 +1617,13 @@ async def list_receipt_day_entries(
     """
     row_cap = max(1, min(int(limit or 500), 2000))
     docs = await db.transactions.find(
-        _visible_tx_query(cashier_id), _RECEIPT_ENTRY_PROJECTION
-    ).to_list(length=max(row_cap * 5, 2000))
+        _receipt_tx_query(cashier_id, day=day), _RECEIPT_ENTRY_PROJECTION
+    ).to_list(length=row_cap)
     matched = [
         tx
         for tx in docs
         if tx_register_calendar_day(tx) == day
-    ][:row_cap]
+    ]
     matched.sort(
         key=lambda tx: (
             tx_register_calendar_day(tx) or date.min,
@@ -1606,9 +1658,12 @@ async def list_receipt_entries(
     row_cap = max(1, min(int(limit or 500), 2000))
     scan_cap = max(row_cap, min(int(scan_limit or 20000), 50000))
     status_key = (status or "all").strip().lower()
-    docs = await db.transactions.find(
-        _visible_tx_query(cashier_id), _RECEIPT_ENTRY_PROJECTION
-    ).to_list(length=scan_cap)
+    docs = await _scan_txs_newest_register_first(
+        db,
+        _receipt_tx_query(cashier_id, date_from=date_from, date_to=date_to),
+        projection=_RECEIPT_ENTRY_PROJECTION,
+        limit=scan_cap,
+    )
 
     filtered: list[dict[str, Any]] = []
     for tx in docs:

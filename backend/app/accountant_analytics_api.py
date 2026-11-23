@@ -2687,30 +2687,46 @@ async def _master_truck_fleet_rows(
     start,
     end,
 ) -> list[dict[str, Any]]:
-    """All Master trucks in window with TZS/USD/ZMW + entry counts (no top-N)."""
+    """All Master trucks in window with TZS/USD/ZMW + entry counts (no top-N).
+
+    Skips missing/blank ``truck_number`` — those are not fleet vehicles and the
+    detail endpoint rejects placeholder plates.
+    """
+    match = {
+        **_master_base_match(start, end),
+        "truck_number": {
+            "$exists": True,
+            "$nin": [None, "", "—", "-", "–", "Unknown", "N/A", "n/a", "none", "null"],
+        },
+    }
     docs = await aggregate_list(
         db.transactions,
         [
-            {"$match": _master_base_match(start, end)},
+            {"$match": match},
             {
                 "$group": {
-                    "_id": {"$ifNull": ["$truck_number", "—"]},
+                    "_id": "$truck_number",
                     **_currency_group_fields(),
                 }
             },
         ],
         None,
     )
-    return [
-        {
-            "truck": (str(doc.get("_id") or "").strip() or "—"),
-            "tzs": float(doc.get("tzs") or 0.0),
-            "usd": float(doc.get("usd") or 0.0),
-            "zmw": float(doc.get("zmw") or 0.0),
-            "count": int(doc.get("count") or 0),
-        }
-        for doc in docs
-    ]
+    rows: list[dict[str, Any]] = []
+    for doc in docs:
+        plate = str(doc.get("_id") or "").strip()
+        if not plate or plate in {"—", "-", "–"}:
+            continue
+        rows.append(
+            {
+                "truck": plate,
+                "tzs": float(doc.get("tzs") or 0.0),
+                "usd": float(doc.get("usd") or 0.0),
+                "zmw": float(doc.get("zmw") or 0.0),
+                "count": int(doc.get("count") or 0),
+            }
+        )
+    return rows
 
 
 async def _fleet_kind_lookup(db: Any) -> dict[str, str]:
@@ -2760,8 +2776,8 @@ async def analytics_trucks_fleet(
 ) -> dict:
     """Analytics → Trucks fleet table (multi-currency Master spend)."""
     kind, resolved_month = _parse_period(year, period, month)
-    # v3 key — MoM + share_basis + vehicle_kind + SN.
-    cache_k = entity_cache_key("trucks_fleet_v3", year, kind, resolved_month)
+    # v4 key — exclude blank/placeholder truck_number buckets from fleet.
+    cache_k = entity_cache_key("trucks_fleet_v4", year, kind, resolved_month)
     cached = entity_cache_get(cache_k)
     if cached is not None:
         return cached

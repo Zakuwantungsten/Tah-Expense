@@ -433,6 +433,11 @@ class AnalyticsMeetingsPage(QWidget):
         from tahmeed.ui.async_utils import schedule_coro
         schedule_coro(self._load())
 
+    def ensure_loaded(self) -> None:
+        if self._data:
+            return
+        self.refresh()
+
     async def _load(self) -> None:
         if self._loading:
             return
