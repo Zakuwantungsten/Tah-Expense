@@ -282,6 +282,8 @@ def test_entities_phase_e2_helpers() -> None:
         "Parking A + Parking B"
     )
     assert entity_set_label("payees", ["A", "B", "C"]).startswith("3 payees · A")
+    assert entity_set_label("mixed", ["A", "B", "C"]).startswith("3 entities · A")
+    assert entity_set_label("entities", []) == "Entities"
 
 
 def test_entities_phase_e3_cache_and_compare_limits() -> None:

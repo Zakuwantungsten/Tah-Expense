@@ -33,7 +33,7 @@ class AnalyticsEntitiesPage(QWidget):
         self._year = today.year
         self._period = "year"
         self._month = today.month
-        self._family = "items"
+        self._family = "mixed"
         self._entity_keys: list[str] = []
         self._chart_currency = "TZS"
         self._loading = False
@@ -42,7 +42,6 @@ class AnalyticsEntitiesPage(QWidget):
         self._families: list[dict] = []
         self._entities: list[dict] = []
 
-        self._family_btns: list[QPushButton] = []
         self._entity_combo: Optional[CheckableMultiCombo] = None
         self._load_timer: Optional[QTimer] = None
         self._year_btn: Optional[QPushButton] = None
@@ -95,31 +94,56 @@ class AnalyticsEntitiesPage(QWidget):
             self._families = list(payload.get("families") or [])
             if not self._families:
                 self._sources_loaded = False
+                if self._status_lbl:
+                    self._status_lbl.setText(
+                        "Could not load entity catalog (empty response)."
+                    )
+                    self._status_lbl.show()
                 return
-            if self._family not in {str(f.get("key") or "") for f in self._families}:
-                self._family = str(self._families[0].get("key") or "items")
-            self._sync_family_buttons()
+            self._family = "mixed"
             self._populate_entities()
             self._sources_loaded = True
-        except Exception:
+        except Exception as exc:
             self._sources_loaded = False
+            if self._status_lbl:
+                self._status_lbl.setText(f"Could not load entity catalog.\n{exc}")
+                self._status_lbl.show()
+
+    @staticmethod
+    def _entity_display_label(ent: dict, family_key: str) -> str:
+        raw = str(ent.get("label") or ent.get("key") or "").strip() or "—"
+        prefix = {
+            "items": "Item",
+            "payees": "Payee",
+            "suppliers": "Supplier",
+        }.get(family_key, "Entity")
+        # Avoid double-prefix if backend already stamped one.
+        if raw.lower().startswith(f"{prefix.lower()} ·"):
+            return raw
+        return f"{prefix} · {raw}"
 
     def _populate_entities(self) -> None:
-        fam = next(
-            (f for f in self._families if str(f.get("key") or "") == self._family),
-            None,
-        )
-        self._entities = list((fam or {}).get("entities") or [])
+        # Flatten Items + Payees + Suppliers into one bulk-select catalog.
+        flat: list[dict] = []
+        for fam in self._families:
+            fam_key = str(fam.get("key") or "")
+            for ent in list(fam.get("entities") or []):
+                key = str(ent.get("key") or "")
+                if not key:
+                    continue
+                flat.append(
+                    {
+                        **ent,
+                        "family": fam_key or str(ent.get("family") or ""),
+                        "label": self._entity_display_label(ent, fam_key),
+                    }
+                )
+        self._entities = flat
         if self._entity_combo is None:
             return
-        noun = {
-            "items": "items",
-            "payees": "payees",
-            "suppliers": "suppliers",
-        }.get(self._family, "selected")
         self._entity_combo.configure(
-            all_label=f"Select {noun}…",
-            noun_plural=noun,
+            all_label="Select items, payees, suppliers…",
+            noun_plural="entities",
         )
         pairs = [
             (str(ent.get("label") or ent.get("key") or ""), str(ent.get("key") or ""))
@@ -139,9 +163,9 @@ class AnalyticsEntitiesPage(QWidget):
             self._data = {
                 "ready": False,
                 "mode": "merge",
-                "label": self._family_label(),
+                "label": "Entities",
                 "message": (
-                    f"Search and tick one or more {self._family_label().lower()} "
+                    "Search and tick one or more items, payees, or suppliers "
                     "above to begin deep analysis."
                 ),
             }
@@ -153,7 +177,7 @@ class AnalyticsEntitiesPage(QWidget):
         try:
             month = self._month if self._period == "month" else None
             self._data = await get_analytics_entities(
-                self._family,
+                "mixed",
                 keys,
                 self._year,
                 period=self._period,
@@ -173,11 +197,14 @@ class AnalyticsEntitiesPage(QWidget):
             hide_widget_loading(self)
 
     def _family_label(self) -> str:
-        fam = next(
-            (f for f in self._families if str(f.get("key") or "") == self._family),
+        fam = str(self._data.get("family") or self._family or "mixed")
+        if fam == "mixed":
+            return "Entities"
+        named = next(
+            (f for f in self._families if str(f.get("key") or "") == fam),
             None,
         )
-        return str((fam or {}).get("label") or self._family.title())
+        return str((named or {}).get("label") or fam.title())
 
     def _apply(self) -> None:
         ready = bool(self._data.get("ready"))
@@ -394,21 +421,6 @@ class AnalyticsEntitiesPage(QWidget):
                     _lbl("No receipt data yet.", size=12, color=_TM)
                 )
 
-    def _on_family(self, key: str) -> None:
-        if key == self._family:
-            return
-        self._family = key
-        self._entity_keys = []
-        self._sync_family_buttons()
-        self._populate_entities()
-        from tahmeed.ui.async_utils import schedule_coro
-        schedule_coro(self._load())
-
-    def _sync_family_buttons(self) -> None:
-        for btn in self._family_btns:
-            active = str(btn.property("family_key") or "") == self._family
-            btn.setChecked(active)
-
     def _on_entity_changed(self) -> None:
         if not self._entity_combo:
             return
@@ -517,39 +529,20 @@ class AnalyticsEntitiesPage(QWidget):
         left.setSpacing(4)
         left.addWidget(_lbl("Entities", size=22, weight=700))
         self._subtitle = _lbl(
-            "Search and tick Items, Payees, or Suppliers — multi-select combines into one deep-dive.",
+            "One filter for Items, Payees, and Suppliers — search, multi-select, combined deep-dive.",
             size=13,
             color=_T2,
         )
         left.addWidget(self._subtitle)
         header.addLayout(left, 1)
 
-        for key, label in (("items", "Items"), ("payees", "Payees"), ("suppliers", "Suppliers")):
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(34)
-            btn.setProperty("family_key", key)
-            btn.setStyleSheet(
-                f"QPushButton {{"
-                f"  background: {_WHITE}; border: 1px solid {_BORDER}; border-radius: 8px;"
-                f"  padding: 0 14px; font-size: 13px; font-weight: 600; color: {_T1};"
-                f"}}"
-                f"QPushButton:checked {{ background: {_BLUE_L}; border-color: {_BLUE}; color: {_NAVY}; }}"
-            )
-            btn.clicked.connect(lambda _=False, k=key: self._on_family(k))
-            self._family_btns.append(btn)
-            header.addWidget(btn)
-        if self._family_btns:
-            self._family_btns[0].setChecked(True)
-
         self._entity_combo = CheckableMultiCombo(
-            all_label="Select items…",
-            noun_plural="items",
+            all_label="Select items, payees, suppliers…",
+            noun_plural="entities",
             searchable=True,
             parent=self,
         )
-        self._entity_combo.setMinimumWidth(280)
+        self._entity_combo.setMinimumWidth(360)
         self._entity_combo.setFixedHeight(34)
         self._entity_combo.setStyleSheet(
             f"QComboBox {{"
@@ -617,7 +610,7 @@ class AnalyticsEntitiesPage(QWidget):
         vl = QVBoxLayout(page)
         vl.addStretch()
         msg = _lbl(
-            "Choose Items, Payees, or Suppliers, then search and tick one or more. "
+            "Search and tick one or more items, payees, or suppliers. "
             "Multiple selections combine into a single deep-dive.",
             size=14,
             color=_T2,

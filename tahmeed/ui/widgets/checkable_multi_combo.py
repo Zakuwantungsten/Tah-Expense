@@ -397,8 +397,9 @@ class CheckableMultiCombo(QComboBox):
     def _apply_row_filter(self, text: str) -> None:
         needle = str(text or "").strip().casefold()
         view = self.view()
-        # Always keep the All / Select… row visible.
-        view.setRowHidden(0, False)
+        # While typing, hide the All / Select… row so it cannot steal the first
+        # click or keyboard focus from real matches.
+        view.setRowHidden(0, bool(needle) and self._searchable)
         for row in range(1, self._model.rowCount()):
             item = self._model.item(row)
             if item is None:

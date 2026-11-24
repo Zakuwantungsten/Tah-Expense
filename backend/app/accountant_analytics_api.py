@@ -129,6 +129,7 @@ def _master_base_match(
     payee: str | None = None,
     payees: list[str] | None = None,
     truck: str | None = None,
+    filters_op: str = "and",
 ) -> dict[str, Any]:
     match: dict[str, Any] = {
         "verified": True,
@@ -140,14 +141,18 @@ def _master_base_match(
         cat = category_names_clause(category_names)
     else:
         cat = category_name_clause(category_name or "")
-    if cat:
-        match.update(cat)
     if payees:
         pay = payees_clause(payees)
     else:
         pay = payee_clause(payee or "")
-    if pay:
-        match.update(pay)
+    entity_parts = [part for part in (cat, pay) if part]
+    op = (filters_op or "and").strip().lower()
+    if op == "or" and len(entity_parts) > 1:
+        # Mixed Items/Suppliers + Payees: match any selected entity.
+        match["$or"] = entity_parts
+    else:
+        for part in entity_parts:
+            match.update(part)
     truck_match = truck_number_clause(truck or "")
     if truck_match:
         match.update(truck_match)
@@ -164,6 +169,7 @@ async def _master_totals(
     payee: str | None = None,
     payees: list[str] | None = None,
     truck: str | None = None,
+    filters_op: str = "and",
 ) -> dict[str, Any]:
     docs = await aggregate_list(
         db.transactions,
@@ -177,6 +183,7 @@ async def _master_totals(
                     payee=payee,
                     payees=payees,
                     truck=truck,
+                    filters_op=filters_op,
                 )
             },
             {"$group": master_currency_group()},
@@ -204,6 +211,7 @@ async def _master_month_series_range(
     payee: str | None = None,
     payees: list[str] | None = None,
     truck: str | None = None,
+    filters_op: str = "and",
 ) -> list[dict[str, Any]]:
     """Month buckets for Master spend inside ``start``–``end`` (calendar months 1–12)."""
     docs = await aggregate_list(
@@ -218,6 +226,7 @@ async def _master_month_series_range(
                     payee=payee,
                     payees=payees,
                     truck=truck,
+                    filters_op=filters_op,
                 )
             },
             {
@@ -257,6 +266,7 @@ async def _master_month_series(
     payee: str | None = None,
     payees: list[str] | None = None,
     truck: str | None = None,
+    filters_op: str = "and",
 ) -> list[dict[str, Any]]:
     start, end = period_window(year, "year")
     return await _master_month_series_range(
@@ -268,6 +278,7 @@ async def _master_month_series(
         payee=payee,
         payees=payees,
         truck=truck,
+        filters_op=filters_op,
     )
 
 
@@ -281,6 +292,7 @@ async def _master_category_rows(
     payee: str | None = None,
     payees: list[str] | None = None,
     truck: str | None = None,
+    filters_op: str = "and",
 ) -> list[dict[str, Any]]:
     docs = await aggregate_list(
         db.transactions,
@@ -294,6 +306,7 @@ async def _master_category_rows(
                     payee=payee,
                     payees=payees,
                     truck=truck,
+                    filters_op=filters_op,
                 )
             },
             {
@@ -327,6 +340,7 @@ async def _master_payee_rows(
     payee: str | None = None,
     category_names: list[str] | None = None,
     truck: str | None = None,
+    filters_op: str = "and",
     top_n: int = 10,
 ) -> list[dict[str, Any]]:
     """Break spend down by payee (Entities multi-payee mix)."""
@@ -341,6 +355,7 @@ async def _master_payee_rows(
                     payee=payee,
                     payees=payees,
                     truck=truck,
+                    filters_op=filters_op,
                 )
             },
             {
@@ -393,6 +408,7 @@ async def _master_description_rows(
     payee: str | None = None,
     payees: list[str] | None = None,
     truck: str | None = None,
+    filters_op: str = "and",
     top_n: int = 10,
 ) -> list[dict[str, Any]]:
     """Break spend down by description (one or many ITEMS / payee filters)."""
@@ -408,6 +424,7 @@ async def _master_description_rows(
                     payee=payee,
                     payees=payees,
                     truck=truck,
+                    filters_op=filters_op,
                 )
             },
             {
@@ -772,6 +789,7 @@ async def _master_truck_rows(
     payee: str | None = None,
     payees: list[str] | None = None,
     truck: str | None = None,
+    filters_op: str = "and",
 ) -> list[dict[str, Any]]:
     docs = await aggregate_list(
         db.transactions,
@@ -785,6 +803,7 @@ async def _master_truck_rows(
                     payee=payee,
                     payees=payees,
                     truck=truck,
+                    filters_op=filters_op,
                 )
             },
             {
@@ -819,6 +838,7 @@ async def _master_receipts(
     payee: str | None = None,
     payees: list[str] | None = None,
     truck: str | None = None,
+    filters_op: str = "and",
 ) -> dict[str, int]:
     docs = await aggregate_list(
         db.transactions,
@@ -832,6 +852,7 @@ async def _master_receipts(
                     payee=payee,
                     payees=payees,
                     truck=truck,
+                    filters_op=filters_op,
                 )
             },
             {"$group": {"_id": "$receipt_status", "count": {"$sum": 1}}},
@@ -919,6 +940,7 @@ async def _compute_master_trends(
     phase: int | None = None,
     mix_label: str | None = None,
     trucks_label: str | None = None,
+    filters_op: str = "and",
 ) -> dict[str, Any]:
     start, end = period_window(year, kind, month)  # type: ignore[arg-type]
     days = period_day_count(year, kind, month)  # type: ignore[arg-type]
@@ -942,6 +964,7 @@ async def _compute_master_trends(
     multi_payees = len(payee_names) > 1
     resolved_trucks_label = trucks_label or "Spend by Truck"
     secondary_coro = None
+    resolved_filters_op = (filters_op or "and").strip().lower() or "and"
 
     if multi_items:
         mix_coro = _master_category_rows(
@@ -951,6 +974,7 @@ async def _compute_master_trends(
             category_names=names,
             payees=payee_names or None,
             truck=truck_name or None,
+            filters_op=resolved_filters_op,
         )
         resolved_mix = mix_label or "Spend by Item"
         resolved_phase = phase if phase is not None else 2
@@ -964,6 +988,7 @@ async def _compute_master_trends(
             category_names=names or None,
             truck=truck_name or None,
             top_n=10,
+            filters_op=resolved_filters_op,
         )
         resolved_mix = mix_label or "Spend by Payee"
         resolved_phase = phase if phase is not None else 2
@@ -997,6 +1022,7 @@ async def _compute_master_trends(
             payees=payee_names or None,
             truck=truck_name or None,
             top_n=10,
+            filters_op=resolved_filters_op,
         )
         resolved_mix = mix_label or "Spend by Description"
         resolved_phase = phase if phase is not None else 2
@@ -1013,6 +1039,7 @@ async def _compute_master_trends(
         "payee": None,
         "payees": payee_names or None,
         "truck": truck_name or None,
+        "filters_op": (filters_op or "and").strip().lower() or "and",
     }
     secondary = (
         secondary_coro
@@ -2427,89 +2454,145 @@ def _entity_meta_rows(selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _infer_entity_family(key: str, explicit: str | None = None) -> str:
+    """Map a key prefix (or explicit family) to items|payees|suppliers|mixed."""
+    fam = (explicit or "").strip().lower()
+    if fam in ENTITY_FAMILY_KEYS or fam == "mixed":
+        return fam
+    raw = (key or "").strip().lower()
+    if raw.startswith("payee:"):
+        return "payees"
+    if raw.startswith("supplier:"):
+        return "suppliers"
+    if raw.startswith("item:"):
+        return "items"
+    return fam or "items"
+
+
+async def _lookup_payee_row(
+    catalog: list[dict[str, Any]], key: str
+) -> dict[str, Any] | None:
+    by_key = {str(p["key"]): p for p in catalog}
+    row = by_key.get(key)
+    if row is None and key.startswith("payee:"):
+        slug = key.split(":", 1)[1]
+        for p in catalog:
+            if item_key_from_name(str(p.get("payee") or "")) == slug:
+                return p
+    if row is None:
+        by_name = {str(p.get("payee") or "").casefold(): p for p in catalog}
+        row = by_name.get(key.casefold())
+    return row
+
+
+async def _lookup_category_row(
+    catalog: list[dict[str, Any]], key: str, *, prefix: str
+) -> dict[str, Any] | None:
+    by_key = {str(r["key"]): r for r in catalog}
+    row = by_key.get(key)
+    if row is None:
+        want = key if key.startswith(prefix) else f"{prefix}{key}"
+        row = by_key.get(want)
+    return row
+
+
 async def _resolve_entity_selection(
     db: Any,
     family: str,
     keys: list[str],
-) -> tuple[str, str, list[str] | None, list[str] | None, list[dict[str, Any]]]:
-    """Return (source_key, label, category_names|None, payees|None, entities)."""
-    fam = (family or "items").strip().lower()
-    if fam not in ENTITY_FAMILY_KEYS:
-        raise HTTPException(status_code=422, detail=f"Unknown entity family '{family}'")
+) -> tuple[str, str, list[str] | None, list[str] | None, list[dict[str, Any]], str]:
+    """Return (source_key, label, category_names, payees, entities, filters_op).
+
+    ``family`` may be items|payees|suppliers|mixed. Mixed (or mixed key prefixes)
+    resolves each key from the same catalogs used by ``/entities/sources``.
+    Items use the full active catalog — not sidebar-only — so suggested keys load.
+    """
     if not keys:
         raise HTTPException(status_code=422, detail="Select at least one entity")
 
-    if fam == "payees":
-        catalog = await _payee_entity_sources(db)
-        by_key = {str(p["key"]): p for p in catalog}
-        by_name = {
-            str(p.get("payee") or "").casefold(): p for p in catalog
-        }
-        selected = []
-        for key in keys:
-            row = by_key.get(key)
-            if row is None and key.startswith("payee:"):
-                slug = key.split(":", 1)[1]
-                for p in catalog:
-                    if item_key_from_name(str(p.get("payee") or "")) == slug:
-                        row = p
-                        break
-            if row is None:
-                row = by_name.get(key.casefold())
+    fam_in = (family or "").strip().lower() or "mixed"
+    if fam_in not in ENTITY_FAMILY_KEYS and fam_in != "mixed":
+        raise HTTPException(status_code=422, detail=f"Unknown entity family '{family}'")
+
+    # Infer per-key families; promote to mixed when prefixes disagree.
+    inferred = {_infer_entity_family(k, None if fam_in == "mixed" else fam_in) for k in keys}
+    if fam_in == "mixed" or len(inferred) > 1:
+        fam = "mixed"
+    else:
+        fam = next(iter(inferred)) if inferred else fam_in
+
+    items_cat: list[dict[str, Any]] | None = None
+    suppliers_cat: list[dict[str, Any]] | None = None
+    payees_cat: list[dict[str, Any]] | None = None
+    selected: list[dict[str, Any]] = []
+
+    for key in keys:
+        key_fam = _infer_entity_family(key, None if fam == "mixed" else fam)
+        if key_fam == "payees":
+            if payees_cat is None:
+                payees_cat = await _payee_entity_sources(db)
+            row = await _lookup_payee_row(payees_cat, key)
             if row is None:
                 raise HTTPException(status_code=404, detail=f"Unknown payee '{key}'")
-            selected.append(row)
-        payee_names = [
-            str(r.get("payee") or r.get("label") or "").strip()
-            for r in selected
-            if str(r.get("payee") or r.get("label") or "").strip()
-        ]
-        if not payee_names:
-            raise HTTPException(status_code=404, detail="No matching payees")
-        labels = [str(r.get("label") or r.get("payee") or "") for r in selected]
-        label = entity_set_label(fam, labels)
-        source_key = (
-            str(selected[0]["key"])
-            if len(selected) == 1
-            else ",".join(str(r["key"]) for r in selected)
-        )
-        return source_key, label, None, payee_names, _entity_meta_rows(selected)
-
-    # items / suppliers — category names
-    catalog = (
-        await _sidebar_item_sources(db)
-        if fam == "items"
-        else await _supplier_entity_sources(db)
-    )
-    by_key = {str(r["key"]): r for r in catalog}
-    selected = []
-    for key in keys:
-        row = by_key.get(key)
-        if row is None:
-            prefix = "item:" if fam == "items" else "supplier:"
-            want = key if key.startswith(prefix) else f"{prefix}{key}"
-            row = by_key.get(want)
-        if row is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Unknown {fam[:-1]} '{key}'",
+            selected.append({**row, "family": "payees"})
+        elif key_fam == "suppliers":
+            if suppliers_cat is None:
+                suppliers_cat = await _supplier_entity_sources(db)
+            row = await _lookup_category_row(
+                suppliers_cat, key, prefix="supplier:"
             )
-        selected.append(row)
-    names = [
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"Unknown supplier '{key}'")
+            selected.append({**row, "family": "suppliers"})
+        else:
+            # Full catalog (matches /entities/sources) — not sidebar-only.
+            if items_cat is None:
+                items_cat = await _item_entity_sources(db)
+            row = await _lookup_category_row(items_cat, key, prefix="item:")
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"Unknown item '{key}'")
+            selected.append({**row, "family": "items"})
+
+    category_names = [
         str(r.get("category_name") or r.get("label") or "").strip()
         for r in selected
-        if str(r.get("category_name") or r.get("label") or "").strip()
+        if str(r.get("family") or "") in {"items", "suppliers"}
+        and str(r.get("category_name") or r.get("label") or "").strip()
     ]
-    if not names:
-        raise HTTPException(status_code=404, detail="No matching categories")
-    labels = [str(r.get("label") or r.get("category_name") or "") for r in selected]
-    label = entity_set_label(fam, labels)
+    payee_names = [
+        str(r.get("payee") or r.get("label") or "").strip()
+        for r in selected
+        if str(r.get("family") or "") == "payees"
+        and str(r.get("payee") or r.get("label") or "").strip()
+    ]
+    if not category_names and not payee_names:
+        raise HTTPException(status_code=404, detail="No matching entities")
+
+    labels = [
+        str(r.get("label") or r.get("category_name") or r.get("payee") or "")
+        for r in selected
+    ]
+    label_family = fam if fam != "mixed" else "entities"
+    label = entity_set_label(label_family, labels)
     source_key = (
         str(selected[0]["key"])
         if len(selected) == 1
         else ",".join(str(r["key"]) for r in selected)
     )
-    return source_key, label, names, None, _entity_meta_rows(selected)
+    # Mixed category + payee selection must OR, otherwise AND yields empty sets.
+    filters_op = "or" if category_names and payee_names else "and"
+    meta = _entity_meta_rows(selected)
+    for i, row in enumerate(selected):
+        if i < len(meta):
+            meta[i]["family"] = str(row.get("family") or "")
+    return (
+        source_key,
+        label,
+        category_names or None,
+        payee_names or None,
+        meta,
+        filters_op,
+    )
 
 
 @analytics.get("/entities/sources")
@@ -2575,7 +2658,11 @@ async def _compute_entity_compare_slice(
 async def analytics_entities(
     request: Request,
     _manager: Manager,
-    family: str = Query("items", pattern="^(items|payees|suppliers)$"),
+    family: str = Query(
+        "mixed",
+        pattern="^(items|payees|suppliers|mixed)$",
+        description="Entity family, or mixed for a combined Items/Payees/Suppliers filter",
+    ),
     keys: str = Query(..., description="Comma-separated entity keys"),
     year: int = Query(..., ge=2000, le=2100),
     period: str = Query("year", pattern="^(year|month)$"),
@@ -2591,27 +2678,49 @@ async def analytics_entities(
     if cached is not None:
         return cached
     db = _database(request)
-    source_key, label, category_names, payees, entities = await _resolve_entity_selection(
-        db, family, key_list
-    )
+    (
+        source_key,
+        label,
+        category_names,
+        payees,
+        entities,
+        filters_op,
+    ) = await _resolve_entity_selection(db, family, key_list)
     n_cat = len(category_names or [])
     n_pay = len(payees or [])
+    families_present = {
+        str(e.get("family") or "")
+        for e in entities
+        if str(e.get("family") or "")
+    }
+    if len(families_present) > 1 or family == "mixed":
+        resolved_family = "mixed"
+    else:
+        resolved_family = next(iter(families_present), family)
     kind_name = {
         "items": "item" if n_cat <= 1 else "item_set",
         "suppliers": "supplier" if n_cat <= 1 else "supplier_set",
         "payees": "payee" if n_pay <= 1 else "payee_set",
-    }[family]
-    mix_label = {
-        "items": (
-            "Spend by Item" if n_cat > 1 else "Spend by Description"
-        ),
-        "suppliers": (
-            "Spend by Supplier" if n_cat > 1 else "Spend by Description"
-        ),
-        "payees": (
-            "Spend by Payee" if n_pay > 1 else "Spend by Description"
-        ),
-    }[family]
+        "mixed": "entity_set" if max(n_cat, n_pay) > 1 else "entity",
+    }.get(resolved_family, "entity")
+    if resolved_family == "mixed":
+        mix_label = "Spend by Description"
+        if n_cat > 1 and n_pay == 0:
+            mix_label = "Spend by Item"
+        elif n_pay > 1 and n_cat == 0:
+            mix_label = "Spend by Payee"
+    else:
+        mix_label = {
+            "items": (
+                "Spend by Item" if n_cat > 1 else "Spend by Description"
+            ),
+            "suppliers": (
+                "Spend by Supplier" if n_cat > 1 else "Spend by Description"
+            ),
+            "payees": (
+                "Spend by Payee" if n_pay > 1 else "Spend by Description"
+            ),
+        }.get(resolved_family, "Spend by Description")
     payload = await _compute_master_trends(
         db,
         year,
@@ -2625,7 +2734,9 @@ async def analytics_entities(
         kind_name=kind_name,
         phase=2 if max(n_cat, n_pay) > 1 else 1,
         mix_label=mix_label,
+        filters_op=filters_op,
     )
+    payload["family"] = resolved_family
     entity_cache_set(cache_k, payload)
     return payload
 
@@ -2634,7 +2745,10 @@ async def analytics_entities(
 async def analytics_entities_compare(
     request: Request,
     _manager: Manager,
-    family: str = Query("items", pattern="^(items|payees|suppliers)$"),
+    family: str = Query(
+        "mixed",
+        pattern="^(items|payees|suppliers|mixed)$",
+    ),
     keys: str = Query(..., description="Comma-separated entity keys (2–4)"),
     year: int = Query(..., ge=2000, le=2100),
     period: str = Query("year", pattern="^(year|month)$"),
@@ -2661,7 +2775,7 @@ async def analytics_entities_compare(
     slices = []
     labels = []
     for i, key in enumerate(key_list):
-        source_key, label, category_names, payees, entities = (
+        source_key, label, category_names, payees, entities, _filters_op = (
             await _resolve_entity_selection(db, family, [key])
         )
         color = ENTITY_COMPARE_COLORS[i % len(ENTITY_COMPARE_COLORS)]

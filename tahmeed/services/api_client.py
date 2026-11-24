@@ -149,9 +149,22 @@ class ApiClient:
             body = response.json()
             data = body.get("error", body) if isinstance(body, dict) else {}
             if isinstance(data, dict):
-                message = str(data.get("message") or message)
+                detail = data.get("detail")
+                if isinstance(detail, list) and detail:
+                    # FastAPI validation errors: [{loc, msg, type}, ...]
+                    first = detail[0] if isinstance(detail[0], dict) else {}
+                    detail_msg = str(
+                        first.get("msg") or first.get("message") or detail[0]
+                    )
+                elif detail is not None:
+                    detail_msg = str(detail)
+                else:
+                    detail_msg = ""
+                message = str(
+                    data.get("message") or detail_msg or message
+                )
                 code = str(data.get("code") or code)
-                details = data.get("details")
+                details = data.get("details", detail)
                 request_id = data.get("request_id") or request_id
         except ValueError:
             if response.text.strip():

@@ -455,13 +455,16 @@ def entity_set_label(
     """Human label for one or many selected Entities."""
     names = [str(n).strip() for n in (labels or ()) if str(n).strip()]
     if not names:
-        return family.title()
+        fam = (family or "").strip().lower()
+        return "Entities" if fam in {"", "mixed", "entities"} else family.title()
     if len(names) == 1:
         return names[0]
     noun = {
         "items": "items",
         "payees": "payees",
         "suppliers": "suppliers",
+        "mixed": "entities",
+        "entities": "entities",
     }.get((family or "").strip().lower(), "entities")
     if len(names) == 2:
         return f"{names[0]} + {names[1]}"

@@ -85,7 +85,7 @@ def test_set_options_deferred_while_popup_open() -> None:
 
 
 def test_searchable_filters_rows_by_substring() -> None:
-    """Entities catalog: type-to-filter keeps All visible and hides non-matches."""
+    """Entities catalog: typing hides All/Select row and non-matches."""
     _app = QApplication.instance() or QApplication([])
     combo = CheckableMultiCombo(
         "Select items…",
@@ -96,11 +96,12 @@ def test_searchable_filters_rows_by_substring() -> None:
     combo.showPopup()
     combo._apply_row_filter("fuel")
     view = combo.view()
-    assert not view.isRowHidden(0)
+    assert view.isRowHidden(0)  # Select… hidden while filtering
     assert view.isRowHidden(1)  # Parking Fee
     assert not view.isRowHidden(2)  # Fuel Diesel
     assert view.isRowHidden(3)  # Toll Gate
     combo._apply_row_filter("")
+    assert not view.isRowHidden(0)
     assert not view.isRowHidden(1)
     assert not view.isRowHidden(2)
     assert not view.isRowHidden(3)

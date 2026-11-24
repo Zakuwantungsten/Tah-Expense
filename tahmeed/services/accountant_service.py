@@ -1260,7 +1260,7 @@ async def get_analytics_entities(
 ) -> dict:
     """Deep-dive payload for one or more Master-side entities (merged)."""
     params: Dict[str, Any] = {
-        "family": (family or "items").strip().lower(),
+        "family": (family or "mixed").strip().lower() or "mixed",
         "keys": _entities_keys_param(keys),
         "year": int(year),
         "period": (period or "year").strip().lower(),
@@ -1285,7 +1285,7 @@ async def get_analytics_entities_compare(
 ) -> dict:
     """Side-by-side compare payload for 2–4 Entities."""
     params: Dict[str, Any] = {
-        "family": (family or "items").strip().lower(),
+        "family": (family or "mixed").strip().lower() or "mixed",
         "keys": _entities_keys_param(keys),
         "year": int(year),
         "period": (period or "year").strip().lower(),
