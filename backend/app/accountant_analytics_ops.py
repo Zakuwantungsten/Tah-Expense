@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Literal
 
-from .accountant_overview_ops import safe_double, sum_amount_if_currency
-from .feed_ops import not_trashed_clause
+from .accountant_overview_ops import sum_amount_if_currency
+from .feed_ops import _legacy_tx_date_filter, not_trashed_clause
 from .reconciliation_ops import ENTITY as SM_BURHANI_ENTITY
 
 PeriodKind = Literal["year", "month"]
@@ -26,15 +26,42 @@ class SeparateFeedSpec:
     date_field: str
     amount_expr: dict[str, Any]
     absolute: bool = True
+    # Same display-string fallback the live tab year filter uses (e.g. payment_date).
+    legacy_date_field: str | None = None
+
+
+def _safe_money(field: str) -> dict[str, Any]:
+    """Numeric or formatted string amounts (``1,234.50``) → double."""
+    cleaned = {
+        "$replaceAll": {
+            "input": {
+                "$replaceAll": {
+                    "input": {"$toString": {"$ifNull": [f"${field}", "0"]}},
+                    "find": ",",
+                    "replacement": "",
+                }
+            },
+            "find": " ",
+            "replacement": "",
+        }
+    }
+    return {
+        "$convert": {
+            "input": cleaned,
+            "to": "double",
+            "onError": 0.0,
+            "onNull": 0.0,
+        }
+    }
 
 
 def _abs_field(field: str) -> dict[str, Any]:
-    return {"$abs": safe_double(field)}
+    return {"$abs": _safe_money(field)}
 
 
 def _zambia_spend_expr() -> dict[str, Any]:
     """Debit is spend; credit is top-up — count debit only (absolute)."""
-    return {"$abs": safe_double("debit")}
+    return {"$abs": _safe_money("debit")}
 
 
 # All SEPARATE EXPENSES tabs (excluding Uploads Trash).
@@ -47,6 +74,7 @@ SEPARATE_EXPENSE_FEEDS: tuple[SeparateFeedSpec, ...] = (
         match={"feed_type": "toll_plaza", **not_trashed_clause()},
         date_field="transaction_date",
         amount_expr=_abs_field("tender_amount"),
+        legacy_date_field="toll_date",
     ),
     SeparateFeedSpec(
         key="parking_congo",
@@ -56,6 +84,7 @@ SEPARATE_EXPENSE_FEEDS: tuple[SeparateFeedSpec, ...] = (
         match={"feed_type": "parking_congo", **not_trashed_clause()},
         date_field="transaction_date",
         amount_expr=_abs_field("amount"),
+        legacy_date_field="payment_date",
     ),
     SeparateFeedSpec(
         key="congo_exp",
@@ -128,6 +157,7 @@ SEPARATE_EXPENSE_FEEDS: tuple[SeparateFeedSpec, ...] = (
         match={"feed_type": "rahntech", **not_trashed_clause()},
         date_field="transaction_date",
         amount_expr=_abs_field("amount"),
+        legacy_date_field="sales_date",
     ),
 )
 
@@ -210,15 +240,56 @@ def averages_from_totals(
     }
 
 
+def _period_is_full_calendar_year(start: datetime, end: datetime) -> bool:
+    if start.month != 1 or start.day != 1 or start.year != end.year:
+        return False
+    # period_window year end is 31 Dec 23:59:59; year_window uses 1 Jan next year.
+    return (end.month == 12 and end.day >= 31) or (
+        end.year == start.year + 1 and end.month == 1 and end.day == 1
+    )
+
+
+def feed_period_match(
+    spec: SeparateFeedSpec,
+    start: datetime,
+    end: datetime,
+) -> dict[str, Any]:
+    """Match one feed for a period — same legacy date fallback as the live tab."""
+    match = dict(spec.match)
+    if spec.legacy_date_field and _period_is_full_calendar_year(start, end):
+        match.update(
+            _legacy_tx_date_filter(
+                start.year,
+                0,
+                legacy_field=spec.legacy_date_field,
+            )
+        )
+        return match
+    if (
+        spec.legacy_date_field
+        and start.year == end.year
+        and start.month == end.month
+        and start.day == 1
+    ):
+        match.update(
+            _legacy_tx_date_filter(
+                start.year,
+                start.month,
+                legacy_field=spec.legacy_date_field,
+            )
+        )
+        return match
+    match[spec.date_field] = {"$gte": start, "$lte": end}
+    return match
+
+
 def feed_sum_pipeline(
     spec: SeparateFeedSpec,
     start: datetime,
     end: datetime,
 ) -> list[dict[str, Any]]:
-    match = dict(spec.match)
-    match[spec.date_field] = {"$gte": start, "$lte": end}
     return [
-        {"$match": match},
+        {"$match": feed_period_match(spec, start, end)},
         {
             "$group": {
                 "_id": None,

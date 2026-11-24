@@ -18,6 +18,7 @@ from .accountant_master_ops import master_period_clause
 from .accountant_ops import VERIFIED_SORT, build_verified_query
 from .accountant_analytics_ops import (
     SEPARATE_EXPENSE_FEEDS,
+    feed_period_match,
     feed_sum_pipeline,
     master_currency_group,
     period_window,
@@ -168,148 +169,142 @@ async def _month_sum_map(
     return out
 
 
-async def _overview_zmw_feed_month_totals(db: Any, year: int) -> dict[int, float]:
-    start, end = year_window(year)
-    toll_docs, zambia_docs = await asyncio.gather(
-        aggregate_list(db.imported_feeds, 
-            [
-                {
-                    "$match": {
-                        "feed_type": "toll_plaza",
-                        "transaction_date": {"$gte": start, "$lt": end},
-                    }
-                },
-                {
-                    "$group": {
-                        "_id": {"$month": "$transaction_date"},
-                        "total": {"$sum": safe_double("tender_amount")},
-                    }
-                },
-            ]
-        , length=None),
-        aggregate_list(db.imported_feeds, 
-            [
-                {
-                    "$match": {
-                        "feed_type": "zambia_parking",
-                        "transaction_date": {"$gte": start, "$lt": end},
-                    }
-                },
-                {
-                    "$group": {
-                        "_id": {"$month": "$transaction_date"},
-                        "total": {"$sum": safe_double("debit")},
-                    }
-                },
-            ]
-        , length=None),
-    )
-    toll = await _month_sum_map(toll_docs)
-    zambia = await _month_sum_map(zambia_docs)
-    return {m: toll[m] + zambia[m] for m in range(1, 13)}
-
-
-async def _overview_usd_feed_month_totals(db: Any, year: int) -> dict[int, float]:
-    start, end = year_window(year)
-    congo_docs, kimvi_docs, parking_docs, afritrack_docs = await asyncio.gather(
-        aggregate_list(db.separate_expenses, 
-            [
-                {
-                    "$match": {
-                        "expense_type": "congo_expenses",
-                        "expense_date": {"$gte": start, "$lt": end},
-                    }
-                },
-                {
-                    "$group": {
-                        "_id": {"$month": "$expense_date"},
-                        "total": {
-                            "$sum": {
-                                "$cond": [
-                                    {
-                                        "$gt": [
-                                            {"$ifNull": ["$amount_usd", 0]},
-                                            0,
-                                        ]
-                                    },
-                                    {"$ifNull": ["$amount_usd", 0]},
-                                    0,
-                                ]
-                            }
-                        },
-                    }
-                },
-            ]
-        , length=None),
-        aggregate_list(db.separate_expenses, 
-            [
-                {
-                    "$match": {
-                        "expense_type": "ahmed_kimvi",
-                        "expense_date": {"$gte": start, "$lt": end},
-                    }
-                },
-                {
-                    "$group": {
-                        "_id": {"$month": "$expense_date"},
-                        "total": {
-                            "$sum": {
-                                "$cond": [
-                                    {
-                                        "$gt": [
-                                            {"$ifNull": ["$amount_usd", 0]},
-                                            0,
-                                        ]
-                                    },
-                                    {"$ifNull": ["$amount_usd", 0]},
-                                    0,
-                                ]
-                            }
-                        },
-                    }
-                },
-            ]
-        , length=None),
-        aggregate_list(db.imported_feeds, 
-            [
-                {
-                    "$match": {
-                        "feed_type": "parking_congo",
-                        "transaction_date": {"$gte": start, "$lt": end},
-                    }
-                },
-                {
-                    "$group": {
-                        "_id": {"$month": "$transaction_date"},
-                        "total": {"$sum": safe_double("amount")},
-                    }
-                },
-            ]
-        , length=None),
-        aggregate_list(db.imported_feeds, 
-            [
-                {
-                    "$match": {
-                        "feed_type": "afritrack",
-                        "import_date": {"$gte": start, "$lt": end},
-                    }
-                },
-                {
-                    "$group": {
-                        "_id": {"$month": "$import_date"},
-                        "total": {"$sum": safe_double("total_invoice")},
-                    }
-                },
-            ]
-        , length=None),
-    )
-    congo = await _month_sum_map(congo_docs)
-    kimvi = await _month_sum_map(kimvi_docs)
-    parking = await _month_sum_map(parking_docs)
-    afritrack = await _month_sum_map(afritrack_docs)
+def _empty_feed_month_currency() -> dict[str, dict[int, float]]:
     return {
-        m: congo[m] + kimvi[m] + parking[m] + afritrack[m] for m in range(1, 13)
+        "tzs": {m: 0.0 for m in range(1, 13)},
+        "usd": {m: 0.0 for m in range(1, 13)},
+        "zmw": {m: 0.0 for m in range(1, 13)},
     }
+
+
+def _currency_bucket_key(currency: str | None) -> str | None:
+    cur = str(currency or "").strip().upper()
+    if cur in {"TZS", "TSH", "TZ"}:
+        return "tzs"
+    if cur == "USD":
+        return "usd"
+    if cur in {"ZMW", "ZMB", "ZK"}:
+        return "zmw"
+    return None
+
+
+def _feed_month_expr(spec: Any) -> dict[str, Any]:
+    """Calendar month from BSON date, with legacy display-string fallback."""
+    primary = f"${spec.date_field}"
+    if not getattr(spec, "legacy_date_field", None):
+        return {"$month": primary}
+    return {
+        "$month": {
+            "$ifNull": [
+                primary,
+                {
+                    "$dateFromString": {
+                        "dateString": f"${spec.legacy_date_field}",
+                        "format": "%d %b %Y",
+                        "onError": None,
+                        "onNull": None,
+                    }
+                },
+            ]
+        }
+    }
+
+
+async def _overview_separate_feed_month_totals(
+    db: Any, year: int
+) -> dict[str, dict[int, float]]:
+    """Every SEPARATE EXPENSES tab → native currency month buckets (Sources parity)."""
+    start, end = period_window(year, "year")
+    out = _empty_feed_month_currency()
+
+    async def _one(spec: Any) -> None:
+        coll = getattr(db, spec.collection, None)
+        if coll is None:
+            return
+        cur_key = _currency_bucket_key(spec.currency)
+        if cur_key is None:
+            return
+        docs = await aggregate_list(
+            coll,
+            [
+                {"$match": feed_period_match(spec, start, end)},
+                {
+                    "$group": {
+                        "_id": _feed_month_expr(spec),
+                        "total": {"$sum": spec.amount_expr},
+                    }
+                },
+            ],
+            length=None,
+        )
+        months = await _month_sum_map(docs)
+        for month, total in months.items():
+            out[cur_key][month] += abs(float(total or 0.0))
+
+    await asyncio.gather(*[_one(spec) for spec in SEPARATE_EXPENSE_FEEDS])
+    return out
+
+
+async def _overview_diesel_station_month_totals(
+    db: Any, year: int
+) -> dict[str, dict[int, float]]:
+    """Imported diesel stations only (Diesel Cash already lives in Master)."""
+    start, end = year_window(year)
+    out = _empty_feed_month_currency()
+    docs = await aggregate_list(
+        db.imported_feeds,
+        [
+            {
+                "$match": {
+                    "feed_type": {"$in": list(DIESEL_STATION_FEED_TYPES)},
+                    "transaction_date": {"$gte": start, "$lt": end},
+                    **not_trashed_clause(),
+                }
+            },
+            {
+                "$group": {
+                    "_id": {
+                        "month": {"$month": "$transaction_date"},
+                        "currency": {
+                            "$toUpper": {"$ifNull": ["$currency", ""]}
+                        },
+                    },
+                    "total": {"$sum": diesel_computed_amount()},
+                }
+            },
+        ],
+        length=None,
+    )
+    for doc in docs:
+        meta = doc.get("_id")
+        if not isinstance(meta, dict):
+            continue
+        month = meta.get("month")
+        if not isinstance(month, int) or not (1 <= month <= 12):
+            continue
+        cur_key = _currency_bucket_key(str(meta.get("currency") or ""))
+        if cur_key is None:
+            # Unknown currency codes fall through to TZS (same as accumulate_currency_amount).
+            cur_key = "tzs"
+        out[cur_key][month] += abs(float(doc.get("total") or 0.0))
+    return out
+
+
+async def _overview_non_master_month_totals(
+    db: Any, year: int
+) -> dict[str, dict[int, float]]:
+    """Separate tabs + diesel stations for TZS / USD / ZMW cards and trend."""
+    separate, stations = await asyncio.gather(
+        _overview_separate_feed_month_totals(db, year),
+        _overview_diesel_station_month_totals(db, year),
+    )
+    out = _empty_feed_month_currency()
+    for cur in ("tzs", "usd", "zmw"):
+        for month in range(1, 13):
+            out[cur][month] = float(separate[cur][month]) + float(
+                stations[cur][month]
+            )
+    return out
 
 
 async def _compute_kpis(db: Any, year: int) -> dict[str, Any]:
@@ -464,25 +459,47 @@ async def _compute_fuel_liters(db: Any, year: int) -> dict[str, Any]:
     return {"year": year, "series": serialize_fuel_liters_series(store)}
 
 
-async def _compute_month_totals(db: Any, year: int) -> dict[str, Any]:
-    master, feed_usd, feed_zmw = await asyncio.gather(
-        _master_month_totals(db, year),
-        _overview_usd_feed_month_totals(db, year),
-        _overview_zmw_feed_month_totals(db, year),
+async def _non_master_ytd_currency(db: Any, year: int) -> dict[str, float]:
+    """Year totals for separate tabs + diesel stations (same scope as Sources)."""
+    start, end = period_window(year, "year")
+    feeds, stations = await asyncio.gather(
+        _separate_feed_amount_rows(db, start, end),
+        _diesel_station_abs_totals(db, start, end),
     )
+    out = empty_currency_bucket()
+    for feed in feeds:
+        accumulate_currency_amount(
+            out,
+            str(feed.get("currency") or ""),
+            float(feed.get("amount") or 0.0),
+        )
+    return add_currency_buckets(out, stations)
+
+
+async def _compute_month_totals(db: Any, year: int) -> dict[str, Any]:
+    master, feeds, ytd = await asyncio.gather(
+        _master_month_totals(db, year),
+        _overview_non_master_month_totals(db, year),
+        _non_master_ytd_currency(db, year),
+    )
+    feed_tzs = feeds["tzs"]
+    feed_usd = feeds["usd"]
+    feed_zmw = feeds["zmw"]
     months: dict[str, dict[str, Any]] = {}
     for month in range(1, 13):
         row = master.get(month, {"tzs": 0.0, "usd": 0.0, "zmw": 0.0, "count": 0})
         months[str(month)] = {
-            "tzs": float(row.get("tzs") or 0.0),
+            "tzs": float(row.get("tzs") or 0.0) + float(feed_tzs.get(month) or 0.0),
             "usd": float(row.get("usd") or 0.0) + float(feed_usd.get(month) or 0.0),
             "zmw": float(row.get("zmw") or 0.0) + float(feed_zmw.get(month) or 0.0),
             "count": int(row.get("count") or 0),
         }
     return {
         "months": months,
-        "feed_usd_ytd": float(sum(feed_usd.values())),
-        "feed_zmw_ytd": float(sum(feed_zmw.values())),
+        # Authoritative YTD (legacy dates + money strings) — matches Sources bars.
+        "feed_tzs_ytd": float(ytd.get("tzs") or 0.0),
+        "feed_usd_ytd": float(ytd.get("usd") or 0.0),
+        "feed_zmw_ytd": float(ytd.get("zmw") or 0.0),
     }
 
 
@@ -777,6 +794,11 @@ async def overview_dashboard(
         _compute_sources(db, year),
     )
     kpis = dict(kpis)
+    # Master YTD + every separate tab + diesel stations (native currency).
+    kpis["total_tzs_ytd"] = (
+        float(kpis.get("total_tzs_ytd") or 0.0)
+        + float(month_payload.get("feed_tzs_ytd") or 0.0)
+    )
     kpis["total_usd_ytd"] = (
         float(kpis.get("total_usd_ytd") or 0.0)
         + float(month_payload.get("feed_usd_ytd") or 0.0)

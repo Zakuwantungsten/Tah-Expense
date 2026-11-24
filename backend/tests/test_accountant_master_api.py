@@ -372,6 +372,25 @@ def test_master_list_count_totals_and_meta() -> None:
     assert slim["categories"] is None
 
 
+def test_master_list_accepts_export_page_size() -> None:
+    """Excel exports page at 2000; API must accept that limit (not 422)."""
+    app = _app(FakeTransactions([_verified()]))
+    app.dependency_overrides[current_user] = lambda: _manager()
+
+    with TestClient(app) as client:
+        ok = client.get(
+            "/v1/accountant/master",
+            params={"year": 2026, "limit": 2000, "skip": 0},
+        )
+        too_big = client.get(
+            "/v1/accountant/master",
+            params={"year": 2026, "limit": 2001, "skip": 0},
+        )
+
+    assert ok.status_code == 200
+    assert too_big.status_code == 422
+
+
 def test_master_list_composite_total_and_cashier_names() -> None:
     """List returns full match count (not page length) + page cashier names."""
     cashier_a = ObjectId()

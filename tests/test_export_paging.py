@@ -7,6 +7,11 @@ import asyncio
 from tahmeed.ui.widgets.export_paging import EXPORT_PAGE_SIZE, fetch_all_pages
 
 
+def test_export_page_size_within_api_max() -> None:
+    """Keep client page size aligned with accountant/feeds Query(le=2000)."""
+    assert 1 <= EXPORT_PAGE_SIZE <= 2000
+
+
 def test_fetch_all_pages_walks_until_short_batch() -> None:
     batches = [
         [{"id": 1}, {"id": 2}],

@@ -30,7 +30,7 @@ from tahmeed.ui.widgets.excel_column_filter import (
     ExcelFilterHeaderView, SORT_ASC, cascade_column_values,
 )
 from tahmeed.ui.widgets.export_runner import (
-    FAST_STYLE_ROW_LIMIT, PROGRESS_EVERY,
+    FAST_STYLE_ROW_LIMIT, PROGRESS_EVERY, ExportProgressTracker,
     attach_export_overlay, export_file_ready, fetch_records_with_progress,
     hide_export_busy, normalize_xlsx_path, notify_export_error,
     notify_export_info, pick_export_path, run_export_write, show_export_busy,
@@ -1031,10 +1031,14 @@ class ItemQuickReportView(QWidget):
             )
             return
 
-        from tahmeed.services.accountant_service import get_cashier_names
+        from tahmeed.services.accountant_service import (
+            count_master_transactions,
+            get_cashier_names,
+        )
 
         self._export_in_flight = True
         overlay = attach_export_overlay(self)
+        tracker = ExportProgressTracker(overlay)
         kw = self._query_kwargs(all_records=all_records)
         mode_label = "All" if all_records else "Filtered"
         safe_cat = self._category.replace(" ", "_").replace("&", "and").replace("/", "-")
@@ -1049,6 +1053,8 @@ class ItemQuickReportView(QWidget):
                         kw, limit=limit, skip=skip,
                     ),
                     phase=f"Loading {mode_label.lower()} records",
+                    count_fn=lambda: count_master_transactions(**kw),
+                    tracker=tracker,
                 )
             except Exception as exc:
                 await notify_export_error(self, "Export Error", f"Failed to fetch data: {exc}")
@@ -1184,7 +1190,10 @@ class ItemQuickReportView(QWidget):
                 wb.save(path)
 
             try:
-                await run_export_write(overlay, total, _write)
+                show_export_busy(overlay, "Writing Excel…", maximum=0)
+                await run_export_write(
+                    overlay, total, _write, phase="Writing Excel", tracker=tracker,
+                )
             except Exception as exc:
                 await notify_export_error(self, "Save Error", f"Could not save file:\n{exc}")
                 return

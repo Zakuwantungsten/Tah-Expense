@@ -38,6 +38,7 @@ from tahmeed.ui.widgets.circuit_geometry import CircuitChromeFrame
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 from tahmeed.ui.widgets.split_export_button import make_export_menu_btn
 from tahmeed.ui.widgets.export_runner import (
+    ExportProgressTracker,
     attach_export_overlay,
     export_file_ready,
     fetch_records_with_progress,
@@ -1481,10 +1482,14 @@ class MasterExpensesWidget(QWidget):
             )
             return
 
-        from tahmeed.services.accountant_service import get_cashier_names
+        from tahmeed.services.accountant_service import (
+            count_master_transactions,
+            get_cashier_names,
+        )
 
         self._export_in_flight = True
         overlay = attach_export_overlay(self)
+        tracker = ExportProgressTracker(overlay)
         kw = self._export_scope_kw(all_records=all_records)
         mode_label = "All" if all_records else "Filtered"
         suffix = mode_label
@@ -1499,6 +1504,8 @@ class MasterExpensesWidget(QWidget):
                         kw, limit=limit, skip=skip,
                     ),
                     phase=f"Loading {mode_label.lower()} records",
+                    count_fn=lambda: count_master_transactions(**kw),
+                    tracker=tracker,
                 )
             except Exception as exc:
                 await notify_export_error(self, "Export Error", f"Failed to fetch data: {exc}")
@@ -1696,7 +1703,10 @@ class MasterExpensesWidget(QWidget):
                 wb.save(path)
 
             try:
-                await run_export_write(overlay, total, _write)
+                show_export_busy(overlay, "Writing Excel…", maximum=0)
+                await run_export_write(
+                    overlay, total, _write, phase="Writing Excel", tracker=tracker,
+                )
             except Exception as exc:
                 await notify_export_error(self, "Save Error", f"Could not save file:\n{exc}")
                 return

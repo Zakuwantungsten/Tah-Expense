@@ -1526,10 +1526,32 @@ class _ReconUploadDetail(QWidget):
             return
         from openpyxl.styles import Font, PatternFill, Alignment
 
-        rows = await recon_svc.get_recon_upload_records(
-            self._upload_id, self._table, self._station_filter(),
-            self._search, limit=100_000, skip=0,
+        from tahmeed.ui.widgets.export_runner import (
+            attach_export_overlay,
+            fetch_records_with_progress,
+            hide_export_busy,
+            show_export_busy,
         )
+
+        upload_id = self._upload_id
+        table = self._table
+        station = self._station_filter()
+        search = self._search
+        overlay = attach_export_overlay(self)
+        show_export_busy(overlay, "Loading reconciliation rows…", maximum=0)
+        try:
+            rows = await fetch_records_with_progress(
+                overlay,
+                lambda *, limit, skip: recon_svc.get_recon_upload_records(
+                    upload_id, table, station, search, limit=limit, skip=skip,
+                ),
+                phase="Loading reconciliation rows",
+                count_fn=lambda: recon_svc.count_recon_upload_records(
+                    upload_id, table, station, search,
+                ),
+            )
+        finally:
+            hide_export_busy(self)
 
         wb = openpyxl.Workbook()
         ws = wb.active

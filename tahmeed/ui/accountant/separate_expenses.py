@@ -49,6 +49,7 @@ from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.accountant.feed_upload_actions import upload_browse_headers
 from tahmeed.ui.widgets.export_paging import EXPORT_PAGE_SIZE, fetch_all_pages
 from tahmeed.ui.widgets.export_runner import (
+    ExportProgressTracker,
     attach_export_overlay,
     export_file_ready,
     fetch_records_with_progress,
@@ -581,6 +582,7 @@ class _FeedExportMixin:
 
         self._export_in_flight = True
         overlay = attach_export_overlay(self)
+        tracker = ExportProgressTracker(overlay)
         scope = "All" if all_records else "Filtered"
         try:
             show_export_busy(overlay, f"Loading {scope.lower()} records…", maximum=0)
@@ -591,6 +593,10 @@ class _FeedExportMixin:
                         all_records=all_records, limit=limit, skip=skip,
                     ),
                     phase=f"Loading {scope.lower()} records",
+                    count_fn=lambda: self._count_export_records(
+                        all_records=all_records,
+                    ),
+                    tracker=tracker,
                 )
             except Exception as exc:
                 await notify_export_error(self, "Export Error", str(exc))
@@ -639,7 +645,10 @@ class _FeedExportMixin:
                 )
 
             try:
-                await run_export_write(overlay, total, _write)
+                show_export_busy(overlay, "Writing Excel…", maximum=0)
+                await run_export_write(
+                    overlay, total, _write, phase="Writing Excel", tracker=tracker,
+                )
             except Exception as exc:
                 await notify_export_error(self, "Export Error", str(exc))
                 return
@@ -660,6 +669,51 @@ class _FeedExportMixin:
         finally:
             hide_export_busy(self)
             self._export_in_flight = False
+
+    def _export_count_fn_name(self) -> str:
+        fn_name = getattr(self, "_export_svc", "") or ""
+        if fn_name.startswith("get_"):
+            return "count_" + fn_name[4:]
+        return ""
+
+    async def _count_export_records(self, *, all_records: bool) -> int:
+        from tahmeed.services import accountant_service as svc
+
+        count_name = self._export_count_fn_name()
+        if not count_name:
+            return 0
+        fn = getattr(svc, count_name, None)
+        if fn is None:
+            return 0
+        kind = getattr(self, "_export_kind", "year_month")
+        search = "" if all_records else getattr(self, "_search", "")
+
+        if kind == "year_month":
+            date_kw = {} if all_records else self._date_kw()
+            extra: dict = {}
+            if hasattr(self, "_amount_filter_kw"):
+                extra.update(self._amount_filter_kw())
+            if hasattr(self, "_credit_only"):
+                extra["credit_only"] = self._credit_only
+            month = self._effective_month()
+            return int(await fn(
+                search, self._year, month, **date_kw, **extra,
+            ) or 0)
+
+        if kind == "upload":
+            return int(await fn(self._upload_id, search) or 0)
+
+        if kind == "deposits":
+            date_kw = {} if all_records else self._date_kw()
+            return int(await fn(search, **date_kw) or 0)
+
+        if kind == "insurance":
+            month = getattr(self, "_month", "")
+            status = "" if all_records else getattr(self, "_status", "")
+            feed = self._export_feed
+            return int(await fn(feed, search, month, status) or 0)
+
+        return 0
 
     async def _fetch_export_page(
         self, *, all_records: bool, limit: int, skip: int,

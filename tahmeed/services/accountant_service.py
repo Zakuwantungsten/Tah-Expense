@@ -532,49 +532,6 @@ def _sum_amount_if_currency(*codes: str, absolute: bool = False) -> dict:
     }
 
 
-async def _overview_zmw_feed_month_totals(year: int) -> Dict[int, float]:
-    """Per-month ZMW from Toll Plaza + Zambia Parking (same date filters as feed tabs)."""
-
-    async def _month(m: int) -> tuple[int, float]:
-        toll, zambia = await asyncio.gather(
-            get_toll_plaza_all_totals(year=year, month=m),
-            get_zambia_parking_all_totals(year=year, month=m),
-        )
-        total = float(toll.get("total_zmw", 0) or 0) + float(
-            zambia.get("total_debit", 0) or 0
-        )
-        return m, total
-
-    pairs = await asyncio.gather(*[_month(m) for m in range(1, 13)])
-    return dict(pairs)
-
-
-async def _overview_usd_feed_month_totals(year: int) -> Dict[int, float]:
-    """Per-month USD from separate-expense feeds (all except Toll Plaza / Zambia ZMW).
-
-    Congo / Kimvi contribute money-out; Parking Congo and Afritrack contribute
-    their spend totals. Toll Plaza stays in the ZMW feed merge only.
-    """
-
-    async def _month(m: int) -> tuple[int, float]:
-        congo, kimvi, parking, afritrack = await asyncio.gather(
-            get_congo_all_totals(year=year, month=m),
-            get_kimvi_all_totals(year=year, month=m),
-            get_parking_congo_all_totals(year=year, month=m),
-            get_afritrack_all_totals(year=year, month=m),
-        )
-        total = (
-            float(congo.get("money_out", 0) or 0)
-            + float(kimvi.get("money_out", 0) or 0)
-            + float(parking.get("amount", 0) or 0)
-            + float(afritrack.get("total_invoice", 0) or 0)
-        )
-        return m, total
-
-    pairs = await asyncio.gather(*[_month(m) for m in range(1, 13)])
-    return dict(pairs)
-
-
 def _overview_int_months(raw: dict | None) -> Dict[int, dict]:
     """Convert API month-totals keys (often strings) to int keys for the UI."""
     out: Dict[int, dict] = {}
@@ -623,10 +580,10 @@ def _deserialize_fuel_liters_series(
 
 
 async def get_overview_kpis(year: Optional[int] = None) -> dict:
-    """Aggregate real counts for the Overview KPI cards (TZS / USD / ZMW).
+    """Master-only KPI snapshot from ``/overview/kpis``.
 
-    USD/ZMW from imported separate-expense feeds are merged by
-    ``get_overview_dashboard`` so feed aggregations run once per refresh.
+    Inclusive TZS/USD/ZMW YTD (Master + every separate tab + diesel stations)
+    comes from ``get_overview_dashboard`` / ``GET /overview``.
     """
     params: dict = {}
     if year is not None:
@@ -877,11 +834,10 @@ async def get_overview_fuel_liters(year: int) -> dict:
 async def get_overview_month_totals(year: int) -> Dict:
     """Per-month TZS / USD / ZMW totals for the Overview trend chart.
 
-    Master ledger supplies TZS/USD/(any ZMW on transactions). Separate-expense
-    USD feeds (Congo, Kimvi, Parking Congo, Afritrack) are added into USD;
-    Toll Plaza and Zambia Parking feeds are added into ZMW.
+    Master plus every Separate Expenses tab and diesel station, bucketed by
+    native currency (same scope as the Overview currency KPI cards).
 
-    Returns ``{"months": {1: {...}, ...}, "feed_usd_ytd": float, "feed_zmw_ytd": float}``.
+    Returns months plus ``feed_tzs_ytd`` / ``feed_usd_ytd`` / ``feed_zmw_ytd``.
     """
     payload = await api_client.request(
         "GET",
@@ -893,6 +849,7 @@ async def get_overview_month_totals(year: int) -> Dict:
         months.setdefault(month, {"tzs": 0.0, "usd": 0.0, "zmw": 0.0, "count": 0})
     return {
         "months": months,
+        "feed_tzs_ytd": float(payload.get("feed_tzs_ytd") or 0.0),
         "feed_usd_ytd": float(payload.get("feed_usd_ytd") or 0.0),
         "feed_zmw_ytd": float(payload.get("feed_zmw_ytd") or 0.0),
     }

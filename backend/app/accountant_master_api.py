@@ -242,7 +242,7 @@ async def list_master(
     column_filters: str = "",
     sort_field: str = "date",
     sort_asc: bool = False,
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
     skip: int = Query(0, ge=0),
 ) -> dict:
     query = await _master_query(

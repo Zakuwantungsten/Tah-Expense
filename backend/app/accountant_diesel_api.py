@@ -169,7 +169,7 @@ async def diesel_cash_transactions(
     date_to: datetime | None = None,
     sort_field: str = "date",
     sort_asc: bool = False,
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
     skip: int = Query(0, ge=0),
 ) -> dict:
     db = _database(request)
@@ -267,7 +267,7 @@ async def diesel_cash_totals(
 async def diesel_cash_entries(
     _manager: Manager,
     station: str | None = None,
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
     skip: int = Query(0, ge=0),
 ) -> dict:
     # Desktop stub — reserved for future station-ledger entries.

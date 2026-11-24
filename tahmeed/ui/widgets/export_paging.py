@@ -6,6 +6,7 @@ from typing import Awaitable, Callable, List, Optional, TypeVar
 
 T = TypeVar("T")
 
+# Must stay within accountant/feeds list API max (Query le=2000).
 EXPORT_PAGE_SIZE = 2000
 
 
@@ -14,8 +15,15 @@ async def fetch_all_pages(
     *,
     page_size: int = EXPORT_PAGE_SIZE,
     on_batch: Optional[Callable[[int], None]] = None,
+    total: Optional[int] = None,
 ) -> List[T]:
-    """Walk a (limit, skip) fetch until the source is exhausted."""
+    """Walk a (limit, skip) fetch until the source is exhausted.
+
+    When *total* is known, callers can drive a determinate % bar from
+    ``on_batch(loaded_count)``. Pagination continues past any page size —
+    there is no artificial row cap (30k+ master exports are fine).
+    """
+    del total  # reserved for callers / progress; never used to cap rows
     out: List[T] = []
     skip = 0
     while True:

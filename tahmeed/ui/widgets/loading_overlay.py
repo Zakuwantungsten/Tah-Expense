@@ -70,6 +70,10 @@ class LoadingOverlay(QFrame):
         painter.fillRect(event.rect(), QColor(255, 255, 255, 140))
         painter.end()
 
+    def enable_progress(self, enabled: bool = True) -> None:
+        """Exports enable the determinate % bar; ordinary loads stay message-only."""
+        self._panel.enable_progress(enabled)
+
     def show_loading(
         self,
         message: Optional[str] = None,

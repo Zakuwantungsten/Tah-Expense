@@ -419,7 +419,7 @@ async def list_skipped_rows(
     feed_key: str = Query(..., min_length=1),
     search: str = Query(""),
     skip: int = Query(0, ge=0),
-    limit: int = Query(200, ge=1, le=500),
+    limit: int = Query(200, ge=1, le=2000),
 ) -> list[dict[str, Any]]:
     del manager
     query = skipped_import_query(feed_key, search)
@@ -661,7 +661,7 @@ async def list_feed_records(
     called_out_only: bool = Query(False),
     file_labels: str = Query(""),
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
     sort_field: str = Query(""),
     sort_asc: bool = Query(False),
 ) -> list[dict[str, Any]]:
@@ -873,7 +873,7 @@ async def list_parking_congo_deposits(
     date_from: datetime | None = Query(None),
     date_to: datetime | None = Query(None),
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
 ) -> list[dict[str, Any]]:
     del manager
     query = parking_congo_deposits_query(search, date_from, date_to)
@@ -1032,7 +1032,7 @@ async def list_upload_records(
     manager: Manager,
     search: str = Query(""),
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
     sort_field: str = Query(""),
     sort_asc: bool = Query(True),
 ) -> list[dict[str, Any]]:

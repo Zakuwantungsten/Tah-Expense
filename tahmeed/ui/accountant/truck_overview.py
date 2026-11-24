@@ -1551,8 +1551,9 @@ class TruckOverviewWidget(QWidget):
                     if item is not None:
                         item.setBackground(QColor(_BLUE_L))
 
-    def _show_export_busy(self, message: str) -> None:
-        self._loading_overlay.show_loading(message)
+    def _show_export_busy(self, message: str, *, value=None, maximum=None) -> None:
+        self._loading_overlay.enable_progress(True)
+        self._loading_overlay.show_loading(message, value=value, maximum=maximum)
         self._status.setText(message)
 
     def _hide_export_busy(self) -> None:
@@ -1577,15 +1578,22 @@ class TruckOverviewWidget(QWidget):
             )
             return
 
-        get_records, _count_records, get_summary = self._overview_apis()
+        get_records, count_records, get_summary = self._overview_apis()
 
         self._show_export_busy(f"Preparing Excel export for {truck}…")
         rows = None
         summary = None
         prepare_error = None
         try:
+            from tahmeed.ui.widgets.export_runner import fetch_records_with_progress
+
             kw = self._filter_kw()
-            rows = await get_records(**kw, limit=100000, skip=0)
+            rows = await fetch_records_with_progress(
+                self._loading_overlay,
+                lambda *, limit, skip: get_records(**kw, limit=limit, skip=skip),
+                phase=f"Loading records for {truck}",
+                count_fn=lambda: count_records(**kw),
+            )
             summary = await get_summary(**kw)
         except Exception as exc:
             prepare_error = exc
@@ -1673,15 +1681,22 @@ class TruckOverviewWidget(QWidget):
         if not self._has_valid_date_range(warn=True):
             return
 
-        get_records, _count_records, get_summary = self._overview_apis()
+        get_records, count_records, get_summary = self._overview_apis()
 
         self._show_export_busy(f"Preparing PDF export for {truck}…")
         rows = None
         summary = None
         prepare_error = None
         try:
+            from tahmeed.ui.widgets.export_runner import fetch_records_with_progress
+
             kw = self._filter_kw()
-            rows = await get_records(**kw, limit=100000, skip=0)
+            rows = await fetch_records_with_progress(
+                self._loading_overlay,
+                lambda *, limit, skip: get_records(**kw, limit=limit, skip=skip),
+                phase=f"Loading records for {truck}",
+                count_fn=lambda: count_records(**kw),
+            )
             summary = await get_summary(**kw)
         except Exception as exc:
             prepare_error = exc

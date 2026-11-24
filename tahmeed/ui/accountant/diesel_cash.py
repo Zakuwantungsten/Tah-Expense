@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt, QSize, QTimer, Signal, QDate
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QHeaderView,
-    QLineEdit, QComboBox, QPushButton, QMessageBox, QFileDialog,
+    QLineEdit, QComboBox, QPushButton, QMessageBox,
     QStackedWidget, QListWidget, QListWidgetItem, QAbstractItemView,
 )
 
@@ -37,6 +37,19 @@ from tahmeed.ui.accountant.separate_expenses import (
 )
 from tahmeed.ui.accountant.feed_sort_helpers import (
     DIESEL_CASH_SORT, wire_feed_table_sort, sort_kw, reset_feed_sort,
+)
+from tahmeed.ui.widgets.export_runner import (
+    ExportProgressTracker,
+    attach_export_overlay,
+    export_file_ready,
+    fetch_records_with_progress,
+    hide_export_busy,
+    normalize_xlsx_path,
+    notify_export_error,
+    notify_export_info,
+    pick_export_path,
+    run_export_write,
+    show_export_busy,
 )
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 
@@ -445,76 +458,115 @@ class _DieselCashAllEntries(QWidget):
 
     async def _do_export(self) -> None:
         try:
-            import openpyxl
-            from openpyxl.styles import Font, PatternFill, Alignment
+            import openpyxl  # noqa: F401
         except ImportError:
-            QMessageBox.critical(
+            await notify_export_error(
                 self, "Missing Dependency",
                 "openpyxl is required for Excel export.\n\nRun: pip install openpyxl",
             )
             return
 
-        from tahmeed.services.accountant_service import get_diesel_cash_transactions
-        kw = self._filter_kw()
-        try:
-            txs = await get_diesel_cash_transactions(
-                **kw, **sort_kw(self._sort_state), limit=10_000, skip=0,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")
-            return
-
+        from tahmeed.services.accountant_service import (
+            count_diesel_cash_transactions,
+            get_diesel_cash_transactions,
+        )
         from tahmeed.services.export_restriction_service import (
             filter_transactions_for_export,
         )
 
-        txs = await filter_transactions_for_export(
-            txs, surface="diesel_cash", fmt="excel",
-        )
-        if not txs:
-            QMessageBox.information(
-                self, "Export",
-                "All records belong to items restricted from Excel export.",
-            )
-            return
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Diesel Cash"
-        ws.merge_cells(_EXPORT_SPAN)
-        ws["A1"] = "TAHMEED COACH TZ LTD"
-        ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
-        ws["A1"].alignment = Alignment(horizontal="center")
-        ws.merge_cells("A2:L2")
-        ws["A2"] = "Diesel Cash — All Entries"
-        ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
-        ws["A2"].alignment = Alignment(horizontal="center")
-        ws.append([])
-        ws.append([c[0] for c in _DIESEL_COLS])
-        hdr_row = ws.max_row
-        grey = PatternFill("solid", fgColor="F1F5F9")
-        for cell in ws[hdr_row]:
-            cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
-            cell.fill = grey
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        for tx in txs:
-            ws.append(_diesel_export_row(tx))
-
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Diesel Cash",
-            "DieselCash_AllEntries.xlsx",
-            "Excel Files (*.xlsx)",
-        )
-        if not path:
-            return
-        if not path.endswith(".xlsx"):
-            path += ".xlsx"
+        overlay = attach_export_overlay(self)
+        tracker = ExportProgressTracker(overlay)
+        kw = self._filter_kw()
+        sort = sort_kw(self._sort_state)
         try:
-            wb.save(path)
-            QMessageBox.information(self, "Export Complete", f"Saved to:\n{path}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+            show_export_busy(overlay, "Loading diesel cash…", maximum=0)
+            try:
+                txs = await fetch_records_with_progress(
+                    overlay,
+                    lambda *, limit, skip: get_diesel_cash_transactions(
+                        **kw, **sort, limit=limit, skip=skip,
+                    ),
+                    phase="Loading diesel cash",
+                    count_fn=lambda: count_diesel_cash_transactions(**kw),
+                    tracker=tracker,
+                )
+            except Exception as exc:
+                await notify_export_error(
+                    self, "Export Error", f"Failed to fetch data: {exc}",
+                )
+                return
+            finally:
+                hide_export_busy(self)
+
+            txs = await filter_transactions_for_export(
+                txs, surface="diesel_cash", fmt="excel",
+            )
+            if not txs:
+                await notify_export_info(
+                    self, "Export",
+                    "All records belong to items restricted from Excel export.",
+                )
+                return
+
+            path = await pick_export_path(
+                self, "Export Diesel Cash", "DieselCash_AllEntries.xlsx",
+            )
+            if not path:
+                return
+            path = normalize_xlsx_path(path)
+            total = len(txs)
+
+            def _write(progress_cb) -> None:
+                from openpyxl.styles import Font, PatternFill, Alignment
+
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "Diesel Cash"
+                ws.merge_cells(_EXPORT_SPAN)
+                ws["A1"] = "TAHMEED COACH TZ LTD"
+                ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
+                ws["A1"].alignment = Alignment(horizontal="center")
+                ws.merge_cells("A2:L2")
+                ws["A2"] = "Diesel Cash — All Entries"
+                ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
+                ws["A2"].alignment = Alignment(horizontal="center")
+                ws.append([])
+                ws.append([c[0] for c in _DIESEL_COLS])
+                hdr_row = ws.max_row
+                grey = PatternFill("solid", fgColor="F1F5F9")
+                for cell in ws[hdr_row]:
+                    cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
+                    cell.fill = grey
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                for i, tx in enumerate(txs, 1):
+                    ws.append(_diesel_export_row(tx))
+                    if progress_cb and (i % 500 == 0 or i == total):
+                        progress_cb(i, "Writing Excel")
+                if progress_cb:
+                    progress_cb(total, "Saving file")
+                wb.save(path)
+
+            try:
+                show_export_busy(overlay, "Writing Excel…", maximum=0)
+                await run_export_write(
+                    overlay, total, _write, phase="Writing Excel", tracker=tracker,
+                )
+            except Exception as exc:
+                await notify_export_error(self, "Export Error", str(exc))
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not export_file_ready(path):
+                await notify_export_error(
+                    self, "Export Error", f"The file could not be saved:\n{path}",
+                )
+                return
+            await notify_export_info(
+                self, "Export Complete", f"Saved {total:,} row(s) to:\n{path}",
+            )
+        finally:
+            hide_export_busy(self)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1024,81 +1076,120 @@ class _DieselCashMonthDetail(QWidget):
 
     async def _do_export(self) -> None:
         try:
-            import openpyxl
-            from openpyxl.styles import Font, PatternFill, Alignment
+            import openpyxl  # noqa: F401
         except ImportError:
-            QMessageBox.critical(
+            await notify_export_error(
                 self, "Missing Dependency",
                 "openpyxl is required for Excel export.\n\nRun: pip install openpyxl",
             )
             return
 
-        from tahmeed.services.accountant_service import get_diesel_cash_transactions
+        from tahmeed.services.accountant_service import (
+            count_diesel_cash_transactions,
+            get_diesel_cash_transactions,
+        )
+        from tahmeed.services.export_restriction_service import (
+            filter_transactions_for_export,
+        )
+
+        overlay = attach_export_overlay(self)
+        tracker = ExportProgressTracker(overlay)
         kw = dict(
             year=self._year, month=self._month,
             search=self._search_text(), truck="",
             receipt=self._receipt_filter(),
             **self._date_kw(),
         )
+        sort = sort_kw(self._sort_state)
+        subtitle = f"Diesel Cash — {self._month_name} {self._year}"
+        default = f"DieselCash_{self._month_name}_{self._year}.xlsx"
         try:
-            txs = await get_diesel_cash_transactions(
-                **kw, **sort_kw(self._sort_state), limit=10_000, skip=0,
+            show_export_busy(overlay, "Loading diesel cash…", maximum=0)
+            try:
+                txs = await fetch_records_with_progress(
+                    overlay,
+                    lambda *, limit, skip: get_diesel_cash_transactions(
+                        **kw, **sort, limit=limit, skip=skip,
+                    ),
+                    phase="Loading diesel cash",
+                    count_fn=lambda: count_diesel_cash_transactions(**kw),
+                    tracker=tracker,
+                )
+            except Exception as exc:
+                await notify_export_error(
+                    self, "Export Error", f"Failed to fetch data: {exc}",
+                )
+                return
+            finally:
+                hide_export_busy(self)
+
+            txs = await filter_transactions_for_export(
+                txs, surface="diesel_cash", fmt="excel",
             )
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Error", f"Failed to fetch data: {exc}")
-            return
+            if not txs:
+                await notify_export_info(
+                    self, "Export",
+                    "All records belong to items restricted from Excel export.",
+                )
+                return
 
-        from tahmeed.services.export_restriction_service import (
-            filter_transactions_for_export,
-        )
+            path = await pick_export_path(self, "Export Diesel Cash", default)
+            if not path:
+                return
+            path = normalize_xlsx_path(path)
+            total = len(txs)
 
-        txs = await filter_transactions_for_export(
-            txs, surface="diesel_cash", fmt="excel",
-        )
-        if not txs:
-            QMessageBox.information(
-                self, "Export",
-                "All records belong to items restricted from Excel export.",
+            def _write(progress_cb) -> None:
+                from openpyxl.styles import Font, PatternFill, Alignment
+
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "Diesel Cash"
+                ws.merge_cells(_EXPORT_SPAN)
+                ws["A1"] = "TAHMEED COACH TZ LTD"
+                ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
+                ws["A1"].alignment = Alignment(horizontal="center")
+                ws.merge_cells("A2:L2")
+                ws["A2"] = subtitle
+                ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
+                ws["A2"].alignment = Alignment(horizontal="center")
+                ws.append([])
+                ws.append([c[0] for c in _DIESEL_COLS])
+                hdr_row = ws.max_row
+                grey = PatternFill("solid", fgColor="F1F5F9")
+                for cell in ws[hdr_row]:
+                    cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
+                    cell.fill = grey
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                for i, tx in enumerate(txs, 1):
+                    ws.append(_diesel_export_row(tx))
+                    if progress_cb and (i % 500 == 0 or i == total):
+                        progress_cb(i, "Writing Excel")
+                if progress_cb:
+                    progress_cb(total, "Saving file")
+                wb.save(path)
+
+            try:
+                show_export_busy(overlay, "Writing Excel…", maximum=0)
+                await run_export_write(
+                    overlay, total, _write, phase="Writing Excel", tracker=tracker,
+                )
+            except Exception as exc:
+                await notify_export_error(self, "Export Error", str(exc))
+                return
+            finally:
+                hide_export_busy(self)
+
+            if not export_file_ready(path):
+                await notify_export_error(
+                    self, "Export Error", f"The file could not be saved:\n{path}",
+                )
+                return
+            await notify_export_info(
+                self, "Export Complete", f"Saved {total:,} row(s) to:\n{path}",
             )
-            return
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Diesel Cash"
-        ws.merge_cells(_EXPORT_SPAN)
-        ws["A1"] = "TAHMEED COACH TZ LTD"
-        ws["A1"].font = Font(name="Segoe UI", bold=True, size=14, color="1B2B4B")
-        ws["A1"].alignment = Alignment(horizontal="center")
-        ws.merge_cells("A2:L2")
-        ws["A2"] = f"Diesel Cash — {self._month_name} {self._year}"
-        ws["A2"].font = Font(name="Segoe UI", bold=True, size=11, color="374151")
-        ws["A2"].alignment = Alignment(horizontal="center")
-        ws.append([])
-        ws.append([c[0] for c in _DIESEL_COLS])
-        hdr_row = ws.max_row
-        grey = PatternFill("solid", fgColor="F1F5F9")
-        for cell in ws[hdr_row]:
-            cell.font = Font(name="Segoe UI", bold=True, size=10, color="6B7280")
-            cell.fill = grey
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        for tx in txs:
-            ws.append(_diesel_export_row(tx))
-
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Diesel Cash",
-            f"DieselCash_{self._month_name}_{self._year}.xlsx",
-            "Excel Files (*.xlsx)",
-        )
-        if not path:
-            return
-        if not path.endswith(".xlsx"):
-            path += ".xlsx"
-        try:
-            wb.save(path)
-            QMessageBox.information(self, "Export Complete", f"Saved to:\n{path}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Export Error", str(exc))
+        finally:
+            hide_export_busy(self)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

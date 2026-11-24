@@ -25,6 +25,10 @@ def _matches(doc: dict, query: dict) -> bool:
             continue
         actual = doc.get(key)
         if isinstance(expected, dict):
+            if "$exists" in expected:
+                exists = key in doc and doc.get(key) is not None
+                if bool(expected["$exists"]) != exists:
+                    return False
             if "$ne" in expected and actual == expected["$ne"]:
                 return False
             if "$in" in expected and actual not in expected["$in"]:
@@ -289,20 +293,34 @@ class FakeTransactions:
         return FakeCursor(docs)
 
 
+def _parse_money(value: object) -> float:
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "").replace(" ", "")
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
 def _feed_amount(doc: dict) -> float:
     if "tender_amount" in doc:
-        return abs(float(doc.get("tender_amount") or 0))
+        return abs(_parse_money(doc.get("tender_amount")))
     if "debit" in doc:
-        return abs(float(doc.get("debit") or 0))
+        return abs(_parse_money(doc.get("debit")))
     if "total_invoice" in doc:
-        return abs(float(doc.get("total_invoice") or 0))
+        return abs(_parse_money(doc.get("total_invoice")))
     if "total_premium" in doc:
-        return abs(float(doc.get("total_premium") or 0))
+        return abs(_parse_money(doc.get("total_premium")))
     if "premium" in doc:
-        return abs(float(doc.get("premium") or 0))
+        return abs(_parse_money(doc.get("premium")))
     if "ltrs" in doc or "price_per_ltr" in doc:
-        return abs(float(doc.get("ltrs") or 0) * float(doc.get("price_per_ltr") or 0))
-    return abs(float(doc.get("amount") or 0))
+        return abs(
+            _parse_money(doc.get("ltrs")) * _parse_money(doc.get("price_per_ltr"))
+        )
+    return abs(_parse_money(doc.get("amount")))
 
 
 class FakeImportedFeeds:
@@ -338,6 +356,26 @@ class FakeImportedFeeds:
                             elif cur in {"ZMW", "ZMB", "ZK"}:
                                 row["zmw"] += amt
                     docs = [row]
+                elif (
+                    isinstance(gid, dict)
+                    and "month" in gid
+                    and "currency" in gid
+                ):
+                    # Diesel stations: group by calendar month + currency.
+                    buckets_mc: dict[tuple, float] = {}
+                    for d in docs:
+                        day = d.get("transaction_date")
+                        if not isinstance(day, datetime):
+                            continue
+                        key = (day.month, str(d.get("currency") or "").upper())
+                        buckets_mc[key] = buckets_mc.get(key, 0.0) + _feed_amount(d)
+                    docs = [
+                        {
+                            "_id": {"month": month, "currency": cur},
+                            "total": total,
+                        }
+                        for (month, cur), total in buckets_mc.items()
+                    ]
                 elif (
                     isinstance(gid, dict)
                     and "feed" in gid
@@ -394,16 +432,20 @@ class FakeImportedFeeds:
                         bucket["liters"] += float(d.get("ltrs") or 0)
                     docs = list(buckets.values())
                 elif isinstance(gid, dict) and "$month" in str(gid):
-                    field = (
-                        "import_date"
-                        if "import_date" in str(pipeline)
-                        else "transaction_date"
-                    )
                     buckets2: dict[int, dict] = {}
                     for d in docs:
-                        day = d.get(field) or d.get("transaction_date") or d.get(
-                            "import_date"
+                        day = (
+                            d.get("transaction_date")
+                            or d.get("import_date")
+                            or d.get("payment_date")
+                            or d.get("toll_date")
+                            or d.get("sales_date")
                         )
+                        if isinstance(day, str):
+                            try:
+                                day = datetime.strptime(day, "%d %b %Y")
+                            except ValueError:
+                                day = None
                         if not isinstance(day, datetime):
                             continue
                         amt = _feed_amount(d)
@@ -446,13 +488,34 @@ class FakeReconciliationEntries:
             if "$match" in stage:
                 docs = [d for d in docs if _matches(d, stage["$match"])]
             elif "$group" in stage:
-                docs = [
-                    {
-                        "_id": None,
-                        "total": sum(abs(float(d.get("charge") or 0)) for d in docs),
-                        "count": len(docs),
-                    }
-                ]
+                group = stage["$group"]
+                gid = group.get("_id")
+                if gid is None:
+                    docs = [
+                        {
+                            "_id": None,
+                            "total": sum(
+                                abs(float(d.get("charge") or 0)) for d in docs
+                            ),
+                            "count": len(docs),
+                        }
+                    ]
+                elif isinstance(gid, dict) and "$month" in str(gid):
+                    buckets: dict[int, dict] = {}
+                    for d in docs:
+                        day = d.get("t1_date")
+                        if not isinstance(day, datetime):
+                            continue
+                        month = day.month
+                        bucket = buckets.setdefault(
+                            month,
+                            {"_id": month, "total": 0.0, "count": 0},
+                        )
+                        bucket["total"] += abs(float(d.get("charge") or 0))
+                        bucket["count"] += 1
+                    docs = list(buckets.values())
+                else:
+                    docs = []
         return FakeCursor(docs)
 
 
@@ -631,6 +694,22 @@ def test_overview_kpis_categories_receipts_and_dashboard(monkeypatch) -> None:
                 "transaction_date": datetime(2026, 2, 5),
                 "tender_amount": 30.0,
             },
+            {
+                "feed_type": "third_party",
+                "import_date": datetime(2026, 4, 1),
+                "total_premium": 40.0,
+            },
+            {
+                "feed_type": "rahntech",
+                "transaction_date": datetime(2026, 5, 1),
+                "amount": 12.0,
+            },
+            # Legacy Parking Congo row: display payment_date only (no BSON date).
+            {
+                "feed_type": "parking_congo",
+                "payment_date": "15 Mar 2026",
+                "amount": "1,250.50",
+            },
         ]
     )
     separate = FakeSeparateExpenses(
@@ -642,11 +721,21 @@ def test_overview_kpis_categories_receipts_and_dashboard(monkeypatch) -> None:
             }
         ]
     )
+    recon = FakeReconciliationEntries(
+        [
+            {
+                "entity": "sm_burhani",
+                "t1_date": datetime(2026, 6, 1),
+                "charge": 8.0,
+            }
+        ]
+    )
     app = _app(
         FakeTransactions(docs),
         imported_feeds=feeds,
         separate_expenses=separate,
         categories=categories,
+        reconciliation_entries=recon,
     )
     app.dependency_overrides[current_user] = lambda: _manager()
 
@@ -693,13 +782,18 @@ def test_overview_kpis_categories_receipts_and_dashboard(monkeypatch) -> None:
     assert "diesel_cash" in fuel.json()["series"]
     assert "infinity" in fuel.json()["series"]
     assert months.status_code == 200
-    assert months.json()["feed_usd_ytd"] == 25.0
-    assert months.json()["feed_zmw_ytd"] == 30.0
+    # Non-master add-ons: all separate tabs + diesel stations by currency.
+    assert months.json()["feed_tzs_ytd"] == 200.0 + 40.0  # Infinity + Third Party
+    # Congo + RahnTech + Burhani + legacy Parking Congo ("1,250.50")
+    assert months.json()["feed_usd_ytd"] == 25.0 + 12.0 + 8.0 + 1250.50
+    assert months.json()["feed_zmw_ytd"] == 30.0  # Toll Plaza
     assert sources.status_code == 200
     source_items = {row["key"]: row for row in sources.json()["items"]}
     # Separate tabs are ungrouped — one bar per sidebar tab.
     assert source_items["toll_plaza"]["native"]["zmw"] == 30.0
     assert source_items["congo_exp"]["native"]["usd"] == 25.0
+    assert source_items["parking_congo"]["native"]["usd"] == 1250.50
+    assert source_items["parking_congo"]["amount_tzs"] == 1250.50 * 2500.0
     assert "congo" not in source_items
     assert "toll_zambia" not in source_items
     assert source_items["fuel"]["native"]["tzs"] == 80.0 + 200.0
@@ -707,6 +801,14 @@ def test_overview_kpis_categories_receipts_and_dashboard(monkeypatch) -> None:
     assert dash.status_code == 200
     assert "kpis" in dash.json()
     assert "sources" in dash.json()
+    # Master TZS (100+200+80) + Infinity 200 + Third Party 40
+    assert dash.json()["kpis"]["total_tzs_ytd"] == 380.0 + 240.0
+    # Master USD 50 + Congo 25 + RahnTech 12 + SM Burhani 8 + Parking Congo 1250.50
+    assert dash.json()["kpis"]["total_usd_ytd"] == 50.0 + 45.0 + 1250.50
+    # Master ZMW 0 + Toll 30
+    assert dash.json()["kpis"]["total_zmw_ytd"] == 30.0
+    # Monthly trend: Master USD (Mar) + legacy Parking Congo (15 Mar 2026).
+    assert months.json()["months"]["3"]["usd"] == 50.0 + 1250.50
     assert dash.json()["kpis"]["supplier_tzs_ytd"] == 200.0
     assert len(dash.json()["recent"]) <= 8
 

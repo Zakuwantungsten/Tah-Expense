@@ -46,6 +46,7 @@ from tahmeed.ui.widgets.column_persistence import (
     bind_column_width_persistence,
 )
 from tahmeed.ui.widgets.export_runner import (
+    ExportProgressTracker,
     attach_export_overlay,
     export_file_ready,
     fetch_records_with_progress,
@@ -695,10 +696,14 @@ class CategoryTableWidget(QWidget):
             )
             return
 
-        from tahmeed.services.accountant_service import get_master_transactions
+        from tahmeed.services.accountant_service import (
+            count_master_transactions,
+            get_master_transactions,
+        )
 
         self._export_in_flight = True
         overlay = attach_export_overlay(self)
+        tracker = ExportProgressTracker(overlay)
         date_from, date_to = self._date_filters()
         kw = dict(
             year=self._year, month=self._month,
@@ -716,6 +721,8 @@ class CategoryTableWidget(QWidget):
                         **kw, **sort_kw(self._sort_state), limit=limit, skip=skip,
                     ),
                     phase=f"Loading {self._title}",
+                    count_fn=lambda: count_master_transactions(**kw),
+                    tracker=tracker,
                 )
             except Exception as exc:
                 await notify_export_error(self, "Export Error", f"Failed to fetch data: {exc}")
@@ -840,7 +847,10 @@ class CategoryTableWidget(QWidget):
                 wb.save(path)
 
             try:
-                await run_export_write(overlay, total, _write)
+                show_export_busy(overlay, "Writing Excel…", maximum=0)
+                await run_export_write(
+                    overlay, total, _write, phase="Writing Excel", tracker=tracker,
+                )
             except Exception as exc:
                 await notify_export_error(self, "Save Error", f"Could not save file:\n{exc}")
                 return

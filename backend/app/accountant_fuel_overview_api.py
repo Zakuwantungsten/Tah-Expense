@@ -167,7 +167,7 @@ async def list_fuel_overview_records(
     sort_field: str = Query("date"),
     sort_asc: bool = Query(True),
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
 ) -> list[dict[str, Any]]:
     del manager
     rows = await _prepared_rows(

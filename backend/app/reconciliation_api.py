@@ -132,7 +132,7 @@ async def list_rows(
     _manager: Manager,
     station: str = "",
     search: str = "",
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
     skip: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     table = _table(table)
@@ -189,7 +189,7 @@ async def list_all_records(
     search: str = "",
     year: int = Query(0, ge=0, le=2100),
     month: int = Query(0, ge=0, le=12),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
     skip: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     table = _table(table)
@@ -319,7 +319,7 @@ async def upload_records(
     _manager: Manager,
     station: str = "",
     search: str = "",
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
     skip: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     table = _table(table)

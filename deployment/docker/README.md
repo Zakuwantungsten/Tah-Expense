@@ -90,7 +90,26 @@ upgrading tool major versions.
 Receipt files are the primary copy. They must live on a host path that survives
 container recreate, not in the container layer and not in the `tahmeed-api-backups`
 volume. Mount the disk first, then create the directory as the container user
-(UID/GID 10001) before the first `docker compose up`:
+(UID/GID 10001) before the first `docker compose up`.
+
+Preferred path on a new or replacement HDD — interactive helper (lists connected
+disks, lets you **keep existing files** or **format**, confirms, writes
+`/etc/fstab` with `nofail` when it mounts, sets `10001:10001` on the receipts
+folder only, and can recreate `api`/`scheduler`):
+
+```bash
+cd /opt/tahmeed-expense/deployment/docker
+sudo scripts/attach-receipt-disk.sh
+```
+
+- **Keep files:** mounts the disk (or reuses an existing mount) and stores
+  receipts under a subdirectory (default `tahmeed-receipts/`) so other data on
+  the disk is left alone; Compose gets `ATTACHMENTS_HOST_PATH` pointing at that
+  folder.
+- **Format:** erases the device (type `YES`), mounts it as a dedicated receipts
+  disk (default `/mnt/tahmeed-receipts`).
+
+Manual equivalent:
 
 ```bash
 # Mount the disk at this path first. If the directory is created while the

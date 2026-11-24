@@ -226,6 +226,17 @@ class BrandLoaderPanel(QWidget):
         self._base_message = strip_loader_ellipsis(message)
         self._label.setText(self._compose_text())
 
+    def enable_progress(self, enabled: bool = True) -> None:
+        """Show/hide the % bar (exports turn this on; plain tab loaders stay off)."""
+        self._show_progress = bool(enabled)
+        if self._show_progress:
+            self._bar.show()
+            if self._running:
+                self._bar.start()
+        else:
+            self._bar.stop()
+            self._bar.hide()
+
     def set_progress(
         self,
         *,

@@ -354,7 +354,7 @@ async def list_truck_overview_records(
     date_from: datetime | None = Query(None),
     date_to: datetime | None = Query(None),
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=2000),
 ) -> list[dict[str, Any]]:
     del manager
     rows = await _filtered_rows(

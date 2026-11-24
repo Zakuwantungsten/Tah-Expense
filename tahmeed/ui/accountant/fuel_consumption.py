@@ -54,6 +54,7 @@ from tahmeed.ui.accountant.separate_expenses import (
 )
 from tahmeed.ui.widgets.column_persistence import bind_column_width_persistence
 from tahmeed.ui.widgets.export_runner import (
+    ExportProgressTracker,
     attach_export_overlay,
     export_file_ready,
     fetch_records_with_progress,
@@ -370,6 +371,23 @@ class _DieselExportMixin:
             **sort,
         )
 
+    async def _count_diesel_export_records(self, *, all_records: bool) -> int:
+        from tahmeed.services import accountant_service as svc
+
+        search = "" if all_records else getattr(self, "_search", "")
+        if self._export_scope == "upload":
+            return int(await svc.count_diesel_upload_records(
+                self._feed_type, self._upload_id, search,
+            ) or 0)
+        list_kw = {} if all_records else self._list_kw()
+        return int(await svc.count_diesel_all_records(
+            self._feed_type,
+            search,
+            self._year,
+            self._effective_month(),
+            **list_kw,
+        ) or 0)
+
     async def _run_diesel_export(self, *, all_records: bool) -> None:
         if getattr(self, "_export_in_flight", False):
             return
@@ -382,6 +400,7 @@ class _DieselExportMixin:
 
         self._export_in_flight = True
         overlay = attach_export_overlay(self)
+        tracker = ExportProgressTracker(overlay)
         scope = "All" if all_records else "Filtered"
         title = self._diesel_export_title()
         try:
@@ -393,6 +412,10 @@ class _DieselExportMixin:
                         all_records=all_records, limit=limit, skip=skip,
                     ),
                     phase=f"Loading {scope.lower()} records",
+                    count_fn=lambda: self._count_diesel_export_records(
+                        all_records=all_records,
+                    ),
+                    tracker=tracker,
                 )
             except Exception as exc:
                 await notify_export_error(self, "Export Error", str(exc))
@@ -445,7 +468,10 @@ class _DieselExportMixin:
                 )
 
             try:
-                await run_export_write(overlay, total, _write)
+                show_export_busy(overlay, "Writing Excel…", maximum=0)
+                await run_export_write(
+                    overlay, total, _write, phase="Writing Excel", tracker=tracker,
+                )
             except Exception as exc:
                 await notify_export_error(self, "Export Error", str(exc))
                 return
