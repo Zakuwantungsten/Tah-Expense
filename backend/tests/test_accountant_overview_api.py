@@ -234,42 +234,71 @@ class FakeTransactions:
                         buckets2[key] = buckets2.get(key, 0) + 1
                     docs = [{"_id": k, "count": v} for k, v in buckets2.items()]
                 elif isinstance(gid, dict) and "$ifNull" in gid:
-                    # Meetings: group by ownership / approver person
                     expr = gid.get("$ifNull") or []
                     field_ref = str(expr[0] if expr else "")
-                    person_field = "approver"
-                    if "ownership" in field_ref:
-                        person_field = "ownership"
-                    elif "approver" in field_ref:
-                        person_field = "approver"
-                    buckets_p: dict[str, dict] = {}
-                    for d in docs:
-                        person = str(d.get(person_field) or "")
-                        bucket = buckets_p.setdefault(
-                            person,
-                            {
-                                "_id": person,
-                                "tzs": 0.0,
-                                "usd": 0.0,
-                                "zmw": 0.0,
-                                "count": 0,
-                                "receipt_statuses": [],
-                            },
-                        )
-                        cur = str(d.get("currency") or "").upper()
-                        amt = abs(float(d.get("amount") or 0))
-                        if cur in {"TZS", "TSH", "TZ"}:
-                            bucket["tzs"] += amt
-                        elif cur == "USD":
-                            bucket["usd"] += amt
-                        elif cur in {"ZMW", "ZMB", "ZK"}:
-                            bucket["zmw"] += amt
-                        bucket["count"] += 1
-                        if "receipt_statuses" in group:
-                            bucket["receipt_statuses"].append(
-                                d.get("receipt_status")
+                    default_val = expr[1] if len(expr) > 1 else ""
+                    # Supplier / category group-by uses $category_name.
+                    if "category_name" in field_ref:
+                        buckets_cat: dict[str, dict] = {}
+                        for d in docs:
+                            name = str(
+                                d.get("category_name") or default_val or "Supplier"
                             )
-                    docs = list(buckets_p.values())
+                            bucket = buckets_cat.setdefault(
+                                name,
+                                {
+                                    "_id": name,
+                                    "tzs": 0.0,
+                                    "usd": 0.0,
+                                    "zmw": 0.0,
+                                    "count": 0,
+                                },
+                            )
+                            cur = str(d.get("currency") or "").upper()
+                            amt = abs(float(d.get("amount") or 0))
+                            if cur in {"TZS", "TSH", "TZ"}:
+                                bucket["tzs"] += amt
+                            elif cur == "USD":
+                                bucket["usd"] += amt
+                            elif cur in {"ZMW", "ZMB", "ZK"}:
+                                bucket["zmw"] += amt
+                            bucket["count"] += 1
+                        docs = list(buckets_cat.values())
+                    else:
+                        # Meetings: group by ownership / approver person
+                        person_field = "approver"
+                        if "ownership" in field_ref:
+                            person_field = "ownership"
+                        elif "approver" in field_ref:
+                            person_field = "approver"
+                        buckets_p: dict[str, dict] = {}
+                        for d in docs:
+                            person = str(d.get(person_field) or "")
+                            bucket = buckets_p.setdefault(
+                                person,
+                                {
+                                    "_id": person,
+                                    "tzs": 0.0,
+                                    "usd": 0.0,
+                                    "zmw": 0.0,
+                                    "count": 0,
+                                    "receipt_statuses": [],
+                                },
+                            )
+                            cur = str(d.get("currency") or "").upper()
+                            amt = abs(float(d.get("amount") or 0))
+                            if cur in {"TZS", "TSH", "TZ"}:
+                                bucket["tzs"] += amt
+                            elif cur == "USD":
+                                bucket["usd"] += amt
+                            elif cur in {"ZMW", "ZMB", "ZK"}:
+                                bucket["zmw"] += amt
+                            bucket["count"] += 1
+                            if "receipt_statuses" in group:
+                                bucket["receipt_statuses"].append(
+                                    d.get("receipt_status")
+                                )
+                        docs = list(buckets_p.values())
                 else:
                     # category breakdown
                     buckets3: dict[str, dict] = {}
@@ -323,6 +352,27 @@ def _feed_amount(doc: dict) -> float:
     return abs(_parse_money(doc.get("amount")))
 
 
+def _forced_currency_bucket(group: dict) -> str | None:
+    """Detect groups that force spend into exactly one of tzs/usd/zmw."""
+    forced = [
+        cur
+        for cur in ("tzs", "usd", "zmw")
+        if isinstance(group.get(cur), dict)
+        and group[cur].get("$sum") not in (0, 0.0, None)
+    ]
+    return forced[0] if len(forced) == 1 else None
+
+
+def _accumulate_row_currency(row: dict, currency: str, amount: float) -> None:
+    cur = str(currency or "").upper()
+    if cur in {"TZS", "TSH", "TZ"}:
+        row["tzs"] += amount
+    elif cur == "USD":
+        row["usd"] += amount
+    elif cur in {"ZMW", "ZMB", "ZK"}:
+        row["zmw"] += amount
+
+
 class FakeImportedFeeds:
     def __init__(self, documents: list[dict] | None = None) -> None:
         self.documents = list(documents or [])
@@ -346,15 +396,15 @@ class FakeImportedFeeds:
                         row["tzs"] = 0.0
                         row["usd"] = 0.0
                         row["zmw"] = 0.0
+                        forced = _forced_currency_bucket(group)
                         for d in docs:
                             amt = _feed_amount(d)
-                            cur = str(d.get("currency") or "").upper()
-                            if cur in {"TZS", "TSH", "TZ"}:
-                                row["tzs"] += amt
-                            elif cur == "USD":
-                                row["usd"] += amt
-                            elif cur in {"ZMW", "ZMB", "ZK"}:
-                                row["zmw"] += amt
+                            if forced:
+                                row[forced] += amt
+                            else:
+                                _accumulate_row_currency(
+                                    row, str(d.get("currency") or ""), amt
+                                )
                     docs = [row]
                 elif (
                     isinstance(gid, dict)
@@ -491,15 +541,22 @@ class FakeReconciliationEntries:
                 group = stage["$group"]
                 gid = group.get("_id")
                 if gid is None:
-                    docs = [
-                        {
-                            "_id": None,
-                            "total": sum(
-                                abs(float(d.get("charge") or 0)) for d in docs
-                            ),
-                            "count": len(docs),
-                        }
-                    ]
+                    total = sum(abs(float(d.get("charge") or 0)) for d in docs)
+                    row = {
+                        "_id": None,
+                        "total": total,
+                        "count": len(docs),
+                        "tzs": 0.0,
+                        "usd": 0.0,
+                        "zmw": 0.0,
+                    }
+                    forced = _forced_currency_bucket(group)
+                    if forced:
+                        row[forced] = total
+                    elif any(k in group for k in ("tzs", "usd", "zmw")):
+                        # Default SM Burhani / recon charges are USD.
+                        row["usd"] = total
+                    docs = [row]
                 elif isinstance(gid, dict) and "$month" in str(gid):
                     buckets: dict[int, dict] = {}
                     for d in docs:
@@ -801,10 +858,12 @@ def test_overview_kpis_categories_receipts_and_dashboard(monkeypatch) -> None:
     assert dash.status_code == 200
     assert "kpis" in dash.json()
     assert "sources" in dash.json()
+    # Same rollup as Analytics Data table (absolute Master + tabs + stations).
     # Master TZS (100+200+80) + Infinity 200 + Third Party 40
     assert dash.json()["kpis"]["total_tzs_ytd"] == 380.0 + 240.0
-    # Master USD 50 + Congo 25 + RahnTech 12 + SM Burhani 8 + Parking Congo 1250.50
-    assert dash.json()["kpis"]["total_usd_ytd"] == 50.0 + 45.0 + 1250.50
+    # Master USD 50 + Congo 25 + RahnTech 12 + SM Burhani 8
+    # (legacy Parking Congo payment_date-only rows are excluded — matches summary)
+    assert dash.json()["kpis"]["total_usd_ytd"] == 50.0 + 25.0 + 12.0 + 8.0
     # Master ZMW 0 + Toll 30
     assert dash.json()["kpis"]["total_zmw_ytd"] == 30.0
     # Monthly trend: Master USD (Mar) + legacy Parking Congo (15 Mar 2026).

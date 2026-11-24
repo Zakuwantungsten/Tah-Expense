@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Interactive helper: mount a newly attached host disk for PDF receipt storage
-# and wire it to the Docker API/scheduler bind mount.
+# Interactive helper: mount a host disk for PDF receipt storage and wire it
+# to the Docker API/scheduler bind mount.
 #
 # Usage (on the Ubuntu host):
 #   sudo scripts/attach-receipt-disk.sh
 #
-# You can either:
-#   - format the device (dedicated empty receipts disk), or
-#   - keep existing files and store receipts in a subdirectory on that disk.
+# You only pick the disk and keep-or-format. Paths are fixed:
+#   format → mount /mnt/tahmeed-receipts  (whole disk = receipts root)
+#   keep   → mount /mnt/tahmeed-data + auto find/create tahmeed-receipts/
 #
-# Default dedicated mount: /mnt/tahmeed-receipts
-# Default shared mount:    /mnt/tahmeed-data  (+ tahmeed-receipts/ subdir)
+# Remounting the same disk reuses the existing receipts folder (no path prompts).
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -86,19 +85,23 @@ device_fstype() {
   blkid -o value -s TYPE "$1" 2>/dev/null || true
 }
 
+device_uuid() {
+  blkid -o value -s UUID "$1" 2>/dev/null || true
+}
+
 current_receipt_status() {
   info ""
   info "=== Current receipt mount ==="
-  if findmnt -n "$DEFAULT_MOUNT_DEDICATED" >/dev/null 2>&1; then
-    findmnt -n -o SOURCE,FSTYPE,OPTIONS,TARGET "$DEFAULT_MOUNT_DEDICATED" || true
-    df -h "$DEFAULT_MOUNT_DEDICATED" | awk 'NR==1 || NR==2'
-  else
-    info "$DEFAULT_MOUNT_DEDICATED is not a mount point yet."
-    if [[ -d "$DEFAULT_MOUNT_DEDICATED" ]]; then
-      local count
-      count="$(find "$DEFAULT_MOUNT_DEDICATED" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
-      info "Directory exists with $count top-level entries."
+  local shown=0
+  local mp
+  for mp in "$DEFAULT_MOUNT_DEDICATED" "$DEFAULT_MOUNT_SHARED"; do
+    if findmnt -n "$mp" >/dev/null 2>&1; then
+      findmnt -n -o SOURCE,FSTYPE,OPTIONS,TARGET "$mp" || true
+      shown=1
     fi
+  done
+  if [[ "$shown" -eq 0 ]]; then
+    info "No standard receipt mounts yet ($DEFAULT_MOUNT_DEDICATED / $DEFAULT_MOUNT_SHARED)."
   fi
   if [[ -f .env ]] && grep -q '^ATTACHMENTS_HOST_PATH=' .env 2>/dev/null; then
     info "Compose .env: $(grep '^ATTACHMENTS_HOST_PATH=' .env)"
@@ -130,6 +133,10 @@ list_candidates() {
       *) continue ;;
     esac
     [[ "$name" == loop* || "$name" == ram* || "$name" == zram* ]] && continue
+    # Skip swap / tiny EFI-ish volumes — not usable for receipts
+    case "${fstype,,}" in
+      swap|linux_raid_member|crypto_LUKS) continue ;;
+    esac
 
     if [[ -n "$root_pk" ]]; then
       [[ "$name" == "$root_pk" ]] && continue
@@ -140,7 +147,6 @@ list_candidates() {
       /|/boot|/boot/*|/home|/home/*|/var|/var/*|/usr|/usr/*|/snap|/snap/*) continue ;;
     esac
 
-    # Whole disks with partitions: pick a partition instead
     if [[ "$type" == "disk" ]]; then
       kids="$(lsblk -nr -o NAME "/dev/$name" 2>/dev/null | wc -l | tr -d ' ')"
       [[ "$kids" -gt 1 ]] && continue
@@ -171,29 +177,23 @@ choose_format_mode() {
   info "=== Format choice ==="
   if [[ -n "$fstype" ]]; then
     info "Detected filesystem on $path: $fstype"
-    info "  1) Keep existing filesystem and files (store receipts in a subdirectory)"
-    info "  2) Format / erase the device (dedicated empty receipts disk)"
+    info "  1) Keep existing files — receipts go in fixed folder '$RECEIPTS_SUBDIR/'"
+    info "  2) Format / erase — dedicated empty receipts disk"
   else
     info "$path has no filesystem yet."
     info "  1) Keep / do not format  (not possible until a filesystem exists)"
-    info "  2) Format as ext4        (creates a new empty filesystem — erases device)"
+    info "  2) Format as ext4        (erases device)"
   fi
   local choice
   choice="$(ask "Choose 1 or 2" "1")"
   case "$choice" in
-    1)
-      FORMAT_MODE="keep"
-      ;;
-    2)
-      FORMAT_MODE="format"
-      ;;
-    *)
-      die "invalid format choice"
-      ;;
+    1) FORMAT_MODE="keep" ;;
+    2) FORMAT_MODE="format" ;;
+    *) die "invalid format choice" ;;
   esac
 
   if [[ "$FORMAT_MODE" == "keep" && -z "$fstype" ]]; then
-    die "cannot keep files: $path has no filesystem. Choose option 2 to format, or prepare the disk first."
+    die "cannot keep files: $path has no filesystem. Choose option 2 to format."
   fi
 }
 
@@ -214,10 +214,10 @@ do_format() {
 uuid_of() {
   local path="$1" uuid
   udevadm settle 2>/dev/null || true
-  uuid="$(blkid -o value -s UUID "$path" 2>/dev/null || true)"
+  uuid="$(device_uuid "$path")"
   if [[ -z "$uuid" ]]; then
     blkid -g >/dev/null 2>&1 || true
-    uuid="$(blkid -o value -s UUID "$path" 2>/dev/null || true)"
+    uuid="$(device_uuid "$path")"
   fi
   [[ -n "$uuid" ]] || die "could not read UUID for $path"
   printf '%s' "$uuid"
@@ -243,29 +243,50 @@ fstab_options_for() {
   esac
 }
 
+# Resolve where this device is already mounted (if anywhere).
+current_mount_of() {
+  findmnt -n -o TARGET -S "$1" 2>/dev/null | head -n1 || true
+}
+
 ensure_mount_point_dir() {
-  local mp="$1" entries
+  local mp="$1"
   if [[ -e "$mp" && ! -d "$mp" ]]; then
     die "$mp exists and is not a directory"
   fi
   if [[ ! -d "$mp" ]]; then
     install -d -m 0755 "$mp"
   fi
-  if findmnt -n "$mp" >/dev/null 2>&1; then
-    die "$mp is already mounted from $(findmnt -n -o SOURCE "$mp") — pick another mount point or unmount first"
+}
+
+# If mp is already a mount of a *different* device, stop. Same device is OK.
+assert_mount_point_compatible() {
+  local mp="$1" path="$2"
+  if ! findmnt -n "$mp" >/dev/null 2>&1; then
+    return 0
   fi
-  entries="$(find "$mp" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
-  if [[ "$entries" -gt 0 ]]; then
-    info "WARNING: $mp already contains $entries entries on the host."
-    info "Mounting a disk here will hide that host content until the disk is unmounted."
-    confirm_yes "Continue anyway?" || die "aborted"
+  local src
+  src="$(findmnt -n -o SOURCE "$mp")"
+  if [[ "$src" == "$path" ]]; then
+    return 0
   fi
+  # Compare UUIDs when SOURCE is like /dev/sdb4 vs UUID=
+  local want have
+  want="$(device_uuid "$path")"
+  have="$(findmnt -n -o UUID "$mp" 2>/dev/null || true)"
+  if [[ -n "$want" && -n "$have" && "$want" == "$have" ]]; then
+    return 0
+  fi
+  die "$mp is already mounted from $src — unmount it first to avoid conflict"
 }
 
 write_fstab() {
   local uuid="$1" mp="$2" fstype="$3"
   local opts line tmp
   opts="$(fstab_options_for "$fstype")"
+  # Prefer ntfs-3g helper name in fstab when available
+  if [[ "$fstype" == "ntfs" ]] && command -v mount.ntfs-3g >/dev/null 2>&1; then
+    fstype="ntfs-3g"
+  fi
   line="UUID=${uuid} ${mp} ${fstype} ${opts} 0 2"
   tmp="$(mktemp)"
   [[ -f /etc/fstab ]] || die "/etc/fstab missing"
@@ -286,12 +307,26 @@ write_fstab() {
   info "Updated /etc/fstab for $mp (UUID=$uuid, type=$fstype, nofail)."
 }
 
-set_receipts_dir_ownership() {
+ensure_receipts_dir() {
   local dir="$1"
+  local existed=0
+  if [[ -d "$dir" ]]; then
+    existed=1
+    info "Found existing receipts folder: $dir (resuming previous storage)."
+  else
+    info "Creating receipts folder: $dir"
+  fi
   install -d -o "$CONTAINER_UID" -g "$CONTAINER_GID" -m 0750 "$dir"
+  # Only chown the receipts root itself — never recurse into existing files.
   chown "$CONTAINER_UID:$CONTAINER_GID" "$dir"
   chmod 0750 "$dir"
-  info "Receipts directory ready: $dir (${CONTAINER_UID}:${CONTAINER_GID} mode 0750)"
+  if [[ "$existed" -eq 1 ]]; then
+    local n
+    n="$(find "$dir" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+    info "Receipts folder ready (${n} top-level entries kept)."
+  else
+    info "Receipts folder ready (${CONTAINER_UID}:${CONTAINER_GID} mode 0750)."
+  fi
 }
 
 write_compose_host_path() {
@@ -356,6 +391,7 @@ main() {
   need_cmds
 
   info "Tahmeed receipt disk attach"
+  info "Paths are automatic — you only pick the disk and keep/format."
   info "Repo deploy dir: $ROOT"
   current_receipt_status
 
@@ -375,7 +411,6 @@ main() {
   entry="${CANDIDATES[$idx]}"
   local name path size type fstype mount model tran
   IFS='|' read -r name path size type fstype mount model tran <<<"$entry"
-  # Prefer blkid if lsblk fstype is empty
   if [[ -z "$fstype" ]]; then
     fstype="$(device_fstype "$path")"
   fi
@@ -383,54 +418,47 @@ main() {
   FORMAT_MODE=""
   choose_format_mode "$path" "$fstype"
 
+  # Fixed paths — never prompt for mount point or subdirectory name.
   local mp receipts_host_path already_mounted=0
-  if [[ -n "$mount" ]]; then
-    already_mounted=1
-  fi
+  local existing_mp
+  existing_mp="$(current_mount_of "$path")"
 
-  info ""
   if [[ "$FORMAT_MODE" == "format" ]]; then
-    if [[ "$already_mounted" -eq 1 ]]; then
-      die "$path is mounted at $mount — unmount it before formatting"
+    if [[ -n "$existing_mp" ]]; then
+      die "$path is mounted at $existing_mp — unmount it before formatting"
     fi
-    mp="$(ask "Host mount point (entire disk used for receipts)" "$DEFAULT_MOUNT_DEDICATED")"
+    mp="$DEFAULT_MOUNT_DEDICATED"
     receipts_host_path="$mp"
   else
-    # Keep files: mount disk (or reuse existing mount), receipts live in a subdir
-    if [[ "$already_mounted" -eq 1 ]]; then
-      info "$path is already mounted at $mount — will keep that mount and add a receipts folder."
-      mp="$mount"
+    if [[ -n "$existing_mp" ]]; then
+      # Remount / reconnect: reuse wherever this disk already is.
+      mp="$existing_mp"
+      already_mounted=1
+      info "Disk already mounted at $mp — will reuse it and ensure '$RECEIPTS_SUBDIR/' exists."
     else
-      mp="$(ask "Host mount point for the whole disk (existing files stay here)" "$DEFAULT_MOUNT_SHARED")"
+      mp="$DEFAULT_MOUNT_SHARED"
     fi
-    local sub
-    sub="$(ask "Receipts subdirectory under that mount" "$RECEIPTS_SUBDIR")"
-    [[ "$sub" != /* ]] || die "subdirectory must be relative (e.g. tahmeed-receipts), not absolute"
-    [[ "$sub" != "." && "$sub" != ".." && "$sub" != *"/"* ]] || die "use a single directory name (no slashes)"
-    receipts_host_path="${mp%/}/${sub}"
+    receipts_host_path="${mp%/}/${RECEIPTS_SUBDIR}"
   fi
 
-  [[ "$mp" == /* ]] || die "mount point must be an absolute path"
-  [[ "$mp" != "/" ]] || die "refusing to use / as receipt mount"
-
   info ""
-  info "Plan:"
+  info "Plan (auto paths):"
   info "  device:        $path ($size, $type${fstype:+, $fstype})"
   info "  format:        $FORMAT_MODE"
   if [[ "$already_mounted" -eq 1 ]]; then
-    info "  disk mount:    $mp (already mounted)"
+    info "  disk mount:    $mp (already mounted — no conflict)"
   else
     info "  disk mount:    $mp"
   fi
-  info "  receipts path: $receipts_host_path  ← Compose bind-mount host side"
-  info "  container:     → /mnt/tahmeed-receipts (ATTACHMENTS_DIRECTORY)"
+  info "  receipts path: $receipts_host_path"
+  info "  container:     → /mnt/tahmeed-receipts"
   if [[ "$FORMAT_MODE" == "keep" ]]; then
-    info "  note:          existing files on the disk are preserved; only $receipts_host_path is owned by ${CONTAINER_UID}:${CONTAINER_GID}"
+    info "  note:          keeps other files on the disk; only manages $RECEIPTS_SUBDIR/"
   else
-    info "  note:          device will be erased; mount root becomes the receipts root"
+    info "  note:          erases device; mount root becomes the receipts root"
   fi
   if [[ "$receipts_host_path" != "$DEFAULT_MOUNT_DEDICATED" ]]; then
-    info "  compose:       ATTACHMENTS_HOST_PATH=$receipts_host_path in $ROOT/.env"
+    info "  compose:       ATTACHMENTS_HOST_PATH=$receipts_host_path"
   fi
   confirm_yes "Proceed with this plan?" || die "aborted"
 
@@ -446,13 +474,29 @@ main() {
 
   if [[ "$already_mounted" -eq 0 ]]; then
     ensure_mount_point_dir "$mp"
-    write_fstab "$uuid" "$mp" "$fstype"
-    mount "$mp" || die "mount failed — check dmesg / journalctl -xe"
+    assert_mount_point_compatible "$mp" "$path"
+    if findmnt -n "$mp" >/dev/null 2>&1; then
+      info "Mount point $mp already has this disk — skipping remount."
+    else
+      write_fstab "$uuid" "$mp" "$fstype"
+      # ntfs often needs ntfs-3g
+      if [[ "${fstype,,}" == "ntfs" ]] && ! mount -t ntfs-3g "$path" "$mp" 2>/dev/null; then
+        mount "$mp" || die "mount failed — for NTFS install ntfs-3g, then re-run"
+      elif ! mount "$mp" 2>/dev/null; then
+        # fstab may use UUID; fall back to explicit device mount
+        mount "$path" "$mp" || die "mount failed — check dmesg / journalctl -xe"
+      fi
+    fi
   else
-    info "Reusing existing mount at $mp (fstab left unchanged)."
+    # Still record fstab for reboot if this mount isn't already persisted for our path
+    if [[ "$mp" == "$DEFAULT_MOUNT_SHARED" || "$mp" == "$DEFAULT_MOUNT_DEDICATED" ]]; then
+      write_fstab "$uuid" "$mp" "$fstype"
+    else
+      info "Reusing existing mount at $mp (left fstab alone for non-standard path)."
+    fi
   fi
 
-  set_receipts_dir_ownership "$receipts_host_path"
+  ensure_receipts_dir "$receipts_host_path"
   write_compose_host_path "$receipts_host_path"
 
   info ""
@@ -468,7 +512,6 @@ main() {
   info "  findmnt $mp"
   info "  ls -la $receipts_host_path"
   info "  curl -fsS http://127.0.0.1:8000/health/ready"
-  info "  upload a receipt, restart api, download it again"
 }
 
 main "$@"

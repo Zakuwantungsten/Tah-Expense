@@ -92,22 +92,22 @@ container recreate, not in the container layer and not in the `tahmeed-api-backu
 volume. Mount the disk first, then create the directory as the container user
 (UID/GID 10001) before the first `docker compose up`.
 
-Preferred path on a new or replacement HDD — interactive helper (lists connected
-disks, lets you **keep existing files** or **format**, confirms, writes
-`/etc/fstab` with `nofail` when it mounts, sets `10001:10001` on the receipts
-folder only, and can recreate `api`/`scheduler`):
+Preferred path on a new or replacement HDD — interactive helper (you only pick
+the disk and keep/format; **paths are automatic**). It writes `/etc/fstab` with
+`nofail`, finds or creates the fixed receipts folder, sets `10001:10001`, and
+can recreate `api`/`scheduler`:
 
 ```bash
 cd /opt/tahmeed-expense/deployment/docker
+sudo chmod 0755 scripts/attach-receipt-disk.sh   # once if needed
 sudo scripts/attach-receipt-disk.sh
 ```
 
-- **Keep files:** mounts the disk (or reuses an existing mount) and stores
-  receipts under a subdirectory (default `tahmeed-receipts/`) so other data on
-  the disk is left alone; Compose gets `ATTACHMENTS_HOST_PATH` pointing at that
-  folder.
-- **Format:** erases the device (type `YES`), mounts it as a dedicated receipts
-  disk (default `/mnt/tahmeed-receipts`).
+- **Keep files:** mounts at `/mnt/tahmeed-data` (or reuses the disk’s current
+  mount), then auto-finds or creates `tahmeed-receipts/` so remounting continues
+  where you left off; Compose gets `ATTACHMENTS_HOST_PATH` for that folder.
+- **Format:** erases the device (type `YES`), mounts at `/mnt/tahmeed-receipts`
+  as a dedicated receipts disk.
 
 Manual equivalent:
 

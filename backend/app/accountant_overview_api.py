@@ -308,6 +308,11 @@ async def _overview_non_master_month_totals(
 
 
 async def _compute_kpis(db: Any, year: int) -> dict[str, Any]:
+    """Master-only KPI snapshot (counts + absolute Master YTD).
+
+    Inclusive all-sources currency cards are filled in ``overview_dashboard``
+    via ``_summary_all_sources_ytd`` (same math as Analytics → Data table).
+    """
     today = date.today()
     month_start = datetime(today.year, today.month, 1)
     year_start = datetime(year, 1, 1)
@@ -322,18 +327,12 @@ async def _compute_kpis(db: Any, year: int) -> dict[str, Any]:
                 {
                     "$match": {
                         "verified": True,
-                        "date": {"$gte": year_start, "$lte": year_end},
+                        "deletion_requested": {"$ne": True},
+                        "trashed": {"$ne": True},
+                        **master_period_clause(year_start, year_end),
                     }
                 },
-                {
-                    "$group": {
-                        "_id": None,
-                        "count": {"$sum": 1},
-                        "tzs_total": sum_amount_if_currency("TZS", "TSH", "TZ"),
-                        "usd_total": sum_amount_if_currency("USD"),
-                        "zmw_total": sum_amount_if_currency("ZMW", "ZMB", "ZK"),
-                    }
-                },
+                {"$group": master_currency_group()},
             ]
         , 1),
         aggregate_list(db.transactions, 
@@ -351,9 +350,9 @@ async def _compute_kpis(db: Any, year: int) -> dict[str, Any]:
     )
     ytd = ytd_res[0] if ytd_res else {
         "count": 0,
-        "tzs_total": 0.0,
-        "usd_total": 0.0,
-        "zmw_total": 0.0,
+        "tzs": 0.0,
+        "usd": 0.0,
+        "zmw": 0.0,
     }
     month = month_res[0] if month_res else {"verified": 0, "total": 0}
     return {
@@ -361,9 +360,25 @@ async def _compute_kpis(db: Any, year: int) -> dict[str, Any]:
         "master_count": int(ytd.get("count") or 0),
         "verified_this_month": int(month.get("verified") or 0),
         "submitted_this_month": int(month.get("total") or 0),
-        "total_tzs_ytd": float(ytd.get("tzs_total") or 0.0),
-        "total_usd_ytd": float(ytd.get("usd_total") or 0.0),
-        "total_zmw_ytd": float(ytd.get("zmw_total") or 0.0),
+        "total_tzs_ytd": float(ytd.get("tzs") or 0.0),
+        "total_usd_ytd": float(ytd.get("usd") or 0.0),
+        "total_zmw_ytd": float(ytd.get("zmw") or 0.0),
+    }
+
+
+async def _summary_all_sources_ytd(db: Any, year: int) -> dict[str, float]:
+    """Native YTD across every monetary source — same as Analytics Data table."""
+    # Lazy import: analytics_api does not import overview_api.
+    from .accountant_analytics_api import _data_table_source_rows
+    from .accountant_trends_ops import build_data_table_rows
+
+    start, end = period_window(year, "year")
+    table = build_data_table_rows(await _data_table_source_rows(db, start, end))
+    totals = table["totals"]
+    return {
+        "tzs": float(totals.get("tzs") or 0.0),
+        "usd": float(totals.get("usd") or 0.0),
+        "zmw": float(totals.get("zmw") or 0.0),
     }
 
 
@@ -780,6 +795,7 @@ async def overview_dashboard(
         recent,
         supplier_totals,
         sources,
+        summary_ytd,
     ) = await asyncio.gather(
         _compute_kpis(db, year),
         _compute_month_totals(db, year),
@@ -792,21 +808,13 @@ async def overview_dashboard(
         .to_list(length=8),
         _supplier_payments_totals(db, year),
         _compute_sources(db, year),
+        _summary_all_sources_ytd(db, year),
     )
     kpis = dict(kpis)
-    # Master YTD + every separate tab + diesel stations (native currency).
-    kpis["total_tzs_ytd"] = (
-        float(kpis.get("total_tzs_ytd") or 0.0)
-        + float(month_payload.get("feed_tzs_ytd") or 0.0)
-    )
-    kpis["total_usd_ytd"] = (
-        float(kpis.get("total_usd_ytd") or 0.0)
-        + float(month_payload.get("feed_usd_ytd") or 0.0)
-    )
-    kpis["total_zmw_ytd"] = (
-        float(kpis.get("total_zmw_ytd") or 0.0)
-        + float(month_payload.get("feed_zmw_ytd") or 0.0)
-    )
+    # Currency cards = Analytics Data table grand totals (all monetary sources).
+    kpis["total_tzs_ytd"] = float(summary_ytd.get("tzs") or 0.0)
+    kpis["total_usd_ytd"] = float(summary_ytd.get("usd") or 0.0)
+    kpis["total_zmw_ytd"] = float(summary_ytd.get("zmw") or 0.0)
     kpis["supplier_tzs_ytd"] = float(supplier_totals.get("tzs") or 0.0)
     kpis["supplier_usd_ytd"] = float(supplier_totals.get("usd") or 0.0)
     return {

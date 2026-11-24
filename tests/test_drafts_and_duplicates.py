@@ -316,10 +316,28 @@ def test_duplicate_review_dialog_pills_filter_and_rescan(qapp=None):
     dlg._lookback_spin.setValue(3)
     dlg._checks[0].setChecked(True)
     dlg._request_rescan()
+    assert dlg.result() == DuplicateReviewDialog.RESCAN
+    assert dlg.is_rescan_result()
     assert dlg.requested_rescan_days() == 3
     assert dlg.checked_rows_snapshot() == {5}
     assert dlg.lookback_unit() == "days"
     assert dlg.lookback_value() == 3
+
+    # Fresh scan replaces pairs in the same dialog (no stale list).
+    fresh = _sample_item()
+    fresh.row = 9
+    fresh.row_display = 10
+    fresh.description = "OTHER"
+    dlg.apply_fresh_scan(
+        [fresh],
+        dup_days=3,
+        lookback_value=3,
+        lookback_unit="days",
+    )
+    assert dlg._table.rowCount() == 2
+    assert dlg._table.item(0, 4).text() == "OTHER"
+    assert "last 3 days" in dlg._title.text()
+    assert dlg.requested_rescan_days() is None
 
 
 def test_duplicate_review_dialog_months_rescan_uses_converted_days(qapp=None):
@@ -338,6 +356,7 @@ def test_duplicate_review_dialog_months_rescan_uses_converted_days(qapp=None):
     dlg._lookback_spin.setValue(5)
     assert dlg._lookback_hint.text() == "= 150 days"
     dlg._request_rescan()
+    assert dlg.result() == DuplicateReviewDialog.RESCAN
     assert dlg.requested_rescan_days() == 150
     assert dlg.lookback_unit() == "months"
     assert dlg.lookback_value() == 5
@@ -389,6 +408,10 @@ def test_lookback_overrides_dialog_saves_non_default_only(qapp=None):
     )
     assert dlg._kind_combo.currentData() == "item"
     key = item.item.casefold()
+    assert dlg._table.horizontalHeaderItem(0).text() == "SN"
+    assert dlg._table.item(0, 0).text() == "1"
+    assert dlg._table.item(0, 1).text() == item.item
+    assert dlg._table.rowHeight(0) <= 24
     spin = dlg._spins[("item", key)]
     assert spin.value() == 2
     spin.setValue(12)

@@ -44,6 +44,7 @@ from tahmeed.services.duplicate_review import (
     normalize_lookback_overrides,
 )
 from tahmeed.ui.dialogs.lookback_overrides_dialog import LookbackOverridesDialog
+from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -165,6 +166,9 @@ class _ContextChip(QPushButton):
 class DuplicateReviewDialog(QDialog):
     """Review possible duplicates — new row + matching existing expense."""
 
+    # exec() result: parent re-queries with requested_rescan_days (dialog stays open).
+    RESCAN = 100
+
     def __init__(
         self,
         items: List[DuplicateReviewItem],
@@ -231,6 +235,7 @@ class DuplicateReviewDialog(QDialog):
         self._checks: list[QCheckBox] = []
         self._source_pills: Dict[str, _FilterPill] = {}
         self._truck_count_badge: QLabel | None = None
+        self._loading: LoadingOverlay | None = None
 
         self.setWindowTitle(
             "Possible duplicates (edited rows)"
@@ -241,6 +246,89 @@ class DuplicateReviewDialog(QDialog):
         self.resize(900, 480)
         self.setStyleSheet(f"background:{_WHITE}; color:{_T1};")
         self._build()
+        self._rebuild_filters_and_table()
+
+    def done(self, r: int) -> None:  # noqa: N802
+        """RESCAN exits exec() without hiding — parent refreshes this same window."""
+        if int(r) == self.RESCAN:
+            self.setResult(int(r))
+            self.finished.emit(int(r))
+            return
+        super().done(r)
+
+    def show_rescan_busy(self, message: str = "Rescanning duplicates…") -> None:
+        """In-dialog overlay so Rescan does not flash a separate tiny window."""
+        if self._loading is None:
+            self._loading = LoadingOverlay(self, message)
+        self.setEnabled(False)
+        self._loading.show_loading(message)
+
+    def hide_rescan_busy(self) -> None:
+        if self._loading is not None:
+            self._loading.hide_loading()
+        self.setEnabled(True)
+
+    def apply_fresh_scan(
+        self,
+        items: List[DuplicateReviewItem],
+        *,
+        dup_days: int,
+        pending_total: int | None = None,
+        initial_checked: Set[int] | None = None,
+        lookback_value: int | None = None,
+        lookback_unit: str | None = None,
+        lookback_overrides: object = None,
+    ) -> None:
+        """Replace pairs after a fresh API scan — same dialog, no stale list."""
+        self._sync_visible_checks_into_map()
+        preserved = {
+            row for row, on in self._checked_by_row.items() if on
+        }
+        if initial_checked is not None:
+            preserved = set(initial_checked)
+
+        self._items = list(items)
+        self._dup_days = max(1, min(365, int(dup_days)))
+        if lookback_overrides is not None:
+            self._lookback_overrides = normalize_lookback_overrides(
+                lookback_overrides
+            )
+        if lookback_unit is not None:
+            self._lookback_unit = (
+                "months"
+                if str(lookback_unit).strip().casefold().startswith("month")
+                else "days"
+            )
+        if lookback_value is not None:
+            cap = 12 if self._lookback_unit == "months" else 365
+            self._lookback_value = max(1, min(cap, int(lookback_value)))
+        self._pending_total = (
+            int(pending_total)
+            if pending_total is not None
+            else len(self._items)
+        )
+        self._requested_rescan_days = None
+        self._save_anyway_rows = set()
+        self._keep_for_later = False
+        self._checked_by_row = {item.row: False for item in self._items}
+        for row in preserved:
+            if row in self._checked_by_row:
+                self._checked_by_row[row] = True
+
+        # Reset facet filters so the fresh list is not hidden behind old chips.
+        self._source_filter = "all"
+        self._item_filter = None
+        self._desc_filter = None
+
+        self._suppress_lookback_unit_change = True
+        self._apply_lookback_spin_range(self._lookback_unit)
+        self._lookback_unit_combo.setCurrentIndex(
+            1 if self._lookback_unit == "months" else 0
+        )
+        self._lookback_spin.setValue(self._lookback_value)
+        self._suppress_lookback_unit_change = False
+        self._refresh_lookback_hint()
+        self._refresh_title_copy()
         self._rebuild_filters_and_table()
 
     def save_anyway_rows(self) -> Set[int]:
@@ -256,8 +344,13 @@ class DuplicateReviewDialog(QDialog):
         return bool(self._keep_for_later)
 
     def requested_rescan_days(self) -> int | None:
-        """When set, parent should re-scan with this day window and re-open."""
+        """When set, parent should re-query with this day window (in-place)."""
         return self._requested_rescan_days
+
+    def is_rescan_result(self, code: int | None = None) -> bool:
+        """True when exec() returned because Rescan / Custom Save & Rescan."""
+        result = self.result() if code is None else int(code)
+        return int(result) == self.RESCAN
 
     def checked_rows_snapshot(self) -> Set[int]:
         """Rows currently ticked Save — used to preserve state across rescan."""
@@ -856,6 +949,16 @@ class DuplicateReviewDialog(QDialog):
         unit = self._current_lookback_unit()
         return lookback_days_from_unit(value, unit)
 
+    def _finish_rescan_request(self) -> None:
+        """Exit exec() with RESCAN while keeping this window visible."""
+        self._sync_visible_checks_into_map()
+        self._lookback_value = int(self._lookback_spin.value())
+        self._lookback_unit = self._current_lookback_unit()
+        self._requested_rescan_days = self._effective_rescan_days()
+        self._keep_for_later = False
+        self._save_anyway_rows = set()
+        self.done(self.RESCAN)
+
     def _open_custom_lookback(self) -> None:
         if not self._allow_rescan:
             return
@@ -869,24 +972,12 @@ class DuplicateReviewDialog(QDialog):
             return
         self._lookback_overrides = dlg.overrides()
         self._lookback_overrides_changed = True
-        self._sync_visible_checks_into_map()
-        self._lookback_value = int(self._lookback_spin.value())
-        self._lookback_unit = self._current_lookback_unit()
-        self._requested_rescan_days = self._effective_rescan_days()
-        self._keep_for_later = False
-        self._save_anyway_rows = set()
-        self.accept()
+        self._finish_rescan_request()
 
     def _request_rescan(self) -> None:
         if not self._allow_rescan:
             return
-        self._sync_visible_checks_into_map()
-        self._lookback_value = int(self._lookback_spin.value())
-        self._lookback_unit = self._current_lookback_unit()
-        self._requested_rescan_days = self._effective_rescan_days()
-        self._keep_for_later = False
-        self._save_anyway_rows = set()
-        self.accept()
+        self._finish_rescan_request()
 
     def _accept_checked(self) -> None:
         self._sync_visible_checks_into_map()

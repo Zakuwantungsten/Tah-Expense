@@ -189,3 +189,114 @@ def test_analytics_data_table_spend_trend_uses_to_year() -> None:
     assert body["month_trend"][0]["tzs"] == 40.0
     assert sum(row["tzs"] for row in body["month_trend"]) == 40.0
     entity_cache_clear()
+
+
+def test_analytics_landing_matches_data_table_all_sources() -> None:
+    """Landing KPIs / source mix / trend use the same all-sources rollup as summary."""
+    entity_cache_clear()
+    docs = [
+        {
+            "_id": ObjectId(),
+            "verified": True,
+            "deletion_requested": False,
+            "trashed": False,
+            "date": datetime(2026, 3, 10),
+            "amount": 100.0,
+            "currency": "TZS",
+            "category_name": "Fuel",
+            "item": "Fuel",
+            "description": "x",
+            "receipt_status": "received",
+        },
+        {
+            "_id": ObjectId(),
+            "verified": True,
+            "deletion_requested": False,
+            "trashed": False,
+            "date": datetime(2026, 3, 11),
+            "amount": 200.0,
+            "currency": "TZS",
+            "category_name": "Supplier X",
+            "item": "Parts",
+            "description": "supplier",
+            "receipt_status": "received",
+        },
+    ]
+    feeds = FakeImportedFeeds(
+        [
+            {
+                "feed_type": "diesel_infinity",
+                "transaction_date": datetime(2026, 3, 10),
+                "ltrs": 50,
+                "price_per_ltr": 2.0,
+                "currency": "TZS",
+            },
+            {
+                "feed_type": "toll_plaza",
+                "transaction_date": datetime(2026, 2, 5),
+                "tender_amount": 30.0,
+            },
+        ]
+    )
+    separate = FakeSeparateExpenses(
+        [
+            {
+                "expense_type": "congo_expenses",
+                "expense_date": datetime(2026, 1, 15),
+                "amount_usd": 25.0,
+            }
+        ]
+    )
+    from tests.test_accountant_overview_api import FakeCategories
+
+    app = _app(
+        FakeTransactions(docs),
+        imported_feeds=feeds,
+        separate_expenses=separate,
+        categories=FakeCategories(
+            [{"name": "Supplier X", "is_supplier": True, "active": True}]
+        ),
+    )
+    app.dependency_overrides[current_user] = lambda: _manager()
+
+    with TestClient(app) as client:
+        table = client.get(
+            "/v1/accountant/analytics/data-table",
+            params={"date_from": "2026-01-01", "date_to": "2026-12-31"},
+        )
+        landing = client.get(
+            "/v1/accountant/analytics",
+            params={"year": 2026, "period": "year"},
+        )
+
+    assert table.status_code == 200, table.text
+    assert landing.status_code == 200, landing.text
+    totals = table.json()["totals"]
+    kpis = landing.json()["kpis"]["totals"]
+    assert kpis["tzs"] == totals["tzs"]
+    assert kpis["usd"] == totals["usd"]
+    assert kpis["zmw"] == totals["zmw"]
+    # Master 300 + Infinity 100
+    assert kpis["tzs"] == 400.0
+    assert kpis["usd"] == 25.0
+    assert kpis["zmw"] == 30.0
+
+    mix = landing.json()["source_mix"]
+    assert mix["master"]["tzs"] == 300.0
+    assert mix["fuel"]["tzs"] == 100.0
+    assert mix["separate"]["usd"] == 25.0
+    assert mix["separate"]["zmw"] == 30.0
+
+    names = {row["name"] for row in landing.json()["categories"]}
+    assert "Infinity" in names
+    assert "Congo Expenses" in names or "Toll Plaza" in names
+
+    supplier_names = {row["name"] for row in landing.json()["suppliers"]}
+    assert "Supplier X" in supplier_names
+    assert "Infinity" in supplier_names
+
+    march = next(
+        row for row in landing.json()["month_trend"] if int(row["month"]) == 3
+    )
+    assert march["tzs"] == 400.0  # Master 300 + Infinity 100
+    entity_cache_clear()

@@ -1156,7 +1156,7 @@ class AnalyticsWidget(QWidget):
         ]
         if self._line_chart:
             self._line_chart.set_data(
-                months, series, empty="No master spend for this year."
+                months, series, empty="No spend for this year."
             )
 
     def _refresh_pareto(self) -> None:
@@ -1207,7 +1207,8 @@ class AnalyticsWidget(QWidget):
         mix = self._data.get("source_mix") or {}
         master = float((mix.get("master") or {}).get(key) or 0.0)
         separate = float((mix.get("separate") or {}).get(key) or 0.0)
-        total = master + separate
+        fuel = float((mix.get("fuel") or {}).get(key) or 0.0)
+        total = master + separate + fuel
         slices: list[tuple[str, float, str, str]] = []
         if total > 0:
             if separate > 0:
@@ -1216,6 +1217,13 @@ class AnalyticsWidget(QWidget):
                     separate / total,
                     _RED,
                     _fmt_currency_short(self._chart_currency, separate),
+                ))
+            if fuel > 0:
+                slices.append((
+                    "Fuel stations",
+                    fuel / total,
+                    _GREEN,
+                    _fmt_currency_short(self._chart_currency, fuel),
                 ))
             if master > 0:
                 slices.append((

@@ -943,6 +943,8 @@ class EntryForm(QWidget):
         lookback_unit = "days"
         lookback_value = dup_days
         item_text = self._item.text().strip()
+        dlg: DuplicateReviewDialog | None = None
+        dupes: list = []
         while True:
             eff_days = effective_lookback_days(
                 item=item_text,
@@ -950,6 +952,8 @@ class EntryForm(QWidget):
                 default_days=dup_days,
                 overrides=lookback_overrides,
             )
+            if dlg is not None:
+                dlg.show_rescan_busy("Rescanning duplicates…")
             try:
                 dupes = await check_for_duplicates(
                     truck_number=truck_number,
@@ -961,8 +965,13 @@ class EntryForm(QWidget):
                 )
             except Exception:
                 dupes = []
+            finally:
+                if dlg is not None:
+                    dlg.hide_rescan_busy()
 
             if not dupes:
+                if dlg is not None:
+                    dlg.reject()
                 break
 
             probe = Transaction(
@@ -983,18 +992,28 @@ class EntryForm(QWidget):
                 existing=dupes[0],
                 date_label=format_new_date(tx_date),
             )
-            dlg = DuplicateReviewDialog(
-                [item],
-                dup_days=dup_days,
-                parent=self,
-                initial_checked=save_checks,
-                lookback_value=lookback_value,
-                lookback_unit=lookback_unit,
-                allow_rescan=True,
-                lookback_overrides=lookback_overrides,
-            )
-            if dlg.exec() != QDialog.Accepted:
-                return
+            if dlg is None:
+                dlg = DuplicateReviewDialog(
+                    [item],
+                    dup_days=dup_days,
+                    parent=self,
+                    initial_checked=save_checks,
+                    lookback_value=lookback_value,
+                    lookback_unit=lookback_unit,
+                    allow_rescan=True,
+                    lookback_overrides=lookback_overrides,
+                )
+            else:
+                dlg.apply_fresh_scan(
+                    [item],
+                    dup_days=dup_days,
+                    initial_checked=save_checks,
+                    lookback_value=lookback_value,
+                    lookback_unit=lookback_unit,
+                    lookback_overrides=lookback_overrides,
+                )
+
+            code = dlg.exec()
             if dlg.lookback_overrides_changed():
                 lookback_overrides = dlg.lookback_overrides()
                 try:
@@ -1003,13 +1022,14 @@ class EntryForm(QWidget):
                     )
                 except Exception:
                     pass
-            rescan_days = dlg.requested_rescan_days()
-            if rescan_days is not None:
-                dup_days = int(rescan_days)
+            if dlg.is_rescan_result(code):
+                dup_days = int(dlg.requested_rescan_days() or dup_days)
                 lookback_unit = dlg.lookback_unit()
                 lookback_value = dlg.lookback_value()
                 save_checks = dlg.checked_rows_snapshot()
                 continue
+            if code != QDialog.Accepted:
+                return
             if 0 not in dlg.save_anyway_rows():
                 return
             possible_dup = True

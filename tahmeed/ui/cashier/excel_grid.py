@@ -1852,44 +1852,75 @@ class DailyRegister(QWidget):
         lookback_unit = "days"
         lookback_value = int(dup_days)
         save_checks: set[int] = set()
+        dlg: DuplicateReviewDialog | None = None
+        duplicate_items: list = []
         while True:
-            self._show_register_loading(
-                f"Checking edited duplicates ({len(row_txs)})…"
-            )
-            duplicate_items = await self._scan_soft_duplicates(
-                row_txs, int(dup_days), exclude_ids=exclude_ids
-            )
-            if not duplicate_items:
-                for body in updates_by_row.values():
-                    body["possible_duplicate"] = False
-                    body["duplicate_of_id"] = None
-                return set()
-            dlg = DuplicateReviewDialog(
-                duplicate_items,
-                dup_days=int(dup_days),
-                parent=self,
-                pending_total=len(row_txs),
-                initial_checked=save_checks,
-                lookback_value=lookback_value,
-                lookback_unit=lookback_unit,
-                allow_rescan=True,
-                review_mode="edit",
-                lookback_overrides=getattr(
-                    self, "_duplicate_lookback_overrides", None
-                ),
-            )
+            if dlg is None:
+                self._show_register_loading(
+                    f"Checking edited duplicates ({len(row_txs)})…"
+                )
+                duplicate_items = await self._scan_soft_duplicates(
+                    row_txs, int(dup_days), exclude_ids=exclude_ids
+                )
+                self._hide_register_loading()
+                if not duplicate_items:
+                    for body in updates_by_row.values():
+                        body["possible_duplicate"] = False
+                        body["duplicate_of_id"] = None
+                    return set()
+                dlg = DuplicateReviewDialog(
+                    duplicate_items,
+                    dup_days=int(dup_days),
+                    parent=self,
+                    pending_total=len(row_txs),
+                    initial_checked=save_checks,
+                    lookback_value=lookback_value,
+                    lookback_unit=lookback_unit,
+                    allow_rescan=True,
+                    review_mode="edit",
+                    lookback_overrides=getattr(
+                        self, "_duplicate_lookback_overrides", None
+                    ),
+                )
+            else:
+                dlg.show_rescan_busy(
+                    f"Rescanning edited duplicates ({len(row_txs)})…"
+                )
+                try:
+                    duplicate_items = await self._scan_soft_duplicates(
+                        row_txs, int(dup_days), exclude_ids=exclude_ids
+                    )
+                finally:
+                    dlg.hide_rescan_busy()
+                if not duplicate_items:
+                    dlg.reject()
+                    for body in updates_by_row.values():
+                        body["possible_duplicate"] = False
+                        body["duplicate_of_id"] = None
+                    return set()
+                dlg.apply_fresh_scan(
+                    duplicate_items,
+                    dup_days=int(dup_days),
+                    pending_total=len(row_txs),
+                    initial_checked=save_checks,
+                    lookback_value=lookback_value,
+                    lookback_unit=lookback_unit,
+                    lookback_overrides=getattr(
+                        self, "_duplicate_lookback_overrides", None
+                    ),
+                )
+
             with pause_background_polls(self):
-                accepted = await await_ui(lambda: dlg.exec() == QDialog.Accepted)
-            if not accepted:
-                return None
+                code = await await_ui(lambda: dlg.exec())
             await self._persist_dup_lookback_overrides_from_dialog(dlg)
-            rescan_days = dlg.requested_rescan_days()
-            if rescan_days is not None:
-                dup_days = int(rescan_days)
+            if dlg.is_rescan_result(code):
+                dup_days = int(dlg.requested_rescan_days() or dup_days)
                 lookback_unit = dlg.lookback_unit()
                 lookback_value = dlg.lookback_value()
                 save_checks = dlg.checked_rows_snapshot()
                 continue
+            if code != QDialog.Accepted:
+                return None
             save_anyway = dlg.save_anyway_rows()
             deferred = dlg.deferred_duplicate_rows()
             flagged = {item.row for item in duplicate_items}
@@ -3802,73 +3833,137 @@ class DailyRegister(QWidget):
         lookback_unit = "days"
         lookback_value = dup_days
         save_checks: set[int] = set()
+        dlg: DuplicateReviewDialog | None = None
+        duplicate_items: list = []
         while True:
-            self._show_register_loading(
-                f"Scanning duplicates ({len(row_txs)})…"
-            )
-            duplicate_items = await self._scan_soft_duplicates(
-                row_txs, int(dup_days), exclude_ids=exclude_ids
-            )
-            if not duplicate_items:
-                clear_patches: list[tuple] = []
-                for row, _tx in row_txs:
-                    if row in self._saved_ids:
-                        tx = self._saved_txs.get(row)
-                        if tx is not None and getattr(tx, "possible_duplicate", False):
-                            tx.possible_duplicate = False
-                            tx.duplicate_of_id = None
-                            clear_patches.append(
-                                (
-                                    self._saved_ids[row],
-                                    {
-                                        "possible_duplicate": False,
-                                        "duplicate_of_id": None,
-                                    },
+            if dlg is None:
+                self._show_register_loading(
+                    f"Scanning duplicates ({len(row_txs)})…"
+                )
+                duplicate_items = await self._scan_soft_duplicates(
+                    row_txs, int(dup_days), exclude_ids=exclude_ids
+                )
+                self._hide_register_loading()
+                if not duplicate_items:
+                    clear_patches: list[tuple] = []
+                    for row, _tx in row_txs:
+                        if row in self._saved_ids:
+                            tx = self._saved_txs.get(row)
+                            if tx is not None and getattr(
+                                tx, "possible_duplicate", False
+                            ):
+                                tx.possible_duplicate = False
+                                tx.duplicate_of_id = None
+                                clear_patches.append(
+                                    (
+                                        self._saved_ids[row],
+                                        {
+                                            "possible_duplicate": False,
+                                            "duplicate_of_id": None,
+                                        },
+                                    )
                                 )
-                            )
-                            self._apply_dup_flag_visual(row, False)
-                    else:
-                        meta = dict(self._pending_row_meta.get(row) or {})
-                        if meta.pop("possible_duplicate", None) is not None:
-                            meta.pop("duplicate_of_id", None)
-                            self._pending_row_meta[row] = meta
-                            self._apply_dup_flag_visual(row, False)
-                if clear_patches:
-                    try:
-                        await bulk_update_transactions(clear_patches)
-                    except Exception:
-                        pass
-                    self._flush_local_draft()
-                if empty_toast:
-                    self.transient_status.emit(empty_toast)
-                return
+                                self._apply_dup_flag_visual(row, False)
+                        else:
+                            meta = dict(self._pending_row_meta.get(row) or {})
+                            if meta.pop("possible_duplicate", None) is not None:
+                                meta.pop("duplicate_of_id", None)
+                                self._pending_row_meta[row] = meta
+                                self._apply_dup_flag_visual(row, False)
+                    if clear_patches:
+                        try:
+                            await bulk_update_transactions(clear_patches)
+                        except Exception:
+                            pass
+                        self._flush_local_draft()
+                    if empty_toast:
+                        self.transient_status.emit(empty_toast)
+                    return
 
-            dlg = DuplicateReviewDialog(
-                duplicate_items,
-                dup_days=int(dup_days),
-                parent=self,
-                pending_total=len(row_txs),
-                initial_checked=save_checks,
-                lookback_value=lookback_value,
-                lookback_unit=lookback_unit,
-                allow_rescan=True,
-                review_mode=review_mode,
-                lookback_overrides=getattr(
-                    self, "_duplicate_lookback_overrides", None
-                ),
-            )
+                dlg = DuplicateReviewDialog(
+                    duplicate_items,
+                    dup_days=int(dup_days),
+                    parent=self,
+                    pending_total=len(row_txs),
+                    initial_checked=save_checks,
+                    lookback_value=lookback_value,
+                    lookback_unit=lookback_unit,
+                    allow_rescan=True,
+                    review_mode=review_mode,
+                    lookback_overrides=getattr(
+                        self, "_duplicate_lookback_overrides", None
+                    ),
+                )
+            else:
+                # In-place rescan — same window, fresh API query (no stale pairs).
+                dlg.show_rescan_busy(
+                    f"Rescanning duplicates ({len(row_txs)})…"
+                )
+                try:
+                    duplicate_items = await self._scan_soft_duplicates(
+                        row_txs, int(dup_days), exclude_ids=exclude_ids
+                    )
+                finally:
+                    dlg.hide_rescan_busy()
+                if not duplicate_items:
+                    dlg.reject()
+                    clear_patches = []
+                    for row, _tx in row_txs:
+                        if row in self._saved_ids:
+                            tx = self._saved_txs.get(row)
+                            if tx is not None and getattr(
+                                tx, "possible_duplicate", False
+                            ):
+                                tx.possible_duplicate = False
+                                tx.duplicate_of_id = None
+                                clear_patches.append(
+                                    (
+                                        self._saved_ids[row],
+                                        {
+                                            "possible_duplicate": False,
+                                            "duplicate_of_id": None,
+                                        },
+                                    )
+                                )
+                                self._apply_dup_flag_visual(row, False)
+                        else:
+                            meta = dict(self._pending_row_meta.get(row) or {})
+                            if meta.pop("possible_duplicate", None) is not None:
+                                meta.pop("duplicate_of_id", None)
+                                self._pending_row_meta[row] = meta
+                                self._apply_dup_flag_visual(row, False)
+                    if clear_patches:
+                        try:
+                            await bulk_update_transactions(clear_patches)
+                        except Exception:
+                            pass
+                        self._flush_local_draft()
+                    if empty_toast:
+                        self.transient_status.emit(empty_toast)
+                    return
+                dlg.apply_fresh_scan(
+                    duplicate_items,
+                    dup_days=int(dup_days),
+                    pending_total=len(row_txs),
+                    initial_checked=save_checks,
+                    lookback_value=lookback_value,
+                    lookback_unit=lookback_unit,
+                    lookback_overrides=getattr(
+                        self, "_duplicate_lookback_overrides", None
+                    ),
+                )
+
             with pause_background_polls(self):
-                accepted = await await_ui(lambda: dlg.exec() == QDialog.Accepted)
-            if not accepted:
-                return
+                code = await await_ui(lambda: dlg.exec())
             await self._persist_dup_lookback_overrides_from_dialog(dlg)
-            rescan_days = dlg.requested_rescan_days()
-            if rescan_days is not None:
-                dup_days = int(rescan_days)
+            if dlg.is_rescan_result(code):
+                dup_days = int(dlg.requested_rescan_days() or dup_days)
                 lookback_unit = dlg.lookback_unit()
                 lookback_value = dlg.lookback_value()
                 save_checks = dlg.checked_rows_snapshot()
                 continue
+            if code != QDialog.Accepted:
+                return
 
             save_anyway = dlg.save_anyway_rows()
             deferred = dlg.deferred_duplicate_rows()
@@ -11193,45 +11288,72 @@ class DailyRegister(QWidget):
                 save_checks: set[int] = set()
                 lookback_unit = "days"
                 lookback_value = dup_days
+                dlg: DuplicateReviewDialog | None = None
+                duplicate_items: list = []
                 while True:
-                    self._show_register_loading(
-                        f"Checking duplicates ({len(draft_inserts)})…"
-                    )
-                    duplicate_items = await self._scan_soft_duplicates(
-                        draft_inserts, dup_days
-                    )
-                    if not duplicate_items:
-                        deferred_dups = set()
-                        break
-                    dlg = DuplicateReviewDialog(
-                        duplicate_items,
-                        dup_days=dup_days,
-                        parent=self,
-                        pending_total=len(draft_inserts),
-                        initial_checked=save_checks,
-                        lookback_value=lookback_value,
-                        lookback_unit=lookback_unit,
-                        allow_rescan=True,
-                        lookback_overrides=getattr(
-                            self, "_duplicate_lookback_overrides", None
-                        ),
-                    )
-                    with pause_background_polls(self):
-                        accepted = await await_ui(
-                            lambda: dlg.exec() == QDialog.Accepted
+                    if dlg is None:
+                        self._show_register_loading(
+                            f"Checking duplicates ({len(draft_inserts)})…"
                         )
-                    if not accepted:
-                        self._rollback_materialized_parked_rows(materialized_parked)
-                        self._flush_local_draft()
-                        return False
+                        duplicate_items = await self._scan_soft_duplicates(
+                            draft_inserts, dup_days
+                        )
+                        self._hide_register_loading()
+                        if not duplicate_items:
+                            deferred_dups = set()
+                            break
+                        dlg = DuplicateReviewDialog(
+                            duplicate_items,
+                            dup_days=dup_days,
+                            parent=self,
+                            pending_total=len(draft_inserts),
+                            initial_checked=save_checks,
+                            lookback_value=lookback_value,
+                            lookback_unit=lookback_unit,
+                            allow_rescan=True,
+                            lookback_overrides=getattr(
+                                self, "_duplicate_lookback_overrides", None
+                            ),
+                        )
+                    else:
+                        dlg.show_rescan_busy(
+                            f"Rescanning duplicates ({len(draft_inserts)})…"
+                        )
+                        try:
+                            duplicate_items = await self._scan_soft_duplicates(
+                                draft_inserts, dup_days
+                            )
+                        finally:
+                            dlg.hide_rescan_busy()
+                        if not duplicate_items:
+                            dlg.reject()
+                            deferred_dups = set()
+                            break
+                        dlg.apply_fresh_scan(
+                            duplicate_items,
+                            dup_days=dup_days,
+                            pending_total=len(draft_inserts),
+                            initial_checked=save_checks,
+                            lookback_value=lookback_value,
+                            lookback_unit=lookback_unit,
+                            lookback_overrides=getattr(
+                                self, "_duplicate_lookback_overrides", None
+                            ),
+                        )
+
+                    with pause_background_polls(self):
+                        code = await await_ui(lambda: dlg.exec())
                     await self._persist_dup_lookback_overrides_from_dialog(dlg)
-                    rescan_days = dlg.requested_rescan_days()
-                    if rescan_days is not None:
-                        dup_days = int(rescan_days)
+                    if dlg.is_rescan_result(code):
+                        dup_days = int(dlg.requested_rescan_days() or dup_days)
                         lookback_unit = dlg.lookback_unit()
                         lookback_value = dlg.lookback_value()
                         save_checks = dlg.checked_rows_snapshot()
                         continue
+                    if code != QDialog.Accepted:
+                        self._rollback_materialized_parked_rows(materialized_parked)
+                        self._flush_local_draft()
+                        return False
                     save_anyway = dlg.save_anyway_rows()
                     deferred_dups = dlg.deferred_duplicate_rows()
                     for row in save_anyway:

@@ -626,7 +626,134 @@ def _source_mix(
             **separate,
             "count": separate_count,
         },
+        "fuel": {**empty_currency_totals(), "count": 0},
     }
+
+
+def _bucket_from_source_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tzs": float(row.get("tzs") or 0.0),
+        "usd": float(row.get("usd") or 0.0),
+        "zmw": float(row.get("zmw") or 0.0),
+        "count": int(row.get("count") or 0),
+    }
+
+
+def _source_mix_from_rows(sources: list[dict[str, Any]]) -> dict[str, Any]:
+    """Master / Separate / Fuel buckets — same groups as the Data table."""
+    master = {**empty_currency_totals(), "count": 0}
+    separate = {**empty_currency_totals(), "count": 0}
+    fuel = {**empty_currency_totals(), "count": 0}
+    for row in sources or []:
+        group = str(row.get("group") or "")
+        if group == "Master" or str(row.get("key") or "") == "master":
+            target = master
+        elif group == "Fuel stations":
+            target = fuel
+        else:
+            target = separate
+        for cur in ("tzs", "usd", "zmw"):
+            target[cur] += float(row.get(cur) or 0.0)
+        target["count"] += int(row.get("count") or 0)
+    return {"master": master, "separate": separate, "fuel": fuel}
+
+
+def _non_master_source_named_rows(
+    sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Separate tabs + fuel stations as named spend rows (for category/supplier)."""
+    rows: list[dict[str, Any]] = []
+    for src in sources or []:
+        key = str(src.get("key") or "")
+        group = str(src.get("group") or "")
+        if key == "master" or group == "Master":
+            continue
+        tzs = float(src.get("tzs") or 0.0)
+        usd = float(src.get("usd") or 0.0)
+        zmw = float(src.get("zmw") or 0.0)
+        if tzs <= 0 and usd <= 0 and zmw <= 0:
+            continue
+        rows.append(
+            {
+                "name": str(src.get("label") or key or "Source"),
+                "tzs": tzs,
+                "usd": usd,
+                "zmw": zmw,
+                "count": int(src.get("count") or 0),
+                "source": "fuel" if group == "Fuel stations" else "separate",
+            }
+        )
+    return rows
+
+
+def _separate_feeds_from_sources(
+    sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hbar payload for Separate Expenses — native currency amounts from summary rows."""
+    by_key = {str(r.get("key") or ""): r for r in sources or []}
+    out: list[dict[str, Any]] = []
+    for spec in SEPARATE_EXPENSE_FEEDS:
+        row = by_key.get(spec.key) or {}
+        bucket = currency_bucket_key(spec.currency)
+        out.append(
+            {
+                "key": spec.key,
+                "label": spec.label,
+                "currency": spec.currency,
+                "amount": float(row.get(bucket) or 0.0),
+                "count": int(row.get("count") or 0),
+            }
+        )
+    return out
+
+
+async def _data_table_source_rows(
+    db: Any,
+    start,
+    end,
+) -> list[dict[str, Any]]:
+    """One monetary row per source — same rules as Analytics → Data table."""
+
+    async def _master_row() -> dict[str, Any]:
+        totals = await _master_totals(db, start, end)
+        return {
+            "key": "master",
+            "label": "Master Expenses",
+            "group": "Master",
+            **_bucket_from_source_row(totals),
+        }
+
+    async def _separate_row(spec: Any) -> dict[str, Any]:
+        dims = PHASE5_SEPARATE_DIMS.get(spec.key)
+        exclude = bool(dims and dims.exclude_deposits)
+        totals = await _separate_period_totals(
+            db, spec, start, end, exclude_deposits=exclude
+        )
+        return {
+            "key": spec.key,
+            "label": spec.label,
+            "group": "Separate Expenses",
+            **_bucket_from_source_row(totals),
+        }
+
+    async def _station_row(
+        key: str, label: str, feed_type: str, native: str
+    ) -> dict[str, Any]:
+        totals = await _diesel_period_totals(db, feed_type, native, start, end)
+        return {
+            "key": key,
+            "label": label,
+            "group": "Fuel stations",
+            **_bucket_from_source_row(totals),
+        }
+
+    row_coros: list[Any] = [_master_row()]
+    row_coros.extend(_separate_row(spec) for spec in SEPARATE_EXPENSE_FEEDS)
+    row_coros.extend(
+        _station_row(key, label, feed_type, native)
+        for key, label, feed_type, native in DIESEL_STATION_TRENDS
+    )
+    return list(await asyncio.gather(*row_coros))
 
 
 def _pareto_bundle(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -646,28 +773,51 @@ async def _compute_dashboard(
     start, end = period_window(year, kind, month)  # type: ignore[arg-type]
     days = period_day_count(year, kind, month)  # type: ignore[arg-type]
     label = period_label(year, kind, month)  # type: ignore[arg-type]
+    year_start = datetime(year, 1, 1, 0, 0, 0)
+    year_end = datetime(year, 12, 31, 23, 59, 59)
+    prior_start = datetime(year - 1, 1, 1, 0, 0, 0)
+    prior_end = datetime(year - 1, 12, 31, 23, 59, 59)
 
     (
-        master,
         master_cats,
         suppliers_raw,
-        feeds,
-        month_series,
-        prior_month_series,
+        source_rows,
+        month_buckets,
+        prior_month_buckets,
     ) = await asyncio.gather(
-        _master_totals(db, start, end),
         _master_category_rows(db, start, end),
         _supplier_rows(db, start, end),
-        _separate_feed_totals(db, start, end),
-        _master_month_series(db, year),
-        _master_month_series(db, year - 1),
+        _data_table_source_rows(db, start, end),
+        _data_table_month_buckets(db, year_start, year_end),
+        _data_table_month_buckets(db, prior_start, prior_end),
     )
 
-    all_category_rows = master_cats + _feeds_as_category_rows(feeds)
-    categories = collapse_top_n(all_category_rows, top_n=10)
-    suppliers = collapse_top_n(suppliers_raw, top_n=12)
-    combined = _merge_currency(master, feeds)
+    table = build_data_table_rows(list(source_rows))
+    sources = list(table["sources"])
+    combined = {
+        "tzs": float(table["totals"]["tzs"]),
+        "usd": float(table["totals"]["usd"]),
+        "zmw": float(table["totals"]["zmw"]),
+    }
     avgs = averages_from_totals(combined, days)
+    master = next(
+        (r for r in sources if str(r.get("key") or "") == "master"),
+        {**empty_currency_totals(), "count": 0},
+    )
+    non_master = _non_master_source_named_rows(sources)
+    all_category_rows = master_cats + non_master
+    categories = collapse_top_n(all_category_rows, top_n=10)
+    # Master supplier categories + each monetary tab/station (summary-inclusive).
+    suppliers = collapse_top_n(list(suppliers_raw) + non_master, top_n=12)
+    feeds = _separate_feeds_from_sources(sources)
+    month_series = build_data_table_month_trend(
+        month_buckets, date(year, 1, 1), date(year, 12, 31)
+    )
+    prior_month_series = build_data_table_month_trend(
+        prior_month_buckets,
+        date(year - 1, 1, 1),
+        date(year - 1, 12, 31),
+    )
 
     return {
         "year": year,
@@ -688,7 +838,7 @@ async def _compute_dashboard(
         "categories": categories,
         "suppliers": suppliers,
         "pareto": _pareto_bundle(all_category_rows),
-        "source_mix": _source_mix(master, feeds),
+        "source_mix": _source_mix_from_rows(sources),
         "month_trend": month_series,
         "prior_month_trend": prior_month_series,
         "separate_feeds": feeds,
@@ -3079,52 +3229,6 @@ async def analytics_data_table(
 
     db = _database(request)
 
-    async def _master_row() -> dict[str, Any]:
-        totals = await _master_totals(db, start, end)
-        return {
-            "key": "master",
-            "label": "Master Expenses",
-            "group": "Master",
-            "tzs": float(totals.get("tzs") or 0.0),
-            "usd": float(totals.get("usd") or 0.0),
-            "zmw": float(totals.get("zmw") or 0.0),
-            "count": int(totals.get("count") or 0),
-        }
-
-    async def _separate_row(spec: Any) -> dict[str, Any]:
-        dims = PHASE5_SEPARATE_DIMS.get(spec.key)
-        exclude = bool(dims and dims.exclude_deposits)
-        totals = await _separate_period_totals(
-            db, spec, start, end, exclude_deposits=exclude
-        )
-        return {
-            "key": spec.key,
-            "label": spec.label,
-            "group": "Separate Expenses",
-            "tzs": float(totals.get("tzs") or 0.0),
-            "usd": float(totals.get("usd") or 0.0),
-            "zmw": float(totals.get("zmw") or 0.0),
-            "count": int(totals.get("count") or 0),
-        }
-
-    async def _station_row(key: str, label: str, feed_type: str, native: str) -> dict[str, Any]:
-        totals = await _diesel_period_totals(db, feed_type, native, start, end)
-        return {
-            "key": key,
-            "label": label,
-            "group": "Fuel stations",
-            "tzs": float(totals.get("tzs") or 0.0),
-            "usd": float(totals.get("usd") or 0.0),
-            "zmw": float(totals.get("zmw") or 0.0),
-            "count": int(totals.get("count") or 0),
-        }
-
-    row_coros: list[Any] = [_master_row()]
-    row_coros.extend(_separate_row(spec) for spec in SEPARATE_EXPENSE_FEEDS)
-    row_coros.extend(
-        _station_row(key, label, feed_type, native)
-        for key, label, feed_type, native in DIESEL_STATION_TRENDS
-    )
     # Spend Trend is always a full calendar year (Jan–Dec), keyed off To date.
     chart_year = end_d.year
     year_start = datetime(chart_year, 1, 1, 0, 0, 0)
@@ -3132,7 +3236,7 @@ async def analytics_data_table(
     from .fx_rates import get_rates_to_tzs
 
     raw_rows, month_buckets, fx = await asyncio.gather(
-        asyncio.gather(*row_coros),
+        _data_table_source_rows(db, start, end),
         _data_table_month_buckets(db, year_start, year_end),
         asyncio.to_thread(get_rates_to_tzs),
     )
