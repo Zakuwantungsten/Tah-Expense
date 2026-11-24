@@ -134,6 +134,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "auto_fill_from_description_maps": True,
     "restrict_trucks": True,
     "duplicate_check_days": 5,
+    "duplicate_lookback_overrides": {"item": {}, "description": {}},
     "allowed_truck_labels": ["YARD", "GARAGE"],
     "diesel_cash_items": ["Diesel Cash"],
     "export_restrict_surfaces": [

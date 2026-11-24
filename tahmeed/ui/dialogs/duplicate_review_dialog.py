@@ -3,8 +3,9 @@
 Each match is shown as a compact pair: the new row on top, the existing
 expense underneath (expense/saved tint) so both can be compared at a glance.
 
-Pills filter by source (All / In system / Same table), truck, and optional
-item/description facets. Lookback days/months can request a rescan.
+Pills filter by source (All / In system / Same table) plus optional
+item/description facets. A compact Trucks badge shows how many distinct
+trucks are in the current list. Lookback days/months can request a rescan.
 """
 
 from __future__ import annotations
@@ -32,13 +33,17 @@ from PySide6.QtWidgets import (
 
 from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
+    LookbackOverrides,
+    convert_lookback_value,
     filter_duplicate_items,
     format_amount_label,
     format_existing_date,
     format_lookback_label,
     group_counts,
     lookback_days_from_unit,
+    normalize_lookback_overrides,
 )
+from tahmeed.ui.dialogs.lookback_overrides_dialog import LookbackOverridesDialog
 
 _WHITE = "#FFFFFF"
 _BG = "#F4F6F8"
@@ -172,21 +177,30 @@ class DuplicateReviewDialog(QDialog):
         lookback_unit: str = "days",
         allow_rescan: bool = True,
         review_mode: str = "insert",
+        lookback_overrides: object = None,
     ) -> None:
         super().__init__(parent)
         self._items = list(items)
         self._dup_days = max(1, min(365, int(dup_days)))
+        self._lookback_overrides = normalize_lookback_overrides(lookback_overrides)
+        self._lookback_overrides_changed = False
         self._lookback_unit = (
             "months"
             if (lookback_unit or "days").strip().casefold().startswith("month")
             else "days"
         )
+        _month_cap = 12
+        _day_cap = 365
         if lookback_value is not None:
             self._lookback_value = max(1, int(lookback_value))
         elif self._lookback_unit == "months":
             self._lookback_value = max(1, (self._dup_days + 29) // 30)
         else:
             self._lookback_value = self._dup_days
+        if self._lookback_unit == "months":
+            self._lookback_value = max(1, min(_month_cap, self._lookback_value))
+        else:
+            self._lookback_value = max(1, min(_day_cap, self._lookback_value))
         self._pending_total = (
             int(pending_total)
             if pending_total is not None
@@ -211,13 +225,12 @@ class DuplicateReviewDialog(QDialog):
                     self._checked_by_row[row] = True
 
         self._source_filter: str = "all"
-        self._truck_filter: str | None = None
         self._item_filter: str | None = None
         self._desc_filter: str | None = None
         self._visible_items: List[DuplicateReviewItem] = []
         self._checks: list[QCheckBox] = []
         self._source_pills: Dict[str, _FilterPill] = {}
-        self._truck_pills: Dict[str, _FilterPill] = {}
+        self._truck_count_badge: QLabel | None = None
 
         self.setWindowTitle(
             "Possible duplicates (edited rows)"
@@ -257,6 +270,13 @@ class DuplicateReviewDialog(QDialog):
     def lookback_value(self) -> int:
         return int(self._lookback_value)
 
+    def lookback_overrides(self) -> LookbackOverrides:
+        return normalize_lookback_overrides(self._lookback_overrides)
+
+    def lookback_overrides_changed(self) -> bool:
+        """True when Custom lookback was saved — parent should persist settings."""
+        return bool(self._lookback_overrides_changed)
+
     def _looks_like_reimport(self) -> bool:
         n = len(self._items)
         if n < 2:
@@ -290,7 +310,7 @@ class DuplicateReviewDialog(QDialog):
         root.addWidget(self._subtitle)
         self._refresh_title_copy()
 
-        # Lookback controls
+        # Lookback controls — unit change converts the spin so Months ≠ same number of Days
         look_row = QHBoxLayout()
         look_row.setSpacing(6)
         look_lbl = QLabel("Lookback")
@@ -300,8 +320,6 @@ class DuplicateReviewDialog(QDialog):
         )
         look_row.addWidget(look_lbl)
         self._lookback_spin = QSpinBox()
-        self._lookback_spin.setRange(1, 365)
-        self._lookback_spin.setValue(self._lookback_value)
         self._lookback_spin.setFixedWidth(64)
         self._lookback_spin.setFixedHeight(26)
         self._lookback_spin.setStyleSheet(
@@ -321,15 +339,16 @@ class DuplicateReviewDialog(QDialog):
             "font-size:11px;font-family:'Segoe UI';min-width:84px;}"
         )
         look_row.addWidget(self._lookback_unit_combo)
+        self._lookback_hint = QLabel("")
+        self._lookback_hint.setStyleSheet(
+            f"font-size:11px;font-weight:600;color:{_BLUE};"
+            "font-family:'Segoe UI',sans-serif;"
+        )
+        look_row.addWidget(self._lookback_hint)
         self._rescan_btn = QPushButton("Rescan")
         self._rescan_btn.setCursor(Qt.PointingHandCursor)
         self._rescan_btn.setFixedHeight(26)
         self._rescan_btn.setEnabled(self._allow_rescan)
-        self._rescan_btn.setToolTip(
-            "Re-check duplicates with this lookback window"
-            if self._allow_rescan
-            else "Rescan not available for this entry"
-        )
         self._rescan_btn.setStyleSheet(
             f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:3px;"
             "padding:2px 12px;font-size:11px;font-weight:600;font-family:'Segoe UI';}"
@@ -338,6 +357,24 @@ class DuplicateReviewDialog(QDialog):
         )
         self._rescan_btn.clicked.connect(self._request_rescan)
         look_row.addWidget(self._rescan_btn)
+        self._custom_lookback_btn = QPushButton("Custom…")
+        self._custom_lookback_btn.setCursor(Qt.PointingHandCursor)
+        self._custom_lookback_btn.setFixedHeight(26)
+        self._custom_lookback_btn.setEnabled(self._allow_rescan)
+        self._custom_lookback_btn.setToolTip(
+            "Set lookback days per item or description (remembered for later days)"
+            if self._allow_rescan
+            else "Custom lookback not available for this entry"
+        )
+        self._custom_lookback_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{_BLUE};border:1px solid {_BORDER};"
+            "border-radius:3px;padding:2px 10px;font-size:11px;font-weight:600;"
+            "font-family:'Segoe UI';}"
+            f"QPushButton:hover{{background:{_BG};}}"
+            "QPushButton:disabled{color:#93C5E8;border-color:#E5E7EB;}"
+        )
+        self._custom_lookback_btn.clicked.connect(self._open_custom_lookback)
+        look_row.addWidget(self._custom_lookback_btn)
         look_row.addStretch()
         tip = QLabel("Same truck/service on different days can be legitimate.")
         tip.setStyleSheet(
@@ -346,15 +383,20 @@ class DuplicateReviewDialog(QDialog):
         look_row.addWidget(tip)
         root.addLayout(look_row)
 
-        # Source pills
+        self._suppress_lookback_unit_change = True
+        self._apply_lookback_spin_range(self._lookback_unit)
+        self._lookback_spin.setValue(self._lookback_value)
+        self._suppress_lookback_unit_change = False
+        self._lookback_spin.valueChanged.connect(self._on_lookback_controls_changed)
+        self._lookback_unit_combo.currentIndexChanged.connect(
+            self._on_lookback_unit_changed
+        )
+        self._refresh_lookback_hint()
+
+        # Source pills + compact trucks counter (sidebar-style badge)
         self._source_row = QHBoxLayout()
         self._source_row.setSpacing(6)
         root.addLayout(self._source_row)
-
-        # Truck pills
-        self._truck_row = QHBoxLayout()
-        self._truck_row.setSpacing(6)
-        root.addLayout(self._truck_row)
 
         # Context chips (item / description)
         self._context_frame = QFrame()
@@ -491,7 +533,7 @@ class DuplicateReviewDialog(QDialog):
                 "Most of these rows already match expenses in the system — "
                 "often from re-importing the same Excel file. Prefer "
                 "Move to Skipped unless you are sure each new row is a separate "
-                "expense. Use pills to focus by truck, item, or description. "
+                "expense. Use pills to focus by item or description. "
                 "Each pair shows the new row (red) above the existing expense (cream)."
             )
         else:
@@ -504,7 +546,7 @@ class DuplicateReviewDialog(QDialog):
             )
             self._subtitle.setText(
                 "Each pair shows the new row (red) above the existing expense (cream). "
-                "Filter by source, truck, item, or description. Tick Save to keep the "
+                "Filter by source, item, or description. Tick Save to keep the "
                 "new row anyway — it will be flagged for Verify → Issues. Unchecked "
                 "pairs (or Move to Skipped) go to the Skipped tab."
             )
@@ -522,7 +564,6 @@ class DuplicateReviewDialog(QDialog):
     def _rebuild_filters_and_table(self) -> None:
         self._sync_visible_checks_into_map()
         self._rebuild_source_pills()
-        self._rebuild_truck_pills()
         self._rebuild_context_chips()
         self._refill_table()
 
@@ -532,6 +573,7 @@ class DuplicateReviewDialog(QDialog):
     def _rebuild_source_pills(self) -> None:
         self._clear_layout(self._source_row)
         self._source_pills.clear()
+        self._truck_count_badge = None
         counts = group_counts(self._items)["source"]
         n_all = len(self._items)
         n_db = int(counts.get("db", 0))
@@ -549,48 +591,47 @@ class DuplicateReviewDialog(QDialog):
             )
             self._source_pills[key] = pill
             self._source_row.addWidget(pill)
+
         self._source_row.addStretch()
+        self._add_trucks_counter()
 
-    def _rebuild_truck_pills(self) -> None:
-        self._clear_layout(self._truck_row)
-        self._truck_pills.clear()
+    def _add_trucks_counter(self) -> None:
+        """Compact Trucks label + sidebar-style count badge (no per-truck pills)."""
         base = self._source_base_items()
-        trucks = group_counts(base)["truck"]
-        if not trucks:
-            self._truck_filter = None
-            return
-        # Reset truck filter if it vanished under the new source filter.
-        if self._truck_filter is not None and self._truck_filter not in trucks:
-            self._truck_filter = None
-
-        all_truck = _FilterPill("All trucks", len(base))
-        all_truck.setChecked(self._truck_filter is None)
-        all_truck.clicked.connect(lambda: self._on_truck_pill(None))
-        self._truck_pills[""] = all_truck
-        self._truck_row.addWidget(all_truck)
-
-        for label, count in sorted(trucks.items(), key=lambda kv: (-kv[1], kv[0].casefold())):
-            pill = _FilterPill(label, int(count))
-            pill.setChecked(self._truck_filter == label)
-            pill.clicked.connect(
-                lambda checked=False, lab=label: self._on_truck_pill(lab)
-            )
-            self._truck_pills[label] = pill
-            self._truck_row.addWidget(pill)
-        self._truck_row.addStretch()
+        n_trucks = len(group_counts(base)["truck"])
+        trucks_lbl = QLabel("Trucks")
+        trucks_lbl.setStyleSheet(
+            f"font-size:11px;font-weight:600;color:{_T2};"
+            "font-family:'Segoe UI',sans-serif;"
+        )
+        self._source_row.addWidget(trucks_lbl)
+        badge = QLabel("0")
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setFixedHeight(18)
+        badge.setMinimumWidth(24)
+        badge.setStyleSheet(
+            "background:#B45309;color:#FFFBEB;border-radius:9px;"
+            "font-size:10px;font-weight:700;font-family:'Segoe UI';padding:0 6px;"
+        )
+        badge.setToolTip(
+            f"{n_trucks} distinct truck{'s' if n_trucks != 1 else ''} "
+            "in the current filter"
+        )
+        shown = "999+" if n_trucks > 999 else str(n_trucks)
+        badge.setText(shown)
+        badge.setVisible(n_trucks > 0)
+        trucks_lbl.setVisible(n_trucks > 0)
+        self._truck_count_badge = badge
+        self._source_row.addWidget(badge)
 
     def _rebuild_context_chips(self) -> None:
         self._clear_layout(self._context_layout)
-        base = filter_duplicate_items(
-            self._items,
-            source=self._source_filter,  # type: ignore[arg-type]
-            truck=self._truck_filter,
-        )
+        base = self._source_base_items()
         counts = group_counts(base)
         items_c = counts["item"]
         descs_c = counts["description"]
 
-        # Drop facet filters that no longer exist under truck/source.
+        # Drop facet filters that no longer exist under the source filter.
         if self._item_filter is not None and self._item_filter not in items_c:
             self._item_filter = None
         if self._desc_filter is not None and self._desc_filter not in descs_c:
@@ -616,6 +657,15 @@ class DuplicateReviewDialog(QDialog):
                 counter.items(), key=lambda kv: (-kv[1], kv[0].casefold())
             )[:12]:
                 chip = _ContextChip(kind, label, int(count))
+                override_days = (self._lookback_overrides.get(kind) or {}).get(
+                    label.casefold()
+                )
+                if override_days is not None:
+                    chip.setText(f"{chip.text()} · {override_days}d")
+                    chip.setToolTip(
+                        f"{kind.title()}: {label} ({count}) — custom lookback "
+                        f"{override_days} day{'s' if override_days != 1 else ''}"
+                    )
                 chip.setChecked(active == label)
                 chip.clicked.connect(
                     lambda checked=False, k=kind, lab=label: self._on_context_chip(k, lab)
@@ -632,7 +682,6 @@ class DuplicateReviewDialog(QDialog):
         return filter_duplicate_items(
             self._items,
             source=self._source_filter,  # type: ignore[arg-type]
-            truck=self._truck_filter,
             item=self._item_filter,
             description=self._desc_filter,
         )
@@ -664,21 +713,6 @@ class DuplicateReviewDialog(QDialog):
                 pill.setChecked(True)
             return
         self._source_filter = key
-        self._truck_filter = None
-        self._item_filter = None
-        self._desc_filter = None
-        self._rebuild_filters_and_table()
-
-    def _on_truck_pill(self, label: str | None) -> None:
-        if label == self._truck_filter or (
-            label is None and self._truck_filter is None
-        ):
-            pill_key = "" if label is None else label
-            pill = self._truck_pills.get(pill_key)
-            if pill is not None:
-                pill.setChecked(True)
-            return
-        self._truck_filter = label
         self._item_filter = None
         self._desc_filter = None
         self._rebuild_filters_and_table()
@@ -766,19 +800,89 @@ class DuplicateReviewDialog(QDialog):
         for item in self._visible_items:
             self._checked_by_row[item.row] = False
 
+    def _current_lookback_unit(self) -> str:
+        return str(self._lookback_unit_combo.currentData() or "days")
+
+    def _apply_lookback_spin_range(self, unit: str) -> None:
+        months = (unit or "days").strip().casefold().startswith("month")
+        self._lookback_spin.setRange(1, 12 if months else 365)
+
+    def _on_lookback_unit_changed(self, *_args) -> None:
+        if getattr(self, "_suppress_lookback_unit_change", False):
+            return
+        new_unit = self._current_lookback_unit()
+        old_unit = self._lookback_unit
+        old_value = int(self._lookback_spin.value())
+        converted = convert_lookback_value(
+            old_value, from_unit=old_unit, to_unit=new_unit
+        )
+        self._suppress_lookback_unit_change = True
+        self._apply_lookback_spin_range(new_unit)
+        self._lookback_spin.setValue(converted)
+        self._lookback_unit = new_unit
+        self._lookback_value = converted
+        self._suppress_lookback_unit_change = False
+        self._refresh_lookback_hint()
+
+    def _on_lookback_controls_changed(self, *_args) -> None:
+        if getattr(self, "_suppress_lookback_unit_change", False):
+            return
+        self._lookback_value = int(self._lookback_spin.value())
+        self._lookback_unit = self._current_lookback_unit()
+        self._refresh_lookback_hint()
+
+    def _refresh_lookback_hint(self) -> None:
+        value = int(self._lookback_spin.value())
+        unit = self._current_lookback_unit()
+        effective = lookback_days_from_unit(value, unit)
+        if unit.startswith("month"):
+            self._lookback_hint.setText(f"= {effective} days")
+            self._lookback_hint.show()
+        else:
+            self._lookback_hint.clear()
+            self._lookback_hint.hide()
+        if self._allow_rescan:
+            label = format_lookback_label(
+                effective, unit=unit, value=value
+            )
+            self._rescan_btn.setToolTip(
+                f"Re-check duplicates for {label} ({effective} day window)"
+            )
+        else:
+            self._rescan_btn.setToolTip("Rescan not available for this entry")
+
     def _effective_rescan_days(self) -> int:
         value = int(self._lookback_spin.value())
-        unit = str(self._lookback_unit_combo.currentData() or "days")
+        unit = self._current_lookback_unit()
         return lookback_days_from_unit(value, unit)
+
+    def _open_custom_lookback(self) -> None:
+        if not self._allow_rescan:
+            return
+        dlg = LookbackOverridesDialog(
+            self._items,
+            default_days=self._effective_rescan_days(),
+            overrides=self._lookback_overrides,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._lookback_overrides = dlg.overrides()
+        self._lookback_overrides_changed = True
+        self._sync_visible_checks_into_map()
+        self._lookback_value = int(self._lookback_spin.value())
+        self._lookback_unit = self._current_lookback_unit()
+        self._requested_rescan_days = self._effective_rescan_days()
+        self._keep_for_later = False
+        self._save_anyway_rows = set()
+        self.accept()
 
     def _request_rescan(self) -> None:
         if not self._allow_rescan:
             return
         self._sync_visible_checks_into_map()
         self._lookback_value = int(self._lookback_spin.value())
-        self._lookback_unit = str(
-            self._lookback_unit_combo.currentData() or "days"
-        )
+        self._lookback_unit = self._current_lookback_unit()
         self._requested_rescan_days = self._effective_rescan_days()
         self._keep_for_later = False
         self._save_anyway_rows = set()

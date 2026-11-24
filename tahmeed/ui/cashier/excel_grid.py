@@ -105,8 +105,10 @@ from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, Tr
 from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
 from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
+    effective_lookback_days,
     format_amount_label,
     format_new_date,
+    normalize_lookback_overrides,
     within_table_duplicate_items,
 )
 from tahmeed.services.register_metrics import log_register_event, timed_op
@@ -1104,6 +1106,10 @@ class DailyRegister(QWidget):
         # When True, typed/pasted descriptions fill blank Item/Payee from maps.
         self._auto_fill_from_maps: bool = True
         self._duplicate_check_days: int = 5
+        self._duplicate_lookback_overrides: dict = {
+            "item": {},
+            "description": {},
+        }
         self._restrict_trucks: bool = True  # always on — only registered fleet numbers
         self._fleet_numbers: set = set()   # uppercased valid fleet numbers
         self._fleet_kinds: dict = {}       # number → "truck" | "trailer" | "motor_vehicle"
@@ -1735,26 +1741,42 @@ class DailyRegister(QWidget):
         """DB bulk soft-dup + within-table twins for the given draft inserts.
 
         ``exclude_ids`` maps row → transaction id so edited rows do not match
-        themselves when rescanning past records.
+        themselves when rescanning past records. Per-item / per-description
+        lookback overrides are applied per candidate when configured.
         """
         if not draft_inserts:
             return []
         exclude_ids = exclude_ids or {}
+        overrides = normalize_lookback_overrides(
+            getattr(self, "_duplicate_lookback_overrides", None)
+        )
+        default_days = max(1, min(365, int(days)))
         dup_hits: list = [[] for _ in draft_inserts]
         try:
             candidates = []
+            pool_days = default_days
             for row, tx in draft_inserts:
+                eff = effective_lookback_days(
+                    item=tx.item or "",
+                    description=tx.description or "",
+                    default_days=default_days,
+                    overrides=overrides,
+                )
+                pool_days = max(pool_days, eff)
                 body = {
                     "truck_number": tx.truck_number or "",
                     "amount": tx.amount,
                     "item": tx.item or "",
                     "description": tx.description or "",
+                    "days": eff,
                 }
+                if getattr(tx, "date", None) is not None:
+                    body["date"] = tx.date
                 exclude_id = exclude_ids.get(row)
                 if exclude_id is not None:
                     body["exclude_id"] = exclude_id
                 candidates.append(body)
-            dup_hits = await check_for_duplicates_bulk(candidates, int(days))
+            dup_hits = await check_for_duplicates_bulk(candidates, int(pool_days))
         except Exception:
             dup_hits = [[] for _ in draft_inserts]
 
@@ -1782,6 +1804,17 @@ class DailyRegister(QWidget):
             )
         )
         return items
+
+    async def _persist_dup_lookback_overrides_from_dialog(self, dlg) -> None:
+        """Save Custom lookback overrides from the review dialog when changed."""
+        if not getattr(dlg, "lookback_overrides_changed", lambda: False)():
+            return
+        overrides = normalize_lookback_overrides(dlg.lookback_overrides())
+        self._duplicate_lookback_overrides = overrides
+        try:
+            await set_setting("duplicate_lookback_overrides", overrides)
+        except Exception:
+            pass
 
     async def _review_edit_soft_duplicates(
         self,
@@ -1841,11 +1874,15 @@ class DailyRegister(QWidget):
                 lookback_unit=lookback_unit,
                 allow_rescan=True,
                 review_mode="edit",
+                lookback_overrides=getattr(
+                    self, "_duplicate_lookback_overrides", None
+                ),
             )
             with pause_background_polls(self):
                 accepted = await await_ui(lambda: dlg.exec() == QDialog.Accepted)
             if not accepted:
                 return None
+            await self._persist_dup_lookback_overrides_from_dialog(dlg)
             rescan_days = dlg.requested_rescan_days()
             if rescan_days is not None:
                 dup_days = int(rescan_days)
@@ -3816,11 +3853,15 @@ class DailyRegister(QWidget):
                 lookback_unit=lookback_unit,
                 allow_rescan=True,
                 review_mode=review_mode,
+                lookback_overrides=getattr(
+                    self, "_duplicate_lookback_overrides", None
+                ),
             )
             with pause_background_polls(self):
                 accepted = await await_ui(lambda: dlg.exec() == QDialog.Accepted)
             if not accepted:
                 return
+            await self._persist_dup_lookback_overrides_from_dialog(dlg)
             rescan_days = dlg.requested_rescan_days()
             if rescan_days is not None:
                 dup_days = int(rescan_days)
@@ -11171,6 +11212,9 @@ class DailyRegister(QWidget):
                         lookback_value=lookback_value,
                         lookback_unit=lookback_unit,
                         allow_rescan=True,
+                        lookback_overrides=getattr(
+                            self, "_duplicate_lookback_overrides", None
+                        ),
                     )
                     with pause_background_polls(self):
                         accepted = await await_ui(
@@ -11180,6 +11224,7 @@ class DailyRegister(QWidget):
                         self._rollback_materialized_parked_rows(materialized_parked)
                         self._flush_local_draft()
                         return False
+                    await self._persist_dup_lookback_overrides_from_dialog(dlg)
                     rescan_days = dlg.requested_rescan_days()
                     if rescan_days is not None:
                         dup_days = int(rescan_days)
@@ -11684,6 +11729,13 @@ class DailyRegister(QWidget):
             )
         except (TypeError, ValueError):
             self._duplicate_check_days = 5
+        self._duplicate_lookback_overrides = normalize_lookback_overrides(
+            setting_from_snapshot(
+                snapshot,
+                "duplicate_lookback_overrides",
+                {"item": {}, "description": {}},
+            )
+        )
         self._restrict_trucks = True
         surfaces = setting_from_snapshot(snapshot, "export_restrict_surfaces", None)
         self._export_restrict_surfaces = set(normalize_export_surfaces(surfaces))

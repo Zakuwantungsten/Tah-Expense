@@ -112,6 +112,62 @@ def filter_duplicate_items(
     return out
 
 
+LookbackOverrideKind = Literal["item", "description"]
+LookbackOverrides = Dict[str, Dict[str, int]]
+
+
+def clamp_lookback_days(days: int) -> int:
+    return max(1, min(365, int(days or 1)))
+
+
+def empty_lookback_overrides() -> LookbackOverrides:
+    return {"item": {}, "description": {}}
+
+
+def normalize_lookback_overrides(raw: object) -> LookbackOverrides:
+    """Coerce settings / dialog payload into ``{item: {key: days}, description: {...}}``."""
+    out = empty_lookback_overrides()
+    if not isinstance(raw, dict):
+        return out
+    for kind in ("item", "description"):
+        bucket = raw.get(kind)
+        if not isinstance(bucket, dict):
+            continue
+        cleaned: Dict[str, int] = {}
+        for label, days in bucket.items():
+            key = str(label or "").strip().casefold()
+            if not key:
+                continue
+            try:
+                cleaned[key] = clamp_lookback_days(int(days))
+            except (TypeError, ValueError):
+                continue
+        out[kind] = cleaned
+    return out
+
+
+def effective_lookback_days(
+    *,
+    item: str = "",
+    description: str = "",
+    default_days: int,
+    overrides: object = None,
+) -> int:
+    """Resolve lookback for one candidate.
+
+    Priority: description override → item override → global default.
+    """
+    default = clamp_lookback_days(default_days)
+    maps = normalize_lookback_overrides(overrides)
+    desc_key = description_facet_label(description).casefold()
+    item_key = item_facet_label(item).casefold()
+    if desc_key in maps["description"]:
+        return maps["description"][desc_key]
+    if item_key in maps["item"]:
+        return maps["item"][item_key]
+    return default
+
+
 def lookback_days_from_unit(value: int, unit: str) -> int:
     """Convert dialog lookback (days|months) to API ``days`` (1–365)."""
     n = max(1, int(value or 1))
@@ -119,6 +175,27 @@ def lookback_days_from_unit(value: int, unit: str) -> int:
     if u.startswith("month"):
         return max(1, min(365, n * 30))
     return max(1, min(365, n))
+
+
+def convert_lookback_value(value: int, *, from_unit: str, to_unit: str) -> int:
+    """Re-express a lookback spin value when the user switches Days ↔ Months.
+
+    Days → Months uses ceil(days/30) so a short window does not collapse to 0.
+    Months → Days uses ×30 (capped at 365). Same unit returns the value unchanged
+    (still clamped to the unit's spin range).
+    """
+    src = (from_unit or "days").strip().casefold()
+    dst = (to_unit or "days").strip().casefold()
+    src_months = src.startswith("month")
+    dst_months = dst.startswith("month")
+    n = max(1, int(value or 1))
+    if src_months == dst_months:
+        return max(1, min(12 if dst_months else 365, n))
+    if dst_months:
+        # days → months
+        return max(1, min(12, (n + 29) // 30))
+    # months → days
+    return max(1, min(365, n * 30))
 
 
 def format_lookback_label(days: int, *, unit: str = "days", value: int | None = None) -> str:

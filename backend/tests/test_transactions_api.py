@@ -1,6 +1,6 @@
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from bson import ObjectId
@@ -1220,6 +1220,97 @@ def test_check_duplicates_bulk_case_insensitive() -> None:
 
     assert response.status_code == 200
     assert response.json()["results"][0]["total"] == 1
+
+
+def test_check_duplicates_bulk_lookback_anchored_to_candidate_date() -> None:
+    """Days vs months must change hits: old match outside 5 days, inside 60."""
+    user = _cashier()
+    candidate_day = datetime(2026, 11, 22)
+    recent = {
+        "_id": ObjectId(),
+        "date": candidate_day - timedelta(days=2),
+        "truck_number": "T1",
+        "amount": 10.0,
+        "item": "Parking",
+        "description": "PARKING",
+        "rejected": False,
+    }
+    older = {
+        "_id": ObjectId(),
+        "date": candidate_day - timedelta(days=40),
+        "truck_number": "T1",
+        "amount": 10.0,
+        "item": "Parking",
+        "description": "PARKING",
+        "rejected": False,
+    }
+    collection = FakeTransactions([recent, older])
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+    candidate = {
+        "truck_number": "T1",
+        "amount": 10.0,
+        "item": "Parking",
+        "description": "PARKING",
+        "date": candidate_day.isoformat(),
+    }
+
+    with TestClient(app) as client:
+        short = client.post(
+            "/v1/transactions/check-duplicates/bulk",
+            json={"days": 5, "candidates": [candidate]},
+        )
+        wide = client.post(
+            "/v1/transactions/check-duplicates/bulk",
+            json={"days": 60, "candidates": [candidate]},
+        )
+
+    assert short.status_code == 200
+    assert wide.status_code == 200
+    assert short.json()["results"][0]["total"] == 1
+    assert wide.json()["results"][0]["total"] == 2
+
+
+def test_check_duplicates_bulk_per_candidate_days_override() -> None:
+    """One candidate can use a wider lookback than the bulk default."""
+    user = _cashier()
+    candidate_day = datetime(2026, 11, 22)
+    older = {
+        "_id": ObjectId(),
+        "date": candidate_day - timedelta(days=40),
+        "truck_number": "T1",
+        "amount": 10.0,
+        "item": "Parking",
+        "description": "PARKING",
+        "rejected": False,
+    }
+    collection = FakeTransactions([older])
+    app = _app(collection)
+    app.dependency_overrides[current_user] = lambda: user
+    base = {
+        "truck_number": "T1",
+        "amount": 10.0,
+        "item": "Parking",
+        "description": "PARKING",
+        "date": candidate_day.isoformat(),
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/transactions/check-duplicates/bulk",
+            json={
+                "days": 5,
+                "candidates": [
+                    dict(base),
+                    {**base, "days": 60},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert results[0]["total"] == 0
+    assert results[1]["total"] == 1
 
 
 def test_search_and_browse_and_meta() -> None:

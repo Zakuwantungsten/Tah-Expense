@@ -29,8 +29,10 @@ from tahmeed.services.cashier_service import (
 from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
 from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
+    effective_lookback_days,
     format_amount_label,
     format_new_date,
+    normalize_lookback_overrides,
 )
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
 from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
@@ -928,20 +930,34 @@ class EntryForm(QWidget):
             dup_days = int(await get_setting("duplicate_check_days") or 5)
         except Exception:
             dup_days = 5
+        try:
+            lookback_overrides = normalize_lookback_overrides(
+                await get_setting("duplicate_lookback_overrides")
+            )
+        except Exception:
+            lookback_overrides = normalize_lookback_overrides(None)
 
         possible_dup = False
         matched_id = None
         save_checks: set[int] = set()
         lookback_unit = "days"
         lookback_value = dup_days
+        item_text = self._item.text().strip()
         while True:
+            eff_days = effective_lookback_days(
+                item=item_text,
+                description=description,
+                default_days=dup_days,
+                overrides=lookback_overrides,
+            )
             try:
                 dupes = await check_for_duplicates(
                     truck_number=truck_number,
                     amount=self._amount.value(),
-                    item=self._item.text().strip(),
+                    item=item_text,
                     description=description,
-                    days=dup_days,
+                    days=eff_days,
+                    date=tx_date,
                 )
             except Exception:
                 dupes = []
@@ -961,7 +977,7 @@ class EntryForm(QWidget):
                 row_display=1,
                 description=description or "—",
                 truck_number=truck_number or "",
-                item=self._item.text().strip(),
+                item=item_text,
                 amount=self._amount.value(),
                 amount_label=format_amount_label(probe),
                 existing=dupes[0],
@@ -975,9 +991,18 @@ class EntryForm(QWidget):
                 lookback_value=lookback_value,
                 lookback_unit=lookback_unit,
                 allow_rescan=True,
+                lookback_overrides=lookback_overrides,
             )
             if dlg.exec() != QDialog.Accepted:
                 return
+            if dlg.lookback_overrides_changed():
+                lookback_overrides = dlg.lookback_overrides()
+                try:
+                    await set_setting(
+                        "duplicate_lookback_overrides", lookback_overrides
+                    )
+                except Exception:
+                    pass
             rescan_days = dlg.requested_rescan_days()
             if rescan_days is not None:
                 dup_days = int(rescan_days)

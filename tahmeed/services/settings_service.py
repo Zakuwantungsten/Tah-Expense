@@ -26,6 +26,10 @@ DEFAULTS = {
     "restrict_trucks": True,
     # How many days back to scan when checking for duplicate transactions.
     "duplicate_check_days": 5,
+    # Per item / description soft-dup lookback overrides (days). Persisted so
+    # cashiers do not re-enter the same windows every day.
+    # Shape: {"item": {"parking…": 2}, "description": {"posho…": 30}}
+    "duplicate_lookback_overrides": {"item": {}, "description": {}},
     # Free-text Truck No. place labels (YARD, GARAGE, …) accepted without fleet match.
     "allowed_truck_labels": ["YARD", "GARAGE"],
     # Item names whose verified transactions appear in Fuel Consumption → Diesel Cash.

@@ -1582,6 +1582,55 @@ async def next_day_order(
         return {"next": 0}
 
 
+def _as_naive_dt(value: Any) -> datetime | None:
+    """Normalize API / Mongo datetimes to naive UTC-ish for lookback math."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo is not None else value
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+    return None
+
+
+def _lookback_cutoff(*, days: int, anchor: datetime | None = None) -> datetime:
+    """Earliest expense date included for a lookback window.
+
+    Anchors to the candidate/register date when provided so backdated rows look
+    back from their own day, not only from ``utcnow()``.
+    """
+    now = utcnow().replace(tzinfo=None)
+    base = _as_naive_dt(anchor) or now
+    # Pool must cover both "relative to expense" and "relative to now".
+    return min(base, now) - timedelta(days=max(1, int(days)))
+
+
+def _soft_dup_within_lookback(
+    doc: dict[str, Any],
+    *,
+    days: int,
+    candidate_date: datetime | None,
+) -> bool:
+    """True when ``doc.date`` falls within ``days`` of the candidate (or now)."""
+    doc_dt = _as_naive_dt(doc.get("date"))
+    if doc_dt is None:
+        return False
+    anchor = _as_naive_dt(candidate_date) or utcnow().replace(tzinfo=None)
+    earliest = anchor - timedelta(days=max(1, int(days)))
+    # Allow a small forward slop so same-calendar-day / timezone skew still hits.
+    latest = anchor + timedelta(days=1)
+    return earliest <= doc_dt <= latest
+
+
 def _duplicate_check_query(
     *,
     days: int,
@@ -1590,8 +1639,9 @@ def _duplicate_check_query(
     item: str = "",
     description: str = "",
     exclude_id: str | None = None,
+    anchor_date: datetime | None = None,
 ) -> dict[str, Any]:
-    cutoff = utcnow().replace(tzinfo=None) - timedelta(days=days)
+    cutoff = _lookback_cutoff(days=days, anchor=anchor_date)
     query: dict[str, Any] = {
         "date": {"$gte": cutoff},
         "rejected": {"$ne": True},
@@ -1619,7 +1669,12 @@ def _ci_eq(actual: Any, expected: str) -> bool:
     return str(actual or "").strip().casefold() == expected.strip().casefold()
 
 
-def _soft_dup_doc_matches(doc: dict[str, Any], *, candidate: Any) -> bool:
+def _soft_dup_doc_matches(
+    doc: dict[str, Any],
+    *,
+    candidate: Any,
+    days: int | None = None,
+) -> bool:
     """In-memory filter matching ``_duplicate_check_query`` field rules."""
     try:
         if float(doc.get("amount") or 0) != float(candidate.amount):
@@ -1642,6 +1697,12 @@ def _soft_dup_doc_matches(doc: dict[str, Any], *, candidate: Any) -> bool:
     description = (getattr(candidate, "description", None) or "").strip()
     if description and not _ci_eq(doc.get("description"), description):
         return False
+    if days is not None:
+        cand_date = _as_naive_dt(getattr(candidate, "date", None))
+        if not _soft_dup_within_lookback(
+            doc, days=int(days), candidate_date=cand_date
+        ):
+            return False
     return True
 
 
@@ -1660,6 +1721,7 @@ async def check_for_duplicates(
         item=body.item,
         description=body.description,
         exclude_id=body.exclude_id,
+        anchor_date=body.date,
     )
     docs = (
         await _database(request)
@@ -1668,7 +1730,15 @@ async def check_for_duplicates(
         .limit(10)
         .to_list(length=10)
     )
-    return {"items": json_safe(docs), "total": len(docs)}
+    # Keep only hits within the lookback of the candidate date (when provided).
+    items = [
+        doc
+        for doc in docs
+        if _soft_dup_within_lookback(
+            doc, days=body.days, candidate_date=body.date
+        )
+    ]
+    return {"items": json_safe(items), "total": len(items)}
 
 
 @transactions.post("/check-duplicates/bulk")
@@ -1679,12 +1749,32 @@ async def check_for_duplicates_bulk(
 
     Fetches a single amount-filtered pool for the window, then matches each
     candidate in memory (same case-insensitive exact rules as the single check).
+    Lookback is anchored to each candidate's ``date`` when provided so Days vs
+    Months changes which past expenses count as duplicates.
     """
     if not body.candidates:
         return {"results": [], "total": 0}
 
+    def _candidate_days(candidate: Any) -> int:
+        raw = getattr(candidate, "days", None)
+        try:
+            if raw is not None:
+                return max(1, min(365, int(raw)))
+        except (TypeError, ValueError):
+            pass
+        return max(1, min(365, int(body.days)))
+
     db = _database(request)
-    cutoff = utcnow().replace(tzinfo=None) - timedelta(days=body.days)
+    pool_days = max(_candidate_days(c) for c in body.candidates)
+    anchors = [
+        _as_naive_dt(getattr(candidate, "date", None))
+        for candidate in body.candidates
+    ]
+    dated = [dt for dt in anchors if dt is not None]
+    if dated:
+        cutoff = _lookback_cutoff(days=pool_days, anchor=min(dated))
+    else:
+        cutoff = _lookback_cutoff(days=pool_days)
     amounts: list[float] = []
     seen_amounts: set[float] = set()
     for candidate in body.candidates:
@@ -1713,8 +1803,11 @@ async def check_for_duplicates_bulk(
     results: list[dict[str, Any]] = []
     for index, candidate in enumerate(body.candidates):
         hits: list[dict[str, Any]] = []
+        cand_days = _candidate_days(candidate)
         for doc in pool:
-            if not _soft_dup_doc_matches(doc, candidate=candidate):
+            if not _soft_dup_doc_matches(
+                doc, candidate=candidate, days=cand_days
+            ):
                 continue
             hits.append(doc)
             if len(hits) >= 10:

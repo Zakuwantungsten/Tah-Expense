@@ -22,6 +22,7 @@ REGISTER_SETTING_KEYS = (
     "defer_item_to_verify",
     "auto_fill_from_description_maps",
     "duplicate_check_days",
+    "duplicate_lookback_overrides",
     "export_restrict_surfaces",
     "allowed_truck_labels",
 )

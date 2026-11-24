@@ -309,6 +309,8 @@ class DuplicateCheckRequest(StrictModel):
     description: str = ""
     days: int = Field(5, ge=1, le=365)
     exclude_id: str | None = None
+    # When set, lookback is anchored to this expense date (not only utcnow).
+    date: datetime | None = None
 
 
 class DuplicateCheckCandidate(StrictModel):
@@ -317,6 +319,10 @@ class DuplicateCheckCandidate(StrictModel):
     item: str = ""
     description: str = ""
     exclude_id: str | None = None
+    # When set, each hit must fall within ``days`` of this candidate date.
+    date: datetime | None = None
+    # Optional per-candidate lookback (item/description overrides); else bulk ``days``.
+    days: int | None = Field(None, ge=1, le=365)
 
 
 class DuplicateCheckBulkRequest(StrictModel):

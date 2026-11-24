@@ -1397,6 +1397,19 @@ async def resubmit_rejected_transactions(
     return int(payload.get("updated") or 0)
 
 
+def _dup_candidate_date_payload(value: object) -> str | None:
+    """Serialize a candidate date for soft-dup lookback anchoring."""
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()  # type: ignore[no-any-return]
+        except Exception:
+            return None
+    text = str(value).strip()
+    return text or None
+
+
 async def check_for_duplicates(
     truck_number: str,
     amount: float,
@@ -1404,8 +1417,9 @@ async def check_for_duplicates(
     description: str,
     days: int,
     exclude_id: Optional[ObjectId] = None,
+    date: object = None,
 ) -> List[Transaction]:
-    """Return existing transactions within the last `days` days that share
+    """Return existing transactions within ``days`` of the candidate that share
     truck_number, amount, item, and description with the candidate entry."""
     body: dict = {
         "truck_number": truck_number or "",
@@ -1416,6 +1430,9 @@ async def check_for_duplicates(
     }
     if exclude_id is not None:
         body["exclude_id"] = str(exclude_id)
+    date_payload = _dup_candidate_date_payload(date)
+    if date_payload is not None:
+        body["date"] = date_payload
     payload = await api_client.request(
         "POST", "v1/transactions/check-duplicates", json=body
     )
@@ -1429,7 +1446,7 @@ async def check_for_duplicates_bulk(
     """Soft-dup check for many candidates (chunked, parallel workers).
 
     Each candidate dict may include truck_number, amount, item, description,
-    exclude_id. Returns a list aligned with *candidates* (empty list if no hits).
+    exclude_id, date. Returns a list aligned with *candidates* (empty list if no hits).
     """
     if not candidates:
         return []
@@ -1461,22 +1478,29 @@ async def _check_duplicates_bulk_chunk(
     results: List[List[Transaction]],
 ) -> None:
     """POST one ≤100-candidate bulk soft-dup chunk into *results* by absolute index."""
+    serialized: list[dict] = []
+    for c in chunk:
+        row = {
+            "truck_number": (c.get("truck_number") or ""),
+            "amount": float(c.get("amount") or 0.0),
+            "item": (c.get("item") or ""),
+            "description": (c.get("description") or ""),
+        }
+        if c.get("exclude_id") is not None:
+            row["exclude_id"] = str(c["exclude_id"])
+        date_payload = _dup_candidate_date_payload(c.get("date"))
+        if date_payload is not None:
+            row["date"] = date_payload
+        raw_days = c.get("days")
+        if raw_days is not None:
+            try:
+                row["days"] = max(1, min(365, int(raw_days)))
+            except (TypeError, ValueError):
+                pass
+        serialized.append(row)
     body = {
         "days": int(days),
-        "candidates": [
-            {
-                "truck_number": (c.get("truck_number") or ""),
-                "amount": float(c.get("amount") or 0.0),
-                "item": (c.get("item") or ""),
-                "description": (c.get("description") or ""),
-                **(
-                    {"exclude_id": str(c["exclude_id"])}
-                    if c.get("exclude_id") is not None
-                    else {}
-                ),
-            }
-            for c in chunk
-        ],
+        "candidates": serialized,
     }
     payload = await api_client.request(
         "POST",

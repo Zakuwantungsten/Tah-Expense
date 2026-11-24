@@ -9,7 +9,9 @@ from PySide6.QtWidgets import QApplication
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
+    convert_lookback_value,
     dup_source_kind,
+    effective_lookback_days,
     filter_duplicate_items,
     format_amount_label,
     format_existing_date,
@@ -17,12 +19,14 @@ from tahmeed.services.duplicate_review import (
     format_new_date,
     group_counts,
     lookback_days_from_unit,
+    normalize_lookback_overrides,
     rows_to_save_with_duplicate_flags,
     soft_dup_key,
     soft_dup_key_is_meaningful,
     within_table_duplicate_items,
 )
 from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
+from tahmeed.ui.dialogs.lookback_overrides_dialog import LookbackOverridesDialog
 
 
 def _app() -> QApplication:
@@ -253,6 +257,10 @@ def test_lookback_days_from_unit_and_label():
     assert lookback_days_from_unit(20, "months") == 365
     assert format_lookback_label(5, unit="days") == "last 5 days"
     assert format_lookback_label(60, unit="months", value=2) == "last 2 months"
+    assert convert_lookback_value(5, from_unit="days", to_unit="months") == 1
+    assert convert_lookback_value(60, from_unit="days", to_unit="months") == 2
+    assert convert_lookback_value(2, from_unit="months", to_unit="days") == 60
+    assert convert_lookback_value(5, from_unit="months", to_unit="days") == 150
 
 
 def test_duplicate_review_dialog_pills_filter_and_rescan(qapp=None):
@@ -287,16 +295,119 @@ def test_duplicate_review_dialog_pills_filter_and_rescan(qapp=None):
     assert "db" in dlg._source_pills
     assert "table" in dlg._source_pills
     assert dlg._source_pills["all"]._count == 2
+    # Truck pills replaced by a compact count badge (2 distinct trucks).
+    assert dlg._truck_count_badge is not None
+    assert dlg._truck_count_badge.text() == "2"
+    assert not dlg._truck_count_badge.isHidden()
+    assert dlg._lookback_hint.text() == "= 60 days"
 
     dlg._on_source_pill("table")
     assert dlg._table.rowCount() == 2
     assert dlg._table.item(0, 5).text() == "T200"
+    assert dlg._truck_count_badge is not None
+    assert dlg._truck_count_badge.text() == "1"
+
+    # Switching Months → Days converts 2 months → 60 days (not leave spin at 2).
+    dlg._lookback_unit_combo.setCurrentIndex(0)  # Days
+    assert dlg.lookback_unit() == "days"
+    assert dlg.lookback_value() == 60
+    assert dlg._lookback_hint.isHidden() or dlg._lookback_hint.text() == ""
 
     dlg._lookback_spin.setValue(3)
-    dlg._lookback_unit_combo.setCurrentIndex(0)  # Days
     dlg._checks[0].setChecked(True)
     dlg._request_rescan()
     assert dlg.requested_rescan_days() == 3
     assert dlg.checked_rows_snapshot() == {5}
     assert dlg.lookback_unit() == "days"
     assert dlg.lookback_value() == 3
+
+
+def test_duplicate_review_dialog_months_rescan_uses_converted_days(qapp=None):
+    _app()
+    dlg = DuplicateReviewDialog(
+        [_sample_item()],
+        dup_days=5,
+        lookback_value=5,
+        lookback_unit="days",
+    )
+    # Days → Months converts 5 days → 1 month; bump to 5 months explicitly.
+    dlg._lookback_unit_combo.setCurrentIndex(1)
+    assert dlg.lookback_unit() == "months"
+    assert dlg.lookback_value() == 1
+    assert dlg._lookback_hint.text() == "= 30 days"
+    dlg._lookback_spin.setValue(5)
+    assert dlg._lookback_hint.text() == "= 150 days"
+    dlg._request_rescan()
+    assert dlg.requested_rescan_days() == 150
+    assert dlg.lookback_unit() == "months"
+    assert dlg.lookback_value() == 5
+
+
+def test_effective_lookback_days_prefers_description_then_item():
+    overrides = normalize_lookback_overrides(
+        {
+            "item": {"diesel": 10},
+            "description": {"fill up": 2},
+        }
+    )
+    assert (
+        effective_lookback_days(
+            item="DIESEL",
+            description="FILL UP",
+            default_days=5,
+            overrides=overrides,
+        )
+        == 2
+    )
+    assert (
+        effective_lookback_days(
+            item="DIESEL",
+            description="OTHER",
+            default_days=5,
+            overrides=overrides,
+        )
+        == 10
+    )
+    assert (
+        effective_lookback_days(
+            item="OTHER",
+            description="OTHER",
+            default_days=5,
+            overrides=overrides,
+        )
+        == 5
+    )
+
+
+def test_lookback_overrides_dialog_saves_non_default_only(qapp=None):
+    _app()
+    item = _sample_item()
+    dlg = LookbackOverridesDialog(
+        [item],
+        default_days=5,
+        overrides={"item": {item.item.casefold(): 2}, "description": {}},
+    )
+    assert dlg._kind_combo.currentData() == "item"
+    key = item.item.casefold()
+    spin = dlg._spins[("item", key)]
+    assert spin.value() == 2
+    spin.setValue(12)
+    dlg._accept()
+    assert dlg.overrides()["item"][key] == 12
+    assert dlg.overrides()["description"] == {}
+
+
+def test_lookback_overrides_dialog_default_clears_override(qapp=None):
+    _app()
+    item = _sample_item()
+    key = item.item.casefold()
+    dlg = LookbackOverridesDialog(
+        [item],
+        default_days=5,
+        overrides={"item": {key: 2}, "description": {}},
+    )
+    spin = dlg._spins[("item", key)]
+    dlg._reset_row("item", key, spin)
+    assert spin.value() == 5
+    dlg._accept()
+    assert key not in dlg.overrides()["item"]
