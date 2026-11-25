@@ -1699,7 +1699,11 @@ class _ReconShellWidget(_FeedRibbonPageMixin, QWidget):
         self._main_stack.addWidget(upload_host)
 
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
+        from tahmeed.ui.accountant.separate_expenses import _bind_skipped_segment_badge
         self._skipped = SkippedTrucksTab(self._table)
+        _bind_skipped_segment_badge(
+            self._tabs, 2, self._skipped, feed_key=self._table
+        )
         self._main_stack.addWidget(self._skipped)
 
         self._tabs.tab_changed.connect(self._on_main_tab)

@@ -24,9 +24,8 @@ from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
     LookbackOverrides,
     clamp_lookback_days,
-    description_facet_label,
     empty_lookback_overrides,
-    item_facet_label,
+    merge_lookback_labels,
     normalize_lookback_overrides,
 )
 
@@ -40,10 +39,12 @@ _ROW_H = 22
 
 
 class LookbackOverridesDialog(QDialog):
-    """Switch Item ↔ Description, list values from this review, set days.
+    """Switch Item ↔ Description, list unique table values, set days.
 
-    Saved overrides persist via settings so the same item/description keeps
-    its window on later days until changed — even if it is absent tomorrow.
+    ``item_labels`` / ``description_labels`` should be the unique values from
+    the register rows being scanned (not only already-flagged dup pairs).
+    Review ``items`` are merged in as a fallback. Saved overrides persist via
+    settings so the same item/description keeps its window on later days.
     """
 
     def __init__(
@@ -52,40 +53,56 @@ class LookbackOverridesDialog(QDialog):
         *,
         default_days: int,
         overrides: object = None,
+        initial_kind: str = "item",
+        item_labels: Sequence[str] | None = None,
+        description_labels: Sequence[str] | None = None,
+        focus_label: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._default_days = clamp_lookback_days(default_days)
         self._overrides = normalize_lookback_overrides(overrides)
-        self._item_labels = self._collect_labels(items, kind="item")
-        self._desc_labels = self._collect_labels(items, kind="description")
+        review_items = self._collect_labels(items, kind="item")
+        review_descs = self._collect_labels(items, kind="description")
+        self._item_labels = merge_lookback_labels(
+            item_labels, review_items, kind="item"
+        )
+        self._desc_labels = merge_lookback_labels(
+            description_labels, review_descs, kind="description"
+        )
+        self._focus_label = (focus_label or "").strip() or None
         self._spins: Dict[Tuple[str, str], QSpinBox] = {}
         self._draft: LookbackOverrides = {
             "item": dict(self._overrides["item"]),
             "description": dict(self._overrides["description"]),
         }
+        kind = str(initial_kind or "item").strip().casefold()
+        self._initial_kind = (
+            "description" if kind.startswith("desc") else "item"
+        )
 
         self.setWindowTitle("Custom lookback")
         self.setMinimumSize(520, 360)
         self.resize(560, 420)
         self.setStyleSheet(f"background:{_WHITE};color:{_T1};")
         self._build()
+        idx = self._kind_combo.findData(self._initial_kind)
+        self._kind_combo.blockSignals(True)
+        if idx >= 0:
+            self._kind_combo.setCurrentIndex(idx)
+        self._kind_combo.blockSignals(False)
         self._refill_table()
 
     @staticmethod
     def _collect_labels(
         items: Sequence[DuplicateReviewItem], *, kind: str
     ) -> List[str]:
-        seen: Dict[str, str] = {}
-        for entry in items:
-            if kind == "item":
-                label = item_facet_label(entry.item)
-            else:
-                label = description_facet_label(entry.description)
-            key = label.casefold()
-            if key and key not in seen:
-                seen[key] = label
-        return sorted(seen.values(), key=lambda s: s.casefold())
+        raw = [
+            entry.item if kind == "item" else entry.description
+            for entry in items
+        ]
+        facet = "item" if kind == "item" else "description"
+        return merge_lookback_labels(raw, kind=facet)
 
     def overrides(self) -> LookbackOverrides:
         """Normalized overrides after Accept (only custom values kept)."""
@@ -104,7 +121,7 @@ class LookbackOverridesDialog(QDialog):
         root.addWidget(title)
 
         sub = QLabel(
-            "Switch Item or Description to list values from this review. "
+            "Switch Item or Description to list unique values from this table. "
             "Set days per row — remembered on later days when that value "
             f"appears again. Default is the global lookback ({self._default_days} days)."
         )
@@ -183,7 +200,15 @@ class LookbackOverridesDialog(QDialog):
         for key in sorted(extra_keys):
             if key not in by_key:
                 by_key[key] = key
-        return sorted(by_key.values(), key=lambda s: s.casefold())
+        labels = sorted(by_key.values(), key=lambda s: s.casefold())
+        # Active review facet jumps to the top when it matches this kind.
+        focus = self._focus_label
+        if focus and kind == self._initial_kind:
+            focus_key = focus.casefold()
+            for i, label in enumerate(labels):
+                if label.casefold() == focus_key:
+                    return [labels[i]] + labels[:i] + labels[i + 1 :]
+        return labels
 
     def _flush_visible_spins_into_draft(self) -> None:
         kind = self._current_kind()
@@ -212,7 +237,7 @@ class LookbackOverridesDialog(QDialog):
         if not labels:
             self._table.setRowCount(1)
             empty = QTableWidgetItem(
-                "No values in this review yet — save overrides after a scan."
+                "No values on this table yet — save overrides after a scan."
             )
             empty.setFlags(empty.flags() & ~Qt.ItemIsEditable)
             self._table.setItem(0, 0, empty)

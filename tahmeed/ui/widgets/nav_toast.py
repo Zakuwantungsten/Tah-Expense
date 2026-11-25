@@ -9,6 +9,10 @@ from PySide6.QtGui import QColor, QPainter, QPaintEvent
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QWidget
 
 _BLUE = "#0077C5"
+_GREEN = "#059669"
+_GREEN_BORDER = "#A7F3D0"
+_GREEN_BG = "#ECFDF5"
+_GREEN_TEXT = "#065F46"
 _TEXT = "#111827"
 _MUTED = "#6B7280"
 _DOT_MS = 380
@@ -43,6 +47,9 @@ class NavToast(QFrame):
         self._base = "Working"
         self._dot_index = 0
         self._generation = 0
+        self._kind = "busy"  # busy | success
+        self._animate_dots = True
+        self._accent = _BLUE
 
         root = QHBoxLayout(self)
         root.setContentsMargins(14, 10, 16, 10)
@@ -98,6 +105,42 @@ class NavToast(QFrame):
     def show_message(self, message: str, *, sticky: bool = False, ms: int = 2500) -> None:
         self._show(self._clean(message) or "Working", sticky=sticky, ms=ms)
 
+    def show_success(self, message: str, *, ms: int = 4500) -> None:
+        """Green status toast (replaces the Table-page inline success pill)."""
+        text = (message or "").strip() or "Done"
+        self._kind = "success"
+        self._animate_dots = False
+        self._accent = _GREEN
+        self._apply_chrome()
+        self._pulse.setText("✓")
+        self._pulse.setStyleSheet(
+            f"color: {_GREEN}; font-size: 12px; font-weight: 700;"
+            " background: transparent; border: none;"
+        )
+        self._label.setStyleSheet(
+            f"color: {_GREEN_TEXT}; font-size: 12px; font-weight: 600;"
+            " font-family:'Segoe UI'; background: transparent; border: none;"
+        )
+        self._generation += 1
+        gen = self._generation
+        self._base = text
+        self._dot_index = 0
+        self._label.setText(text)
+        self._reposition()
+        self.show()
+        self.raise_()
+        self.adjustSize()
+        self._reposition()
+        try:
+            self.repaint()
+        except RuntimeError:
+            pass
+        self._dot_timer.stop()
+        self._pulse_timer.stop()
+        self._hide_timer.stop()
+        self._hide_generation = gen
+        self._hide_timer.start(max(1000, int(ms)))
+
     def dismiss(self) -> None:
         self._generation += 1
         self._hide_timer.stop()
@@ -120,7 +163,37 @@ class NavToast(QFrame):
             t = t[:-1].rstrip()
         return t
 
+    def _apply_chrome(self) -> None:
+        if self._kind == "success":
+            self.setStyleSheet(
+                "QFrame#navToast {"
+                f"  background: {_GREEN_BG};"
+                f"  border: 1px solid {_GREEN_BORDER};"
+                "  border-radius: 10px;"
+                "}"
+            )
+        else:
+            self.setStyleSheet(
+                "QFrame#navToast {"
+                "  background: #FFFFFF;"
+                "  border: 1px solid #DBE4EE;"
+                "  border-radius: 10px;"
+                "}"
+            )
+
     def _show(self, base: str, *, sticky: bool, ms: int = 2500) -> None:
+        self._kind = "busy"
+        self._animate_dots = True
+        self._accent = _BLUE
+        self._apply_chrome()
+        self._pulse.setText("●")
+        self._pulse.setStyleSheet(
+            f"color: {_BLUE}; font-size: 11px; background: transparent; border: none;"
+        )
+        self._label.setStyleSheet(
+            f"color: {_TEXT}; font-size: 12px; font-weight: 600;"
+            " font-family:'Segoe UI'; background: transparent; border: none;"
+        )
         self._generation += 1
         gen = self._generation
         self._base = base or "Working"
@@ -152,10 +225,14 @@ class NavToast(QFrame):
         self.dismiss()
 
     def _tick_dots(self) -> None:
+        if not self._animate_dots:
+            return
         self._dot_index = (self._dot_index + 1) % len(_DOT_CYCLE)
         self._label.setText(f"{self._base}{_DOT_CYCLE[self._dot_index]}")
 
     def _tick_pulse(self) -> None:
+        if self._kind == "success":
+            return
         self._pulse_phase = (self._pulse_phase + 1) % 20
         # Soft brightness pulse on the blue dot (stylesheet only — no opacity effect).
         if self._pulse_phase < 10:
@@ -192,7 +269,13 @@ class NavToast(QFrame):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, False)
-        painter.fillRect(0, 8, 3, max(8, self.height() - 16), QColor(_BLUE))
+        painter.fillRect(
+            0,
+            8,
+            3,
+            max(8, self.height() - 16),
+            QColor(self._accent if self._accent else _BLUE),
+        )
         painter.end()
 
     def hideEvent(self, event) -> None:  # noqa: N802

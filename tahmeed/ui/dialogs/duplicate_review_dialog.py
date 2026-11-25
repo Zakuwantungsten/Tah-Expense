@@ -10,7 +10,7 @@ trucks are in the current list. Lookback days/months can request a rescan.
 
 from __future__ import annotations
 
-from typing import Dict, List, Set
+from typing import Dict, List, Sequence, Set
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor
@@ -23,7 +23,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -41,6 +43,7 @@ from tahmeed.services.duplicate_review import (
     format_lookback_label,
     group_counts,
     lookback_days_from_unit,
+    merge_lookback_labels,
     normalize_lookback_overrides,
 )
 from tahmeed.ui.dialogs.lookback_overrides_dialog import LookbackOverridesDialog
@@ -56,6 +59,8 @@ _AMBER = "#B45309"
 _NEW_BG = "#FEE2E2"       # light red — candidate being saved
 _EXISTING_BG = "#fff8f0"  # matches register saved/expense row tint
 _ROW_H = 22
+# At/under this many facets → compact inline chips; above → scrollable strip.
+_CHIP_INLINE_MAX = 6
 
 _HEADERS = (
     "Save",
@@ -67,6 +72,25 @@ _HEADERS = (
     "Amount",
     "Item",
 )
+
+
+def _checkbox_is_checked(state: object) -> bool:
+    """True for checked Save boxes — PySide6 may emit int or CheckState.
+
+    On current PySide6, ``int(Qt.CheckState.Checked)`` itself raises TypeError,
+    so equality / ``.value`` are used instead of ``int(state)``.
+    """
+    if state == Qt.CheckState.Checked:
+        return True
+    if state in (Qt.CheckState.Unchecked, Qt.CheckState.PartiallyChecked):
+        return False
+    checked_value = getattr(Qt.CheckState.Checked, "value", 2)
+    if state == checked_value:
+        return True
+    try:
+        return int(state) == int(checked_value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return bool(state)
 
 
 def _cell(
@@ -130,20 +154,33 @@ class _FilterPill(QPushButton):
 
 
 class _ContextChip(QPushButton):
-    """Toggleable item/description chip with count."""
+    """Toggleable item/description chip with duplicate count."""
 
-    def __init__(self, kind: str, label: str, count: int, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        kind: str,
+        label: str,
+        count: int,
+        parent: QWidget | None = None,
+        *,
+        max_label_len: int = 28,
+    ) -> None:
         super().__init__(parent)
         self.kind = kind
         self.facet_value = label
+        self._count = int(count)
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedHeight(22)
-        shown = "999+" if count > 999 else str(count)
-        # Truncate long labels for the chip row.
-        display = label if len(label) <= 28 else label[:27] + "…"
+        shown = "999+" if self._count > 999 else str(self._count)
+        # Truncate long labels; full text stays on the tooltip.
+        cap = max(8, int(max_label_len))
+        display = label if len(label) <= cap else label[: cap - 1] + "…"
         self.setText(f"{display} ({shown})")
-        self.setToolTip(f"{kind.title()}: {label} ({count})")
+        self.setToolTip(
+            f"{kind.title()}: {label} — {self._count} duplicate"
+            f"{'' if self._count == 1 else 's'}"
+        )
         self.toggled.connect(self._apply_style)
         self._apply_style()
 
@@ -166,7 +203,7 @@ class _ContextChip(QPushButton):
 class DuplicateReviewDialog(QDialog):
     """Review possible duplicates — new row + matching existing expense."""
 
-    # exec() result: parent re-queries with requested_rescan_days (dialog stays open).
+    # exec() result: parent re-queries with requested_rescan_days, then exec() again.
     RESCAN = 100
 
     def __init__(
@@ -182,12 +219,21 @@ class DuplicateReviewDialog(QDialog):
         allow_rescan: bool = True,
         review_mode: str = "insert",
         lookback_overrides: object = None,
+        lookback_item_labels: Sequence[str] | None = None,
+        lookback_description_labels: Sequence[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self._items = list(items)
         self._dup_days = max(1, min(365, int(dup_days)))
         self._lookback_overrides = normalize_lookback_overrides(lookback_overrides)
         self._lookback_overrides_changed = False
+        # Unique values from the register rows being scanned (Custom catalog).
+        self._lookback_item_labels = merge_lookback_labels(
+            lookback_item_labels, kind="item"
+        )
+        self._lookback_description_labels = merge_lookback_labels(
+            lookback_description_labels, kind="description"
+        )
         self._lookback_unit = (
             "months"
             if (lookback_unit or "days").strip().casefold().startswith("month")
@@ -249,15 +295,21 @@ class DuplicateReviewDialog(QDialog):
         self._rebuild_filters_and_table()
 
     def done(self, r: int) -> None:  # noqa: N802
-        """RESCAN exits exec() without hiding — parent refreshes this same window."""
-        if int(r) == self.RESCAN:
-            self.setResult(int(r))
-            self.finished.emit(int(r))
-            return
+        """Exit modal exec() for Accept / Reject / RESCAN.
+
+        RESCAN must call QDialog.done so the nested event loop quits. Emitting
+        finished alone leaves exec() blocked. Parent then show_rescan_busy /
+        apply_fresh_scan on this same instance and calls exec() again.
+        """
         super().done(r)
 
     def show_rescan_busy(self, message: str = "Rescanning duplicates…") -> None:
         """In-dialog overlay so Rescan does not flash a separate tiny window."""
+        # done(RESCAN) hides the dialog; show again so the overlay is visible
+        # while the parent re-queries before the next exec().
+        if not self.isVisible():
+            self.show()
+            self.raise_()
         if self._loading is None:
             self._loading = LoadingOverlay(self, message)
         self.setEnabled(False)
@@ -278,6 +330,8 @@ class DuplicateReviewDialog(QDialog):
         lookback_value: int | None = None,
         lookback_unit: str | None = None,
         lookback_overrides: object = None,
+        lookback_item_labels: Sequence[str] | None = None,
+        lookback_description_labels: Sequence[str] | None = None,
     ) -> None:
         """Replace pairs after a fresh API scan — same dialog, no stale list."""
         self._sync_visible_checks_into_map()
@@ -289,10 +343,20 @@ class DuplicateReviewDialog(QDialog):
 
         self._items = list(items)
         self._dup_days = max(1, min(365, int(dup_days)))
+        if lookback_item_labels is not None:
+            self._lookback_item_labels = merge_lookback_labels(
+                lookback_item_labels, kind="item"
+            )
+        if lookback_description_labels is not None:
+            self._lookback_description_labels = merge_lookback_labels(
+                lookback_description_labels, kind="description"
+            )
         if lookback_overrides is not None:
+            # Parent is source of truth after persist / rescan refresh.
             self._lookback_overrides = normalize_lookback_overrides(
                 lookback_overrides
             )
+            self._lookback_overrides_changed = False
         if lookback_unit is not None:
             self._lookback_unit = (
                 "months"
@@ -369,6 +433,10 @@ class DuplicateReviewDialog(QDialog):
     def lookback_overrides_changed(self) -> bool:
         """True when Custom lookback was saved — parent should persist settings."""
         return bool(self._lookback_overrides_changed)
+
+    def acknowledge_lookback_overrides_persisted(self) -> None:
+        """Clear dirty flag after parent wrote overrides to memory / settings."""
+        self._lookback_overrides_changed = False
 
     def _looks_like_reimport(self) -> bool:
         n = len(self._items)
@@ -455,7 +523,8 @@ class DuplicateReviewDialog(QDialog):
         self._custom_lookback_btn.setFixedHeight(26)
         self._custom_lookback_btn.setEnabled(self._allow_rescan)
         self._custom_lookback_btn.setToolTip(
-            "Set lookback days per item or description (remembered for later days)"
+            "Set lookback days per unique item or description on this table "
+            "(remembered for later days). Uses the Days/Months value above as default."
             if self._allow_rescan
             else "Custom lookback not available for this entry"
         )
@@ -737,34 +806,83 @@ class DuplicateReviewDialog(QDialog):
         def _add_chip_row(title: str, kind: str, counter) -> None:
             if not counter:
                 return
+            entries = sorted(
+                counter.items(), key=lambda kv: (-kv[1], kv[0].casefold())
+            )
+            use_strip = len(entries) > _CHIP_INLINE_MAX
             row = QHBoxLayout()
             row.setSpacing(4)
+            row.setContentsMargins(0, 0, 0, 0)
             lbl = QLabel(title)
             lbl.setStyleSheet(
                 f"font-size:10px;font-weight:600;color:{_T2};"
                 "font-family:'Segoe UI',sans-serif;"
             )
             row.addWidget(lbl)
+
+            chips_host = QWidget()
+            chips_lay = QHBoxLayout(chips_host)
+            chips_lay.setContentsMargins(0, 1, 0, 1)
+            chips_lay.setSpacing(4)
+            if use_strip:
+                # Fixed content width so the scroll area can pan horizontally.
+                chips_lay.setSizeConstraint(QLayout.SetFixedSize)
+
             active = self._item_filter if kind == "item" else self._desc_filter
-            for label, count in sorted(
-                counter.items(), key=lambda kv: (-kv[1], kv[0].casefold())
-            )[:12]:
-                chip = _ContextChip(kind, label, int(count))
+            # Scroll strip can show longer labels; inline stays compact.
+            label_cap = 40 if use_strip else 28
+            for label, count in entries:
+                chip = _ContextChip(
+                    kind, label, int(count), max_label_len=label_cap
+                )
                 override_days = (self._lookback_overrides.get(kind) or {}).get(
                     label.casefold()
                 )
                 if override_days is not None:
                     chip.setText(f"{chip.text()} · {override_days}d")
                     chip.setToolTip(
-                        f"{kind.title()}: {label} ({count}) — custom lookback "
+                        f"{kind.title()}: {label} — {count} duplicate"
+                        f"{'' if count == 1 else 's'}; custom lookback "
                         f"{override_days} day{'s' if override_days != 1 else ''}"
                     )
                 chip.setChecked(active == label)
+                # Ignore signal payload (bool/CheckState) — only kind/label matter.
                 chip.clicked.connect(
-                    lambda checked=False, k=kind, lab=label: self._on_context_chip(k, lab)
+                    lambda *_args, k=kind, lab=label: self._on_context_chip(k, lab)
                 )
-                row.addWidget(chip)
-            row.addStretch()
+                chips_lay.addWidget(chip)
+
+            if use_strip:
+                scroll = QScrollArea()
+                scroll.setObjectName("dupContextChipStrip")
+                scroll.setWidgetResizable(False)
+                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                scroll.setFrameShape(QFrame.NoFrame)
+                scroll.setFixedHeight(34)
+                scroll.setStyleSheet(
+                    "QScrollArea#dupContextChipStrip{"
+                    "background:transparent;border:none;}"
+                    "QScrollBar:horizontal{height:7px;background:transparent;"
+                    "margin:0 2px 0 2px;}"
+                    "QScrollBar::handle:horizontal{background:#D1D5DB;"
+                    "border-radius:3px;min-width:28px;}"
+                    "QScrollBar::handle:horizontal:hover{background:#9CA3AF;}"
+                    "QScrollBar::add-line:horizontal,"
+                    "QScrollBar::sub-line:horizontal{width:0;height:0;}"
+                    "QScrollBar::add-page:horizontal,"
+                    "QScrollBar::sub-page:horizontal{background:transparent;}"
+                )
+                scroll.setWidget(chips_host)
+                scroll.setToolTip(
+                    f"Scroll to see all {len(entries)} {title.casefold()} "
+                    f"with duplicate counts"
+                )
+                row.addWidget(scroll, 1)
+            else:
+                chips_lay.addStretch()
+                row.addWidget(chips_host, 1)
+
             self._context_layout.addLayout(row)
 
         _add_chip_row("Items", "item", items_c)
@@ -826,11 +944,20 @@ class DuplicateReviewDialog(QDialog):
         cb = QCheckBox()
         cb.setToolTip("Save this new row anyway and flag as possible duplicate")
         cb.setChecked(bool(self._checked_by_row.get(item.row, False)))
-        cb.stateChanged.connect(
-            lambda state, row=item.row: self._checked_by_row.__setitem__(
-                row, int(state) == int(Qt.CheckState.Checked)
+        # Prefer checkStateChanged (Qt 6.7+) — stateChanged may pass CheckState
+        # where int(state) raises TypeError and spams the console on chip filter.
+        if hasattr(cb, "checkStateChanged"):
+            cb.checkStateChanged.connect(
+                lambda state, row=item.row: self._checked_by_row.__setitem__(
+                    row, _checkbox_is_checked(state)
+                )
             )
-        )
+        else:
+            cb.stateChanged.connect(
+                lambda state, row=item.row: self._checked_by_row.__setitem__(
+                    row, _checkbox_is_checked(state)
+                )
+            )
         lay.addWidget(cb)
         self._checks.append(cb)
         self._table.setCellWidget(r, 0, wrap)
@@ -939,7 +1066,8 @@ class DuplicateReviewDialog(QDialog):
                 effective, unit=unit, value=value
             )
             self._rescan_btn.setToolTip(
-                f"Re-check duplicates for {label} ({effective} day window)"
+                f"Re-check DB and same-table duplicates for {label} "
+                f"({effective} day window)"
             )
         else:
             self._rescan_btn.setToolTip("Rescan not available for this entry")
@@ -950,7 +1078,7 @@ class DuplicateReviewDialog(QDialog):
         return lookback_days_from_unit(value, unit)
 
     def _finish_rescan_request(self) -> None:
-        """Exit exec() with RESCAN while keeping this window visible."""
+        """Exit exec() with RESCAN so the parent can refresh and re-exec."""
         self._sync_visible_checks_into_map()
         self._lookback_value = int(self._lookback_spin.value())
         self._lookback_unit = self._current_lookback_unit()
@@ -959,6 +1087,18 @@ class DuplicateReviewDialog(QDialog):
         self._save_anyway_rows = set()
         self.done(self.RESCAN)
 
+    def _custom_lookback_initial_kind(self) -> str:
+        """Prefer Description when that facet is active; else Item."""
+        if self._desc_filter is not None and self._item_filter is None:
+            return "description"
+        return "item"
+
+    def _custom_lookback_focus_label(self) -> str | None:
+        kind = self._custom_lookback_initial_kind()
+        if kind == "description":
+            return self._desc_filter
+        return self._item_filter
+
     def _open_custom_lookback(self) -> None:
         if not self._allow_rescan:
             return
@@ -966,6 +1106,10 @@ class DuplicateReviewDialog(QDialog):
             self._items,
             default_days=self._effective_rescan_days(),
             overrides=self._lookback_overrides,
+            initial_kind=self._custom_lookback_initial_kind(),
+            item_labels=self._lookback_item_labels,
+            description_labels=self._lookback_description_labels,
+            focus_label=self._custom_lookback_focus_label(),
             parent=self,
         )
         if dlg.exec() != QDialog.Accepted:

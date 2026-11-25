@@ -6451,6 +6451,38 @@ async def delete_skipped_import_rows(ids: list[str]) -> int:
     return await _feeds.delete_skipped_import_rows(ids=ids)
 
 
+async def list_trashed_skipped_import_rows(
+    *,
+    feed_key: str = "",
+    search: str = "",
+    limit: int = 200,
+    skip: int = 0,
+) -> dict:
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.list_trashed_skipped_import_rows(
+        feed_key=feed_key, search=search, limit=limit, skip=skip
+    )
+
+
+async def count_trashed_skipped_import_rows(
+    feed_key: str = "", search: str = ""
+) -> int:
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.count_trashed_skipped_import_rows(
+        feed_key=feed_key, search=search
+    )
+
+
+async def restore_skipped_import_rows(ids: list[str]) -> int:
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.restore_skipped_import_rows(ids=ids)
+
+
+async def purge_skipped_import_rows(ids: list[str]) -> int:
+    from tahmeed.services import feed_service as _feeds
+    return await _feeds.purge_skipped_import_rows(ids=ids)
+
+
 async def reupload_skipped_import_rows(ids: list[str]) -> int:
     from tahmeed.services import feed_service as _feeds
     return await _feeds.reupload_skipped_import_rows(ids=ids)

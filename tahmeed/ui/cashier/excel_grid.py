@@ -105,9 +105,12 @@ from tahmeed.ui.dialogs.truck_correction_dialog import TruckCorrectionDialog, Tr
 from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
 from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
+    SoftDuplicateScanError,
+    clamp_lookback_days,
     effective_lookback_days,
     format_amount_label,
     format_new_date,
+    lookback_catalog_from_draft_rows,
     normalize_lookback_overrides,
     within_table_duplicate_items,
 )
@@ -1083,6 +1086,8 @@ class DailyRegister(QWidget):
     verify_queue_bumped = Signal(int)
     # Brief non-blocking status (e.g. after Save) — action bar flash pill
     transient_status = Signal(str)
+    # Ribbon Dupes — True while an on-demand soft-dup scan is running
+    dupes_scan_busy_changed = Signal(bool)
 
     def __init__(self, user: User, categories: List[Category], parent=None):
         super().__init__(parent)
@@ -1750,8 +1755,7 @@ class DailyRegister(QWidget):
         overrides = normalize_lookback_overrides(
             getattr(self, "_duplicate_lookback_overrides", None)
         )
-        default_days = max(1, min(365, int(days)))
-        dup_hits: list = [[] for _ in draft_inserts]
+        default_days = clamp_lookback_days(days)
         try:
             candidates = []
             pool_days = default_days
@@ -1777,8 +1781,12 @@ class DailyRegister(QWidget):
                     body["exclude_id"] = exclude_id
                 candidates.append(body)
             dup_hits = await check_for_duplicates_bulk(candidates, int(pool_days))
-        except Exception:
-            dup_hits = [[] for _ in draft_inserts]
+        except SoftDuplicateScanError:
+            raise
+        except Exception as exc:
+            raise SoftDuplicateScanError(
+                f"Could not check duplicates ({exc})"
+            ) from exc
 
         items: list[DuplicateReviewItem] = []
         for i, (row, tx) in enumerate(draft_inserts):
@@ -1801,20 +1809,38 @@ class DailyRegister(QWidget):
             within_table_duplicate_items(
                 draft_inserts,
                 already_flagged_rows={item.row for item in items},
+                default_days=default_days,
+                overrides=overrides,
             )
         )
         return items
+
+    def _report_soft_dup_scan_failure(self, exc: BaseException) -> None:
+        """Surface soft-dup API failures — never treat them as an empty clean scan."""
+        detail = str(exc).strip() or exc.__class__.__name__
+        self.transient_status.emit(detail)
+        try:
+            QMessageBox.warning(self, "Duplicate check failed", detail)
+        except Exception:
+            pass
 
     async def _persist_dup_lookback_overrides_from_dialog(self, dlg) -> None:
         """Save Custom lookback overrides from the review dialog when changed."""
         if not getattr(dlg, "lookback_overrides_changed", lambda: False)():
             return
         overrides = normalize_lookback_overrides(dlg.lookback_overrides())
+        # Memory first so the immediate rescan uses Custom days even if
+        # settings write fails.
         self._duplicate_lookback_overrides = overrides
         try:
             await set_setting("duplicate_lookback_overrides", overrides)
         except Exception:
             pass
+        acknowledge = getattr(
+            dlg, "acknowledge_lookback_overrides_persisted", None
+        )
+        if callable(acknowledge):
+            acknowledge()
 
     async def _review_edit_soft_duplicates(
         self,
@@ -1856,18 +1882,22 @@ class DailyRegister(QWidget):
         duplicate_items: list = []
         while True:
             if dlg is None:
-                self._show_register_loading(
+                self.transient_status.emit(
                     f"Checking edited duplicates ({len(row_txs)})…"
                 )
-                duplicate_items = await self._scan_soft_duplicates(
-                    row_txs, int(dup_days), exclude_ids=exclude_ids
-                )
-                self._hide_register_loading()
+                try:
+                    duplicate_items = await self._scan_soft_duplicates(
+                        row_txs, int(dup_days), exclude_ids=exclude_ids
+                    )
+                except SoftDuplicateScanError as exc:
+                    self._report_soft_dup_scan_failure(exc)
+                    return None
                 if not duplicate_items:
                     for body in updates_by_row.values():
                         body["possible_duplicate"] = False
                         body["duplicate_of_id"] = None
                     return set()
+                cat_items, cat_descs = lookback_catalog_from_draft_rows(row_txs)
                 dlg = DuplicateReviewDialog(
                     duplicate_items,
                     dup_days=int(dup_days),
@@ -1881,34 +1911,44 @@ class DailyRegister(QWidget):
                     lookback_overrides=getattr(
                         self, "_duplicate_lookback_overrides", None
                     ),
+                    lookback_item_labels=cat_items,
+                    lookback_description_labels=cat_descs,
                 )
             else:
                 dlg.show_rescan_busy(
                     f"Rescanning edited duplicates ({len(row_txs)})…"
                 )
+                scan_failed = False
                 try:
                     duplicate_items = await self._scan_soft_duplicates(
                         row_txs, int(dup_days), exclude_ids=exclude_ids
                     )
+                except SoftDuplicateScanError as exc:
+                    scan_failed = True
+                    self._report_soft_dup_scan_failure(exc)
                 finally:
                     dlg.hide_rescan_busy()
-                if not duplicate_items:
+                if scan_failed:
+                    # Keep prior pairs; re-exec so the cashier can retry Rescan.
+                    pass
+                elif not duplicate_items:
                     dlg.reject()
                     for body in updates_by_row.values():
                         body["possible_duplicate"] = False
                         body["duplicate_of_id"] = None
                     return set()
-                dlg.apply_fresh_scan(
-                    duplicate_items,
-                    dup_days=int(dup_days),
-                    pending_total=len(row_txs),
-                    initial_checked=save_checks,
-                    lookback_value=lookback_value,
-                    lookback_unit=lookback_unit,
-                    lookback_overrides=getattr(
-                        self, "_duplicate_lookback_overrides", None
-                    ),
-                )
+                else:
+                    dlg.apply_fresh_scan(
+                        duplicate_items,
+                        dup_days=int(dup_days),
+                        pending_total=len(row_txs),
+                        initial_checked=save_checks,
+                        lookback_value=lookback_value,
+                        lookback_unit=lookback_unit,
+                        lookback_overrides=getattr(
+                            self, "_duplicate_lookback_overrides", None
+                        ),
+                    )
 
             with pause_background_polls(self):
                 code = await await_ui(lambda: dlg.exec())
@@ -3660,6 +3700,10 @@ class DailyRegister(QWidget):
             return
         self._save_in_flight = True
         self.save_busy_changed.emit(True)
+        self.dupes_scan_busy_changed.emit(True)
+        # Ribbon "Scanning…" only — register LoadingOverlay can flash a tiny
+        # top-level HWND on Windows; avoid it for this short Dupes pass.
+        self.transient_status.emit("Scanning duplicates…")
         from tahmeed.ui.async_utils import pause_background_polls
 
         try:
@@ -3667,17 +3711,18 @@ class DailyRegister(QWidget):
                 await self._scan_duplicates_body()
         finally:
             self._save_in_flight = False
+            self.dupes_scan_busy_changed.emit(False)
             if not self._submit_in_flight:
                 self.save_busy_changed.emit(False)
-                self._hide_register_loading()
 
     def _collect_soft_dup_scan_candidates(
         self,
     ) -> tuple[list[tuple[int, Transaction]], dict[int, object]]:
-        """My-surface rows eligible for an on-demand soft-dup scan.
+        """My-surface rows eligible for ribbon Dupes (whole open day).
 
-        Includes draft/dirty saved rows (exclude self via tx id) and filled
-        unsaved rows that are not parked.
+        Includes every non-parked saved My row (draft or submitted; exclude self
+        via tx id) plus filled unsaved rows. Matches the Dupes tooltip: scan /
+        rescan possible duplicates for this day.
         """
         row_txs: list[tuple[int, Transaction]] = []
         exclude_ids: dict[int, object] = {}
@@ -3687,8 +3732,6 @@ class DailyRegister(QWidget):
                 continue
             status = getattr(tx_orig, "register_status", "") or "submitted"
             if status == "parked":
-                continue
-            if status != "draft" and row not in self._dirty_rows:
                 continue
             try:
                 tx = self._build_transaction_from_row(row)
@@ -3746,13 +3789,23 @@ class DailyRegister(QWidget):
 
         row_txs, exclude_ids = self._collect_soft_dup_scan_candidates()
         if not row_txs:
-            self.transient_status.emit("No draft or unsaved rows to scan")
+            self.transient_status.emit("No rows on this day to scan for duplicates")
+            QMessageBox.information(
+                self,
+                "No rows to scan",
+                "There are no My entries on this day to check for duplicates.\n\n"
+                "Import or enter rows first, then press Dupes again.",
+            )
             return
+        self.transient_status.emit(
+            f"Scanning duplicates ({len(row_txs)})…"
+        )
         await self._soft_dup_review_and_apply(
             row_txs,
             exclude_ids,
             review_mode="insert",
-            empty_toast="No duplicates found",
+            empty_toast="No duplicates found for this day",
+            empty_dialog=True,
         )
 
     def _collect_soft_dup_candidates_for_tx_ids(
@@ -3822,6 +3875,7 @@ class DailyRegister(QWidget):
         *,
         review_mode: str = "insert",
         empty_toast: str | None = "No duplicates found",
+        empty_dialog: bool = False,
     ) -> None:
         """Shared soft-dup dialog + flag/skip apply for a candidate set."""
         if not row_txs:
@@ -3837,13 +3891,16 @@ class DailyRegister(QWidget):
         duplicate_items: list = []
         while True:
             if dlg is None:
-                self._show_register_loading(
+                self.transient_status.emit(
                     f"Scanning duplicates ({len(row_txs)})…"
                 )
-                duplicate_items = await self._scan_soft_duplicates(
-                    row_txs, int(dup_days), exclude_ids=exclude_ids
-                )
-                self._hide_register_loading()
+                try:
+                    duplicate_items = await self._scan_soft_duplicates(
+                        row_txs, int(dup_days), exclude_ids=exclude_ids
+                    )
+                except SoftDuplicateScanError as exc:
+                    self._report_soft_dup_scan_failure(exc)
+                    return
                 if not duplicate_items:
                     clear_patches: list[tuple] = []
                     for row, _tx in row_txs:
@@ -3878,8 +3935,20 @@ class DailyRegister(QWidget):
                         self._flush_local_draft()
                     if empty_toast:
                         self.transient_status.emit(empty_toast)
+                    if empty_dialog:
+                        QMessageBox.information(
+                            self,
+                            "No duplicates found",
+                            (
+                                empty_toast
+                                or "No duplicates found for this day"
+                            )
+                            + f"\n\nChecked {len(row_txs)} row(s) "
+                            f"within the last {int(dup_days)} day(s).",
+                        )
                     return
 
+                cat_items, cat_descs = lookback_catalog_from_draft_rows(row_txs)
                 dlg = DuplicateReviewDialog(
                     duplicate_items,
                     dup_days=int(dup_days),
@@ -3893,19 +3962,27 @@ class DailyRegister(QWidget):
                     lookback_overrides=getattr(
                         self, "_duplicate_lookback_overrides", None
                     ),
+                    lookback_item_labels=cat_items,
+                    lookback_description_labels=cat_descs,
                 )
             else:
                 # In-place rescan — same window, fresh API query (no stale pairs).
                 dlg.show_rescan_busy(
                     f"Rescanning duplicates ({len(row_txs)})…"
                 )
+                scan_failed = False
                 try:
                     duplicate_items = await self._scan_soft_duplicates(
                         row_txs, int(dup_days), exclude_ids=exclude_ids
                     )
+                except SoftDuplicateScanError as exc:
+                    scan_failed = True
+                    self._report_soft_dup_scan_failure(exc)
                 finally:
                     dlg.hide_rescan_busy()
-                if not duplicate_items:
+                if scan_failed:
+                    pass
+                elif not duplicate_items:
                     dlg.reject()
                     clear_patches = []
                     for row, _tx in row_txs:
@@ -3941,17 +4018,18 @@ class DailyRegister(QWidget):
                     if empty_toast:
                         self.transient_status.emit(empty_toast)
                     return
-                dlg.apply_fresh_scan(
-                    duplicate_items,
-                    dup_days=int(dup_days),
-                    pending_total=len(row_txs),
-                    initial_checked=save_checks,
-                    lookback_value=lookback_value,
-                    lookback_unit=lookback_unit,
-                    lookback_overrides=getattr(
-                        self, "_duplicate_lookback_overrides", None
-                    ),
-                )
+                else:
+                    dlg.apply_fresh_scan(
+                        duplicate_items,
+                        dup_days=int(dup_days),
+                        pending_total=len(row_txs),
+                        initial_checked=save_checks,
+                        lookback_value=lookback_value,
+                        lookback_unit=lookback_unit,
+                        lookback_overrides=getattr(
+                            self, "_duplicate_lookback_overrides", None
+                        ),
+                    )
 
             with pause_background_polls(self):
                 code = await await_ui(lambda: dlg.exec())
@@ -11292,16 +11370,34 @@ class DailyRegister(QWidget):
                 duplicate_items: list = []
                 while True:
                     if dlg is None:
-                        self._show_register_loading(
+                        # Status pill only — toggling LoadingOverlay here flashes a
+                        # tiny native window on Windows before the review dialog.
+                        self.transient_status.emit(
                             f"Checking duplicates ({len(draft_inserts)})…"
                         )
-                        duplicate_items = await self._scan_soft_duplicates(
-                            draft_inserts, dup_days
-                        )
-                        self._hide_register_loading()
+                        try:
+                            duplicate_items = await self._scan_soft_duplicates(
+                                draft_inserts, dup_days
+                            )
+                        except SoftDuplicateScanError as exc:
+                            self._report_soft_dup_scan_failure(exc)
+                            self._rollback_materialized_parked_rows(
+                                materialized_parked
+                            )
+                            self._flush_local_draft()
+                            return False
                         if not duplicate_items:
+                            self.transient_status.emit(
+                                f"No duplicates found — saving "
+                                f"{len(draft_inserts)} row(s)…"
+                            )
                             deferred_dups = set()
                             break
+                        # Drop Saving overlay once before the modal review dialog.
+                        self._hide_register_loading()
+                        cat_items, cat_descs = lookback_catalog_from_draft_rows(
+                            draft_inserts
+                        )
                         dlg = DuplicateReviewDialog(
                             duplicate_items,
                             dup_days=dup_days,
@@ -11314,32 +11410,41 @@ class DailyRegister(QWidget):
                             lookback_overrides=getattr(
                                 self, "_duplicate_lookback_overrides", None
                             ),
+                            lookback_item_labels=cat_items,
+                            lookback_description_labels=cat_descs,
                         )
                     else:
                         dlg.show_rescan_busy(
                             f"Rescanning duplicates ({len(draft_inserts)})…"
                         )
+                        scan_failed = False
                         try:
                             duplicate_items = await self._scan_soft_duplicates(
                                 draft_inserts, dup_days
                             )
+                        except SoftDuplicateScanError as exc:
+                            scan_failed = True
+                            self._report_soft_dup_scan_failure(exc)
                         finally:
                             dlg.hide_rescan_busy()
-                        if not duplicate_items:
+                        if scan_failed:
+                            pass
+                        elif not duplicate_items:
                             dlg.reject()
                             deferred_dups = set()
                             break
-                        dlg.apply_fresh_scan(
-                            duplicate_items,
-                            dup_days=dup_days,
-                            pending_total=len(draft_inserts),
-                            initial_checked=save_checks,
-                            lookback_value=lookback_value,
-                            lookback_unit=lookback_unit,
-                            lookback_overrides=getattr(
-                                self, "_duplicate_lookback_overrides", None
-                            ),
-                        )
+                        else:
+                            dlg.apply_fresh_scan(
+                                duplicate_items,
+                                dup_days=dup_days,
+                                pending_total=len(draft_inserts),
+                                initial_checked=save_checks,
+                                lookback_value=lookback_value,
+                                lookback_unit=lookback_unit,
+                                lookback_overrides=getattr(
+                                    self, "_duplicate_lookback_overrides", None
+                                ),
+                            )
 
                     with pause_background_polls(self):
                         code = await await_ui(lambda: dlg.exec())
@@ -11846,8 +11951,8 @@ class DailyRegister(QWidget):
         auto_fill = setting_from_snapshot(snapshot, "auto_fill_from_description_maps", True)
         self._auto_fill_from_maps = True if auto_fill is None else bool(auto_fill)
         try:
-            self._duplicate_check_days = int(
-                setting_from_snapshot(snapshot, "duplicate_check_days", 5) or 5
+            self._duplicate_check_days = clamp_lookback_days(
+                int(setting_from_snapshot(snapshot, "duplicate_check_days", 5) or 5)
             )
         except (TypeError, ValueError):
             self._duplicate_check_days = 5

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import QApplication, QPushButton, QScrollArea
 
 from tahmeed.models.transaction import Transaction
 from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
+    SoftDuplicateScanError,
+    clamp_lookback_days,
     convert_lookback_value,
     dup_source_kind,
     effective_lookback_days,
@@ -18,14 +21,20 @@ from tahmeed.services.duplicate_review import (
     format_lookback_label,
     format_new_date,
     group_counts,
+    lookback_catalog_from_draft_rows,
     lookback_days_from_unit,
+    merge_lookback_labels,
     normalize_lookback_overrides,
     rows_to_save_with_duplicate_flags,
+    soft_dup_dates_within_lookback,
     soft_dup_key,
     soft_dup_key_is_meaningful,
     within_table_duplicate_items,
 )
-from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
+from tahmeed.ui.dialogs.duplicate_review_dialog import (
+    DuplicateReviewDialog,
+    _checkbox_is_checked,
+)
 from tahmeed.ui.dialogs.lookback_overrides_dialog import LookbackOverridesDialog
 
 
@@ -213,6 +222,84 @@ def test_within_table_no_truck_still_matches_on_desc_item_amount():
     assert items[0].truck_number == ""
 
 
+def test_clamp_lookback_days_and_scan_error_type():
+    assert clamp_lookback_days(0) == 1
+    assert clamp_lookback_days(5) == 5
+    assert clamp_lookback_days(999) == 365
+    err = SoftDuplicateScanError("Could not check duplicates (timeout)")
+    assert isinstance(err, RuntimeError)
+    assert "timeout" in str(err)
+
+
+def test_soft_dup_dates_within_lookback_window():
+    anchor = datetime(2026, 8, 23)
+    assert soft_dup_dates_within_lookback(
+        candidate_date=anchor,
+        other_date=anchor - timedelta(days=5),
+        days=5,
+    )
+    assert not soft_dup_dates_within_lookback(
+        candidate_date=anchor,
+        other_date=anchor - timedelta(days=6),
+        days=5,
+    )
+    # Undated other keeps the twin (same-batch undated rows).
+    assert soft_dup_dates_within_lookback(
+        candidate_date=anchor, other_date=None, days=5
+    )
+
+
+def test_within_table_duplicate_items_respects_lookback_days():
+    day = datetime(2026, 8, 23)
+    first = _tx(date=day - timedelta(days=40))
+    second = _tx(date=day)
+    # Narrow window — same fingerprint, too far apart.
+    assert (
+        within_table_duplicate_items(
+            [(0, first), (1, second)], default_days=5
+        )
+        == []
+    )
+    # Wide window — same pair flags.
+    wide = within_table_duplicate_items(
+        [(0, first), (1, second)], default_days=60
+    )
+    assert len(wide) == 1
+    assert wide[0].row == 1
+    assert wide[0].existing is first
+
+
+def test_within_table_lookback_starts_new_chain_when_prior_too_old():
+    day = datetime(2026, 8, 23)
+    a = _tx(date=day - timedelta(days=40))
+    b = _tx(date=day)
+    c = _tx(date=day)
+    # A is outside B's window; B becomes the anchor and C flags against B.
+    items = within_table_duplicate_items(
+        [(0, a), (1, b), (2, c)], default_days=5
+    )
+    assert len(items) == 1
+    assert items[0].row == 2
+    assert items[0].existing is b
+
+
+def test_within_table_lookback_honors_item_override():
+    day = datetime(2026, 8, 23)
+    first = _tx(date=day - timedelta(days=40), item="DIESEL")
+    second = _tx(date=day, item="DIESEL")
+    overrides = normalize_lookback_overrides(
+        {"item": {"diesel": 60}, "description": {}}
+    )
+    assert (
+        within_table_duplicate_items(
+            [(0, first), (1, second)],
+            default_days=5,
+            overrides=overrides,
+        )[0].row
+        == 1
+    )
+
+
 def test_duplicate_review_dialog_same_table_label():
     _app()
     item = _sample_item()
@@ -261,6 +348,76 @@ def test_lookback_days_from_unit_and_label():
     assert convert_lookback_value(60, from_unit="days", to_unit="months") == 2
     assert convert_lookback_value(2, from_unit="months", to_unit="days") == 60
     assert convert_lookback_value(5, from_unit="months", to_unit="days") == 150
+
+
+def test_checkbox_is_checked_accepts_checkstate_and_int():
+    assert _checkbox_is_checked(Qt.CheckState.Checked) is True
+    assert _checkbox_is_checked(Qt.CheckState.Unchecked) is False
+    # PySide6 CheckState may not be int()-able; raw 2 still means Checked.
+    assert _checkbox_is_checked(2) is True
+    assert _checkbox_is_checked(0) is False
+
+
+def test_duplicate_review_context_chips_scroll_when_many(qapp=None):
+    """Few facets stay inline; many Descriptions become a scrollable chip strip."""
+    _app()
+    few = [
+        DuplicateReviewItem(
+            row=i,
+            row_display=i + 1,
+            description=f"DESC {i}",
+            truck_number=f"T{i}",
+            item="PARKING" if i < 3 else "DIESEL",
+            amount=1000.0 + i,
+            amount_label=f"TZS {1000 + i}",
+            existing=Transaction(
+                date=datetime(2026, 8, 20),
+                description=f"DESC {i}",
+                truck_number=f"T{i}",
+                amount=1000.0 + i,
+                item="PARKING" if i < 3 else "DIESEL",
+            ),
+            date_label="23 Aug 2026",
+        )
+        for i in range(4)
+    ]
+    dlg_few = DuplicateReviewDialog(few, dup_days=5)
+    strips_few = dlg_few._context_frame.findChildren(QScrollArea)
+    assert strips_few == []
+
+    many = [
+        DuplicateReviewItem(
+            row=i,
+            row_display=i + 1,
+            description=f"UNIQUE DESCRIPTION {i:02d}",
+            truck_number=f"T{i}",
+            item=f"ITEM {i % 3}",
+            amount=1000.0 + i,
+            amount_label=f"TZS {1000 + i}",
+            existing=Transaction(
+                date=datetime(2026, 8, 20),
+                description=f"UNIQUE DESCRIPTION {i:02d}",
+                truck_number=f"T{i}",
+                amount=1000.0 + i,
+                item=f"ITEM {i % 3}",
+            ),
+            date_label="23 Aug 2026",
+        )
+        for i in range(10)
+    ]
+    dlg_many = DuplicateReviewDialog(many, dup_days=5)
+    strips = dlg_many._context_frame.findChildren(QScrollArea)
+    assert len(strips) >= 1
+    # All description chips exist (not capped at 12) with counts.
+    desc_chip = next(
+        c
+        for c in dlg_many._context_frame.findChildren(QPushButton)
+        if getattr(c, "facet_value", None) == "UNIQUE DESCRIPTION 09"
+    )
+    assert "(1)" in desc_chip.text()
+    desc_chip.click()
+    assert dlg_many._desc_filter == "UNIQUE DESCRIPTION 09"
+    assert dlg_many._table.rowCount() == 2
 
 
 def test_duplicate_review_dialog_pills_filter_and_rescan(qapp=None):
@@ -362,6 +519,34 @@ def test_duplicate_review_dialog_months_rescan_uses_converted_days(qapp=None):
     assert dlg.lookback_value() == 5
 
 
+def test_duplicate_review_dialog_rescan_exits_exec(qapp=None):
+    """Regression: done(RESCAN) must quit QDialog.exec(), not only emit finished."""
+    _app()
+    dlg = DuplicateReviewDialog(
+        [_sample_item()],
+        dup_days=5,
+        lookback_value=5,
+        lookback_unit="days",
+        allow_rescan=True,
+    )
+    dlg._lookback_spin.setValue(12)
+
+    def _click_rescan() -> None:
+        dlg._request_rescan()
+
+    QTimer.singleShot(0, _click_rescan)
+    code = dlg.exec()
+    assert code == DuplicateReviewDialog.RESCAN
+    assert dlg.is_rescan_result(code)
+    assert dlg.requested_rescan_days() == 12
+    # Parent re-shows this instance for the busy overlay / next exec().
+    dlg.show_rescan_busy("Rescanning…")
+    assert dlg.isVisible()
+    assert not dlg.isEnabled()
+    dlg.hide_rescan_busy()
+    assert dlg.isEnabled()
+
+
 def test_effective_lookback_days_prefers_description_then_item():
     overrides = normalize_lookback_overrides(
         {
@@ -434,3 +619,133 @@ def test_lookback_overrides_dialog_default_clears_override(qapp=None):
     assert spin.value() == 5
     dlg._accept()
     assert key not in dlg.overrides()["item"]
+
+
+def test_lookback_overrides_dialog_initial_kind_description(qapp=None):
+    _app()
+    item = _sample_item()
+    dlg = LookbackOverridesDialog(
+        [item],
+        default_days=5,
+        initial_kind="description",
+    )
+    assert dlg._kind_combo.currentData() == "description"
+    assert dlg._table.item(0, 1).text() == item.description
+
+
+def test_lookback_catalog_from_draft_rows_unique():
+    a = Transaction(
+        date=datetime(2026, 8, 23),
+        description="FILL A",
+        truck_number="T1",
+        amount=1.0,
+        item="DIESEL",
+    )
+    b = Transaction(
+        date=datetime(2026, 8, 23),
+        description="FILL B",
+        truck_number="T2",
+        amount=2.0,
+        item="diesel",  # case-insensitive unique
+    )
+    c = Transaction(
+        date=datetime(2026, 8, 23),
+        description="FILL A",
+        truck_number="T3",
+        amount=3.0,
+        item="PARKING",
+    )
+    items, descs = lookback_catalog_from_draft_rows([(0, a), (1, b), (2, c)])
+    assert items == ["DIESEL", "PARKING"]
+    assert descs == ["FILL A", "FILL B"]
+    assert merge_lookback_labels(["X"], ["x"], ["Y"], kind="item") == ["X", "Y"]
+
+
+def test_lookback_overrides_dialog_lists_full_table_catalog(qapp=None):
+    """Custom lists unique table values, not only already-flagged review pairs."""
+    _app()
+    flagged = _sample_item()  # item + description = PARKING
+    dlg = LookbackOverridesDialog(
+        [flagged],
+        default_days=5,
+        item_labels=["DIESEL", "TOLLS", flagged.item],
+        description_labels=["OTHER DESC", flagged.description],
+        focus_label=flagged.item,
+        initial_kind="item",
+    )
+    values = [dlg._table.item(r, 1).text() for r in range(dlg._table.rowCount())]
+    assert values[0] == "PARKING"
+    assert set(values) == {"DIESEL", "PARKING", "TOLLS"}
+
+    review = DuplicateReviewDialog(
+        [flagged],
+        dup_days=5,
+        lookback_item_labels=["DIESEL", "OIL"],
+        lookback_description_labels=["A", "B"],
+    )
+    assert review._lookback_item_labels == ["DIESEL", "OIL"]
+    assert review._lookback_description_labels == ["A", "B"]
+    review._item_filter = "DIESEL"
+    assert review._custom_lookback_focus_label() == "DIESEL"
+
+
+def test_custom_lookback_dirty_flag_clears_after_persist(qapp=None):
+    """Custom Save marks dirty; parent acknowledge / apply_fresh_scan clears it."""
+    _app()
+    item = _sample_item()
+    dlg = DuplicateReviewDialog(
+        [item],
+        dup_days=5,
+        lookback_value=5,
+        lookback_unit="days",
+        allow_rescan=True,
+    )
+    assert not dlg.lookback_overrides_changed()
+
+    overrides = normalize_lookback_overrides(
+        {"item": {item.item.casefold(): 90}, "description": {}}
+    )
+    dlg._lookback_overrides = overrides
+    dlg._lookback_overrides_changed = True
+    assert dlg.lookback_overrides_changed()
+    assert (
+        effective_lookback_days(
+            item=item.item,
+            description=item.description,
+            default_days=5,
+            overrides=dlg.lookback_overrides(),
+        )
+        == 90
+    )
+
+    dlg.acknowledge_lookback_overrides_persisted()
+    assert not dlg.lookback_overrides_changed()
+
+    dlg._lookback_overrides_changed = True
+    dlg.apply_fresh_scan(
+        [item],
+        dup_days=5,
+        lookback_value=5,
+        lookback_unit="days",
+        lookback_overrides=overrides,
+    )
+    assert not dlg.lookback_overrides_changed()
+    assert dlg.lookback_overrides()["item"][item.item.casefold()] == 90
+
+
+def test_custom_lookback_initial_kind_follows_description_filter(qapp=None):
+    _app()
+    item = _sample_item()
+    dlg = DuplicateReviewDialog(
+        [item],
+        dup_days=5,
+        lookback_value=5,
+        lookback_unit="days",
+        allow_rescan=True,
+    )
+    assert dlg._custom_lookback_initial_kind() == "item"
+    dlg._desc_filter = item.description
+    assert dlg._custom_lookback_initial_kind() == "description"
+    dlg._item_filter = item.item
+    # Item filter wins when both are set.
+    assert dlg._custom_lookback_initial_kind() == "item"

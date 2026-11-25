@@ -56,7 +56,7 @@ class SettingsTab(QWidget):
         # Duplicate check window
         dup_row = QHBoxLayout()
         self._dup_days = QSpinBox()
-        self._dup_days.setRange(1, 30)
+        self._dup_days.setRange(1, 365)
         self._dup_days.setSuffix(" days")
         self._dup_days.setFixedWidth(100)
         dup_row.addWidget(self._dup_days)
@@ -64,10 +64,12 @@ class SettingsTab(QWidget):
         form.addRow("Duplicate check window:", dup_row)
 
         dup_note = QLabel(
-            "When saving a new entry, the system looks back this many days for an identical "
+            "Default lookback (1–365 days) when saving: the system searches for an identical "
             "transaction (same truck, amount, item, and description). The cashier is warned "
             "but can still save — the entry is then flagged for the accountant.\n"
-            "Accountants can also change this under Manage Items (Dup check)."
+            "In the duplicate dialog, cashiers can temporarily widen the window (days/months) "
+            "or set Custom per-item / per-description lookbacks. Accountants can also change "
+            "this default under Manage Items (Dup check)."
         )
         dup_note.setStyleSheet("color: #888; font-size: 12px;")
         dup_note.setWordWrap(True)
@@ -102,7 +104,7 @@ class SettingsTab(QWidget):
             settings = await get_all_settings()
             currency = settings.get("default_currency", "TZS")
             threshold = int(settings.get("confidence_threshold", 75))
-            dup_days = int(settings.get("duplicate_check_days", 5))
+            dup_days = max(1, min(365, int(settings.get("duplicate_check_days", 5))))
 
             idx = self._currency.findText(currency)
             if idx >= 0:

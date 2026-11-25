@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 from tahmeed.models.transaction import Transaction
@@ -118,6 +118,54 @@ LookbackOverrides = Dict[str, Dict[str, int]]
 
 def clamp_lookback_days(days: int) -> int:
     return max(1, min(365, int(days or 1)))
+
+
+class SoftDuplicateScanError(RuntimeError):
+    """Raised when the soft-dup API/check fails — callers must not treat as 'no dups'."""
+
+
+def _unique_facet_labels(
+    values: Sequence[str], *, kind: LookbackOverrideKind
+) -> List[str]:
+    """Sorted unique display labels for Custom lookback lists."""
+    seen: Dict[str, str] = {}
+    for raw in values:
+        label = (
+            item_facet_label(raw)
+            if kind == "item"
+            else description_facet_label(raw)
+        )
+        key = label.casefold()
+        if key and key not in seen:
+            seen[key] = label
+    return sorted(seen.values(), key=lambda s: s.casefold())
+
+
+def merge_lookback_labels(
+    *groups: Sequence[str] | None, kind: LookbackOverrideKind
+) -> List[str]:
+    """Union of label groups (table catalog, review pairs, …) for one kind."""
+    merged: List[str] = []
+    for group in groups:
+        if group:
+            merged.extend(str(v) for v in group)
+    return _unique_facet_labels(merged, kind=kind)
+
+
+def lookback_catalog_from_draft_rows(
+    draft_rows: Sequence[Tuple[int, Transaction]] | Sequence[Transaction],
+) -> Tuple[List[str], List[str]]:
+    """Unique item / description labels from the register rows being scanned."""
+    items: List[str] = []
+    descs: List[str] = []
+    for entry in draft_rows:
+        tx = entry[1] if isinstance(entry, tuple) else entry
+        items.append(getattr(tx, "item", None) or "")
+        descs.append(getattr(tx, "description", None) or "")
+    return (
+        _unique_facet_labels(items, kind="item"),
+        _unique_facet_labels(descs, kind="description"),
+    )
 
 
 def empty_lookback_overrides() -> LookbackOverrides:
@@ -245,20 +293,70 @@ def soft_dup_key_is_meaningful(key: SoftDupKey) -> bool:
     return bool(truck) and amount != 0.0
 
 
+def _as_naive_dt(value: object) -> Optional[datetime]:
+    """Normalize date/datetime for lookback math (mirrors API helper)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo is not None else value
+    # date without time
+    year = getattr(value, "year", None)
+    month = getattr(value, "month", None)
+    day = getattr(value, "day", None)
+    if year is not None and month is not None and day is not None:
+        try:
+            return datetime(int(year), int(month), int(day))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def soft_dup_dates_within_lookback(
+    *,
+    candidate_date: object = None,
+    other_date: object = None,
+    days: int,
+) -> bool:
+    """True when ``other_date`` falls within ``days`` of the candidate date.
+
+    Matches backend soft-dup lookback: look back ``days`` from the candidate
+    (or now if undated), with one day of forward slop. Undated ``other`` keeps
+    the twin so same-batch undated rows still surface.
+    """
+    days_i = max(1, int(days or 1))
+    other = _as_naive_dt(other_date)
+    if other is None:
+        return True
+    anchor = _as_naive_dt(candidate_date) or datetime.now(timezone.utc).replace(
+        tzinfo=None
+    )
+    earliest = anchor - timedelta(days=days_i)
+    latest = anchor + timedelta(days=1)
+    return earliest <= other <= latest
+
+
 def within_table_duplicate_items(
     draft_inserts: Sequence[tuple[int, Transaction]],
     *,
     already_flagged_rows: Optional[Set[int]] = None,
+    default_days: int | None = None,
+    overrides: object = None,
 ) -> List[DuplicateReviewItem]:
     """Flag later draft rows that match an earlier draft in the same save.
 
     The first occurrence of each soft-dup key is treated as the original; later
     identical rows become review items (cream row = that earlier draft). Rows
     already flagged by the DB soft-dup scan are left alone.
+
+    When ``default_days`` is set, same-table twins must also fall within that
+    lookback (per-item / per-description overrides apply). A later row outside
+    the window becomes the new chain anchor so nearby future twins can match.
     """
     flagged = set(already_flagged_rows or ())
     first_by_key: dict[SoftDupKey, tuple[int, Transaction]] = {}
     items: List[DuplicateReviewItem] = []
+    apply_lookback = default_days is not None
+    default = clamp_lookback_days(default_days) if apply_lookback else None
 
     for row, tx in draft_inserts:
         key = soft_dup_key_for_tx(tx)
@@ -268,9 +366,24 @@ def within_table_duplicate_items(
         if prior is None:
             first_by_key[key] = (row, tx)
             continue
+        _prior_row, prior_tx = prior
+        if apply_lookback:
+            eff = effective_lookback_days(
+                item=tx.item or "",
+                description=tx.description or "",
+                default_days=int(default or 1),
+                overrides=overrides,
+            )
+            if not soft_dup_dates_within_lookback(
+                candidate_date=getattr(tx, "date", None),
+                other_date=getattr(prior_tx, "date", None),
+                days=eff,
+            ):
+                # Too far from the prior anchor — start a new chain here.
+                first_by_key[key] = (row, tx)
+                continue
         if row in flagged:
             continue
-        _prior_row, prior_tx = prior
         items.append(
             DuplicateReviewItem(
                 row=row,

@@ -462,20 +462,119 @@ async def delete_skipped_rows(
     request: Request,
     manager: Manager,
 ) -> dict[str, Any]:
+    """Soft-delete skipped rows (move to Uploads Trash → Skipped trucks)."""
     oids = _parse_object_ids(body.ids)
     if not oids:
-        return {"deleted": 0}
-    result = await _database(request).skipped_import_rows.delete_many(
-        {"_id": {"$in": oids}}
+        return {"deleted": 0, "trashed": True}
+    now = utcnow()
+    if hasattr(now, "tzinfo") and now.tzinfo is not None:
+        now = now.replace(tzinfo=None)
+    actor_id = str(manager.get("_id") or manager.get("id") or "")
+    result = await _database(request).skipped_import_rows.update_many(
+        {"_id": {"$in": oids}, "trashed": {"$ne": True}},
+        {
+            "$set": {
+                "trashed": True,
+                "trashed_at": now,
+                "trashed_by": actor_id or None,
+            }
+        },
     )
+    deleted = int(result.modified_count or 0)
     await _audit(
         request,
-        action="feed.skipped.delete",
+        action="feed.skipped.trash",
         actor=manager,
         feed="skipped",
-        details={"deleted": int(result.deleted_count)},
+        details={"deleted": deleted},
     )
-    return {"deleted": int(result.deleted_count)}
+    return {"deleted": deleted, "trashed": True}
+
+
+@feeds.get("/skipped/trash")
+async def list_trashed_skipped_rows(
+    request: Request,
+    manager: Manager,
+    feed_key: str = Query(""),
+    search: str = Query(""),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=2000),
+) -> dict[str, Any]:
+    """Soft-deleted skipped import rows across feeds (or one feed_key)."""
+    del manager
+    query = skipped_import_query(feed_key, search, trashed=True)
+    coll = _database(request).skipped_import_rows
+    total = await coll.count_documents(query)
+    cursor = (
+        coll.find(query)
+        .sort([("trashed_at", -1), ("skipped_at", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=limit)
+    return json_safe({"items": docs, "total": int(total)})
+
+
+@feeds.get("/skipped/trash/count")
+async def count_trashed_skipped_rows(
+    request: Request,
+    manager: Manager,
+    feed_key: str = Query(""),
+    search: str = Query(""),
+) -> dict[str, Any]:
+    del manager
+    query = skipped_import_query(feed_key, search, trashed=True)
+    count = await _database(request).skipped_import_rows.count_documents(query)
+    return {"count": int(count)}
+
+
+@feeds.post("/skipped/restore")
+async def restore_skipped_rows(
+    body: SkippedImportIdsRequest,
+    request: Request,
+    manager: Manager,
+) -> dict[str, Any]:
+    """Restore soft-deleted skipped rows back into the live Skipped list."""
+    oids = _parse_object_ids(body.ids)
+    if not oids:
+        return {"restored": 0}
+    result = await _database(request).skipped_import_rows.update_many(
+        {"_id": {"$in": oids}, "trashed": True},
+        {"$unset": {"trashed": "", "trashed_at": "", "trashed_by": ""}},
+    )
+    restored = int(result.modified_count or 0)
+    await _audit(
+        request,
+        action="feed.skipped.restore",
+        actor=manager,
+        feed="skipped",
+        details={"restored": restored},
+    )
+    return {"restored": restored}
+
+
+@feeds.post("/skipped/purge")
+async def purge_skipped_rows(
+    body: SkippedImportIdsRequest,
+    request: Request,
+    manager: Manager,
+) -> dict[str, Any]:
+    """Permanently delete soft-trashed skipped rows."""
+    oids = _parse_object_ids(body.ids)
+    if not oids:
+        return {"purged": 0}
+    result = await _database(request).skipped_import_rows.delete_many(
+        {"_id": {"$in": oids}, "trashed": True}
+    )
+    purged = int(result.deleted_count or 0)
+    await _audit(
+        request,
+        action="feed.skipped.purge",
+        actor=manager,
+        feed="skipped",
+        details={"purged": purged},
+    )
+    return {"purged": purged}
 
 
 @feeds.post("/skipped/reupload")
@@ -489,7 +588,7 @@ async def reupload_skipped_rows(
         return {"saved": 0}
     db = _database(request)
     docs = await db.skipped_import_rows.find(
-        {"_id": {"$in": oids}}
+        {"_id": {"$in": oids}, "trashed": {"$ne": True}}
     ).to_list(length=None)
     if not docs:
         return {"saved": 0}
@@ -544,7 +643,8 @@ async def reupload_skipped_rows(
             )
             saved += inserted
 
-    await db.skipped_import_rows.delete_many({"_id": {"$in": oids}})
+    done_ids = [d["_id"] for d in docs]
+    await db.skipped_import_rows.delete_many({"_id": {"$in": done_ids}})
     await _audit(
         request,
         action="feed.skipped.reupload",

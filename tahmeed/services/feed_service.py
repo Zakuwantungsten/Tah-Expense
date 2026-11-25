@@ -1513,6 +1513,7 @@ async def update_skipped_import_truck(doc_id: str, truck_value: str) -> bool:
 
 
 async def delete_skipped_import_rows(ids: list[str]) -> int:
+    """Soft-delete skipped rows (move to trash)."""
     if not ids:
         return 0
     payload = await api_client.request(
@@ -1521,6 +1522,61 @@ async def delete_skipped_import_rows(ids: list[str]) -> int:
         json={"ids": list(ids)},
     )
     return int((payload or {}).get("deleted") or 0)
+
+
+async def list_trashed_skipped_import_rows(
+    *,
+    feed_key: str = "",
+    search: str = "",
+    limit: int = 200,
+    skip: int = 0,
+) -> dict:
+    payload = await api_client.request(
+        "GET",
+        "v1/feeds/skipped/trash",
+        params=_params(
+            feed_key=feed_key or None,
+            search=search or None,
+            limit=limit,
+            skip=skip,
+        ),
+    )
+    if isinstance(payload, dict):
+        return payload
+    return {"items": [], "total": 0}
+
+
+async def count_trashed_skipped_import_rows(
+    feed_key: str = "", search: str = ""
+) -> int:
+    payload = await api_client.request(
+        "GET",
+        "v1/feeds/skipped/trash/count",
+        params=_params(feed_key=feed_key or None, search=search or None),
+    )
+    return int((payload or {}).get("count") or 0)
+
+
+async def restore_skipped_import_rows(ids: list[str]) -> int:
+    if not ids:
+        return 0
+    payload = await api_client.request(
+        "POST",
+        "v1/feeds/skipped/restore",
+        json={"ids": list(ids)},
+    )
+    return int((payload or {}).get("restored") or 0)
+
+
+async def purge_skipped_import_rows(ids: list[str]) -> int:
+    if not ids:
+        return 0
+    payload = await api_client.request(
+        "POST",
+        "v1/feeds/skipped/purge",
+        json={"ids": list(ids)},
+    )
+    return int((payload or {}).get("purged") or 0)
 
 
 async def reupload_skipped_import_rows(ids: list[str]) -> int:

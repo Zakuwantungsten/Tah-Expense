@@ -875,4 +875,44 @@ def test_skipped_import_rows_lifecycle() -> None:
         )
         assert again.status_code == 201
         assert deleted.json()["deleted"] == 1
+        assert deleted.json()["trashed"] is True
+        assert skipped.documents[0].get("trashed") is True
+
+        live = client.get(
+            "/v1/feeds/skipped",
+            params={"feed_key": "toll_plaza"},
+        )
+        assert live.status_code == 200
+        assert live.json() == []
+
+        trash = client.get("/v1/feeds/skipped/trash")
+        assert trash.status_code == 200
+        assert trash.json()["total"] == 1
+        assert trash.json()["items"][0]["_id"] == del_id
+
+        restored = client.post(
+            "/v1/feeds/skipped/restore",
+            json={"ids": [del_id]},
+        )
+        assert restored.status_code == 200
+        assert restored.json()["restored"] == 1
+        assert "trashed" not in skipped.documents[0]
+
+        live2 = client.get(
+            "/v1/feeds/skipped",
+            params={"feed_key": "toll_plaza"},
+        )
+        assert len(live2.json()) == 1
+
+        deleted2 = client.post(
+            "/v1/feeds/skipped/delete",
+            json={"ids": [del_id]},
+        )
+        assert deleted2.json()["deleted"] == 1
+        purged = client.post(
+            "/v1/feeds/skipped/purge",
+            json={"ids": [del_id]},
+        )
+        assert purged.status_code == 200
+        assert purged.json()["purged"] == 1
         assert skipped.documents == []

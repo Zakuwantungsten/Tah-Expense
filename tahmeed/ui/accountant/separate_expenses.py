@@ -1806,6 +1806,8 @@ class _SegmentTabBar(QWidget):
     ) -> None:
         super().__init__(parent)
         self._index = 0
+        self._labels: List[str] = list(labels)
+        self._badges: List[int] = [0] * len(labels)
         self._buttons: List[QPushButton] = []
         self.setStyleSheet("background:transparent;")
         hl = QHBoxLayout(self)
@@ -1833,6 +1835,26 @@ class _SegmentTabBar(QWidget):
     def current_index(self) -> int:
         return self._index
 
+    def set_badge(self, idx: int, count: int) -> None:
+        """Show a count on a segment (e.g. Skipped). Hidden when count is 0."""
+        if idx < 0 or idx >= len(self._buttons):
+            return
+        n = max(0, int(count or 0))
+        if self._badges[idx] == n:
+            self._sync_button_text(idx)
+            return
+        self._badges[idx] = n
+        self._sync_button_text(idx)
+
+    def _sync_button_text(self, idx: int) -> None:
+        label = self._labels[idx]
+        n = self._badges[idx]
+        if n > 0:
+            text = f"{label} ({n:,})" if n < 1000 else f"{label} (999+)"
+        else:
+            text = label
+        self._buttons[idx].setText(text)
+
     def _apply_styles(self) -> None:
         active = (
             f"QPushButton{{background:{_BLUE};color:#FFF;border:none;border-radius:5px;"
@@ -1846,6 +1868,46 @@ class _SegmentTabBar(QWidget):
         )
         for i, btn in enumerate(self._buttons):
             btn.setStyleSheet(active if i == self._index else inactive)
+            self._sync_button_text(i)
+
+
+def _bind_skipped_segment_badge(
+    tabs: "_SegmentTabBar",
+    skipped_index: int,
+    skipped_tab: QWidget,
+    *,
+    feed_key: str = "",
+) -> None:
+    """Keep the Skipped segment count in sync; also fetch once for lazy hosts."""
+    count_changed = getattr(skipped_tab, "count_changed", None)
+    if count_changed is not None:
+        count_changed.connect(
+            lambda n, idx=skipped_index: tabs.set_badge(idx, n)
+        )
+    key = feed_key or str(getattr(skipped_tab, "_feed_key", "") or "")
+    if key:
+        _schedule_skipped_badge(tabs, skipped_index, key)
+
+
+def _schedule_skipped_badge(
+    tabs: "_SegmentTabBar",
+    skipped_index: int,
+    feed_key: str,
+) -> None:
+    """Fetch live skipped count for a feed and paint the segment badge."""
+    async def _run() -> None:
+        from tahmeed.services import accountant_service as svc
+
+        try:
+            n = await svc.count_skipped_import_rows(feed_key)
+        except Exception:
+            return
+        tabs.set_badge(skipped_index, n)
+
+    try:
+        asyncio.ensure_future(_run())
+    except Exception:
+        pass
 
 
 def _populate_year_combo(cb: QComboBox, years: List[int], selected_year: int) -> int:
@@ -2919,6 +2981,7 @@ class TollPlazaWidget(_FeedRibbonPageMixin, QWidget):
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
         self._sync_chrome_for_tab(0)
+        _schedule_skipped_badge(self._tabs, 2, "toll_plaza")
 
     def _ensure_uploads(self) -> None:
         if self._browse is not None:
@@ -2941,6 +3004,7 @@ class TollPlazaWidget(_FeedRibbonPageMixin, QWidget):
             return
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
         self._skipped = SkippedTrucksTab("toll_plaza")
+        _bind_skipped_segment_badge(self._tabs, 2, self._skipped, feed_key="toll_plaza")
         self._skipped_host_vl.addWidget(self._skipped, 1)
 
     def _on_main_tab(self, idx: int) -> None:
@@ -3888,6 +3952,7 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
         self._tabs.tab_changed.connect(self._on_main_tab)
         vl.addWidget(self._main_stack, 1)
         self._sync_chrome_for_tab(0)
+        _schedule_skipped_badge(self._tabs, 3, "parking_congo")
 
     def _ensure_uploads(self) -> None:
         if self._browse is not None:
@@ -3917,6 +3982,9 @@ class ParkingCongoWidget(_FeedRibbonPageMixin, QWidget):
             return
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
         self._skipped = SkippedTrucksTab("parking_congo")
+        _bind_skipped_segment_badge(
+            self._tabs, 3, self._skipped, feed_key="parking_congo"
+        )
         self._skipped_host_vl.addWidget(self._skipped, 1)
 
     def _on_main_tab(self, idx: int) -> None:
@@ -5184,6 +5252,9 @@ class CongoExpensesWidget(_FeedRibbonPageMixin, QWidget):
 
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
         self._skipped = SkippedTrucksTab("congo_expenses")
+        _bind_skipped_segment_badge(
+            self._tabs, 4, self._skipped, feed_key="congo_expenses"
+        )
         self._main_stack.addWidget(self._skipped)
 
         self._tabs.tab_changed.connect(self._on_main_tab)
@@ -6837,6 +6908,9 @@ class AhmedKimviWidget(_FeedRibbonPageMixin, QWidget):
 
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
         self._skipped = SkippedTrucksTab("ahmed_kimvi")
+        _bind_skipped_segment_badge(
+            self._tabs, 4, self._skipped, feed_key="ahmed_kimvi"
+        )
         self._main_stack.addWidget(self._skipped)
 
         self._tabs.tab_changed.connect(self._on_main_tab)
@@ -8122,6 +8196,9 @@ class ZambiaParkingWidget(_FeedRibbonPageMixin, QWidget):
 
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
         self._skipped = SkippedTrucksTab("zambia_parking")
+        _bind_skipped_segment_badge(
+            self._tabs, 3, self._skipped, feed_key="zambia_parking"
+        )
         self._main_stack.addWidget(self._skipped)
 
         self._tabs.tab_changed.connect(self._on_main_tab)
@@ -10030,6 +10107,9 @@ class AfritrackWidget(_FeedRibbonPageMixin, QWidget):
 
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
         self._skipped = SkippedTrucksTab("afritrack")
+        _bind_skipped_segment_badge(
+            self._tabs, 2, self._skipped, feed_key="afritrack"
+        )
         self._main_stack.addWidget(self._skipped)
 
         self._tabs.tab_changed.connect(self._on_main_tab)
@@ -10890,6 +10970,9 @@ class ComesaWidget(_FeedRibbonPageMixin, _LiftedFiltersMixin, _FeedExportMixin, 
 
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
         self._skipped = SkippedTrucksTab("comesa")
+        _bind_skipped_segment_badge(
+            self._tabs, 1, self._skipped, feed_key="comesa"
+        )
         self._main_stack.addWidget(self._skipped)
 
         self._tabs.tab_changed.connect(self._on_main_tab)
@@ -11156,6 +11239,9 @@ class ThirdPartyWidget(_FeedRibbonPageMixin, _LiftedFiltersMixin, _FeedExportMix
 
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
         self._skipped = SkippedTrucksTab("third_party")
+        _bind_skipped_segment_badge(
+            self._tabs, 1, self._skipped, feed_key="third_party"
+        )
         self._main_stack.addWidget(self._skipped)
 
         self._tabs.tab_changed.connect(self._on_main_tab)
@@ -11956,6 +12042,9 @@ class RahnTechWidget(_FeedRibbonPageMixin, QWidget):
 
         from tahmeed.ui.accountant.skipped_trucks_tab import SkippedTrucksTab
         self._skipped = SkippedTrucksTab("rahntech")
+        _bind_skipped_segment_badge(
+            self._tabs, 2, self._skipped, feed_key="rahntech"
+        )
         self._main_stack.addWidget(self._skipped)
 
         self._tabs.tab_changed.connect(self._on_main_tab)

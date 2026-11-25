@@ -1047,10 +1047,11 @@ class ManageItemsWidget(QWidget):
         dup_wrap = QFrame()
         dup_wrap.setFixedHeight(32)
         dup_wrap.setToolTip(
-            "When a cashier saves a new expense, look back this many days for an\n"
-            "identical row (same truck, amount, item, and description).\n"
-            "Matches are reviewed in the duplicate dialog; Save anyway flags them\n"
-            "for Verify → Issues."
+            "Default soft-dup lookback (1–365 days) when a cashier saves.\n"
+            "Matches use the same truck, amount, item, and description.\n"
+            "The duplicate dialog can temporarily widen days/months or set\n"
+            "Custom per-item / per-description lookbacks. Save anyway flags\n"
+            "matches for Verify → Issues."
         )
         dup_wrap.setStyleSheet(
             f"QFrame {{ background: {_WHITE}; border: 1px solid {_BORDER};"
@@ -1074,7 +1075,7 @@ class ManageItemsWidget(QWidget):
             pass
         dup_lay.addWidget(QLabel("Dup check:"))
         self._dup_days = QSpinBox()
-        self._dup_days.setRange(1, 30)
+        self._dup_days.setRange(1, 365)
         self._dup_days.setSuffix(" d")
         self._dup_days.setValue(5)
         self._dup_days.setFixedHeight(28)
@@ -1417,7 +1418,7 @@ class ManageItemsWidget(QWidget):
             dup_days = int(await get_setting("duplicate_check_days") or 5)
         except Exception:
             dup_days = 5
-        dup_days = max(1, min(30, dup_days))
+        dup_days = max(1, min(365, dup_days))
         self._dup_days.blockSignals(True)
         self._dup_days.setValue(dup_days)
         self._dup_days.blockSignals(False)
@@ -1461,7 +1462,7 @@ class ManageItemsWidget(QWidget):
 
     async def _save_dup_days_setting(self, days: int) -> None:
         try:
-            await set_setting("duplicate_check_days", max(1, min(30, int(days))))
+            await set_setting("duplicate_check_days", max(1, min(365, int(days))))
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Failed to save setting:\n{exc}")
 

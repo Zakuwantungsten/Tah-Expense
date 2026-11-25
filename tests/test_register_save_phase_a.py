@@ -27,13 +27,18 @@ def test_bulk_create_chunk_within_api_max():
     assert BULK_CREATE_CHUNK == 300
 
 
-def test_action_bar_flash_transient_status(qapp):
-    from tahmeed.ui.cashier.dashboard import _ActionBar
+def test_table_page_status_toast_replaces_green_pill(qapp):
+    """Register transient_status shows a floating success toast, not the action-bar pill."""
+    from PySide6.QtWidgets import QWidget
 
-    bar = _ActionBar()
-    bar.show()
-    bar.flash_transient_status("Draft saved: 3 added", ms=1000)
-    assert not bar._status.isHidden()
-    assert "Draft saved" in bar._status.text()
-    bar._clear_transient_status()
-    assert bar._status.isHidden()
+    from tahmeed.ui.widgets.nav_toast import NavToast
+
+    host = QWidget()
+    host.resize(640, 400)
+    host.show()
+    toast = NavToast(host)
+    toast.show_success("196 kept as possible duplicates", ms=2000)
+    assert toast.is_showing()
+    assert "196 kept as possible duplicates" in toast.display_text()
+    toast.dismiss()
+    assert not toast.is_showing()

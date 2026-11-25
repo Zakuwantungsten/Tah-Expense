@@ -190,8 +190,18 @@ def test_parking_congo_queries() -> None:
 
 def test_skipped_import_helpers() -> None:
     q = skipped_import_query("toll_plaza", search="T103")
-    assert q["feed_key"] == "toll_plaza"
-    assert "$or" in q
+    assert "$and" in q
+    assert any(part.get("feed_key") == "toll_plaza" for part in q["$and"])
+    assert any("$or" in part for part in q["$and"])
+    assert any(
+        part.get("trashed") == {"$ne": True} for part in q["$and"]
+    )
+
+    trash_q = skipped_import_query("toll_plaza", trashed=True)
+    assert trash_q == {"feed_key": "toll_plaza", "trashed": True}
+
+    all_trash = skipped_import_query("", trashed=True)
+    assert all_trash == {"trashed": True}
 
     doc = {
         "_id": "abc",

@@ -2123,12 +2123,21 @@ def skipped_import_search_clause(term: str) -> dict[str, Any]:
     return {"$or": clauses}
 
 
-def skipped_import_query(feed_key: str, search: str = "") -> dict[str, Any]:
-    query: dict[str, Any] = {"feed_key": feed_key}
+def skipped_import_query(
+    feed_key: str,
+    search: str = "",
+    *,
+    trashed: bool = False,
+) -> dict[str, Any]:
+    """Live skipped rows by default; pass ``trashed=True`` for trash list/count."""
+    query: dict[str, Any] = {"feed_key": feed_key} if feed_key else {}
     term = (search or "").strip()
     if term:
         query.update(skipped_import_search_clause(term))
-    return query
+    if trashed:
+        query["trashed"] = True
+        return query
+    return and_not_trashed(query)
 
 
 def prepare_skipped_import_docs(

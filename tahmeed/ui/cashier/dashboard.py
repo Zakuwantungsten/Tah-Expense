@@ -974,23 +974,12 @@ class _ActionBar(QFrame):
             self._status.hide()
 
     def flash_transient_status(self, message: str, *, ms: int = 4500) -> None:
-        """Non-blocking success/info pill (replaces modal “Draft saved”)."""
-        text = (message or "").strip()
-        if not text:
-            return
+        """Deprecated inline path — Table page routes status to a floating toast.
+
+        Kept for older callers/tests; clears any leftover inline flash only.
+        """
+        _ = (message, ms)
         self._clear_transient_status()
-        self._status.setText(text)
-        self._status.setStyleSheet(
-            "QLabel{background:#ECFDF5;color:#065F46;border:1px solid #A7F3D0;"
-            "border-radius:5px;padding:2px 10px;font-size:11px;font-weight:600;"
-            "font-family:'Segoe UI',sans-serif;}"
-        )
-        self._status.show()
-        timer = QTimer(self)
-        timer.setSingleShot(True)
-        timer.timeout.connect(self._clear_transient_status)
-        timer.start(max(1000, int(ms)))
-        self._transient_timer = timer
 
     def _clear_transient_status(self) -> None:
         timer = getattr(self, "_transient_timer", None)
@@ -1000,6 +989,10 @@ class _ActionBar(QFrame):
             self._transient_timer = None
         # Leave edit-mode styling to set_edit_state; only hide free-floating flashes.
         if self._status.isVisible() and self._status.text().startswith("Edit mode"):
+            return
+        # Don't wipe draft/submitted amber status pills.
+        text = (self._status.text() or "").strip().casefold()
+        if "draft" in text or "submitted" in text:
             return
         self._status.hide()
         self._status.setText("")
@@ -1060,6 +1053,9 @@ class _TablePage(QWidget):
         register.attachment_count_changed.connect(self._qb_toolbar.set_attachment_count)
         register.edit_state_changed.connect(self._qb_toolbar.set_edit_state)
         register.save_busy_changed.connect(self._qb_toolbar.set_mutation_busy)
+        register.dupes_scan_busy_changed.connect(
+            self._qb_toolbar.set_dupes_scanning
+        )
         register.save_busy_changed.connect(
             lambda busy: (
                 None if busy
@@ -1079,12 +1075,16 @@ class _TablePage(QWidget):
 
         self._register = register
         self._action_bar = _ActionBar()
+        from tahmeed.ui.widgets.nav_toast import NavToast
+
+        self._status_toast = NavToast(self)
         self._action_bar.search_changed.connect(register.set_search)
         self._action_bar.mode_changed.connect(register.set_view_mode)
         self._action_bar.cheque_edited.connect(register.set_active_cheque)
         self._action_bar.reconciled_date_changed.connect(self._on_reconciled_date)
         register.edit_state_changed.connect(self._action_bar.set_edit_state)
-        register.transient_status.connect(self._action_bar.flash_transient_status)
+        # Green success/info notices → floating toast (not the action-bar pill).
+        register.transient_status.connect(self._flash_status_toast)
         register.mode_changed.connect(self._action_bar.sync_mode)
         register.register_status_updated.connect(self._action_bar.set_register_status)
         register.stats_updated.connect(self._sync_mode_tab_counts)
@@ -1111,6 +1111,17 @@ class _TablePage(QWidget):
         vl.addWidget(self._qb_toolbar)
         vl.addWidget(self._action_bar)
         vl.addWidget(register, 1)
+
+    def _flash_status_toast(self, message: str) -> None:
+        """Show register status notices as a bottom-right toast (not inline pill)."""
+        text = (message or "").strip()
+        if not text:
+            return
+        ms = 4500
+        lower = text.casefold()
+        if any(token in lower for token in ("duplicate", "dupes", "scan")):
+            ms = 7000
+        self._status_toast.show_success(text, ms=ms)
 
     def _sync_reconciled_date(self, *_args) -> None:
         self._action_bar.set_reconciled_date(self._register.current_date())

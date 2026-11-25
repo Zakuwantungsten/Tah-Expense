@@ -80,6 +80,24 @@ _SEPARATE_EXPENSE_KEYS = frozenset({
     "rahntech",
 })
 
+# Sidebar nav key → skipped_import_rows feed_key(s) for attention badges.
+_SKIPPED_SIDEBAR_FEEDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("toll_plaza", ("toll_plaza",)),
+    ("parking_congo", ("parking_congo",)),
+    ("congo_exp", ("congo_expenses",)),
+    ("ahmed_kimvi", ("ahmed_kimvi",)),
+    ("zambia_parking", ("zambia_parking",)),
+    ("afritrack", ("afritrack",)),
+    ("third_party", ("third_party",)),
+    ("comesa", ("comesa",)),
+    ("rahntech", ("rahntech",)),
+    ("sm_burhani", ("rpa_schedule", "bonds")),
+    ("infinity", ("diesel_infinity",)),
+    ("lake_zambia", ("diesel_lake_zambia",)),
+    ("lake_tunduma", ("diesel_lake_tunduma",)),
+    ("gbp_diesel", ("diesel_gbp",)),
+)
+
 # Every first-open lazy tab uses an Opening… shell so the stack flips before
 # heavy __init__ (Verify, Master, Table, Separate Expenses, manage pages, …).
 _SHELL_FIRST_KEYS = _LAZY_PAGE_KEYS
@@ -136,6 +154,7 @@ class AccountantDashboard(QWidget):
         self._notification_timer.start()
         self._start_notification_stream()
         schedule_coro(self._refresh_day_issues_badge())
+        schedule_coro(self._refresh_skipped_sidebar_badges())
         # Preload heavy modules after the UI is up so first sidebar clicks
         # spend time on widget build, not cold import.
         QTimer.singleShot(0, self._warm_import_heavy_pages)
@@ -296,6 +315,25 @@ class AccountantDashboard(QWidget):
         """Wrap non-overview pages in the seeded circuit canvas host."""
         return wrap_circuit_page(widget, seed=key, bg=_APP_BG)
 
+    @staticmethod
+    def _page_content(widget: QWidget) -> QWidget:
+        """Unwrap CircuitGeometryPage host to the real feed widget."""
+        content = getattr(widget, "content", None)
+        if isinstance(content, QWidget):
+            return content
+        raw = getattr(widget, "_content", None)
+        if isinstance(raw, QWidget):
+            return raw
+        return widget
+
+    def _maybe_wire_skipped_badge(self, key: str, host: QWidget) -> None:
+        sidebar_key = key.split("::", 1)[0] if key.startswith("sm_burhani::") else key
+        if sidebar_key not in {k for k, _ in _SKIPPED_SIDEBAR_FEEDS}:
+            return
+        if key.startswith("sm_burhani::"):
+            sidebar_key = "sm_burhani"
+        self._wire_skipped_sidebar_badge(sidebar_key, self._page_content(host))
+
     def _ensure_page(self, key: str) -> QWidget:
         """Create and cache a dedicated page the first time it is opened."""
         if key in self._pages:
@@ -303,6 +341,7 @@ class AccountantDashboard(QWidget):
         widget = self._mount_page(key, self._create_page(key))
         self._page_indices[key] = self._stack.addWidget(widget)
         self._pages[key] = widget
+        self._maybe_wire_skipped_badge(key, widget)
         return widget
 
     def _activate_page(self, key: str) -> QWidget:
@@ -414,6 +453,7 @@ class AccountantDashboard(QWidget):
                     else:
                         self._page_indices[k] = self._stack.addWidget(widget)
                     self._pages[k] = widget
+                    self._maybe_wire_skipped_badge(k, widget)
                 else:
                     widget = self._pages[k]
                 # Stale first-open must not steal the stack after the user left.
@@ -919,6 +959,73 @@ class AccountantDashboard(QWidget):
         else:
             self._schedule_day_issues_badge_refresh()
 
+    async def _refresh_skipped_sidebar_badges(self) -> None:
+        """Paint skipped-import counts on Separate Expenses / Fuel sidebar items."""
+        from tahmeed.services import accountant_service as svc
+
+        if not hasattr(self._sidebar, "set_skipped_badge"):
+            return
+        for sidebar_key, feed_keys in _SKIPPED_SIDEBAR_FEEDS:
+            total = 0
+            for feed_key in feed_keys:
+                try:
+                    total += int(await svc.count_skipped_import_rows(feed_key) or 0)
+                except Exception:
+                    continue
+            try:
+                self._sidebar.set_skipped_badge(sidebar_key, total)
+            except Exception:
+                pass
+
+    def _on_skipped_count_for_sidebar(self, sidebar_key: str, count: int) -> None:
+        if sidebar_key == "sm_burhani":
+            from tahmeed.ui.async_utils import schedule_coro
+            schedule_coro(self._refresh_skipped_sidebar_badges())
+            return
+        if hasattr(self._sidebar, "set_skipped_badge"):
+            self._sidebar.set_skipped_badge(sidebar_key, int(count or 0))
+
+    def _wire_skipped_sidebar_badge(
+        self, sidebar_key: str, widget: QWidget
+    ) -> None:
+        """Keep a sidebar badge in sync when that page’s Skipped tab changes."""
+        if getattr(widget, "_skipped_sidebar_wired", False):
+            # Still (re)bind if lazy Skipped tab was created later.
+            pass
+        else:
+            widget._skipped_sidebar_wired = True  # type: ignore[attr-defined]
+
+        skipped = getattr(widget, "_skipped", None)
+        if skipped is not None and not getattr(
+            skipped, "_sidebar_count_wired", False
+        ):
+            count_changed = getattr(skipped, "count_changed", None)
+            if count_changed is not None:
+                count_changed.connect(
+                    lambda n, key=sidebar_key: self._on_skipped_count_for_sidebar(
+                        key, n
+                    )
+                )
+                skipped._sidebar_count_wired = True  # type: ignore[attr-defined]
+
+        ensure = getattr(widget, "_ensure_skipped", None)
+        if callable(ensure) and not getattr(
+            widget, "_ensure_skipped_wrapped", False
+        ):
+            def _wrapped(
+                _ensure=ensure,
+                _widget=widget,
+                _key=sidebar_key,
+            ) -> None:
+                before = getattr(_widget, "_skipped", None)
+                _ensure()
+                after = getattr(_widget, "_skipped", None)
+                if after is not None and after is not before:
+                    self._wire_skipped_sidebar_badge(_key, _widget)
+
+            widget._ensure_skipped = _wrapped  # type: ignore[method-assign]
+            widget._ensure_skipped_wrapped = True  # type: ignore[attr-defined]
+
     async def _refresh_day_issues_badge(self) -> None:
         from datetime import date as _date
         from tahmeed.services.day_issues_service import count_day_issues
@@ -1252,7 +1359,7 @@ class AccountantDashboard(QWidget):
             self._notification_poll_in_flight = False
 
     def _on_nav(self, key: str) -> None:
-        from tahmeed.ui.async_utils import schedule_call
+        from tahmeed.ui.async_utils import schedule_call, schedule_coro
 
         previous = getattr(self, "_nav_key", None)
         self._nav_key = key
@@ -1262,6 +1369,9 @@ class AccountantDashboard(QWidget):
             and self._register is not None
         ):
             self._register.note_catalog_return()
+
+        if key in {k for k, _ in _SKIPPED_SIDEBAR_FEEDS} or key == "feeds_trash":
+            schedule_coro(self._refresh_skipped_sidebar_badges())
 
         if key == "overview":
             self._toast_loading("overview")
@@ -1502,7 +1612,9 @@ class AccountantDashboard(QWidget):
                     RPAScheduleWidget, BondsWidget,
                 )
                 raw = BondsWidget() if m == "bonds" else RPAScheduleWidget()
-                return self._mount_page(f"sm_burhani::{m}", raw)
+                host = self._mount_page(f"sm_burhani::{m}", raw)
+                self._maybe_wire_skipped_badge(f"sm_burhani::{m}", host)
+                return host
 
             self._nav_key = token
             self._open_dynamic_first(

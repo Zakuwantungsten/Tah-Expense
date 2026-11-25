@@ -68,6 +68,7 @@ class RegisterRibbonToolbar(QFrame):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setObjectName("registerRibbonToolbar")
+        self._dupes_scanning = False
         self.setFixedHeight(86)
         # Transparent so the page-level circuit flows through continuously.
         self.setAttribute(Qt.WA_StyledBackground, False)
@@ -810,7 +811,10 @@ class RegisterRibbonToolbar(QFrame):
         self._btn_submit.setEnabled(not busy)
         self._btn_import.setEnabled(not busy)
         self._btn_edit.setEnabled(not busy)
-        self._btn_scan_dups.setEnabled(not busy)
+        # Dupes keeps its own scanning label via set_dupes_scanning; still disable
+        # when any mutation is busy unless that scan owns the busy state.
+        if not getattr(self, "_dupes_scanning", False):
+            self._btn_scan_dups.setEnabled(not busy)
         if busy:
             self._btn_undo.setEnabled(False)
             self._btn_redo.setEnabled(False)
@@ -820,6 +824,25 @@ class RegisterRibbonToolbar(QFrame):
             self._btn_discard_skipped.setEnabled(False)
         else:
             self._refresh_parked_actions()
+        if self._narrow:
+            self._apply_narrow(True)
+
+    def set_dupes_scanning(self, busy: bool) -> None:
+        """Show Scanning… on the Dupes ribbon control while soft-dup runs."""
+        self._dupes_scanning = bool(busy)
+        btn = self._btn_scan_dups
+        if busy:
+            btn.setEnabled(False)
+            btn.setText("Scanning…")
+            btn.setToolTip("Scanning this day for possible duplicates…")
+            btn._ribbon_icon = "mdi.loading"  # type: ignore[attr-defined]
+            self._apply_icon(btn, enabled=False)
+        else:
+            btn.setText("Dupes")
+            btn.setToolTip("Scan / rescan possible duplicates for this day")
+            btn._ribbon_icon = "mdi.content-duplicate"  # type: ignore[attr-defined]
+            self._apply_icon(btn, enabled=True)
+            btn.setEnabled(True)
         if self._narrow:
             self._apply_narrow(True)
 

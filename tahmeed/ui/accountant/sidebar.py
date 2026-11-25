@@ -68,25 +68,25 @@ _SECTIONS: list[tuple[Optional[str], list[tuple]]] = [
     # is rendered statically; the rows below it are built by _load_items().
     ("ITEMS", []),
     ("SEPARATE EXPENSES", [
-        ("toll_plaza",      "Toll Plaza",           "mdi.boom-gate",         {}),
-        ("parking_congo",   "Parking Congo",        "mdi.parking",           {}),
-        ("congo_exp",       "Congo Expenses",       "mdi.map-marker",        {}),
-        ("ahmed_kimvi",     "Ahmed Kimvi (Klesa)",  "mdi.account-cash",      {}),
-        ("zambia_parking",  "Zambia Parking",       "mdi.map",               {}),
-        ("afritrack",       "Afritrack",            "mdi.satellite-variant", {}),
-        ("third_party",     "Third Party Covers",   "mdi.shield-account",    {}),
-        ("comesa",          "COMESA Covers",        "mdi.certificate",       {}),
-        ("sm_burhani",      "SM Burhani",           "mdi.scale-balance",     {}),
-        ("rahntech",        "RahnTech",             "mdi.devices",           {}),
+        ("toll_plaza",      "Toll Plaza",           "mdi.boom-gate",         {"badge": True}),
+        ("parking_congo",   "Parking Congo",        "mdi.parking",           {"badge": True}),
+        ("congo_exp",       "Congo Expenses",       "mdi.map-marker",        {"badge": True}),
+        ("ahmed_kimvi",     "Ahmed Kimvi (Klesa)",  "mdi.account-cash",      {"badge": True}),
+        ("zambia_parking",  "Zambia Parking",       "mdi.map",               {"badge": True}),
+        ("afritrack",       "Afritrack",            "mdi.satellite-variant", {"badge": True}),
+        ("third_party",     "Third Party Covers",   "mdi.shield-account",    {"badge": True}),
+        ("comesa",          "COMESA Covers",        "mdi.certificate",       {"badge": True}),
+        ("sm_burhani",      "SM Burhani",           "mdi.scale-balance",     {"badge": True}),
+        ("rahntech",        "RahnTech",             "mdi.devices",           {"badge": True}),
         ("feeds_trash",     "Uploads Trash",        "mdi.delete-outline",    {}),
     ]),
     ("FUEL CONSUMPTION", [
         ("fuel_overview",   "Fuel Overview", "mdi.chart-box-outline", {}),
         ("diesel_cash",     "Diesel Cash",   "mdi.gas-station-outline", {}),
-        ("infinity",        "Infinity",      "mdi.gas-station",  {}),
-        ("lake_zambia",     "Lake Zambia",   "mdi.water-pump",   {}),
-        ("lake_tunduma",    "Lake Tunduma",  "mdi.water-pump",   {}),
-        ("gbp_diesel",      "GBP Diesel",    "mdi.fuel",         {}),
+        ("infinity",        "Infinity",      "mdi.gas-station",  {"badge": True}),
+        ("lake_zambia",     "Lake Zambia",   "mdi.water-pump",   {"badge": True}),
+        ("lake_tunduma",    "Lake Tunduma",  "mdi.water-pump",   {"badge": True}),
+        ("gbp_diesel",      "GBP Diesel",    "mdi.fuel",         {"badge": True}),
     ]),
     ("MANAGE", [
         ("manage_categories", "Items",             "mdi.tag-multiple-outline", {}),
@@ -758,6 +758,12 @@ class SidebarWidget(QFrame):
             item = self._items.get(key)
             if item is not None:
                 item.set_badge(n)
+
+    def set_skipped_badge(self, key: str, count: int) -> None:
+        """Skipped-import attention count on a Separate Expenses / Fuel nav item."""
+        item = self._items.get(key)
+        if item is not None:
+            item.set_badge(count)
 
     # ── Internal: top-level nav ────────────────────────────────────────────
 

@@ -29,9 +29,11 @@ from tahmeed.services.cashier_service import (
 from tahmeed.ui.dialogs.duplicate_review_dialog import DuplicateReviewDialog
 from tahmeed.services.duplicate_review import (
     DuplicateReviewItem,
+    clamp_lookback_days,
     effective_lookback_days,
     format_amount_label,
     format_new_date,
+    merge_lookback_labels,
     normalize_lookback_overrides,
 )
 from tahmeed.ui.widgets.truck_autocomplete import TruckLineEdit
@@ -927,7 +929,9 @@ class EntryForm(QWidget):
 
         # ── Duplicate check ───────────────────────────────────────────────
         try:
-            dup_days = int(await get_setting("duplicate_check_days") or 5)
+            dup_days = clamp_lookback_days(
+                int(await get_setting("duplicate_check_days") or 5)
+            )
         except Exception:
             dup_days = 5
         try:
@@ -954,6 +958,7 @@ class EntryForm(QWidget):
             )
             if dlg is not None:
                 dlg.show_rescan_busy("Rescanning duplicates…")
+            scan_failed = False
             try:
                 dupes = await check_for_duplicates(
                     truck_number=truck_number,
@@ -963,11 +968,23 @@ class EntryForm(QWidget):
                     days=eff_days,
                     date=tx_date,
                 )
-            except Exception:
+            except Exception as exc:
+                scan_failed = True
                 dupes = []
+                detail = str(exc).strip() or exc.__class__.__name__
+                QMessageBox.warning(
+                    self,
+                    "Duplicate check failed",
+                    f"Could not check duplicates ({detail}). Save cancelled.",
+                )
             finally:
                 if dlg is not None:
                     dlg.hide_rescan_busy()
+
+            if scan_failed:
+                if dlg is not None:
+                    dlg.reject()
+                return
 
             if not dupes:
                 if dlg is not None:
@@ -992,6 +1009,8 @@ class EntryForm(QWidget):
                 existing=dupes[0],
                 date_label=format_new_date(tx_date),
             )
+            cat_items = merge_lookback_labels([item_text], kind="item")
+            cat_descs = merge_lookback_labels([description], kind="description")
             if dlg is None:
                 dlg = DuplicateReviewDialog(
                     [item],
@@ -1002,6 +1021,8 @@ class EntryForm(QWidget):
                     lookback_unit=lookback_unit,
                     allow_rescan=True,
                     lookback_overrides=lookback_overrides,
+                    lookback_item_labels=cat_items,
+                    lookback_description_labels=cat_descs,
                 )
             else:
                 dlg.apply_fresh_scan(
@@ -1011,6 +1032,8 @@ class EntryForm(QWidget):
                     lookback_value=lookback_value,
                     lookback_unit=lookback_unit,
                     lookback_overrides=lookback_overrides,
+                    lookback_item_labels=cat_items,
+                    lookback_description_labels=cat_descs,
                 )
 
             code = dlg.exec()
@@ -1022,6 +1045,7 @@ class EntryForm(QWidget):
                     )
                 except Exception:
                     pass
+                dlg.acknowledge_lookback_overrides_persisted()
             if dlg.is_rescan_result(code):
                 dup_days = int(dlg.requested_rescan_days() or dup_days)
                 lookback_unit = dlg.lookback_unit()
