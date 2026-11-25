@@ -20,6 +20,7 @@ from app.receipt_ops import (
     list_inbox_files,
     manual_link_files,
     reject_if_needed_receipts,
+    still_request_linked_entries,
     store_receipt_file_bytes,
 )
 
@@ -421,3 +422,167 @@ async def test_verify_still_blocks_needed() -> None:
     )
     with pytest.raises(ValueError, match="still need a receipt"):
         await reject_if_needed_receipts(db, [tx_id])
+
+
+async def test_inbox_lists_linked_entry_summaries(tmp_path: Path) -> None:
+    tx_a = ObjectId()
+    tx_b = ObjectId()
+    file_id = "inbox-link-1"
+    db = _db(
+        transactions=[
+            {
+                "_id": tx_a,
+                "date": datetime(2026, 3, 10),
+                "amount": 1000,
+                "currency": "TZS",
+                "item": "DIESEL",
+                "payee": "SHELL",
+                "ownership": "SAADA",
+                "attachments": [],
+                "receipt_status": "pending",
+            },
+            {
+                "_id": tx_b,
+                "date": datetime(2026, 3, 11),
+                "amount": 2000,
+                "currency": "TZS",
+                "item": "PARKING",
+                "payee": "CITY",
+                "ownership": "SAADA",
+                "attachments": [],
+                "receipt_status": "pending",
+            },
+        ],
+        requests=[
+            {
+                "_id": ObjectId(),
+                "transaction_id": tx_a,
+                "status": "needed",
+                "asked_of_name": "SAADA",
+            },
+            {
+                "_id": ObjectId(),
+                "transaction_id": tx_b,
+                "status": "needed",
+                "asked_of_name": "SAADA",
+            },
+        ],
+        files=[
+            {
+                "_id": file_id,
+                "original_filename": "multi.pdf",
+                "inbox_status": INBOX_MATCHED,
+                "uploaded_at": datetime(2026, 3, 12),
+                "size": 10,
+                "source": "desk",
+                "transaction_ids": [tx_a, tx_b],
+            }
+        ],
+    )
+    inbox = await list_inbox_files(db, status="matched")
+    assert len(inbox) == 1
+    row = inbox[0]
+    assert row["linked_count"] == 2
+    assert {e["id"] for e in row["linked_entries"]} == {str(tx_a), str(tx_b)}
+    assert {e["item"] for e in row["linked_entries"]} == {"DIESEL", "PARKING"}
+    assert len(row["request_ids"]) == 2
+
+
+async def test_still_request_then_approve_completes_other(
+    tmp_path: Path,
+) -> None:
+    ensure_receipt_workspace(tmp_path)
+    tx_keep = ObjectId()
+    tx_carve = ObjectId()
+    db = _db(
+        transactions=[
+            {
+                "_id": tx_keep,
+                "date": datetime(2026, 4, 1),
+                "amount": 5000,
+                "currency": "TZS",
+                "item": "FUEL",
+                "payee": "P1",
+                "ownership": "ALI",
+                "attachments": [],
+                "receipt_status": "pending",
+            },
+            {
+                "_id": tx_carve,
+                "date": datetime(2026, 4, 2),
+                "amount": 8000,
+                "currency": "TZS",
+                "item": "TOLL",
+                "payee": "P2",
+                "ownership": "ALI",
+                "attachments": [],
+                "receipt_status": "pending",
+            },
+        ],
+        requests=[
+            {
+                "_id": ObjectId(),
+                "transaction_id": tx_keep,
+                "status": "needed",
+                "asked_of_name": "ALI",
+                "file_ids": [],
+            },
+            {
+                "_id": ObjectId(),
+                "transaction_id": tx_carve,
+                "status": "needed",
+                "asked_of_name": "ALI",
+                "file_ids": [],
+            },
+        ],
+    )
+    meta = await store_receipt_file_bytes(
+        db,
+        tmp_path,
+        filename="cover.pdf",
+        content=PDF,
+        source="desk",
+    )
+    file_id = meta["id"]
+    await manual_link_files(
+        db,
+        file_ids=[file_id],
+        transaction_ids=[tx_keep, tx_carve],
+        actor_id=None,
+        partial=True,
+        partial_note="shared slip",
+        attachments_dir=tmp_path,
+    )
+
+    carved = await still_request_linked_entries(
+        db,
+        file_id=file_id,
+        transaction_ids=[tx_carve],
+        note="Wrong slip for toll",
+        actor={"_id": ObjectId()},
+        notify=False,
+    )
+    assert carved["reopened"] == 1
+    carve_req = next(
+        r for r in db.receipt_requests.documents if r["transaction_id"] == tx_carve
+    )
+    assert carve_req["status"] == "needed"
+    assert carve_req.get("still_request") is True
+
+    result = await approve_receipt_files(
+        db, tmp_path, file_ids=[file_id], actor_id=None
+    )
+    assert result["updated"] == 1
+    assert result["completed_transactions"] == 1
+    by_tx = {t["_id"]: t for t in db.transactions.documents}
+    assert by_tx[tx_keep]["receipt_status"] == "received"
+    assert by_tx[tx_carve]["receipt_status"] == "partial"
+    keep_req = next(
+        r for r in db.receipt_requests.documents if r["transaction_id"] == tx_keep
+    )
+    # Re-fetch carve request after approve
+    carve_req = next(
+        r for r in db.receipt_requests.documents if r["transaction_id"] == tx_carve
+    )
+    assert keep_req["status"] == "received"
+    assert carve_req["status"] == "needed"

@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QToolButton, QSizePolicy, QSpacerItem,
     QMessageBox, QMenu,
 )
-from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtCore import Qt, Signal, QSize, QTimer
 from PySide6.QtGui import QIcon
 from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
@@ -717,7 +717,10 @@ class SidebarWidget(QFrame):
             sep.setVisible(not self._collapsed)
         # Hide sub-table strips while collapsed; restore expanded ones after.
         for key, child in self._child_containers.items():
-            child.setVisible(not self._collapsed and key in self._expanded)
+            if self._collapsed or key not in self._expanded:
+                child.setVisible(False)
+            else:
+                self._reveal_child_strip(key)
         if self._collapsed:
             self._collapse_btn.setText("")
             self._collapse_btn.setIcon(_qta("mdi.chevron-right", color=_MUTED))
@@ -769,10 +772,13 @@ class SidebarWidget(QFrame):
 
     def _on_item_clicked(self, key: str) -> None:
         if key in _FIXED_CHILDREN:
-            self.select(key)
+            # Expand + paint the child strip on this tick; open the page on the
+            # next tick so Receipts/Records rows don't freeze mid-layout while
+            # the heavy page __init__ runs.
+            self._clear_active()
             if key not in self._expanded:
                 self._on_toggle(key)
-            self._activate_first_fixed_child(key)
+            QTimer.singleShot(0, lambda k=key: self.activate_fixed_child(k))
             return
         self.select(key)
         self.nav_selected.emit(key)
@@ -784,6 +790,24 @@ class SidebarWidget(QFrame):
 
     # ── Internal: expand / collapse ────────────────────────────────────────
 
+    def _reveal_child_strip(self, key: str) -> None:
+        """Show the sub-item strip with a finished layout (not a half-height bar)."""
+        child = self._child_containers[key]
+        lay = child.layout()
+        if lay is not None:
+            lay.activate()
+        # Fixed children are known up front — lock height so a later UI freeze
+        # during page open cannot leave the strip looking mid-open / merged.
+        if key in _FIXED_CHILDREN:
+            n = len(_FIXED_CHILDREN[key])
+            child.setMinimumHeight(max(0, n * 30))
+            child.setMaximumHeight(16777215)
+        child.setVisible(True)
+        child.updateGeometry()
+        if lay is not None:
+            lay.activate()
+        child.repaint()
+
     def _on_toggle(self, key: str) -> None:
         if self._collapsed or key not in self._child_containers:
             return
@@ -794,7 +818,7 @@ class SidebarWidget(QFrame):
         else:
             self._expanded.add(key)
             self._items[key].set_expanded(True)
-            self._child_containers[key].setVisible(True)
+            self._reveal_child_strip(key)
             if key not in self._loaded:
                 asyncio.ensure_future(self._load_children(key))
 
@@ -823,7 +847,8 @@ class SidebarWidget(QFrame):
                 w.deleteLater()
 
         parent_category = self._items[key]._text_lbl.text()
-        for name, match, icon_name in _FIXED_CHILDREN[key]:
+        rows = _FIXED_CHILDREN[key]
+        for name, match, icon_name in rows:
             row = _SubNavItem(
                 parent_key=key,
                 parent_category=parent_category,
@@ -835,22 +860,43 @@ class SidebarWidget(QFrame):
             row.activated.connect(self._on_subitem_clicked)
             layout.addWidget(row)
 
+        # Pre-size so the first expand never paints a zero/partial-height strip.
+        container.setMinimumHeight(len(rows) * 30)
+
         if key in self._items:
             self._items[key].set_has_subtables(True)
 
-    def _activate_first_fixed_child(self, key: str) -> None:
-        """Select the first fixed sub-item under a parent like SM Burhani."""
-        container = self._child_containers.get(key)
+    def activate_fixed_child(self, parent_key: str, match: str = "") -> None:
+        """Expand parent if needed and activate a fixed child (emits nav).
+
+        ``match`` empty → first child (Paperwork → Receipts, SM Burhani → RPA).
+        Safe to call after a deferred tick; no-ops if the strip was collapsed.
+        """
+        if parent_key not in _FIXED_CHILDREN or self._collapsed:
+            return
+        if parent_key not in self._expanded:
+            self._on_toggle(parent_key)
+        if parent_key not in self._expanded:
+            return
+        container = self._child_containers.get(parent_key)
         if container is None:
             return
         layout = container.layout()
         if layout is None:
             return
+        want = (match or "").strip().lower()
+        first: Optional[_SubNavItem] = None
         for i in range(layout.count()):
             w = layout.itemAt(i).widget()
-            if isinstance(w, _SubNavItem) and not w.is_add:
+            if not isinstance(w, _SubNavItem) or w.is_add:
+                continue
+            if first is None:
+                first = w
+            if want and (w.match or w.name or "").strip().lower() == want:
                 self._on_subitem_clicked(w)
                 return
+        if first is not None and not want:
+            self._on_subitem_clicked(first)
 
     def _rebuild_children(self, key: str, subs) -> None:
         container = self._child_containers[key]

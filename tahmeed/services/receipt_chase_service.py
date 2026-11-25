@@ -16,18 +16,22 @@ async def list_requests(
     *,
     preset: str = "open",
     ownership: str = "",
+    q: str = "",
     overdue_hours: float = 48.0,
     reminder_threshold: int = 3,
 ) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {
+        "preset": preset,
+        "overdue_hours": overdue_hours,
+        "reminder_threshold": reminder_threshold,
+    }
+    needle = (q or ownership or "").strip()
+    if needle:
+        params["q"] = needle
     payload = await api_client.request(
         "GET",
         "v1/receipts/requests",
-        params={
-            "preset": preset,
-            "ownership": ownership,
-            "overdue_hours": overdue_hours,
-            "reminder_threshold": reminder_threshold,
-        },
+        params=params,
     )
     return list(payload.get("items") or [])
 
@@ -208,6 +212,25 @@ async def reject_files(file_ids: list[str], reason: str) -> dict[str, Any]:
     )
 
 
+async def still_request_linked_entries(
+    file_id: str,
+    transaction_ids: list[str],
+    *,
+    note: str,
+    notify: bool = True,
+) -> dict[str, Any]:
+    """Carve out linked row(s): reopen chase + optional re-notify."""
+    return await api_client.request(
+        "POST",
+        f"v1/receipts/files/{file_id}/still-request",
+        json={
+            "transaction_ids": list(transaction_ids),
+            "note": note,
+            "notify": bool(notify),
+        },
+    )
+
+
 async def search_link_candidates(
     *,
     ownership: str = "",
@@ -249,28 +272,71 @@ async def link_files(
     )
 
 
-async def upload_parked_files(paths: list[str]) -> dict[str, Any]:
-    """Multipart early drop into parked inbox (no request/tx)."""
+def _multipart_files(paths: list[str]) -> tuple[list[Any], list[Any]]:
+    """Open local paths as httpx multipart ``files``; caller must close handles."""
     import mimetypes
     from pathlib import Path
 
-    files = []
-    handles = []
+    files: list[Any] = []
+    handles: list[Any] = []
+    for raw in paths:
+        path = Path(raw)
+        if not path.is_file():
+            continue
+        handle = path.open("rb")
+        handles.append(handle)
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        files.append(("files", (path.name, handle, mime)))
+    return files, handles
+
+
+async def upload_parked_files(paths: list[str]) -> dict[str, Any]:
+    """Multipart early drop into parked inbox (no request/tx). Atomic on server."""
+    import httpx
+
+    files, handles = _multipart_files(paths)
     try:
-        for raw in paths:
-            path = Path(raw)
-            if not path.is_file():
-                continue
-            handle = path.open("rb")
-            handles.append(handle)
-            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            files.append(("files", (path.name, handle, mime)))
         if not files:
             raise ValueError("No readable files selected")
         return await api_client.request(
             "POST",
             "v1/receipts/files/upload",
             files=files,
+            timeout=httpx.Timeout(120.0, connect=5.0),
+        )
+    finally:
+        for handle in handles:
+            handle.close()
+
+
+async def upload_and_link_files(
+    paths: list[str],
+    transaction_ids: list[str],
+    *,
+    partial: bool = False,
+    partial_note: str = "",
+) -> dict[str, Any]:
+    """Atomic park + link (server rolls back parked files if link fails)."""
+    import json
+    import httpx
+
+    files, handles = _multipart_files(paths)
+    try:
+        if not files:
+            raise ValueError("No readable files selected")
+        tx_ids = [str(t).strip() for t in transaction_ids if str(t).strip()]
+        if not tx_ids:
+            raise ValueError("No transactions selected")
+        return await api_client.request(
+            "POST",
+            "v1/receipts/upload-and-link",
+            files=files,
+            data={
+                "transaction_ids": json.dumps(tx_ids),
+                "partial": "true" if partial else "false",
+                "partial_note": partial_note or "",
+            },
+            timeout=httpx.Timeout(120.0, connect=5.0),
         )
     finally:
         for handle in handles:
@@ -286,6 +352,24 @@ async def mark_reminded(
         json={"ownership": ownership, "request_ids": list(request_ids or [])},
     )
     return int(payload.get("updated") or 0)
+
+
+async def waive_receipts(
+    *,
+    reason: str,
+    request_ids: list[str] | None = None,
+    transaction_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Desk waive — accept no receipt / lost for selected entries or requests."""
+    return await api_client.request(
+        "POST",
+        "v1/receipts/waive",
+        json={
+            "reason": reason,
+            "request_ids": list(request_ids or []),
+            "transaction_ids": list(transaction_ids or []),
+        },
+    )
 
 
 def _pack_item_list(item: str = "", items: list[str] | None = None) -> list[str]:

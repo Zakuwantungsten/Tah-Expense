@@ -260,8 +260,9 @@ class ExcelColumnFilterPopup(QFrame):
         self._select_all.setCheckState(Qt.Unchecked)
         self._select_all.blockSignals(False)
 
-    def _on_select_all(self, state: int) -> None:
-        checked = state == Qt.Checked or state == int(Qt.Checked)
+    def _on_select_all(self, state: object) -> None:
+        # PySide6 may emit CheckState; int(Qt.Checked) raises TypeError.
+        checked = state == Qt.Checked or state == getattr(Qt.Checked, "value", 2)
         self._list.blockSignals(True)
         for i in range(self._list.count()):
             self._list.item(i).setCheckState(

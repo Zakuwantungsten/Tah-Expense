@@ -13,6 +13,10 @@ _GREEN = "#059669"
 _GREEN_BORDER = "#A7F3D0"
 _GREEN_BG = "#ECFDF5"
 _GREEN_TEXT = "#065F46"
+_RED = "#DC2626"
+_RED_BORDER = "#FECACA"
+_RED_BG = "#FEF2F2"
+_RED_TEXT = "#991B1B"
 _TEXT = "#111827"
 _MUTED = "#6B7280"
 _DOT_MS = 380
@@ -47,7 +51,7 @@ class NavToast(QFrame):
         self._base = "Working"
         self._dot_index = 0
         self._generation = 0
-        self._kind = "busy"  # busy | success
+        self._kind = "busy"  # busy | success | error
         self._animate_dots = True
         self._accent = _BLUE
 
@@ -107,25 +111,54 @@ class NavToast(QFrame):
 
     def show_success(self, message: str, *, ms: int = 4500) -> None:
         """Green status toast (replaces the Table-page inline success pill)."""
-        text = (message or "").strip() or "Done"
-        self._kind = "success"
+        self._show_result(
+            (message or "").strip() or "Done",
+            kind="success",
+            accent=_GREEN,
+            label_color=_GREEN_TEXT,
+            glyph="✓",
+            ms=ms,
+        )
+
+    def show_error(self, message: str, *, ms: int = 6500) -> None:
+        """Red failure toast."""
+        self._show_result(
+            (message or "").strip() or "Failed",
+            kind="error",
+            accent=_RED,
+            label_color=_RED_TEXT,
+            glyph="!",
+            ms=ms,
+        )
+
+    def _show_result(
+        self,
+        message: str,
+        *,
+        kind: str,
+        accent: str,
+        label_color: str,
+        glyph: str,
+        ms: int,
+    ) -> None:
+        self._kind = kind
         self._animate_dots = False
-        self._accent = _GREEN
+        self._accent = accent
         self._apply_chrome()
-        self._pulse.setText("✓")
+        self._pulse.setText(glyph)
         self._pulse.setStyleSheet(
-            f"color: {_GREEN}; font-size: 12px; font-weight: 700;"
+            f"color: {accent}; font-size: 12px; font-weight: 700;"
             " background: transparent; border: none;"
         )
         self._label.setStyleSheet(
-            f"color: {_GREEN_TEXT}; font-size: 12px; font-weight: 600;"
+            f"color: {label_color}; font-size: 12px; font-weight: 600;"
             " font-family:'Segoe UI'; background: transparent; border: none;"
         )
         self._generation += 1
         gen = self._generation
-        self._base = text
+        self._base = message
         self._dot_index = 0
-        self._label.setText(text)
+        self._label.setText(message)
         self._reposition()
         self.show()
         self.raise_()
@@ -165,21 +198,18 @@ class NavToast(QFrame):
 
     def _apply_chrome(self) -> None:
         if self._kind == "success":
-            self.setStyleSheet(
-                "QFrame#navToast {"
-                f"  background: {_GREEN_BG};"
-                f"  border: 1px solid {_GREEN_BORDER};"
-                "  border-radius: 10px;"
-                "}"
-            )
+            bg, border = _GREEN_BG, _GREEN_BORDER
+        elif self._kind == "error":
+            bg, border = _RED_BG, _RED_BORDER
         else:
-            self.setStyleSheet(
-                "QFrame#navToast {"
-                "  background: #FFFFFF;"
-                "  border: 1px solid #DBE4EE;"
-                "  border-radius: 10px;"
-                "}"
-            )
+            bg, border = "#FFFFFF", "#DBE4EE"
+        self.setStyleSheet(
+            "QFrame#navToast {"
+            f"  background: {bg};"
+            f"  border: 1px solid {border};"
+            "  border-radius: 10px;"
+            "}"
+        )
 
     def _show(self, base: str, *, sticky: bool, ms: int = 2500) -> None:
         self._kind = "busy"
@@ -231,7 +261,7 @@ class NavToast(QFrame):
         self._label.setText(f"{self._base}{_DOT_CYCLE[self._dot_index]}")
 
     def _tick_pulse(self) -> None:
-        if self._kind == "success":
+        if self._kind in {"success", "error"}:
             return
         self._pulse_phase = (self._pulse_phase + 1) % 20
         # Soft brightness pulse on the blue dot (stylesheet only — no opacity effect).

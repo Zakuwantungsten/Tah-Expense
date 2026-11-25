@@ -778,10 +778,9 @@ def _register_dt(primary: Optional[date]) -> Optional[datetime]:
 
 
 def _ref_float_from_notes(notes: str) -> str:
-    low = (notes or "").strip().lower()
-    if "refund" in low and "float" in low:
-        return "REFUND TO FLOAT"
-    return (notes or "").strip().upper()
+    from tahmeed.services.ref_float import canonical_ref_float
+
+    return canonical_ref_float(notes or "")
 
 
 def staged_row_payload(row: DailyImportRow, preview: DailyImportPreview) -> dict:

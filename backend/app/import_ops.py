@@ -20,6 +20,7 @@ from pymongo.errors import BulkWriteError
 from .accountant_master_ops import stamp_truck_sort_key
 from .accountant_ops import append_text_filters
 from .batch_lock import serialized_batch
+from .ref_float import is_refund_float
 
 _MONTH_LABELS = [
     "",
@@ -155,7 +156,7 @@ def verified_doc_from_daily_payload(
         "do_number": (payload.get("do_number") or "").upper(),
         "memo": (payload.get("memo") or "").strip(),
         "receipt_status": payload.get("receipt_status") or "",
-        "notes_flag": ref_float == "REFUND TO FLOAT",
+        "notes_flag": is_refund_float(ref_float),
         "ref_float": ref_float,
         "ownership": (payload.get("ownership") or "").upper(),
         "approver": (payload.get("approver") or "").upper(),

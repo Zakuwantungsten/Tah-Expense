@@ -10,6 +10,7 @@ from typing import Any, Sequence
 
 from bson import ObjectId
 
+from .ref_float import is_refund_float
 from .transaction_ops import normalize_multi_filter
 
 MASTER_SORT_ALLOWED = frozenset(
@@ -562,7 +563,7 @@ def prepare_master_updates(updates: dict[str, Any]) -> dict[str, Any]:
     if "ref_float" in clean:
         ref = (clean.get("ref_float") or "").strip()
         clean["ref_float"] = ref
-        clean["notes_flag"] = ref.upper() == "REFUND TO FLOAT"
+        clean["notes_flag"] = is_refund_float(ref)
 
     if "receipt_status" in clean:
         clean["receipt_status"] = normalize_master_receipt(

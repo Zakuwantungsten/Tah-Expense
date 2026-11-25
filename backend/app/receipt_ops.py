@@ -651,6 +651,93 @@ async def waive_receipt_request(
     return await db.receipt_requests.find_one({"_id": request_doc["_id"]})
 
 
+async def desk_waive_receipts(
+    db: Any,
+    *,
+    reason: str,
+    actor: dict[str, Any] | None,
+    request_ids: list[ObjectId] | None = None,
+    transaction_ids: list[ObjectId] | None = None,
+) -> dict[str, Any]:
+    """Desk bulk waive — by request id and/or transaction id (creates stub if needed)."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("A waiver reason is required")
+    req_ids = list(request_ids or [])
+    tx_ids = list(transaction_ids or [])
+    if not req_ids and not tx_ids:
+        raise ValueError("Select at least one entry or receipt request")
+
+    seen: set[ObjectId] = set()
+    docs: list[dict[str, Any]] = []
+
+    for rid in req_ids:
+        if not isinstance(rid, ObjectId) or rid in seen:
+            continue
+        doc = await db.receipt_requests.find_one({"_id": rid})
+        if not doc:
+            continue
+        seen.add(rid)
+        docs.append(doc)
+
+    for tid in tx_ids:
+        if not isinstance(tid, ObjectId):
+            continue
+        existing = await db.receipt_requests.find_one({"transaction_id": tid})
+        if existing:
+            oid = existing.get("_id")
+            if isinstance(oid, ObjectId) and oid not in seen:
+                seen.add(oid)
+                docs.append(existing)
+            continue
+        tx = await db.transactions.find_one({"_id": tid})
+        if not tx:
+            continue
+        now = utcnow()
+        ownership = normalize_person_name(str(tx.get("ownership") or ""))
+        stub: dict[str, Any] = {
+            "transaction_id": tid,
+            "asked_of_name": ownership,
+            "asked_of_person_id": None,
+            "status": "needed",
+            "opened_at": now,
+            "updated_at": now,
+            "last_reminded_at": None,
+            "reminder_count": 0,
+            "initial_notified_at": None,
+            "immediate_notify_pending": False,
+            "waiver_reason": None,
+            "waived_by": None,
+            "waived_at": None,
+            "file_ids": [],
+        }
+        result = await db.receipt_requests.insert_one(stub)
+        stub["_id"] = result.inserted_id
+        seen.add(result.inserted_id)
+        docs.append(stub)
+
+    waived = 0
+    skipped = 0
+    waived_ids: list[str] = []
+    for doc in docs:
+        status = str(doc.get("status") or "").strip().lower()
+        if status in ("waived", "received"):
+            skipped += 1
+            continue
+        updated = await waive_receipt_request(
+            db, doc, reason=reason, actor=actor
+        )
+        waived += 1
+        if updated and updated.get("_id") is not None:
+            waived_ids.append(str(updated["_id"]))
+
+    return {
+        "waived": waived,
+        "skipped": skipped,
+        "request_ids": waived_ids,
+    }
+
+
 async def ownership_targets_for_user(db: Any, user: dict[str, Any]) -> dict[str, Any]:
     """Names / person ids whose open requests this login may see."""
     user_id = user.get("_id")
@@ -1074,9 +1161,93 @@ async def _tx_lookup(db: Any, tx_ids: list[ObjectId]) -> dict[ObjectId, dict[str
             "payee": 1,
             "ownership": 1,
             "receipt_status": 1,
+            "receipt_partial_note": 1,
+            "truck_number": 1,
+            "description": 1,
+            "approver": 1,
+            "attachments": 1,
+            "cashier_id": 1,
         },
     ).to_list(length=None)
     return {doc["_id"]: doc for doc in docs if isinstance(doc.get("_id"), ObjectId)}
+
+
+def _compact_linked_entry(row: dict[str, Any]) -> dict[str, Any]:
+    """Inbox / file coverage summary — subset of serialize_receipt_entry_row."""
+    return {
+        "id": row.get("id"),
+        "date": row.get("date"),
+        "amount": row.get("amount"),
+        "currency": row.get("currency"),
+        "item": row.get("item") or "",
+        "payee": row.get("payee") or "",
+        "ownership": row.get("ownership") or "",
+        "truck_number": row.get("truck_number") or "",
+        "description": row.get("description") or "",
+        "receipt_status": row.get("receipt_status"),
+        "request_id": row.get("request_id"),
+        "request_status": row.get("request_status"),
+        "display_status": row.get("display_status"),
+        "display_status_key": row.get("display_status_key"),
+        "partial": bool(row.get("partial")),
+        "partial_note": row.get("partial_note") or "",
+    }
+
+
+async def _linked_entry_summaries_for_files(
+    db: Any, docs: list[dict[str, Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    """Map receipt file id → compact linked entry rows."""
+    all_tx: list[ObjectId] = []
+    file_tx: dict[str, list[ObjectId]] = {}
+    for doc in docs:
+        fid = str(doc.get("_id") or "")
+        if not fid:
+            continue
+        oids = _tx_oids_from_file(doc)
+        file_tx[fid] = oids
+        all_tx.extend(oids)
+    seen: set[ObjectId] = set()
+    uniq: list[ObjectId] = []
+    for oid in all_tx:
+        if oid not in seen:
+            seen.add(oid)
+            uniq.append(oid)
+    if not uniq:
+        return {fid: [] for fid in file_tx}
+    tx_map = await _tx_lookup(db, uniq)
+    req_map = await _requests_by_transaction_ids(db, uniq)
+    out: dict[str, list[dict[str, Any]]] = {}
+    for fid, oids in file_tx.items():
+        entries: list[dict[str, Any]] = []
+        for oid in oids:
+            tx = tx_map.get(oid)
+            if not tx:
+                entries.append(
+                    {
+                        "id": str(oid),
+                        "date": None,
+                        "amount": None,
+                        "currency": "TZS",
+                        "item": "",
+                        "payee": "",
+                        "ownership": "",
+                        "truck_number": "",
+                        "description": "(missing row)",
+                        "receipt_status": None,
+                        "request_id": None,
+                        "request_status": None,
+                        "display_status": "—",
+                        "display_status_key": "",
+                        "partial": False,
+                        "partial_note": "",
+                    }
+                )
+                continue
+            full = serialize_receipt_entry_row(tx, req_map.get(oid))
+            entries.append(_compact_linked_entry(full))
+        out[fid] = entries
+    return out
 
 
 def _serialize_request_row(
@@ -1102,10 +1273,35 @@ def _serialize_request_row(
         "currency": (tx or {}).get("currency") or "TZS",
         "item": (tx or {}).get("item") or (tx or {}).get("category_name") or "",
         "payee": (tx or {}).get("payee") or "",
+        "truck_number": str((tx or {}).get("truck_number") or "").strip(),
+        "description": str((tx or {}).get("description") or ""),
+        "approver": str((tx or {}).get("approver") or "").strip(),
         "date": (tx or {}).get("date"),
         "receipt_status": (tx or {}).get("receipt_status") or "",
         "waiver_reason": row.get("waiver_reason") or "",
     }
+
+
+def _request_row_matches_query(item: dict[str, Any], needle: str) -> bool:
+    """Case-insensitive substring match across request + linked entry fields."""
+    q = (needle or "").strip().lower()
+    if not q:
+        return True
+    hay = " ".join(
+        str(item.get(key) or "")
+        for key in (
+            "ownership",
+            "status",
+            "truck_number",
+            "description",
+            "item",
+            "approver",
+            "payee",
+            "amount",
+            "currency",
+        )
+    ).lower()
+    return q in hay
 
 
 async def list_receipt_requests(
@@ -1113,11 +1309,17 @@ async def list_receipt_requests(
     *,
     preset: str = "open",
     ownership: str = "",
+    q: str = "",
     overdue_hours: float = 48.0,
     reminder_threshold: int = 3,
     limit: int = 400,
 ) -> list[dict[str, Any]]:
-    """Desk request list with presets: today / open / overdue / received / waived / all."""
+    """Desk request list with presets: today / open / overdue / received / waived / all.
+
+    ``q`` matches ownership, truck, description, item, approved-by (approver), etc.
+    When ``q`` is set, the exact ``ownership`` Mongo filter is skipped so truck /
+    description hits are not limited to one owner.
+    """
     now = datetime.now(UTC)
     key = (preset or "open").strip().lower()
     query: dict[str, Any] = {}
@@ -1136,12 +1338,14 @@ async def list_receipt_requests(
         query["reminder_count"] = {"$gte": max(1, int(reminder_threshold))}
     # "all" → no status filter
 
+    needle = (q or "").strip()
     name = normalize_person_name(ownership)
-    if name:
+    if name and not needle:
         query["asked_of_name"] = name
 
-    cursor = db.receipt_requests.find(query).sort("opened_at", -1).limit(max(limit * 3, limit))
-    rows = await cursor.to_list(length=max(limit * 3, limit))
+    fetch_cap = max(limit * (10 if needle else 3), limit)
+    cursor = db.receipt_requests.find(query).sort("opened_at", -1).limit(fetch_cap)
+    rows = await cursor.to_list(length=fetch_cap)
     tx_ids = [
         row["transaction_id"]
         for row in rows
@@ -1154,6 +1358,8 @@ async def list_receipt_requests(
         if key == "overdue":
             if (item.get("age_hours") or 0) < float(overdue_hours):
                 continue
+        if needle and not _request_row_matches_query(item, needle):
+            continue
         items.append(item)
         if len(items) >= limit:
             break
@@ -1399,6 +1605,7 @@ _RECEIPT_ENTRY_PROJECTION: dict[str, int] = {
     "category_name": 1,
     "payee": 1,
     "ownership": 1,
+    "approver": 1,
     "description": 1,
     "truck_number": 1,
     "receipt_status": 1,
@@ -1502,6 +1709,7 @@ def serialize_receipt_entry_row(
         "item": str(tx.get("item") or tx.get("category_name") or ""),
         "payee": str(tx.get("payee") or ""),
         "ownership": str(tx.get("ownership") or ""),
+        "approver": str(tx.get("approver") or "").strip(),
         "truck_number": str(tx.get("truck_number") or "").strip(),
         "description": str(tx.get("description") or ""),
         "cashier_id": str(tx["cashier_id"]) if tx.get("cashier_id") is not None else None,
@@ -1842,11 +2050,26 @@ async def list_inbox_files(
         query["record"] = {"$exists": False}
     cursor = db.receipt_files.find(query).sort("uploaded_at", -1).limit(limit)
     docs = await cursor.to_list(length=limit)
+    linked_by_file = await _linked_entry_summaries_for_files(db, docs)
     items: list[dict[str, Any]] = []
     for doc in docs:
+        fid = str(doc.get("_id") or "")
+        linked = list(linked_by_file.get(fid) or [])
+        request_ids = [
+            str(e.get("request_id"))
+            for e in linked
+            if e.get("request_id")
+        ]
+        # unique preserve order
+        seen_req: set[str] = set()
+        uniq_req: list[str] = []
+        for rid in request_ids:
+            if rid not in seen_req:
+                seen_req.add(rid)
+                uniq_req.append(rid)
         items.append(
             {
-                "id": str(doc.get("_id")),
+                "id": fid,
                 "original_filename": doc.get("original_filename") or "",
                 "content_type": doc.get("content_type") or "",
                 "size": int(doc.get("size") or 0),
@@ -1860,6 +2083,9 @@ async def list_inbox_files(
                 if doc.get("request_id") is not None
                 else None,
                 "transaction_ids": [str(oid) for oid in (doc.get("transaction_ids") or [])],
+                "linked_count": len(linked),
+                "linked_entries": linked,
+                "request_ids": uniq_req,
                 "rejection_reason": doc.get("rejection_reason") or "",
                 "approved_at": doc.get("approved_at"),
                 "rejected_at": doc.get("rejected_at"),
@@ -2665,6 +2891,75 @@ def schedule_receipt_side_effects(
     loop.create_task(_runner())
 
 
+async def _complete_linked_tx_on_approve(
+    db: Any, tx_id: ObjectId, *, file_id: str
+) -> bool:
+    """Mark a linked expense row received/collected unless carved out / waived."""
+    tx = await db.transactions.find_one(
+        {"_id": tx_id},
+        {"receipt_status": 1, "attachments": 1},
+    )
+    if not tx:
+        return False
+    request = await db.receipt_requests.find_one({"transaction_id": tx_id})
+    if request and str(request.get("status") or "") == "waived":
+        return False
+    # Skip rows explicitly carved out for still-request (attachment or request flag).
+    for att in list(tx.get("attachments") or []):
+        if str(att.get("file_id") or "") != str(file_id):
+            continue
+        if att.get("still_request") or att.get("carve_out"):
+            return False
+    if request and (
+        request.get("still_request")
+        or (
+            request.get("partial_receipt")
+            and str(request.get("partial_note") or "").startswith("[still-request]")
+        )
+    ):
+        # Active still-request carve-out — leave needed/partial chase open.
+        if str(request.get("status") or "") == "needed":
+            return False
+
+    await db.transactions.update_one(
+        {"_id": tx_id},
+        {
+            "$set": {
+                "receipt_status": "received",
+                "receipt_partial_note": None,
+            }
+        },
+    )
+    # Clear partial flags on this file's attachment meta.
+    attachments = list(tx.get("attachments") or [])
+    changed = False
+    for att in attachments:
+        if str(att.get("file_id") or "") != str(file_id):
+            continue
+        if att.get("partial") or att.get("partial_note"):
+            att["partial"] = False
+            att["partial_note"] = ""
+            changed = True
+    if changed:
+        await db.transactions.update_one(
+            {"_id": tx_id}, {"$set": {"attachments": attachments}}
+        )
+    await mark_request_received(db, tx_id, file_id=file_id)
+    if request:
+        await db.receipt_requests.update_one(
+            {"_id": request["_id"]},
+            {
+                "$set": {
+                    "partial_receipt": False,
+                    "partial_note": None,
+                    "still_request": False,
+                    "updated_at": utcnow(),
+                }
+            },
+        )
+    return True
+
+
 async def approve_receipt_files(
     db: Any,
     base: Path,
@@ -2672,11 +2967,16 @@ async def approve_receipt_files(
     file_ids: list[str],
     actor_id: ObjectId | None,
 ) -> dict[str, Any]:
-    """Mark parked/matched files as permanent evidence (still live under files/)."""
+    """Mark parked/matched files permanent and complete linked rows as received.
+
+    Linked expense rows become collected/received unless waived or carved out
+    via still-request. Partial links without carve-out are completed on approve.
+    """
     ensure_receipt_workspace(base)
     now = utcnow()
     updated = 0
     materialized = 0
+    completed_txs = 0
     for file_id in file_ids:
         fid = (file_id or "").strip()
         if not fid:
@@ -2689,6 +2989,10 @@ async def approve_receipt_files(
             paths = await materialize_approved_file(db, base, doc)
             if paths:
                 materialized += 1
+            # Still try to complete any linked rows that stayed open (e.g. partial).
+            for oid in _tx_oids_from_file(doc):
+                if await _complete_linked_tx_on_approve(db, oid, file_id=fid):
+                    completed_txs += 1
             continue
         if status == INBOX_REJECTED:
             raise ValueError(f"File {fid} was rejected; re-link or re-upload before approve")
@@ -2703,6 +3007,8 @@ async def approve_receipt_files(
                     "rejection_reason": None,
                     "rejected_at": None,
                     "rejected_by": None,
+                    "partial": False,
+                    "partial_note": None,
                 }
             },
         )
@@ -2712,10 +3018,180 @@ async def approve_receipt_files(
             paths = await materialize_approved_file(db, base, refreshed)
             if paths:
                 materialized += 1
+            for oid in _tx_oids_from_file(refreshed):
+                if await _complete_linked_tx_on_approve(db, oid, file_id=fid):
+                    completed_txs += 1
     return {
         "updated": updated,
         "files": len(file_ids),
         "materialized": materialized,
+        "completed_transactions": completed_txs,
+    }
+
+
+async def still_request_linked_entries(
+    db: Any,
+    *,
+    file_id: str,
+    transaction_ids: list[ObjectId],
+    note: str,
+    actor: dict[str, Any] | None = None,
+    notify: bool = True,
+) -> dict[str, Any]:
+    """Carve out linked row(s): keep file link, reopen chase, optionally re-notify.
+
+    Use when an inbox file covers several entries but one (or more) still need a
+    real receipt from ownership. Other linked rows stay eligible for approve→received.
+    """
+    fid = (file_id or "").strip()
+    if not fid:
+        raise ValueError("file_id is required")
+    text = " ".join((note or "").strip().split())
+    if len(text) < 3:
+        raise ValueError("A short still-request note is required (3+ characters)")
+    if not transaction_ids:
+        raise ValueError("Select at least one linked entry")
+
+    doc = await db.receipt_files.find_one({"_id": fid})
+    if not doc:
+        raise ValueError("Receipt file not found")
+    linked = set(_tx_oids_from_file(doc))
+    now = utcnow()
+    actor_id = actor.get("_id") if actor else None
+    reopened = 0
+    skipped = 0
+    notify_tx_ids: list[ObjectId] = []
+
+    for tid in transaction_ids:
+        if tid not in linked:
+            skipped += 1
+            continue
+        tx = await db.transactions.find_one({"_id": tid})
+        if not tx:
+            skipped += 1
+            continue
+        request = await db.receipt_requests.find_one({"transaction_id": tid})
+        if request and str(request.get("status") or "") == "waived":
+            skipped += 1
+            continue
+
+        attachments = list(tx.get("attachments") or [])
+        found_att = False
+        for att in attachments:
+            if str(att.get("file_id") or "") != fid:
+                continue
+            att["partial"] = True
+            att["partial_note"] = text
+            att["still_request"] = True
+            att["carve_out"] = True
+            found_att = True
+        if not found_att:
+            attachments.append(
+                {
+                    "id": ObjectId(),
+                    "filename": str(doc.get("original_filename") or "receipt"),
+                    "file_id": fid,
+                    "partial": True,
+                    "partial_note": text,
+                    "still_request": True,
+                    "carve_out": True,
+                    "size": int(doc.get("size") or 0),
+                    "content_type": str(doc.get("content_type") or ""),
+                }
+            )
+
+        await db.transactions.update_one(
+            {"_id": tid},
+            {
+                "$set": {
+                    "attachments": attachments,
+                    "receipt_status": "partial",
+                    "receipt_partial_note": text,
+                }
+            },
+        )
+
+        ownership = normalize_person_name(str(tx.get("ownership") or ""))
+        req_set: dict[str, Any] = {
+            "status": "needed",
+            "partial_receipt": True,
+            "partial_note": f"[still-request] {text}",
+            "still_request": True,
+            "still_requested_at": now,
+            "still_requested_by": actor_id,
+            "updated_at": now,
+            "immediate_notify_pending": bool(notify and ownership),
+        }
+        if request:
+            await db.receipt_requests.update_one(
+                {"_id": request["_id"]},
+                {"$set": req_set, "$addToSet": {"file_ids": fid}},
+            )
+        else:
+            stub = {
+                "transaction_id": tid,
+                "asked_of_name": ownership,
+                "asked_of_person_id": None,
+                "status": "needed",
+                "opened_at": now,
+                "updated_at": now,
+                "last_reminded_at": None,
+                "reminder_count": 0,
+                "initial_notified_at": None,
+                "immediate_notify_pending": bool(notify and ownership),
+                "partial_receipt": True,
+                "partial_note": f"[still-request] {text}",
+                "still_request": True,
+                "still_requested_at": now,
+                "still_requested_by": actor_id,
+                "waiver_reason": None,
+                "waived_by": None,
+                "waived_at": None,
+                "file_ids": [fid],
+            }
+            await db.receipt_requests.insert_one(stub)
+
+        reopened += 1
+        if notify and ownership:
+            notify_tx_ids.append(tid)
+
+    # File stays linked; mark as partial cover at file level when any carve-out.
+    if reopened:
+        await db.receipt_files.update_one(
+            {"_id": fid},
+            {
+                "$set": {
+                    "partial": True,
+                    "partial_note": text,
+                    "updated_at": now,
+                }
+            },
+        )
+
+    notified = 0
+    if notify_tx_ids:
+        req_ids: list[ObjectId] = []
+        for tid in notify_tx_ids:
+            req = await db.receipt_requests.find_one(
+                {"transaction_id": tid}, {"_id": 1}
+            )
+            if req and isinstance(req.get("_id"), ObjectId):
+                req_ids.append(req["_id"])
+        if req_ids:
+            try:
+                result = await flush_immediate_receipt_notifies(
+                    db, request_ids=req_ids
+                )
+                notified = int((result or {}).get("sent") or 0)
+            except Exception as exc:
+                logger.warning("still-request notify failed: %s", exc)
+
+    return {
+        "file_id": fid,
+        "reopened": reopened,
+        "skipped": skipped,
+        "notified": notified,
+        "note": text,
     }
 
 
@@ -2959,6 +3435,115 @@ async def manual_link_files(
         "partial": bool(partial),
         "partial_note": note if partial else "",
         "rematerialized": rematerialized,
+    }
+
+
+async def discard_unlinked_receipt_files(
+    db: Any,
+    base: Path,
+    file_ids: list[str],
+) -> int:
+    """Hard-delete parked files that never linked (rollback helper)."""
+    discarded = 0
+    for raw in file_ids:
+        fid = (raw or "").strip()
+        if not fid:
+            continue
+        doc = await db.receipt_files.find_one({"_id": fid})
+        if not doc:
+            continue
+        if doc.get("transaction_ids"):
+            continue
+        if str(doc.get("inbox_status") or "") == INBOX_APPROVED:
+            continue
+        path = _resolve_file_path(base, doc)
+        await db.receipt_files.delete_one({"_id": fid})
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        discarded += 1
+    return discarded
+
+
+async def park_receipt_uploads(
+    db: Any,
+    base: Path,
+    *,
+    uploads: list[tuple[str, bytes]],
+    actor_id: ObjectId | None,
+    source: str = "desktop",
+) -> list[dict[str, Any]]:
+    """Store many parked files atomically — any failure discards the batch."""
+    saved: list[dict[str, Any]] = []
+    try:
+        for filename, content in uploads:
+            meta = await store_receipt_file_bytes(
+                db,
+                base,
+                filename=filename,
+                content=content,
+                source=source,
+                actor_id=actor_id,
+            )
+            saved.append(meta)
+        return saved
+    except Exception:
+        if saved:
+            await discard_unlinked_receipt_files(
+                db, base, [str(m.get("id") or "") for m in saved]
+            )
+        raise
+
+
+async def upload_and_link_receipt_files(
+    db: Any,
+    base: Path,
+    *,
+    uploads: list[tuple[str, bytes]],
+    transaction_ids: list[ObjectId],
+    actor_id: ObjectId | None,
+    partial: bool = False,
+    partial_note: str = "",
+    source: str = "desktop",
+) -> dict[str, Any]:
+    """Park then link in one shot; roll back parked files if link fails."""
+    if not uploads:
+        raise ValueError("At least one file is required")
+    if not transaction_ids:
+        raise ValueError("Select at least one transaction")
+    saved = await park_receipt_uploads(
+        db,
+        base,
+        uploads=uploads,
+        actor_id=actor_id,
+        source=source,
+    )
+    file_ids = [str(m.get("id") or "") for m in saved if m.get("id")]
+    try:
+        link_result = await manual_link_files(
+            db,
+            file_ids=file_ids,
+            transaction_ids=transaction_ids,
+            actor_id=actor_id,
+            partial=partial,
+            partial_note=partial_note,
+            attachments_dir=base,
+        )
+    except Exception:
+        await discard_unlinked_receipt_files(db, base, file_ids)
+        raise
+    return {
+        "files": saved,
+        "total": len(saved),
+        "linked": link_result.get("linked"),
+        "skipped": link_result.get("skipped"),
+        "transactions": link_result.get("transactions"),
+        "partial": link_result.get("partial"),
+        "partial_note": link_result.get("partial_note") or "",
+        "rematerialized": link_result.get("rematerialized"),
+        "file_ids": file_ids,
     }
 
 

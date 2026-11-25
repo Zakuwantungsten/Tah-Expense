@@ -108,6 +108,61 @@ def test_transport_errors_are_normalized() -> None:
     asyncio.run(scenario())
 
 
+def test_transport_errors_feed_connectivity_monitor(monkeypatch) -> None:
+    from tahmeed.services import connectivity_service as cs
+
+    reported: list[str] = []
+
+    class _Mon:
+        def report_transport_failure(self, *, detail: str = "connection_error") -> None:
+            reported.append(detail)
+
+    monkeypatch.setattr(cs, "connectivity_monitor", _Mon())
+
+    async def scenario() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("offline", request=request)
+
+        client = ApiClient("https://api.test", transport=httpx.MockTransport(handler))
+        client.set_tokens({"access_token": "access", "refresh_token": "refresh"})
+        try:
+            await client.request("GET", "v1/private")
+            raise AssertionError("request should fail")
+        except ApiConnectionError:
+            pass
+        await client.close()
+
+    asyncio.run(scenario())
+    assert reported == ["connection_error"]
+
+
+def test_health_probe_failures_do_not_echo_into_monitor(monkeypatch) -> None:
+    from tahmeed.services import connectivity_service as cs
+
+    reported: list[str] = []
+
+    class _Mon:
+        def report_transport_failure(self, *, detail: str = "connection_error") -> None:
+            reported.append(detail)
+
+    monkeypatch.setattr(cs, "connectivity_monitor", _Mon())
+
+    async def scenario() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("offline", request=request)
+
+        client = ApiClient("https://api.test", transport=httpx.MockTransport(handler))
+        try:
+            await client.request("GET", "health/live", auth=False)
+            raise AssertionError("request should fail")
+        except ApiConnectionError:
+            pass
+        await client.close()
+
+    asyncio.run(scenario())
+    assert reported == []
+
+
 def test_request_bytes_returns_raw_body() -> None:
     async def scenario() -> None:
         def handler(request: httpx.Request) -> httpx.Response:

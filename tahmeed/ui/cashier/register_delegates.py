@@ -97,17 +97,10 @@ _COL_MIN = {
 
 
 def _is_refund_float(text: str) -> bool:
-    """True for canonical and colloquial Ref_Float refund phrases.
+    """True for canonical, colloquial, and near-miss Ref_Float refund phrases."""
+    from tahmeed.services.ref_float import is_refund_float
 
-    Matches Excel-import rules: exact ``refund to float``, or any text
-    containing both ``refund`` and ``float`` (e.g. ``REFUND TO MY FLOAT``).
-    """
-    low = (text or "").strip().lower()
-    if not low:
-        return False
-    if low == "refund to float":
-        return True
-    return "refund" in low and "float" in low
+    return is_refund_float(text)
 
 
 def _ref_float_text(tx: "Transaction") -> str:

@@ -198,15 +198,19 @@ class ApiClient:
         try:
             response = await self._http().request(method, path, headers=headers, **kwargs)
         except httpx.TimeoutException as exc:
-            raise ApiConnectionError(
+            err = ApiConnectionError(
                 f"The API request timed out ({self._base_url}).", code="timeout"
-            ) from exc
+            )
+            self._report_connectivity_failure(path, err)
+            raise err from exc
         except httpx.RequestError as exc:
             detail = str(exc).strip() or type(exc).__name__
-            raise ApiConnectionError(
+            err = ApiConnectionError(
                 f"Unable to connect to the Tahmeed API ({self._base_url.rstrip('/')}). {detail}",
                 code="connection_error",
-            ) from exc
+            )
+            self._report_connectivity_failure(path, err)
+            raise err from exc
 
         if auth and response.status_code == 401 and await self._refresh(rejected_token):
             headers["Authorization"] = f"Bearer {self._access_token}"
@@ -215,15 +219,19 @@ class ApiClient:
                     method, path, headers=headers, **kwargs
                 )
             except httpx.TimeoutException as exc:
-                raise ApiConnectionError(
+                err = ApiConnectionError(
                     f"The API request timed out ({self._base_url}).", code="timeout"
-                ) from exc
+                )
+                self._report_connectivity_failure(path, err)
+                raise err from exc
             except httpx.RequestError as exc:
                 detail = str(exc).strip() or type(exc).__name__
-                raise ApiConnectionError(
+                err = ApiConnectionError(
                     f"Unable to connect to the Tahmeed API ({self._base_url.rstrip('/')}). {detail}",
                     code="connection_error",
-                ) from exc
+                )
+                self._report_connectivity_failure(path, err)
+                raise err from exc
 
         if response.status_code >= 400:
             raise self._error(response)
@@ -285,6 +293,26 @@ class ApiClient:
         self.clear_tokens()
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
+
+    @staticmethod
+    def _report_connectivity_failure(path: str, err: ApiConnectionError) -> None:
+        """Layer 3 — feed transport failures into the connectivity banner.
+
+        Health probes update the monitor themselves; echoing them would race.
+        """
+        try:
+            from tahmeed.services.connectivity_service import (
+                connectivity_monitor,
+                is_health_probe_path,
+            )
+
+            if is_health_probe_path(path):
+                return
+            connectivity_monitor.report_transport_failure(
+                detail=err.code or "connection_error"
+            )
+        except Exception:
+            pass
 
 
 api_client = ApiClient()

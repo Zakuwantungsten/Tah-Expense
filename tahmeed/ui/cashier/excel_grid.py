@@ -1672,6 +1672,10 @@ class DailyRegister(QWidget):
             self._show_register_loading("Loading upload…")
         else:
             self._show_register_loading(f"Loading {d.strftime('%d %b %Y')}…")
+        if day_changed:
+            # Blank sticky money KPIs immediately so another day's figures do
+            # not linger under the loading overlay until _populate finishes.
+            self._blank_money_footer_for_load()
         asyncio.ensure_future(self._load_date(d))
         return True
 
@@ -1702,6 +1706,11 @@ class DailyRegister(QWidget):
         """
         if d == self._current_date:
             return
+        # Drop day money cache immediately so footer / parked totals cannot
+        # keep summing the previous day's rows while the next load is in flight.
+        self._day_tx_cache = None
+        self._day_tx_cache_key = None
+        self._day_tx_stale = True
         self._clear_my_session()
         self._merged_tx_cache = None
         self._merged_tx_cache_key = None
@@ -1897,6 +1906,9 @@ class DailyRegister(QWidget):
                         body["possible_duplicate"] = False
                         body["duplicate_of_id"] = None
                     return set()
+                # Drop Saving overlay once before the modal review dialog
+                # (mirrors insert soft-dup path).
+                self._hide_register_loading()
                 cat_items, cat_descs = lookback_catalog_from_draft_rows(row_txs)
                 dlg = DuplicateReviewDialog(
                     duplicate_items,
@@ -4818,6 +4830,36 @@ class DailyRegister(QWidget):
         stack["parked"].setText(fmt(float(parked_amount or 0.0)))
         stack["combined"].setText(fmt(combined))
 
+    def _blank_money_footer_for_load(self) -> None:
+        """Zero sticky footer money while a new day/upload load is in flight.
+
+        Does not read the table — old-day rows may still be painted until
+        ``_populate`` replaces them. ``_update_footer`` restores real KPIs.
+        """
+        dash = "—"
+        day = self._current_date
+        if day is None:
+            day_txt = dash
+        else:
+            d = day.date() if hasattr(day, "date") else day
+            day_txt = d.strftime("%a %d %b %Y")
+        if self._load_upload_id:
+            mode_tag = "Merged"
+        elif self._parked_mode:
+            mode_tag = "Parked"
+        elif getattr(self, "_view_mode", "my") == "skipped":
+            mode_tag = "Skipped"
+        elif self._merged_mode:
+            mode_tag = "Merged"
+        else:
+            mode_tag = "My"
+        self._footer_meta.setText(f"{mode_tag}  ·  0 entries  ·  {day_txt}")
+        for stack in (self._footer_refund, self._footer_usd, self._footer_tzs):
+            stack["totals"].setText(dash)
+            stack["parked"].setText(dash)
+            stack["combined"].setText(dash)
+        self.stats_updated.emit(0, 0.0, 0.0, 0.0, self._current_date, 0.0, 0.0, 0.0)
+
     def _update_footer(self) -> None:
         """Recompute My / Parked / Combined money KPIs into the sticky footer only."""
         my = self._my_money_bucket()
@@ -5937,7 +5979,7 @@ class DailyRegister(QWidget):
                 self._validate_truck_cell(row, item)
             if col in (COL_ITEM, COL_DESC, COL_TRUCK):
                 self._update_truck_required_highlight(row)
-            if col == COL_TZS or col == COL_USD:
+            if col in (COL_TZS, COL_USD, COL_REF):
                 self._update_footer()
             if col in (COL_ITEM, COL_PAYEE, COL_DESC):
                 self._notify_day_issues_source_changed()
@@ -8345,13 +8387,13 @@ class DailyRegister(QWidget):
                     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                     self._table.setItem(target, grid_col, it)
                 elif grid_col == COL_REF:
+                    from tahmeed.services.ref_float import canonical_ref_float
+
                     low = raw.lower()
-                    if low in ("1", "true", "yes", "refund to float") or (
-                        "refund" in low and "float" in low
-                    ):
+                    if low in ("1", "true", "yes"):
                         text = "REFUND TO FLOAT"
                     elif raw and raw != "None":
-                        text = raw
+                        text = canonical_ref_float(raw)
                     else:
                         text = ""
                     self._table.setItem(target, grid_col, QTableWidgetItem(text))

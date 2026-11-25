@@ -301,8 +301,8 @@ class ReceiptFileViewer(QDialog):
             if _HAS_PDF and path is not None:
                 self._pdf_doc = QPdfDocument(self)
                 err = self._pdf_doc.load(str(path))
-                # QPdfDocument.Error.None_ == 0 on success in Qt6
-                if int(err) == 0:
+                # PySide6 Error enums are not int()-able; compare to None_ directly.
+                if err == QPdfDocument.Error.None_:
                     self._pdf_view.setDocument(self._pdf_doc)
                     self._stack.setCurrentIndex(2)
                     return

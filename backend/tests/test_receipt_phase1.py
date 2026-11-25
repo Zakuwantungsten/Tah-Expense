@@ -469,6 +469,85 @@ def test_mobile_waive_sets_missing(tmp_path: Path) -> None:
     assert db.transactions.documents[0]["receipt_status"] == "missing"
 
 
+def test_desk_waive_bulk_by_transaction_ids(tmp_path: Path) -> None:
+    tx_needed = ObjectId()
+    tx_orphan = ObjectId()
+    tx_received = ObjectId()
+    req_needed = ObjectId()
+    req_received = ObjectId()
+    db = _db(
+        transactions=[
+            {
+                "_id": tx_needed,
+                "ownership": "ALI",
+                "attachments": [],
+                "receipt_status": "pending",
+            },
+            {
+                "_id": tx_orphan,
+                "ownership": "BOB",
+                "attachments": [],
+                "receipt_status": "pending",
+            },
+            {
+                "_id": tx_received,
+                "ownership": "CAT",
+                "attachments": [{"id": ObjectId(), "filename": "a.pdf"}],
+                "receipt_status": "received",
+            },
+        ],
+        requests=[
+            {
+                "_id": req_needed,
+                "transaction_id": tx_needed,
+                "asked_of_name": "ALI",
+                "status": "needed",
+                "file_ids": [],
+            },
+            {
+                "_id": req_received,
+                "transaction_id": tx_received,
+                "asked_of_name": "CAT",
+                "status": "received",
+                "file_ids": [],
+            },
+        ],
+    )
+    app = create_app(settings=_settings(tmp_path), database=SimpleNamespace(db=db))
+    app.dependency_overrides[current_user] = lambda: {
+        "_id": ObjectId(),
+        "username": "desk",
+        "role": "cashier",
+    }
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/receipts/waive",
+            json={
+                "reason": "Lost / not needed anymore",
+                "transaction_ids": [
+                    str(tx_needed),
+                    str(tx_orphan),
+                    str(tx_received),
+                ],
+            },
+        )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["waived"] == 2
+    assert payload["skipped"] == 1
+    by_tx = {doc["_id"]: doc for doc in db.transactions.documents}
+    assert by_tx[tx_needed]["receipt_status"] == "missing"
+    assert by_tx[tx_orphan]["receipt_status"] == "missing"
+    assert by_tx[tx_received]["receipt_status"] == "received"
+    orphan_req = next(
+        r
+        for r in db.receipt_requests.documents
+        if r.get("transaction_id") == tx_orphan
+    )
+    assert orphan_req["status"] == "waived"
+    assert orphan_req["waiver_reason"] == "Lost / not needed anymore"
+
+
 def test_heic_is_allowed_extension() -> None:
     from app.attachment_ops import allowed_extension
 

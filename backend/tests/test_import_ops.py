@@ -97,6 +97,50 @@ def test_verified_doc_from_daily_payload() -> None:
     assert "import_row_key" not in doc
 
 
+@pytest.mark.parametrize(
+    "ref_float",
+    [
+        "REFUND TO MY FLOAT",
+        "REFUND TO FLOA",
+        "RFUND TO FLOAT",
+    ],
+)
+def test_verified_doc_notes_flag_from_colloquial_ref_float(ref_float: str) -> None:
+    doc = verified_doc_from_daily_payload(
+        {
+            "date": "2026-03-01",
+            "description": "Fuel",
+            "truck_number": "t 1 aa",
+            "amount": 500,
+            "currency": "tzs",
+            "category_name": "DIESEL",
+            "ref_float": ref_float,
+        },
+        verified_by=ObjectId(),
+        day_order=1,
+        now=datetime(2026, 10, 9, 12, 0, 0),
+    )
+    assert doc["notes_flag"] is True
+
+
+def test_verified_doc_notes_flag_false_for_unrelated_ref_float() -> None:
+    doc = verified_doc_from_daily_payload(
+        {
+            "date": "2026-03-01",
+            "description": "Fuel",
+            "truck_number": "t 1 aa",
+            "amount": 500,
+            "currency": "tzs",
+            "category_name": "DIESEL",
+            "ref_float": "OTHER",
+        },
+        verified_by=ObjectId(),
+        day_order=1,
+        now=datetime(2026, 10, 9, 12, 0, 0),
+    )
+    assert doc["notes_flag"] is False
+
+
 def test_verified_doc_from_master_payload() -> None:
     verified_by = ObjectId()
     doc = verified_doc_from_master_payload(

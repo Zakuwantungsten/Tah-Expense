@@ -1,4 +1,12 @@
-"""Live reachability probe for the desktop app (API /health/live only).
+"""Live reachability for the desktop app (three-layer funnel).
+
+Layers
+------
+1. OS reachability (``QNetworkInformation``) — instant when the NIC drops
+   (skipped for loopback API; localhost does not need Wi‑Fi).
+2. Periodic ``GET /health/live`` probe — authoritative for "is our API up".
+3. Transport failures from real API calls — instant Offline without waiting
+   for the next probe tick.
 
 ``/health/ready`` still pings Mongo for operators. The status light must not
 use it: a slow import on the same process would look like a lost connection.
@@ -53,6 +61,11 @@ class ConnectivityStatus:
             )
         if self.api_detail == "busy":
             return "The app is still working. Connection was not lost."
+        if self.api_detail == "os_offline":
+            return (
+                "Cannot reach the Tahmeed API. "
+                "Check your internet connection and try again."
+            )
         if _loopback_api():
             if self.api_detail == "timeout":
                 return "The Tahmeed API did not answer in time."
@@ -84,7 +97,9 @@ class ConnectivityStatus:
 # A cold TLS handshake through Cloudflare alone can take ~2s from East Africa.
 _PROBE_TIMEOUT_S = 6.0
 # One slow probe must not flash the red banner; it recovers on the next tick.
+# Layer-3 transport failures and OS disconnect bypass this hysteresis.
 _FAILURES_BEFORE_OFFLINE = 2
+_HEALTH_LIVE_PATH = "health/live"
 
 
 def _loopback_api() -> bool:
@@ -106,6 +121,11 @@ def _status_while_busy(status: ConnectivityStatus, busy: bool) -> ConnectivitySt
     return status
 
 
+def is_health_probe_path(path: str) -> bool:
+    """True for the liveness probe path (Layer 3 must not echo these)."""
+    return (path or "").lstrip("/").startswith(_HEALTH_LIVE_PATH)
+
+
 async def probe_connectivity(*, timeout: float = _PROBE_TIMEOUT_S) -> ConnectivityStatus:
     """Ping API /health/live; never raises. Does not touch Mongo."""
     api_ok, api_detail = await _probe_api(timeout)
@@ -121,7 +141,7 @@ async def _probe_api(timeout: float) -> tuple[bool, str]:
         from tahmeed.services.api_client import ApiConnectionError, ApiError, api_client
 
         await asyncio.wait_for(
-            api_client.request("GET", "health/live", auth=False),
+            api_client.request("GET", _HEALTH_LIVE_PATH, auth=False),
             timeout=timeout,
         )
         return True, ""
@@ -159,6 +179,9 @@ class ConnectivityMonitor(QObject):
         self._status: ConnectivityStatus | None = None
         self._started = False
         self._failures = 0
+        self._os_info = None
+        self._os_bound = False
+        self._deferred_tick_pending = False
 
     @property
     def status(self) -> ConnectivityStatus | None:
@@ -168,6 +191,7 @@ class ConnectivityMonitor(QObject):
         if self._started:
             return
         self._started = True
+        self._bind_os_reachability()
         if self._busy_depth > 0:
             self._paused = True
             return
@@ -178,12 +202,17 @@ class ConnectivityMonitor(QObject):
     def stop(self) -> None:
         self._started = False
         self._failures = 0
+        self._busy_depth = 0
+        self._paused = False
+        self._deferred_tick_pending = False
         self._timer.stop()
+        self._unbind_os_reachability()
         task = self._task
         if task is not None and not task.done():
             task.cancel()
         self._task = None
         self._in_flight = False
+        self._status = None
 
     def pause(self) -> None:
         """Stop probes for a dialog or a save/import/verify batch.
@@ -211,7 +240,98 @@ class ConnectivityMonitor(QObject):
             self._timer.start()
         self._on_tick()
 
+    def report_transport_failure(self, *, detail: str = "connection_error") -> None:
+        """Layer 3 — a real API call could not reach the server.
+
+        Connection refused / OS loss → Offline immediately (no hysteresis).
+        Timeout while a batch is in flight → amber ``busy``, not Offline.
+        """
+        if not self._started:
+            return
+        detail = (detail or "connection_error").strip() or "connection_error"
+        busy = self._busy_depth > 0
+        if busy and detail == "timeout":
+            status = ConnectivityStatus(
+                api_ok=False,
+                checked_at=datetime.now(),
+                api_detail="busy",
+            )
+        else:
+            # Confirmed hard failure — do not wait for a second probe tick.
+            self._failures = _FAILURES_BEFORE_OFFLINE
+            status = ConnectivityStatus(
+                api_ok=False,
+                checked_at=datetime.now(),
+                api_detail=detail,
+            )
+        self._publish(status)
+
+    def report_os_reachability(self, *, disconnected: bool) -> None:
+        """Layer 1 — OS says the machine has no network path.
+
+        Ignored for loopback API targets (local uvicorn still works offline).
+        """
+        if not self._started:
+            return
+        if _loopback_api():
+            return
+        if disconnected:
+            self.report_transport_failure(detail="os_offline")
+            return
+        # Link came back — confirm the API, don't assume Connected yet.
+        if self._paused:
+            return
+        QTimer.singleShot(0, self._on_tick)
+
+    def _publish(self, status: ConnectivityStatus) -> None:
+        self._status = status
+        from tahmeed.signals import app_signals
+
+        app_signals.connectivity_changed.emit(status)
+
+    def _bind_os_reachability(self) -> None:
+        if self._os_bound:
+            return
+        try:
+            from PySide6.QtNetwork import QNetworkInformation
+
+            if QNetworkInformation.instance() is None:
+                QNetworkInformation.loadDefaultBackend()
+            info = QNetworkInformation.instance()
+            if info is None:
+                return
+            info.reachabilityChanged.connect(self._on_os_reachability_changed)
+            self._os_info = info
+            self._os_bound = True
+            # Seed: if already disconnected (remote API), show Offline now.
+            self._on_os_reachability_changed(info.reachability())
+        except Exception:
+            self._os_info = None
+            self._os_bound = False
+
+    def _unbind_os_reachability(self) -> None:
+        info = self._os_info
+        if info is not None and self._os_bound:
+            try:
+                info.reachabilityChanged.disconnect(self._on_os_reachability_changed)
+            except Exception:
+                pass
+        self._os_info = None
+        self._os_bound = False
+
+    def _on_os_reachability_changed(self, reachability) -> None:
+        try:
+            from PySide6.QtNetwork import QNetworkInformation
+
+            disconnected = (
+                reachability == QNetworkInformation.Reachability.Disconnected
+            )
+        except Exception:
+            return
+        self.report_os_reachability(disconnected=disconnected)
+
     def _on_tick(self) -> None:
+        self._deferred_tick_pending = False
         if self._paused or not self._started or not self._timer.isActive():
             return
         # Previous soft-paused probe may still be finishing — don't stack another.
@@ -221,11 +341,21 @@ class ConnectivityMonitor(QObject):
         if self._in_flight:
             return
         if in_running_task():
+            # Don't drop the tick forever — retry shortly outside the task.
+            if not self._deferred_tick_pending:
+                self._deferred_tick_pending = True
+                QTimer.singleShot(50, self._on_tick)
             return
         prev = self._task
         if prev is not None and not prev.done():
             return
-        self._task = create_task(self._check_async())
+        try:
+            self._task = create_task(self._check_async())
+        except RuntimeError:
+            # No running asyncio loop yet (rare during early start).
+            if not self._deferred_tick_pending:
+                self._deferred_tick_pending = True
+                QTimer.singleShot(100, self._on_tick)
 
     async def _check_async(self) -> None:
         if self._in_flight or self._paused or not self._started:
@@ -244,22 +374,7 @@ class ConnectivityMonitor(QObject):
                 self._failures += 1
                 if self._failures < _FAILURES_BEFORE_OFFLINE:
                     return
-            prev = self._status
-            self._status = status
-            if (
-                prev is None
-                or prev.api_ok != status.api_ok
-                or prev.online != status.online
-                or prev.api_detail != status.api_detail
-            ):
-                from tahmeed.signals import app_signals
-
-                app_signals.connectivity_changed.emit(status)
-            else:
-                # Still refresh "Checked HH:MM:SS" on the status bar.
-                from tahmeed.signals import app_signals
-
-                app_signals.connectivity_changed.emit(status)
+            self._publish(status)
         except asyncio.CancelledError:
             raise
         except Exception:

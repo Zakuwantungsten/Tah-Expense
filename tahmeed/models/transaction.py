@@ -53,7 +53,7 @@ class Transaction:
     do_number: str = ""
     memo: str = ""
     receipt_status: str = "pending"    # free text from register / Excel; legacy keys still ok
-    notes_flag: bool = False           # True when Ref_Float is "REFUND TO FLOAT"
+    notes_flag: bool = False           # True when Ref_Float matches refund-to-float (see ref_float.is_refund_float)
     ref_float: str = ""                # free-text Ref_Float (autocomplete suggests REFUND TO FLOAT)
     ownership: str = ""
     approver: str = ""

@@ -15,6 +15,10 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApiError } from "../api/client";
+import {
+  pickOriginalFileName,
+  stampFallback,
+} from "../api/fileNames";
 import { formatUploadSummary, uploadEarlyFiles } from "../api/receipts";
 import { UploadProgressBar } from "../components/UploadProgressBar";
 import type { MainTabParamList, RootStackParamList } from "../navigation";
@@ -35,14 +39,6 @@ type PickedFile = {
   name: string;
   mimeType?: string | null;
 };
-
-function guessName(uri: string, fallback: string): string {
-  const last = uri.split("/").pop() || fallback;
-  if (last.includes(".")) {
-    return last.split("?")[0];
-  }
-  return fallback.endsWith(".jpg") ? fallback : `${fallback}.jpg`;
-}
 
 export function EarlyUploadScreen({ navigation }: Props) {
   const [picked, setPicked] = useState<PickedFile[]>([]);
@@ -69,7 +65,11 @@ export function EarlyUploadScreen({ navigation }: Props) {
         ...prev,
         {
           uri: asset.uri,
-          name: asset.fileName || guessName(asset.uri, `early-${Date.now()}.jpg`),
+          name: pickOriginalFileName({
+            fileName: asset.fileName,
+            uri: asset.uri,
+            fallback: stampFallback("camera"),
+          }),
           mimeType: asset.mimeType || "image/jpeg",
         },
       ]);
@@ -96,7 +96,11 @@ export function EarlyUploadScreen({ navigation }: Props) {
         ...prev,
         ...result.assets.map((asset, i) => ({
           uri: asset.uri,
-          name: asset.fileName || guessName(asset.uri, `photo-${Date.now()}-${i}.jpg`),
+          name: pickOriginalFileName({
+            fileName: asset.fileName,
+            uri: asset.uri,
+            fallback: stampFallback(`photo-${i + 1}`),
+          }),
           mimeType: asset.mimeType || "image/jpeg",
         })),
       ]);
@@ -118,7 +122,11 @@ export function EarlyUploadScreen({ navigation }: Props) {
         ...prev,
         ...result.assets.map((asset) => ({
           uri: asset.uri,
-          name: asset.name || guessName(asset.uri, "file.pdf"),
+          name: pickOriginalFileName({
+            name: asset.name,
+            uri: asset.uri,
+            fallback: stampFallback("file", ".pdf"),
+          }),
           mimeType: asset.mimeType,
         })),
       ]);

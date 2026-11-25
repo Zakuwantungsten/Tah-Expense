@@ -31,6 +31,7 @@ from .receipt_evidence import (
 from .receipt_ops import (
     approve_receipt_files,
     chase_groups,
+    desk_waive_receipts,
     ensure_receipt_workspace,
     get_receipt_file_open_meta,
     list_inbox_files,
@@ -46,11 +47,13 @@ from .receipt_ops import (
     mark_requests_reminded,
     materialize_approved_file,
     open_receipt_file_bytes,
+    park_receipt_uploads,
     receipt_compliance_summary,
     reject_receipt_files,
     rematerialize_approved_for_transaction,
     search_link_transactions,
-    store_receipt_file_bytes,
+    still_request_linked_entries,
+    upload_and_link_receipt_files,
 )
 from .receipt_records_ops import (
     build_records_pack,
@@ -112,6 +115,12 @@ class ReceiptRemindBody(BaseModel):
     request_ids: list[str] = Field(default_factory=list)
 
 
+class ReceiptDeskWaiveBody(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+    request_ids: list[str] = Field(default_factory=list)
+    transaction_ids: list[str] = Field(default_factory=list)
+
+
 class EvidencePackBody(BaseModel):
     date_from: date
     date_to: date
@@ -134,6 +143,12 @@ class ConsolidateBody(BaseModel):
 
 class ReceiptFilesBody(BaseModel):
     file_ids: list[str] = Field(default_factory=list, min_length=1)
+
+
+class ReceiptStillRequestBody(BaseModel):
+    transaction_ids: list[str] = Field(default_factory=list, min_length=1)
+    note: str = Field(min_length=3, max_length=500)
+    notify: bool = True
 
 
 class ReceiptRejectBody(BaseModel):
@@ -348,6 +363,7 @@ async def get_receipt_requests(
     _user: DeskActor,
     preset: str = Query("open"),
     ownership: str = "",
+    q: str = Query("", description="Search ownership, truck, description, item, approver…"),
     overdue_hours: float = Query(48.0, ge=1.0, le=720.0),
     reminder_threshold: int = Query(3, ge=1, le=50),
     limit: int = Query(400, ge=1, le=1000),
@@ -356,6 +372,7 @@ async def get_receipt_requests(
         _database(request),
         preset=preset,
         ownership=ownership,
+        q=q,
         overdue_hours=overdue_hours,
         reminder_threshold=reminder_threshold,
         limit=limit,
@@ -613,7 +630,55 @@ async def post_receipt_files_approve(
         request=request,
         entity_type="receipt_file",
         entity_ids=file_ids[:40],
-        details={"updated": result.get("updated")},
+        details={
+            "updated": result.get("updated"),
+            "completed_transactions": result.get("completed_transactions"),
+        },
+    )
+    return json_safe(result)
+
+
+@receipts.post("/files/{file_id}/still-request")
+async def post_receipt_file_still_request(
+    file_id: str,
+    body: ReceiptStillRequestBody,
+    request: Request,
+    actor: DeskActor,
+) -> dict[str, Any]:
+    """Carve out linked row(s): reopen chase + optional re-notify ownership."""
+    tx_ids: list[ObjectId] = []
+    for raw in body.transaction_ids:
+        try:
+            tx_ids.append(object_id(raw))
+        except ValueError as exc:
+            raise ApiError(
+                422, "invalid_id", "One or more transaction ids are invalid"
+            ) from exc
+    try:
+        result = await still_request_linked_entries(
+            _database(request),
+            file_id=file_id,
+            transaction_ids=tx_ids,
+            note=body.note,
+            actor=actor,
+            notify=bool(body.notify),
+        )
+    except ValueError as exc:
+        raise ApiError(422, "still_request_failed", str(exc)) from None
+    await record_operation_event(
+        _database(request),
+        action="receipt.still_request",
+        actor=actor,
+        request=request,
+        entity_type="receipt_file",
+        entity_ids=[file_id],
+        details={
+            "reopened": result.get("reopened"),
+            "skipped": result.get("skipped"),
+            "notified": result.get("notified"),
+            "transaction_ids": [str(oid) for oid in tx_ids][:40],
+            "note": (body.note or "")[:200],
+        },
     )
     return json_safe(result)
 
@@ -713,21 +778,10 @@ async def get_link_candidates(
     return {"items": json_safe(items), "total": len(items)}
 
 
-@receipts.post("/files/upload", status_code=status.HTTP_201_CREATED)
-async def post_receipt_files_early_upload(
-    request: Request,
-    actor: DeskActor,
-    files: list[UploadFile] = File(...),
-) -> dict[str, Any]:
-    """Desk early drop — park unmatched files with no request/tx yet."""
+async def _read_upload_batch(files: list[UploadFile]) -> list[tuple[str, bytes]]:
     if not files:
         raise ApiError(422, "files_required", "At least one file is required")
-    await _require_receipt_storage(request)
-    db = _database(request)
-    base = await resolve_attachments_directory(_settings(request), db)
-    ensure_receipt_workspace(base)
-    actor_id = _actor_oid(actor)
-    saved: list[dict[str, Any]] = []
+    uploads: list[tuple[str, bytes]] = []
     for upload in files:
         filename = upload.filename or "file"
         try:
@@ -736,20 +790,35 @@ async def post_receipt_files_early_upload(
             raise ApiError(400, "read_failed", "Could not read uploaded file") from exc
         finally:
             await upload.close()
-        try:
-            meta = await store_receipt_file_bytes(
-                db,
-                base,
-                filename=filename,
-                content=content,
-                source="desktop",
-                actor_id=actor_id,
-            )
-        except ValueError as exc:
-            raise ApiError(422, "invalid_attachment", str(exc)) from None
-        except OSError as exc:
-            raise ApiError(500, "storage_error", "Failed to store attachment") from exc
-        saved.append(meta)
+        uploads.append((filename, content))
+    return uploads
+
+
+@receipts.post("/files/upload", status_code=status.HTTP_201_CREATED)
+async def post_receipt_files_early_upload(
+    request: Request,
+    actor: DeskActor,
+    files: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    """Desk early drop — park unmatched files with no request/tx yet (atomic)."""
+    uploads = await _read_upload_batch(files)
+    await _require_receipt_storage(request)
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    ensure_receipt_workspace(base)
+    actor_id = _actor_oid(actor)
+    try:
+        saved = await park_receipt_uploads(
+            db,
+            base,
+            uploads=uploads,
+            actor_id=actor_id,
+            source="desktop",
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_attachment", str(exc)) from None
+    except OSError as exc:
+        raise ApiError(500, "storage_error", "Failed to store attachment") from exc
     await record_operation_event(
         db,
         action="receipt.park",
@@ -757,9 +826,78 @@ async def post_receipt_files_early_upload(
         request=request,
         entity_type="receipt_file",
         entity_ids=[str(m.get("id")) for m in saved][:40],
-        details={"files": len(saved), "source": "desktop"},
+        details={"files": len(saved), "source": "desktop", "atomic": True},
     )
     return {"files": json_safe(saved), "total": len(saved)}
+
+
+@receipts.post("/upload-and-link", status_code=status.HTTP_201_CREATED)
+async def post_receipt_upload_and_link(
+    request: Request,
+    actor: DeskActor,
+    files: list[UploadFile] = File(...),
+    transaction_ids: str = Form(""),
+    partial: bool = Form(False),
+    partial_note: str = Form(""),
+) -> dict[str, Any]:
+    """Atomic park + link for on-behalf uploads (rolls back parked files on link failure)."""
+    import json as _json
+
+    uploads = await _read_upload_batch(files)
+    raw_ids = (transaction_ids or "").strip()
+    parsed: list[str] = []
+    if raw_ids.startswith("["):
+        try:
+            loaded = _json.loads(raw_ids)
+        except _json.JSONDecodeError as exc:
+            raise ApiError(422, "invalid_id", "transaction_ids must be JSON or comma-separated") from exc
+        if isinstance(loaded, list):
+            parsed = [str(x).strip() for x in loaded if str(x).strip()]
+    else:
+        parsed = [part.strip() for part in raw_ids.split(",") if part.strip()]
+    try:
+        tx_ids = [object_id(raw) for raw in parsed]
+    except ValueError as exc:
+        raise ApiError(422, "invalid_id", "One or more transaction ids are invalid") from exc
+    if not tx_ids:
+        raise ApiError(422, "empty_link", "Select at least one transaction")
+
+    await _require_receipt_storage(request)
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    ensure_receipt_workspace(base)
+    try:
+        result = await upload_and_link_receipt_files(
+            db,
+            base,
+            uploads=uploads,
+            transaction_ids=tx_ids,
+            actor_id=_actor_oid(actor),
+            partial=bool(partial),
+            partial_note=partial_note or "",
+            source="desktop",
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_upload_link", str(exc)) from None
+    except OSError as exc:
+        raise ApiError(500, "storage_error", "Failed to store attachment") from exc
+
+    await record_operation_event(
+        db,
+        action="receipt.upload_and_link",
+        actor=actor,
+        request=request,
+        entity_type="receipt_file",
+        entity_ids=list(result.get("file_ids") or [])[:40],
+        details={
+            "files": result.get("total"),
+            "linked": result.get("linked"),
+            "partial": result.get("partial"),
+            "transaction_ids": [str(oid) for oid in tx_ids][:40],
+            "atomic": True,
+        },
+    )
+    return json_safe(result)
 
 
 @receipts.post("/link")
@@ -830,6 +968,52 @@ async def post_mark_reminded(
         details={"updated": updated, "ownership": body.ownership},
     )
     return {"updated": updated}
+
+
+@receipts.post("/waive")
+async def post_desk_waive(
+    body: ReceiptDeskWaiveBody, request: Request, actor: DeskActor
+) -> dict[str, Any]:
+    """Cashier/accountant: waive selected receipt requests / expense rows."""
+    request_ids: list[ObjectId] = []
+    for raw in body.request_ids:
+        try:
+            request_ids.append(object_id(raw))
+        except ValueError as exc:
+            raise ApiError(422, "invalid_id", "One or more request ids are invalid") from exc
+    transaction_ids: list[ObjectId] = []
+    for raw in body.transaction_ids:
+        try:
+            transaction_ids.append(object_id(raw))
+        except ValueError as exc:
+            raise ApiError(
+                422, "invalid_id", "One or more transaction ids are invalid"
+            ) from exc
+    try:
+        result = await desk_waive_receipts(
+            _database(request),
+            reason=body.reason,
+            actor=actor,
+            request_ids=request_ids or None,
+            transaction_ids=transaction_ids or None,
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_waiver", str(exc)) from None
+    await record_operation_event(
+        _database(request),
+        action="receipt.desk_waive",
+        actor=actor,
+        request=request,
+        entity_type="receipt_request",
+        entity_ids=list(result.get("request_ids") or [])[:40],
+        details={
+            "waived": result.get("waived"),
+            "skipped": result.get("skipped"),
+            "reason": body.reason[:200],
+            "transaction_ids": [str(oid) for oid in transaction_ids][:40],
+        },
+    )
+    return json_safe(result)
 
 
 @receipts.post("/files/consolidate")

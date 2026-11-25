@@ -38,6 +38,10 @@ def test_status_labels():
     assert db_down.short_label() == "Server unavailable"
     assert "database" in db_down.banner_message().lower()
 
+    os_off = ConnectivityStatus(api_ok=False, api_detail="os_offline")
+    assert not os_off.online
+    assert "internet" in os_off.banner_message().lower()
+
 
 def test_probe_timeout_covers_a_cold_tls_handshake():
     assert _PROBE_TIMEOUT_S == 6.0
@@ -173,6 +177,114 @@ def test_nested_pause_does_not_resume_the_light_early(monkeypatch):
         mon._busy_depth = 0
         mon._paused = False
         _app.processEvents()
+
+
+def test_stop_resets_busy_depth_so_next_start_is_not_stuck():
+    _app = QApplication.instance() or QApplication([])
+    mon = connectivity_monitor
+    mon.stop()
+    mon._started = True
+    mon.pause()
+    assert mon._busy_depth == 1
+    mon.stop()
+    assert mon._busy_depth == 0
+    assert not mon._paused
+    assert mon.status is None
+    assert _app is not None
+
+
+def test_transport_failure_publishes_offline_immediately():
+    from tahmeed.signals import app_signals
+
+    mon = connectivity_monitor
+    mon.stop()
+    mon._started = True
+    published: list[ConnectivityStatus] = []
+
+    def _record(status):
+        published.append(status)
+
+    app_signals.connectivity_changed.connect(_record)
+    try:
+        mon.report_transport_failure(detail="connection_error")
+    finally:
+        app_signals.connectivity_changed.disconnect(_record)
+        mon.stop()
+    assert len(published) == 1
+    assert not published[0].online
+    assert published[0].api_detail == "connection_error"
+
+
+def test_transport_timeout_while_busy_is_amber_not_offline():
+    from tahmeed.signals import app_signals
+
+    mon = connectivity_monitor
+    mon.stop()
+    mon._started = True
+    mon.pause()
+    published: list[ConnectivityStatus] = []
+
+    def _record(status):
+        published.append(status)
+
+    app_signals.connectivity_changed.connect(_record)
+    try:
+        mon.report_transport_failure(detail="timeout")
+    finally:
+        app_signals.connectivity_changed.disconnect(_record)
+        mon.stop()
+    assert len(published) == 1
+    assert published[0].api_detail == "busy"
+    assert published[0].degraded
+
+
+def test_os_disconnect_ignored_for_loopback(monkeypatch):
+    from tahmeed.signals import app_signals
+
+    monkeypatch.setattr(
+        "tahmeed.services.connectivity_service._loopback_api",
+        lambda: True,
+    )
+    mon = connectivity_monitor
+    mon.stop()
+    mon._started = True
+    published: list[ConnectivityStatus] = []
+
+    def _record(status):
+        published.append(status)
+
+    app_signals.connectivity_changed.connect(_record)
+    try:
+        mon.report_os_reachability(disconnected=True)
+    finally:
+        app_signals.connectivity_changed.disconnect(_record)
+        mon.stop()
+    assert published == []
+
+
+def test_os_disconnect_marks_offline_for_remote_api(monkeypatch):
+    from tahmeed.signals import app_signals
+
+    monkeypatch.setattr(
+        "tahmeed.services.connectivity_service._loopback_api",
+        lambda: False,
+    )
+    mon = connectivity_monitor
+    mon.stop()
+    mon._started = True
+    published: list[ConnectivityStatus] = []
+
+    def _record(status):
+        published.append(status)
+
+    app_signals.connectivity_changed.connect(_record)
+    try:
+        mon.report_os_reachability(disconnected=True)
+    finally:
+        app_signals.connectivity_changed.disconnect(_record)
+        mon.stop()
+    assert len(published) == 1
+    assert published[0].api_detail == "os_offline"
 
 
 @pytest.mark.asyncio

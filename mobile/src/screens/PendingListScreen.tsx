@@ -20,6 +20,10 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApiError } from "../api/client";
 import {
+  pickOriginalFileName,
+  stampFallback,
+} from "../api/fileNames";
+import {
   listOpenRequests,
   uploadFilesToManyRequests,
   type ReceiptRequestSummary,
@@ -117,14 +121,6 @@ function formatLastUpload(entry: UploadHistoryEntry | null): string {
         : entry.itemLabel || "Upload";
   const fail = entry.failed ? ` · ${entry.failed} failed` : "";
   return `${whenLabel} · ${kind} · ${entry.sent} sent${fail}`;
-}
-
-function guessName(uri: string, fallback: string): string {
-  const last = uri.split("/").pop() || fallback;
-  if (last.includes(".")) {
-    return last.split("?")[0];
-  }
-  return fallback.endsWith(".jpg") ? fallback : `${fallback}.jpg`;
 }
 
 export function PendingListScreen({ navigation }: Props) {
@@ -273,7 +269,11 @@ export function PendingListScreen({ navigation }: Props) {
               resolve([
                 {
                   uri: a.uri,
-                  name: a.fileName || guessName(a.uri, `camera-${Date.now()}.jpg`),
+                  name: pickOriginalFileName({
+                    fileName: a.fileName,
+                    uri: a.uri,
+                    fallback: stampFallback("camera"),
+                  }),
                   mimeType: a.mimeType || "image/jpeg",
                 },
               ]);
@@ -301,7 +301,11 @@ export function PendingListScreen({ navigation }: Props) {
               resolve(
                 result.assets.map((a, i) => ({
                   uri: a.uri,
-                  name: a.fileName || guessName(a.uri, `photo-${Date.now()}-${i}.jpg`),
+                  name: pickOriginalFileName({
+                    fileName: a.fileName,
+                    uri: a.uri,
+                    fallback: stampFallback(`photo-${i + 1}`),
+                  }),
                   mimeType: a.mimeType || "image/jpeg",
                 }))
               );
@@ -324,7 +328,11 @@ export function PendingListScreen({ navigation }: Props) {
               resolve(
                 result.assets.map((a) => ({
                   uri: a.uri,
-                  name: a.name || guessName(a.uri, `file-${Date.now()}.bin`),
+                  name: pickOriginalFileName({
+                    name: a.name,
+                    uri: a.uri,
+                    fallback: stampFallback("file", ".bin"),
+                  }),
                   mimeType: a.mimeType || "application/octet-stream",
                 }))
               );

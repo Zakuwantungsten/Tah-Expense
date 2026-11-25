@@ -2630,9 +2630,11 @@ def prepare_master_updates(updates: dict) -> dict:
         clean["item"] = clean["category_name"]
 
     if "ref_float" in clean:
+        from tahmeed.services.ref_float import is_refund_float
+
         ref = (clean.get("ref_float") or "").strip()
         clean["ref_float"] = ref
-        clean["notes_flag"] = ref.upper() == "REFUND TO FLOAT"
+        clean["notes_flag"] = is_refund_float(ref)
 
     if "receipt_status" in clean:
         clean["receipt_status"] = _normalize_master_receipt(

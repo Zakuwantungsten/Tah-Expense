@@ -758,13 +758,16 @@ class AccountantDashboard(QWidget):
     def _menu_navigate_sub(self, parent_key: str, match: str) -> None:
         labels = {"rpa_schedule": "RPA Schedule", "bonds": "Bonds"}
         name = labels.get(match, match)
-        self._sidebar.select(parent_key)
+        expand = getattr(self._sidebar, "_on_toggle", None)
         expanded = getattr(self._sidebar, "_expanded", set())
-        if parent_key not in expanded:
-            toggle = getattr(self._sidebar, "_on_toggle", None)
-            if callable(toggle):
-                toggle(parent_key)
-        self._show_subtable(parent_key, "SM Burhani", name, match)
+        if parent_key not in expanded and callable(expand):
+            expand(parent_key)
+        activate = getattr(self._sidebar, "activate_fixed_child", None)
+        if callable(activate):
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda pk=parent_key, m=match: activate(pk, m))
+        else:
+            self._show_subtable(parent_key, "SM Burhani", name, match)
 
     def _refresh_current(self) -> None:
         widget = self._stack.currentWidget()
@@ -1149,14 +1152,19 @@ class AccountantDashboard(QWidget):
         # Paperwork is an expandable parent — open Receipts (or Records) child.
         if key in ("paperwork", "receipts", "records"):
             match = "records" if key == "records" else "receipts"
-            name = "Records" if match == "records" else "Receipts"
-            self._sidebar.select("paperwork")
+            # Expand strip now; activate child next tick so rows paint before
+            # the heavy Receipts/Records page open (same as sidebar click).
+            expand = getattr(self._sidebar, "_on_toggle", None)
             expanded = getattr(self._sidebar, "_expanded", set())
-            if "paperwork" not in expanded:
-                toggle = getattr(self._sidebar, "_on_toggle", None)
-                if callable(toggle):
-                    toggle("paperwork")
-            self._show_subtable("paperwork", "Paperwork", name, match)
+            if "paperwork" not in expanded and callable(expand):
+                expand("paperwork")
+            activate = getattr(self._sidebar, "activate_fixed_child", None)
+            if callable(activate):
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(0, lambda m=match: activate("paperwork", m))
+            else:
+                name = "Records" if match == "records" else "Receipts"
+                self._show_subtable("paperwork", "Paperwork", name, match)
             return
         self._sidebar.select(key)
         self._on_nav(key)

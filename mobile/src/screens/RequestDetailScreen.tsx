@@ -14,6 +14,10 @@ import {
 } from "react-native";
 import { ApiError } from "../api/client";
 import {
+  pickOriginalFileName,
+  stampFallback,
+} from "../api/fileNames";
+import {
   formatUploadSummary,
   getRequest,
   uploadFiles,
@@ -37,21 +41,17 @@ type PickedFile = {
   mimeType?: string | null;
 };
 
-function guessName(uri: string, fallback: string): string {
-  const last = uri.split("/").pop() || fallback;
-  if (last.includes(".")) {
-    return last.split("?")[0];
-  }
-  return fallback.endsWith(".jpg") ? fallback : `${fallback}.jpg`;
-}
-
 function assetToPicked(
   asset: ImagePicker.ImagePickerAsset,
   fallback: string
 ): PickedFile {
   return {
     uri: asset.uri,
-    name: asset.fileName || guessName(asset.uri, fallback),
+    name: pickOriginalFileName({
+      fileName: asset.fileName,
+      uri: asset.uri,
+      fallback,
+    }),
     mimeType: asset.mimeType || "image/jpeg",
   };
 }
@@ -100,7 +100,7 @@ export function RequestDetailScreen({ navigation, route }: Props) {
       }
       setPicked((prev) => [
         ...prev,
-        assetToPicked(result.assets[0], `camera-${Date.now()}.jpg`),
+        assetToPicked(result.assets[0], stampFallback("camera")),
       ]);
     } catch (exc) {
       Alert.alert(
@@ -128,7 +128,7 @@ export function RequestDetailScreen({ navigation, route }: Props) {
       setPicked((prev) => [
         ...prev,
         ...result.assets.map((asset, index) =>
-          assetToPicked(asset, `photo-${Date.now()}-${index}.jpg`)
+          assetToPicked(asset, stampFallback(`photo-${index + 1}`))
         ),
       ]);
     } catch (exc) {
@@ -153,7 +153,11 @@ export function RequestDetailScreen({ navigation, route }: Props) {
         ...prev,
         ...result.assets.map((asset) => ({
           uri: asset.uri,
-          name: asset.name || guessName(asset.uri, `file-${Date.now()}.bin`),
+          name: pickOriginalFileName({
+            name: asset.name,
+            uri: asset.uri,
+            fallback: stampFallback("file", ".bin"),
+          }),
           mimeType: asset.mimeType || "application/octet-stream",
         })),
       ]);

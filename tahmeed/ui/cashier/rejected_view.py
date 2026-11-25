@@ -21,6 +21,7 @@ from PySide6.QtGui import QColor, QBrush, QKeyEvent
 
 from tahmeed.models.transaction import Transaction, pack_money
 from tahmeed.models.user import User
+from tahmeed.services.ref_float import is_refund_float
 from tahmeed.ui.cashier.register_delegates import (
     COL_SNO, COL_DATE, COL_ITEM, COL_DESC, COL_TRUCK, COL_MEMO,
     COL_REF, COL_TZS, COL_USD, COL_RECEIPT, COL_OWN, COL_APR, COL_PAYEE, COL_CHEQUE,
@@ -1094,7 +1095,7 @@ class RejectedView(QWidget):
             "memo": self._txt(row, COL_MEMO),
             "receipt_status": rcpt,
             "ref_float": ref,
-            "notes_flag": ref == "REFUND TO FLOAT",
+            "notes_flag": is_refund_float(ref),
             "ownership": self._txt(row, COL_OWN),
             "approver": self._txt(row, COL_APR),
             "payee": payee_name,
