@@ -1676,7 +1676,8 @@ async def get_record_files(
     q: str = Query(""),
     date_from: date | None = None,
     date_to: date | None = None,
-    limit: int = Query(200, ge=1, le=500),
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0, le=10_000_000),
 ) -> dict[str, Any]:
     try:
         items = await list_record_files(
@@ -1688,10 +1689,11 @@ async def get_record_files(
             date_from=date_from,
             date_to=date_to,
             limit=limit,
+            offset=offset,
         )
     except ValueError as exc:
         raise ApiError(422, "invalid_filter", str(exc)) from None
-    return {"items": json_safe(items), "total": len(items)}
+    return {"items": json_safe(items), "total": len(items), "offset": offset}
 
 
 @receipts.post("/records/upload", status_code=status.HTTP_201_CREATED)

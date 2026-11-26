@@ -39,6 +39,9 @@ def cmd_icon_button(
 ) -> QToolButton:
     """Icon-only tool button (Windows 11 command-bar look)."""
     btn = QToolButton()
+    btn.setProperty("cmdIcon", icon)
+    btn.setProperty("cmdIconColor", color)
+    btn.setProperty("cmdIconPx", icon_px)
     btn.setIcon(qta.icon(icon, color=color))
     btn.setIconSize(QSize(icon_px, icon_px))
     btn.setToolTip(tip)
@@ -59,6 +62,18 @@ def cmd_icon_button(
     )
     return btn
 
+
+def _paint_cmd_icon(btn: QToolButton, *, enabled: bool) -> None:
+    """Recolor qtawesome icons — stylesheet color alone does not grey QIcons."""
+    icon = str(btn.property("cmdIcon") or "")
+    if not icon:
+        return
+    active = str(btn.property("cmdIconColor") or _TEXT)
+    px = int(btn.property("cmdIconPx") or 18)
+    color = active if enabled else _DISABLED
+    btn.setIcon(qta.icon(icon, color=color))
+    btn.setIconSize(QSize(px, px))
+    btn.setCursor(Qt.PointingHandCursor if enabled else Qt.ArrowCursor)
 
 def cmd_separator() -> QFrame:
     line = QFrame()
@@ -311,14 +326,19 @@ class WindowsExplorerChrome(QWidget):
     ) -> None:
         if back is not None:
             self.btn_back.setEnabled(back)
+            _paint_cmd_icon(self.btn_back, enabled=back)
         if forward is not None:
             self.btn_forward.setEnabled(forward)
+            _paint_cmd_icon(self.btn_forward, enabled=forward)
         if up is not None:
             self.btn_up.setEnabled(up)
+            _paint_cmd_icon(self.btn_up, enabled=up)
 
     def _sync_hist_buttons(self) -> None:
-        self.btn_back.setEnabled(self._hist_index > 0)
-        self.btn_forward.setEnabled(self._hist_index < len(self._history) - 1)
+        self.set_nav_enabled(
+            back=self._hist_index > 0,
+            forward=self._hist_index < len(self._history) - 1,
+        )
 
     def history_back(self) -> str | None:
         if self._hist_index <= 0:

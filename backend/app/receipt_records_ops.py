@@ -8,10 +8,10 @@ browse copy under ``records/<kind>/<slug>/YYYY/MM/``. Custom folders live in
 from __future__ import annotations
 
 import hashlib
-import io
 import os
 import re
 import shutil
+import tempfile
 import uuid
 import zipfile
 from datetime import date, datetime, timezone
@@ -31,7 +31,34 @@ from .receipt_ops import (
 from .receipt_upload_security import UploadSecurityError, validate_receipt_upload
 from .security import utcnow
 
-_MAX_PACK_FILES = 500
+# Page size for pack builders (not a hard export ceiling — callers batch).
+_PACK_PAGE_SIZE = 500
+
+# Already-compressed (or container) formats — STORE is far faster than DEFLATE
+# and usually the same size (IDM/torrent-style: don't recompress payload bytes).
+_ZIP_STORE_SUFFIXES = frozenset(
+    {
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".tif",
+        ".tiff",
+        ".heic",
+        ".heif",
+        ".zip",
+        ".docx",
+        ".xlsx",
+        ".pptx",
+        ".odt",
+        ".ods",
+        ".mp4",
+        ".mov",
+        ".avi",
+    }
+)
 
 UTC = timezone.utc
 
@@ -1238,6 +1265,8 @@ async def list_record_files(
     date_from: date | datetime | None = None,
     date_to: date | datetime | None = None,
     limit: int = 200,
+    offset: int = 0,
+    exclude_ids: set[str] | None = None,
     include_approved: bool = True,
 ) -> list[dict[str, Any]]:
     query: dict[str, Any] = {
@@ -1257,26 +1286,71 @@ async def list_record_files(
     if rk:
         query["record.ref_key"] = rk
 
+    skip_ids = {str(x).strip() for x in (exclude_ids or set()) if str(x or "").strip()}
+    if skip_ids:
+        oids: list[ObjectId] = []
+        for raw in skip_ids:
+            try:
+                oids.append(ObjectId(raw))
+            except Exception:
+                continue
+        if oids:
+            query["_id"] = {"$nin": oids}
+
     start = _as_day_start(date_from)
     end = _as_day_end(date_to)
-    # Date filters use record.file_date when set (backlog filing month), else
-    # uploaded_at — applied after fetch so mixed rows stay correct.
+    # Push filing-day filter into Mongo so offset/batch paging stays correct.
+    if start is not None or end is not None:
+        fd_clause: dict[str, Any] = {}
+        up_clause: dict[str, Any] = {}
+        if start is not None:
+            fd_clause["$gte"] = start.strftime("%Y-%m-%d")
+            up_clause["$gte"] = start
+        if end is not None:
+            fd_clause["$lte"] = end.strftime("%Y-%m-%d")
+            up_clause["$lte"] = end
+        query["$and"] = list(query.get("$and") or []) + [
+            {
+                "$or": [
+                    {"record.file_date": fd_clause},
+                    {
+                        "$and": [
+                            {
+                                "$or": [
+                                    {"record.file_date": {"$exists": False}},
+                                    {"record.file_date": None},
+                                    {"record.file_date": ""},
+                                ]
+                            },
+                            {"uploaded_at": up_clause},
+                        ]
+                    },
+                ]
+            }
+        ]
+
     needle = (q or "").strip()
-    cap = max(1, min(int(limit), 500))
-    fetch_n = min(500, cap * 3 if (start is not None or end is not None) else cap)
+    # Page size for UI / batch export — not a hard ceiling on total export size.
+    cap = max(1, min(int(limit), 2_000))
+    skip_n = max(0, int(offset or 0))
     if needle:
         from .receipt_ops import find_receipt_files_matching_name
 
+        # Name search helpers don't always honor skip; over-fetch then slice.
+        fetch_n = min(10_000, skip_n + cap)
         docs = await find_receipt_files_matching_name(
             db, query, needle, limit=fetch_n
         )
+        docs = docs[skip_n : skip_n + cap]
     else:
-        docs = (
-            await db.receipt_files.find(query)
-            .sort("uploaded_at", -1)
-            .limit(fetch_n)
-            .to_list(length=fetch_n)
+        cursor = db.receipt_files.find(query).sort(
+            [("uploaded_at", -1), ("_id", -1)]
         )
+        # Only chain skip when needed — lightweight test doubles may omit it.
+        if skip_n > 0 and hasattr(cursor, "skip"):
+            cursor = cursor.skip(skip_n)
+        docs = await cursor.limit(cap).to_list(length=cap)
+    # Belt-and-suspenders day filter (covers odd legacy rows).
     if start is not None or end is not None:
         filtered: list[dict[str, Any]] = []
         for doc in docs:
@@ -1288,11 +1362,11 @@ async def list_record_files(
             if end is not None and effective > end:
                 continue
             filtered.append(doc)
-        docs = filtered[:cap]
-    else:
-        docs = docs[:cap]
+        docs = filtered
     items: list[dict[str, Any]] = [_serialize_record_file_row(doc) for doc in docs]
-    seen = {str(row.get("id") or "") for row in items}
+    if skip_ids:
+        items = [row for row in items if str(row.get("id") or "") not in skip_ids]
+    seen = {str(row.get("id") or "") for row in items} | skip_ids
 
     if (
         include_approved
@@ -1300,6 +1374,7 @@ async def list_record_files(
         and rk
         and not fid
         and len(items) < cap
+        and skip_n == 0
     ):
         bridged = await _approved_bridge_files(
             db,
@@ -1341,6 +1416,14 @@ def _pack_arcname(doc: dict[str, Any], *, used: set[str]) -> str:
     return name
 
 
+def _zip_compress_type_for(name: str) -> int:
+    """STORE for already-compressed payloads; DEFLATE only when it helps."""
+    suf = Path(name or "").suffix.lower()
+    if suf in _ZIP_STORE_SUFFIXES:
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED
+
+
 async def build_records_pack(
     db: Any,
     base: Path,
@@ -1352,48 +1435,71 @@ async def build_records_pack(
     date_from: date | datetime | None = None,
     date_to: date | datetime | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
-    """ZIP Records filings for the active destination filters (Manager handoff)."""
+    """ZIP Records filings — pages through matches (no hard file-count ceiling)."""
     ensure_records_workspace(base)
-    # Over-fetch one to detect cap overflow
-    rows = await list_record_files(
-        db,
-        kind=kind,
-        ref_key=ref_key,
-        folder_id=folder_id,
-        q=q,
-        date_from=date_from,
-        date_to=date_to,
-        limit=_MAX_PACK_FILES + 1,
-    )
-    if len(rows) > _MAX_PACK_FILES:
-        raise ValueError(
-            f"More than {_MAX_PACK_FILES} files match. Narrow the destination or dates."
-        )
-    ids = [str(r.get("id") or "") for r in rows if r.get("id")]
-    docs: list[dict[str, Any]] = []
-    if ids:
-        docs = await db.receipt_files.find({"_id": {"$in": ids}}).to_list(
-            length=len(ids) + 10
-        )
-        order = {fid: i for i, fid in enumerate(ids)}
-        docs.sort(key=lambda d: order.get(str(d.get("_id")), 10_000))
-
-    buf = io.BytesIO()
     used: set[str] = set()
     copied = 0
     missing = 0
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for doc in docs:
-            path = resolve_receipt_file_path(base, doc)
-            if path is None or not path.is_file():
-                missing += 1
-                continue
-            arc = _pack_arcname(doc, used=used)
-            try:
-                zf.write(path, arcname=arc)
-                copied += 1
-            except OSError:
-                missing += 1
+    offset = 0
+    page = _PACK_PAGE_SIZE
+
+    # Spooled file keeps small packs in RAM and large audit packs on disk.
+    spool = tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024)
+    with zipfile.ZipFile(
+        spool, "w", compression=zipfile.ZIP_STORED, allowZip64=True
+    ) as zf:
+        while True:
+            rows = await list_record_files(
+                db,
+                kind=kind,
+                ref_key=ref_key,
+                folder_id=folder_id,
+                q=q,
+                date_from=date_from,
+                date_to=date_to,
+                limit=page,
+                offset=offset,
+                include_approved=True,
+            )
+            if not rows:
+                break
+            ids = [str(r.get("id") or "") for r in rows if r.get("id")]
+            docs: list[dict[str, Any]] = []
+            if ids:
+                # IDs may be ObjectId hex or app UUIDs — match either form.
+                id_keys: list[Any] = []
+                for fid in ids:
+                    id_keys.append(fid)
+                    try:
+                        id_keys.append(ObjectId(fid))
+                    except Exception:
+                        pass
+                docs = await db.receipt_files.find(
+                    {"_id": {"$in": id_keys}}
+                ).to_list(length=len(ids) + 10)
+                order = {fid: i for i, fid in enumerate(ids)}
+                docs.sort(
+                    key=lambda d: order.get(str(d.get("_id")), 10_000)
+                )
+            for doc in docs:
+                path = resolve_receipt_file_path(base, doc)
+                if path is None or not path.is_file():
+                    missing += 1
+                    continue
+                arc = _pack_arcname(doc, used=used)
+                try:
+                    zf.write(
+                        path,
+                        arcname=arc,
+                        compress_type=_zip_compress_type_for(arc),
+                    )
+                    copied += 1
+                except OSError:
+                    missing += 1
+            offset += len(rows)
+            if len(rows) < page:
+                break
+
         readme = (
             "Tahmeed Paperwork → Records pack\n"
             f"kind={kind or 'any'} ref_key={ref_key or '-'} "
@@ -1402,7 +1508,9 @@ async def build_records_pack(
         )
         zf.writestr("README.txt", readme)
 
-    payload = buf.getvalue()
+    spool.seek(0)
+    payload = spool.read()
+    spool.close()
     digest = hashlib.sha256(payload).hexdigest()
     stamp = utcnow().strftime("%Y%m%d")
     kind_part = record_slug(kind or "all", fallback="all")

@@ -74,7 +74,10 @@ from tahmeed.services.receipt_chase_service import (
 from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
 from tahmeed.ui.dialogs.inbox_linked_entries_dialog import InboxLinkedEntriesDialog
 from tahmeed.ui.dialogs.person_receipt_dossier_dialog import PersonReceiptDossierDialog
-from tahmeed.services.receipt_records_service import upload_record_files
+from tahmeed.services.receipt_records_service import (
+    format_records_upload_progress,
+    upload_record_files,
+)
 from tahmeed.ui.dialogs.receipt_upload_destination_dialog import (
     ReceiptUploadDestinationDialog,
     UploadDestinationChoice,
@@ -4111,24 +4114,43 @@ class ReceiptChasePanel(QWidget):
                 hide_widget_loading(self)
             return
 
+        bytes_total = sum(
+            Path(p).stat().st_size for p in paths if Path(p).is_file()
+        )
+        bar_max = bytes_total if bytes_total > 0 else n
         with UploadBusy(
             self,
-            f"Uploading 0/{n}…",
+            format_records_upload_progress(0, n, 0, bytes_total),
             title="Records upload",
             cancellable=True,
         ) as busy:
-            busy.update(f"Uploading 0/{n}…", value=0, maximum=n)
+            busy.update(
+                format_records_upload_progress(0, n, 0, bytes_total),
+                value=0,
+                maximum=bar_max,
+            )
 
-            def on_progress(done: int, total: int, filename: str) -> None:
+            def on_progress(
+                files_done: int,
+                files_total: int,
+                bytes_done: int,
+                bytes_total_cb: int,
+                filename: str,
+            ) -> None:
                 busy.raise_if_cancelled()
-                if done >= total:
-                    busy.update("Finishing…", value=total, maximum=total)
-                else:
-                    busy.update(
-                        f"Uploading {done + 1}/{total} — {filename}",
-                        value=done,
-                        maximum=total,
-                    )
+                maximum = bytes_total_cb if bytes_total_cb > 0 else files_total
+                value = bytes_done if bytes_total_cb > 0 else files_done
+                busy.update(
+                    format_records_upload_progress(
+                        files_done,
+                        files_total,
+                        bytes_done,
+                        bytes_total_cb,
+                        filename,
+                    ),
+                    value=value,
+                    maximum=maximum,
+                )
 
             try:
                 result = await upload_record_files(

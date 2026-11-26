@@ -40,10 +40,13 @@ from tahmeed.services.api_client import ApiError
 from tahmeed.services.receipt_records_service import (
     create_custom_folder,
     delete_custom_folder,
-    download_records_pack,
+    export_records_zip_fast,
+    format_records_upload_progress,
+    format_upload_mib,
     list_destinations,
     list_record_files,
     move_record_files,
+    records_zip_stem,
     rename_custom_folder,
     upload_record_files,
 )
@@ -277,6 +280,36 @@ def _month_folder_label(month_key: str) -> str:
         return month_key
 
 
+def _month_key_from_label(label: str) -> str | None:
+    """Inverse of ``_month_folder_label`` for address-bar history restore."""
+    text = (label or "").strip()
+    if not text:
+        return None
+    if text.casefold() == "unknown month":
+        return "unknown"
+    try:
+        return datetime.strptime(text, "%B %Y").strftime("%Y-%m")
+    except ValueError:
+        return None
+
+
+def _month_date_bounds(month_key: str) -> tuple[str, str] | None:
+    """Inclusive YYYY-MM-DD range for a filing month key."""
+    import calendar
+
+    key = (month_key or "").strip()
+    if len(key) < 7 or key[4] != "-":
+        return None
+    try:
+        y = int(key[:4])
+        m = int(key[5:7])
+        start = date(y, m, 1)
+        end = date(y, m, calendar.monthrange(y, m)[1])
+        return start.isoformat(), end.isoformat()
+    except ValueError:
+        return None
+
+
 def _stripe(row: int) -> QColor:
     return QColor(_STRIPE if row % 2 else _ROW_EVEN)
 
@@ -297,6 +330,8 @@ class ReceiptRecordsPanel(QWidget):
         }
         self._selected: dict[str, Any] | None = None  # concrete destination
         self._month_key: str | None = None  # "YYYY-MM" when drilled into a filing month
+        # Set while restoring address history so _on_dest_changed keeps the month.
+        self._pending_history_month: str | None = None
         self._files: list[dict[str, Any]] = []
         self._content_rows: list[dict[str, Any]] = []  # folders + files for Explorer pane
         self._loading = False
@@ -786,7 +821,10 @@ class ReceiptRecordsPanel(QWidget):
         current: QTreeWidgetItem | None,
         _previous: QTreeWidgetItem | None,
     ) -> None:
-        self._month_key = None
+        # History restore may ask us to keep a filing-month drill-in.
+        pending_month = self._pending_history_month
+        self._pending_history_month = None
+        self._month_key = pending_month
         if current is None:
             self._selected = None
         else:
@@ -882,18 +920,103 @@ class ReceiptRecordsPanel(QWidget):
         if path:
             self._apply_address_path(path)
 
+    def _find_dest_by_name(self, kind: str, name: str) -> dict[str, Any] | None:
+        needle = (name or "").strip().casefold()
+        if not needle:
+            return None
+        for row in self._destinations.get(kind) or []:
+            labels = (
+                str(row.get("display_label") or ""),
+                str(row.get("label") or ""),
+                str(row.get("ref_key") or ""),
+            )
+            if any(lab.strip().casefold() == needle for lab in labels if lab.strip()):
+                return {**row, "kind": kind}
+        return None
+
+    def _current_folder_name(self) -> str:
+        if not self._selected:
+            return "All"
+        return str(
+            self._selected.get("display_label")
+            or self._selected.get("label")
+            or self._selected.get("ref_key")
+            or "All"
+        )
+
     def _apply_address_path(self, path: str) -> None:
-        """Best-effort restore kind from address history string."""
+        """Restore kind / folder / month from an address-bar history entry."""
         parts = [p.strip() for p in path.split(">") if p.strip()]
-        # Paperwork > Records > Items > …
+        # Paperwork > Records > Custom > Covernotes > August 2026
+        kind_key = self._kind
         if len(parts) >= 3:
             kind_label = parts[2]
             for key, lab, _ in _KINDS:
                 if lab.casefold() == kind_label.casefold():
-                    if key != self._kind:
-                        self._on_kind(key)
+                    kind_key = key
                     break
-        self._sync_records_address(push_history=False)
+
+        folder_name = parts[3] if len(parts) >= 4 else "All"
+        month_label = parts[4] if len(parts) >= 5 else ""
+        target_month = _month_key_from_label(month_label) if month_label else None
+        want_all = folder_name.casefold() == "all" or not folder_name.strip()
+
+        same_kind = kind_key == self._kind
+        same_folder = same_kind and (
+            (want_all and self._selected is None)
+            or (
+                not want_all
+                and self._selected is not None
+                and self._current_folder_name().casefold() == folder_name.casefold()
+            )
+        )
+
+        chrome = self._chrome
+        chrome._suppress_hist = True
+        try:
+            self._kind = kind_key
+            self._expanded_kinds.add(kind_key)
+            root = self._kind_roots.get(kind_key)
+            if root is not None:
+                root.setExpanded(True)
+
+            if same_folder:
+                # Tree selection unchanged — currentItemChanged will not fire.
+                self._month_key = target_month
+                self._sync_records_address(push_history=False)
+                self._sync_up_enabled()
+                schedule_coro(self._load_files())
+                return
+
+            # Stash month so _on_dest_changed does not wipe it before load.
+            self._pending_history_month = target_month if not want_all else None
+
+            if want_all:
+                if root is not None:
+                    self._dest_tree.setCurrentItem(root)
+                else:
+                    self._pending_history_month = None
+                    self._selected = None
+                    self._month_key = None
+                    schedule_coro(self._load_files())
+            else:
+                hit = self._find_dest_by_name(kind_key, folder_name)
+                if hit:
+                    self._reselect(hit)
+                elif root is not None:
+                    self._pending_history_month = None
+                    self._dest_tree.setCurrentItem(root)
+                else:
+                    self._pending_history_month = None
+                    self._selected = None
+                    self._month_key = None
+                    schedule_coro(self._load_files())
+
+            self._sync_records_address(push_history=False)
+            self._sync_up_enabled()
+        finally:
+            chrome._suppress_hist = False
+            self._pending_history_month = None
 
     def _child_folders(self) -> list[dict[str, Any]]:
         """Folders shown inside the current Explorer location."""
@@ -956,6 +1079,9 @@ class ReceiptRecordsPanel(QWidget):
         upload_act = menu.addAction("Upload files…")
         upload_act.setIcon(qta.icon("mdi.upload-outline", color=_TEXT))
         upload_act.setEnabled(not is_root and self._selected is not None)
+        zip_act = menu.addAction("Download ZIP")
+        zip_act.setIcon(qta.icon("mdi.zip-box-outline", color=_TEXT))
+        zip_act.setEnabled(True)
 
         new_act = sub_act = rename_act = delete_act = None
         if is_custom_root or is_custom_folder:
@@ -981,6 +1107,8 @@ class ReceiptRecordsPanel(QWidget):
             schedule_coro(self.refresh())
         elif chosen == upload_act:
             schedule_coro(self._upload())
+        elif chosen == zip_act:
+            schedule_coro(self._download_pack())
         elif new_act is not None and chosen == new_act:
             schedule_coro(self._new_custom())
         elif sub_act is not None and chosen == sub_act:
@@ -1000,6 +1128,8 @@ class ReceiptRecordsPanel(QWidget):
         open_act.setIcon(qta.icon("mdi.folder-open-outline", color=_TEXT))
         view_act = menu.addAction("View")
         view_act.setIcon(qta.icon("mdi.eye-outline", color=_TEXT))
+        zip_act = menu.addAction("Download ZIP")
+        zip_act.setIcon(qta.icon("mdi.zip-box-outline", color=_TEXT))
         menu.addSeparator()
         if self._kind == "custom":
             new_act = menu.addAction("New folder…")
@@ -1028,6 +1158,7 @@ class ReceiptRecordsPanel(QWidget):
         file_rows = [r for r in rows if r.get("_row_kind") == "file"]
         open_act.setEnabled(bool(rows))
         view_act.setEnabled(bool(file_rows or month_rows or folder_rows))
+        zip_act.setEnabled(bool(folder_rows or month_rows or file_rows or self._selected))
         cut_act.setEnabled(bool(file_rows))
         copy_act.setEnabled(bool(file_rows))
         paste_act.setEnabled(bool(self._clip and self._clip.get("files")))
@@ -1042,6 +1173,13 @@ class ReceiptRecordsPanel(QWidget):
                 self._view_selected()
         elif chosen == view_act:
             self._view_selected()
+        elif chosen == zip_act:
+            schedule_coro(
+                self._download_pack_from_rows(
+                    folder_rows=folder_rows,
+                    month_rows=month_rows,
+                )
+            )
         elif new_act is not None and chosen == new_act:
             schedule_coro(self._new_custom())
         elif sub_act is not None and chosen == sub_act:
@@ -1811,29 +1949,52 @@ class ReceiptRecordsPanel(QWidget):
         file_date = self._file_as.date().toString("yyyy-MM-dd")
         file_ym = self._file_as.date().toString("yyyy/MM")
         n = len(paths)
+        bytes_total = sum(
+            Path(p).stat().st_size for p in paths if Path(p).is_file()
+        )
+        bar_max = bytes_total if bytes_total > 0 else n
         with UploadBusy(
             self,
-            f"Uploading 0/{n} → …/{file_ym}/",
+            format_records_upload_progress(
+                0, n, 0, bytes_total, suffix=f"Browse folder …/{file_ym}/"
+            ),
             title="Records upload",
             cancellable=True,
         ) as busy:
-            busy.update(f"Uploading 0/{n} → …/{file_ym}/", value=0, maximum=n)
+            busy.update(
+                format_records_upload_progress(
+                    0, n, 0, bytes_total, suffix=f"Browse folder …/{file_ym}/"
+                ),
+                value=0,
+                maximum=bar_max,
+            )
 
-            def on_progress(done: int, total: int, filename: str) -> None:
+            def on_progress(
+                files_done: int,
+                files_total: int,
+                bytes_done: int,
+                bytes_total_cb: int,
+                filename: str,
+            ) -> None:
                 busy.raise_if_cancelled()
-                if done >= total:
-                    busy.update(
-                        f"Finishing → …/{file_ym}/",
-                        value=total,
-                        maximum=total,
-                    )
-                else:
-                    busy.update(
-                        f"Uploading {done + 1}/{total} — {filename}\n"
-                        f"Browse folder …/{file_ym}/",
-                        value=done,
-                        maximum=total,
-                    )
+                maximum = bytes_total_cb if bytes_total_cb > 0 else files_total
+                value = (
+                    bytes_done
+                    if bytes_total_cb > 0
+                    else files_done
+                )
+                busy.update(
+                    format_records_upload_progress(
+                        files_done,
+                        files_total,
+                        bytes_done,
+                        bytes_total_cb,
+                        filename,
+                        suffix=f"Browse folder …/{file_ym}/",
+                    ),
+                    value=value,
+                    maximum=maximum,
+                )
 
             try:
                 result = await upload_record_files(
@@ -1881,50 +2042,174 @@ class ReceiptRecordsPanel(QWidget):
                     f"{exc}\n\nNo files from this batch were kept.",
                 )
 
-    def _pack_filters(self) -> dict[str, str]:
-        kwargs: dict[str, str] = {
-            "kind": self._kind,
-            "q": self._search.text().strip(),
-            "date_from": self._date_from.date().toString("yyyy-MM-dd"),
-            "date_to": self._date_to.date().toString("yyyy-MM-dd"),
-        }
-        if self._selected:
-            if self._kind == "custom" and self._selected.get("id"):
-                kwargs["folder_id"] = str(self._selected["id"])
+    def _folder_label_for_pack(self, folder: dict[str, Any] | None = None) -> str:
+        src = folder if folder is not None else self._selected
+        if not src:
+            kind_label = next(
+                (lab for k, lab, _ in _KINDS if k == self._kind), self._kind
+            )
+            return f"All {kind_label}"
+        return str(
+            src.get("display_label")
+            or src.get("label")
+            or src.get("ref_key")
+            or "folder"
+        )
+
+    def _pack_default_name(
+        self,
+        *,
+        folder: dict[str, Any] | None = None,
+        month_key: str = "",
+    ) -> str:
+        folder_label = self._folder_label_for_pack(folder)
+        month = (month_key or self._month_key or "").strip()
+        month_label = _month_folder_label(month) if month else ""
+        return f"{records_zip_stem(folder_label, month_label)}.zip"
+
+    def _pack_filters(
+        self,
+        *,
+        folder: dict[str, Any] | None = None,
+        month_key: str = "",
+        include_search: bool = True,
+    ) -> dict[str, str]:
+        """Build list/pack filters for the current view or a targeted folder/month."""
+        target = folder if folder is not None else self._selected
+        kind = str((target or {}).get("kind") or self._kind)
+        kwargs: dict[str, str] = {"kind": kind, "q": "", "ref_key": "", "folder_id": ""}
+        if include_search:
+            kwargs["q"] = self._search.text().strip()
+
+        if target:
+            if kind == "custom" and target.get("id"):
+                kwargs["folder_id"] = str(target["id"])
             else:
-                kwargs["ref_key"] = str(self._selected.get("ref_key") or "")
+                kwargs["ref_key"] = str(target.get("ref_key") or "")
+
+        month = (month_key or "").strip() or (
+            "" if folder is not None else (self._month_key or "")
+        )
+        bounds = _month_date_bounds(month) if month else None
+        if bounds:
+            kwargs["date_from"], kwargs["date_to"] = bounds
+        else:
+            kwargs["date_from"] = self._date_from.date().toString("yyyy-MM-dd")
+            kwargs["date_to"] = self._date_to.date().toString("yyyy-MM-dd")
         return kwargs
 
-    async def _download_pack(self) -> None:
-        if not self._files:
-            # Still allow pack from server filters even if table empty after a failed load
-            pass
+    async def _download_pack_from_rows(
+        self,
+        *,
+        folder_rows: list[dict[str, Any]] | None = None,
+        month_rows: list[dict[str, Any]] | None = None,
+    ) -> None:
+        folder_rows = folder_rows or []
+        month_rows = month_rows or []
+        if month_rows:
+            month_key = str(month_rows[0].get("month_key") or "")
+            await self._download_pack(month_key=month_key)
+            return
+        if folder_rows:
+            folder = dict(folder_rows[0].get("folder") or {})
+            await self._download_pack(folder=folder)
+            return
+        await self._download_pack()
+
+    async def _download_pack(
+        self,
+        *,
+        folder: dict[str, Any] | None = None,
+        month_key: str = "",
+    ) -> None:
         from tahmeed.ui.file_dialogs import get_save_file_name
 
+        default_name = self._pack_default_name(folder=folder, month_key=month_key)
         path, _ = await await_blocking(
             lambda: get_save_file_name(
                 self,
                 "Save Records ZIP",
-                "tahmeed-records.zip",
+                default_name,
                 "ZIP files (*.zip)",
             )
         )
         if not path:
             return
-        show_widget_loading(self, "Building Records pack…")
-        try:
-            payload, meta = await download_records_pack(**self._pack_filters())
-            out = Path(path)
-            if out.suffix.lower() != ".zip":
-                out = out.with_suffix(".zip")
-            out.write_bytes(payload)
-            count = meta.get("file_count") or "?"
-            self._status.setText(
-                f"Saved Records pack ({count} file(s)) → {out.name}"
-            )
-        except ApiError as exc:
-            QMessageBox.warning(self, "Pack failed", str(exc))
-        except Exception as exc:
-            QMessageBox.critical(self, "Pack failed", str(exc))
-        finally:
-            hide_widget_loading(self)
+
+        filters = self._pack_filters(folder=folder, month_key=month_key)
+        with UploadBusy(
+            self,
+            "Preparing download…",
+            title="Download ZIP",
+            cancellable=True,
+        ) as busy:
+            busy.update("Listing files…", value=0, maximum=100)
+
+            def on_progress(
+                files_done: int,
+                files_total: int,
+                bytes_done: int,
+                bytes_total: int,
+                phase: str,
+                detail: str,
+            ) -> None:
+                busy.raise_if_cancelled()
+                if phase == "listing":
+                    busy.update("Listing files…", value=0, maximum=100)
+                    return
+                if phase == "zipping":
+                    busy.update(
+                        f"Writing ZIP…\n{files_done}/{files_total} files",
+                        value=max(files_total, 1),
+                        maximum=max(files_total, 1),
+                    )
+                    return
+                if phase == "done":
+                    maximum = bytes_total if bytes_total > 0 else max(files_total, 1)
+                    value = bytes_done if bytes_total > 0 else files_done
+                    busy.update(
+                        f"Saved {detail}\n"
+                        f"{files_done}/{files_total} files · {format_upload_mib(bytes_done)}",
+                        value=value,
+                        maximum=maximum,
+                    )
+                    return
+                maximum = bytes_total if bytes_total > 0 else max(files_total, 1)
+                value = bytes_done if bytes_total > 0 else files_done
+                left = max(0, (bytes_total or 0) - (bytes_done or 0))
+                busy.update(
+                    f"Downloading {files_done}/{files_total} files"
+                    + (f" · {detail}" if detail else "")
+                    + f"\n{format_upload_mib(bytes_done)} of "
+                    f"{format_upload_mib(bytes_total)} · {format_upload_mib(left)} left",
+                    value=value,
+                    maximum=maximum,
+                )
+
+            try:
+                result = await export_records_zip_fast(
+                    path,
+                    kind=filters.get("kind") or self._kind,
+                    ref_key=filters.get("ref_key") or "",
+                    folder_id=filters.get("folder_id") or "",
+                    q=filters.get("q") or "",
+                    date_from=filters.get("date_from") or "",
+                    date_to=filters.get("date_to") or "",
+                    on_progress=on_progress,
+                    should_cancel=busy.should_cancel,
+                )
+                count = int(result.get("file_count") or 0)
+                missing = int(result.get("missing") or 0)
+                out_name = Path(str(result.get("path") or path)).name
+                msg = f"Saved {count} file(s) → {out_name}"
+                if missing:
+                    msg += f" · {missing} missing"
+                self._status.setText(msg)
+            except (UploadCancelled, InterruptedError):
+                self._status.setText("Download cancelled.")
+            except ApiError as exc:
+                QMessageBox.warning(self, "Pack failed", str(exc))
+            except ValueError as exc:
+                QMessageBox.information(self, "Download ZIP", str(exc))
+            except Exception as exc:
+                QMessageBox.critical(self, "Pack failed", str(exc))
