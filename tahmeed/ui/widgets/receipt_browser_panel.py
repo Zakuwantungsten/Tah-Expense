@@ -12,6 +12,7 @@ from typing import Any
 
 import qtawesome as qta
 from PySide6.QtCore import QDate, Qt
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -43,6 +44,7 @@ from tahmeed.services.receipt_storage_service import (
     list_storage_objects,
     list_storage_tree,
 )
+from tahmeed.ui.widgets.popup_styles import with_light_popups
 from tahmeed.ui.widgets.receipt_file_viewer import open_receipt_viewer
 
 _BG = "#F3F4F6"
@@ -52,6 +54,61 @@ _MUTED = "#6B7280"
 _BORDER = "#E5E7EB"
 _PRIMARY = "#1B2B4B"
 _FOLDER = "#D97706"
+_ACCENT = "#0077C5"
+_SEL = "#E0F2FE"
+
+_PAGE_SS = with_light_popups(
+    f"QWidget#ReceiptBrowserPanel {{ background: {_BG}; color: {_TEXT}; }}"
+)
+_TAB_SS = with_light_popups(f"""
+QTabWidget::pane {{
+  border:1px solid {_BORDER}; border-radius:8px; top:-1px; background:{_CARD};
+}}
+QTabBar::tab {{
+  background:{_CARD}; color:{_MUTED}; font:600 12px 'Segoe UI';
+  padding:8px 14px; margin-right:2px; border:1px solid transparent;
+  border-bottom:2px solid transparent; border-top-left-radius:6px;
+  border-top-right-radius:6px;
+}}
+QTabBar::tab:selected {{
+  color:{_ACCENT}; background:{_CARD}; border-bottom:2px solid {_ACCENT};
+}}
+QTabBar::tab:hover {{ color:{_TEXT}; background:#F8FAFC; }}
+""")
+_INPUT_SS = (
+    f"QLineEdit,QDateEdit{{font:12px 'Segoe UI';color:{_TEXT};"
+    f"border:1px solid {_BORDER};border-radius:6px;padding:4px 8px;"
+    f"background:{_CARD};min-height:28px;selection-background-color:{_SEL};"
+    f"selection-color:{_TEXT};}}"
+    f"QLineEdit:focus,QDateEdit:focus{{border-color:{_ACCENT};}}"
+)
+_TREE_SS = with_light_popups(f"""
+QTreeWidget {{
+  border:none; background:{_CARD}; color:{_TEXT}; font:13px 'Segoe UI';
+  outline:none;
+}}
+QTreeWidget::item {{
+  padding:4px 2px; color:{_TEXT}; background:transparent;
+}}
+QTreeWidget::item:hover {{ background:#F8FAFC; color:{_TEXT}; }}
+QTreeWidget::item:selected {{
+  background:{_SEL}; color:{_TEXT};
+}}
+QTreeWidget::item:selected:active {{
+  background:{_SEL}; color:{_TEXT};
+}}
+""")
+_TABLE_SS = with_light_popups(f"""
+QTableWidget {{
+  border:none; background:{_CARD}; color:{_TEXT}; font:12px 'Segoe UI';
+  gridline-color:#F3F4F6; alternate-background-color:#F8FAFC;
+  selection-background-color:{_SEL}; selection-color:{_TEXT};
+}}
+QHeaderView::section {{
+  background:{_BG}; border:none; padding:6px;
+  font:600 11px 'Segoe UI'; color:{_MUTED};
+}}
+""")
 
 
 def _ghost(text: str, icon: str) -> QPushButton:
@@ -86,11 +143,22 @@ def _fmt_size(n: int) -> str:
     return f"{n / (1024 * 1024):.1f} MB"
 
 
+def _tree_item(label: str, *, icon=None) -> QTreeWidgetItem:
+    """Tree row with forced dark text — OS dark mode otherwise paints white-on-white."""
+    item = QTreeWidgetItem([label])
+    item.setForeground(0, QBrush(QColor(_TEXT)))
+    if icon is not None:
+        item.setIcon(0, icon)
+    return item
+
+
 class ReceiptBrowserPanel(QWidget):
     """Windows/bucket-style browse of the receipt disk + pack/download tools."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("ReceiptBrowserPanel")
+        self.setStyleSheet(_PAGE_SS)
         self._prefix = ""
         self._objects: list[dict[str, Any]] = []
         self._day_rows: list[dict[str, Any]] = []
@@ -119,17 +187,15 @@ class ReceiptBrowserPanel(QWidget):
 
         self._tabs = QTabWidget()
         self._tabs.setDocumentMode(True)
-        self._tabs.setStyleSheet(
-            f"QTabWidget::pane{{border:1px solid {_BORDER}; border-radius:8px; background:{_CARD};}}"
-            f"QTabBar::tab{{padding:8px 14px; font:600 12px 'Segoe UI'; color:{_MUTED};}}"
-            f"QTabBar::tab:selected{{color:{_TEXT};}}"
-        )
+        self._tabs.setStyleSheet(_TAB_SS)
         self._tabs.addTab(self._build_explorer_tab(), "Explorer")
         self._tabs.addTab(self._build_pack_tab(), "Pack & download")
         root.addWidget(self._tabs, 1)
 
         self._status = QLabel("")
-        self._status.setStyleSheet(f"color:{_MUTED}; font:11px 'Segoe UI';")
+        self._status.setStyleSheet(
+            f"color:{_MUTED}; font:11px 'Segoe UI'; background:transparent;"
+        )
         root.addWidget(self._status)
 
     # ── Explorer (directory / bucket) ─────────────────────────────────────
@@ -155,6 +221,7 @@ class ReceiptBrowserPanel(QWidget):
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search filename or sha256 in this folder…")
         self._search.setClearButtonEnabled(True)
+        self._search.setStyleSheet(_INPUT_SS)
         self._search.returnPressed.connect(
             lambda: asyncio.ensure_future(self._load_objects())
         )
@@ -191,16 +258,14 @@ class ReceiptBrowserPanel(QWidget):
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(6, 6, 6, 6)
         folders_lbl = QLabel("Folders")
-        folders_lbl.setStyleSheet(f"color:{_MUTED}; font:600 11px 'Segoe UI';")
+        folders_lbl.setStyleSheet(
+            f"color:{_MUTED}; font:600 11px 'Segoe UI'; background:transparent;"
+        )
         left_lay.addWidget(folders_lbl)
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
         self._tree.setAnimated(True)
-        self._tree.setStyleSheet(
-            "QTreeWidget{border:none; font:13px 'Segoe UI';}"
-            "QTreeWidget::item{padding:4px 2px;}"
-            "QTreeWidget::item:selected{background:#E8EEF7; color:#111827;}"
-        )
+        self._tree.setStyleSheet(_TREE_SS)
         self._tree.itemExpanded.connect(self._on_tree_expand)
         self._tree.itemClicked.connect(self._on_tree_click)
         left_lay.addWidget(self._tree, 1)
@@ -213,7 +278,9 @@ class ReceiptBrowserPanel(QWidget):
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(6, 6, 6, 6)
         files_lbl = QLabel("Files in folder  (multi-select for download)")
-        files_lbl.setStyleSheet(f"color:{_MUTED}; font:600 11px 'Segoe UI';")
+        files_lbl.setStyleSheet(
+            f"color:{_MUTED}; font:600 11px 'Segoe UI'; background:transparent;"
+        )
         right_lay.addWidget(files_lbl)
         self._table = QTableWidget(0, 5)
         self._table.setHorizontalHeaderLabels(
@@ -229,11 +296,7 @@ class ReceiptBrowserPanel(QWidget):
         hdr = self._table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.Stretch)
         hdr.setStretchLastSection(True)
-        self._table.setStyleSheet(
-            f"QTableWidget{{border:none; font:12px 'Segoe UI';}}"
-            f"QHeaderView::section{{background:{_BG}; border:none; padding:6px; "
-            f"font:600 11px 'Segoe UI'; color:{_MUTED};}}"
-        )
+        self._table.setStyleSheet(_TABLE_SS)
         self._table.cellDoubleClicked.connect(lambda *_: self._view_selected())
         right_lay.addWidget(self._table, 1)
         split.addWidget(right)
@@ -255,7 +318,9 @@ class ReceiptBrowserPanel(QWidget):
             "(pack itself uses transaction date, same as evidence consolidate)."
         )
         tip.setWordWrap(True)
-        tip.setStyleSheet(f"color:{_MUTED}; font:11px 'Segoe UI';")
+        tip.setStyleSheet(
+            f"color:{_MUTED}; font:11px 'Segoe UI'; background:transparent;"
+        )
         lay.addWidget(tip)
 
         filters = QHBoxLayout()
@@ -263,22 +328,36 @@ class ReceiptBrowserPanel(QWidget):
         self._pack_from.setCalendarPopup(True)
         self._pack_from.setDisplayFormat("yyyy-MM-dd")
         self._pack_from.setDate(QDate.currentDate().addMonths(-1))
+        self._pack_from.setStyleSheet(_INPUT_SS)
         self._pack_to = QDateEdit()
         self._pack_to.setCalendarPopup(True)
         self._pack_to.setDisplayFormat("yyyy-MM-dd")
         self._pack_to.setDate(QDate.currentDate())
+        self._pack_to.setStyleSheet(_INPUT_SS)
         self._pack_item = QLineEdit()
         self._pack_item.setPlaceholderText("Item (optional)")
+        self._pack_item.setStyleSheet(_INPUT_SS)
         self._pack_payee = QLineEdit()
         self._pack_payee.setPlaceholderText("Payee (optional)")
+        self._pack_payee.setStyleSheet(_INPUT_SS)
         self._pack_own = QLineEdit()
         self._pack_own.setPlaceholderText("Ownership (optional)")
+        self._pack_own.setStyleSheet(_INPUT_SS)
         self._pack_approved = QCheckBox("Approved only")
         self._pack_approved.setChecked(True)
-        filters.addWidget(QLabel("From"))
-        filters.addWidget(self._pack_from)
-        filters.addWidget(QLabel("To"))
-        filters.addWidget(self._pack_to)
+        self._pack_approved.setStyleSheet(
+            f"QCheckBox{{color:{_TEXT};font:12px 'Segoe UI';background:transparent;}}"
+        )
+        for text in ("From", "To"):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f"color:{_MUTED};font:11px 'Segoe UI';background:transparent;"
+            )
+            filters.addWidget(lbl)
+            if text == "From":
+                filters.addWidget(self._pack_from)
+            else:
+                filters.addWidget(self._pack_to)
         filters.addWidget(self._pack_item, 1)
         filters.addWidget(self._pack_payee, 1)
         filters.addWidget(self._pack_own, 1)
@@ -318,7 +397,9 @@ class ReceiptBrowserPanel(QWidget):
         lay.addLayout(actions)
 
         days_lbl = QLabel("Receipts by upload day (select rows, then Pack selected days)")
-        days_lbl.setStyleSheet(f"color:{_TEXT}; font:600 12px 'Segoe UI';")
+        days_lbl.setStyleSheet(
+            f"color:{_TEXT}; font:600 12px 'Segoe UI'; background:transparent;"
+        )
         lay.addWidget(days_lbl)
         self._days = QTableWidget(0, 4)
         self._days.setHorizontalHeaderLabels(
@@ -332,9 +413,8 @@ class ReceiptBrowserPanel(QWidget):
         self._days.setShowGrid(False)
         self._days.horizontalHeader().setStretchLastSection(True)
         self._days.setStyleSheet(
-            f"QTableWidget{{border:1px solid {_BORDER}; border-radius:6px; font:12px 'Segoe UI';}}"
-            f"QHeaderView::section{{background:{_BG}; border:none; padding:6px; "
-            f"font:600 11px 'Segoe UI'; color:{_MUTED};}}"
+            _TABLE_SS
+            + f"QTableWidget{{border:1px solid {_BORDER}; border-radius:6px;}}"
         )
         lay.addWidget(self._days, 1)
         return page
@@ -383,12 +463,15 @@ class ReceiptBrowserPanel(QWidget):
             return
         # Build only after await so we never touch items cleared by a concurrent reload.
         self._tree.clear()
-        root = QTreeWidgetItem(["Receipt disk"])
-        root.setIcon(0, qta.icon("mdi.harddisk", color=_PRIMARY))
+        root = _tree_item(
+            "Receipt disk", icon=qta.icon("mdi.harddisk", color=_PRIMARY)
+        )
         root.setData(0, Qt.UserRole, {"prefix": "", "loaded": True})
         for folder in tree.get("folders") or []:
-            child = QTreeWidgetItem([str(folder.get("name") or "")])
-            child.setIcon(0, qta.icon("mdi.folder", color=_FOLDER))
+            child = _tree_item(
+                str(folder.get("name") or ""),
+                icon=qta.icon("mdi.folder", color=_FOLDER),
+            )
             child.setData(
                 0,
                 Qt.UserRole,
@@ -396,7 +479,7 @@ class ReceiptBrowserPanel(QWidget):
             )
             child.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
             # Placeholder so expand chevron appears
-            child.addChild(QTreeWidgetItem(["…"]))
+            child.addChild(_tree_item("…"))
             root.addChild(child)
         self._tree.addTopLevelItem(root)
         root.setExpanded(True)
@@ -445,15 +528,17 @@ class ReceiptBrowserPanel(QWidget):
         while item.childCount():
             item.removeChild(item.child(0))
         for folder in tree.get("folders") or []:
-            child = QTreeWidgetItem([str(folder.get("name") or "")])
-            child.setIcon(0, qta.icon("mdi.folder", color=_FOLDER))
+            child = _tree_item(
+                str(folder.get("name") or ""),
+                icon=qta.icon("mdi.folder", color=_FOLDER),
+            )
             child.setData(
                 0,
                 Qt.UserRole,
                 {"prefix": str(folder.get("prefix") or ""), "loaded": False},
             )
             child.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-            child.addChild(QTreeWidgetItem(["…"]))
+            child.addChild(_tree_item("…"))
             item.addChild(child)
         data["loaded"] = True
         item.setData(0, Qt.UserRole, data)
@@ -488,6 +573,7 @@ class ReceiptBrowserPanel(QWidget):
             ]
             for c, cell in enumerate(values):
                 cell.setData(Qt.UserRole, row)
+                cell.setForeground(QBrush(QColor(_TEXT)))
                 self._table.setItem(r, c, cell)
         self._status.setText(
             f"{self._prefix or 'root'} · {len(self._objects)} file(s)"
@@ -639,6 +725,7 @@ class ReceiptBrowserPanel(QWidget):
             ):
                 cell = QTableWidgetItem(value)
                 cell.setData(Qt.UserRole, rec)
+                cell.setForeground(QBrush(QColor(_TEXT)))
                 self._days.setItem(r, c, cell)
         self._status.setText(
             f"Scan: {len(rows)} file(s) across {len(self._day_rows)} day(s)"

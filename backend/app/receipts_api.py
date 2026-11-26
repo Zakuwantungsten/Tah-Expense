@@ -67,6 +67,7 @@ from .receipt_records_ops import (
     list_custom_folders,
     list_record_destinations,
     list_record_files,
+    parse_record_file_date,
     rename_custom_folder,
     resolve_record_destination,
     store_record_file_bytes,
@@ -1418,6 +1419,7 @@ async def post_records_upload(
     ref_key: str = Form(""),
     folder_id: str = Form(""),
     note: str = Form(""),
+    file_date: str = Form(""),
 ) -> dict[str, Any]:
     """Bulk file into Records under Item / Supplier / Separate / Custom."""
     if not files:
@@ -1432,6 +1434,11 @@ async def post_records_upload(
         )
     except ValueError as exc:
         raise ApiError(422, "invalid_destination", str(exc)) from None
+
+    try:
+        filed_on = parse_record_file_date(file_date or None)
+    except ValueError as exc:
+        raise ApiError(422, "invalid_file_date", str(exc)) from None
 
     actor_id = _actor_oid(actor)
     note_clean = " ".join((note or "").split())[:2000]
@@ -1454,6 +1461,7 @@ async def post_records_upload(
                 actor_id=actor_id,
                 note="",
                 claimed_content_type=upload.content_type,
+                file_date=filed_on,
             )
         except ValueError as exc:
             raise ApiError(422, "invalid_attachment", str(exc)) from None
@@ -1471,6 +1479,7 @@ async def post_records_upload(
             "Tahmeed Records — upload note\n"
             f"Destination: {destination.get('label') or destination.get('ref_key') or ''}\n"
             f"Type: {destination.get('kind') or ''}\n"
+            f"File as date: {filed_on.isoformat()}\n"
             f"Files in this upload: {len(saved)}\n"
             "-----\n"
             f"{note_clean}\n"
@@ -1485,6 +1494,7 @@ async def post_records_upload(
                 actor_id=actor_id,
                 note=note_clean[:500],
                 claimed_content_type="text/plain",
+                file_date=filed_on,
             )
             saved.append(note_file)
         except (ValueError, OSError):
@@ -1504,6 +1514,7 @@ async def post_records_upload(
             "ref_key": destination.get("ref_key"),
             "folder_id": destination.get("folder_id"),
             "label": destination.get("label"),
+            "file_date": filed_on.isoformat(),
             "note_file": bool(note_file),
             "has_note": bool(note_clean),
         },
@@ -1512,6 +1523,7 @@ async def post_records_upload(
         "files": json_safe(saved),
         "total": len(saved),
         "destination": json_safe(destination),
+        "file_date": filed_on.isoformat(),
         "note_file": json_safe(note_file) if note_file else None,
     }
 

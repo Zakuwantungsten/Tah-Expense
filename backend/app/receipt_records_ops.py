@@ -110,6 +110,23 @@ def _as_day_end(value: date | datetime | None) -> datetime | None:
     return start.replace(hour=23, minute=59, second=59, microsecond=999999)
 
 
+def parse_record_file_date(value: date | datetime | str | None) -> date:
+    """Normalize optional filing date (backlog month/day). Defaults to today UTC."""
+    if value is None or value == "":
+        return utcnow().date()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC).date()
+        return value.astimezone(UTC).date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()[:10]
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("file_date must be YYYY-MM-DD") from exc
+
+
 def _parent_id_str(doc: dict[str, Any] | None) -> str | None:
     if not doc:
         return None
@@ -586,8 +603,13 @@ async def store_record_file_bytes(
     actor_id: ObjectId | None = None,
     note: str = "",
     claimed_content_type: str | None = None,
+    file_date: date | datetime | str | None = None,
 ) -> dict[str, Any]:
-    """Validate, store under ``files/``, materialize under ``records/…``, index."""
+    """Validate, store under ``files/``, materialize under ``records/…``, index.
+
+    ``file_date`` controls the browse ``YYYY/MM`` folder (backlog). ``uploaded_at``
+    remains the real upload timestamp.
+    """
     ensure_records_workspace(base)
     try:
         checked = validate_receipt_upload(
@@ -618,7 +640,11 @@ async def store_record_file_bytes(
     dest_file = workspace["files"] / stored_name
     checksum = hashlib.sha256(content).hexdigest()
     now = utcnow()
-    browse_rel = _records_browse_rel(destination, stored_name=stored_name, when=now)
+    filed_on = parse_record_file_date(file_date)
+    filed_at = datetime(filed_on.year, filed_on.month, filed_on.day, tzinfo=UTC)
+    browse_rel = _records_browse_rel(
+        destination, stored_name=stored_name, when=filed_at
+    )
     browse_abs = attachments_root(base) / Path(*browse_rel.split("/"))
 
     try:
@@ -638,6 +664,7 @@ async def store_record_file_bytes(
     path_slugs = [
         str(s) for s in (destination.get("path_slugs") or []) if str(s or "").strip()
     ]
+    file_date_iso = filed_on.isoformat()
     record_block = {
         "kind": destination["kind"],
         "folder_id": destination.get("folder_id"),
@@ -647,6 +674,7 @@ async def store_record_file_bytes(
         "path_slugs": path_slugs,
         "path": browse_rel,
         "note": note_clean,
+        "file_date": file_date_iso,
     }
     meta = {
         "id": file_id,
@@ -691,6 +719,26 @@ async def store_record_file_bytes(
     return meta
 
 
+def _effective_record_day(doc: dict[str, Any]) -> datetime | None:
+    """Filing day for filters: record.file_date, else uploaded_at."""
+    rec = doc.get("record") or {}
+    raw = rec.get("file_date")
+    if raw not in (None, ""):
+        try:
+            day = parse_record_file_date(raw)
+            return datetime(day.year, day.month, day.day, tzinfo=UTC)
+        except ValueError:
+            pass
+    uploaded = doc.get("uploaded_at")
+    if isinstance(uploaded, datetime):
+        if uploaded.tzinfo is None:
+            return uploaded.replace(tzinfo=UTC)
+        return uploaded.astimezone(UTC)
+    if isinstance(uploaded, date):
+        return datetime(uploaded.year, uploaded.month, uploaded.day, tzinfo=UTC)
+    return None
+
+
 def _serialize_record_file_row(
     doc: dict[str, Any], *, synthetic_record: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -714,6 +762,7 @@ def _serialize_record_file_row(
             "path_slugs": list(rec.get("path_slugs") or []),
             "path": rec.get("path") or "",
             "note": rec.get("note") or "",
+            "file_date": rec.get("file_date") or None,
             "from_approved": bool(rec.get("from_approved")),
         },
     }
@@ -859,25 +908,34 @@ async def list_record_files(
 
     start = _as_day_start(date_from)
     end = _as_day_end(date_to)
-    if start is not None or end is not None:
-        span: dict[str, Any] = {}
-        if start is not None:
-            span["$gte"] = start
-        if end is not None:
-            span["$lte"] = end
-        query["uploaded_at"] = span
-
+    # Date filters use record.file_date when set (backlog filing month), else
+    # uploaded_at — applied after fetch so mixed rows stay correct.
     needle = (q or "").strip()
     if needle:
         query["original_filename"] = {"$regex": re.escape(needle), "$options": "i"}
 
     cap = max(1, min(int(limit), 500))
+    fetch_n = min(500, cap * 3 if (start is not None or end is not None) else cap)
     docs = (
         await db.receipt_files.find(query)
         .sort("uploaded_at", -1)
-        .limit(cap)
-        .to_list(length=cap)
+        .limit(fetch_n)
+        .to_list(length=fetch_n)
     )
+    if start is not None or end is not None:
+        filtered: list[dict[str, Any]] = []
+        for doc in docs:
+            effective = _effective_record_day(doc)
+            if effective is None:
+                continue
+            if start is not None and effective < start:
+                continue
+            if end is not None and effective > end:
+                continue
+            filtered.append(doc)
+        docs = filtered[:cap]
+    else:
+        docs = docs[:cap]
     items: list[dict[str, Any]] = [_serialize_record_file_row(doc) for doc in docs]
     seen = {str(row.get("id") or "") for row in items}
 

@@ -23,13 +23,14 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -47,7 +48,7 @@ from tahmeed.services.receipt_records_service import (
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
-from tahmeed.ui.widgets.popup_styles import with_light_popups
+from tahmeed.ui.widgets.popup_styles import apply_light_menu, with_light_popups
 from tahmeed.ui.widgets.receipt_file_viewer import open_receipt_viewer
 
 _BG = "#F3F4F6"
@@ -75,20 +76,30 @@ QHeaderView::section {{
   padding:6px 8px;
 }}
 """)
-_LIST_SS = with_light_popups(f"""
-QListWidget {{
+_TREE_SS = with_light_popups(f"""
+QTreeWidget {{
   background:{_CARD}; border:1px solid {_BORDER}; border-radius:6px;
   font:12px 'Segoe UI'; color:{_TEXT}; outline:none;
   padding:4px;
 }}
-QListWidget::item {{
-  padding:6px 8px; border-radius:4px; margin:1px 0;
+QTreeWidget::item {{
+  padding:4px 6px; border-radius:4px; min-height:22px;
 }}
-QListWidget::item:selected {{
+QTreeWidget::item:selected {{
   background:#E0F2FE; color:{_TEXT};
 }}
-QListWidget::item:hover {{
+QTreeWidget::item:hover {{
   background:#F8FAFC;
+}}
+QTreeWidget::branch:has-children:!has-siblings:closed,
+QTreeWidget::branch:closed:has-children:has-siblings {{
+  border-image: none;
+  image: none;
+}}
+QTreeWidget::branch:open:has-children:!has-siblings,
+QTreeWidget::branch:open:has-children:has-siblings {{
+  border-image: none;
+  image: none;
 }}
 """)
 _BTN_GHOST = with_light_popups(f"""
@@ -200,6 +211,7 @@ class ReceiptRecordsPanel(QWidget):
         }
         self._selected: dict[str, Any] | None = None  # concrete destination
         self._files: list[dict[str, Any]] = []
+        self._content_rows: list[dict[str, Any]] = []  # folders + files for Explorer pane
         self._loading = False
         self._chip_buttons: dict[str, QPushButton] = {}
         self._build()
@@ -236,7 +248,7 @@ class ReceiptRecordsPanel(QWidget):
         split.addWidget(self._build_files_pane())
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([260, 720])
+        split.setSizes([300, 720])
         root.addWidget(split, 1)
 
         self._status = QLabel("")
@@ -269,11 +281,18 @@ class ReceiptRecordsPanel(QWidget):
         chips.addStretch(1)
         lay.addLayout(chips)
 
-        self._dest_list = QListWidget()
-        self._dest_list.setStyleSheet(_LIST_SS)
-        self._dest_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._dest_list.currentItemChanged.connect(self._on_dest_changed)
-        lay.addWidget(self._dest_list, 1)
+        self._dest_tree = QTreeWidget()
+        self._dest_tree.setStyleSheet(_TREE_SS)
+        self._dest_tree.setHeaderHidden(True)
+        self._dest_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._dest_tree.setAnimated(True)
+        self._dest_tree.setExpandsOnDoubleClick(True)
+        self._dest_tree.setIndentation(18)
+        self._dest_tree.setUniformRowHeights(True)
+        self._dest_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._dest_tree.customContextMenuRequested.connect(self._dest_context_menu)
+        self._dest_tree.currentItemChanged.connect(self._on_dest_changed)
+        lay.addWidget(self._dest_tree, 1)
 
         custom_row = QHBoxLayout()
         custom_row.setSpacing(6)
@@ -310,12 +329,20 @@ class ReceiptRecordsPanel(QWidget):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(8)
 
+        crumb_row = QHBoxLayout()
+        crumb_row.setSpacing(6)
+        self._up_btn = _ghost("Up", "mdi.arrow-up")
+        self._up_btn.setToolTip("Go to parent folder")
+        self._up_btn.clicked.connect(self._go_up)
+        self._up_btn.setEnabled(False)
+        crumb_row.addWidget(self._up_btn)
         self._dest_hint = QLabel("Select a folder on the left to browse or upload.")
         self._dest_hint.setWordWrap(True)
         self._dest_hint.setStyleSheet(
             f"color:{_TEXT}; font:600 12px 'Segoe UI'; background:transparent;"
         )
-        lay.addWidget(self._dest_hint)
+        crumb_row.addWidget(self._dest_hint, 1)
+        lay.addLayout(crumb_row)
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
@@ -342,6 +369,22 @@ class ReceiptRecordsPanel(QWidget):
         search_btn = _ghost("Search", "mdi.magnify")
         search_btn.clicked.connect(lambda: asyncio.ensure_future(self._load_files()))
 
+        file_as_lbl = QLabel("File as")
+        file_as_lbl.setStyleSheet(f"color:{_MUTED};font:11px 'Segoe UI';")
+        file_as_lbl.setToolTip(
+            "Browse YYYY/MM folder for new uploads. Set an older month for backlog."
+        )
+        self._file_as = QDateEdit()
+        self._file_as.setCalendarPopup(True)
+        self._file_as.setDisplayFormat("yyyy-MM-dd")
+        self._file_as.setDate(QDate.currentDate())
+        self._file_as.setStyleSheet(_INPUT_SS)
+        self._file_as.setToolTip(
+            "Filing date for Upload — controls the records/…/YYYY/MM/ folder. "
+            "Does not change when the file was actually uploaded."
+        )
+        style_calendar_popup(self._file_as)
+
         self._date_from = QDateEdit()
         self._date_from.setCalendarPopup(True)
         self._date_from.setDisplayFormat("yyyy-MM-dd")
@@ -356,6 +399,8 @@ class ReceiptRecordsPanel(QWidget):
         style_calendar_popup(self._date_to)
 
         toolbar.addWidget(self._upload_btn)
+        toolbar.addWidget(file_as_lbl)
+        toolbar.addWidget(self._file_as)
         toolbar.addWidget(view_btn)
         toolbar.addWidget(pack_btn)
         toolbar.addWidget(refresh_btn)
@@ -370,7 +415,7 @@ class ReceiptRecordsPanel(QWidget):
 
         self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(
-            ["S/NO", "Uploaded", "File", "Destination", "Note", "Size"]
+            ["Name", "Type", "Filed", "Destination", "Note", "Size"]
         )
         self._table.setStyleSheet(_TABLE_SS)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -378,16 +423,16 @@ class ReceiptRecordsPanel(QWidget):
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.setShowGrid(False)
-        self._table.setFocusPolicy(Qt.NoFocus)
+        self._table.setFocusPolicy(Qt.StrongFocus)
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(False)
-        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self._table.setColumnWidth(0, 48)
-        self._table.setColumnWidth(1, 130)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._table.setColumnWidth(1, 72)
+        self._table.setColumnWidth(2, 110)
         self._table.setColumnWidth(3, 160)
         self._table.setColumnWidth(4, 140)
         self._table.setColumnWidth(5, 72)
-        self._table.cellDoubleClicked.connect(lambda *_: self._view_selected())
+        self._table.cellDoubleClicked.connect(self._on_content_double_clicked)
         lay.addWidget(self._table, 1)
         self._sync_upload_enabled()
         return pane
@@ -400,46 +445,99 @@ class ReceiptRecordsPanel(QWidget):
             btn.setChecked(key == kind)
             btn.setStyleSheet(_chip_style(key == kind))
         self._sync_custom_actions()
-        self._populate_dest_list()
+        self._populate_dest_tree()
         self._selected = None
         self._update_dest_hint()
         self._sync_upload_enabled()
         asyncio.ensure_future(self._load_files())
 
-    def _populate_dest_list(self) -> None:
-        self._dest_list.blockSignals(True)
-        self._dest_list.clear()
-        all_item = QListWidgetItem("All in this group")
-        all_item.setData(Qt.UserRole, {"_all": True, "kind": self._kind})
-        all_item.setIcon(qta.icon("mdi.folder-multiple-outline", color=_MUTED))
-        self._dest_list.addItem(all_item)
+    def _make_tree_item(self, data: dict[str, Any], *, label: str) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([label])
+        tip = str(data.get("display_label") or label)
+        item.setToolTip(0, tip)
+        item.setData(0, Qt.UserRole, data)
+        if data.get("_all"):
+            item.setIcon(0, qta.icon("mdi.folder-multiple-outline", color=_MUTED))
+        else:
+            item.setIcon(0, qta.icon("mdi.folder-outline", color=_ACCENT))
+        return item
+
+    def _populate_dest_tree(self) -> None:
+        tree = self._dest_tree
+        tree.blockSignals(True)
+        tree.clear()
+
+        all_item = self._make_tree_item(
+            {"_all": True, "kind": self._kind},
+            label="All in this group",
+        )
+        tree.addTopLevelItem(all_item)
 
         rows = list(self._destinations.get(self._kind) or [])
-        for row in rows:
-            if self._kind == "custom":
-                depth = int(row.get("depth") or 0)
-                leaf = str(row.get("label") or row.get("ref_key") or "Untitled")
-                label = ("    " * depth) + leaf
-                tip = str(row.get("display_label") or leaf)
-            else:
+        if self._kind == "custom":
+            by_id: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                fid = str(row.get("id") or "")
+                if fid:
+                    by_id[fid] = row
+            nodes: dict[str, QTreeWidgetItem] = {}
+            # Parents before children (API already sorts by path_slugs)
+            pending = list(rows)
+            guard = 0
+            while pending and guard < len(rows) + 5:
+                guard += 1
+                next_pending: list[dict[str, Any]] = []
+                for row in pending:
+                    fid = str(row.get("id") or "")
+                    if not fid:
+                        continue
+                    parent_id = str(row.get("parent_id") or "")
+                    leaf = str(row.get("label") or row.get("ref_key") or "Untitled")
+                    data = {**row, "kind": "custom", "_all": False}
+                    node = self._make_tree_item(data, label=leaf)
+                    if parent_id and parent_id in nodes:
+                        nodes[parent_id].addChild(node)
+                        nodes[fid] = node
+                    elif not parent_id or parent_id not in by_id:
+                        tree.addTopLevelItem(node)
+                        nodes[fid] = node
+                    else:
+                        next_pending.append(row)
+                if len(next_pending) == len(pending):
+                    # Orphan / cycle — attach remaining at root
+                    for row in next_pending:
+                        fid = str(row.get("id") or "")
+                        if not fid or fid in nodes:
+                            continue
+                        leaf = str(row.get("label") or row.get("ref_key") or "Untitled")
+                        node = self._make_tree_item(
+                            {**row, "kind": "custom", "_all": False}, label=leaf
+                        )
+                        tree.addTopLevelItem(node)
+                        nodes[fid] = node
+                    break
+                pending = next_pending
+            tree.expandToDepth(1)
+        else:
+            for row in rows:
                 label = str(row.get("label") or row.get("ref_key") or "Untitled")
-                tip = label
-            item = QListWidgetItem(label)
-            item.setToolTip(tip)
-            item.setData(Qt.UserRole, {**row, "kind": self._kind, "_all": False})
-            item.setIcon(qta.icon("mdi.folder-outline", color=_ACCENT))
-            self._dest_list.addItem(item)
-        self._dest_list.blockSignals(False)
-        if self._dest_list.count():
-            self._dest_list.setCurrentRow(0)
+                node = self._make_tree_item(
+                    {**row, "kind": self._kind, "_all": False}, label=label
+                )
+                tree.addTopLevelItem(node)
+
+        tree.blockSignals(False)
+        tree.setCurrentItem(all_item)
 
     def _on_dest_changed(
-        self, current: QListWidgetItem | None, _previous: QListWidgetItem | None
+        self,
+        current: QTreeWidgetItem | None,
+        _previous: QTreeWidgetItem | None,
     ) -> None:
         if current is None:
             self._selected = None
         else:
-            data = current.data(Qt.UserRole) or {}
+            data = current.data(0, Qt.UserRole) or {}
             if data.get("_all"):
                 self._selected = None
             else:
@@ -461,8 +559,43 @@ class ReceiptRecordsPanel(QWidget):
             self._dest_hint.setText(f"{kind_label} · {name}")
         else:
             self._dest_hint.setText(
-                f"{kind_label} · All — pick a folder to upload, or browse everything below."
+                f"{kind_label} · All — open a folder below, or pick one on the left."
             )
+        self._sync_up_enabled()
+
+    def _sync_up_enabled(self) -> None:
+        can_up = False
+        if self._kind == "custom" and self._selected:
+            if self._selected.get("parent_id") or self._selected.get("id"):
+                # Any concrete folder can go up (to parent or to All)
+                can_up = True
+        elif self._selected is not None:
+            # Item/Supplier/Separate: up returns to All
+            can_up = True
+        self._up_btn.setEnabled(can_up)
+
+    def _child_folders(self) -> list[dict[str, Any]]:
+        """Folders shown inside the current Explorer location."""
+        rows = list(self._destinations.get(self._kind) or [])
+        if self._kind == "custom":
+            if self._selected and self._selected.get("id"):
+                parent_id = str(self._selected["id"])
+                return [
+                    {**r, "kind": "custom", "_all": False}
+                    for r in rows
+                    if str(r.get("parent_id") or "") == parent_id
+                ]
+            # All: root custom folders only
+            return [
+                {**r, "kind": "custom", "_all": False}
+                for r in rows
+                if not r.get("parent_id")
+            ]
+        # Item / supplier / separate — All shows each destination as a folder;
+        # inside a destination there are no nested folders.
+        if self._selected is None:
+            return [{**r, "kind": self._kind, "_all": False} for r in rows]
+        return []
 
     def _sync_custom_actions(self) -> None:
         is_custom = self._kind == "custom"
@@ -477,6 +610,33 @@ class ReceiptRecordsPanel(QWidget):
 
     def _sync_upload_enabled(self) -> None:
         self._upload_btn.setEnabled(self._selected is not None)
+
+    def _dest_context_menu(self, pos) -> None:
+        item = self._dest_tree.itemAt(pos)
+        if item is not None:
+            self._dest_tree.setCurrentItem(item)
+        if self._kind != "custom":
+            return
+        menu = apply_light_menu(QMenu(self))
+        new_act = menu.addAction("New folder…")
+        new_act.setIcon(qta.icon("mdi.folder-plus-outline", color=_TEXT))
+        sub_act = menu.addAction("New subfolder…")
+        sub_act.setIcon(qta.icon("mdi.folder-pound-outline", color=_TEXT))
+        sub_act.setEnabled(bool(self._selected and self._selected.get("id")))
+        menu.addSeparator()
+        rename_act = menu.addAction("Rename…")
+        rename_act.setEnabled(bool(self._selected and self._selected.get("id")))
+        delete_act = menu.addAction("Delete…")
+        delete_act.setEnabled(bool(self._selected and self._selected.get("id")))
+        chosen = menu.exec(self._dest_tree.viewport().mapToGlobal(pos))
+        if chosen == new_act:
+            asyncio.ensure_future(self._new_custom())
+        elif chosen == sub_act:
+            asyncio.ensure_future(self._new_custom_subfolder())
+        elif chosen == rename_act:
+            asyncio.ensure_future(self._rename_custom())
+        elif chosen == delete_act:
+            asyncio.ensure_future(self._delete_custom())
 
     # ── Data load ─────────────────────────────────────────────────────────
 
@@ -495,7 +655,7 @@ class ReceiptRecordsPanel(QWidget):
             }
             # Preserve selection by id/ref_key when possible
             prev = dict(self._selected) if self._selected else None
-            self._populate_dest_list()
+            self._populate_dest_tree()
             if prev:
                 self._reselect(prev)
             await self._load_files(show_overlay=False)
@@ -512,24 +672,44 @@ class ReceiptRecordsPanel(QWidget):
             hide_widget_loading(self)
             self._loading = False
 
+    def _iter_tree_items(self, root: QTreeWidgetItem | None = None):
+        if root is None:
+            for i in range(self._dest_tree.topLevelItemCount()):
+                item = self._dest_tree.topLevelItem(i)
+                yield item
+                yield from self._iter_tree_items(item)
+            return
+        for i in range(root.childCount()):
+            child = root.child(i)
+            yield child
+            yield from self._iter_tree_items(child)
+
     def _reselect(self, prev: dict[str, Any]) -> None:
         target_id = str(prev.get("id") or "")
         target_key = str(prev.get("ref_key") or "")
-        for i in range(self._dest_list.count()):
-            item = self._dest_list.item(i)
-            data = item.data(Qt.UserRole) or {}
+        for item in self._iter_tree_items():
+            data = item.data(0, Qt.UserRole) or {}
             if data.get("_all"):
                 continue
+            hit = False
             if target_id and str(data.get("id") or "") == target_id:
-                self._dest_list.setCurrentRow(i)
-                return
-            if target_key and str(data.get("ref_key") or "") == target_key:
-                self._dest_list.setCurrentRow(i)
-                return
+                hit = True
+            elif target_key and str(data.get("ref_key") or "") == target_key:
+                hit = True
+            if not hit:
+                continue
+            # Expand ancestors so the node is visible
+            parent = item.parent()
+            while parent is not None:
+                parent.setExpanded(True)
+                parent = parent.parent()
+            self._dest_tree.setCurrentItem(item)
+            self._dest_tree.scrollToItem(item)
+            return
 
     async def _load_files(self, *, show_overlay: bool = True) -> None:
         if show_overlay:
-            show_widget_loading(self._table, "Loading files…")
+            show_widget_loading(self._table, "Loading…")
         try:
             kwargs: dict[str, Any] = {
                 "kind": self._kind,
@@ -538,21 +718,43 @@ class ReceiptRecordsPanel(QWidget):
                 "date_to": self._date_to.date().toString("yyyy-MM-dd"),
                 "limit": 300,
             }
+            # When browsing All for Item/Supplier/Separate, folders are listed
+            # and we still show files for the whole group.
             if self._selected:
                 if self._kind == "custom" and self._selected.get("id"):
                     kwargs["folder_id"] = str(self._selected["id"])
                 else:
                     kwargs["ref_key"] = str(self._selected.get("ref_key") or "")
             self._files = await list_record_files(**kwargs)
+            folders = self._child_folders()
+            # Filename search should not hide folder rows unless they match too
+            needle = self._search.text().strip().lower()
+            if needle:
+                folders = [
+                    f
+                    for f in folders
+                    if needle
+                    in str(
+                        f.get("display_label") or f.get("label") or f.get("ref_key") or ""
+                    ).lower()
+                ]
+            self._content_rows = [
+                {"_row_kind": "folder", "folder": f} for f in folders
+            ] + [{"_row_kind": "file", "file": f} for f in self._files]
             self._fill_table()
             dest = (
-                (self._selected or {}).get("label")
+                (self._selected or {}).get("display_label")
+                or (self._selected or {}).get("label")
                 or (self._selected or {}).get("ref_key")
                 or f"All {self._kind}"
             )
-            self._status.setText(f"{len(self._files)} file(s) · {dest}")
+            self._status.setText(
+                f"{len(folders)} folder(s) · {len(self._files)} file(s) · {dest}"
+            )
+            self._sync_up_enabled()
         except Exception as exc:
             self._files = []
+            self._content_rows = []
             self._fill_table()
             self._status.setText(f"Could not load files: {exc}")
         finally:
@@ -561,46 +763,136 @@ class ReceiptRecordsPanel(QWidget):
 
     def _fill_table(self) -> None:
         self._table.setRowCount(0)
-        for idx, row in enumerate(self._files):
+        for idx, entry in enumerate(self._content_rows):
             r = self._table.rowCount()
             self._table.insertRow(r)
-            rec = row.get("record") or {}
-            dest = str(rec.get("label") or rec.get("ref_key") or "—")
-            if rec.get("from_approved"):
-                dest = f"{dest} · approved"
-            note = str(rec.get("note") or "—")
-            if rec.get("from_approved") and note == "—":
-                note = "Chase approved"
-            values = [
-                str(idx + 1),
-                _fmt_when(row.get("uploaded_at")),
-                str(row.get("original_filename") or "—"),
-                dest,
-                note,
-                _fmt_size(int(row.get("size") or 0)),
-            ]
             bg = _stripe(r)
+            if entry.get("_row_kind") == "folder":
+                folder = entry.get("folder") or {}
+                name = str(
+                    folder.get("label")
+                    or folder.get("ref_key")
+                    or "Untitled"
+                )
+                path = str(
+                    folder.get("display_label") or folder.get("label") or name
+                )
+                values = [name, "Folder", "—", path, "—", "—"]
+                tip = f"Open folder: {path}"
+                payload = {"_row_kind": "folder", "folder": folder}
+                icon = qta.icon("mdi.folder-outline", color=_ACCENT)
+            else:
+                row = entry.get("file") or {}
+                rec = row.get("record") or {}
+                dest = str(rec.get("label") or rec.get("ref_key") or "—")
+                if rec.get("from_approved"):
+                    dest = f"{dest} · approved"
+                note = str(rec.get("note") or "—")
+                if rec.get("from_approved") and note == "—":
+                    note = "Chase approved"
+                filed = str(rec.get("file_date") or "").strip()
+                filed_display = filed if filed else _fmt_when(row.get("uploaded_at"))
+                name = str(row.get("original_filename") or "—")
+                values = [
+                    name,
+                    "File",
+                    filed_display,
+                    dest,
+                    note,
+                    _fmt_size(int(row.get("size") or 0)),
+                ]
+                tip = f"Uploaded: {_fmt_when(row.get('uploaded_at'))}"
+                if filed:
+                    tip = f"Filed as: {filed}\n{tip}"
+                payload = {"_row_kind": "file", "id": str(row.get("id") or "")}
+                icon = qta.icon("mdi.file-outline", color=_MUTED)
+
             for c, text in enumerate(values):
                 item = QTableWidgetItem(text)
                 item.setBackground(bg)
                 if c == 0:
-                    item.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
-                    item.setData(Qt.UserRole, str(row.get("id") or ""))
+                    item.setData(Qt.UserRole, payload)
+                    item.setIcon(icon)
+                    item.setToolTip(tip)
+                if c == 2 and entry.get("_row_kind") == "file":
+                    item.setToolTip(tip)
                 self._table.setItem(r, c, item)
             self._table.setRowHeight(r, _ROW_H)
 
-    def _selected_file_id(self) -> str:
+    def _selected_content(self) -> dict[str, Any] | None:
         items = self._table.selectedItems()
         if not items:
+            return None
+        cell = self._table.item(items[0].row(), 0)
+        data = cell.data(Qt.UserRole) if cell else None
+        return data if isinstance(data, dict) else None
+
+    def _selected_file_id(self) -> str:
+        data = self._selected_content()
+        if not data or data.get("_row_kind") != "file":
             return ""
-        row = items[0].row()
+        return str(data.get("id") or "")
+
+    def _on_content_double_clicked(self, row: int, _col: int) -> None:
         cell = self._table.item(row, 0)
-        return str(cell.data(Qt.UserRole) or "") if cell else ""
+        data = cell.data(Qt.UserRole) if cell else None
+        if not isinstance(data, dict):
+            return
+        if data.get("_row_kind") == "folder":
+            folder = data.get("folder") or {}
+            self._open_folder(folder)
+            return
+        self._view_selected()
+
+    def _open_folder(self, folder: dict[str, Any]) -> None:
+        """Drill into a folder — sync left tree + reload contents."""
+        if not folder:
+            return
+        self._reselect(
+            {
+                "id": folder.get("id"),
+                "ref_key": folder.get("ref_key"),
+            }
+        )
+        # _reselect sets current tree item → _on_dest_changed loads files
+
+    def _go_up(self) -> None:
+        if not self._selected:
+            return
+        if self._kind == "custom":
+            parent_id = str(self._selected.get("parent_id") or "")
+            if parent_id:
+                parent = next(
+                    (
+                        r
+                        for r in (self._destinations.get("custom") or [])
+                        if str(r.get("id") or "") == parent_id
+                    ),
+                    None,
+                )
+                if parent:
+                    self._reselect(
+                        {"id": parent.get("id"), "ref_key": parent.get("ref_key")}
+                    )
+                    return
+            # Root custom folder → All
+            if self._dest_tree.topLevelItemCount():
+                self._dest_tree.setCurrentItem(self._dest_tree.topLevelItem(0))
+            return
+        # Item / supplier / separate → All
+        if self._dest_tree.topLevelItemCount():
+            self._dest_tree.setCurrentItem(self._dest_tree.topLevelItem(0))
 
     def _view_selected(self) -> None:
+        data = self._selected_content()
+        if data and data.get("_row_kind") == "folder":
+            self._open_folder(data.get("folder") or {})
+            return
         fid = self._selected_file_id()
         if not fid:
-            QMessageBox.information(self, "Records", "Select a file to view.")
+            QMessageBox.information(
+                self, "Records", "Select a file to view, or double-click a folder."
+            )
             return
         row = next((f for f in self._files if str(f.get("id")) == fid), None)
         title = str((row or {}).get("original_filename") or "")
@@ -749,6 +1041,7 @@ class ReceiptRecordsPanel(QWidget):
         if not paths:
             return
         kind = str(self._selected.get("kind") or self._kind)
+        file_date = self._file_as.date().toString("yyyy-MM-dd")
         show_widget_loading(self, f"Uploading {len(paths)} file(s)…")
         try:
             result = await upload_record_files(
@@ -756,10 +1049,13 @@ class ReceiptRecordsPanel(QWidget):
                 kind=kind,
                 ref_key=str(self._selected.get("ref_key") or ""),
                 folder_id=str(self._selected.get("id") or ""),
+                file_date=file_date,
             )
             total = int(result.get("total") or 0)
             dest = (result.get("destination") or {}).get("label") or kind
-            self._status.setText(f"Uploaded {total} file(s) → {dest}")
+            self._status.setText(
+                f"Uploaded {total} file(s) → {dest} · filed as {file_date}"
+            )
             await self._load_files(show_overlay=False)
         except ApiError as exc:
             QMessageBox.warning(self, "Upload failed", str(exc))

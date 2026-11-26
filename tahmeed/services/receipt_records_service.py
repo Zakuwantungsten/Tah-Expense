@@ -80,8 +80,12 @@ async def upload_record_files(
     ref_key: str = "",
     folder_id: str = "",
     note: str = "",
+    file_date: str = "",
 ) -> dict[str, Any]:
-    """Multipart bulk upload into a Records destination."""
+    """Multipart bulk upload into a Records destination.
+
+    ``file_date`` is YYYY-MM-DD for the browse YYYY/MM folder (backlog). Empty = today.
+    """
     import mimetypes
     from pathlib import Path
 
@@ -103,6 +107,7 @@ async def upload_record_files(
             "ref_key": ref_key or "",
             "folder_id": folder_id or "",
             "note": note or "",
+            "file_date": (file_date or "").strip(),
         }
         return await api_client.request(
             "POST",

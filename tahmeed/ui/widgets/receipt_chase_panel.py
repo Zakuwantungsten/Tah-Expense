@@ -4062,11 +4062,13 @@ class ReceiptChasePanel(QWidget):
             )
         else:
             dest = choice.label or choice.ref_key or choice.kind or "Records"
+            filed = (choice.file_date or "").strip() or "today"
             ok = await self._confirm_upload(
                 heading=f"File {n} file(s) to Records?",
                 body=(
                     f"{self._upload_file_names(paths)}\n\n"
-                    f"Destination: {choice.kind} · {dest}"
+                    f"Destination: {choice.kind} · {dest}\n"
+                    f"File as date: {filed} (browse YYYY/MM folder)"
                 ),
                 accept_label="Upload",
             )
@@ -4103,6 +4105,7 @@ class ReceiptChasePanel(QWidget):
                 ref_key=choice.ref_key,
                 folder_id=choice.folder_id,
                 note=choice.note,
+                file_date=choice.file_date,
             )
             total = int(result.get("total") or n)
             api_dest = result.get("destination") or {}

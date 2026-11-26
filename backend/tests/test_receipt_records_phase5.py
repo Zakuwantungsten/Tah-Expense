@@ -214,6 +214,38 @@ async def test_nested_custom_folder_path_and_disk(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_records_file_date_controls_browse_month(tmp_path: Path) -> None:
+    """Backlog filing: January file_date → …/2026/01/ even when uploaded later."""
+    from datetime import date as date_cls
+
+    db = FakeDB()
+    base = tmp_path / "attachments"
+    ensure_records_workspace(base)
+    dest = await resolve_record_destination(db, kind="item", ref_key="Diesel")
+    meta = await store_record_file_bytes(
+        db,
+        base,
+        filename="jan-fuel.pdf",
+        content=b"%PDF-1.4 january-backlog",
+        destination=dest,
+        file_date=date_cls(2026, 1, 15),
+    )
+    path = str((meta.get("record") or {}).get("path") or "")
+    assert "/2026/01/" in path
+    assert (meta.get("record") or {}).get("file_date") == "2026-01-15"
+    assert (base / Path(*path.split("/"))).is_file()
+
+    listed = await list_record_files(
+        db,
+        kind="item",
+        ref_key="Diesel",
+        date_from=date_cls(2026, 1, 1),
+        date_to=date_cls(2026, 1, 31),
+    )
+    assert any(r["id"] == meta["id"] for r in listed)
+
+
+@pytest.mark.asyncio
 async def test_records_item_lists_approved_chase_receipt(tmp_path: Path) -> None:
     db = FakeDB()
     base = tmp_path / "attachments"
