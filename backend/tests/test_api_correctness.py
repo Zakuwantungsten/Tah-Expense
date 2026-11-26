@@ -224,7 +224,7 @@ async def test_final_active_admin_cannot_be_removed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_accountant_can_manage_non_admin_users_only() -> None:
+async def test_accountant_can_manage_users_including_admins() -> None:
     db = SimpleNamespace(users=FakeUsers())
     request = request_for(db)
     cashier = await create_user(
@@ -239,18 +239,17 @@ async def test_accountant_can_manage_non_admin_users_only() -> None:
     )
     assert cashier["role"] == "cashier"
 
-    with pytest.raises(ApiError) as raised:
-        await create_user(
-            UserCreate(
-                username="another-admin",
-                password="Long-enough-pass1",
-                role="admin",
-                full_name="Another Admin",
-            ),
-            request,
-            {"role": "accountant"},
-        )
-    assert raised.value.code == "forbidden"
+    admin = await create_user(
+        UserCreate(
+            username="another-admin",
+            password="Long-enough-pass1",
+            role="admin",
+            full_name="Another Admin",
+        ),
+        request,
+        {"role": "accountant"},
+    )
+    assert admin["role"] == "admin"
 
 
 @pytest.mark.asyncio

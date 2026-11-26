@@ -62,6 +62,7 @@ _LAZY_PAGE_KEYS = frozenset({
     "receipt_disk",
     "receipts",
     "records",
+    "receipt_trash",
     "receipt_browse",
     "table",
     "browse",
@@ -275,8 +276,14 @@ class AccountantDashboard(QWidget):
 
     def _nav_toast_label(self, key: str) -> str:
         """Human label for a sidebar / stack key."""
-        from tahmeed.ui.accountant.sidebar import _SECTIONS
+        from tahmeed.ui.accountant.sidebar import _FIXED_CHILDREN, _SECTIONS
 
+        if key == "receipt_trash":
+            return "Trash"
+        for rows in _FIXED_CHILDREN.values():
+            for label, match, _icon in rows:
+                if match == key:
+                    return str(label)
         for _section, items in _SECTIONS:
             for item_key, label, *_rest in items:
                 if item_key == key:
@@ -653,7 +660,10 @@ class AccountantDashboard(QWidget):
 
         if key == "manage_users":
             from tahmeed.ui.admin.users_tab import UsersTab
-            return UsersTab()
+            tab = UsersTab()
+            tab.view_sessions_requested.connect(self._open_user_sessions_dialog)
+            tab.view_audit_requested.connect(self._open_user_audit_dialog)
+            return tab
 
         if key == "receipt_disk":
             from tahmeed.ui.widgets.receipt_storage_panel import ReceiptStoragePanel
@@ -670,6 +680,11 @@ class AccountantDashboard(QWidget):
             # Paperwork → Records: company paper (Phase 1 placeholder; Phase 3 UI).
             from tahmeed.ui.widgets.receipt_records_panel import ReceiptRecordsPanel
             return ReceiptRecordsPanel()
+
+        if key == "receipt_trash":
+            # Paperwork → Trash: Windows-style recycle bin for receipt files.
+            from tahmeed.ui.widgets.receipt_trash_panel import ReceiptTrashPanel
+            return ReceiptTrashPanel()
 
         if key == "receipt_browse":
             # Folder/bucket explorer + pack/download (not the chase desk).
@@ -847,12 +862,10 @@ class AccountantDashboard(QWidget):
             content.set_submit_badge(n)
 
     def _note_submitted_drafts(self, updated: int) -> None:
-        """Submit already returned the count — update badges without waiting on poll."""
+        """Submit finished — recount day badges (updated is expense lines)."""
         n = int(updated or 0)
         self._skip_draft_recount = True
-        current = self._sidebar.drafts_badge() if hasattr(self._sidebar, "drafts_badge") else 0
-        nxt = max(0, current - n)
-        self._apply_draft_badges(nxt)
+        asyncio.ensure_future(self._refresh_drafts_badge())
         # Optimistic Verify bump so the sidebar moves even if /wait is down.
         # Submit runs inside pause_background_polls; a force GET can briefly
         # still see the pre-submit counter — don't let that wipe this bump.
@@ -1149,9 +1162,14 @@ class AccountantDashboard(QWidget):
         self._on_drafts_open_register(d)
 
     def _on_overview_nav(self, key: str) -> None:
-        # Paperwork is an expandable parent — open Receipts (or Records) child.
-        if key in ("paperwork", "receipts", "records"):
-            match = "records" if key == "records" else "receipts"
+        # Paperwork is an expandable parent — open Receipts / Records / Trash child.
+        if key in ("paperwork", "receipts", "records", "receipt_trash"):
+            if key == "records":
+                match = "records"
+            elif key == "receipt_trash":
+                match = "receipt_trash"
+            else:
+                match = "receipts"
             # Expand strip now; activate child next tick so rows paint before
             # the heavy Receipts/Records page open (same as sidebar click).
             expand = getattr(self._sidebar, "_on_toggle", None)
@@ -1163,7 +1181,10 @@ class AccountantDashboard(QWidget):
                 from PySide6.QtCore import QTimer
                 QTimer.singleShot(0, lambda m=match: activate("paperwork", m))
             else:
-                name = "Records" if match == "records" else "Receipts"
+                name = {
+                    "records": "Records",
+                    "receipt_trash": "Trash",
+                }.get(match, "Receipts")
                 self._show_subtable("paperwork", "Paperwork", name, match)
             return
         self._sidebar.select(key)
@@ -1248,7 +1269,8 @@ class AccountantDashboard(QWidget):
             self._protect_verify_badge_until = 0.0
         self._sidebar.set_verify_badge(incoming)
         if "drafts" in payload:
-            self._apply_draft_badges(int(payload.get("drafts") or 0))
+            # Stored notification counter is expense lines; sidebar wants day-rows.
+            asyncio.ensure_future(self._refresh_drafts_badge())
         if hasattr(self._sidebar, "set_receipt_storage_badge"):
             self._sidebar.set_receipt_storage_badge(
                 int(payload.get("receipt_storage_down") or 0)
@@ -1641,11 +1663,14 @@ class AccountantDashboard(QWidget):
         if parent_key == "sm_burhani":
             self._show_recon(match)
             return
-        # Paperwork → Receipts | Records (fixed children).
+        # Paperwork → Receipts | Records | Trash (fixed children).
         if parent_key == "paperwork":
             route = (match or name or "").strip().lower()
             if route in ("records", "record"):
                 self._on_nav("records")
+                return
+            if route in ("receipt_trash", "trash", "recycle"):
+                self._on_nav("receipt_trash")
                 return
             self._on_nav("receipts")
             return
@@ -1658,6 +1683,9 @@ class AccountantDashboard(QWidget):
                 return
             if route in ("records", "record"):
                 self._on_nav("records")
+                return
+            if route in ("receipt_trash", "trash", "recycle"):
+                self._on_nav("receipt_trash")
                 return
             self._on_nav("receipts")
             return
@@ -1696,6 +1724,35 @@ class AccountantDashboard(QWidget):
         self._toast_loading(cache_key)
         from tahmeed.ui.async_utils import schedule_call
         schedule_call(self._stack.widget(idx).refresh)
+
+
+    def _open_user_sessions_dialog(self, username: str) -> None:
+        """Users-tab Sessions action — same Security panel Superadmin uses."""
+        from tahmeed.ui.admin.security_tab import SecurityTab
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Sessions — {username}")
+        dlg.resize(900, 560)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(0, 0, 0, 0)
+        panel = SecurityTab()
+        lay.addWidget(panel)
+        panel.focus_user(username)
+        dlg.exec()
+
+    def _open_user_audit_dialog(self, username: str) -> None:
+        """Users-tab Audit action — same Audit panel Superadmin uses."""
+        from tahmeed.ui.admin.audit_tab import AuditTab
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Audit — {username}")
+        dlg.resize(960, 600)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(0, 0, 0, 0)
+        panel = AuditTab()
+        lay.addWidget(panel)
+        panel.focus_actor(username)
+        dlg.exec()
 
 
 # ── Placeholder ────────────────────────────────────────────────────────────────

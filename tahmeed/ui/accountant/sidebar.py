@@ -117,6 +117,7 @@ _FIXED_CHILDREN: dict[str, list[tuple[str, str, str]]] = {
     "paperwork": [
         ("Receipts", "receipts", "mdi.receipt"),
         ("Records",  "records",  "mdi.folder-multiple-outline"),
+        ("Trash",    "receipt_trash", "mdi.trash-can-outline"),
     ],
 }
 

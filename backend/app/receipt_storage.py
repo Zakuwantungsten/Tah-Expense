@@ -161,6 +161,7 @@ def probe_directory(path: Path, *, create: bool = False) -> dict[str, Any]:
         "used_bytes": used_bytes,
         "total_human": _fmt_bytes(total_bytes),
         "free_human": _fmt_bytes(free_bytes),
+        "used_human": _fmt_bytes(used_bytes),
         "drive": drive,
         "mount_hint": mount_hint,
     }
@@ -251,6 +252,53 @@ async def pending_receipt_backup_count(db: Any) -> int:
         return 0
 
 
+def receipt_storage_mounts(
+    *,
+    effective_path: str | Path,
+    probe: dict[str, Any],
+    extra_mounts: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Configured receipt mounts for Explorer “Devices and drives”.
+
+    Today: one primary mount (the attachments root). Extra mounts can be
+    appended later for backup / supplemental volumes without changing the UI.
+    """
+    drive = str(probe.get("drive") or "").strip()
+    name = "Receipt disk"
+    if drive:
+        letter = drive.rstrip(":\\/")
+        name = f"Receipt disk ({letter}:)"
+    free_b = probe.get("free_bytes")
+    total_b = probe.get("total_bytes")
+    used_b = probe.get("used_bytes")
+    if used_b is None and free_b is not None and total_b is not None:
+        try:
+            used_b = max(0, int(total_b) - int(free_b))
+        except (TypeError, ValueError):
+            used_b = None
+    mounts: list[dict[str, Any]] = [
+        {
+            "id": "primary",
+            "name": name,
+            "role": "primary",
+            "path": str(effective_path),
+            "mount_hint": probe.get("mount_hint") or drive or None,
+            "free_bytes": free_b,
+            "total_bytes": total_b,
+            "used_bytes": used_b,
+            "free_human": probe.get("free_human"),
+            "total_human": probe.get("total_human"),
+            "used_human": probe.get("used_human") or _fmt_bytes(used_b),
+            "writable": probe.get("writable"),
+            "open_prefix": "",
+        }
+    ]
+    for row in extra_mounts or []:
+        if isinstance(row, dict) and row.get("id"):
+            mounts.append(dict(row))
+    return mounts
+
+
 async def storage_status(settings: Settings, db: Any) -> dict[str, Any]:
     env_path = env_attachments_directory(settings)
     override = await load_override_path(db)
@@ -268,6 +316,9 @@ async def storage_status(settings: Settings, db: Any) -> dict[str, Any]:
         "s3_bucket": settings.backup_s3_bucket or None,
         "pending_s3_rows": await pending_receipt_backup_count(db),
         "probe": probe,
+        "mounts": receipt_storage_mounts(
+            effective_path=effective, probe=probe
+        ),
         "candidates": list_candidate_roots(),
     }
 

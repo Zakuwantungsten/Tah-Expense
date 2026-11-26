@@ -14,9 +14,11 @@ from app.receipt_ops import INBOX_APPROVED, list_inbox_files, list_storage_tree
 from app.receipt_records_ops import (
     build_records_pack,
     create_custom_folder,
+    discard_record_upload_batch,
     ensure_custom_folder_path,
     ensure_records_workspace,
     list_custom_folders,
+    list_record_destinations,
     list_record_files,
     resolve_record_destination,
     store_record_file_bytes,
@@ -101,6 +103,13 @@ class FakeColl:
     async def count_documents(self, query: dict) -> int:
         return sum(1 for doc in self.documents if _match(doc, query))
 
+    async def delete_one(self, query: dict):
+        for i, doc in enumerate(self.documents):
+            if _match(doc, query):
+                del self.documents[i]
+                return SimpleNamespace(deleted_count=1)
+        return SimpleNamespace(deleted_count=0)
+
     def find(self, query: dict, projection: dict | None = None):
         docs = [dict(d) for d in self.documents if _match(d, query)]
 
@@ -121,6 +130,77 @@ class FakeColl:
                 return list(self._docs[:length])
 
         return _C(docs)
+
+    def aggregate(self, pipeline: list[dict]):
+        docs = [dict(d) for d in self.documents]
+        for stage in pipeline:
+            if "$match" in stage:
+                docs = [d for d in docs if _match(d, stage["$match"])]
+            elif "$group" in stage:
+                grouped: dict[tuple, dict] = {}
+                spec = stage["$group"]
+                id_spec = spec.get("_id") or {}
+                for doc in docs:
+                    if isinstance(id_spec, dict):
+                        key_parts = []
+                        for alias, path in id_spec.items():
+                            _p, val = _dig(doc, str(path).lstrip("$"))
+                            key_parts.append((alias, val))
+                        key = tuple(key_parts)
+                        row = grouped.setdefault(
+                            key,
+                            {
+                                "_id": {a: v for a, v in key_parts},
+                                "count": 0,
+                            },
+                        )
+                    else:
+                        row = grouped.setdefault(
+                            ("_all",),
+                            {"_id": id_spec, "count": 0},
+                        )
+                    if "count" in spec and "$sum" in (spec.get("count") or {}):
+                        row["count"] = int(row.get("count") or 0) + int(
+                            spec["count"]["$sum"]
+                        )
+                    if "total_size" in spec:
+                        sum_spec = spec.get("total_size") or {}
+                        add = 0
+                        if isinstance(sum_spec, dict) and "$sum" in sum_spec:
+                            s = sum_spec["$sum"]
+                            if isinstance(s, dict) and "$ifNull" in s:
+                                path = str((s["$ifNull"] or [None])[0] or "").lstrip(
+                                    "$"
+                                )
+                                _p, val = _dig(doc, path)
+                                add = int(val or 0)
+                            else:
+                                add = int(s or 0)
+                        row["total_size"] = int(row.get("total_size") or 0) + add
+                docs = list(grouped.values())
+
+        class _Agg:
+            def __init__(self, rows: list[dict]) -> None:
+                self._docs = rows
+                self._i = 0
+
+            def __aiter__(self):
+                self._i = 0
+                return self
+
+            async def __anext__(self):
+                if self._i >= len(self._docs):
+                    raise StopAsyncIteration
+                row = self._docs[self._i]
+                self._i += 1
+                return row
+
+            async def to_list(self, length=None):  # noqa: ANN001
+                if length is None:
+                    return list(self._docs)
+                return list(self._docs[:length])
+
+        return _Agg(docs)
 
 
 class FakeDB:
@@ -299,3 +379,71 @@ async def test_records_item_lists_approved_chase_receipt(tmp_path: Path) -> None
     approved_row = next(r for r in listed if r["id"] == file_id)
     assert approved_row["record"]["from_approved"] is True
     assert any(r["original_filename"] == "policy.pdf" for r in listed)
+
+
+@pytest.mark.asyncio
+async def test_destinations_include_file_counts(tmp_path: Path) -> None:
+    db = FakeDB()
+    base = tmp_path / "attachments"
+    ensure_records_workspace(base)
+    db.categories.documents.append(
+        {"_id": ObjectId(), "name": "Diesel", "sidebar_name": "Diesel", "is_supplier": False}
+    )
+    db.categories.documents.append(
+        {"_id": ObjectId(), "name": "Empty Item", "is_supplier": False}
+    )
+    dest = await resolve_record_destination(db, kind="item", ref_key="Diesel")
+    await store_record_file_bytes(
+        db,
+        base,
+        filename="a.pdf",
+        content=b"%PDF-1.4 a",
+        destination=dest,
+    )
+    await store_record_file_bytes(
+        db,
+        base,
+        filename="b.pdf",
+        content=b"%PDF-1.4 b",
+        destination=dest,
+    )
+    payload = await list_record_destinations(db)
+    by_key = {r["ref_key"]: r for r in payload["items"]}
+    assert by_key["Diesel"]["file_count"] == 2
+    assert by_key["Diesel"]["total_size"] == len(b"%PDF-1.4 a") + len(b"%PDF-1.4 b")
+    assert by_key["Empty Item"]["file_count"] == 0
+    assert by_key["Empty Item"]["total_size"] == 0
+
+
+@pytest.mark.asyncio
+async def test_discard_record_upload_batch_removes_files(tmp_path: Path) -> None:
+    db = FakeDB()
+    base = tmp_path / "attachments"
+    ensure_records_workspace(base)
+    dest = await resolve_record_destination(db, kind="item", ref_key="Oil")
+    first = await store_record_file_bytes(
+        db,
+        base,
+        filename="one.pdf",
+        content=b"%PDF-1.4 one",
+        destination=dest,
+    )
+    second = await store_record_file_bytes(
+        db,
+        base,
+        filename="two.pdf",
+        content=b"%PDF-1.4 two",
+        destination=dest,
+    )
+    path1 = base / Path(*str(first["record"]["path"]).split("/"))
+    path2 = base / Path(*str(second["record"]["path"]).split("/"))
+    assert path1.is_file() and path2.is_file()
+
+    discarded = await discard_record_upload_batch(
+        db, base, [first["id"], second["id"]]
+    )
+    assert discarded == 2
+    assert await db.receipt_files.find_one({"_id": first["id"]}) is None
+    assert await db.receipt_files.find_one({"_id": second["id"]}) is None
+    assert not path1.exists()
+    assert not path2.exists()

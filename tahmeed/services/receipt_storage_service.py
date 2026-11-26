@@ -61,3 +61,68 @@ async def list_storage_objects(
         "v1/receipts/storage/objects",
         params=params,
     )
+
+
+async def create_storage_folder(*, prefix: str, name: str) -> dict[str, Any]:
+    return await api_client.request(
+        "POST",
+        "v1/receipts/storage/folders",
+        json={"prefix": prefix or "", "name": name},
+    )
+
+
+async def delete_storage_folder(*, prefix: str, cascade: bool = False) -> dict[str, Any]:
+    return await api_client.request(
+        "DELETE",
+        "v1/receipts/storage/folders",
+        params={"prefix": prefix, "cascade": "true" if cascade else "false"},
+    )
+
+
+async def rename_storage_folder(*, prefix: str, name: str) -> dict[str, Any]:
+    return await api_client.request(
+        "PATCH",
+        "v1/receipts/storage/folders",
+        json={"prefix": prefix, "name": name},
+    )
+
+
+async def list_receipt_trash(*, limit: int = 200, q: str = "") -> dict[str, Any]:
+    params: dict[str, Any] = {"limit": limit}
+    if q.strip():
+        params["q"] = q.strip()
+    return await api_client.request(
+        "GET", "v1/receipts/trash", params=params
+    )
+
+
+async def restore_all_receipt_trash() -> dict[str, Any]:
+    return await api_client.request("POST", "v1/receipts/trash/restore-all")
+
+
+async def empty_receipt_trash() -> dict[str, Any]:
+    return await api_client.request("POST", "v1/receipts/trash/empty")
+
+
+async def trash_receipt_files(file_ids: list[str]) -> dict[str, Any]:
+    return await api_client.request(
+        "POST",
+        "v1/receipts/trash",
+        json={"file_ids": list(file_ids)},
+    )
+
+
+async def restore_receipt_trash(file_ids: list[str]) -> dict[str, Any]:
+    return await api_client.request(
+        "POST",
+        "v1/receipts/trash/restore",
+        json={"file_ids": list(file_ids)},
+    )
+
+
+async def purge_receipt_trash(file_ids: list[str]) -> dict[str, Any]:
+    return await api_client.request(
+        "POST",
+        "v1/receipts/trash/purge",
+        json={"file_ids": list(file_ids)},
+    )

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from PySide6.QtCore import Qt
@@ -26,7 +25,104 @@ from tahmeed.services.receipt_storage_service import (
     probe_storage,
     set_storage_path,
 )
+from tahmeed.ui.async_utils import await_blocking, schedule_coro
 from tahmeed.ui.widgets.table_contrast import apply_light_table_contrast, light_table_item
+
+_BG = "#F3F4F6"
+_CARD = "#FFFFFF"
+_TEXT = "#111827"
+_MUTED = "#4B5563"
+_BORDER = "#E5E7EB"
+_ACCENT = "#0077C5"
+
+_PAGE_SS = f"""
+QWidget#ReceiptStoragePanel {{
+  background: {_BG};
+  color: {_TEXT};
+}}
+QWidget#ReceiptStoragePanel QLabel {{
+  color: {_TEXT};
+  background: transparent;
+  font-family: "Segoe UI";
+  font-size: 13px;
+}}
+QWidget#ReceiptStoragePanel QLineEdit {{
+  background: {_CARD};
+  color: {_TEXT};
+  border: 1px solid {_BORDER};
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-family: "Segoe UI";
+  font-size: 13px;
+  selection-background-color: #DBEAFE;
+  selection-color: {_TEXT};
+}}
+QWidget#ReceiptStoragePanel QComboBox {{
+  background: {_CARD};
+  color: {_TEXT};
+  border: 1px solid {_BORDER};
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-family: "Segoe UI";
+  font-size: 13px;
+}}
+QWidget#ReceiptStoragePanel QComboBox QAbstractItemView {{
+  background: {_CARD};
+  color: {_TEXT};
+  selection-background-color: #DBEAFE;
+  selection-color: {_TEXT};
+}}
+QWidget#ReceiptStoragePanel QCheckBox {{
+  color: {_TEXT};
+  background: transparent;
+  font-family: "Segoe UI";
+  font-size: 12px;
+  spacing: 6px;
+}}
+QWidget#ReceiptStoragePanel QCheckBox::indicator {{
+  width: 16px;
+  height: 16px;
+  border: 1px solid {_BORDER};
+  border-radius: 3px;
+  background: {_CARD};
+}}
+QWidget#ReceiptStoragePanel QCheckBox::indicator:checked {{
+  background: {_ACCENT};
+  border-color: {_ACCENT};
+}}
+QWidget#ReceiptStoragePanel QPushButton {{
+  background: {_CARD};
+  color: {_TEXT};
+  border: 1px solid {_BORDER};
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-family: "Segoe UI";
+  font-size: 12px;
+  font-weight: 600;
+}}
+QWidget#ReceiptStoragePanel QPushButton:hover:!disabled {{
+  background: #F8FAFC;
+}}
+QWidget#ReceiptStoragePanel QPushButton:disabled {{
+  color: #9CA3AF;
+  background: #F3F4F6;
+}}
+"""
+
+_BTN_PRIMARY = f"""
+QPushButton {{
+  background: {_ACCENT};
+  color: #FFFFFF;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-family: "Segoe UI";
+  font-size: 12px;
+  font-weight: 600;
+}}
+QPushButton:hover:!disabled {{ background: #005EA3; }}
+QPushButton:disabled {{ background: #93C5FD; color: #FFFFFF; }}
+"""
 
 
 class ReceiptStoragePanel(QWidget):
@@ -34,10 +130,12 @@ class ReceiptStoragePanel(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setObjectName("ReceiptStoragePanel")
+        self.setStyleSheet(_PAGE_SS)
         self._status: dict[str, Any] = {}
         self._busy = False
         self._build()
-        asyncio.ensure_future(self.refresh())
+        schedule_coro(self.refresh())
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
@@ -45,7 +143,10 @@ class ReceiptStoragePanel(QWidget):
         root.setSpacing(12)
 
         heading = QLabel("Receipt disk")
-        heading.setStyleSheet("color:#111827; font:700 18px 'Segoe UI';")
+        heading.setStyleSheet(
+            f"color:{_TEXT}; font-weight:700; font-size:18px; "
+            f'font-family:"Segoe UI"; background:transparent;'
+        )
         root.addWidget(heading)
 
         self._health_banner = QLabel("")
@@ -53,7 +154,8 @@ class ReceiptStoragePanel(QWidget):
         self._health_banner.setVisible(False)
         self._health_banner.setStyleSheet(
             "background:#FEF2F2;color:#991B1B;border:1px solid #FECACA;"
-            "border-radius:8px;padding:10px 12px;font:600 13px 'Segoe UI';"
+            'border-radius:8px;padding:10px 12px;font-weight:600;font-size:13px;'
+            'font-family:"Segoe UI";'
         )
         root.addWidget(self._health_banner)
 
@@ -64,11 +166,15 @@ class ReceiptStoragePanel(QWidget):
             "under the old directory."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color:#6B7280; font:12px 'Segoe UI';")
+        hint.setStyleSheet(
+            f"color:{_MUTED}; font-size:12px; font-family:\"Segoe UI\"; "
+            "background:transparent;"
+        )
         root.addWidget(hint)
 
         form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignRight)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
         form.setHorizontalSpacing(16)
         form.setVerticalSpacing(8)
 
@@ -84,6 +190,10 @@ class ReceiptStoragePanel(QWidget):
         self._s3 = QLabel("—")
         self._pending = QLabel("—")
 
+        value_ss = (
+            f"color:{_TEXT}; font-size:13px; font-family:\"Segoe UI\"; "
+            "background:transparent;"
+        )
         for widget in (
             self._host,
             self._platform,
@@ -95,23 +205,33 @@ class ReceiptStoragePanel(QWidget):
             self._s3,
             self._pending,
         ):
-            widget.setStyleSheet("color:#111827; font:13px 'Segoe UI';")
+            widget.setStyleSheet(value_ss)
 
-        form.addRow("API host:", self._host)
-        form.addRow("Platform:", self._platform)
-        form.addRow("Active path:", self._effective)
-        form.addRow("Configured by:", self._source)
-        form.addRow("Env default:", self._env)
-        form.addRow("Disk space:", self._space)
-        form.addRow("Writable:", self._writable)
-        form.addRow("S3 backup:", self._s3)
-        form.addRow("Rows pending S3:", self._pending)
+        def _form_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f"color:{_MUTED}; font-size:12px; font-weight:600; "
+                f'font-family:"Segoe UI"; background:transparent;'
+            )
+            return lbl
+
+        form.addRow(_form_label("API host:"), self._host)
+        form.addRow(_form_label("Platform:"), self._platform)
+        form.addRow(_form_label("Active path:"), self._effective)
+        form.addRow(_form_label("Configured by:"), self._source)
+        form.addRow(_form_label("Env default:"), self._env)
+        form.addRow(_form_label("Disk space:"), self._space)
+        form.addRow(_form_label("Writable:"), self._writable)
+        form.addRow(_form_label("S3 backup:"), self._s3)
+        form.addRow(_form_label("Rows pending S3:"), self._pending)
         root.addLayout(form)
 
         path_row = QHBoxLayout()
         path_row.setSpacing(8)
         self._path = QLineEdit()
-        self._path.setPlaceholderText("Absolute path on the API host, e.g. E:\\tahmeed-receipts")
+        self._path.setPlaceholderText(
+            "Absolute path on the API host, e.g. E:\\tahmeed-receipts"
+        )
         path_row.addWidget(self._path, 1)
         self._create = QCheckBox("Create folder if missing")
         self._create.setChecked(True)
@@ -121,21 +241,19 @@ class ReceiptStoragePanel(QWidget):
         actions = QHBoxLayout()
         actions.setSpacing(8)
         self._refresh_btn = QPushButton("Refresh")
-        self._refresh_btn.clicked.connect(lambda: asyncio.ensure_future(self.refresh()))
+        self._refresh_btn.clicked.connect(lambda: schedule_coro(self.refresh()))
         self._probe_btn = QPushButton("Test write")
         self._probe_btn.clicked.connect(self._on_probe)
         self._apply_btn = QPushButton("Apply path")
-        self._apply_btn.setStyleSheet(
-            "QPushButton{background:#0077C5;color:#FFFFFF;border:none;"
-            "border-radius:6px;padding:6px 14px;font:600 12px 'Segoe UI';}"
-            "QPushButton:hover:!disabled{background:#005EA3;}"
-            "QPushButton:disabled{background:#93C5FD;}"
-        )
+        self._apply_btn.setStyleSheet(_BTN_PRIMARY)
         self._apply_btn.clicked.connect(self._on_apply)
         self._clear_btn = QPushButton("Use env default")
         self._clear_btn.clicked.connect(self._on_clear)
         self._status_lbl = QLabel("")
-        self._status_lbl.setStyleSheet("color:#16A34A; font-size:12px;")
+        self._status_lbl.setStyleSheet(
+            'color:#16A34A; font-size:12px; font-family:"Segoe UI"; '
+            "background:transparent;"
+        )
         for btn in (
             self._refresh_btn,
             self._probe_btn,
@@ -147,8 +265,11 @@ class ReceiptStoragePanel(QWidget):
         actions.addStretch()
         root.addLayout(actions)
 
-        cand_lbl = QLabel("Connected drives / mounts on the API host")
-        cand_lbl.setStyleSheet("color:#374151; font:600 13px 'Segoe UI';")
+        cand_lbl = QLabel("Server drives / mounts")
+        cand_lbl.setStyleSheet(
+            f"color:{_TEXT}; font-weight:600; font-size:13px; "
+            f'font-family:"Segoe UI"; background:transparent;'
+        )
         root.addWidget(cand_lbl)
 
         pick_row = QHBoxLayout()
@@ -206,11 +327,17 @@ class ReceiptStoragePanel(QWidget):
         self._space.setText(space)
         if probe.get("write_ok"):
             self._writable.setText("Yes")
-            self._writable.setStyleSheet("color:#16A34A; font:13px 'Segoe UI';")
+            self._writable.setStyleSheet(
+                'color:#16A34A; font-size:13px; font-family:"Segoe UI"; '
+                "background:transparent;"
+            )
         else:
             err = probe.get("error") or "No"
             self._writable.setText(str(err))
-            self._writable.setStyleSheet("color:#DC2626; font:13px 'Segoe UI';")
+            self._writable.setStyleSheet(
+                'color:#DC2626; font-size:13px; font-family:"Segoe UI"; '
+                "background:transparent;"
+            )
         if status.get("s3_configured"):
             bucket = status.get("s3_bucket") or ""
             prefix = status.get("receipt_s3_prefix") or "receipts"
@@ -272,7 +399,11 @@ class ReceiptStoragePanel(QWidget):
             status = await get_storage_status()
             self._fill(status)
         except Exception as exc:
-            QMessageBox.critical(self, "Receipt disk", f"Failed to load status:\n{exc}")
+            await await_blocking(
+                lambda: QMessageBox.critical(
+                    self, "Receipt disk", f"Failed to load status:\n{exc}"
+                )
+            )
         finally:
             self._set_busy(False)
 
@@ -299,7 +430,6 @@ class ReceiptStoragePanel(QWidget):
                 self._path.setText(str(suggested))
             index = self._candidate.findData(data)
             if index < 0:
-                # Match by path string if object identity differs.
                 path = str(data.get("path") or "")
                 for i in range(self._candidate.count()):
                     payload = self._candidate.itemData(i)
@@ -310,12 +440,16 @@ class ReceiptStoragePanel(QWidget):
                 self._candidate.setCurrentIndex(index)
 
     def _on_probe(self) -> None:
-        asyncio.ensure_future(self._do_probe())
+        schedule_coro(self._do_probe())
 
     async def _do_probe(self) -> None:
         path = self._path.text().strip()
         if not path:
-            QMessageBox.information(self, "Receipt disk", "Enter a path first.")
+            await await_blocking(
+                lambda: QMessageBox.information(
+                    self, "Receipt disk", "Enter a path first."
+                )
+            )
             return
         self._set_busy(True)
         try:
@@ -323,32 +457,46 @@ class ReceiptStoragePanel(QWidget):
             if probe.get("write_ok"):
                 free = probe.get("free_human") or "?"
                 self._status_lbl.setText(f"Write OK · {free} free")
-                self._status_lbl.setStyleSheet("color:#16A34A; font-size:12px;")
+                self._status_lbl.setStyleSheet(
+                    'color:#16A34A; font-size:12px; font-family:"Segoe UI"; '
+                    "background:transparent;"
+                )
             else:
                 self._status_lbl.setText(str(probe.get("error") or "Not writable"))
-                self._status_lbl.setStyleSheet("color:#DC2626; font-size:12px;")
+                self._status_lbl.setStyleSheet(
+                    'color:#DC2626; font-size:12px; font-family:"Segoe UI"; '
+                    "background:transparent;"
+                )
         except Exception as exc:
-            QMessageBox.warning(self, "Test write failed", str(exc))
+            await await_blocking(
+                lambda: QMessageBox.warning(self, "Test write failed", str(exc))
+            )
         finally:
             self._set_busy(False)
 
     def _on_apply(self) -> None:
-        asyncio.ensure_future(self._do_apply())
+        schedule_coro(self._do_apply())
 
     async def _do_apply(self) -> None:
         path = self._path.text().strip()
         if not path:
-            QMessageBox.information(self, "Receipt disk", "Enter a path first.")
+            await await_blocking(
+                lambda: QMessageBox.information(
+                    self, "Receipt disk", "Enter a path first."
+                )
+            )
             return
-        confirm = QMessageBox.question(
-            self,
-            "Apply receipt path?",
-            (
-                f"Store new receipts on the API host at:\n\n{path}\n\n"
-                "Existing files stay in the previous folder until moved manually."
-            ),
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+        confirm = await await_blocking(
+            lambda: QMessageBox.question(
+                self,
+                "Apply receipt path?",
+                (
+                    f"Store new receipts on the API host at:\n\n{path}\n\n"
+                    "Existing files stay in the previous folder until moved manually."
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
         )
         if confirm != QMessageBox.Yes:
             return
@@ -357,22 +505,30 @@ class ReceiptStoragePanel(QWidget):
             status = await set_storage_path(path, create=self._create.isChecked())
             self._fill(status)
             self._status_lbl.setText("Path applied.")
-            self._status_lbl.setStyleSheet("color:#16A34A; font-size:12px;")
+            self._status_lbl.setStyleSheet(
+                'color:#16A34A; font-size:12px; font-family:"Segoe UI"; '
+                "background:transparent;"
+            )
         except Exception as exc:
-            QMessageBox.critical(self, "Apply failed", str(exc))
+            await await_blocking(
+                lambda: QMessageBox.critical(self, "Apply failed", str(exc))
+            )
         finally:
             self._set_busy(False)
 
     def _on_clear(self) -> None:
-        asyncio.ensure_future(self._do_clear())
+        schedule_coro(self._do_clear())
 
     async def _do_clear(self) -> None:
-        confirm = QMessageBox.question(
-            self,
-            "Use env default?",
-            "Clear the database override and use ATTACHMENTS_DIRECTORY from the server env?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+        confirm = await await_blocking(
+            lambda: QMessageBox.question(
+                self,
+                "Use env default?",
+                "Clear the database override and use ATTACHMENTS_DIRECTORY "
+                "from the server env?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
         )
         if confirm != QMessageBox.Yes:
             return
@@ -381,8 +537,13 @@ class ReceiptStoragePanel(QWidget):
             status = await clear_storage_override()
             self._fill(status)
             self._status_lbl.setText("Using env default.")
-            self._status_lbl.setStyleSheet("color:#16A34A; font-size:12px;")
+            self._status_lbl.setStyleSheet(
+                'color:#16A34A; font-size:12px; font-family:"Segoe UI"; '
+                "background:transparent;"
+            )
         except Exception as exc:
-            QMessageBox.critical(self, "Clear failed", str(exc))
+            await await_blocking(
+                lambda: QMessageBox.critical(self, "Clear failed", str(exc))
+            )
         finally:
             self._set_busy(False)

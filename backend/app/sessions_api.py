@@ -8,7 +8,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Query, Request, Response, status
 
 from .audit_ops import record_operation_event
-from .dependencies import Admin
+from .dependencies import Manager
 from .errors import ApiError
 from .security import utcnow
 from .serialization import json_safe, object_id
@@ -46,7 +46,7 @@ def _public_session(
 @sessions.get("")
 async def list_sessions(
     request: Request,
-    _admin: Admin,
+    _manager: Manager,
     user_id: str | None = Query(None),
     active_only: bool = Query(True),
     limit: int = Query(200, ge=1, le=500),
@@ -83,7 +83,7 @@ async def list_sessions(
 
 @sessions.post("/{session_id}/revoke", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_session(
-    session_id: str, request: Request, admin: Admin
+    session_id: str, request: Request, manager: Manager
 ) -> Response:
     db = _database(request)
     try:
@@ -111,7 +111,7 @@ async def revoke_session(
         db,
         action="session.revoke",
         outcome="ok",
-        actor=admin,
+        actor=manager,
         request=request,
         entity_type="session",
         entity_ids=[str(oid)],
@@ -122,7 +122,7 @@ async def revoke_session(
 
 @sessions.post("/revoke-user/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_user_sessions(
-    user_id: str, request: Request, admin: Admin
+    user_id: str, request: Request, manager: Manager
 ) -> Response:
     db = _database(request)
     try:
@@ -141,7 +141,7 @@ async def revoke_user_sessions(
         db,
         action="session.revoke_user",
         outcome="ok",
-        actor=admin,
+        actor=manager,
         request=request,
         entity_type="user",
         entity_ids=[str(oid)],
@@ -151,7 +151,7 @@ async def revoke_user_sessions(
 
 
 @sessions.post("/revoke-all", status_code=status.HTTP_204_NO_CONTENT)
-async def revoke_all_sessions(request: Request, admin: Admin) -> Response:
+async def revoke_all_sessions(request: Request, manager: Manager) -> Response:
     """Revoke every active session except the caller's."""
     db = _database(request)
     now = utcnow()
@@ -164,7 +164,7 @@ async def revoke_all_sessions(request: Request, admin: Admin) -> Response:
         db,
         action="session.revoke_all",
         outcome="ok",
-        actor=admin,
+        actor=manager,
         request=request,
         entity_type="session",
         details={"revoked_count": int(result.modified_count)},

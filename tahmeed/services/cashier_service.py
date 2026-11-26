@@ -1684,7 +1684,7 @@ async def count_draft_transactions(
     *,
     all_cashiers: bool = False,
 ) -> int:
-    """Count unsubmitted draft rows (for sidebar badge)."""
+    """Count unsubmitted draft/parked calendar days (sidebar Drafts/Saved badge)."""
     params: dict = {"all_cashiers": "true" if all_cashiers else "false"}
     if not all_cashiers and cashier_id is not None:
         params["cashier_id"] = str(cashier_id)

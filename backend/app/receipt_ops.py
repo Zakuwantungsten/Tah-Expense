@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -2841,6 +2842,143 @@ async def list_storage_tree(db: Any, base: Path, *, prefix: str = "") -> dict[st
     return {"prefix": norm, "folders": folders}
 
 
+def _storage_display_fields(
+    doc: dict[str, Any] | None,
+    *,
+    path_name: str = "",
+    content_type: str = "",
+) -> dict[str, Any]:
+    """Type / status labels for Explorer.
+
+    Records filings are company paper — never surface chase ``approved`` as status.
+    Type prefers the Records destination (item / supplier / folder name).
+    """
+    if not doc:
+        ext = Path(path_name or "").suffix.lstrip(".").lower()
+        short = (content_type or "").split("/")[-1] if content_type else ""
+        return {
+            "display_type": ext or short or "file",
+            "display_status": "disk only",
+            "source": "",
+            "record_kind": "",
+            "record_label": "",
+        }
+    rec = doc.get("record") if isinstance(doc.get("record"), dict) else None
+    source = str(doc.get("source") or "")
+    if rec:
+        label = str(rec.get("label") or rec.get("ref_key") or "").strip()
+        kind = str(rec.get("kind") or "").strip().lower()
+        kind_title = {
+            "item": "Item",
+            "supplier": "Supplier",
+            "separate": "Separate",
+            "custom": "Custom",
+        }.get(kind, kind.title() if kind else "Records")
+        type_s = label or kind_title
+        if rec.get("from_approved"):
+            status = "Approved · bridged"
+        else:
+            status = "Records"
+        return {
+            "display_type": type_s,
+            "display_status": status,
+            "source": source or "records",
+            "record_kind": kind,
+            "record_label": label,
+        }
+    status = str(doc.get("inbox_status") or "").strip() or "—"
+    ext = Path(
+        str(doc.get("original_filename") or path_name or "")
+    ).suffix.lstrip(".").lower()
+    ctype = content_type or str(doc.get("content_type") or "")
+    short = ctype.split("/")[-1] if ctype else ""
+    return {
+        "display_type": ext or short or "file",
+        "display_status": status,
+        "source": source or "chase",
+        "record_kind": "",
+        "record_label": "",
+    }
+
+
+async def find_receipt_files_matching_name(
+    db: Any,
+    base_query: dict[str, Any],
+    needle: str,
+    *,
+    limit: int = 200,
+    sort: list[tuple[str, int]] | None = None,
+) -> list[dict[str, Any]]:
+    """Filename / sha search using text index when present, else regex.
+
+    Browse filters in ``base_query`` (kind, folder, trashed, …) still apply.
+    """
+    q = (needle or "").strip()
+    if not q:
+        return []
+    cap = max(1, min(int(limit), 500))
+    order = sort or [("uploaded_at", -1)]
+    # Prefer $text (receipt_files_search_text) for token/word search.
+    if len(q) >= 2:
+        try:
+            text_query = {**base_query, "$text": {"$search": q}}
+            docs = (
+                await db.receipt_files.find(
+                    text_query,
+                    {"score": {"$meta": "textScore"}},
+                )
+                .sort([("score", {"$meta": "textScore"}), *order])
+                .limit(cap)
+                .to_list(length=cap)
+            )
+            if docs:
+                return docs
+        except Exception:
+            # No text index yet, or server rejected $text — fall through.
+            pass
+    rx = re.escape(q)
+    regex_query = {
+        "$and": [
+            base_query,
+            {
+                "$or": [
+                    {"original_filename": {"$regex": rx, "$options": "i"}},
+                    {"sha256": {"$regex": f"^{re.escape(q.lower())}"}},
+                    {"stored_path": {"$regex": rx, "$options": "i"}},
+                ]
+            },
+        ]
+    }
+    return (
+        await db.receipt_files.find(regex_query)
+        .sort(order)
+        .limit(cap)
+        .to_list(length=cap)
+    )
+
+
+def _dir_total_size(path: Path, *, max_files: int = 4000) -> int:
+    """Best-effort recursive folder byte size (capped for Explorer snappiness)."""
+    total = 0
+    n = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                if name.startswith("."):
+                    continue
+                fp = Path(root) / name
+                try:
+                    total += int(fp.stat().st_size)
+                except OSError:
+                    continue
+                n += 1
+                if n >= max_files:
+                    return total
+    except OSError:
+        return total
+    return total
+
+
 async def list_storage_objects(
     db: Any,
     base: Path,
@@ -2849,7 +2987,7 @@ async def list_storage_objects(
     q: str = "",
     limit: int = 200,
 ) -> dict[str, Any]:
-    """List files in a prefix, enriched from ``receipt_files`` when possible.
+    """List folders + files in a prefix, enriched from ``receipt_files`` when possible.
 
     When ``q`` is set, search the index by filename / sha256 prefix (still
     scoped to allowed roots) instead of only the current folder.
@@ -2862,18 +3000,11 @@ async def list_storage_objects(
     items: list[dict[str, Any]] = []
 
     if needle:
-        rx = re.escape(needle)
-        query: dict[str, Any] = {
-            "$or": [
-                {"original_filename": {"$regex": rx, "$options": "i"}},
-                {"sha256": {"$regex": f"^{re.escape(needle.lower())}"}},
-                {"stored_path": {"$regex": rx, "$options": "i"}},
-            ]
-        }
+        scope: dict[str, Any] = {"trashed": {"$ne": True}}
         if norm:
-            query = {
+            scope = {
                 "$and": [
-                    query,
+                    {"trashed": {"$ne": True}},
                     {
                         "$or": [
                             {"stored_path": {"$regex": f"^{re.escape(norm)}(/|$)"}},
@@ -2893,18 +3024,23 @@ async def list_storage_objects(
                     },
                 ]
             }
-        docs = (
-            await db.receipt_files.find(query)
-            .sort("uploaded_at", -1)
-            .limit(cap)
-            .to_list(length=cap)
+        docs = await find_receipt_files_matching_name(
+            db, scope, needle, limit=cap
         )
         for doc in docs:
+            if doc.get("trashed") is True:
+                continue
             stored = str(doc.get("stored_path") or "").replace("\\", "/")
             fid = str(doc.get("_id") or "")
+            name = str(doc.get("original_filename") or Path(stored).name or fid)
+            labels = _storage_display_fields(
+                doc,
+                path_name=name,
+                content_type=str(doc.get("content_type") or ""),
+            )
             items.append(
                 {
-                    "name": str(doc.get("original_filename") or Path(stored).name or fid),
+                    "name": name,
                     "key": stored or str(doc.get("quarantine_path") or ""),
                     "kind": "file",
                     "size": int(doc.get("size") or 0),
@@ -2914,23 +3050,66 @@ async def list_storage_objects(
                     "sha256": doc.get("sha256") or "",
                     "uploaded_at": doc.get("uploaded_at"),
                     "indexed": True,
+                    **labels,
                 }
             )
         return {"prefix": norm, "q": needle, "items": items, "total": len(items)}
 
     if not norm:
-        return {"prefix": "", "q": "", "items": [], "total": 0}
+        # Windows-like root: show workspace folders in the detail pane too.
+        folders = []
+        for name in ("files", "approved", "quarantine", "parked", "records"):
+            folder_path = _storage_dir(base, name)
+            folders.append(
+                {
+                    "name": name,
+                    "key": name,
+                    "kind": "folder",
+                    "prefix": name,
+                    "size": _dir_total_size(folder_path) if folder_path.is_dir() else 0,
+                    "file_id": "",
+                    "content_type": "folder",
+                    "inbox_status": "",
+                    "sha256": "",
+                    "uploaded_at": None,
+                    "indexed": False,
+                }
+            )
+        return {"prefix": "", "q": "", "items": folders, "total": len(folders)}
 
     target = _storage_dir(base, norm)
     if not target.is_dir():
         return {"prefix": norm, "q": "", "items": [], "total": 0}
 
+    disk_folders: list[Path] = []
     disk_files: list[Path] = []
-    for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
-        if child.is_file() and not child.name.startswith("."):
+    for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        if child.name.startswith("."):
+            continue
+        if child.is_dir():
+            disk_folders.append(child)
+        elif child.is_file():
             disk_files.append(child)
-        if len(disk_files) >= cap:
+        if len(disk_folders) + len(disk_files) >= cap:
             break
+
+    for folder in disk_folders:
+        key = f"{norm}/{folder.name}".replace("\\", "/")
+        items.append(
+            {
+                "name": folder.name,
+                "key": key,
+                "kind": "folder",
+                "prefix": key,
+                "size": _dir_total_size(folder),
+                "file_id": "",
+                "content_type": "folder",
+                "inbox_status": "",
+                "sha256": "",
+                "uploaded_at": None,
+                "indexed": False,
+            }
+        )
 
     guessed_ids = [_file_id_from_stored_name(p.name) for p in disk_files]
     by_id = await _docs_by_ids(db, guessed_ids)
@@ -2961,29 +3140,426 @@ async def list_storage_objects(
         key = f"{norm}/{path.name}".replace("\\", "/")
         fid = _file_id_from_stored_name(path.name)
         doc = by_key.get(key) or by_id.get(fid)
+        if doc is not None and doc.get("trashed") is True:
+            continue
         try:
             size = path.stat().st_size
         except OSError:
             size = int((doc or {}).get("size") or 0)
+        ctype = (doc or {}).get("content_type") or guess_content_type(path.name)
+        name = str((doc or {}).get("original_filename") or path.name)
+        labels = _storage_display_fields(
+            doc, path_name=name, content_type=str(ctype or "")
+        )
         items.append(
             {
-                "name": str(
-                    (doc or {}).get("original_filename") or path.name
-                ),
+                "name": name,
                 "key": key,
                 "kind": "file",
                 "size": size,
                 "file_id": str((doc or {}).get("_id") or fid or ""),
-                "content_type": (doc or {}).get("content_type")
-                or guess_content_type(path.name),
+                "content_type": ctype,
                 "inbox_status": (doc or {}).get("inbox_status") or "",
                 "sha256": (doc or {}).get("sha256") or "",
                 "uploaded_at": (doc or {}).get("uploaded_at"),
                 "indexed": doc is not None,
+                **labels,
             }
         )
 
     return {"prefix": norm, "q": "", "items": items, "total": len(items)}
+
+
+async def create_storage_folder(
+    base: Path, *, prefix: str, name: str
+) -> dict[str, Any]:
+    """Create an empty child folder under an allowed storage prefix."""
+    ensure_receipt_workspace(base)
+    raw = " ".join((name or "").split())
+    if not raw or raw in {".", ".."} or "/" in raw or "\\" in raw:
+        raise ValueError("Enter a single folder name (no path separators)")
+    if any(ch in raw for ch in '<>:"|?*'):
+        raise ValueError("Folder name contains invalid characters")
+    parent = normalize_storage_prefix(prefix)
+    if not parent:
+        raise ValueError("Create folders under files, approved, records, etc. — not at disk root")
+    parent_dir = _storage_dir(base, parent)
+    if not parent_dir.is_dir():
+        raise ValueError("Parent folder does not exist")
+    dest = parent_dir / raw
+    if dest.exists():
+        raise ValueError(f"“{raw}” already exists here")
+    dest.mkdir(parents=False, exist_ok=False)
+    key = f"{parent}/{raw}".replace("\\", "/")
+    return {"name": raw, "prefix": key, "kind": "folder"}
+
+
+async def rename_storage_folder(
+    base: Path, *, prefix: str, name: str
+) -> dict[str, Any]:
+    """Rename a non-root disk folder (last path segment only)."""
+    ensure_receipt_workspace(base)
+    norm = normalize_storage_prefix(prefix)
+    if not norm or norm in {"files", "approved", "quarantine", "parked", "records"}:
+        raise ValueError("Cannot rename workspace root folders")
+    raw = " ".join((name or "").split())
+    if not raw or raw in {".", ".."} or "/" in raw or "\\" in raw:
+        raise ValueError("Enter a single folder name (no path separators)")
+    if any(ch in raw for ch in '<>:"|?*'):
+        raise ValueError("Folder name contains invalid characters")
+    target = _storage_dir(base, norm)
+    if not target.is_dir():
+        raise ValueError("Folder not found")
+    parent = target.parent
+    dest = parent / raw
+    if dest.exists():
+        raise ValueError(f"“{raw}” already exists here")
+    target.rename(dest)
+    new_prefix = "/".join(norm.split("/")[:-1] + [raw]).strip("/")
+    return {"prefix": new_prefix, "name": raw, "old_prefix": norm}
+
+
+async def delete_empty_storage_folder(base: Path, *, prefix: str) -> dict[str, Any]:
+    """Remove an empty disk folder under the attachments workspace."""
+    ensure_receipt_workspace(base)
+    norm = normalize_storage_prefix(prefix)
+    if not norm or norm in {"files", "approved", "quarantine", "parked", "records"}:
+        raise ValueError("Cannot delete workspace root folders")
+    target = _storage_dir(base, norm)
+    if not target.is_dir():
+        raise ValueError("Folder not found")
+    try:
+        next(target.iterdir())
+        raise ValueError("Folder is not empty — move or trash files first")
+    except StopIteration:
+        pass
+    target.rmdir()
+    return {"prefix": norm, "deleted": True}
+
+
+async def trash_storage_folder(
+    db: Any,
+    base: Path,
+    *,
+    prefix: str,
+    actor_id: ObjectId | None = None,
+) -> dict[str, Any]:
+    """Soft-trash indexed files under a prefix, then remove the disk folder tree.
+
+    Workspace roots (files/approved/…) cannot be deleted. Indexed files go to
+    Trash (restorable); the empty-or-remaining disk tree is removed.
+    """
+    ensure_receipt_workspace(base)
+    norm = normalize_storage_prefix(prefix)
+    if not norm or norm in {"files", "approved", "quarantine", "parked", "records"}:
+        raise ValueError("Cannot delete workspace root folders")
+    target = _storage_dir(base, norm)
+    if not target.is_dir():
+        raise ValueError("Folder not found")
+
+    rx = f"^{re.escape(norm)}(/|$)"
+    docs = await db.receipt_files.find(
+        {
+            "trashed": {"$ne": True},
+            "$or": [
+                {"stored_path": {"$regex": rx}},
+                {"quarantine_path": {"$regex": rx}},
+                {
+                    "materialized_paths": {
+                        "$elemMatch": {"$regex": rx}
+                    }
+                },
+                {"record.path": {"$regex": rx}},
+            ],
+        },
+        {"_id": 1},
+    ).to_list(length=5000)
+    file_ids = [str(d.get("_id") or "") for d in docs if d.get("_id")]
+    trashed = await trash_receipt_files(db, file_ids=file_ids, actor_id=actor_id)
+
+    # Remove remaining disk tree (indexed bytes stay via files/ primary paths).
+    removed = False
+    try:
+        shutil.rmtree(target)
+        removed = True
+    except OSError as exc:
+        # Fall back to empty-only delete if tree still locked
+        try:
+            if not any(target.iterdir()):
+                target.rmdir()
+                removed = True
+            else:
+                raise ValueError(
+                    f"Files moved to Trash, but folder “{norm}” could not be "
+                    f"removed from disk ({exc}). Refresh and retry."
+                ) from exc
+        except ValueError:
+            raise
+        except OSError as exc2:
+            raise ValueError(
+                f"Files moved to Trash, but folder “{norm}” could not be "
+                f"removed from disk ({exc2})."
+            ) from exc2
+
+    return {
+        "prefix": norm,
+        "deleted": removed,
+        "trashed_files": int(trashed.get("trashed") or 0),
+        "skipped_files": int(trashed.get("skipped") or 0),
+        # Sample for audit accountability (who cascade-trashed which files).
+        "file_ids": file_ids[:40],
+    }
+
+
+async def trash_receipt_files(
+    db: Any,
+    *,
+    file_ids: list[str],
+    actor_id: ObjectId | None = None,
+) -> dict[str, Any]:
+    """Soft-delete indexed receipt files into Trash (bytes stay on disk)."""
+    now = utcnow()
+    trashed = 0
+    skipped = 0
+    for raw in file_ids:
+        fid = (raw or "").strip()
+        if not fid:
+            continue
+        doc = await db.receipt_files.find_one({"_id": fid})
+        if not doc or doc.get("trashed") is True:
+            skipped += 1
+            continue
+        origin = str(doc.get("stored_path") or "").replace("\\", "/")
+        if not origin:
+            for mp in doc.get("materialized_paths") or []:
+                text = str(mp or "").replace("\\", "/")
+                if text:
+                    origin = text
+                    break
+        rec = doc.get("record") if isinstance(doc.get("record"), dict) else {}
+        if not origin and rec.get("path"):
+            origin = str(rec.get("path") or "").replace("\\", "/")
+        await db.receipt_files.update_one(
+            {"_id": fid},
+            {
+                "$set": {
+                    "trashed": True,
+                    "trashed_at": now,
+                    "trashed_by": actor_id,
+                    "trash_origin": origin,
+                }
+            },
+        )
+        trashed += 1
+    return {"trashed": trashed, "skipped": skipped, "requested": len(file_ids)}
+
+
+def _trash_item_type(doc: dict[str, Any]) -> str:
+    name = str(doc.get("original_filename") or "")
+    ext = Path(name).suffix.lstrip(".").upper()
+    ctype = str(doc.get("content_type") or "")
+    if ext:
+        return f"{ext} File"
+    if ctype:
+        return ctype.split("/")[-1]
+    return "File"
+
+
+async def list_trashed_receipt_files(
+    db: Any, *, limit: int = 200, q: str = ""
+) -> dict[str, Any]:
+    cap = max(1, min(int(limit), 500))
+    query: dict[str, Any] = {"trashed": True}
+    needle = (q or "").strip()
+    if needle:
+        docs = await find_receipt_files_matching_name(
+            db,
+            query,
+            needle,
+            limit=cap,
+            sort=[("trashed_at", -1), ("uploaded_at", -1)],
+        )
+    else:
+        docs = (
+            await db.receipt_files.find(query)
+            .sort([("trashed_at", -1), ("uploaded_at", -1)])
+            .limit(cap)
+            .to_list(length=cap)
+        )
+    total = await db.receipt_files.count_documents({"trashed": True})
+    items: list[dict[str, Any]] = []
+    for doc in docs:
+        rec = doc.get("record") if isinstance(doc.get("record"), dict) else {}
+        origin = str(doc.get("trash_origin") or doc.get("stored_path") or "").replace(
+            "\\", "/"
+        )
+        if not origin and rec.get("path"):
+            origin = str(rec.get("path") or "").replace("\\", "/")
+        items.append(
+            {
+                "id": str(doc.get("_id") or ""),
+                "original_filename": doc.get("original_filename") or "",
+                "size": int(doc.get("size") or 0),
+                "content_type": doc.get("content_type") or "",
+                "item_type": _trash_item_type(doc),
+                "inbox_status": doc.get("inbox_status") or "",
+                "stored_path": doc.get("stored_path") or "",
+                "original_location": origin,
+                "source": doc.get("source") or "",
+                "trashed_at": doc.get("trashed_at"),
+                "uploaded_at": doc.get("uploaded_at"),
+                "date_modified": doc.get("uploaded_at"),
+                "record_kind": rec.get("kind") or "",
+                "record_label": rec.get("label") or rec.get("ref_key") or "",
+            }
+        )
+    return {"items": items, "total": int(total), "shown": len(items)}
+
+
+async def restore_all_trashed_receipt_files(db: Any) -> dict[str, Any]:
+    docs = await db.receipt_files.find(
+        {"trashed": True}, {"_id": 1}
+    ).to_list(length=5000)
+    ids = [str(d.get("_id") or "") for d in docs if d.get("_id")]
+    return await restore_trashed_receipt_files(db, file_ids=ids)
+
+
+async def empty_receipt_trash(db: Any, base: Path) -> dict[str, Any]:
+    docs = await db.receipt_files.find(
+        {"trashed": True}, {"_id": 1}
+    ).to_list(length=5000)
+    ids = [str(d.get("_id") or "") for d in docs if d.get("_id")]
+    return await purge_trashed_receipt_files(db, base, file_ids=ids)
+
+
+async def restore_trashed_receipt_files(
+    db: Any, *, file_ids: list[str]
+) -> dict[str, Any]:
+    restored = 0
+    for raw in file_ids:
+        fid = (raw or "").strip()
+        if not fid:
+            continue
+        result = await db.receipt_files.update_one(
+            {"_id": fid, "trashed": True},
+            {
+                "$unset": {
+                    "trashed": "",
+                    "trashed_at": "",
+                    "trashed_by": "",
+                    "trash_origin": "",
+                }
+            },
+        )
+        if int(getattr(result, "modified_count", 0) or 0) > 0:
+            restored += 1
+    return {"restored": restored, "requested": len(file_ids)}
+
+
+async def _detach_file_from_transactions(
+    db: Any, *, file_id: str, transaction_ids: list[Any]
+) -> int:
+    """Remove a receipt file from linked expense attachments before hard-delete."""
+    detached = 0
+    fid = (file_id or "").strip()
+    if not fid:
+        return 0
+    for raw in transaction_ids or []:
+        tx_id = raw
+        if not isinstance(tx_id, ObjectId):
+            try:
+                tx_id = ObjectId(str(raw))
+            except Exception:
+                continue
+        await db.transactions.update_one(
+            {"_id": tx_id},
+            {"$pull": {"attachments": {"file_id": fid}}},
+        )
+        await db.transactions.update_one(
+            {"_id": tx_id},
+            {"$pull": {"attachments": {"id": fid}}},
+        )
+        await db.receipt_requests.update_one(
+            {"transaction_id": tx_id},
+            {"$pull": {"file_ids": fid}},
+        )
+        await sync_receipt_status_after_detach(db, tx_id)
+        detached += 1
+    return detached
+
+
+async def purge_trashed_receipt_files(
+    db: Any,
+    base: Path,
+    *,
+    file_ids: list[str],
+) -> dict[str, Any]:
+    """Permanently delete trashed receipt files (DB + primary/materialized bytes).
+
+    Expense-linked files are unlinked from transactions, then removed — otherwise
+    Trash would keep showing them forever after “Delete permanently”.
+    """
+    from .receipt_records_ops import discard_record_upload_batch
+
+    purged = 0
+    skipped = 0
+    unlinked = 0
+    record_ids: list[str] = []
+    other_ids: list[str] = []
+    for raw in file_ids:
+        fid = (raw or "").strip()
+        if not fid:
+            continue
+        doc = await db.receipt_files.find_one({"_id": fid, "trashed": True})
+        if not doc:
+            skipped += 1
+            continue
+        txs = list(doc.get("transaction_ids") or [])
+        if txs:
+            unlinked += await _detach_file_from_transactions(
+                db, file_id=fid, transaction_ids=txs
+            )
+            # Clear links so discard_record_upload_batch will hard-delete.
+            await db.receipt_files.update_one(
+                {"_id": fid},
+                {"$set": {"transaction_ids": []}},
+            )
+        if isinstance(doc.get("record"), dict):
+            record_ids.append(fid)
+        else:
+            other_ids.append(fid)
+
+    if record_ids:
+        purged += await discard_record_upload_batch(db, base, record_ids)
+
+    root = attachments_root(base)
+    for fid in other_ids:
+        doc = await db.receipt_files.find_one({"_id": fid})
+        if not doc:
+            continue
+        path = _resolve_file_path(base, doc)
+        await db.receipt_files.delete_one({"_id": fid})
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for rel in doc.get("materialized_paths") or []:
+            text = str(rel or "").replace("\\", "/").lstrip("/")
+            if not text:
+                continue
+            try:
+                (root / Path(*text.split("/"))).unlink(missing_ok=True)
+            except OSError:
+                pass
+        purged += 1
+
+    return {
+        "purged": purged,
+        "skipped": skipped,
+        "unlinked": unlinked,
+        "requested": len(file_ids),
+    }
 
 
 async def get_receipt_file_open_meta(

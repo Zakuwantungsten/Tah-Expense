@@ -1,31 +1,30 @@
-"""Where should these files go? — Receipts park vs Records destinations.
-
-Used from Receipts Main Upload (accountant). Customs created here are the same
-folders as Paperwork → Records. File-to-Records uses an Explorer-style tree
-plus optional typeahead jump.
-"""
+"""Upload destination — dense Windows Save As–style park / Records picker."""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 import qtawesome as qta
 from PySide6.QtCore import QDate, QSize, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QButtonGroup,
     QComboBox,
     QDateEdit,
     QDialog,
+    QFrame,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QRadioButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -39,75 +38,120 @@ from tahmeed.services.receipt_records_service import (
 )
 from tahmeed.ui.accountant.date_filters import style_calendar_popup
 from tahmeed.ui.widgets.combo_styles import with_combo_popup
-from tahmeed.ui.widgets.completer_line_edit import CompleterLineEdit
 from tahmeed.ui.widgets.popup_styles import with_light_popups
+from tahmeed.ui.widgets.windows_command_bar import WindowsExplorerChrome
 
-_BG = "#F3F4F6"
+_BG = "#F0F0F0"
 _CARD = "#FFFFFF"
-_BORDER = "#E5E7EB"
-_TEXT = "#111827"
-_MUTED = "#6B7280"
+_BORDER = "#D0D0D0"
+_TEXT = "#1A1A1A"
+_MUTED = "#5A5A5A"
 _ACCENT = "#0077C5"
-_NAVY = "#1B2B4B"
+_FOLDER = "#D97706"
 
-_CARD_SS = f"""
-QWidget#UploadDestCard {{
-  background: {_CARD};
-  border: 1px solid {_BORDER};
-  border-radius: 8px;
-}}
-QWidget#UploadDestCard QLabel {{
-  background: transparent;
-  border: none;
-  color: {_TEXT};
-}}
-QWidget#UploadDestCard QRadioButton {{
-  background: transparent;
-  border: none;
-  color: {_TEXT};
-  font: 600 12px 'Segoe UI';
-}}
-"""
+_KIND_ICONS: dict[str, tuple[str, str]] = {
+    "custom": ("mdi.folder-star", _FOLDER),
+    "item": ("mdi.package-variant-closed", _ACCENT),
+    "supplier": ("mdi.truck-outline", "#0F766E"),
+    "separate": ("mdi.file-cabinet", "#7C3AED"),
+}
+_KINDS: tuple[tuple[str, str], ...] = (
+    ("custom", "Custom"),
+    ("item", "Items"),
+    ("supplier", "Suppliers"),
+    ("separate", "Separate"),
+)
 
-_COMBO_SS = with_combo_popup(
-    f"QComboBox{{font:12px 'Segoe UI';color:{_TEXT};border:1px solid {_BORDER};"
-    f"border-radius:4px;padding:4px 8px;background:#FFFFFF;min-height:30px;}}"
-)
-_INPUT_SS = (
-    f"QLineEdit,QDateEdit{{font:12px 'Segoe UI';color:{_TEXT};border:1px solid {_BORDER};"
-    f"border-radius:4px;padding:4px 8px;background:#FFFFFF;min-height:30px;}}"
-)
-_TREE_SS = with_light_popups(
-    f"QTreeWidget{{font:12px 'Segoe UI';color:{_TEXT};border:1px solid {_BORDER};"
-    f"border-radius:4px;background:#FFFFFF;outline:none;padding:4px;}}"
-    "QTreeWidget::item{padding:3px 6px;border-radius:3px;min-height:22px;}"
-    f"QTreeWidget::item:selected{{background:#E0F2FE;color:{_TEXT};}}"
-    "QTreeWidget::item:hover{background:#F8FAFC;}"
-)
-_FIELD_LBL_SS = (
-    f"color:{_MUTED};font:600 11px 'Segoe UI';background:transparent;border:none;"
-)
-_HINT_SS = (
-    f"color:{_MUTED};font:11px 'Segoe UI';background:transparent;border:none;"
-)
 _BTN_GHOST = with_light_popups(
     f"QPushButton{{background:{_CARD};color:{_TEXT};border:1px solid {_BORDER};"
-    f"border-radius:4px;padding:6px 12px;font:600 12px 'Segoe UI';}}"
-    f"QPushButton:hover{{background:#F8FAFC;}}"
-    f"QPushButton:disabled{{color:#9CA3AF;}}"
+    f"border-radius:3px;padding:4px 14px;font-weight:600; font-size:12px; font-family:\"Segoe UI\";min-height:26px;}}"
+    f"QPushButton:hover{{background:#F5F5F5;}}"
 )
 _BTN_PRIMARY = with_light_popups(
     f"QPushButton{{background:{_ACCENT};color:#FFFFFF;border:none;"
-    f"border-radius:4px;padding:6px 14px;font:600 12px 'Segoe UI';}}"
+    f"border-radius:3px;padding:4px 16px;font-weight:600; font-size:12px; font-family:\"Segoe UI\";min-height:26px;}}"
     f"QPushButton:hover{{background:#005EA3;}}"
     f"QPushButton:disabled{{background:#93C5FD;}}"
 )
-_BTN_SMALL = with_light_popups(
-    f"QPushButton{{background:{_CARD};color:{_TEXT};border:1px solid {_BORDER};"
-    f"border-radius:4px;padding:4px 8px;font:600 11px 'Segoe UI';}}"
-    f"QPushButton:hover{{background:#F8FAFC;}}"
-    f"QPushButton:disabled{{color:#9CA3AF;}}"
+_INPUT_SS = (
+    f"QLineEdit,QDateEdit,QComboBox{{font-size:12px; font-family:\"Segoe UI\";color:{_TEXT};"
+    f"border:1px solid {_BORDER};border-radius:3px;padding:2px 6px;"
+    f"background:{_CARD};min-height:24px;}}"
 )
+_COMBO_SS = with_combo_popup(_INPUT_SS)
+_RIBBON_DATE = (
+    "QDateEdit{"
+    f"font-size:11px; font-family:\"Segoe UI\";color:{_TEXT};"
+    f"border:1px solid {_BORDER};border-radius:3px;padding:1px 4px;"
+    f"background:{_CARD};min-height:22px;max-height:24px;min-width:92px;}}"
+)
+
+
+def _tree_stylesheet() -> str:
+    from PySide6.QtWidgets import QApplication
+
+    closed_url = opened_url = ""
+    if QApplication.instance() is not None:
+        cache = Path(__file__).resolve().parents[2] / ".cache" / "tree_branch"
+        cache.mkdir(parents=True, exist_ok=True)
+        closed = cache / "chevron_right.png"
+        opened = cache / "chevron_down.png"
+        if not closed.exists():
+            qta.icon("mdi.chevron-right", color=_MUTED).pixmap(10, 10).save(str(closed))
+        if not opened.exists():
+            qta.icon("mdi.chevron-down", color=_MUTED).pixmap(10, 10).save(str(opened))
+        closed_url, opened_url = closed.as_posix(), opened.as_posix()
+    branch_closed = f'image: url("{closed_url}");' if closed_url else "image: none;"
+    branch_open = f'image: url("{opened_url}");' if opened_url else "image: none;"
+    return with_light_popups(f"""
+QTreeWidget {{
+  background:{_CARD}; border:none; font-size:12px; font-family:\"Segoe UI\"; color:{_TEXT};
+  outline:none; padding:0; show-decoration-selected:0;
+}}
+QTreeWidget::item {{
+  padding:1px 4px; border-radius:2px; min-height:20px;
+  border: none; outline: none;
+}}
+QTreeWidget::item:selected,
+QTreeWidget::item:selected:active,
+QTreeWidget::item:selected:!active {{
+  background:#CCE8FF; color:{_TEXT}; border: none; outline: none;
+}}
+QTreeWidget::item:hover:!selected {{ background:#F2F2F2; }}
+QTreeWidget::branch {{
+  background: transparent; border: none; border-image: none;
+}}
+QTreeWidget::branch:selected,
+QTreeWidget::branch:selected:active {{
+  background: transparent; border: none;
+}}
+QTreeWidget::branch:has-siblings:!adjoins-item,
+QTreeWidget::branch:!has-children:!has-siblings:adjoins-item,
+QTreeWidget::branch:!has-children:has-siblings:adjoins-item {{
+  border-image: none; image: none; background: transparent;
+}}
+QTreeWidget::branch:has-children:!has-siblings:closed,
+QTreeWidget::branch:closed:has-children:has-siblings {{
+  border-image: none; background: transparent; {branch_closed}
+}}
+QTreeWidget::branch:open:has-children:!has-siblings,
+QTreeWidget::branch:open:has-children:has-siblings {{
+  border-image: none; background: transparent; {branch_open}
+}}
+""")
+
+
+_TABLE_SS = with_light_popups(f"""
+QTableWidget {{
+  background:{_CARD}; border:none; font-size:12px; font-family:\"Segoe UI\"; color:{_TEXT};
+  gridline-color:transparent; outline:none;
+  selection-background-color:#CCE8FF; selection-color:{_TEXT};
+}}
+QHeaderView::section {{
+  background:#F5F5F5; color:{_MUTED}; font-weight:600; font-size:11px; font-family:\"Segoe UI\";
+  border:none; border-bottom:1px solid {_BORDER}; padding:3px 8px;
+}}
+""")
 
 UploadMode = Literal["park", "records"]
 
@@ -127,11 +171,11 @@ class UploadDestinationChoice:
     folder_id: str = ""
     label: str = ""
     note: str = ""
-    file_date: str = ""  # YYYY-MM-DD for Records browse YYYY/MM; empty = today
+    file_date: str = ""
 
 
 class ReceiptUploadDestinationDialog(QDialog):
-    """Pick Receipts inbox park vs a Records destination after multi-file select."""
+    """Dense Save As picker: Records tree fills the window; park is a save-type."""
 
     def __init__(
         self,
@@ -142,263 +186,298 @@ class ReceiptUploadDestinationDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self._allow_records = bool(allow_records)
+        self._file_count = max(1, int(file_count))
         self._choice: UploadDestinationChoice | None = None
         self._accepting = False
-        self._syncing_jump = False
-        self._tree_selected: dict[str, Any] | None = None
+        self._kind = "item"
+        self._selected: dict[str, Any] | None = None
+        self._kind_roots: dict[str, QTreeWidgetItem] = {}
+        self._expanded_kinds: set[str] = {"item"}
+        self._content_rows: list[dict[str, Any]] = []
+        self._filter = ""
         self._destinations: dict[str, list[dict[str, Any]]] = {
             "custom": [],
             "item": [],
             "supplier": [],
             "separate": [],
         }
-        self.setWindowTitle("Upload destination")
+        self.setWindowTitle("Save to…")
         self.setModal(True)
-        self.setMinimumWidth(560)
-        self.setMinimumHeight(520)
         self.setStyleSheet(f"QDialog{{background:{_BG};}}")
-        self._build(file_count)
+        if self._allow_records:
+            self.setMinimumSize(640, 420)
+            self.resize(700, 460)
+        else:
+            self.setMinimumSize(360, 140)
+            self.resize(420, 150)
+        self._build()
         if self._allow_records:
             asyncio.ensure_future(self._load_destinations())
 
     def result_choice(self) -> UploadDestinationChoice | None:
         return self._choice
 
-    def _build(self, file_count: int) -> None:
+    def _is_park(self) -> bool:
+        if not self._allow_records:
+            return True
+        return str(self._save_type.currentData() or "records") == "park"
+
+    # ── UI ────────────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 18, 20, 18)
-        root.setSpacing(12)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        card = QWidget()
-        card.setObjectName("UploadDestCard")
-        card.setStyleSheet(_CARD_SS)
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(18, 16, 18, 16)
-        lay.setSpacing(10)
+        if not self._allow_records:
+            self._build_park_only(root)
+            return
 
-        title = QLabel("Where should these files go?")
-        title.setStyleSheet(
-            f"color:{_NAVY};font:700 16px 'Segoe UI';background:transparent;border:none;"
+        # Explorer fills the dialog (no outer padding void)
+        self._chrome = WindowsExplorerChrome(
+            search_placeholder="Search folders",
+            address="Records",
+            compact=True,
+            search_width=180,
+            framed=False,
         )
-        lay.addWidget(title)
-
-        n = max(1, int(file_count))
-        summary = QLabel(
-            f"{n} file{'s' if n != 1 else ''} selected. "
-            "Park in Receipts inbox (link later), or file straight into Records."
-            if self._allow_records
-            else f"{n} file{'s' if n != 1 else ''} selected. "
-            "Files will be parked in the Receipts inbox."
+        self._chrome.set_address_icon("mdi.folder-multiple-outline")
+        self._chrome.back_clicked.connect(self._nav_back)
+        self._chrome.forward_clicked.connect(self._nav_forward)
+        self._chrome.up_clicked.connect(self._go_up)
+        self._chrome.refresh_clicked.connect(
+            lambda: asyncio.ensure_future(self._load_destinations())
         )
-        summary.setWordWrap(True)
-        summary.setStyleSheet(_HINT_SS)
-        lay.addWidget(summary)
+        self._chrome.search_submitted.connect(self._on_search)
+        self._chrome.search.textChanged.connect(self._on_search_live)
 
-        self._mode_group = QButtonGroup(self)
-        self._park_radio = QRadioButton("Park in Receipts inbox")
-        self._park_radio.setChecked(True)
-        self._mode_group.addButton(self._park_radio, 0)
-        lay.addWidget(self._park_radio)
-        park_hint = QLabel(
-            "Early drop with no expense row yet — use Inbox → Link when ready."
+        ribbon = self._chrome.ribbon
+        ribbon.add_button(
+            "new",
+            "mdi.folder-plus-outline",
+            "New folder",
+            lambda: asyncio.ensure_future(self._new_folder()),
         )
-        park_hint.setWordWrap(True)
-        park_hint.setStyleSheet(_HINT_SS + "padding-left:22px;")
-        lay.addWidget(park_hint)
-
-        self._records_radio = QRadioButton("File to Records")
-        self._mode_group.addButton(self._records_radio, 1)
-        if self._allow_records:
-            lay.addWidget(self._records_radio)
-            records_hint = QLabel(
-                "Permanent company paper. Pick a folder in the tree (or jump by typing)."
-            )
-            records_hint.setWordWrap(True)
-            records_hint.setStyleSheet(_HINT_SS + "padding-left:22px;")
-            lay.addWidget(records_hint)
-        else:
-            self._records_radio.setVisible(False)
-
-        self._records_box = QWidget()
-        self._records_box.setStyleSheet("background:transparent;border:none;")
-        rec_lay = QVBoxLayout(self._records_box)
-        rec_lay.setContentsMargins(22, 6, 0, 0)
-        rec_lay.setSpacing(8)
-
-        # Type
-        type_col = QVBoxLayout()
-        type_col.setSpacing(4)
-        type_lbl = QLabel("Type")
-        type_lbl.setStyleSheet(_FIELD_LBL_SS)
-        self._kind = QComboBox()
-        self._kind.setStyleSheet(_COMBO_SS)
-        for key, label in (
-            ("item", "Item"),
-            ("supplier", "Supplier"),
-            ("separate", "Separate expense"),
-            ("custom", "Custom folder"),
-        ):
-            self._kind.addItem(label, key)
-        self._kind.currentIndexChanged.connect(self._on_kind_changed)
-        type_col.addWidget(type_lbl)
-        type_col.addWidget(self._kind)
-        rec_lay.addLayout(type_col)
-
-        # Jump / typeahead
-        jump_col = QVBoxLayout()
-        jump_col.setSpacing(4)
-        self._dest_lbl = QLabel("Jump to folder")
-        self._dest_lbl.setStyleSheet(_FIELD_LBL_SS)
-        self._dest_edit = CompleterLineEdit([], ranked_contains=True)
-        self._dest_edit.setStyleSheet(_INPUT_SS)
-        self._dest_edit.setPlaceholderText("Type to search and select in the tree…")
-        self._dest_edit.setClearButtonEnabled(True)
-        self._dest_edit.editingFinished.connect(self._jump_from_typeahead)
-        jump_col.addWidget(self._dest_lbl)
-        jump_col.addWidget(self._dest_edit)
-        self._dest_hint = QLabel("")
-        self._dest_hint.setWordWrap(True)
-        self._dest_hint.setStyleSheet(_HINT_SS)
-        jump_col.addWidget(self._dest_hint)
-        rec_lay.addLayout(jump_col)
-
-        # Folder tree
-        tree_hdr = QHBoxLayout()
-        tree_lbl = QLabel("Folder tree")
-        tree_lbl.setStyleSheet(_FIELD_LBL_SS)
-        tree_hdr.addWidget(tree_lbl)
-        tree_hdr.addStretch(1)
-        self._new_btn = QPushButton("New…")
-        self._new_btn.setCursor(Qt.PointingHandCursor)
-        self._new_btn.setFixedHeight(26)
-        self._new_btn.setStyleSheet(_BTN_SMALL)
-        self._new_btn.clicked.connect(lambda: asyncio.ensure_future(self._new_folder()))
-        self._sub_btn = QPushButton("Subfolder…")
-        self._sub_btn.setCursor(Qt.PointingHandCursor)
-        self._sub_btn.setFixedHeight(26)
-        self._sub_btn.setStyleSheet(_BTN_SMALL)
-        self._sub_btn.setToolTip("Create a nested folder under the selected custom folder")
-        self._sub_btn.clicked.connect(
-            lambda: asyncio.ensure_future(self._new_subfolder())
+        ribbon.add_button(
+            "sub",
+            "mdi.folder-pound-outline",
+            "New subfolder",
+            lambda: asyncio.ensure_future(self._new_subfolder()),
         )
-        tree_hdr.addWidget(self._new_btn)
-        tree_hdr.addWidget(self._sub_btn)
-        rec_lay.addLayout(tree_hdr)
-
-        self._tree = QTreeWidget()
-        self._tree.setStyleSheet(_TREE_SS)
-        self._tree.setHeaderHidden(True)
-        self._tree.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._tree.setAnimated(True)
-        self._tree.setExpandsOnDoubleClick(True)
-        self._tree.setIndentation(18)
-        self._tree.setUniformRowHeights(True)
-        self._tree.setMinimumHeight(160)
-        self._tree.currentItemChanged.connect(self._on_tree_changed)
-        rec_lay.addWidget(self._tree, 1)
-
-        self._tree_status = QLabel("")
-        self._tree_status.setStyleSheet(_HINT_SS)
-        rec_lay.addWidget(self._tree_status)
-
-        # File as date (backlog → YYYY/MM folder)
-        date_col = QVBoxLayout()
-        date_col.setSpacing(4)
-        date_lbl = QLabel("File as date")
-        date_lbl.setStyleSheet(_FIELD_LBL_SS)
+        ribbon.add_sep()
+        ribbon.add_label("File as")
         self._file_date = QDateEdit()
         self._file_date.setCalendarPopup(True)
         self._file_date.setDisplayFormat("yyyy-MM-dd")
         self._file_date.setDate(QDate.currentDate())
-        self._file_date.setStyleSheet(_INPUT_SS)
+        self._file_date.setFixedHeight(24)
+        self._file_date.setStyleSheet(_RIBBON_DATE)
+        self._file_date.setToolTip("Records browse month (YYYY/MM)")
         style_calendar_popup(self._file_date)
-        date_col.addWidget(date_lbl)
-        date_col.addWidget(self._file_date)
-        date_tip = QLabel(
-            "Browse folder month (YYYY/MM). Use an older date for backlog "
-            "(e.g. January files). Upload time is still recorded separately."
-        )
-        date_tip.setWordWrap(True)
-        date_tip.setStyleSheet(_HINT_SS)
-        date_col.addWidget(date_tip)
-        rec_lay.addLayout(date_col)
-
-        # Note
-        note_col = QVBoxLayout()
-        note_col.setSpacing(4)
-        note_lbl = QLabel("Note")
-        note_lbl.setStyleSheet(_FIELD_LBL_SS)
+        ribbon.add_widget(self._file_date)
+        ribbon.add_sep()
+        ribbon.add_label("Note")
         self._note = QLineEdit()
-        self._note.setPlaceholderText("Optional — saved as a .txt in the folder")
+        self._note.setPlaceholderText("Optional")
+        self._note.setFixedHeight(24)
+        self._note.setFixedWidth(140)
         self._note.setStyleSheet(_INPUT_SS)
-        note_col.addWidget(note_lbl)
-        note_col.addWidget(self._note)
-        note_tip = QLabel(
-            "If you enter a note, it is stored as an upload-note .txt beside the files."
+        ribbon.add_widget(self._note)
+        ribbon.add_stretch()
+        n = self._file_count
+        count_lbl = QLabel(f"{n} file{'s' if n != 1 else ''}")
+        count_lbl.setStyleSheet(
+            f"color:{_MUTED};font-size:11px; font-family:\"Segoe UI\";background:transparent;padding:0 6px;"
         )
-        note_tip.setWordWrap(True)
-        note_tip.setStyleSheet(_HINT_SS)
-        note_col.addWidget(note_tip)
-        rec_lay.addLayout(note_col)
+        ribbon.add_widget(count_lbl)
+        root.addWidget(self._chrome)
 
-        lay.addWidget(self._records_box)
-        self._records_box.setEnabled(False)
-        self._records_box.setVisible(False)
+        # Split: nav | contents — edge to edge
+        split_host = QFrame()
+        split_host.setStyleSheet(
+            f"QFrame{{background:{_CARD};border-top:1px solid {_BORDER};"
+            f"border-bottom:1px solid {_BORDER};}}"
+        )
+        split_lay = QHBoxLayout(split_host)
+        split_lay.setContentsMargins(0, 0, 0, 0)
+        split_lay.setSpacing(0)
 
-        self._park_radio.toggled.connect(self._sync_mode_ui)
-        self._records_radio.toggled.connect(self._sync_mode_ui)
+        split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.setHandleWidth(1)
+        split.setStyleSheet(
+            f"QSplitter::handle{{background:{_BORDER};width:1px;}}"
+        )
 
-        root.addWidget(card, 1)
+        left = QWidget()
+        left.setStyleSheet(f"background:{_CARD};")
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(2, 2, 2, 2)
+        left_lay.setSpacing(0)
+        self._tree = QTreeWidget()
+        self._tree.setStyleSheet(_tree_stylesheet())
+        self._tree.setHeaderHidden(True)
+        self._tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._tree.setAnimated(True)
+        self._tree.setExpandsOnDoubleClick(True)
+        self._tree.setRootIsDecorated(True)
+        self._tree.setIndentation(12)
+        self._tree.setIconSize(QSize(16, 16))
+        self._tree.setUniformRowHeights(True)
+        self._tree.setAllColumnsShowFocus(False)
+        self._tree.setFrameShape(QFrame.NoFrame)
+        self._tree.currentItemChanged.connect(self._on_tree_changed)
+        self._tree.itemExpanded.connect(self._on_kind_expanded)
+        self._tree.itemCollapsed.connect(self._on_kind_collapsed)
+        self._tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
+        left_lay.addWidget(self._tree, 1)
+        split.addWidget(left)
 
+        right = QWidget()
+        right.setStyleSheet(f"background:{_CARD};")
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(0)
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Name", "Type"])
+        self._table.setStyleSheet(_TABLE_SS)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setShowGrid(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(22)
+        self._table.setIconSize(QSize(16, 16))
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeToContents
+        )
+        self._table.cellDoubleClicked.connect(self._on_content_double_clicked)
+        self._table.itemSelectionChanged.connect(self._on_content_selection)
+        right_lay.addWidget(self._table, 1)
+        split.addWidget(right)
+        split.setSizes([200, 480])
+        split_lay.addWidget(split)
+        root.addWidget(split_host, 1)
+
+        # Footer — classic Save As: Save in + Save as type + buttons
+        foot = QWidget()
+        foot.setStyleSheet(f"background:{_BG};")
+        foot_lay = QVBoxLayout(foot)
+        foot_lay.setContentsMargins(10, 8, 10, 10)
+        foot_lay.setSpacing(6)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+        save_in_lbl = QLabel("Save in:")
+        save_in_lbl.setFixedWidth(78)
+        save_in_lbl.setStyleSheet(
+            f"color:{_TEXT};font-size:12px; font-family:\"Segoe UI\";background:transparent;"
+        )
+        row1.addWidget(save_in_lbl)
+        self._dest_path = QLineEdit()
+        self._dest_path.setReadOnly(True)
+        self._dest_path.setPlaceholderText("Select a folder")
+        self._dest_path.setStyleSheet(_INPUT_SS)
+        row1.addWidget(self._dest_path, 1)
+        foot_lay.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        type_lbl = QLabel("Save as type:")
+        type_lbl.setFixedWidth(78)
+        type_lbl.setStyleSheet(
+            f"color:{_TEXT};font-size:12px; font-family:\"Segoe UI\";background:transparent;"
+        )
+        row2.addWidget(type_lbl)
+        self._save_type = QComboBox()
+        self._save_type.setStyleSheet(_COMBO_SS)
+        self._save_type.addItem("File to Records (folder)", "records")
+        self._save_type.addItem("Park in Receipts inbox", "park")
+        self._save_type.currentIndexChanged.connect(self._sync_save_type)
+        row2.addWidget(self._save_type, 1)
+        foot_lay.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        self._status = QLabel("")
+        self._status.setStyleSheet(
+            f"color:{_MUTED};font-size:11px; font-family:\"Segoe UI\";background:transparent;"
+        )
+        row3.addWidget(self._status, 1)
+        cancel = QPushButton("Cancel")
+        cancel.setCursor(Qt.PointingHandCursor)
+        cancel.setStyleSheet(_BTN_GHOST)
+        cancel.clicked.connect(self.reject)
+        self._ok_btn = QPushButton("Save")
+        self._ok_btn.setIcon(qta.icon("mdi.content-save-outline", color="#FFFFFF"))
+        self._ok_btn.setIconSize(QSize(14, 14))
+        self._ok_btn.setCursor(Qt.PointingHandCursor)
+        self._ok_btn.setStyleSheet(_BTN_PRIMARY)
+        self._ok_btn.setDefault(True)
+        self._ok_btn.clicked.connect(lambda: asyncio.ensure_future(self._accept_async()))
+        row3.addWidget(cancel)
+        row3.addWidget(self._ok_btn)
+        foot_lay.addLayout(row3)
+        root.addWidget(foot)
+
+        self._sync_save_type()
+        self._sync_folder_actions()
+
+    def _build_park_only(self, root: QVBoxLayout) -> None:
+        wrap = QVBoxLayout()
+        wrap.setContentsMargins(14, 12, 14, 12)
+        wrap.setSpacing(8)
+        n = self._file_count
+        msg = QLabel(
+            f"Park {n} file{'s' if n != 1 else ''} in the Receipts inbox "
+            "(link to an expense later)."
+        )
+        msg.setWordWrap(True)
+        msg.setStyleSheet(f"color:{_TEXT};font-size:12px; font-family:\"Segoe UI\";")
+        wrap.addWidget(msg)
         actions = QHBoxLayout()
         actions.addStretch(1)
         cancel = QPushButton("Cancel")
-        cancel.setCursor(Qt.PointingHandCursor)
-        cancel.setFixedHeight(32)
         cancel.setStyleSheet(_BTN_GHOST)
         cancel.clicked.connect(self.reject)
         self._ok_btn = QPushButton("Park")
         self._ok_btn.setIcon(qta.icon("mdi.file-upload-outline", color="#FFFFFF"))
         self._ok_btn.setIconSize(QSize(14, 14))
-        self._ok_btn.setCursor(Qt.PointingHandCursor)
-        self._ok_btn.setFixedHeight(32)
         self._ok_btn.setStyleSheet(_BTN_PRIMARY)
         self._ok_btn.clicked.connect(lambda: asyncio.ensure_future(self._accept_async()))
         actions.addWidget(cancel)
         actions.addWidget(self._ok_btn)
-        root.addLayout(actions)
+        wrap.addLayout(actions)
+        # placeholders so attribute access is safe
+        self._save_type = None  # type: ignore[assignment]
+        self._file_date = QDateEdit()
+        self._file_date.setDate(QDate.currentDate())
+        self._note = QLineEdit()
+        self._status = QLabel("")
+        self._dest_path = QLineEdit()
+        root.addLayout(wrap)
 
-        self._sync_mode_ui()
-        self._on_kind_changed()
-
-    def _sync_mode_ui(self) -> None:
-        records = self._allow_records and self._records_radio.isChecked()
-        self._records_box.setEnabled(records)
-        self._records_box.setVisible(records)
-        if records:
-            self._ok_btn.setText("Upload to Records")
-            self.resize(max(self.width(), 560), max(self.height(), 560))
-        else:
+    def _sync_save_type(self) -> None:
+        if not self._allow_records:
+            return
+        park = self._is_park()
+        # Dim explorer when parking — still visible so the dialog never looks empty
+        self._tree.setEnabled(not park)
+        self._table.setEnabled(not park)
+        self._chrome.setEnabled(not park)
+        if park:
+            self._dest_path.setText("Receipts inbox (park)")
             self._ok_btn.setText("Park")
+            self._ok_btn.setIcon(qta.icon("mdi.file-upload-outline", color="#FFFFFF"))
+            self._status.setText("Files land in Inbox — link to an expense when ready.")
+        else:
+            self._ok_btn.setText("Save")
+            self._ok_btn.setIcon(qta.icon("mdi.content-save-outline", color="#FFFFFF"))
+            self._sync_address()
+            self._fill_contents()
 
-    def _current_kind(self) -> str:
-        return str(self._kind.currentData() or "item")
-
-    def _on_kind_changed(self) -> None:
-        kind = self._current_kind()
-        self._dest_lbl.setText(f"Jump to {_KIND_DEST_LABEL.get(kind, 'folder').lower()}")
-        self._dest_edit.clear()
-        self._tree_selected = None
-        self._refresh_dest_suggestions(kind)
-        self._populate_tree(kind)
-        self._sync_folder_actions()
-
-    def _sync_folder_actions(self) -> None:
-        is_custom = self._current_kind() == "custom"
-        self._new_btn.setVisible(is_custom)
-        self._sub_btn.setVisible(is_custom)
-        has_sel = bool(self._tree_selected and self._tree_selected.get("id"))
-        self._sub_btn.setEnabled(is_custom and has_sel)
+    # ── Tree / destinations ───────────────────────────────────────────────
 
     async def _load_destinations(self) -> None:
         try:
@@ -409,94 +488,170 @@ class ReceiptUploadDestinationDialog(QDialog):
                 "supplier": list(payload.get("suppliers") or []),
                 "separate": list(payload.get("separate") or []),
             }
-            kind = self._current_kind()
-            self._refresh_dest_suggestions(kind)
-            self._populate_tree(kind)
+            self._populate_tree()
+            if not self._is_park():
+                self._status.setText(
+                    f"Custom {len(self._destinations['custom'])} · "
+                    f"Items {len(self._destinations['item'])} · "
+                    f"Suppliers {len(self._destinations['supplier'])} · "
+                    f"Separate {len(self._destinations['separate'])}"
+                )
         except Exception as exc:
-            self._tree_status.setText(f"Could not load destinations: {exc}")
+            self._status.setText(f"Could not load destinations: {exc}")
 
     def _make_tree_item(self, data: dict[str, Any], *, label: str) -> QTreeWidgetItem:
         item = QTreeWidgetItem([label])
-        tip = str(data.get("display_label") or label)
-        item.setToolTip(0, tip)
+        item.setToolTip(0, str(data.get("display_label") or label))
         item.setData(0, Qt.UserRole, data)
-        item.setIcon(0, qta.icon("mdi.folder-outline", color=_ACCENT))
+        if data.get("_kind_root"):
+            icon_name, color = _KIND_ICONS.get(
+                str(data.get("kind") or ""), ("mdi.folder", _FOLDER)
+            )
+            item.setIcon(0, qta.icon(icon_name, color=color))
+        else:
+            item.setIcon(0, qta.icon("mdi.folder", color=_FOLDER))
         return item
 
-    def _populate_tree(self, kind: str) -> None:
-        tree = self._tree
-        tree.blockSignals(True)
-        tree.clear()
-        rows = list(self._destinations.get(kind) or [])
+    def _row_matches(self, row: dict[str, Any], needle: str) -> bool:
+        if not needle:
+            return True
+        hay = " ".join(
+            str(row.get(k) or "")
+            for k in ("label", "ref_key", "display_label", "slug")
+        ).casefold()
+        path = " ".join(str(x) for x in (row.get("path_labels") or [])).casefold()
+        return needle in hay or needle in path
 
+    def _visible_rows(self, kind: str) -> list[dict[str, Any]]:
+        rows = list(self._destinations.get(kind) or [])
+        needle = self._filter
         if kind == "custom":
-            by_id: dict[str, dict[str, Any]] = {}
+            by_id = {
+                str(r.get("id") or ""): r for r in rows if str(r.get("id") or "")
+            }
+            keep: set[str] = set()
             for row in rows:
                 fid = str(row.get("id") or "")
-                if fid:
-                    by_id[fid] = row
-            nodes: dict[str, QTreeWidgetItem] = {}
-            pending = list(rows)
-            guard = 0
-            while pending and guard < len(rows) + 5:
-                guard += 1
-                next_pending: list[dict[str, Any]] = []
-                for row in pending:
+                if not fid or not self._row_matches(row, needle):
+                    continue
+                keep.add(fid)
+                parent_id = str(row.get("parent_id") or "")
+                while parent_id and parent_id in by_id:
+                    if parent_id in keep:
+                        break
+                    keep.add(parent_id)
+                    parent_id = str(by_id[parent_id].get("parent_id") or "")
+            return [
+                {**r, "kind": "custom"}
+                for r in rows
+                if str(r.get("id") or "") in keep
+            ]
+        return [
+            {**row, "kind": kind}
+            for row in rows
+            if self._row_matches(row, needle)
+        ]
+
+    def _add_custom_children(
+        self, parent: QTreeWidgetItem, visible: list[dict[str, Any]]
+    ) -> None:
+        by_id = {
+            str(r.get("id") or ""): r for r in visible if str(r.get("id") or "")
+        }
+        nodes: dict[str, QTreeWidgetItem] = {}
+        pending = list(visible)
+        guard = 0
+        while pending and guard < len(visible) + 5:
+            guard += 1
+            next_pending: list[dict[str, Any]] = []
+            for row in pending:
+                fid = str(row.get("id") or "")
+                if not fid:
+                    continue
+                parent_id = str(row.get("parent_id") or "")
+                leaf = str(row.get("label") or row.get("ref_key") or "Untitled")
+                node = self._make_tree_item(
+                    {**row, "kind": "custom", "_all": False}, label=leaf
+                )
+                if parent_id and parent_id in nodes:
+                    nodes[parent_id].addChild(node)
+                    nodes[fid] = node
+                elif not parent_id or parent_id not in by_id:
+                    parent.addChild(node)
+                    nodes[fid] = node
+                else:
+                    next_pending.append(row)
+            if len(next_pending) == len(pending):
+                for row in next_pending:
                     fid = str(row.get("id") or "")
-                    if not fid:
+                    if not fid or fid in nodes:
                         continue
-                    parent_id = str(row.get("parent_id") or "")
                     leaf = str(row.get("label") or row.get("ref_key") or "Untitled")
-                    data = {**row, "kind": "custom"}
-                    node = self._make_tree_item(data, label=leaf)
-                    if parent_id and parent_id in nodes:
-                        nodes[parent_id].addChild(node)
-                        nodes[fid] = node
-                    elif not parent_id or parent_id not in by_id:
-                        tree.addTopLevelItem(node)
-                        nodes[fid] = node
-                    else:
-                        next_pending.append(row)
-                if len(next_pending) == len(pending):
-                    for row in next_pending:
-                        fid = str(row.get("id") or "")
-                        if not fid or fid in nodes:
-                            continue
-                        leaf = str(row.get("label") or row.get("ref_key") or "Untitled")
-                        node = self._make_tree_item(
-                            {**row, "kind": "custom"}, label=leaf
-                        )
-                        tree.addTopLevelItem(node)
-                        nodes[fid] = node
-                    break
-                pending = next_pending
-            tree.expandToDepth(1)
-            n = len(rows)
-            self._tree_status.setText(
-                f"{n} custom folder{'s' if n != 1 else ''} — select one, or New / Subfolder."
-                if n
-                else "No custom folders yet — click New… or type Parent/Child above."
+                    node = self._make_tree_item(
+                        {**row, "kind": "custom", "_all": False}, label=leaf
+                    )
+                    parent.addChild(node)
+                    nodes[fid] = node
+                break
+            pending = next_pending
+
+    def _populate_tree(self) -> None:
+        if not self._allow_records:
+            return
+        tree = self._tree
+        prev_kind = self._kind
+        prev = dict(self._selected) if self._selected else None
+        tree.blockSignals(True)
+        tree.clear()
+        self._kind_roots = {}
+
+        for key, label in _KINDS:
+            visible = self._visible_rows(key)
+            total = len(self._destinations.get(key) or [])
+            root = self._make_tree_item(
+                {"_kind_root": True, "_all": True, "kind": key},
+                label=(
+                    f"{label}  ({len(visible)}/{total})"
+                    if self._filter
+                    else f"{label}  ({total})"
+                ),
             )
-        else:
-            for row in rows:
-                label = str(row.get("label") or row.get("ref_key") or "Untitled")
-                node = self._make_tree_item({**row, "kind": kind}, label=label)
-                tree.addTopLevelItem(node)
-            noun = {
-                "item": "item",
-                "supplier": "supplier",
-                "separate": "separate destination",
-            }.get(kind, "folder")
-            n = len(rows)
-            self._tree_status.setText(
-                f"{n} {noun}{'s' if n != 1 else ''} — select in the tree or jump by typing."
-                if n
-                else f"No {noun}s loaded — you can still type a folder name above."
-            )
+            if key == "custom":
+                self._add_custom_children(root, visible)
+            else:
+                for row in visible:
+                    leaf = str(row.get("label") or row.get("ref_key") or "Untitled")
+                    node = self._make_tree_item(
+                        {**row, "kind": key, "_all": False}, label=leaf
+                    )
+                    root.addChild(node)
+            tree.addTopLevelItem(root)
+            self._kind_roots[key] = root
+            if visible and (
+                key in self._expanded_kinds or key == prev_kind or bool(self._filter)
+            ):
+                root.setExpanded(True)
 
         tree.blockSignals(False)
-        self._tree_selected = None
+        if prev:
+            self._reselect(prev)
+        else:
+            root = self._kind_roots.get(prev_kind)
+            if root is not None:
+                tree.setCurrentItem(root)
+        self._sync_address()
+        self._fill_contents()
         self._sync_folder_actions()
+
+    def _on_kind_expanded(self, item: QTreeWidgetItem) -> None:
+        data = item.data(0, Qt.UserRole) or {}
+        if data.get("_kind_root"):
+            self._expanded_kinds.add(str(data.get("kind") or ""))
+
+    def _on_kind_collapsed(self, item: QTreeWidgetItem) -> None:
+        data = item.data(0, Qt.UserRole) or {}
+        if data.get("_kind_root"):
+            self._expanded_kinds.discard(str(data.get("kind") or ""))
 
     def _on_tree_changed(
         self,
@@ -504,23 +659,30 @@ class ReceiptUploadDestinationDialog(QDialog):
         _previous: QTreeWidgetItem | None,
     ) -> None:
         if current is None:
-            self._tree_selected = None
+            self._selected = None
         else:
             data = current.data(0, Qt.UserRole) or {}
-            self._tree_selected = dict(data) if data else None
+            kind = str(data.get("kind") or self._kind)
+            if kind in {"custom", "item", "supplier", "separate"}:
+                self._kind = kind
+            if data.get("_kind_root") or data.get("_all"):
+                self._selected = None
+            else:
+                self._selected = dict(data)
+        if hasattr(self, "_chrome"):
+            self._chrome.set_address(self._address_text(), push_history=True)
+            self._chrome.set_nav_enabled(up=self._can_go_up())
+        self._sync_address()
+        self._fill_contents()
         self._sync_folder_actions()
-        if self._syncing_jump or not self._tree_selected:
+
+    def _on_tree_double_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
+        data = item.data(0, Qt.UserRole) or {}
+        if data.get("_kind_root"):
+            item.setExpanded(not item.isExpanded())
             return
-        display = str(
-            self._tree_selected.get("display_label")
-            or self._tree_selected.get("label")
-            or self._tree_selected.get("ref_key")
-            or ""
-        )
-        if display and self._dest_edit.text().strip() != display:
-            self._syncing_jump = True
-            self._dest_edit.setText(display)
-            self._syncing_jump = False
+        if item.childCount() > 0:
+            item.setExpanded(True)
 
     def _iter_tree_items(self, root: QTreeWidgetItem | None = None):
         if root is None:
@@ -534,23 +696,18 @@ class ReceiptUploadDestinationDialog(QDialog):
             yield child
             yield from self._iter_tree_items(child)
 
-    def _select_tree_row(self, row: dict[str, Any]) -> bool:
-        target_id = str(row.get("id") or "")
-        target_key = str(row.get("ref_key") or "")
-        target_display = str(row.get("display_label") or row.get("label") or "").lower()
+    def _reselect(self, prev: dict[str, Any]) -> None:
+        target_id = str(prev.get("id") or "")
+        target_key = str(prev.get("ref_key") or "")
         for item in self._iter_tree_items():
             data = item.data(0, Qt.UserRole) or {}
+            if data.get("_kind_root") or data.get("_all"):
+                continue
             hit = False
             if target_id and str(data.get("id") or "") == target_id:
                 hit = True
             elif target_key and str(data.get("ref_key") or "") == target_key:
                 hit = True
-            elif target_display:
-                blob = str(
-                    data.get("display_label") or data.get("label") or ""
-                ).lower()
-                if blob == target_display:
-                    hit = True
             if not hit:
                 continue
             parent = item.parent()
@@ -559,91 +716,186 @@ class ReceiptUploadDestinationDialog(QDialog):
                 parent = parent.parent()
             self._tree.setCurrentItem(item)
             self._tree.scrollToItem(item)
-            return True
-        return False
-
-    def _resolve_row(self, kind: str, typed: str) -> dict[str, Any] | None:
-        needle = " ".join((typed or "").split())
-        if not needle:
-            return None
-        rows = list(self._destinations.get(kind) or [])
-        lower = needle.lower()
-        for row in rows:
-            label = str(row.get("label") or "").strip()
-            display = str(row.get("display_label") or "").strip()
-            ref = str(row.get("ref_key") or "").strip()
-            if (
-                label.lower() == lower
-                or display.lower() == lower
-                or ref.lower() == lower
-            ):
-                return row
-        hits = []
-        for row in rows:
-            label = str(row.get("label") or "").strip()
-            display = str(row.get("display_label") or "").strip()
-            ref = str(row.get("ref_key") or "").strip()
-            blob = f"{label} {display} {ref}".lower()
-            if lower in blob:
-                hits.append(row)
-        if len(hits) == 1:
-            return hits[0]
-        return None
-
-    def _jump_from_typeahead(self) -> None:
-        if self._syncing_jump:
             return
-        kind = self._current_kind()
-        typed = " ".join((self._dest_edit.text() or "").split())
-        if not typed:
-            return
-        row = self._resolve_row(kind, typed)
-        if row:
-            self._select_tree_row(row)
 
-    def _refresh_dest_suggestions(self, kind: str) -> None:
-        rows = list(self._destinations.get(kind) or [])
-        labels: list[str] = []
-        for r in rows:
+    def _child_folders(self) -> list[dict[str, Any]]:
+        rows = self._visible_rows(self._kind)
+        if self._kind == "custom":
+            if self._selected and self._selected.get("id"):
+                parent_id = str(self._selected["id"])
+                return [
+                    {**r, "kind": "custom"}
+                    for r in rows
+                    if str(r.get("parent_id") or "") == parent_id
+                ]
+            return [
+                {**r, "kind": "custom"}
+                for r in rows
+                if not r.get("parent_id")
+            ]
+        if self._selected is None:
+            return [{**r, "kind": self._kind} for r in rows]
+        return []
+
+    def _fill_contents(self) -> None:
+        if not self._allow_records or self._is_park():
+            return
+        folders = self._child_folders()
+        self._content_rows = folders
+        self._table.setRowCount(0)
+        type_label = _KIND_DEST_LABEL.get(self._kind, "Folder")
+        for row in folders:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
             name = str(
-                r.get("display_label") or r.get("label") or r.get("ref_key") or ""
-            ).strip()
+                row.get("display_label")
+                or row.get("label")
+                or row.get("ref_key")
+                or "—"
+            )
+            name_item = QTableWidgetItem(qta.icon("mdi.folder", color=_FOLDER), name)
+            name_item.setData(Qt.UserRole, row)
+            type_item = QTableWidgetItem(
+                "File folder" if self._kind == "custom" else type_label
+            )
+            type_item.setData(Qt.UserRole, row)
+            type_item.setForeground(Qt.gray)
+            self._table.setItem(r, 0, name_item)
+            self._table.setItem(r, 1, type_item)
+
+    def _on_content_selection(self) -> None:
+        items = self._table.selectedItems()
+        if not items:
+            return
+        row = items[0].data(Qt.UserRole) or {}
+        if row:
+            self._reselect(row)
+
+    def _on_content_double_clicked(self, row: int, _col: int) -> None:
+        cell = self._table.item(row, 0)
+        if cell is None:
+            return
+        data = cell.data(Qt.UserRole) or {}
+        if not data:
+            return
+        self._reselect(data)
+        if self._kind == "custom" and data.get("id"):
+            for item in self._iter_tree_items():
+                d = item.data(0, Qt.UserRole) or {}
+                if str(d.get("id") or "") == str(data.get("id") or ""):
+                    item.setExpanded(True)
+                    break
+
+    def _address_text(self) -> str:
+        kind_label = next((lab for k, lab in _KINDS if k == self._kind), self._kind)
+        parts = ["Records", kind_label]
+        if self._selected:
+            name = (
+                self._selected.get("display_label")
+                or self._selected.get("label")
+                or self._selected.get("ref_key")
+                or ""
+            )
             if name:
-                labels.append(name)
-        seen: set[str] = set()
-        unique: list[str] = []
-        for name in labels:
-            key = name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(name)
-        self._dest_edit.set_values(unique)
-        if kind == "custom":
-            self._dest_edit.setPlaceholderText(
-                "Search tree, or type new name / Parent/Child…"
+                parts.append(str(name))
+        return " > ".join(parts)
+
+    def _sync_address(self) -> None:
+        if not self._allow_records or self._is_park():
+            return
+        text = self._address_text()
+        self._dest_path.setText(text)
+        if hasattr(self, "_chrome"):
+            self._chrome.set_search_placeholder(
+                f"Search {next((lab for k, lab in _KINDS if k == self._kind), 'folders')}"
             )
-            self._dest_hint.setText(
-                "Select a folder in the tree, jump by typing, or create with New / "
-                "Subfolder (Parent/Child also works)."
+
+    def _can_go_up(self) -> bool:
+        return self._selected is not None
+
+    def _go_up(self) -> None:
+        if not self._selected:
+            return
+        if self._kind == "custom":
+            parent_id = str(self._selected.get("parent_id") or "")
+            if parent_id:
+                parent = next(
+                    (
+                        r
+                        for r in (self._destinations.get("custom") or [])
+                        if str(r.get("id") or "") == parent_id
+                    ),
+                    None,
+                )
+                if parent:
+                    self._reselect(parent)
+                    return
+        root = self._kind_roots.get(self._kind)
+        if root is not None:
+            self._tree.setCurrentItem(root)
+
+    def _nav_back(self) -> None:
+        path = self._chrome.history_back()
+        if path:
+            self._apply_history_path(path)
+
+    def _nav_forward(self) -> None:
+        path = self._chrome.history_forward()
+        if path:
+            self._apply_history_path(path)
+
+    def _apply_history_path(self, path: str) -> None:
+        parts = [p.strip() for p in path.split(">") if p.strip()]
+        if len(parts) >= 2:
+            for key, lab in _KINDS:
+                if lab.casefold() == parts[1].casefold():
+                    self._kind = key
+                    break
+        if len(parts) >= 3:
+            name = parts[-1]
+            rows = self._destinations.get(self._kind) or []
+            hit = next(
+                (
+                    r
+                    for r in rows
+                    if str(r.get("display_label") or r.get("label") or "").casefold()
+                    == name.casefold()
+                    or str(r.get("ref_key") or "").casefold() == name.casefold()
+                ),
+                None,
             )
-        elif kind == "separate":
-            self._dest_edit.setPlaceholderText("Type to jump to a separate expense…")
-            self._dest_hint.setText("Select in the tree or jump by typing.")
-        else:
-            noun = "item" if kind == "item" else "supplier"
-            self._dest_edit.setPlaceholderText(f"Type to jump to an {noun}…")
-            self._dest_hint.setText(
-                f"Select an {noun} in the tree. Approved chase receipts for the "
-                f"same {noun} also appear in Records."
-            )
+            if hit:
+                self._reselect({**hit, "kind": self._kind})
+                return
+        root = self._kind_roots.get(self._kind)
+        if root is not None:
+            self._tree.setCurrentItem(root)
+
+    def _on_search(self, text: str) -> None:
+        self._filter = (text or "").strip().casefold()
+        self._populate_tree()
+
+    def _on_search_live(self, text: str) -> None:
+        needle = (text or "").strip().casefold()
+        if needle == self._filter:
+            return
+        self._filter = needle
+        self._populate_tree()
+
+    def _sync_folder_actions(self) -> None:
+        if not self._allow_records:
+            return
+        is_custom = self._kind == "custom" and not self._is_park()
+        ribbon = self._chrome.ribbon
+        ribbon.set_enabled("new", is_custom)
+        has_sel = bool(self._selected and self._selected.get("id"))
+        ribbon.set_enabled("sub", is_custom and has_sel)
 
     async def _reload_custom_and_select(self, folder: dict[str, Any]) -> None:
         try:
             payload = await list_destinations()
             self._destinations["custom"] = list(payload.get("custom") or [])
         except Exception:
-            # Fall back to merging the created folder locally
             fid = str(folder.get("id") or "")
             self._destinations["custom"] = [
                 folder,
@@ -653,26 +905,22 @@ class ReceiptUploadDestinationDialog(QDialog):
                     if str(r.get("id")) != fid
                 ],
             ]
-        if self._current_kind() != "custom":
-            idx = self._kind.findData("custom")
-            if idx >= 0:
-                self._kind.setCurrentIndex(idx)
-        self._refresh_dest_suggestions("custom")
-        self._populate_tree("custom")
-        self._select_tree_row(folder)
-        display = str(
-            folder.get("display_label") or folder.get("label") or ""
-        )
-        if display:
-            self._syncing_jump = True
-            self._dest_edit.setText(display)
-            self._syncing_jump = False
+        self._kind = "custom"
+        self._expanded_kinds.add("custom")
+        self._populate_tree()
+        self._reselect(folder)
 
     async def _new_folder(self) -> None:
+        if self._is_park():
+            return
+        if self._kind != "custom":
+            self._kind = "custom"
+            root = self._kind_roots.get("custom")
+            if root is not None:
+                root.setExpanded(True)
+                self._tree.setCurrentItem(root)
         label, ok = QInputDialog.getText(
-            self,
-            "New custom folder",
-            "Folder name (or Parent/Child for a nested path):",
+            self, "New folder", "Folder name (or Parent/Child):"
         )
         if not ok:
             return
@@ -682,27 +930,27 @@ class ReceiptUploadDestinationDialog(QDialog):
         try:
             folder = await create_custom_folder(label)
         except ApiError as exc:
-            QMessageBox.warning(self, "Records", str(exc))
+            QMessageBox.warning(self, "Save to…", str(exc))
             return
         except Exception as exc:
-            QMessageBox.critical(self, "Records", f"Could not create folder:\n{exc}")
+            QMessageBox.critical(self, "Save to…", f"Could not create folder:\n{exc}")
             return
         await self._reload_custom_and_select(folder)
 
     async def _new_subfolder(self) -> None:
-        parent = self._tree_selected
+        if self._is_park():
+            return
+        parent = self._selected
         if not parent or not parent.get("id"):
             QMessageBox.information(
-                self, "Records", "Select a parent custom folder in the tree first."
+                self, "Save to…", "Select a parent custom folder first."
             )
             return
         parent_name = str(
             parent.get("display_label") or parent.get("label") or "folder"
         )
         label, ok = QInputDialog.getText(
-            self,
-            "New subfolder",
-            f"Subfolder name under “{parent_name}”:",
+            self, "New subfolder", f"Name under “{parent_name}”:"
         )
         if not ok:
             return
@@ -710,124 +958,65 @@ class ReceiptUploadDestinationDialog(QDialog):
         if not label:
             return
         if "/" in label or "\\" in label:
-            QMessageBox.information(
-                self,
-                "Records",
-                "Enter a single folder name (no /). Nest further with Subfolder again.",
-            )
+            QMessageBox.information(self, "Save to…", "Enter a single folder name.")
             return
         try:
-            folder = await create_custom_folder(
-                label, parent_id=str(parent["id"])
-            )
+            folder = await create_custom_folder(label, parent_id=str(parent["id"]))
         except ApiError as exc:
-            QMessageBox.warning(self, "Records", str(exc))
+            QMessageBox.warning(self, "Save to…", str(exc))
             return
         except Exception as exc:
-            QMessageBox.critical(self, "Records", f"Could not create subfolder:\n{exc}")
+            QMessageBox.critical(self, "Save to…", f"Could not create subfolder:\n{exc}")
             return
         await self._reload_custom_and_select(folder)
 
     async def _accept_async(self) -> None:
         if self._accepting:
             return
-        if not self._allow_records or self._park_radio.isChecked():
+        if self._is_park():
             self._choice = UploadDestinationChoice(mode="park")
             self.accept()
             return
 
-        kind = self._current_kind()
-        typed = " ".join((self._dest_edit.text() or "").split())
-        # Prefer explicit tree selection
-        selected = dict(self._tree_selected) if self._tree_selected else None
-        if selected is None and typed:
-            self._jump_from_typeahead()
-            selected = dict(self._tree_selected) if self._tree_selected else None
+        kind = self._kind
+        selected = dict(self._selected) if self._selected else None
+        if selected is None:
+            QMessageBox.information(
+                self,
+                "Save to…",
+                f"Select a {_KIND_DEST_LABEL.get(kind, 'destination').lower()} "
+                "before saving — or switch Save as type to Park.",
+            )
+            self._tree.setFocus()
+            return
+
+        folder_id = ""
+        ref_key = str(selected.get("ref_key") or "")
+        label = str(
+            selected.get("display_label")
+            or selected.get("label")
+            or selected.get("ref_key")
+            or ""
+        )
+        if kind == "custom":
+            folder_id = str(selected.get("id") or "")
+            if not folder_id:
+                QMessageBox.information(
+                    self, "Save to…", "Select a custom folder, or create one."
+                )
+                return
+        else:
+            if not ref_key:
+                ref_key = label
+            if not ref_key:
+                QMessageBox.information(
+                    self, "Save to…", "Select a destination in the tree."
+                )
+                return
 
         self._accepting = True
         self._ok_btn.setEnabled(False)
         try:
-            folder_id = ""
-            ref_key = ""
-            label = ""
-
-            if selected:
-                folder_id = str(selected.get("id") or "")
-                ref_key = str(selected.get("ref_key") or "")
-                label = str(
-                    selected.get("display_label")
-                    or selected.get("label")
-                    or selected.get("ref_key")
-                    or ""
-                )
-                if kind != "custom":
-                    folder_id = ""  # only custom uses folder_id
-                    if not ref_key:
-                        ref_key = label
-            elif kind == "custom" and typed:
-                try:
-                    folder = await create_custom_folder(typed)
-                except ApiError as exc:
-                    QMessageBox.warning(self, "Records", str(exc))
-                    return
-                except Exception as exc:
-                    QMessageBox.critical(
-                        self, "Records", f"Could not create folder:\n{exc}"
-                    )
-                    return
-                folder_id = str(folder.get("id") or "")
-                if not folder_id:
-                    QMessageBox.warning(
-                        self,
-                        "Records",
-                        "Folder was not created — pick one in the tree or try again.",
-                    )
-                    return
-                ref_key = str(folder.get("ref_key") or "")
-                label = str(
-                    folder.get("display_label") or folder.get("label") or typed
-                )
-                await self._reload_custom_and_select(folder)
-            elif kind in {"item", "supplier"} and typed:
-                row = self._resolve_row(kind, typed)
-                if row:
-                    ref_key = str(row.get("ref_key") or typed)
-                    label = str(row.get("label") or ref_key)
-                else:
-                    ref_key = typed
-                    label = typed
-            elif kind == "separate":
-                QMessageBox.information(
-                    self,
-                    "Upload destination",
-                    "Select a separate expense in the tree (or jump by typing).",
-                )
-                return
-            else:
-                QMessageBox.information(
-                    self,
-                    "Upload destination",
-                    f"Select a {_KIND_DEST_LABEL.get(kind, 'destination').lower()} "
-                    "in the folder tree before uploading to Records.",
-                )
-                self._tree.setFocus()
-                return
-
-            if kind == "custom" and not folder_id:
-                QMessageBox.information(
-                    self,
-                    "Upload destination",
-                    "Select a custom folder in the tree, or create one with New…",
-                )
-                return
-            if kind != "custom" and not ref_key:
-                QMessageBox.information(
-                    self,
-                    "Upload destination",
-                    "Select a destination in the folder tree.",
-                )
-                return
-
             self._choice = UploadDestinationChoice(
                 mode="records",
                 kind=kind,

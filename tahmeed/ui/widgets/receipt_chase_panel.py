@@ -88,6 +88,7 @@ from tahmeed.ui.widgets.excel_column_filter import (
 from tahmeed.ui.widgets.loading_overlay import hide_widget_loading, show_widget_loading
 from tahmeed.ui.widgets.nav_toast import NavToast
 from tahmeed.ui.widgets.receipt_file_viewer import open_receipt_viewer
+from tahmeed.ui.widgets.upload_busy import UploadBusy, UploadCancelled
 
 # Fluent / Office-adjacent tokens (align with admin desk)
 _BG = "#F3F4F6"
@@ -2429,12 +2430,15 @@ class ReceiptChasePanel(QWidget):
                     )
                 )
                 return
+        from tahmeed.ui.file_dialogs import get_open_file_names
+
+        caption = "Upload receipt(s) for selected entr" + (
+            "y" if len(tx_ids) == 1 else "ies"
+        )
         paths, _ = await await_blocking(
-            lambda: QFileDialog.getOpenFileNames(
+            lambda: get_open_file_names(
                 self,
-                "Upload receipt(s) for selected entr"
-                + ("y" if len(tx_ids) == 1 else "ies"),
-                "",
+                caption,
                 "Receipts (*.pdf *.png *.jpg *.jpeg *.heic *.webp *.doc *.docx);;All (*.*)",
             )
         )
@@ -3964,11 +3968,12 @@ class ReceiptChasePanel(QWidget):
         return (ownership or "").strip()
 
     async def _park_files(self) -> None:
+        from tahmeed.ui.file_dialogs import get_open_file_names
+
         paths, _ = await await_blocking(
-            lambda: QFileDialog.getOpenFileNames(
+            lambda: get_open_file_names(
                 self,
                 "Park receipt files",
-                "",
                 "Receipts (*.pdf *.png *.jpg *.jpeg *.heic *.webp *.doc *.docx "
                 "*.xls *.xlsx *.csv *.txt);;All (*.*)",
             )
@@ -4014,11 +4019,12 @@ class ReceiptChasePanel(QWidget):
 
     async def _main_upload(self) -> None:
         """Main-tab multi-upload: park in Receipts and/or file to Records."""
+        from tahmeed.ui.file_dialogs import get_open_file_names
+
         paths, _ = await await_blocking(
-            lambda: QFileDialog.getOpenFileNames(
+            lambda: get_open_file_names(
                 self,
                 "Upload files",
-                "",
                 "Documents (*.pdf *.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff "
                 "*.heic *.heif *.doc *.docx *.xls *.xlsx *.csv *.txt);;All files (*.*)",
             )
@@ -4075,9 +4081,9 @@ class ReceiptChasePanel(QWidget):
         if not ok:
             return
 
-        show_widget_loading(self, f"Uploading {n} file(s)…")
-        try:
-            if choice.mode == "park":
+        if choice.mode == "park":
+            show_widget_loading(self, f"Uploading {n} file(s)…")
+            try:
                 result = await upload_parked_files(paths, ownership=ownership)
                 total = int(result.get("total") or n)
                 stamped = str(
@@ -4097,34 +4103,68 @@ class ReceiptChasePanel(QWidget):
                     if self._tabs.tabText(i).strip().lower() == "inbox":
                         self._tabs.setCurrentIndex(i)
                         break
-                return
+            except ApiError as exc:
+                self._toast_error(f"Upload failed: {exc}")
+            except Exception as exc:
+                self._toast_error(f"Upload failed: {exc}")
+            finally:
+                hide_widget_loading(self)
+            return
 
-            result = await upload_record_files(
-                paths,
-                kind=choice.kind,
-                ref_key=choice.ref_key,
-                folder_id=choice.folder_id,
-                note=choice.note,
-                file_date=choice.file_date,
-            )
-            total = int(result.get("total") or n)
-            api_dest = result.get("destination") or {}
-            dest = (
-                str(api_dest.get("label") or "").strip()
-                or choice.label
-                or choice.ref_key
-                or choice.kind
-            )
-            self._toast_success(
-                f"Filed {total} file(s) to Records · {choice.kind} · {dest} "
-                "(open Paperwork → Records to browse)"
-            )
-        except ApiError as exc:
-            self._toast_error(f"Upload failed: {exc}")
-        except Exception as exc:
-            self._toast_error(f"Upload failed: {exc}")
-        finally:
-            hide_widget_loading(self)
+        with UploadBusy(
+            self,
+            f"Uploading 0/{n}…",
+            title="Records upload",
+            cancellable=True,
+        ) as busy:
+            busy.update(f"Uploading 0/{n}…", value=0, maximum=n)
+
+            def on_progress(done: int, total: int, filename: str) -> None:
+                busy.raise_if_cancelled()
+                if done >= total:
+                    busy.update("Finishing…", value=total, maximum=total)
+                else:
+                    busy.update(
+                        f"Uploading {done + 1}/{total} — {filename}",
+                        value=done,
+                        maximum=total,
+                    )
+
+            try:
+                result = await upload_record_files(
+                    paths,
+                    kind=choice.kind,
+                    ref_key=choice.ref_key,
+                    folder_id=choice.folder_id,
+                    note=choice.note,
+                    file_date=choice.file_date,
+                    on_progress=on_progress,
+                    should_cancel=busy.should_cancel,
+                )
+                total = int(result.get("total") or n)
+                api_dest = result.get("destination") or {}
+                dest = (
+                    str(api_dest.get("label") or "").strip()
+                    or choice.label
+                    or choice.ref_key
+                    or choice.kind
+                )
+                self._toast_success(
+                    f"Filed {total} file(s) to Records · {choice.kind} · {dest} "
+                    "(open Paperwork → Records to browse)"
+                )
+            except (UploadCancelled, InterruptedError):
+                self._toast_error(
+                    "Upload cancelled — no files from this batch were kept."
+                )
+            except ApiError as exc:
+                self._toast_error(
+                    f"Upload failed: {exc} — no files from this batch were kept."
+                )
+            except Exception as exc:
+                self._toast_error(
+                    f"Upload failed: {exc} — no files from this batch were kept."
+                )
 
     async def _load_candidates(self) -> None:
         self._refresh_link_file_hint()
@@ -4750,11 +4790,12 @@ class ReceiptChasePanel(QWidget):
                     )
                 )
                 return
+        from tahmeed.ui.file_dialogs import get_open_file_names
+
         paths, _ = await await_blocking(
-            lambda: QFileDialog.getOpenFileNames(
+            lambda: get_open_file_names(
                 self,
                 "Upload receipt(s) for selected request(s)",
-                "",
                 "Receipts (*.pdf *.png *.jpg *.jpeg *.heic *.webp *.doc *.docx);;All (*.*)",
             )
         )

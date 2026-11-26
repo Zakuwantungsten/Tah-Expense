@@ -21,6 +21,7 @@ from typing import Any
 from bson import ObjectId
 
 from .attachment_ops import attachments_root, safe_name
+from .mongo_async import aggregate_list
 from .receipt_ops import (
     INBOX_APPROVED,
     ensure_receipt_workspace,
@@ -404,67 +405,295 @@ async def rename_custom_folder(
     return await _serialize_folder_with_path(db, updated or doc)
 
 
-async def delete_custom_folder(db: Any, folder_id: ObjectId) -> dict[str, Any]:
+async def delete_custom_folder(
+    db: Any,
+    folder_id: ObjectId,
+    *,
+    cascade: bool = False,
+    actor_id: ObjectId | None = None,
+) -> dict[str, Any]:
+    """Soft-delete a custom folder. With ``cascade``, trash filed files + subfolders."""
     doc = await db.receipt_record_folders.find_one(
         {"_id": folder_id, "kind": "custom", "deleted_at": None}
     )
     if not doc:
         raise ValueError("Custom folder not found")
-    child = await db.receipt_record_folders.find_one(
-        {"kind": "custom", "parent_id": folder_id, "deleted_at": None}
-    )
-    if child:
-        raise ValueError(
-            f"Cannot delete “{doc.get('label')}” — it still has subfolders. "
-            "Delete or move children first."
+
+    if not cascade:
+        child = await db.receipt_record_folders.find_one(
+            {"kind": "custom", "parent_id": folder_id, "deleted_at": None}
         )
-    in_use = await db.receipt_files.count_documents(
-        {"record.folder_id": str(folder_id), "security_rejected": {"$ne": True}}
-    )
-    if in_use:
-        raise ValueError(
-            f"Cannot delete “{doc.get('label')}” — {in_use} file(s) are filed there. "
-            "Move or keep the folder."
+        if child:
+            raise ValueError(
+                f"Cannot delete “{doc.get('label')}” — it still has subfolders. "
+                "Delete or move children first, or use cascade trash."
+            )
+        in_use = await db.receipt_files.count_documents(
+            {
+                "record.folder_id": str(folder_id),
+                "security_rejected": {"$ne": True},
+                "trashed": {"$ne": True},
+            }
         )
+        if in_use:
+            raise ValueError(
+                f"Cannot delete “{doc.get('label')}” — {in_use} file(s) are filed there. "
+                "Trash the files first, or use cascade trash."
+            )
+        now = utcnow()
+        await db.receipt_record_folders.update_one(
+            {"_id": folder_id},
+            {"$set": {"deleted_at": now, "updated_at": now}},
+        )
+        return {
+            "id": str(folder_id),
+            "deleted": True,
+            "cascade": False,
+            "trashed_files": 0,
+            "deleted_folders": 1,
+        }
+
+    # Cascade: collect this folder + all descendants, trash files, soft-delete folders.
+    all_docs = await db.receipt_record_folders.find(
+        {"kind": "custom", "deleted_at": None}
+    ).to_list(length=5000)
+    by_parent: dict[str, list[dict[str, Any]]] = {}
+    for row in all_docs:
+        pid = str(row.get("parent_id") or "")
+        by_parent.setdefault(pid, []).append(row)
+
+    subtree: list[dict[str, Any]] = []
+
+    def _walk(oid: ObjectId) -> None:
+        key = str(oid)
+        for child in by_parent.get(key, []):
+            _walk(child["_id"])
+        # Find self
+        for row in all_docs:
+            if row.get("_id") == oid:
+                subtree.append(row)
+                break
+
+    _walk(folder_id)
+    if not subtree:
+        subtree = [doc]
+
+    folder_ids = [str(r.get("_id")) for r in subtree if r.get("_id") is not None]
+    file_docs = await db.receipt_files.find(
+        {
+            "record.folder_id": {"$in": folder_ids},
+            "security_rejected": {"$ne": True},
+            "trashed": {"$ne": True},
+        },
+        {"_id": 1},
+    ).to_list(length=5000)
+    file_ids = [str(d.get("_id") or "") for d in file_docs if d.get("_id")]
+
+    from .receipt_ops import trash_receipt_files
+
+    trashed = await trash_receipt_files(db, file_ids=file_ids, actor_id=actor_id)
     now = utcnow()
-    await db.receipt_record_folders.update_one(
-        {"_id": folder_id},
-        {"$set": {"deleted_at": now, "updated_at": now}},
-    )
-    return {"id": str(folder_id), "deleted": True}
+    deleted_folders = 0
+    for row in subtree:
+        oid = row.get("_id")
+        if oid is None:
+            continue
+        result = await db.receipt_record_folders.update_one(
+            {"_id": oid, "deleted_at": None},
+            {"$set": {"deleted_at": now, "updated_at": now}},
+        )
+        if int(getattr(result, "modified_count", 0) or 0) > 0:
+            deleted_folders += 1
+
+    return {
+        "id": str(folder_id),
+        "deleted": True,
+        "cascade": True,
+        "trashed_files": int(trashed.get("trashed") or 0),
+        "deleted_folders": deleted_folders,
+        # Sample for audit accountability (who cascade-trashed which files).
+        "file_ids": file_ids[:40],
+        "folder_ids": folder_ids[:40],
+    }
+
+
+async def _record_file_stats(
+    db: Any,
+) -> tuple[
+    dict[tuple[str, str], dict[str, int]],
+    dict[str, dict[str, int]],
+]:
+    """Counts + byte totals of Records files by (kind, ref_key) and custom folder_id."""
+    pipeline = [
+        {
+            "$match": {
+                "record": {"$exists": True, "$ne": None},
+                "security_rejected": {"$ne": True},
+                "trashed": {"$ne": True},
+            }
+        },
+        {
+            "$group": {
+                "_id": {
+                    "kind": "$record.kind",
+                    "ref_key": "$record.ref_key",
+                    "folder_id": "$record.folder_id",
+                },
+                "count": {"$sum": 1},
+                "total_size": {"$sum": {"$ifNull": ["$size", 0]}},
+            }
+        },
+    ]
+    by_ref: dict[tuple[str, str], dict[str, int]] = {}
+    by_folder: dict[str, dict[str, int]] = {}
+    # PyMongo AsyncMongoClient: aggregate() is a coroutine (see mongo_async).
+    rows = await aggregate_list(db.receipt_files, pipeline, length=None)
+    for row in rows:
+        key = row.get("_id") or {}
+        kind = str(key.get("kind") or "").strip().lower()
+        count = int(row.get("count") or 0)
+        total_size = int(row.get("total_size") or 0)
+        if count <= 0 or not kind:
+            continue
+        folder_id = key.get("folder_id")
+        if folder_id not in (None, ""):
+            fid = str(folder_id).strip()
+            if fid:
+                prev = by_folder.get(fid) or {"count": 0, "total_size": 0}
+                prev["count"] += count
+                prev["total_size"] += total_size
+                by_folder[fid] = prev
+        ref_key = " ".join(str(key.get("ref_key") or "").split())
+        if ref_key:
+            pair = (kind, ref_key)
+            prev = by_ref.get(pair) or {"count": 0, "total_size": 0}
+            prev["count"] += count
+            prev["total_size"] += total_size
+            by_ref[pair] = prev
+    return by_ref, by_folder
+
+
+async def _record_file_counts(
+    db: Any,
+) -> tuple[dict[tuple[str, str], int], dict[str, int]]:
+    """Counts of indexed Records files by (kind, ref_key) and by custom folder_id."""
+    by_ref_stats, by_folder_stats = await _record_file_stats(db)
+    by_ref = {k: int(v.get("count") or 0) for k, v in by_ref_stats.items()}
+    by_folder = {k: int(v.get("count") or 0) for k, v in by_folder_stats.items()}
+    return by_ref, by_folder
 
 
 async def list_record_destinations(db: Any) -> dict[str, Any]:
-    """Picker payload: items, suppliers, separate feeds, custom folders."""
+    """Picker payload: items, suppliers, separate feeds, custom folders.
+
+    Each row includes ``file_count`` and ``total_size`` (bytes of indexed Records
+    files for that destination).
+    """
+    by_ref, by_folder = await _record_file_stats(db)
     cats = await db.categories.find(
         {},
         {"name": 1, "sidebar_name": 1, "is_supplier": 1},
     ).sort([("name", 1)]).to_list(length=2000)
 
-    items: list[dict[str, str]] = []
-    suppliers: list[dict[str, str]] = []
+    items: list[dict[str, Any]] = []
+    suppliers: list[dict[str, Any]] = []
     for cat in cats:
         name = str(cat.get("name") or "").strip()
         if not name:
             continue
         label = str(cat.get("sidebar_name") or name).strip() or name
-        row = {"ref_key": name, "label": label, "slug": record_slug(name)}
-        if cat.get("is_supplier") is True:
+        kind = "supplier" if cat.get("is_supplier") is True else "item"
+        stats = by_ref.get((kind, name)) or {}
+        row = {
+            "ref_key": name,
+            "label": label,
+            "slug": record_slug(name),
+            "file_count": int(stats.get("count") or 0),
+            "total_size": int(stats.get("total_size") or 0),
+        }
+        if kind == "supplier":
             suppliers.append(row)
         else:
             items.append(row)
 
-    separate = [
-        {"ref_key": key, "label": label, "slug": record_slug(key)}
-        for key, label in SEPARATE_RECORD_DESTINATIONS
-    ]
+    separate = []
+    for key, label in SEPARATE_RECORD_DESTINATIONS:
+        stats = by_ref.get(("separate", key)) or {}
+        separate.append(
+            {
+                "ref_key": key,
+                "label": label,
+                "slug": record_slug(key),
+                "file_count": int(stats.get("count") or 0),
+                "total_size": int(stats.get("total_size") or 0),
+            }
+        )
     customs = await list_custom_folders(db)
+    for row in customs:
+        fid = str(row.get("id") or "").strip()
+        stats = by_folder.get(fid) if fid else None
+        row["file_count"] = int((stats or {}).get("count") or 0)
+        row["total_size"] = int((stats or {}).get("total_size") or 0)
     return {
         "items": items,
         "suppliers": suppliers,
         "separate": separate,
         "custom": customs,
     }
+
+
+async def discard_record_upload_batch(
+    db: Any,
+    base: Path,
+    file_ids: list[str],
+) -> int:
+    """Hard-delete Records files from a failed / cancelled multi-upload batch.
+
+    Unlike park discard, this intentionally removes ``inbox_status=approved``
+    record filings (they are company paper, not chase inbox).
+    """
+    discarded = 0
+    root = attachments_root(base)
+    for raw in file_ids:
+        fid = (raw or "").strip()
+        if not fid:
+            continue
+        doc = await db.receipt_files.find_one({"_id": fid})
+        if not doc:
+            continue
+        if not isinstance(doc.get("record"), dict):
+            continue
+        if doc.get("transaction_ids"):
+            # Linked to an expense — never roll back via upload batch discard.
+            continue
+        paths: list[Path] = []
+        primary = resolve_receipt_file_path(base, doc)
+        if primary is not None:
+            paths.append(primary)
+        for rel in doc.get("materialized_paths") or []:
+            text = str(rel or "").replace("\\", "/").lstrip("/")
+            if not text:
+                continue
+            paths.append(root / Path(*text.split("/")))
+        rec_path = str((doc.get("record") or {}).get("path") or "").replace("\\", "/")
+        if rec_path:
+            paths.append(root / Path(*rec_path.lstrip("/").split("/")))
+        await db.receipt_files.delete_one({"_id": fid})
+        seen: set[str] = set()
+        for path in paths:
+            try:
+                key = str(path.resolve())
+            except OSError:
+                key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        discarded += 1
+    return discarded
 
 
 async def resolve_record_destination(
@@ -719,6 +948,126 @@ async def store_record_file_bytes(
     return meta
 
 
+async def move_record_files(
+    db: Any,
+    base: Path,
+    *,
+    file_ids: list[str],
+    destination: dict[str, Any],
+) -> dict[str, Any]:
+    """Move Records files into another destination (Cut → Paste).
+
+    Updates ``record`` metadata and rematerializes the browse copy under the
+    new ``records/…`` path. Primary ``files/`` bytes stay put.
+    """
+    ensure_records_workspace(base)
+    root = attachments_root(base)
+    moved = 0
+    skipped = 0
+    for raw in file_ids:
+        fid = (raw or "").strip()
+        if not fid:
+            continue
+        doc = await db.receipt_files.find_one({"_id": fid})
+        if not doc or doc.get("trashed") is True:
+            skipped += 1
+            continue
+        rec = doc.get("record") if isinstance(doc.get("record"), dict) else None
+        if not rec:
+            skipped += 1
+            continue
+
+        filed = _effective_record_day(doc) or utcnow()
+        stored_name = Path(str(doc.get("stored_path") or "")).name
+        if not stored_name:
+            skipped += 1
+            continue
+        new_rel = _records_browse_rel(
+            destination, stored_name=stored_name, when=filed
+        )
+        new_abs = root / Path(*new_rel.split("/"))
+        old_rel = str(rec.get("path") or "").replace("\\", "/").lstrip("/")
+        primary = resolve_receipt_file_path(base, doc)
+
+        try:
+            new_abs.parent.mkdir(parents=True, exist_ok=True)
+            src = primary if primary is not None and primary.is_file() else None
+            if src is None and old_rel:
+                candidate = root / Path(*old_rel.split("/"))
+                if candidate.is_file():
+                    src = candidate
+            if src is None:
+                skipped += 1
+                continue
+            if new_abs.resolve() != src.resolve():
+                shutil.copy2(src, new_abs)
+        except OSError:
+            skipped += 1
+            continue
+
+        path_slugs = [
+            str(s)
+            for s in (destination.get("path_slugs") or [])
+            if str(s or "").strip()
+        ]
+        note_clean = str(rec.get("note") or "")
+        file_date_iso = str(rec.get("file_date") or "") or (
+            filed.date().isoformat() if isinstance(filed, datetime) else ""
+        )
+        new_record = {
+            "kind": destination["kind"],
+            "folder_id": destination.get("folder_id"),
+            "ref_key": destination.get("ref_key") or "",
+            "label": destination.get("label") or "",
+            "slug": destination.get("slug") or "",
+            "path_slugs": path_slugs,
+            "path": new_rel,
+            "note": note_clean,
+            "file_date": file_date_iso,
+        }
+        # Preserve bridge flags if present
+        if rec.get("from_approved"):
+            new_record["from_approved"] = True
+
+        mats = [
+            str(p).replace("\\", "/")
+            for p in (doc.get("materialized_paths") or [])
+            if str(p or "").strip()
+        ]
+        mats = [p for p in mats if p != old_rel and p != new_rel]
+        mats.append(new_rel)
+
+        await db.receipt_files.update_one(
+            {"_id": fid},
+            {
+                "$set": {
+                    "record": new_record,
+                    "materialized_paths": mats,
+                    "materialized_at": utcnow(),
+                }
+            },
+        )
+
+        if old_rel and old_rel != new_rel:
+            try:
+                (root / Path(*old_rel.split("/"))).unlink(missing_ok=True)
+            except OSError:
+                pass
+        moved += 1
+
+    return {
+        "moved": moved,
+        "skipped": skipped,
+        "requested": len(file_ids),
+        "destination": {
+            "kind": destination.get("kind"),
+            "ref_key": destination.get("ref_key"),
+            "folder_id": destination.get("folder_id"),
+            "label": destination.get("label"),
+        },
+    }
+
+
 def _effective_record_day(doc: dict[str, Any]) -> datetime | None:
     """Filing day for filters: record.file_date, else uploaded_at."""
     rec = doc.get("record") or {}
@@ -791,6 +1140,7 @@ async def _approved_bridge_files(
     query: dict[str, Any] = {
         "inbox_status": INBOX_APPROVED,
         "security_rejected": {"$ne": True},
+        "trashed": {"$ne": True},
         "$or": [
             {"record": {"$exists": False}},
             {"record": None},
@@ -893,6 +1243,7 @@ async def list_record_files(
     query: dict[str, Any] = {
         "record": {"$exists": True, "$ne": None},
         "security_rejected": {"$ne": True},
+        "trashed": {"$ne": True},
     }
     kind_key = (kind or "").strip().lower()
     if kind_key:
@@ -911,17 +1262,21 @@ async def list_record_files(
     # Date filters use record.file_date when set (backlog filing month), else
     # uploaded_at — applied after fetch so mixed rows stay correct.
     needle = (q or "").strip()
-    if needle:
-        query["original_filename"] = {"$regex": re.escape(needle), "$options": "i"}
-
     cap = max(1, min(int(limit), 500))
     fetch_n = min(500, cap * 3 if (start is not None or end is not None) else cap)
-    docs = (
-        await db.receipt_files.find(query)
-        .sort("uploaded_at", -1)
-        .limit(fetch_n)
-        .to_list(length=fetch_n)
-    )
+    if needle:
+        from .receipt_ops import find_receipt_files_matching_name
+
+        docs = await find_receipt_files_matching_name(
+            db, query, needle, limit=fetch_n
+        )
+    else:
+        docs = (
+            await db.receipt_files.find(query)
+            .sort("uploaded_at", -1)
+            .limit(fetch_n)
+            .to_list(length=fetch_n)
+        )
     if start is not None or end is not None:
         filtered: list[dict[str, Any]] = []
         for doc in docs:

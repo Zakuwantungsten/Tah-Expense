@@ -184,14 +184,14 @@ def test_list_sessions_admin_only() -> None:
         sessions, users, session_state={"_id": session_id, "user_id": admin_id}
     )
 
-    # Accountant denied
-    app.dependency_overrides[current_user] = lambda: {
-        "_id": ObjectId(),
-        "username": "acct",
-        "role": "accountant",
-    }
+    # Accountant shares session visibility with Superadmin (Users-tab parity).
+    async def accountant_user(request: Request):
+        request.state.session = {"_id": session_id, "user_id": admin_id}
+        return {"_id": ObjectId(), "username": "acct", "role": "accountant"}
+
+    app.dependency_overrides[current_user] = accountant_user
     with TestClient(app) as client:
-        assert client.get("/v1/sessions").status_code == 403
+        assert client.get("/v1/sessions").status_code == 200
 
     async def admin_user(request: Request):
         request.state.session = {"_id": session_id, "user_id": admin_id}

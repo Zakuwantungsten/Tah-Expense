@@ -1580,11 +1580,11 @@ class CashierDashboard(QWidget):
             self._table_page.set_submit_badge(n)
 
     def _note_submitted_drafts(self, updated: int) -> None:
-        """Submit already returned the count. Move the badge by that amount."""
+        """Submit finished — recount day badges (updated is expense lines)."""
+        from tahmeed.ui.async_utils import schedule_coro
+
         self._skip_draft_recount = True
-        current = self._sidebar.drafts_badge() if hasattr(self._sidebar, "drafts_badge") else 0
-        nxt = max(0, current - int(updated or 0))
-        self._apply_draft_badges(nxt)
+        schedule_coro(self._refresh_draft_badge())
 
     def _on_register_drafts_changed(self) -> None:
         if getattr(self, "_skip_draft_recount", False):

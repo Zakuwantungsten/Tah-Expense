@@ -62,6 +62,30 @@ def style_calendar_popup(edit: QDateEdit) -> None:
     cal.setStyleSheet(_CALENDAR_SS)
 
 
+def sync_calendar_page_to_date(edit: QDateEdit) -> None:
+    """When the popup month/year changes, commit that month into the QDateEdit.
+
+    Without this, users can browse to July in the calendar while the field still
+    shows November — Upload then files under the old month. Matching Windows
+    month navigation: changing the visible page updates the filing date.
+    """
+    cal = edit.calendarWidget()
+    if cal is None:
+        return
+    if getattr(edit, "_tahmeed_page_sync", False):
+        return
+
+    def _on_page(year: int, month: int) -> None:
+        cur = edit.date()
+        day = min(cur.day(), calendar.monthrange(year, month)[1])
+        nxt = QDate(year, month, day)
+        if nxt != cur:
+            edit.setDate(nxt)
+
+    cal.currentPageChanged.connect(_on_page)
+    edit._tahmeed_page_sync = True  # type: ignore[attr-defined]
+
+
 def _qdate_to_dt_start(qd: QDate) -> datetime:
     return datetime(qd.year(), qd.month(), qd.day())
 

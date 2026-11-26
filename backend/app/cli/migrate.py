@@ -236,7 +236,17 @@ async def create_indexes(db: Any) -> None:
                 [("original_filename", ASCENDING)],
                 name="receipt_files_original_name",
             ),
+            # Text index for Storage / Records / Trash filename search (fast $text).
+            IndexModel(
+                [("original_filename", "text"), ("sha256", "text")],
+                name="receipt_files_search_text",
+                default_language="none",
+            ),
             IndexModel([("sha256", ASCENDING)], name="receipt_files_sha256"),
+            IndexModel(
+                [("trashed", ASCENDING), ("uploaded_at", DESCENDING)],
+                name="receipt_files_trashed_uploaded",
+            ),
             IndexModel(
                 [("s3_key", ASCENDING)],
                 name="receipt_files_pending_s3",
@@ -255,6 +265,15 @@ async def create_indexes(db: Any) -> None:
                 [("record.folder_id", ASCENDING), ("uploaded_at", DESCENDING)],
                 name="receipt_files_records_folder",
                 partialFilterExpression={"record.folder_id": {"$type": "string"}},
+            ),
+            IndexModel(
+                [
+                    ("record.kind", ASCENDING),
+                    ("record.ref_key", ASCENDING),
+                    ("original_filename", ASCENDING),
+                ],
+                name="receipt_files_records_name",
+                partialFilterExpression={"record": {"$exists": True}},
             ),
         ]
     )

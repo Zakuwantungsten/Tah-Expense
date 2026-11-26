@@ -31,6 +31,10 @@ from .receipt_evidence import (
 from .receipt_ops import (
     approve_receipt_files,
     chase_groups,
+    create_storage_folder,
+    delete_empty_storage_folder,
+    rename_storage_folder,
+    trash_storage_folder,
     desk_undo_waive_receipts,
     desk_waive_receipts,
     ensure_receipt_workspace,
@@ -44,29 +48,37 @@ from .receipt_ops import (
     list_receipt_requests,
     list_storage_objects,
     list_storage_tree,
+    empty_receipt_trash,
+    list_trashed_receipt_files,
     manual_link_files,
     mark_requests_reminded,
     materialize_approved_file,
     open_receipt_file_bytes,
     park_receipt_uploads,
     person_receipt_dossier,
+    purge_trashed_receipt_files,
     receipt_compliance_summary,
     reject_receipt_files,
     resolve_intended_ownership,
     rematerialize_approved_for_transaction,
+    restore_all_trashed_receipt_files,
+    restore_trashed_receipt_files,
     search_link_transactions,
     still_request_linked_entries,
+    trash_receipt_files,
     upload_and_link_receipt_files,
 )
 from .receipt_records_ops import (
     build_records_pack,
     create_custom_folder,
     delete_custom_folder,
+    discard_record_upload_batch,
     ensure_custom_folder_path,
     ensure_records_workspace,
     list_custom_folders,
     list_record_destinations,
     list_record_files,
+    move_record_files,
     parse_record_file_date,
     rename_custom_folder,
     resolve_record_destination,
@@ -189,6 +201,31 @@ class RecordsPackBody(BaseModel):
     date_to: date | None = None
 
 
+class RecordsDiscardBatchBody(BaseModel):
+    file_ids: list[str] = Field(default_factory=list)
+
+
+class RecordsMoveBody(BaseModel):
+    file_ids: list[str] = Field(default_factory=list)
+    kind: str = Field(min_length=1)
+    ref_key: str = ""
+    folder_id: str = ""
+
+
+class ReceiptTrashBody(BaseModel):
+    file_ids: list[str] = Field(default_factory=list)
+
+
+class StorageFolderCreateBody(BaseModel):
+    prefix: str = ""
+    name: str = Field(min_length=1, max_length=120)
+
+
+class StorageFolderRenameBody(BaseModel):
+    prefix: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=120)
+
+
 def _database(request: Request) -> Any:
     return request.app.state.database.db
 
@@ -264,7 +301,7 @@ async def get_receipt_storage_objects(
     q: str = Query(""),
     limit: int = Query(200, ge=1, le=500),
 ) -> dict[str, Any]:
-    """Files in a prefix (or filename/sha search), mapped to receipt_files when possible."""
+    """Folders + files in a prefix (or filename/sha search), mapped to receipt_files when possible."""
     db = _database(request)
     base = await resolve_attachments_directory(_settings(request), db)
     try:
@@ -274,6 +311,230 @@ async def get_receipt_storage_objects(
     except ValueError as exc:
         raise ApiError(422, "invalid_prefix", str(exc)) from None
     return json_safe(payload)
+
+
+@receipts.post("/storage/folders", status_code=status.HTTP_201_CREATED)
+async def post_storage_folder(
+    request: Request,
+    actor: Manager,
+    body: StorageFolderCreateBody,
+) -> dict[str, Any]:
+    await _require_receipt_storage(request)
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    try:
+        payload = await create_storage_folder(
+            base, prefix=body.prefix, name=body.name
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_folder", str(exc)) from None
+    await record_operation_event(
+        db,
+        action="storage.folder_create",
+        actor=actor,
+        request=request,
+        entity_type="storage_folder",
+        entity_ids=[str(payload.get("prefix") or "")],
+        details=payload,
+    )
+    return json_safe(payload)
+
+
+@receipts.patch("/storage/folders")
+async def patch_storage_folder(
+    request: Request,
+    actor: Manager,
+    body: StorageFolderRenameBody,
+) -> dict[str, Any]:
+    await _require_receipt_storage(request)
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    try:
+        payload = await rename_storage_folder(
+            base, prefix=body.prefix, name=body.name
+        )
+    except ValueError as exc:
+        raise ApiError(422, "folder_rename_failed", str(exc)) from None
+    await record_operation_event(
+        db,
+        action="storage.folder_rename",
+        actor=actor,
+        request=request,
+        entity_type="storage_folder",
+        entity_ids=[str(payload.get("prefix") or "")],
+        details=payload,
+    )
+    return json_safe(payload)
+
+
+@receipts.delete("/storage/folders")
+async def delete_storage_folder_route(
+    request: Request,
+    actor: Manager,
+    prefix: str = Query(...),
+    cascade: bool = Query(False),
+) -> dict[str, Any]:
+    await _require_receipt_storage(request)
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    try:
+        if cascade:
+            payload = await trash_storage_folder(
+                db, base, prefix=prefix, actor_id=_actor_oid(actor)
+            )
+        else:
+            payload = await delete_empty_storage_folder(base, prefix=prefix)
+    except ValueError as exc:
+        raise ApiError(422, "folder_delete_failed", str(exc)) from None
+    file_ids = [
+        str(x) for x in (payload.get("file_ids") or []) if str(x or "").strip()
+    ]
+    await record_operation_event(
+        db,
+        action="storage.folder_delete",
+        actor=actor,
+        request=request,
+        entity_type="storage_folder",
+        entity_ids=[prefix, *file_ids][:40],
+        details={**payload, "cascade": cascade},
+    )
+    # Separate trash trail when cascade moved indexed files (searchable under Trash).
+    if cascade and int(payload.get("trashed_files") or 0) > 0:
+        await record_operation_event(
+            db,
+            action="receipts.trash",
+            actor=actor,
+            request=request,
+            entity_type="receipt_file",
+            entity_ids=file_ids[:40],
+            details={
+                "source": "storage.folder_delete",
+                "prefix": prefix,
+                "trashed": payload.get("trashed_files"),
+                "skipped": payload.get("skipped_files"),
+            },
+        )
+    return json_safe(payload)
+
+
+@receipts.get("/trash")
+async def get_receipt_trash(
+    request: Request,
+    _user: Manager,
+    limit: int = Query(200, ge=1, le=500),
+    q: str = Query(""),
+) -> dict[str, Any]:
+    return json_safe(
+        await list_trashed_receipt_files(_database(request), limit=limit, q=q)
+    )
+
+
+@receipts.post("/trash/restore-all")
+async def post_receipt_trash_restore_all(
+    request: Request,
+    actor: Manager,
+) -> dict[str, Any]:
+    result = await restore_all_trashed_receipt_files(_database(request))
+    await record_operation_event(
+        db=_database(request),
+        action="receipts.trash_restore_all",
+        actor=actor,
+        request=request,
+        entity_type="receipt_file",
+        details=result,
+    )
+    return json_safe(result)
+
+
+@receipts.post("/trash/empty")
+async def post_receipt_trash_empty(
+    request: Request,
+    actor: Manager,
+) -> dict[str, Any]:
+    await _require_receipt_storage(request)
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    result = await empty_receipt_trash(db, base)
+    await record_operation_event(
+        db=db,
+        action="receipts.trash_empty",
+        actor=actor,
+        request=request,
+        entity_type="receipt_file",
+        details=result,
+    )
+    return json_safe(result)
+
+
+@receipts.post("/trash")
+async def post_receipt_trash(
+    request: Request,
+    actor: Manager,
+    body: ReceiptTrashBody,
+) -> dict[str, Any]:
+    ids = [str(x).strip() for x in (body.file_ids or []) if str(x or "").strip()]
+    if not ids:
+        raise ApiError(422, "file_ids_required", "Select at least one file")
+    result = await trash_receipt_files(
+        _database(request), file_ids=ids, actor_id=_actor_oid(actor)
+    )
+    await record_operation_event(
+        db=_database(request),
+        action="receipts.trash",
+        actor=actor,
+        request=request,
+        entity_type="receipt_file",
+        entity_ids=ids[:40],
+        details=result,
+    )
+    return json_safe(result)
+
+
+@receipts.post("/trash/restore")
+async def post_receipt_trash_restore(
+    request: Request,
+    actor: Manager,
+    body: ReceiptTrashBody,
+) -> dict[str, Any]:
+    ids = [str(x).strip() for x in (body.file_ids or []) if str(x or "").strip()]
+    if not ids:
+        raise ApiError(422, "file_ids_required", "Select at least one file")
+    result = await restore_trashed_receipt_files(_database(request), file_ids=ids)
+    await record_operation_event(
+        db=_database(request),
+        action="receipts.trash_restore",
+        actor=actor,
+        request=request,
+        entity_type="receipt_file",
+        entity_ids=ids[:40],
+        details=result,
+    )
+    return json_safe(result)
+
+
+@receipts.post("/trash/purge")
+async def post_receipt_trash_purge(
+    request: Request,
+    actor: Manager,
+    body: ReceiptTrashBody,
+) -> dict[str, Any]:
+    ids = [str(x).strip() for x in (body.file_ids or []) if str(x or "").strip()]
+    if not ids:
+        raise ApiError(422, "file_ids_required", "Select at least one file")
+    await _require_receipt_storage(request)
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    result = await purge_trashed_receipt_files(db, base, file_ids=ids)
+    await record_operation_event(
+        db=db,
+        action="receipts.trash_purge",
+        actor=actor,
+        request=request,
+        entity_type="receipt_file",
+        entity_ids=ids[:40],
+        details=result,
+    )
+    return json_safe(result)
 
 
 @receipts.get("/storage/candidates")
@@ -1359,7 +1620,10 @@ async def patch_record_folder(
 
 @receipts.delete("/records/folders/{folder_id}")
 async def delete_record_folder_route(
-    folder_id: str, request: Request, actor: Manager
+    folder_id: str,
+    request: Request,
+    actor: Manager,
+    cascade: bool = Query(False),
 ) -> dict[str, Any]:
     try:
         oid = object_id(folder_id)
@@ -1367,18 +1631,38 @@ async def delete_record_folder_route(
         raise ApiError(422, "invalid_id", "Invalid folder id") from exc
     db = _database(request)
     try:
-        result = await delete_custom_folder(db, oid)
+        result = await delete_custom_folder(
+            db, oid, cascade=cascade, actor_id=_actor_oid(actor)
+        )
     except ValueError as exc:
         raise ApiError(422, "invalid_folder", str(exc)) from None
+    file_ids = [
+        str(x) for x in (result.get("file_ids") or []) if str(x or "").strip()
+    ]
     await record_operation_event(
         db,
         action="records.folder.delete",
         actor=actor,
         request=request,
         entity_type="receipt_record_folder",
-        entity_ids=[folder_id],
+        entity_ids=[folder_id, *file_ids][:40],
         details=result,
     )
+    if cascade and int(result.get("trashed_files") or 0) > 0:
+        await record_operation_event(
+            db,
+            action="receipts.trash",
+            actor=actor,
+            request=request,
+            entity_type="receipt_file",
+            entity_ids=file_ids[:40],
+            details={
+                "source": "records.folder.delete",
+                "folder_id": folder_id,
+                "trashed": result.get("trashed_files"),
+                "deleted_folders": result.get("deleted_folders"),
+            },
+        )
     return json_safe(result)
 
 
@@ -1443,63 +1727,91 @@ async def post_records_upload(
     actor_id = _actor_oid(actor)
     note_clean = " ".join((note or "").split())[:2000]
     saved: list[dict[str, Any]] = []
-    for upload in files:
-        filename = upload.filename or "file"
-        try:
-            content = await upload.read()
-        except Exception as exc:
-            raise ApiError(400, "read_failed", "Could not read uploaded file") from exc
-        finally:
-            await upload.close()
-        try:
-            meta = await store_record_file_bytes(
-                db,
-                base,
-                filename=filename,
-                content=content,
-                destination=destination,
-                actor_id=actor_id,
-                note="",
-                claimed_content_type=upload.content_type,
-                file_date=filed_on,
-            )
-        except ValueError as exc:
-            raise ApiError(422, "invalid_attachment", str(exc)) from None
-        except OSError as exc:
-            raise ApiError(500, "storage_error", "Failed to store attachment") from exc
-        saved.append(meta)
-
     note_file: dict[str, Any] | None = None
-    if note_clean:
-        from .security import utcnow
+    try:
+        for upload in files:
+            filename = upload.filename or "file"
+            try:
+                content = await upload.read()
+            except Exception as exc:
+                raise ApiError(
+                    400, "read_failed", "Could not read uploaded file"
+                ) from exc
+            finally:
+                await upload.close()
+            try:
+                meta = await store_record_file_bytes(
+                    db,
+                    base,
+                    filename=filename,
+                    content=content,
+                    destination=destination,
+                    actor_id=actor_id,
+                    note="",
+                    claimed_content_type=upload.content_type,
+                    file_date=filed_on,
+                )
+            except ValueError as exc:
+                raise ApiError(422, "invalid_attachment", str(exc)) from None
+            except OSError as exc:
+                raise ApiError(
+                    500, "storage_error", "Failed to store attachment"
+                ) from exc
+            saved.append(meta)
 
-        stamp = utcnow().strftime("%Y%m%d_%H%M%S")
-        note_name = f"upload-note_{stamp}.txt"
-        note_body = (
-            "Tahmeed Records — upload note\n"
-            f"Destination: {destination.get('label') or destination.get('ref_key') or ''}\n"
-            f"Type: {destination.get('kind') or ''}\n"
-            f"File as date: {filed_on.isoformat()}\n"
-            f"Files in this upload: {len(saved)}\n"
-            "-----\n"
-            f"{note_clean}\n"
-        ).encode("utf-8")
-        try:
-            note_file = await store_record_file_bytes(
+        if note_clean:
+            from .security import utcnow
+
+            stamp = utcnow().strftime("%Y%m%d_%H%M%S")
+            note_name = f"upload-note_{stamp}.txt"
+            note_body = (
+                "Tahmeed Records — upload note\n"
+                f"Destination: {destination.get('label') or destination.get('ref_key') or ''}\n"
+                f"Type: {destination.get('kind') or ''}\n"
+                f"File as date: {filed_on.isoformat()}\n"
+                f"Files in this upload: {len(saved)}\n"
+                "-----\n"
+                f"{note_clean}\n"
+            ).encode("utf-8")
+            try:
+                note_file = await store_record_file_bytes(
+                    db,
+                    base,
+                    filename=note_name,
+                    content=note_body,
+                    destination=destination,
+                    actor_id=actor_id,
+                    note=note_clean[:500],
+                    claimed_content_type="text/plain",
+                    file_date=filed_on,
+                )
+                saved.append(note_file)
+            except (ValueError, OSError):
+                # Files already stored — do not fail the whole upload for a note miss.
+                note_file = None
+    except Exception as exc:
+        if saved:
+            rollback_ids = [str(m.get("id") or "") for m in saved if m.get("id")]
+            discarded = await discard_record_upload_batch(db, base, rollback_ids)
+            await record_operation_event(
                 db,
-                base,
-                filename=note_name,
-                content=note_body,
-                destination=destination,
-                actor_id=actor_id,
-                note=note_clean[:500],
-                claimed_content_type="text/plain",
-                file_date=filed_on,
+                action="records.discard_batch",
+                actor=actor,
+                request=request,
+                entity_type="receipt_file",
+                entity_ids=rollback_ids[:40],
+                outcome="fail",
+                error=str(exc)[:400],
+                details={
+                    "rollback": True,
+                    "discarded": discarded,
+                    "kind": destination.get("kind"),
+                    "ref_key": destination.get("ref_key"),
+                    "folder_id": destination.get("folder_id"),
+                    "label": destination.get("label"),
+                },
             )
-            saved.append(note_file)
-        except (ValueError, OSError):
-            # Files already stored — do not fail the whole upload for a note miss.
-            note_file = None
+        raise
 
     await record_operation_event(
         db,
@@ -1517,6 +1829,7 @@ async def post_records_upload(
             "file_date": filed_on.isoformat(),
             "note_file": bool(note_file),
             "has_note": bool(note_clean),
+            "atomic": True,
         },
     )
     return {
@@ -1525,7 +1838,81 @@ async def post_records_upload(
         "destination": json_safe(destination),
         "file_date": filed_on.isoformat(),
         "note_file": json_safe(note_file) if note_file else None,
+        "atomic": True,
     }
+
+
+@receipts.post("/records/move")
+async def post_records_move(
+    request: Request,
+    actor: Manager,
+    body: RecordsMoveBody,
+) -> dict[str, Any]:
+    """Cut → Paste: move Records files into another destination folder."""
+    file_ids = [str(x).strip() for x in (body.file_ids or []) if str(x or "").strip()]
+    if not file_ids:
+        raise ApiError(422, "file_ids_required", "Select at least one file")
+    await _require_receipt_storage(request)
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    try:
+        destination = await resolve_record_destination(
+            db,
+            kind=body.kind,
+            ref_key=body.ref_key,
+            folder_id=body.folder_id,
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_destination", str(exc)) from None
+    try:
+        result = await move_record_files(
+            db, base, file_ids=file_ids, destination=destination
+        )
+    except ValueError as exc:
+        raise ApiError(422, "move_failed", str(exc)) from None
+    await record_operation_event(
+        db,
+        action="records.move",
+        actor=actor,
+        request=request,
+        entity_type="receipt_file",
+        entity_ids=file_ids[:40],
+        details={
+            "moved": result.get("moved"),
+            "skipped": result.get("skipped"),
+            "kind": destination.get("kind"),
+            "ref_key": destination.get("ref_key"),
+            "folder_id": destination.get("folder_id"),
+            "label": destination.get("label"),
+        },
+    )
+    return json_safe(result)
+
+
+@receipts.post("/records/discard-batch")
+async def post_records_discard_batch(
+    request: Request,
+    actor: Manager,
+    body: RecordsDiscardBatchBody,
+) -> dict[str, Any]:
+    """Roll back file ids from a cancelled / failed sequential Records upload."""
+    file_ids = [str(x).strip() for x in (body.file_ids or []) if str(x or "").strip()]
+    if not file_ids:
+        return {"discarded": 0, "requested": 0}
+    await _require_receipt_storage(request)
+    db = _database(request)
+    base = await resolve_attachments_directory(_settings(request), db)
+    discarded = await discard_record_upload_batch(db, base, file_ids)
+    await record_operation_event(
+        db,
+        action="records.discard_batch",
+        actor=actor,
+        request=request,
+        entity_type="receipt_file",
+        entity_ids=file_ids[:40],
+        details={"requested": len(file_ids), "discarded": discarded},
+    )
+    return {"discarded": discarded, "requested": len(file_ids)}
 
 
 @receipts.post("/records/pack")

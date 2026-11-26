@@ -245,8 +245,9 @@ def test_list_audit_events_admin_only() -> None:
         "role": "accountant",
     }
     with TestClient(app) as client:
-        denied = client.get("/v1/audit/events")
-    assert denied.status_code == 403
+        as_accountant = client.get("/v1/audit/events", params={"action": "auth"})
+    assert as_accountant.status_code == 200
+    assert len(as_accountant.json()) == 1
 
     app.dependency_overrides[current_user] = lambda: {
         "_id": ObjectId(),

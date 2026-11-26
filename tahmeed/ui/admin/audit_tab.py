@@ -31,11 +31,16 @@ from tahmeed.ui.widgets.table_contrast import apply_light_table_contrast, light_
 from tahmeed.ui.widgets.loading_overlay import LoadingOverlay
 
 # Preset chips: label → action substring passed to the API regex filter.
+# Anchored prefix match (see parse_audit_filters) — keep tokens simple.
 _FILTER_CHIPS: tuple[tuple[str, str], ...] = (
     ("All", ""),
     ("Auth", "auth"),
     ("Users", "user"),
     ("Transactions", "txn"),
+    ("Paperwork", "receipt"),  # receipt.* + receipts.* + receipt_storage.*
+    ("Storage", "storage"),  # storage.folder_*
+    ("Records", "records"),
+    ("Trash", "receipts.trash"),
     ("Settings", "settings"),
 )
 
@@ -83,7 +88,8 @@ class AuditTab(QWidget):
         root.addWidget(title)
 
         description = QLabel(
-            "Append-only record of sign-ins, admin changes, and business operations. "
+            "Append-only record of sign-ins, admin changes, and business operations "
+            "(including Paperwork storage, Records, and Trash — who deleted what). "
             "Newest events appear first."
         )
         description.setWordWrap(True)

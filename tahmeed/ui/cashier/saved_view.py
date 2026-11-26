@@ -499,9 +499,9 @@ class SavedView(QWidget):
         self._populate()
 
     def _populate(self) -> None:
-        entries_total = sum(s.entries_count for s in self._visible)
-        self._count_chip.setText(str(entries_total))
-        self._count_chip.setVisible(entries_total > 0)
+        day_total = len(self._visible)
+        self._count_chip.setText(str(day_total))
+        self._count_chip.setVisible(day_total > 0)
         if not self._visible:
             self._stack.setCurrentIndex(0)
             self._table.setRowCount(0)

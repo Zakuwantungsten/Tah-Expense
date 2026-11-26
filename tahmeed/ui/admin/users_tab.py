@@ -45,10 +45,12 @@ from tahmeed.ui.widgets.table_contrast import apply_light_table_contrast, light_
 from tahmeed.ui.widgets.popup_styles import apply_light_menu
 
 
-def _editable_roles(user: Optional[User]) -> list[str]:
-    roles = ["cashier", "accountant"]
-    if user and user.role == "admin":
-        roles.append("admin")
+def _editable_roles(user: Optional[User] = None) -> list[str]:
+    """Roles available in Add/Edit — accountants share Superadmin Users-tab powers."""
+    roles = ["cashier", "accountant", "admin"]
+    # Keep current role selectable even if the catalog expands later.
+    if user and user.role and user.role not in roles:
+        roles.append(user.role)
     return roles
 
 
@@ -231,18 +233,20 @@ class UsersTab(QWidget):
         layout.addLayout(bar)
 
         self._table = QTableWidget()
-        self._table.setColumnCount(6)
+        self._table.setColumnCount(7)
         self._table.setHorizontalHeaderLabels(
-            ["Full Name", "Username", "Role", "Status", "Last Login", "Actions"]
+            ["SN", "Full Name", "Username", "Role", "Status", "Last Login", "Actions"]
         )
         hh = self._table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(0, QHeaderView.Fixed)
+        self._table.setColumnWidth(0, 44)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
         hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(5, QHeaderView.Fixed)
-        self._table.setColumnWidth(5, 120)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(6, QHeaderView.Fixed)
+        self._table.setColumnWidth(6, 120)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
@@ -273,23 +277,26 @@ class UsersTab(QWidget):
     def _refresh(self) -> None:
         self._table.setRowCount(len(self._users))
         for i, user in enumerate(self._users):
-            self._table.setItem(i, 0, light_table_item(user.full_name))
-            self._table.setItem(i, 1, light_table_item(user.username))
-            self._table.setItem(i, 2, light_table_item(user.role.title()))
+            sn_item = light_table_item(str(i + 1))
+            sn_item.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(i, 0, sn_item)
+            self._table.setItem(i, 1, light_table_item(user.full_name))
+            self._table.setItem(i, 2, light_table_item(user.username))
+            self._table.setItem(i, 3, light_table_item(user.role.title()))
 
             status_item = light_table_item(user.status_label)
             status_item.setForeground(self._status_color(user))
             if user.banned and user.ban_reason:
                 status_item.setToolTip(user.ban_reason)
-            self._table.setItem(i, 3, status_item)
+            self._table.setItem(i, 4, status_item)
 
             last = (
                 user.last_login.strftime("%d %b %Y  %H:%M")
                 if user.last_login
                 else "Never"
             )
-            self._table.setItem(i, 4, light_table_item(last))
-            self._table.setCellWidget(i, 5, self._make_actions(user))
+            self._table.setItem(i, 5, light_table_item(last))
+            self._table.setCellWidget(i, 6, self._make_actions(user))
 
         self._table.resizeRowsToContents()
 

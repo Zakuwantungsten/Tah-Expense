@@ -37,10 +37,13 @@ async def rename_custom_folder(folder_id: str, label: str) -> dict[str, Any]:
     )
 
 
-async def delete_custom_folder(folder_id: str) -> dict[str, Any]:
+async def delete_custom_folder(
+    folder_id: str, *, cascade: bool = False
+) -> dict[str, Any]:
     return await api_client.request(
         "DELETE",
         f"v1/receipts/records/folders/{folder_id}",
+        params={"cascade": "true" if cascade else "false"},
     )
 
 
@@ -73,6 +76,80 @@ async def list_record_files(
     return list((payload or {}).get("items") or [])
 
 
+async def discard_record_upload_batch(file_ids: list[str]) -> dict[str, Any]:
+    """Roll back Records file ids after a failed / cancelled multi-upload."""
+    ids = [str(x).strip() for x in file_ids if str(x or "").strip()]
+    if not ids:
+        return {"discarded": 0, "requested": 0}
+    return await api_client.request(
+        "POST",
+        "v1/receipts/records/discard-batch",
+        json={"file_ids": ids},
+    )
+
+
+async def move_record_files(
+    file_ids: list[str],
+    *,
+    kind: str,
+    ref_key: str = "",
+    folder_id: str = "",
+) -> dict[str, Any]:
+    """Cut → Paste: move Records files into another destination."""
+    ids = [str(x).strip() for x in file_ids if str(x or "").strip()]
+    if not ids:
+        return {"moved": 0, "skipped": 0, "requested": 0}
+    return await api_client.request(
+        "POST",
+        "v1/receipts/records/move",
+        json={
+            "file_ids": ids,
+            "kind": kind,
+            "ref_key": ref_key,
+            "folder_id": folder_id,
+        },
+    )
+
+
+async def trash_record_files(file_ids: list[str]) -> dict[str, Any]:
+    """Move Records / receipt files to Trash (soft delete)."""
+    from tahmeed.services.receipt_storage_service import trash_receipt_files
+
+    return await trash_receipt_files(file_ids)
+
+
+async def upload_record_file(
+    path: str,
+    *,
+    kind: str,
+    ref_key: str = "",
+    folder_id: str = "",
+    note: str = "",
+    file_date: str = "",
+) -> dict[str, Any]:
+    """Upload a single file into a Records destination."""
+    import mimetypes
+    from pathlib import Path
+
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise ValueError(f"File not found: {path}")
+    mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    with file_path.open("rb") as handle:
+        return await api_client.request(
+            "POST",
+            "v1/receipts/records/upload",
+            data={
+                "kind": kind,
+                "ref_key": ref_key or "",
+                "folder_id": folder_id or "",
+                "note": note or "",
+                "file_date": (file_date or "").strip(),
+            },
+            files=[("files", (file_path.name, handle, mime))],
+        )
+
+
 async def upload_record_files(
     paths: list[str],
     *,
@@ -81,43 +158,75 @@ async def upload_record_files(
     folder_id: str = "",
     note: str = "",
     file_date: str = "",
+    on_progress: Any | None = None,
+    should_cancel: Any | None = None,
 ) -> dict[str, Any]:
-    """Multipart bulk upload into a Records destination.
+    """Sequential multi-file Records upload with progress + all-or-nothing rollback.
 
-    ``file_date`` is YYYY-MM-DD for the browse YYYY/MM folder (backlog). Empty = today.
+    ``on_progress(done, total, filename)`` is called before each file (done is
+    0-based index of the file about to upload) and once at the end with
+    ``done == total``. ``should_cancel()`` returning True aborts and discards.
     """
-    import mimetypes
     from pathlib import Path
 
-    files: list[tuple[str, tuple[str, Any, str]]] = []
-    handles: list[Any] = []
+    readable = [str(p) for p in paths if Path(p).is_file()]
+    if not readable:
+        raise ValueError("No readable files selected")
+
+    total = len(readable)
+    saved_files: list[dict[str, Any]] = []
+    saved_ids: list[str] = []
+    destination: dict[str, Any] = {}
+    filed = (file_date or "").strip()
+    note_clean = note or ""
+    note_file: dict[str, Any] | None = None
+
+    committed = False
     try:
-        for raw in paths:
-            path = Path(raw)
-            if not path.is_file():
-                continue
-            handle = path.open("rb")
-            handles.append(handle)
-            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            files.append(("files", (path.name, handle, mime)))
-        if not files:
-            raise ValueError("No readable files selected")
-        data = {
-            "kind": kind,
-            "ref_key": ref_key or "",
-            "folder_id": folder_id or "",
-            "note": note or "",
-            "file_date": (file_date or "").strip(),
+        for index, raw in enumerate(readable):
+            if should_cancel is not None and should_cancel():
+                raise InterruptedError("Upload cancelled")
+            name = Path(raw).name
+            if on_progress is not None:
+                on_progress(index, total, name)
+            # Attach optional note only on the last file so a mid-batch failure
+            # never leaves a note without its companions.
+            attach_note = note_clean if index == total - 1 else ""
+            result = await upload_record_file(
+                raw,
+                kind=kind,
+                ref_key=ref_key,
+                folder_id=folder_id,
+                note=attach_note,
+                file_date=filed,
+            )
+            destination = dict(result.get("destination") or destination)
+            filed = str(result.get("file_date") or filed)
+            batch = list(result.get("files") or [])
+            if result.get("note_file"):
+                note_file = dict(result["note_file"])
+            for meta in batch:
+                fid = str(meta.get("id") or "").strip()
+                if fid:
+                    saved_ids.append(fid)
+                saved_files.append(meta)
+        if on_progress is not None:
+            on_progress(total, total, "")
+        committed = True
+        return {
+            "files": saved_files,
+            "total": len(saved_files),
+            "destination": destination,
+            "file_date": filed,
+            "note_file": note_file,
+            "atomic": True,
         }
-        return await api_client.request(
-            "POST",
-            "v1/receipts/records/upload",
-            data=data,
-            files=files,
-        )
     finally:
-        for handle in handles:
-            handle.close()
+        if not committed and saved_ids:
+            try:
+                await discard_record_upload_batch(saved_ids)
+            except Exception:
+                pass
 
 
 def _pack_response_meta(response: Any) -> dict[str, str]:

@@ -633,7 +633,7 @@ async def put_setting(
 @audit_api.get("/events")
 async def list_audit_events(
     request: Request,
-    _admin: Admin,
+    _manager: Manager,
     limit: int = Query(100, ge=1, le=500),
     action: str | None = Query(None, max_length=200),
     actor: str | None = Query(None, max_length=100),
@@ -641,7 +641,7 @@ async def list_audit_events(
     since: datetime | None = Query(None),
     until: datetime | None = Query(None),
 ) -> list[dict]:
-    """Admin-only newest-first audit trail viewer."""
+    """Manager (admin + accountant) newest-first audit trail viewer."""
     query = parse_audit_filters(
         action=action, actor=actor, outcome=outcome, since=since, until=until
     )
@@ -696,11 +696,12 @@ async def create_audit_event(
 @users.get("")
 async def list_users(
     request: Request,
-    manager: Manager,
+    _manager: Manager,
     include_deleted: bool = Query(False),
 ) -> list[dict]:
     query: dict[str, Any] = {}
-    if not include_deleted or manager.get("role") != "admin":
+    # Managers (admin + accountant) share full Users-tab visibility.
+    if not include_deleted:
         query["deleted_at"] = None
     docs = (
         await database(request)
@@ -713,8 +714,6 @@ async def list_users(
 
 @users.post("", status_code=201)
 async def create_user(body: UserCreate, request: Request, manager: Manager) -> dict:
-    if body.role == "admin" and manager.get("role") != "admin":
-        raise ApiError(403, "forbidden", "Only an administrator can create administrators")
     db = database(request)
     enforce_password_policy(body.password, await merged_settings(db))
     doc = body.model_dump(exclude={"password"})
@@ -751,8 +750,6 @@ async def _require_manageable_user(
         raise ApiError(404, "not_found", "User not found")
     if not allow_self and actor.get("_id") == oid:
         raise ApiError(400, "cannot_target_self", "You cannot perform this action on yourself")
-    if current.get("role") == "admin" and actor.get("role") != "admin":
-        raise ApiError(403, "forbidden", "Only an administrator can manage administrators")
     return current
 
 
@@ -803,10 +800,6 @@ async def update_user(user_id: str, body: UserUpdate, request: Request, manager:
         current = await db.users.find_one({"_id": oid})
         if not current or current.get("deleted_at"):
             raise ApiError(404, "not_found", "User not found")
-        if manager.get("role") != "admin" and (
-            current.get("role") == "admin" or values.get("role") == "admin"
-        ):
-            raise ApiError(403, "forbidden", "Only an administrator can modify administrators")
         if values.get("active") is True:
             values.update(banned=False, ban_reason="", banned_at=None, banned_by=None)
         removes_active_admin = (
@@ -857,11 +850,11 @@ async def update_user(user_id: str, body: UserUpdate, request: Request, manager:
 
 @users.post("/{user_id}/ban", status_code=status.HTTP_204_NO_CONTENT)
 async def ban_user(
-    user_id: str, body: UserBanRequest, request: Request, admin: Admin
+    user_id: str, body: UserBanRequest, request: Request, manager: Manager
 ) -> Response:
     oid = valid_id(user_id)
     db = database(request)
-    current = await _require_manageable_user(db, oid, admin)
+    current = await _require_manageable_user(db, oid, manager)
     await _assert_not_last_active_admin(db, current)
     now = utcnow()
     await db.users.update_one(
@@ -871,7 +864,7 @@ async def ban_user(
                 "active": False,
                 "banned": True,
                 "banned_at": now,
-                "banned_by": admin.get("_id"),
+                "banned_by": manager.get("_id"),
                 "ban_reason": body.reason.strip(),
             }
         },
@@ -881,7 +874,7 @@ async def ban_user(
         db,
         action="user.ban",
         outcome="ok",
-        actor=admin,
+        actor=manager,
         request=request,
         entity_type="user",
         entity_ids=[str(oid)],
@@ -895,10 +888,10 @@ async def ban_user(
 
 
 @users.post("/{user_id}/unban", status_code=status.HTTP_204_NO_CONTENT)
-async def unban_user(user_id: str, request: Request, admin: Admin) -> Response:
+async def unban_user(user_id: str, request: Request, manager: Manager) -> Response:
     oid = valid_id(user_id)
     db = database(request)
-    current = await _require_manageable_user(db, oid, admin, allow_self=True)
+    current = await _require_manageable_user(db, oid, manager, allow_self=True)
     await db.users.update_one(
         {"_id": oid},
         {
@@ -916,7 +909,7 @@ async def unban_user(user_id: str, request: Request, admin: Admin) -> Response:
         db,
         action="user.unban",
         outcome="ok",
-        actor=admin,
+        actor=manager,
         request=request,
         entity_type="user",
         entity_ids=[str(oid)],
@@ -926,20 +919,20 @@ async def unban_user(user_id: str, request: Request, admin: Admin) -> Response:
 
 
 @users.post("/{user_id}/force-logout", status_code=status.HTTP_204_NO_CONTENT)
-async def force_logout_user(user_id: str, request: Request, admin: Admin) -> Response:
+async def force_logout_user(user_id: str, request: Request, manager: Manager) -> Response:
     oid = valid_id(user_id)
     db = database(request)
-    current = await _require_manageable_user(db, oid, admin, allow_self=True)
+    current = await _require_manageable_user(db, oid, manager, allow_self=True)
     query: dict[str, Any] = {"user_id": oid, "revoked_at": None}
     current_sid = request.state.session.get("_id") if hasattr(request.state, "session") else None
-    if current_sid and admin.get("_id") == oid:
+    if current_sid and manager.get("_id") == oid:
         query["_id"] = {"$ne": current_sid}
     result = await db.auth_sessions.update_many(query, {"$set": {"revoked_at": utcnow()}})
     await record_operation_event(
         db,
         action="user.force_logout",
         outcome="ok",
-        actor=admin,
+        actor=manager,
         request=request,
         entity_type="user",
         entity_ids=[str(oid)],
@@ -953,11 +946,11 @@ async def force_logout_user(user_id: str, request: Request, admin: Admin) -> Res
 
 @users.post("/{user_id}/reset-password", status_code=status.HTTP_204_NO_CONTENT)
 async def reset_user_password(
-    user_id: str, body: UserResetPasswordRequest, request: Request, admin: Admin
+    user_id: str, body: UserResetPasswordRequest, request: Request, manager: Manager
 ) -> Response:
     oid = valid_id(user_id)
     db = database(request)
-    current = await _require_manageable_user(db, oid, admin, allow_self=True)
+    current = await _require_manageable_user(db, oid, manager, allow_self=True)
     enforce_password_policy(body.password, await merged_settings(db))
     await db.users.update_one(
         {"_id": oid}, {"$set": {"password_hash": hash_password(body.password)}}
@@ -967,7 +960,7 @@ async def reset_user_password(
         db,
         action="user.reset_password",
         outcome="ok",
-        actor=admin,
+        actor=manager,
         request=request,
         entity_type="user",
         entity_ids=[str(oid)],
@@ -977,10 +970,10 @@ async def reset_user_password(
 
 
 @users.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_user(user_id: str, request: Request, admin: Admin) -> Response:
+async def delete_user(user_id: str, request: Request, manager: Manager) -> Response:
     oid = valid_id(user_id)
     db = database(request)
-    current = await _require_manageable_user(db, oid, admin)
+    current = await _require_manageable_user(db, oid, manager)
     await _assert_not_last_active_admin(db, current)
     now = utcnow()
     await db.users.update_one(
@@ -991,7 +984,7 @@ async def delete_user(user_id: str, request: Request, admin: Admin) -> Response:
                 "active": False,
                 "banned": True,
                 "banned_at": now,
-                "banned_by": admin.get("_id"),
+                "banned_by": manager.get("_id"),
                 "ban_reason": current.get("ban_reason") or "Account deleted",
             }
         },
@@ -1001,7 +994,7 @@ async def delete_user(user_id: str, request: Request, admin: Admin) -> Response:
         db,
         action="user.delete",
         outcome="ok",
-        actor=admin,
+        actor=manager,
         request=request,
         entity_type="user",
         entity_ids=[str(oid)],

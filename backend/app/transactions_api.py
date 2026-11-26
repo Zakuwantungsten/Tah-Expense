@@ -18,11 +18,9 @@ from .badge_counters import (
     BADGE_TOUCH_FIELDS,
     adjust_badges,
     apply_remembered,
-    drafts_badge_total,
     load_badge_docs,
     note_many,
     note_transition,
-    read_badges,
 )
 from .dependencies import Authenticated, require_roles
 from .errors import ApiError
@@ -1267,11 +1265,30 @@ async def count_draft_transactions(
     cashier_id: str | None = None,
     all_cashiers: bool = False,
 ) -> dict:
-    """Badge total from the stored counter: drafts + parked."""
-    db = _database(request)
-    cashier = None if all_cashiers else _actor_cashier_id(actor, cashier_id)
-    total = drafts_badge_total(await read_badges(db), cashier_id=cashier)
-    return {"count": int(total)}
+    """Sidebar badge: distinct calendar days with drafts and/or parked rows.
+
+    Matches Drafts/Saved day lists (one badge per day-row), not expense lines.
+    """
+    match: dict[str, Any] = dict(DRAFT_OR_PARKED_MATCH)
+    if not all_cashiers:
+        match["cashier_id"] = _actor_cashier_id(actor, cashier_id)
+    pipeline = [
+        {"$match": match},
+        {"$addFields": {"register_day": REGISTER_DAY_EXPR}},
+        {
+            "$group": {
+                "_id": {
+                    "year": {"$year": "$register_day"},
+                    "month": {"$month": "$register_day"},
+                    "day": {"$dayOfMonth": "$register_day"},
+                }
+            }
+        },
+    ]
+    docs = await aggregate_list(
+        _database(request).transactions, pipeline, length=None
+    )
+    return {"count": len(docs)}
 
 
 @transactions.get("/drafts/day-summaries")

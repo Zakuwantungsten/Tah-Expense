@@ -111,17 +111,18 @@ class AttachmentDialog(QDialog):
         return next((a for a in self._items if a.get("id") == att_id), None)
 
     def _add(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
+        from tahmeed.ui.file_dialogs import get_open_file_names
+
+        paths, _ = get_open_file_names(
             self,
             "Attach file",
-            "",
             "Documents & Images (*.pdf *.png *.jpg *.jpeg *.gif *.webp "
             "*.bmp *.tif *.tiff *.doc *.docx *.xls *.xlsx *.csv *.txt);;"
             "All files (*.*)",
         )
-        if not path:
+        if not paths:
             return
-        asyncio.ensure_future(self._do_add(path))
+        asyncio.ensure_future(self._do_add(paths[0]))
 
     async def _do_add(self, path: str) -> None:
         try:

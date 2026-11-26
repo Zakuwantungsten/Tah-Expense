@@ -103,7 +103,7 @@ async def test_tree_and_objects_for_files(tmp_path: Path) -> None:
     )
     tree = await list_storage_tree(db, tmp_path, prefix="")
     names = {f["name"] for f in tree["folders"]}
-    assert names == {"files", "approved", "quarantine", "parked"}
+    assert names == {"files", "approved", "quarantine", "parked", "records"}
 
     files_tree = await list_storage_tree(db, tmp_path, prefix="files")
     assert files_tree["folders"] == []

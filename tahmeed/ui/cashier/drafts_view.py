@@ -710,6 +710,6 @@ class DraftsView(QWidget):
 
 
 async def fetch_draft_badge_count(user: User, *, all_cashiers: bool = False) -> int:
-    """Sidebar badge helper."""
+    """Sidebar Drafts/Saved badge: number of day-rows, not expense lines."""
     cashier_id = None if all_cashiers else user._id
     return await count_draft_transactions(cashier_id, all_cashiers=all_cashiers)
