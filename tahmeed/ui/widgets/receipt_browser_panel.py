@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolTip,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -1016,25 +1017,41 @@ class ReceiptBrowserPanel(QWidget):
         item = self._tree.itemAt(pos)
         if item is None:
             return
+        QToolTip.hideText()
         self._tree.setCurrentItem(item)
         data = item.data(0, Qt.UserRole) or {}
         prefix = str(data.get("prefix") or "")
+        roots = {"", "files", "approved", "quarantine", "parked", "records"}
+        can_mutate = bool(prefix) and prefix not in roots
+
         menu = apply_light_menu(QMenu(self))
         open_act = menu.addAction("Open")
         open_act.setIcon(qta.icon("mdi.folder-open-outline", color=_TEXT))
+        refresh_act = menu.addAction("Refresh")
+        refresh_act.setIcon(qta.icon("mdi.refresh", color=_TEXT))
+        menu.addSeparator()
         new_act = menu.addAction("New folder…")
         new_act.setIcon(qta.icon("mdi.folder-plus-outline", color=_TEXT))
         new_act.setEnabled(bool(prefix))
-        del_act = menu.addAction("Delete empty folder")
+        rename_act = menu.addAction("Rename…")
+        rename_act.setIcon(qta.icon("mdi.rename-box", color=_TEXT))
+        rename_act.setEnabled(can_mutate)
+        menu.addSeparator()
+        del_act = menu.addAction("Delete…")
         del_act.setIcon(qta.icon("mdi.folder-remove-outline", color=_TEXT))
-        roots = {"", "files", "approved", "quarantine", "parked", "records"}
-        del_act.setEnabled(bool(prefix) and prefix not in roots)
+        del_act.setEnabled(can_mutate)
         chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
         if chosen == open_act:
             schedule_coro(self._go_prefix(prefix))
+        elif chosen == refresh_act:
+            schedule_coro(self._reload_explorer())
         elif chosen == new_act:
             schedule_coro(self._go_prefix(prefix))
             schedule_coro(self._new_folder_under(prefix))
+        elif chosen == rename_act:
+            schedule_coro(self._rename_folder_prefix(prefix))
         elif chosen == del_act:
             schedule_coro(self._delete_empty_folder(prefix))
 
@@ -1250,6 +1267,9 @@ class ReceiptBrowserPanel(QWidget):
         if not prefix:
             # Fall back to current tree location if it's a renameable folder
             prefix = self._prefix
+        await self._rename_folder_prefix(prefix)
+
+    async def _rename_folder_prefix(self, prefix: str) -> None:
         roots = {"", "files", "approved", "quarantine", "parked", "records"}
         if not prefix or prefix in roots:
             QMessageBox.information(

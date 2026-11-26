@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolTip,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -608,6 +609,7 @@ class ReceiptRecordsPanel(QWidget):
         include_empty = self._include_empty_folders()
 
         if kind == "custom":
+            # Always list custom folders (even empty) so right-click Rename/Delete works.
             by_id = {
                 str(r.get("id") or ""): r for r in rows if str(r.get("id") or "")
             }
@@ -615,9 +617,6 @@ class ReceiptRecordsPanel(QWidget):
             for row in rows:
                 fid = str(row.get("id") or "")
                 if not fid:
-                    continue
-                count = int(row.get("file_count") or 0)
-                if not include_empty and count <= 0:
                     continue
                 if not self._row_matches_filter(row, needle):
                     continue
@@ -936,30 +935,59 @@ class ReceiptRecordsPanel(QWidget):
             self._upload_btn.setEnabled(self._selected is not None)
 
     def _dest_context_menu(self, pos) -> None:
+        """Windows-style folder command menu for any Navigation tree node."""
         item = self._dest_tree.itemAt(pos)
-        if item is not None:
-            self._dest_tree.setCurrentItem(item)
-        if self._kind != "custom":
+        if item is None:
             return
+        QToolTip.hideText()
+        self._dest_tree.setCurrentItem(item)
+        data = dict(item.data(0, Qt.UserRole) or {})
+        kind = str(data.get("kind") or self._kind or "")
+        is_root = bool(data.get("_kind_root") or data.get("_all"))
+        is_custom_folder = kind == "custom" and not is_root and bool(data.get("id"))
+        is_custom_root = kind == "custom" and is_root
+        has_custom_sel = bool(self._selected and self._selected.get("id"))
+
         menu = apply_light_menu(QMenu(self))
-        new_act = menu.addAction("New folder…")
-        new_act.setIcon(qta.icon("mdi.folder-plus-outline", color=_TEXT))
-        sub_act = menu.addAction("New subfolder…")
-        sub_act.setIcon(qta.icon("mdi.folder-pound-outline", color=_TEXT))
-        sub_act.setEnabled(bool(self._selected and self._selected.get("id")))
-        menu.addSeparator()
-        rename_act = menu.addAction("Rename…")
-        rename_act.setEnabled(bool(self._selected and self._selected.get("id")))
-        delete_act = menu.addAction("Delete…")
-        delete_act.setEnabled(bool(self._selected and self._selected.get("id")))
+        open_act = menu.addAction("Open")
+        open_act.setIcon(qta.icon("mdi.folder-open-outline", color=_TEXT))
+        refresh_act = menu.addAction("Refresh")
+        refresh_act.setIcon(qta.icon("mdi.refresh", color=_TEXT))
+        upload_act = menu.addAction("Upload files…")
+        upload_act.setIcon(qta.icon("mdi.upload-outline", color=_TEXT))
+        upload_act.setEnabled(not is_root and self._selected is not None)
+
+        new_act = sub_act = rename_act = delete_act = None
+        if is_custom_root or is_custom_folder:
+            menu.addSeparator()
+            new_act = menu.addAction("New folder…")
+            new_act.setIcon(qta.icon("mdi.folder-plus-outline", color=_TEXT))
+            sub_act = menu.addAction("New subfolder…")
+            sub_act.setIcon(qta.icon("mdi.folder-pound-outline", color=_TEXT))
+            sub_act.setEnabled(is_custom_folder or has_custom_sel)
+            menu.addSeparator()
+            rename_act = menu.addAction("Rename…")
+            rename_act.setEnabled(is_custom_folder)
+            delete_act = menu.addAction("Delete…")
+            delete_act.setIcon(qta.icon("mdi.delete-outline", color=_TEXT))
+            delete_act.setEnabled(is_custom_folder)
+
         chosen = menu.exec(self._dest_tree.viewport().mapToGlobal(pos))
-        if chosen == new_act:
+        if chosen is None:
+            return
+        if chosen == open_act:
+            schedule_coro(self._load_files())
+        elif chosen == refresh_act:
+            schedule_coro(self.refresh())
+        elif chosen == upload_act:
+            schedule_coro(self._upload())
+        elif new_act is not None and chosen == new_act:
             schedule_coro(self._new_custom())
-        elif chosen == sub_act:
+        elif sub_act is not None and chosen == sub_act:
             schedule_coro(self._new_custom_subfolder())
-        elif chosen == rename_act:
+        elif rename_act is not None and chosen == rename_act:
             schedule_coro(self._rename_custom())
-        elif chosen == delete_act:
+        elif delete_act is not None and chosen == delete_act:
             schedule_coro(self._delete_custom())
 
     def _table_context_menu(self, pos) -> None:
