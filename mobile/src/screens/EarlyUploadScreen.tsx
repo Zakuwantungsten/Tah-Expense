@@ -20,6 +20,7 @@ import {
   stampFallback,
 } from "../api/fileNames";
 import { formatUploadSummary, uploadEarlyFiles } from "../api/receipts";
+import { useAuth } from "../auth/AuthContext";
 import { UploadProgressBar } from "../components/UploadProgressBar";
 import type { MainTabParamList, RootStackParamList } from "../navigation";
 import {
@@ -41,6 +42,7 @@ type PickedFile = {
 };
 
 export function EarlyUploadScreen({ navigation }: Props) {
+  const { username } = useAuth();
   const [picked, setPicked] = useState<PickedFile[]>([]);
   const [busy, setBusy] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
@@ -144,12 +146,16 @@ export function EarlyUploadScreen({ navigation }: Props) {
     setUploadProgress(0);
     setUploadDetail(`Preparing ${picked.length} file(s)…`);
     try {
-      const summary = await uploadEarlyFiles(picked, (ev) => {
-        setUploadProgress(ev.overall);
-        setUploadDetail(
-          `File ${ev.fileIndex + 1} of ${ev.fileCount}: ${ev.fileName}`
-        );
-      });
+      const summary = await uploadEarlyFiles(
+        picked,
+        (ev) => {
+          setUploadProgress(ev.overall);
+          setUploadDetail(
+            `File ${ev.fileIndex + 1} of ${ev.fileCount}: ${ev.fileName}`
+          );
+        },
+        username || undefined
+      );
       await appendUploadHistory({
         kind: "early",
         itemLabel: "Parked early",

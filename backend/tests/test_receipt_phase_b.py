@@ -256,6 +256,95 @@ async def test_compliance_parked_approved_rejected() -> None:
     assert summary["unmatched_uploads"] == 1
     assert summary["approved_files"] == 1
     assert summary["rejected_files"] == 1
+    assert summary.get("ownership") is None
+
+
+async def test_compliance_and_inbox_scoped_by_ownership() -> None:
+    user_id = ObjectId()
+    tx_ali = ObjectId()
+    db = _db(
+        requests=[
+            {
+                "_id": ObjectId(),
+                "asked_of_name": "ALI",
+                "status": "needed",
+                "opened_at": datetime(2026, 3, 1),
+                "reminder_count": 0,
+            },
+            {
+                "_id": ObjectId(),
+                "asked_of_name": "BOB",
+                "status": "needed",
+                "opened_at": datetime(2026, 3, 1),
+                "reminder_count": 0,
+            },
+            {
+                "_id": ObjectId(),
+                "asked_of_name": "ALI",
+                "status": "received",
+                "opened_at": datetime(2026, 2, 1),
+            },
+        ],
+        files=[
+            {
+                "_id": "park_ali",
+                "inbox_status": INBOX_UNMATCHED,
+                "uploaded_at": datetime(2026, 3, 2),
+                "intended_ownership": "ALI",
+                "transaction_ids": [],
+            },
+            {
+                "_id": "park_bob",
+                "inbox_status": INBOX_UNMATCHED,
+                "uploaded_at": datetime(2026, 3, 3),
+                "uploaded_by": user_id,
+                "transaction_ids": [],
+            },
+            {
+                "_id": "linked_ali",
+                "inbox_status": INBOX_MATCHED,
+                "uploaded_at": datetime(2026, 3, 4),
+                "transaction_ids": [tx_ali],
+            },
+            {
+                "_id": "other",
+                "inbox_status": INBOX_APPROVED,
+                "uploaded_at": datetime(2026, 3, 5),
+                "transaction_ids": [],
+            },
+        ],
+    )
+    db.people = FakeColl(
+        [{"_id": ObjectId(), "name": "BOB", "user_id": user_id}]
+    )
+    db.transactions = FakeColl(
+        [
+            {
+                "_id": tx_ali,
+                "ownership": "Ali",
+                "amount": 10,
+                "currency": "TZS",
+                "item": "Diesel",
+                "attachments": [],
+                "receipt_status": "pending",
+            }
+        ]
+    )
+
+    summary = await receipt_compliance_summary(db, ownership="ali")
+    assert summary["ownership"] == "ALI"
+    assert summary["still_needed"] == 1
+    assert summary["received"] == 1
+    assert summary["unmatched_uploads"] == 1  # intended_ownership ALI
+    assert summary["matched_pending"] == 1  # linked to Ali tx
+    assert summary["parked_uploads"] == 2
+    assert summary["approved_files"] == 0
+
+    ali_inbox = await list_inbox_files(db, status="parked", ownership="ALI")
+    assert {row["id"] for row in ali_inbox} == {"park_ali", "linked_ali"}
+
+    bob_inbox = await list_inbox_files(db, status="parked", ownership="bob")
+    assert {row["id"] for row in bob_inbox} == {"park_bob"}
 
 
 def test_approve_api(tmp_path: Path) -> None:

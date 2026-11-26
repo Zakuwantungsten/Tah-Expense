@@ -31,6 +31,7 @@ from .receipt_evidence import (
 from .receipt_ops import (
     approve_receipt_files,
     chase_groups,
+    desk_undo_waive_receipts,
     desk_waive_receipts,
     ensure_receipt_workspace,
     get_receipt_file_open_meta,
@@ -48,8 +49,10 @@ from .receipt_ops import (
     materialize_approved_file,
     open_receipt_file_bytes,
     park_receipt_uploads,
+    person_receipt_dossier,
     receipt_compliance_summary,
     reject_receipt_files,
+    resolve_intended_ownership,
     rematerialize_approved_for_transaction,
     search_link_transactions,
     still_request_linked_entries,
@@ -59,6 +62,7 @@ from .receipt_records_ops import (
     build_records_pack,
     create_custom_folder,
     delete_custom_folder,
+    ensure_custom_folder_path,
     ensure_records_workspace,
     list_custom_folders,
     list_record_destinations,
@@ -121,6 +125,11 @@ class ReceiptDeskWaiveBody(BaseModel):
     transaction_ids: list[str] = Field(default_factory=list)
 
 
+class ReceiptDeskUndoWaiveBody(BaseModel):
+    request_ids: list[str] = Field(default_factory=list)
+    transaction_ids: list[str] = Field(default_factory=list)
+
+
 class EvidencePackBody(BaseModel):
     date_from: date
     date_to: date
@@ -163,6 +172,7 @@ class ReceiptRematerializeBody(BaseModel):
 
 class RecordFolderCreate(BaseModel):
     label: str = Field(min_length=1, max_length=120)
+    parent_id: str | None = None
 
 
 class RecordFolderRename(BaseModel):
@@ -386,13 +396,50 @@ async def get_receipt_compliance(
     _user: DeskActor,
     overdue_hours: float = Query(48.0, ge=1.0, le=720.0),
     reminder_threshold: int = Query(3, ge=1, le=50),
+    ownership: str = Query(""),
 ) -> dict[str, Any]:
+    """Desk KPI counts. Optional ``ownership`` scopes to one person."""
     summary = await receipt_compliance_summary(
         _database(request),
         overdue_hours=overdue_hours,
         reminder_threshold=reminder_threshold,
+        ownership=ownership,
     )
     return json_safe(summary)
+
+
+@receipts.get("/people/{ownership}")
+async def get_person_receipt_dossier(
+    ownership: str,
+    request: Request,
+    _user: DeskActor,
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    overdue_hours: float = Query(48.0, ge=1.0, le=720.0),
+    reminder_threshold: int = Query(3, ge=1, le=50),
+    entry_limit: int = Query(500, ge=1, le=2000),
+    request_limit: int = Query(400, ge=1, le=1000),
+    file_limit: int = Query(200, ge=1, le=500),
+) -> dict[str, Any]:
+    """Person dossier: stats + needed + entries + submitted + parked + rejected.
+
+    ``ownership`` is the chase target name (URL-decoded, normalized UPPER).
+    """
+    try:
+        payload = await person_receipt_dossier(
+            _database(request),
+            ownership,
+            date_from=date_from,
+            date_to=date_to,
+            overdue_hours=overdue_hours,
+            reminder_threshold=reminder_threshold,
+            entry_limit=entry_limit,
+            request_limit=request_limit,
+            file_limit=file_limit,
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_ownership", str(exc)) from None
+    return json_safe(payload)
 
 
 @receipts.get("/day-summaries")
@@ -443,6 +490,7 @@ async def get_receipt_day_entries(
     _user: DeskActor,
     day: date = Query(..., description="Register calendar day YYYY-MM-DD"),
     cashier_id: str | None = Query(None),
+    ownership: str = Query(""),
     limit: int = Query(500, ge=1, le=2000),
 ) -> dict[str, Any]:
     """Main drill: expense rows for one register day with one display status.
@@ -450,6 +498,7 @@ async def get_receipt_day_entries(
     Each item includes ``display_status`` / ``display_status_key`` and
     attachment refs (``primary_file_id``, ``attachments[]``) for the shared
     viewer. Open path is unchanged — client uses existing file open routes.
+    Optional ``ownership`` narrows to one person's rows.
     """
     owner: ObjectId | None = None
     if cashier_id and str(cashier_id).strip():
@@ -461,6 +510,7 @@ async def get_receipt_day_entries(
         _database(request),
         day=day,
         cashier_id=owner,
+        ownership=ownership,
         limit=limit,
     )
     return json_safe({"items": items, "total": len(items), "day": day.isoformat()})
@@ -474,12 +524,14 @@ async def get_receipt_entries(
     date_to: date | None = Query(None),
     status: str = Query("all"),
     cashier_id: str | None = Query(None),
+    ownership: str = Query(""),
     limit: int = Query(500, ge=1, le=2000),
 ) -> dict[str, Any]:
     """View all: flat entry list across a date range (same row shape as day-entries).
 
     ``status`` filters ``display_status_key``: all | needed | received | partial |
     waived | no_receipt | pending.
+    ``ownership`` filters transaction ownership (normalized person name).
     """
     owner: ObjectId | None = None
     if cashier_id and str(cashier_id).strip():
@@ -493,6 +545,7 @@ async def get_receipt_entries(
         date_to=date_to,
         status=status,
         cashier_id=owner,
+        ownership=ownership,
         limit=limit,
     )
     return json_safe(
@@ -500,6 +553,7 @@ async def get_receipt_entries(
             "items": items,
             "total": len(items),
             "status": (status or "all").strip().lower() or "all",
+            "ownership": (ownership or "").strip() or None,
         }
     )
 
@@ -510,15 +564,23 @@ async def get_receipt_inbox(
     _user: DeskActor,
     status: str = Query("parked"),
     unmatched_only: bool = Query(False),
+    ownership: str = Query(""),
     limit: int = Query(100, ge=1, le=500),
 ) -> dict[str, Any]:
+    """Inbox files. Optional ``ownership`` scopes to one person's attributed files."""
     items = await list_inbox_files(
         _database(request),
         status=status,
         unmatched_only=unmatched_only,
+        ownership=ownership,
         limit=limit,
     )
-    return {"items": json_safe(items), "total": len(items), "status": status}
+    return {
+        "items": json_safe(items),
+        "total": len(items),
+        "status": status,
+        "ownership": (ownership or "").strip() or None,
+    }
 
 
 @receipts.get("/quarantine")
@@ -799,14 +861,21 @@ async def post_receipt_files_early_upload(
     request: Request,
     actor: DeskActor,
     files: list[UploadFile] = File(...),
+    ownership: str = Form(""),
 ) -> dict[str, Any]:
-    """Desk early drop — park unmatched files with no request/tx yet (atomic)."""
+    """Desk early drop — park unmatched files with no request/tx yet (atomic).
+
+    Optional ``ownership`` stamps ``intended_ownership`` for person dossier / Inbox.
+    """
     uploads = await _read_upload_batch(files)
     await _require_receipt_storage(request)
     db = _database(request)
     base = await resolve_attachments_directory(_settings(request), db)
     ensure_receipt_workspace(base)
     actor_id = _actor_oid(actor)
+    intended, person_id = await resolve_intended_ownership(
+        db, explicit=ownership, user=None
+    )
     try:
         saved = await park_receipt_uploads(
             db,
@@ -814,6 +883,8 @@ async def post_receipt_files_early_upload(
             uploads=uploads,
             actor_id=actor_id,
             source="desktop",
+            intended_ownership=intended,
+            asked_of_person_id=person_id,
         )
     except ValueError as exc:
         raise ApiError(422, "invalid_attachment", str(exc)) from None
@@ -826,9 +897,18 @@ async def post_receipt_files_early_upload(
         request=request,
         entity_type="receipt_file",
         entity_ids=[str(m.get("id")) for m in saved][:40],
-        details={"files": len(saved), "source": "desktop", "atomic": True},
+        details={
+            "files": len(saved),
+            "source": "desktop",
+            "atomic": True,
+            "intended_ownership": intended or None,
+        },
     )
-    return {"files": json_safe(saved), "total": len(saved)}
+    return {
+        "files": json_safe(saved),
+        "total": len(saved),
+        "intended_ownership": intended or None,
+    }
 
 
 @receipts.post("/upload-and-link", status_code=status.HTTP_201_CREATED)
@@ -1016,6 +1096,49 @@ async def post_desk_waive(
     return json_safe(result)
 
 
+@receipts.post("/undo-waive")
+async def post_desk_undo_waive(
+    body: ReceiptDeskUndoWaiveBody, request: Request, actor: DeskActor
+) -> dict[str, Any]:
+    """Cashier/accountant: undo waive for selected receipt requests / expense rows."""
+    request_ids: list[ObjectId] = []
+    for raw in body.request_ids:
+        try:
+            request_ids.append(object_id(raw))
+        except ValueError as exc:
+            raise ApiError(422, "invalid_id", "One or more request ids are invalid") from exc
+    transaction_ids: list[ObjectId] = []
+    for raw in body.transaction_ids:
+        try:
+            transaction_ids.append(object_id(raw))
+        except ValueError as exc:
+            raise ApiError(
+                422, "invalid_id", "One or more transaction ids are invalid"
+            ) from exc
+    try:
+        result = await desk_undo_waive_receipts(
+            _database(request),
+            request_ids=request_ids or None,
+            transaction_ids=transaction_ids or None,
+        )
+    except ValueError as exc:
+        raise ApiError(422, "invalid_undo_waiver", str(exc)) from None
+    await record_operation_event(
+        _database(request),
+        action="receipt.desk_undo_waive",
+        actor=actor,
+        request=request,
+        entity_type="receipt_request",
+        entity_ids=list(result.get("request_ids") or [])[:40],
+        details={
+            "restored": result.get("restored"),
+            "skipped": result.get("skipped"),
+            "transaction_ids": [str(oid) for oid in transaction_ids][:40],
+        },
+    )
+    return json_safe(result)
+
+
 @receipts.post("/files/consolidate")
 async def post_receipt_files_consolidate(
     body: ConsolidateBody, request: Request, actor: Manager
@@ -1172,10 +1295,20 @@ async def post_record_folder(
     body: RecordFolderCreate, request: Request, actor: Manager
 ) -> dict[str, Any]:
     db = _database(request)
+    label = (body.label or "").strip()
     try:
-        folder = await create_custom_folder(
-            db, label=body.label, actor_id=_actor_oid(actor)
-        )
+        # Smart nested path: "Parent/Child" creates (or reuses) the chain.
+        if "/" in label.replace("\\", "/") and not body.parent_id:
+            folder = await ensure_custom_folder_path(
+                db, path=label, actor_id=_actor_oid(actor)
+            )
+        else:
+            folder = await create_custom_folder(
+                db,
+                label=label,
+                actor_id=_actor_oid(actor),
+                parent_id=body.parent_id,
+            )
     except ValueError as exc:
         raise ApiError(422, "invalid_folder", str(exc)) from None
     await record_operation_event(
@@ -1185,7 +1318,12 @@ async def post_record_folder(
         request=request,
         entity_type="receipt_record_folder",
         entity_ids=[folder["id"]],
-        details={"label": folder.get("label"), "slug": folder.get("slug")},
+        details={
+            "label": folder.get("label"),
+            "slug": folder.get("slug"),
+            "parent_id": folder.get("parent_id"),
+            "display_label": folder.get("display_label"),
+        },
     )
     return json_safe(folder)
 

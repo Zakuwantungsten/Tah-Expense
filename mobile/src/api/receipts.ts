@@ -114,7 +114,8 @@ async function uploadWithProgress(
   localUri: string,
   file: { name: string; mimeType?: string | null },
   accessToken: string | null,
-  onFileProgress?: (fraction: number) => void
+  onFileProgress?: (fraction: number) => void,
+  parameters?: Record<string, string>
 ): Promise<{ status: number; body: string }> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (accessToken) {
@@ -126,6 +127,8 @@ async function uploadWithProgress(
     fieldName: "files",
     mimeType: file.mimeType || "image/jpeg",
     headers,
+    parameters:
+      parameters && Object.keys(parameters).length ? parameters : undefined,
   };
   if (typeof FileSystem.createUploadTask === "function" && onFileProgress) {
     const task = FileSystem.createUploadTask(
@@ -220,15 +223,18 @@ async function uploadOneEarlyFile(
   localUri: string,
   file: { name: string; mimeType?: string | null },
   accessToken: string | null,
-  onFileProgress?: (fraction: number) => void
+  onFileProgress?: (fraction: number) => void,
+  ownership?: string
 ): Promise<EarlyUploadResult> {
   const url = `${API_BASE_URL}/v1/mobile/receipt-files`;
+  const own = (ownership || "").trim();
   const response = await uploadWithProgress(
     url,
     localUri,
     file,
     accessToken,
-    onFileProgress
+    onFileProgress,
+    own ? { ownership: own } : undefined
   );
   return parseEarlyBody(response.status, response.body);
 }
@@ -246,7 +252,8 @@ function errMessage(exc: unknown): string {
 /** Park photos/files before a ledger row exists — continues on per-file failure. */
 export async function uploadEarlyFiles(
   files: Array<{ uri: string; name: string; mimeType?: string | null }>,
-  onProgress?: ProgressCb
+  onProgress?: ProgressCb,
+  ownership?: string
 ): Promise<AtomicUploadSummary> {
   if (!files.length) {
     throw new ApiError(400, "empty", "Pick at least one file first");
@@ -274,14 +281,26 @@ export async function uploadEarlyFiles(
       const localUri = await ensureUploadableUri(file.uri, file.name);
       let result: EarlyUploadResult;
       try {
-        result = await uploadOneEarlyFile(localUri, file, access, emit);
+        result = await uploadOneEarlyFile(
+          localUri,
+          file,
+          access,
+          emit,
+          ownership
+        );
       } catch (exc) {
         if (exc instanceof ApiError && exc.status === 401) {
           access = await refreshAccessToken();
           if (!access) {
             throw new ApiError(401, "unauthorized", "Session expired. Sign in again.");
           }
-          result = await uploadOneEarlyFile(localUri, file, access, emit);
+          result = await uploadOneEarlyFile(
+            localUri,
+            file,
+            access,
+            emit,
+            ownership
+          );
         } else {
           throw exc;
         }

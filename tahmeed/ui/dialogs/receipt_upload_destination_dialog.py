@@ -261,7 +261,9 @@ class ReceiptUploadDestinationDialog(QDialog):
 
         lay.addWidget(self._records_box)
         self._records_box.setEnabled(False)
-        self._records_box.setVisible(self._allow_records)
+        # Only show Records fields when that mode is active — avoids the trap of
+        # filling Item/Supplier while Park is still selected.
+        self._records_box.setVisible(False)
 
         self._park_radio.toggled.connect(self._sync_mode_ui)
         self._records_radio.toggled.connect(self._sync_mode_ui)
@@ -275,7 +277,7 @@ class ReceiptUploadDestinationDialog(QDialog):
         cancel.setFixedHeight(32)
         cancel.setStyleSheet(_BTN_GHOST)
         cancel.clicked.connect(self.reject)
-        self._ok_btn = QPushButton("Upload")
+        self._ok_btn = QPushButton("Park")
         self._ok_btn.setIcon(qta.icon("mdi.file-upload-outline", color="#FFFFFF"))
         self._ok_btn.setIconSize(QSize(14, 14))
         self._ok_btn.setCursor(Qt.PointingHandCursor)
@@ -292,7 +294,11 @@ class ReceiptUploadDestinationDialog(QDialog):
     def _sync_mode_ui(self) -> None:
         records = self._allow_records and self._records_radio.isChecked()
         self._records_box.setEnabled(records)
-        self._records_box.setVisible(self._allow_records)
+        self._records_box.setVisible(records)
+        if records:
+            self._ok_btn.setText("Upload to Records")
+        else:
+            self._ok_btn.setText("Park")
 
     def _current_kind(self) -> str:
         return str(self._kind.currentData() or "item")
@@ -303,55 +309,6 @@ class ReceiptUploadDestinationDialog(QDialog):
         self._dest_lbl.setText(label)
         self._dest_edit.clear()
         self._refresh_dest_suggestions(kind)
-
-    def _refresh_dest_suggestions(self, kind: str) -> None:
-        rows = list(self._destinations.get(kind) or [])
-        labels = [
-            str(r.get("label") or r.get("ref_key") or "").strip()
-            for r in rows
-            if str(r.get("label") or r.get("ref_key") or "").strip()
-        ]
-        # Prefer unique display labels; keep order
-        seen: set[str] = set()
-        unique: list[str] = []
-        for name in labels:
-            key = name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(name)
-        self._dest_edit.set_values(unique)
-        n = len(unique)
-        if kind == "custom":
-            self._dest_edit.setPlaceholderText(
-                "Type to search existing, or enter a new folder name…"
-            )
-            self._dest_hint.setText(
-                "Pick an existing custom folder from suggestions, or type a new "
-                "name to create it on upload."
-            )
-            self._dest_status.setText(
-                f"{n} custom folder{'s' if n != 1 else ''} available."
-                if n
-                else "No custom folders yet — type a new name to create one."
-            )
-        elif kind == "separate":
-            self._dest_edit.setPlaceholderText("Type to search separate expenses…")
-            self._dest_hint.setText(
-                "The separate expense you pick is the Records folder."
-            )
-            self._dest_status.setText(f"{n} separate destination{'s' if n != 1 else ''}.")
-        else:
-            noun = "item" if kind == "item" else "supplier"
-            self._dest_edit.setPlaceholderText(f"Type to search {noun}s…")
-            self._dest_hint.setText(
-                f"The {noun} you pick is the Records folder for these files."
-            )
-            self._dest_status.setText(
-                f"{n} {noun}{'s' if n != 1 else ''} available."
-                if n
-                else f"No {noun}s in catalog — you can still type a folder name."
-            )
 
     async def _load_destinations(self) -> None:
         try:
@@ -372,23 +329,81 @@ class ReceiptUploadDestinationDialog(QDialog):
             return None
         rows = list(self._destinations.get(kind) or [])
         lower = needle.lower()
-        # Exact label / ref_key first
+        # Exact label / display_label / ref_key first
         for row in rows:
             label = str(row.get("label") or "").strip()
+            display = str(row.get("display_label") or "").strip()
             ref = str(row.get("ref_key") or "").strip()
-            if label.lower() == lower or ref.lower() == lower:
+            if (
+                label.lower() == lower
+                or display.lower() == lower
+                or ref.lower() == lower
+            ):
                 return row
         # Contains: unique match only
         hits = []
         for row in rows:
             label = str(row.get("label") or "").strip()
+            display = str(row.get("display_label") or "").strip()
             ref = str(row.get("ref_key") or "").strip()
-            blob = f"{label} {ref}".lower()
+            blob = f"{label} {display} {ref}".lower()
             if lower in blob:
                 hits.append(row)
         if len(hits) == 1:
             return hits[0]
         return None
+
+    def _refresh_dest_suggestions(self, kind: str) -> None:
+        rows = list(self._destinations.get(kind) or [])
+        labels = []
+        for r in rows:
+            name = str(
+                r.get("display_label") or r.get("label") or r.get("ref_key") or ""
+            ).strip()
+            if name:
+                labels.append(name)
+        # Prefer unique display labels; keep order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for name in labels:
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(name)
+        self._dest_edit.set_values(unique)
+        n = len(unique)
+        if kind == "custom":
+            self._dest_edit.setPlaceholderText(
+                "Existing folder, new name, or Parent/Child subfolder…"
+            )
+            self._dest_hint.setText(
+                "Pick an existing custom folder, type a new name, or use "
+                "Parent/Child (creates nested folders under Records → Custom)."
+            )
+            self._dest_status.setText(
+                f"{n} custom folder{'s' if n != 1 else ''} available."
+                if n
+                else "No custom folders yet — type a name or Parent/Child path."
+            )
+        elif kind == "separate":
+            self._dest_edit.setPlaceholderText("Type to search separate expenses…")
+            self._dest_hint.setText(
+                "The separate expense you pick is the Records folder."
+            )
+            self._dest_status.setText(f"{n} separate destination{'s' if n != 1 else ''}.")
+        else:
+            noun = "item" if kind == "item" else "supplier"
+            self._dest_edit.setPlaceholderText(f"Type to search {noun}s…")
+            self._dest_hint.setText(
+                f"The {noun} you pick is the Records folder. Approved chase "
+                f"receipts for the same {noun} also appear there."
+            )
+            self._dest_status.setText(
+                f"{n} {noun}{'s' if n != 1 else ''} available."
+                if n
+                else f"No {noun}s in catalog — you can still type a folder name."
+            )
 
     async def _accept_async(self) -> None:
         if self._accepting:
@@ -404,7 +419,8 @@ class ReceiptUploadDestinationDialog(QDialog):
             QMessageBox.information(
                 self,
                 "Upload destination",
-                f"Enter or pick a {_KIND_DEST_LABEL.get(kind, 'destination').lower()}.",
+                f"Enter or pick a {_KIND_DEST_LABEL.get(kind, 'destination').lower()} "
+                "before uploading to Records.",
             )
             self._dest_edit.setFocus()
             return
@@ -418,12 +434,15 @@ class ReceiptUploadDestinationDialog(QDialog):
             label = typed
 
             if kind == "custom":
-                if row and row.get("id"):
+                if row and row.get("id") and "/" not in typed.replace("\\", "/"):
                     folder_id = str(row["id"])
                     ref_key = str(row.get("ref_key") or "")
-                    label = str(row.get("label") or typed)
+                    label = str(
+                        row.get("display_label") or row.get("label") or typed
+                    )
                 else:
                     try:
+                        # Flat name or Parent/Child — API creates nested path.
                         folder = await create_custom_folder(typed)
                     except ApiError as exc:
                         QMessageBox.warning(self, "Records", str(exc))
@@ -434,8 +453,17 @@ class ReceiptUploadDestinationDialog(QDialog):
                         )
                         return
                     folder_id = str(folder.get("id") or "")
+                    if not folder_id:
+                        QMessageBox.warning(
+                            self,
+                            "Records",
+                            "Folder was not created — try again or pick an existing one.",
+                        )
+                        return
                     ref_key = str(folder.get("ref_key") or "")
-                    label = str(folder.get("label") or typed)
+                    label = str(
+                        folder.get("display_label") or folder.get("label") or typed
+                    )
                     # Keep local cache warm for next open
                     self._destinations["custom"] = [
                         folder,

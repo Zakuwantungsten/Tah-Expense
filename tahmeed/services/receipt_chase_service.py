@@ -37,15 +37,56 @@ async def list_requests(
 
 
 async def get_compliance(
-    *, overdue_hours: float = 48.0, reminder_threshold: int = 3
+    *,
+    overdue_hours: float = 48.0,
+    reminder_threshold: int = 3,
+    ownership: str = "",
 ) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "overdue_hours": overdue_hours,
+        "reminder_threshold": reminder_threshold,
+    }
+    if ownership.strip():
+        params["ownership"] = ownership.strip()
     return await api_client.request(
         "GET",
         "v1/receipts/compliance",
-        params={
-            "overdue_hours": overdue_hours,
-            "reminder_threshold": reminder_threshold,
-        },
+        params=params,
+    )
+
+
+async def get_person_receipt_dossier(
+    ownership: str,
+    *,
+    date_from: str = "",
+    date_to: str = "",
+    overdue_hours: float = 48.0,
+    reminder_threshold: int = 3,
+    entry_limit: int = 500,
+    request_limit: int = 400,
+    file_limit: int = 200,
+) -> dict[str, Any]:
+    """Person dossier: stats + needed + entries + submitted + parked + rejected."""
+    name = (ownership or "").strip()
+    if not name:
+        raise ValueError("ownership is required")
+    from urllib.parse import quote
+
+    params: dict[str, Any] = {
+        "overdue_hours": overdue_hours,
+        "reminder_threshold": reminder_threshold,
+        "entry_limit": max(1, min(int(entry_limit or 500), 2000)),
+        "request_limit": max(1, min(int(request_limit or 400), 1000)),
+        "file_limit": max(1, min(int(file_limit or 200), 500)),
+    }
+    if date_from.strip():
+        params["date_from"] = date_from.strip()
+    if date_to.strip():
+        params["date_to"] = date_to.strip()
+    return await api_client.request(
+        "GET",
+        f"v1/receipts/people/{quote(name, safe='')}",
+        params=params,
     )
 
 
@@ -78,6 +119,7 @@ async def list_receipt_day_entries(
     *,
     day: str,
     cashier_id: str = "",
+    ownership: str = "",
     limit: int = 500,
 ) -> list[dict[str, Any]]:
     """Main drill: entries for one register day (status + attachment refs)."""
@@ -90,6 +132,8 @@ async def list_receipt_day_entries(
     }
     if cashier_id.strip():
         params["cashier_id"] = cashier_id.strip()
+    if ownership.strip():
+        params["ownership"] = ownership.strip()
     payload = await api_client.request(
         "GET", "v1/receipts/day-entries", params=params
     )
@@ -102,9 +146,10 @@ async def list_receipt_entries(
     date_to: str = "",
     status: str = "all",
     cashier_id: str = "",
+    ownership: str = "",
     limit: int = 500,
 ) -> list[dict[str, Any]]:
-    """View all: flat entries across a date range with optional status filter."""
+    """View all: flat entries across a date range with optional status/ownership."""
     params: dict[str, Any] = {
         "status": (status or "all").strip() or "all",
         "limit": max(1, min(int(limit or 500), 2000)),
@@ -115,23 +160,31 @@ async def list_receipt_entries(
         params["date_to"] = date_to.strip()
     if cashier_id.strip():
         params["cashier_id"] = cashier_id.strip()
+    if ownership.strip():
+        params["ownership"] = ownership.strip()
     payload = await api_client.request("GET", "v1/receipts/entries", params=params)
     return list(payload.get("items") or [])
 
 
 async def list_inbox(
-    *, status: str = "parked", unmatched_only: bool = False
+    *,
+    status: str = "parked",
+    unmatched_only: bool = False,
+    ownership: str = "",
 ) -> list[dict[str, Any]]:
     if status == "quarantine":
         payload = await api_client.request("GET", "v1/receipts/quarantine")
         return list(payload.get("items") or [])
+    params: dict[str, Any] = {
+        "status": status,
+        "unmatched_only": "true" if unmatched_only else "false",
+    }
+    if ownership.strip():
+        params["ownership"] = ownership.strip()
     payload = await api_client.request(
         "GET",
         "v1/receipts/inbox",
-        params={
-            "status": status,
-            "unmatched_only": "true" if unmatched_only else "false",
-        },
+        params=params,
     )
     return list(payload.get("items") or [])
 
@@ -290,18 +343,28 @@ def _multipart_files(paths: list[str]) -> tuple[list[Any], list[Any]]:
     return files, handles
 
 
-async def upload_parked_files(paths: list[str]) -> dict[str, Any]:
-    """Multipart early drop into parked inbox (no request/tx). Atomic on server."""
+async def upload_parked_files(
+    paths: list[str], *, ownership: str = ""
+) -> dict[str, Any]:
+    """Multipart early drop into parked inbox (no request/tx). Atomic on server.
+
+    Optional ``ownership`` stamps intended_ownership for person-scoped Inbox.
+    """
     import httpx
 
     files, handles = _multipart_files(paths)
     try:
         if not files:
             raise ValueError("No readable files selected")
+        data: dict[str, str] | None = None
+        own = (ownership or "").strip()
+        if own:
+            data = {"ownership": own}
         return await api_client.request(
             "POST",
             "v1/receipts/files/upload",
             files=files,
+            data=data,
             timeout=httpx.Timeout(120.0, connect=5.0),
         )
     finally:
@@ -366,6 +429,22 @@ async def waive_receipts(
         "v1/receipts/waive",
         json={
             "reason": reason,
+            "request_ids": list(request_ids or []),
+            "transaction_ids": list(transaction_ids or []),
+        },
+    )
+
+
+async def undo_waive_receipts(
+    *,
+    request_ids: list[str] | None = None,
+    transaction_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Desk undo-waive — reopen selected waived entries or requests."""
+    return await api_client.request(
+        "POST",
+        "v1/receipts/undo-waive",
+        json={
             "request_ids": list(request_ids or []),
             "transaction_ids": list(transaction_ids or []),
         },

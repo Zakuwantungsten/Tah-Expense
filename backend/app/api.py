@@ -1686,6 +1686,18 @@ async def get_people(
     return await list_people(request, search, active, limit, offset)
 
 
+@people.get("/{name}")
+async def get_person(
+    name: str, request: Request, _user: Authenticated
+) -> dict:
+    """Fetch one people row by normalized name (identity fields included)."""
+    normalized = " ".join(name.upper().split())
+    doc = await database(request)["people"].find_one({"name": normalized})
+    if not doc:
+        raise ApiError(404, "person_not_found", f"No person named {normalized}")
+    return json_safe(doc)
+
+
 @people.put("/{name}")
 async def upsert_person(name: str, body: PeopleWrite, request: Request, manager: Manager) -> dict:
     normalized = " ".join(name.upper().split())
@@ -1701,6 +1713,10 @@ async def upsert_person(name: str, body: PeopleWrite, request: Request, manager:
             payload["user_id"] = object_id(str(raw_user_id))
         except ValueError as exc:
             raise ApiError(422, "invalid_user_id", "user_id must be a valid id") from exc
+        # Ensure the linked login exists.
+        user = await db["users"].find_one({"_id": payload["user_id"]}, {"_id": 1})
+        if not user:
+            raise ApiError(422, "user_not_found", "Linked user_id does not exist")
     doc = await db["people"].find_one_and_update(
         {"name": body.name},
         {"$set": payload},
@@ -1715,7 +1731,11 @@ async def upsert_person(name: str, body: PeopleWrite, request: Request, manager:
         request=request,
         entity_type="person",
         entity_ids=[body.name],
-        details={"active": body.active},
+        details={
+            "active": body.active,
+            "receives_receipt_requests": body.receives_receipt_requests,
+            "user_id": str(payload["user_id"]) if payload.get("user_id") else None,
+        },
     )
     return json_safe(doc)
 

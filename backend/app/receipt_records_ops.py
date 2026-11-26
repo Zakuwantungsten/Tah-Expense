@@ -110,13 +110,42 @@ def _as_day_end(value: date | datetime | None) -> datetime | None:
     return start.replace(hour=23, minute=59, second=59, microsecond=999999)
 
 
-def _serialize_folder(doc: dict[str, Any]) -> dict[str, Any]:
+def _parent_id_str(doc: dict[str, Any] | None) -> str | None:
+    if not doc:
+        return None
+    raw = doc.get("parent_id")
+    if raw in (None, ""):
+        return None
+    return str(raw)
+
+
+def _serialize_folder(
+    doc: dict[str, Any],
+    *,
+    path_labels: list[str] | None = None,
+    path_slugs: list[str] | None = None,
+    depth: int | None = None,
+) -> dict[str, Any]:
+    labels = list(path_labels or [])
+    slugs = list(path_slugs or [])
+    label = str(doc.get("label") or "")
+    slug = str(doc.get("slug") or "")
+    if not labels and label:
+        labels = [label]
+    if not slugs and slug:
+        slugs = [slug]
+    display = " / ".join(labels) if labels else label
     return {
         "id": str(doc.get("_id")),
         "kind": doc.get("kind") or "custom",
-        "label": doc.get("label") or "",
-        "slug": doc.get("slug") or "",
-        "ref_key": doc.get("ref_key") or "",
+        "label": label,
+        "slug": slug,
+        "ref_key": doc.get("ref_key") or slug,
+        "parent_id": _parent_id_str(doc),
+        "path_labels": labels,
+        "path_slugs": slugs,
+        "display_label": display,
+        "depth": int(depth if depth is not None else max(0, len(labels) - 1)),
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
         "created_by": str(doc["created_by"])
@@ -125,13 +154,64 @@ def _serialize_folder(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _folder_ancestry(db: Any, doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Root → leaf chain for a custom folder (max depth 8)."""
+    chain = [doc]
+    seen = {doc.get("_id")}
+    parent_raw = doc.get("parent_id")
+    for _ in range(8):
+        if parent_raw in (None, ""):
+            break
+        try:
+            oid = parent_raw if isinstance(parent_raw, ObjectId) else ObjectId(str(parent_raw))
+        except Exception:
+            break
+        if oid in seen:
+            break
+        parent = await db.receipt_record_folders.find_one(
+            {"_id": oid, "kind": "custom", "deleted_at": None}
+        )
+        if not parent:
+            break
+        chain.insert(0, parent)
+        seen.add(oid)
+        parent_raw = parent.get("parent_id")
+    return chain
+
+
+async def _serialize_folder_with_path(db: Any, doc: dict[str, Any]) -> dict[str, Any]:
+    chain = await _folder_ancestry(db, doc)
+    labels = [str(d.get("label") or "").strip() or "Folder" for d in chain]
+    slugs = [
+        str(d.get("slug") or record_slug(str(d.get("label") or "folder"))) for d in chain
+    ]
+    return _serialize_folder(
+        doc, path_labels=labels, path_slugs=slugs, depth=max(0, len(chain) - 1)
+    )
+
+
+def _split_folder_path(label: str) -> list[str]:
+    """Split ``Parent/Child`` or ``Parent / Child`` into segments."""
+    text = (label or "").replace("\\", "/")
+    parts = [ " ".join(p.split()) for p in text.split("/") ]
+    return [p for p in parts if p]
+
+
 async def list_custom_folders(db: Any, *, include_deleted: bool = False) -> list[dict[str, Any]]:
     query: dict[str, Any] = {"kind": "custom"}
     if not include_deleted:
         query["deleted_at"] = None
     cursor = db.receipt_record_folders.find(query).sort([("label", 1)])
     docs = await cursor.to_list(length=500)
-    return [_serialize_folder(doc) for doc in docs]
+    rows = [await _serialize_folder_with_path(db, doc) for doc in docs]
+    # Depth-first: parents before children, stable by display path
+    rows.sort(
+        key=lambda r: (
+            "/".join(str(s).lower() for s in (r.get("path_slugs") or [r.get("slug") or ""])),
+            str(r.get("label") or "").lower(),
+        )
+    )
+    return rows
 
 
 async def create_custom_folder(
@@ -139,24 +219,62 @@ async def create_custom_folder(
     *,
     label: str,
     actor_id: ObjectId | None = None,
+    parent_id: str | ObjectId | None = None,
 ) -> dict[str, Any]:
     clean = " ".join((label or "").split())
     if not clean:
         raise ValueError("Folder label is required")
     if len(clean) > 120:
         raise ValueError("Folder label is too long")
+    if "/" in clean or "\\" in clean:
+        raise ValueError(
+            "Folder name cannot contain /. Use Parent/Child to create a nested path."
+        )
+
+    parent_oid: ObjectId | None = None
+    parent_doc: dict[str, Any] | None = None
+    if parent_id not in (None, ""):
+        try:
+            parent_oid = (
+                parent_id if isinstance(parent_id, ObjectId) else ObjectId(str(parent_id))
+            )
+        except Exception as exc:
+            raise ValueError("Invalid parent folder id") from exc
+        parent_doc = await db.receipt_record_folders.find_one(
+            {"_id": parent_oid, "kind": "custom", "deleted_at": None}
+        )
+        if not parent_doc:
+            raise ValueError("Parent custom folder not found")
+        ancestry = await _folder_ancestry(db, parent_doc)
+        if len(ancestry) >= 8:
+            raise ValueError("Custom folder nesting is limited to 8 levels")
+
     slug = record_slug(clean)
-    existing = await db.receipt_record_folders.find_one(
-        {"kind": "custom", "slug": slug, "deleted_at": None}
-    )
+    clash_query: dict[str, Any] = {
+        "kind": "custom",
+        "slug": slug,
+        "deleted_at": None,
+    }
+    if parent_oid is None:
+        clash_query["$or"] = [
+            {"parent_id": None},
+            {"parent_id": {"$exists": False}},
+            {"parent_id": ""},
+        ]
+    else:
+        clash_query["parent_id"] = parent_oid
+    existing = await db.receipt_record_folders.find_one(clash_query)
     if existing:
-        raise ValueError(f"A custom folder named “{existing.get('label') or clean}” already exists")
+        raise ValueError(
+            f"A custom folder named “{existing.get('label') or clean}” already exists here"
+        )
     now = utcnow()
     doc = {
         "kind": "custom",
         "label": clean,
         "slug": slug,
         "ref_key": slug,
+        "parent_id": parent_oid,
         "created_at": now,
         "updated_at": now,
         "created_by": actor_id,
@@ -164,7 +282,51 @@ async def create_custom_folder(
     }
     result = await db.receipt_record_folders.insert_one(doc)
     doc["_id"] = result.inserted_id
-    return _serialize_folder(doc)
+    return await _serialize_folder_with_path(db, doc)
+
+
+async def ensure_custom_folder_path(
+    db: Any,
+    *,
+    path: str,
+    actor_id: ObjectId | None = None,
+) -> dict[str, Any]:
+    """Create or reuse a nested custom folder from ``Parent/Child`` path text."""
+    segments = _split_folder_path(path)
+    if not segments:
+        raise ValueError("Folder path is required")
+    if len(segments) > 8:
+        raise ValueError("Custom folder nesting is limited to 8 levels")
+    parent_id: ObjectId | None = None
+    current: dict[str, Any] | None = None
+    for segment in segments:
+        slug = record_slug(segment)
+        query: dict[str, Any] = {
+            "kind": "custom",
+            "slug": slug,
+            "deleted_at": None,
+        }
+        if parent_id is None:
+            query["$or"] = [
+                {"parent_id": None},
+                {"parent_id": {"$exists": False}},
+                {"parent_id": ""},
+            ]
+        else:
+            query["parent_id"] = parent_id
+        found = await db.receipt_record_folders.find_one(query)
+        if found:
+            current = found
+            parent_id = found["_id"]
+            continue
+        created = await create_custom_folder(
+            db, label=segment, actor_id=actor_id, parent_id=parent_id
+        )
+        parent_id = ObjectId(created["id"])
+        current = await db.receipt_record_folders.find_one({"_id": parent_id})
+    if not current:
+        raise ValueError("Could not resolve custom folder path")
+    return await _serialize_folder_with_path(db, current)
 
 
 async def rename_custom_folder(
@@ -178,22 +340,32 @@ async def rename_custom_folder(
         raise ValueError("Folder label is required")
     if len(clean) > 120:
         raise ValueError("Folder label is too long")
+    if "/" in clean or "\\" in clean:
+        raise ValueError("Folder name cannot contain /")
     doc = await db.receipt_record_folders.find_one(
         {"_id": folder_id, "kind": "custom", "deleted_at": None}
     )
     if not doc:
         raise ValueError("Custom folder not found")
     new_slug = record_slug(clean)
-    clash = await db.receipt_record_folders.find_one(
-        {
-            "kind": "custom",
-            "slug": new_slug,
-            "deleted_at": None,
-            "_id": {"$ne": folder_id},
-        }
-    )
+    parent_raw = doc.get("parent_id")
+    clash_query: dict[str, Any] = {
+        "kind": "custom",
+        "slug": new_slug,
+        "deleted_at": None,
+        "_id": {"$ne": folder_id},
+    }
+    if parent_raw in (None, ""):
+        clash_query["$or"] = [
+            {"parent_id": None},
+            {"parent_id": {"$exists": False}},
+            {"parent_id": ""},
+        ]
+    else:
+        clash_query["parent_id"] = parent_raw
+    clash = await db.receipt_record_folders.find_one(clash_query)
     if clash:
-        raise ValueError(f"A custom folder named “{clash.get('label') or clean}” already exists")
+        raise ValueError(f"A custom folder named “{clash.get('label') or clean}” already exists here")
     await db.receipt_record_folders.update_one(
         {"_id": folder_id},
         {
@@ -212,7 +384,7 @@ async def rename_custom_folder(
         {"$set": {"record.label": clean, "record.slug": new_slug, "record.ref_key": new_slug}},
     )
     updated = await db.receipt_record_folders.find_one({"_id": folder_id})
-    return _serialize_folder(updated or doc)
+    return await _serialize_folder_with_path(db, updated or doc)
 
 
 async def delete_custom_folder(db: Any, folder_id: ObjectId) -> dict[str, Any]:
@@ -221,6 +393,14 @@ async def delete_custom_folder(db: Any, folder_id: ObjectId) -> dict[str, Any]:
     )
     if not doc:
         raise ValueError("Custom folder not found")
+    child = await db.receipt_record_folders.find_one(
+        {"kind": "custom", "parent_id": folder_id, "deleted_at": None}
+    )
+    if child:
+        raise ValueError(
+            f"Cannot delete “{doc.get('label')}” — it still has subfolders. "
+            "Delete or move children first."
+        )
     in_use = await db.receipt_files.count_documents(
         {"record.folder_id": str(folder_id), "security_rejected": {"$ne": True}}
     )
@@ -299,12 +479,16 @@ async def resolve_record_destination(
         )
         if not doc:
             raise ValueError("Custom folder not found")
+        serialized = await _serialize_folder_with_path(db, doc)
         return {
             "kind": "custom",
-            "folder_id": str(doc["_id"]),
-            "ref_key": doc.get("ref_key") or doc.get("slug") or "",
-            "label": doc.get("label") or "",
-            "slug": doc.get("slug") or record_slug(str(doc.get("label") or "custom")),
+            "folder_id": serialized["id"],
+            "ref_key": serialized.get("ref_key") or serialized.get("slug") or "",
+            "label": serialized.get("display_label") or serialized.get("label") or "",
+            "slug": serialized.get("slug") or record_slug(str(doc.get("label") or "custom")),
+            "path_slugs": list(serialized.get("path_slugs") or []),
+            "path_labels": list(serialized.get("path_labels") or []),
+            "parent_id": serialized.get("parent_id"),
         }
 
     raw = " ".join((ref_key or "").split())
@@ -375,9 +559,21 @@ def _records_browse_rel(
         day = day.astimezone(UTC)
     kind = dest["kind"]
     disk_kind = KIND_DISK[kind]
-    slug = _folder_segment(dest.get("slug") or dest.get("ref_key") or "untitled")
+    path_slugs = [
+        _folder_segment(str(s))
+        for s in (dest.get("path_slugs") or [])
+        if str(s or "").strip()
+    ]
+    if not path_slugs:
+        path_slugs = [
+            _folder_segment(dest.get("slug") or dest.get("ref_key") or "untitled")
+        ]
+    slug_path = "/".join(path_slugs)
     year, month = f"{day.year:04d}", f"{day.month:02d}"
-    return f"records/{disk_kind}/{slug}/{year}/{month}/{safe_name(Path(stored_name).name)}"
+    return (
+        f"records/{disk_kind}/{slug_path}/{year}/{month}/"
+        f"{safe_name(Path(stored_name).name)}"
+    )
 
 
 async def store_record_file_bytes(
@@ -439,12 +635,16 @@ async def store_record_file_bytes(
         raise
 
     note_clean = " ".join((note or "").split())[:500]
+    path_slugs = [
+        str(s) for s in (destination.get("path_slugs") or []) if str(s or "").strip()
+    ]
     record_block = {
         "kind": destination["kind"],
         "folder_id": destination.get("folder_id"),
         "ref_key": destination.get("ref_key") or "",
         "label": destination.get("label") or "",
         "slug": destination.get("slug") or "",
+        "path_slugs": path_slugs,
         "path": browse_rel,
         "note": note_clean,
     }
@@ -491,6 +691,144 @@ async def store_record_file_bytes(
     return meta
 
 
+def _serialize_record_file_row(
+    doc: dict[str, Any], *, synthetic_record: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    rec = synthetic_record if synthetic_record is not None else (doc.get("record") or {})
+    return {
+        "id": str(doc.get("_id")),
+        "original_filename": doc.get("original_filename") or "",
+        "content_type": doc.get("content_type") or "",
+        "size": int(doc.get("size") or 0),
+        "sha256": doc.get("sha256") or "",
+        "stored_path": doc.get("stored_path") or "",
+        "uploaded_at": doc.get("uploaded_at"),
+        "source": doc.get("source") or ("approved" if synthetic_record else "records"),
+        "inbox_status": doc.get("inbox_status") or INBOX_APPROVED,
+        "record": {
+            "kind": rec.get("kind") or "",
+            "folder_id": rec.get("folder_id"),
+            "ref_key": rec.get("ref_key") or "",
+            "label": rec.get("label") or "",
+            "slug": rec.get("slug") or "",
+            "path_slugs": list(rec.get("path_slugs") or []),
+            "path": rec.get("path") or "",
+            "note": rec.get("note") or "",
+            "from_approved": bool(rec.get("from_approved")),
+        },
+    }
+
+
+async def _approved_bridge_files(
+    db: Any,
+    *,
+    kind: str,
+    ref_key: str,
+    q: str = "",
+    date_from: date | datetime | None = None,
+    date_to: date | datetime | None = None,
+    limit: int = 200,
+    exclude_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Approved chase receipts that belong under an Item/Supplier Records folder.
+
+    Matching: linked transaction ``item`` (item folders) or ``payee`` (supplier).
+    """
+    key = (kind or "").strip().lower()
+    needle_key = " ".join((ref_key or "").split())
+    if key not in {"item", "supplier"} or not needle_key:
+        return []
+
+    query: dict[str, Any] = {
+        "inbox_status": INBOX_APPROVED,
+        "security_rejected": {"$ne": True},
+        "$or": [
+            {"record": {"$exists": False}},
+            {"record": None},
+        ],
+    }
+    start = _as_day_start(date_from)
+    end = _as_day_end(date_to)
+    if start is not None or end is not None:
+        span: dict[str, Any] = {}
+        if start is not None:
+            span["$gte"] = start
+        if end is not None:
+            span["$lte"] = end
+        query["uploaded_at"] = span
+    name_q = (q or "").strip()
+    if name_q:
+        query["original_filename"] = {"$regex": re.escape(name_q), "$options": "i"}
+
+    fetch_n = min(800, max(limit * 4, limit))
+    docs = (
+        await db.receipt_files.find(query)
+        .sort("uploaded_at", -1)
+        .limit(fetch_n)
+        .to_list(length=fetch_n)
+    )
+    if not docs:
+        return []
+
+    from .receipt_ops import _linked_entry_summaries_for_files
+
+    linked = await _linked_entry_summaries_for_files(db, docs)
+    target = needle_key.casefold()
+    slug = record_slug(needle_key)
+    skip = exclude_ids or set()
+    out: list[dict[str, Any]] = []
+    for doc in docs:
+        fid = str(doc.get("_id") or "")
+        if not fid or fid in skip:
+            continue
+        entries = list(linked.get(fid) or [])
+        matched = False
+        for entry in entries:
+            if key == "item":
+                value = str(entry.get("item") or "").strip()
+            else:
+                value = str(entry.get("payee") or "").strip()
+            if value and value.casefold() == target:
+                matched = True
+                break
+        if not matched:
+            # Fallback: approved browse path contains the item folder segment
+            for mp in doc.get("materialized_paths") or []:
+                text = str(mp or "").replace("\\", "/")
+                if f"/{_folder_segment(needle_key)}/" in f"/{text}/":
+                    matched = True
+                    break
+        if not matched:
+            continue
+        path = ""
+        for mp in doc.get("materialized_paths") or []:
+            text = str(mp or "").replace("\\", "/").lstrip("/")
+            if text.startswith("approved/"):
+                path = text
+                break
+            if text and not path:
+                path = f"approved/{text}" if not text.startswith("approved/") else text
+        out.append(
+            _serialize_record_file_row(
+                doc,
+                synthetic_record={
+                    "kind": key,
+                    "folder_id": None,
+                    "ref_key": needle_key,
+                    "label": needle_key,
+                    "slug": slug,
+                    "path_slugs": [slug],
+                    "path": path,
+                    "note": "",
+                    "from_approved": True,
+                },
+            )
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def list_record_files(
     db: Any,
     *,
@@ -501,6 +839,7 @@ async def list_record_files(
     date_from: date | datetime | None = None,
     date_to: date | datetime | None = None,
     limit: int = 200,
+    include_approved: bool = True,
 ) -> list[dict[str, Any]]:
     query: dict[str, Any] = {
         "record": {"$exists": True, "$ne": None},
@@ -539,31 +878,32 @@ async def list_record_files(
         .limit(cap)
         .to_list(length=cap)
     )
-    items: list[dict[str, Any]] = []
-    for doc in docs:
-        rec = doc.get("record") or {}
-        items.append(
-            {
-                "id": str(doc.get("_id")),
-                "original_filename": doc.get("original_filename") or "",
-                "content_type": doc.get("content_type") or "",
-                "size": int(doc.get("size") or 0),
-                "sha256": doc.get("sha256") or "",
-                "stored_path": doc.get("stored_path") or "",
-                "uploaded_at": doc.get("uploaded_at"),
-                "source": doc.get("source") or "records",
-                "inbox_status": doc.get("inbox_status") or INBOX_APPROVED,
-                "record": {
-                    "kind": rec.get("kind") or "",
-                    "folder_id": rec.get("folder_id"),
-                    "ref_key": rec.get("ref_key") or "",
-                    "label": rec.get("label") or "",
-                    "slug": rec.get("slug") or "",
-                    "path": rec.get("path") or "",
-                    "note": rec.get("note") or "",
-                },
-            }
+    items: list[dict[str, Any]] = [_serialize_record_file_row(doc) for doc in docs]
+    seen = {str(row.get("id") or "") for row in items}
+
+    if (
+        include_approved
+        and kind_key in {"item", "supplier"}
+        and rk
+        and not fid
+        and len(items) < cap
+    ):
+        bridged = await _approved_bridge_files(
+            db,
+            kind=kind_key,
+            ref_key=rk,
+            q=needle,
+            date_from=date_from,
+            date_to=date_to,
+            limit=cap - len(items),
+            exclude_ids=seen,
         )
+        items.extend(bridged)
+        items.sort(
+            key=lambda row: row.get("uploaded_at") or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        items = items[:cap]
     return items
 
 

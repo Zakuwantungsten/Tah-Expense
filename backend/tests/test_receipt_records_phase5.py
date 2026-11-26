@@ -10,11 +10,13 @@ from types import SimpleNamespace
 import pytest
 from bson import ObjectId
 
-from app.receipt_ops import list_inbox_files, list_storage_tree
+from app.receipt_ops import INBOX_APPROVED, list_inbox_files, list_storage_tree
 from app.receipt_records_ops import (
     build_records_pack,
     create_custom_folder,
+    ensure_custom_folder_path,
     ensure_records_workspace,
+    list_custom_folders,
     list_record_files,
     resolve_record_destination,
     store_record_file_bytes,
@@ -33,6 +35,13 @@ def _dig(doc: dict, key: str):
 
 
 def _match(doc: dict, query: dict) -> bool:
+    if "$and" in query:
+        return all(_match(doc, clause) for clause in query["$and"])
+    if "$or" in query:
+        if not any(_match(doc, clause) for clause in query["$or"]):
+            return False
+        rest = {k: v for k, v in query.items() if k != "$or"}
+        return _match(doc, rest) if rest else True
     for key, expected in query.items():
         present, actual = _dig(doc, key)
         if isinstance(expected, dict):
@@ -119,6 +128,8 @@ class FakeDB:
         self.receipt_files = FakeColl()
         self.receipt_record_folders = FakeColl()
         self.categories = FakeColl()
+        self.transactions = FakeColl()
+        self.receipt_requests = FakeColl()
 
 
 @pytest.mark.asyncio
@@ -164,3 +175,95 @@ async def test_records_upload_excluded_from_inbox_and_packable(tmp_path: Path) -
         pdfs = [n for n in names if n.lower().endswith(".pdf")]
         assert pdfs
         assert zf.read(pdfs[0]).startswith(b"%PDF")
+
+
+@pytest.mark.asyncio
+async def test_nested_custom_folder_path_and_disk(tmp_path: Path) -> None:
+    db = FakeDB()
+    base = tmp_path / "attachments"
+    ensure_records_workspace(base)
+
+    leaf = await ensure_custom_folder_path(db, path="Contracts/2026")
+    assert leaf["label"] == "2026"
+    assert leaf["depth"] == 1
+    assert leaf["path_labels"] == ["Contracts", "2026"]
+    assert leaf["display_label"] == "Contracts / 2026"
+    assert leaf["parent_id"]
+
+    folders = await list_custom_folders(db)
+    assert len(folders) == 2
+    assert {f["label"] for f in folders} == {"Contracts", "2026"}
+
+    dest = await resolve_record_destination(db, kind="custom", folder_id=leaf["id"])
+    assert dest["path_slugs"] == ["contracts", "2026"]
+    meta = await store_record_file_bytes(
+        db,
+        base,
+        filename="deal.pdf",
+        content=b"%PDF-1.4 nested",
+        destination=dest,
+    )
+    path = str((meta.get("record") or {}).get("path") or "")
+    assert path.startswith("records/custom/contracts/2026/")
+    assert (base / Path(*path.split("/"))).is_file()
+
+    # Same path reuses folders
+    again = await ensure_custom_folder_path(db, path="Contracts/2026")
+    assert again["id"] == leaf["id"]
+    assert len(await list_custom_folders(db)) == 2
+
+
+@pytest.mark.asyncio
+async def test_records_item_lists_approved_chase_receipt(tmp_path: Path) -> None:
+    db = FakeDB()
+    base = tmp_path / "attachments"
+    ensure_records_workspace(base)
+    tx_id = ObjectId()
+    file_id = "approved_diesel_1"
+
+    db.transactions.documents.append(
+        {
+            "_id": tx_id,
+            "date": __import__("datetime").datetime(2026, 5, 1, 10, 0, 0),
+            "amount": 100,
+            "currency": "TZS",
+            "item": "Diesel",
+            "payee": "Shell",
+            "ownership": "ALI",
+            "attachments": [{"id": file_id, "file_id": file_id, "filename": "fuel.pdf"}],
+            "receipt_status": "received",
+            "trashed": False,
+        }
+    )
+    db.receipt_files.documents.append(
+        {
+            "_id": file_id,
+            "original_filename": "fuel.pdf",
+            "inbox_status": INBOX_APPROVED,
+            "uploaded_at": __import__("datetime").datetime(
+                2026, 5, 1, 12, 0, 0, tzinfo=__import__("datetime").timezone.utc
+            ),
+            "transaction_ids": [tx_id],
+            "security_rejected": False,
+            "size": 12,
+            "stored_path": "files/fuel.pdf",
+            "materialized_paths": ["approved/2026/05/Diesel/fuel.pdf"],
+        }
+    )
+
+    # Also file a Records-native document under Diesel
+    dest = await resolve_record_destination(db, kind="item", ref_key="Diesel")
+    await store_record_file_bytes(
+        db,
+        base,
+        filename="policy.pdf",
+        content=b"%PDF-1.4 policy",
+        destination=dest,
+    )
+
+    listed = await list_record_files(db, kind="item", ref_key="Diesel", limit=50)
+    ids = {row["id"] for row in listed}
+    assert file_id in ids
+    approved_row = next(r for r in listed if r["id"] == file_id)
+    assert approved_row["record"]["from_approved"] is True
+    assert any(r["original_filename"] == "policy.pdf" for r in listed)

@@ -2,21 +2,34 @@
 
 Cashiers can still type any free-text value; this registry only powers
 suggestions and inline preview (same interaction as Items).
+
+Also stores receipt identity: linked login (user_id) and whether the person
+receives mobile receipt requests — used by chase / early park / person dossier.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import qtawesome as qta
 from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFrame,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
-    QPushButton, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
 
 from tahmeed.ui.accountant.master_ledger_table import _TABLE_SS as _MASTER_TABLE_SS
@@ -41,7 +54,7 @@ _T2      = "#6B7280"
 _TM      = "#9CA3AF"
 _HDR_BG  = "#F1F5F9"
 
-_COL_DEFAULTS = [52, 280, 100]
+_COL_DEFAULTS = [52, 220, 180, 100, 100]
 _PAGE_SIZE = 100
 
 
@@ -114,43 +127,124 @@ def _status_chip(active: bool) -> QLabel:
     return lbl
 
 
-class _AddPersonDialog(QDialog):
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+class _PersonEditorDialog(QDialog):
+    """Add / edit a people row including receipt identity fields."""
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        person: Optional[dict[str, Any]] = None,
+        users: Optional[List[Any]] = None,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Add Person")
-        self.setMinimumWidth(360)
+        self._editing = bool(person and person.get("name"))
+        self.setWindowTitle("Edit Person" if self._editing else "Add Person")
+        self.setMinimumWidth(420)
         self.setStyleSheet("background:#FFFFFF;")
-        self.result_name: Optional[str] = None
+        self.result: Optional[dict[str, Any]] = None
+        self._users = list(users or [])
+
+        field_ss = (
+            f"QLineEdit,QComboBox{{border:1px solid {_BORDER};border-radius:5px;"
+            f"background:{_WHITE};color:{_T1};font-size:13px;"
+            "font-family:'Segoe UI';padding:0 8px;"
+            "min-height:34px;max-height:34px;}"
+            f"QLineEdit:focus,QComboBox:focus{{border-color:{_BLUE};}}"
+            "QComboBox::drop-down{border:none;width:20px;}"
+        )
 
         vl = QVBoxLayout(self)
         vl.setContentsMargins(24, 24, 24, 24)
-        vl.setSpacing(12)
+        vl.setSpacing(10)
 
-        vl.addWidget(_lbl("Add Person", size=15, weight=700))
-        vl.addWidget(_lbl(
-            "Used for Ownership and APR BY suggestions in the register.",
-            size=12, color=_T2,
-        ))
+        vl.addWidget(
+            _lbl(
+                "Edit Person" if self._editing else "Add Person",
+                size=15,
+                weight=700,
+            )
+        )
+        vl.addWidget(
+            _lbl(
+                "Ownership / APR BY suggestions, plus mobile receipt identity "
+                "(linked login + receives requests).",
+                size=12,
+                color=_T2,
+            )
+        )
 
         vl.addWidget(_lbl("Name *", size=12, color=_T2))
         self._inp = QLineEdit()
         self._inp.setPlaceholderText("e.g. JOHN DOE")
-        self._inp.setStyleSheet(
-            f"QLineEdit{{border:1px solid {_BORDER};border-radius:5px;"
-            f"background:{_WHITE};color:{_T1};font-size:13px;"
-            "font-family:'Segoe UI';padding:0 8px;"
-            "min-height:34px;max-height:34px;}"
-            f"QLineEdit:focus{{border-color:{_BLUE};}}"
-        )
-        self._inp.returnPressed.connect(self._accept)
+        self._inp.setStyleSheet(field_ss)
+        if self._editing:
+            self._inp.setText(str(person.get("name") or ""))
+            self._inp.setReadOnly(True)
+            self._inp.setToolTip("Rename is not supported — create a new person instead.")
+        else:
+            self._inp.returnPressed.connect(self._accept)
         vl.addWidget(self._inp)
+
+        vl.addWidget(_lbl("Phone", size=12, color=_T2))
+        self._phone = QLineEdit()
+        self._phone.setPlaceholderText("Optional")
+        self._phone.setStyleSheet(field_ss)
+        if person:
+            self._phone.setText(str(person.get("phone") or ""))
+        vl.addWidget(self._phone)
+
+        vl.addWidget(_lbl("Linked login", size=12, color=_T2))
+        from tahmeed.ui.widgets.combo_styles import with_combo_popup
+
+        self._user_cb = QComboBox()
+        self._user_cb.setStyleSheet(with_combo_popup(field_ss))
+        self._user_cb.addItem("(none)", None)
+        current_uid = str(person.get("user_id") or "") if person else ""
+        selected_idx = 0
+        for i, user in enumerate(self._users, start=1):
+            uid = str(getattr(user, "_id", "") or "")
+            full = str(getattr(user, "full_name", "") or "").strip()
+            uname = str(getattr(user, "username", "") or "").strip()
+            role = str(getattr(user, "role", "") or "").strip()
+            label = full or uname or uid
+            if uname and full and uname.upper() != full.upper():
+                label = f"{full} ({uname})"
+            if role:
+                label = f"{label} · {role}"
+            self._user_cb.addItem(label, uid or None)
+            if current_uid and uid == current_uid:
+                selected_idx = i
+        self._user_cb.setCurrentIndex(selected_idx)
+        vl.addWidget(self._user_cb)
+
+        self._receives = QCheckBox("Receives receipt requests (mobile chase)")
+        self._receives.setChecked(
+            True
+            if not person
+            else bool(person.get("receives_receipt_requests", True))
+        )
+        self._receives.setStyleSheet(
+            f"QCheckBox{{color:{_T1};font:12px 'Segoe UI';background:transparent;}}"
+        )
+        vl.addWidget(self._receives)
+
+        if self._editing:
+            self._active = QCheckBox("Active")
+            self._active.setChecked(bool(person.get("active", True)))
+            self._active.setStyleSheet(
+                f"QCheckBox{{color:{_T1};font:12px 'Segoe UI';background:transparent;}}"
+            )
+            vl.addWidget(self._active)
+        else:
+            self._active = None
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel = _btn("Cancel", primary=False, height=32)
         cancel.clicked.connect(self.reject)
         btn_row.addWidget(cancel)
-        save = _btn("Add", primary=True, height=32)
+        save = _btn("Save" if self._editing else "Add", primary=True, height=32)
         save.clicked.connect(self._accept)
         btn_row.addWidget(save)
         vl.addLayout(btn_row)
@@ -160,8 +254,13 @@ class _AddPersonDialog(QDialog):
         if not val:
             QMessageBox.warning(self, "Validation", "Name is required.")
             return
-        self.result_name = val
-        self._inp.setText(val)
+        self.result = {
+            "name": val,
+            "phone": self._phone.text().strip(),
+            "user_id": self._user_cb.currentData(),
+            "receives_receipt_requests": self._receives.isChecked(),
+            "active": True if self._active is None else self._active.isChecked(),
+        }
         self.accept()
 
 
@@ -205,7 +304,11 @@ class PeopleRegistryWidget(QWidget):
         hdr.addWidget(self._count_chip)
         hdr.addStretch()
 
-        hint = _lbl("Suggestions only — cashiers may still type any name", size=11, color=_TM)
+        hint = _lbl(
+            "Suggestions + receipt identity — cashiers may still type any name",
+            size=11,
+            color=_TM,
+        )
         hdr.addWidget(hint)
 
         add_btn = _btn("+ Add Person", primary=True, height=32)
@@ -248,11 +351,12 @@ class PeopleRegistryWidget(QWidget):
         table_vl.setContentsMargins(0, 0, 0, 0)
         table_vl.setSpacing(0)
 
-        self._table = _make_table(["#", "Name", "Status"])
+        self._table = _make_table(["#", "Name", "Linked login", "Receives", "Status"])
         self._table.setStyleSheet(_MASTER_TABLE_SS)
         self._table.setShowGrid(True)
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._context_menu)
+        self._table.cellDoubleClicked.connect(self._on_row_double_clicked)
 
         hdr_view = self._table.horizontalHeader()
         hdr_view.setSectionsMovable(False)
@@ -391,6 +495,14 @@ class PeopleRegistryWidget(QWidget):
                 _cell(str(skip + i + 1), Qt.AlignCenter | Qt.AlignVCenter, bg=row_bg),
             )
             self._table.setItem(i, 1, _cell(row.get("name", ""), bg=row_bg))
+            linked = "Linked" if row.get("user_id") else "—"
+            self._table.setItem(i, 2, _cell(linked, bg=row_bg))
+            receives = row.get("receives_receipt_requests", True)
+            self._table.setItem(
+                i,
+                3,
+                _cell("Yes" if receives else "No", bg=row_bg),
+            )
             chip = _status_chip(active)
             chip_container = QWidget()
             chip_container.setStyleSheet(f"background: {row_bg};")
@@ -398,7 +510,7 @@ class PeopleRegistryWidget(QWidget):
             cl.setContentsMargins(6, 1, 6, 1)
             cl.addWidget(chip)
             cl.addStretch()
-            self._table.setCellWidget(i, 2, chip_container)
+            self._table.setCellWidget(i, 4, chip_container)
             _finish_table_row(self._table, i, row_bg)
 
         shown = len(rows)
@@ -415,16 +527,47 @@ class PeopleRegistryWidget(QWidget):
         name = entry.get("name", "")
 
         menu = apply_light_menu(QMenu(self))
+        edit_act = menu.addAction("Edit identity…")
+        edit_act.setIcon(qta.icon("mdi.account-edit-outline", color=_T1))
         toggle_act = menu.addAction("Deactivate" if active else "Activate")
         menu.addSeparator()
         delete_act = menu.addAction("Delete")
         delete_act.setIcon(qta.icon("mdi.delete-outline", color=_RED))
 
         chosen = menu.exec(self._table.viewport().mapToGlobal(pos))
-        if chosen == toggle_act:
+        if chosen == edit_act:
+            asyncio.ensure_future(self._edit_person(entry))
+        elif chosen == toggle_act:
             asyncio.ensure_future(self._toggle_active(name, not active))
         elif chosen == delete_act:
             self._confirm_delete(name)
+
+    def _on_row_double_clicked(self, row: int, _col: int) -> None:
+        if row < 0 or row >= len(self._rows):
+            return
+        asyncio.ensure_future(self._edit_person(self._rows[row]))
+
+    async def _load_users_for_editor(self) -> list:
+        try:
+            from tahmeed.services.user_service import get_all_users
+
+            users = await get_all_users()
+            return [
+                u
+                for u in users
+                if getattr(u, "active", True)
+                and not getattr(u, "banned", False)
+                and not getattr(u, "deleted_at", None)
+            ]
+        except Exception:
+            return []
+
+    async def _edit_person(self, entry: dict) -> None:
+        users = await self._load_users_for_editor()
+        dlg = _PersonEditorDialog(parent=self, person=entry, users=users)
+        if dlg.exec() != QDialog.Accepted or not dlg.result:
+            return
+        await self._do_upsert(dlg.result)
 
     async def _toggle_active(self, name: str, active: bool) -> None:
         from tahmeed.services.people_service import set_person_active
@@ -455,15 +598,28 @@ class PeopleRegistryWidget(QWidget):
         await self._load()
 
     def _add_person(self) -> None:
-        dlg = _AddPersonDialog(parent=self)
-        if dlg.exec() == QDialog.Accepted and dlg.result_name:
-            asyncio.ensure_future(self._do_add(dlg.result_name))
+        asyncio.ensure_future(self._add_person_async())
 
-    async def _do_add(self, name: str) -> None:
-        from tahmeed.services.people_service import add_person
+    async def _add_person_async(self) -> None:
+        users = await self._load_users_for_editor()
+        dlg = _PersonEditorDialog(parent=self, users=users)
+        if dlg.exec() != QDialog.Accepted or not dlg.result:
+            return
+        await self._do_upsert(dlg.result)
+
+    async def _do_upsert(self, payload: dict[str, Any]) -> None:
+        from tahmeed.services.people_service import upsert_person
 
         try:
-            await add_person(name)
+            await upsert_person(
+                str(payload.get("name") or ""),
+                active=bool(payload.get("active", True)),
+                phone=str(payload.get("phone") or ""),
+                receives_receipt_requests=bool(
+                    payload.get("receives_receipt_requests", True)
+                ),
+                user_id=payload.get("user_id"),
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Error", str(exc))
             return

@@ -279,6 +279,13 @@ class ReceiptRecordsPanel(QWidget):
         custom_row.setSpacing(6)
         self._new_btn = _ghost("New…", "mdi.folder-plus-outline")
         self._new_btn.clicked.connect(lambda: asyncio.ensure_future(self._new_custom()))
+        self._sub_btn = _ghost("Subfolder…", "mdi.folder-pound-outline")
+        self._sub_btn.setToolTip(
+            "Create a nested folder under the selected custom folder"
+        )
+        self._sub_btn.clicked.connect(
+            lambda: asyncio.ensure_future(self._new_custom_subfolder())
+        )
         self._rename_btn = _ghost("Rename…", "mdi.pencil-outline")
         self._rename_btn.clicked.connect(
             lambda: asyncio.ensure_future(self._rename_custom())
@@ -287,7 +294,7 @@ class ReceiptRecordsPanel(QWidget):
         self._delete_btn.clicked.connect(
             lambda: asyncio.ensure_future(self._delete_custom())
         )
-        for b in (self._new_btn, self._rename_btn, self._delete_btn):
+        for b in (self._new_btn, self._sub_btn, self._rename_btn, self._delete_btn):
             custom_row.addWidget(b)
         custom_row.addStretch(1)
         lay.addLayout(custom_row)
@@ -409,8 +416,16 @@ class ReceiptRecordsPanel(QWidget):
 
         rows = list(self._destinations.get(self._kind) or [])
         for row in rows:
-            label = str(row.get("label") or row.get("ref_key") or "Untitled")
+            if self._kind == "custom":
+                depth = int(row.get("depth") or 0)
+                leaf = str(row.get("label") or row.get("ref_key") or "Untitled")
+                label = ("    " * depth) + leaf
+                tip = str(row.get("display_label") or leaf)
+            else:
+                label = str(row.get("label") or row.get("ref_key") or "Untitled")
+                tip = label
             item = QListWidgetItem(label)
+            item.setToolTip(tip)
             item.setData(Qt.UserRole, {**row, "kind": self._kind, "_all": False})
             item.setIcon(qta.icon("mdi.folder-outline", color=_ACCENT))
             self._dest_list.addItem(item)
@@ -437,7 +452,12 @@ class ReceiptRecordsPanel(QWidget):
     def _update_dest_hint(self) -> None:
         kind_label = next((lab for k, lab, _ in _KINDS if k == self._kind), self._kind)
         if self._selected:
-            name = self._selected.get("label") or self._selected.get("ref_key") or ""
+            name = (
+                self._selected.get("display_label")
+                or self._selected.get("label")
+                or self._selected.get("ref_key")
+                or ""
+            )
             self._dest_hint.setText(f"{kind_label} · {name}")
         else:
             self._dest_hint.setText(
@@ -447,9 +467,11 @@ class ReceiptRecordsPanel(QWidget):
     def _sync_custom_actions(self) -> None:
         is_custom = self._kind == "custom"
         self._new_btn.setVisible(is_custom)
+        self._sub_btn.setVisible(is_custom)
         self._rename_btn.setVisible(is_custom)
         self._delete_btn.setVisible(is_custom)
         has_sel = bool(self._selected and self._selected.get("id"))
+        self._sub_btn.setEnabled(is_custom and has_sel)
         self._rename_btn.setEnabled(is_custom and has_sel)
         self._delete_btn.setEnabled(is_custom and has_sel)
 
@@ -544,12 +566,17 @@ class ReceiptRecordsPanel(QWidget):
             self._table.insertRow(r)
             rec = row.get("record") or {}
             dest = str(rec.get("label") or rec.get("ref_key") or "—")
+            if rec.get("from_approved"):
+                dest = f"{dest} · approved"
+            note = str(rec.get("note") or "—")
+            if rec.get("from_approved") and note == "—":
+                note = "Chase approved"
             values = [
                 str(idx + 1),
                 _fmt_when(row.get("uploaded_at")),
                 str(row.get("original_filename") or "—"),
                 dest,
-                str(rec.get("note") or "—"),
+                note,
                 _fmt_size(int(row.get("size") or 0)),
             ]
             bg = _stripe(r)
@@ -582,7 +609,11 @@ class ReceiptRecordsPanel(QWidget):
     # ── Custom folder CRUD ────────────────────────────────────────────────
 
     async def _new_custom(self) -> None:
-        label, ok = QInputDialog.getText(self, "New custom folder", "Folder name:")
+        label, ok = QInputDialog.getText(
+            self,
+            "New custom folder",
+            "Folder name (or Parent/Child for a nested path):",
+        )
         if not ok:
             return
         label = " ".join((label or "").split())
@@ -600,7 +631,51 @@ class ReceiptRecordsPanel(QWidget):
         self._kind = "custom"
         self._on_kind("custom")
         self._reselect({"id": folder.get("id"), "ref_key": folder.get("ref_key")})
-        self._status.setText(f"Created custom folder “{folder.get('label')}”")
+        shown = folder.get("display_label") or folder.get("label")
+        self._status.setText(f"Created custom folder “{shown}”")
+
+    async def _new_custom_subfolder(self) -> None:
+        if not self._selected or not self._selected.get("id"):
+            QMessageBox.information(
+                self, "Records", "Select a parent custom folder first."
+            )
+            return
+        parent_name = str(
+            self._selected.get("display_label")
+            or self._selected.get("label")
+            or "folder"
+        )
+        label, ok = QInputDialog.getText(
+            self,
+            "New subfolder",
+            f"Subfolder name under “{parent_name}”:",
+        )
+        if not ok:
+            return
+        label = " ".join((label or "").split())
+        if not label:
+            return
+        if "/" in label or "\\" in label:
+            QMessageBox.information(
+                self,
+                "Records",
+                "Enter a single folder name (no /). Nest further with Subfolder again.",
+            )
+            return
+        try:
+            folder = await create_custom_folder(
+                label, parent_id=str(self._selected["id"])
+            )
+        except ApiError as exc:
+            QMessageBox.warning(self, "Records", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Records", f"Could not create subfolder:\n{exc}")
+            return
+        await self.refresh()
+        self._reselect({"id": folder.get("id"), "ref_key": folder.get("ref_key")})
+        shown = folder.get("display_label") or folder.get("label")
+        self._status.setText(f"Created subfolder “{shown}”")
 
     async def _rename_custom(self) -> None:
         if not self._selected or not self._selected.get("id"):

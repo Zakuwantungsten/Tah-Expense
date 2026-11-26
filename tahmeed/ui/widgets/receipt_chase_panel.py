@@ -66,12 +66,14 @@ from tahmeed.services.receipt_chase_service import (
     reject_files,
     search_link_candidates,
     still_request_linked_entries,
+    undo_waive_receipts,
     upload_and_link_files,
     upload_parked_files,
     waive_receipts,
 )
 from tahmeed.ui.dialogs.confirm_dialog import ask_confirm
 from tahmeed.ui.dialogs.inbox_linked_entries_dialog import InboxLinkedEntriesDialog
+from tahmeed.ui.dialogs.person_receipt_dossier_dialog import PersonReceiptDossierDialog
 from tahmeed.services.receipt_records_service import upload_record_files
 from tahmeed.ui.dialogs.receipt_upload_destination_dialog import (
     ReceiptUploadDestinationDialog,
@@ -243,7 +245,7 @@ _ENTRY_COL_OPEN = 8
 _ENTRY_FILTERABLE = set(range(1, _ENTRY_COL_OPEN))
 _ENTRY_SORT_KINDS = {1: "truck", 6: "number"}
 
-# View all: Date + same entry columns
+# View all: Date + same entry columns + Reason (before Open)
 _VIEW_ALL_HEADERS = [
     "S/NO",
     "Date",
@@ -254,11 +256,13 @@ _VIEW_ALL_HEADERS = [
     "Ownership",
     "Amount",
     "Status",
+    "Reason",
     "",
 ]
-_VIEW_ALL_COL_DEFAULTS = [44, 110, 90, 170, 120, 110, 100, 110, 90, 72]
-_VIEW_ALL_COL_KEY = "receipt_view_all_entries_v3"
-_VIEW_ALL_COL_OPEN = 9
+_VIEW_ALL_COL_DEFAULTS = [44, 110, 90, 160, 110, 100, 100, 100, 80, 160, 72]
+_VIEW_ALL_COL_KEY = "receipt_view_all_entries_v4"
+_VIEW_ALL_COL_OPEN = 10
+_VIEW_ALL_COL_REASON = 9
 _VIEW_ALL_FILTERABLE = set(range(1, _VIEW_ALL_COL_OPEN))
 _VIEW_ALL_SORT_KINDS = {1: "date", 2: "truck", 7: "number"}
 _VIEW_ALL_LIMIT = 500
@@ -584,6 +588,7 @@ class ReceiptChasePanel(QWidget):
         self._view_all_rows: list[dict[str, Any]] = []
         self._view_all_visible: list[dict[str, Any]] = []
         self._view_all_status = "all"
+        self._link_stash_ids: set[str] = set()
         self._view_all_search = ""
         self._view_all_filters: dict[int, set[str]] = {}
         self._view_all_sort: tuple[int | None, bool] = (None, True)
@@ -856,6 +861,16 @@ class ReceiptChasePanel(QWidget):
             f"Waive… ({n})",
             "mdi.file-cancel-outline",
             lambda: schedule_coro(self._waive_selected_entries(table)),
+        )
+        has_waived = any(
+            str(r.get("display_status_key") or "") == "waived" for r in selected
+        )
+        self._menu_action(
+            menu,
+            f"Undo waive… ({n})",
+            "mdi.undo-variant",
+            lambda: schedule_coro(self._undo_waive_selected_entries(table)),
+            enabled=has_waived,
         )
         menu.addSeparator()
         self._menu_action(
@@ -1183,6 +1198,18 @@ class ReceiptChasePanel(QWidget):
             )
         )
         drill_bar.addWidget(self._main_entry_waive_btn)
+        self._main_entry_undo_waive_btn = _ghost_btn(
+            "Undo waive…", "mdi.undo-variant"
+        )
+        self._main_entry_undo_waive_btn.setToolTip(
+            "Restore selected waived entries to Needed (or Received if a file is linked)."
+        )
+        self._main_entry_undo_waive_btn.clicked.connect(
+            lambda: schedule_coro(
+                self._undo_waive_selected_entries(self._main_entries)
+            )
+        )
+        drill_bar.addWidget(self._main_entry_undo_waive_btn)
         self._main_entry_open_btn = _ghost_btn("Open receipt", "mdi.file-eye-outline")
         self._main_entry_open_btn.clicked.connect(self._open_selected_main_entry_receipt)
         drill_bar.addWidget(self._main_entry_open_btn)
@@ -1408,6 +1435,19 @@ class ReceiptChasePanel(QWidget):
             )
         )
         toolbar.addWidget(self._view_all_waive_btn, 0, Qt.AlignVCenter)
+        self._view_all_undo_waive_btn = _ghost_btn(
+            "Undo waive…", "mdi.undo-variant"
+        )
+        self._view_all_undo_waive_btn.setFixedHeight(toolbar_h)
+        self._view_all_undo_waive_btn.setToolTip(
+            "Restore selected waived entries to Needed (or Received if a file is linked)."
+        )
+        self._view_all_undo_waive_btn.clicked.connect(
+            lambda: schedule_coro(
+                self._undo_waive_selected_entries(self._view_all_entries)
+            )
+        )
+        toolbar.addWidget(self._view_all_undo_waive_btn, 0, Qt.AlignVCenter)
         self._view_all_open_btn = _icon_btn(
             "mdi.file-eye-outline", "Open receipt for the selected entry"
         )
@@ -1868,6 +1908,9 @@ class ReceiptChasePanel(QWidget):
         )
         approver = str(row.get("approver") or "")
         if include_date:
+            reason = ""
+            if str(row.get("display_status_key") or "") == "waived":
+                reason = str(row.get("waiver_reason") or "").strip()
             mapping = {
                 1: date_label,
                 2: str(row.get("truck_number") or ""),
@@ -1877,6 +1920,7 @@ class ReceiptChasePanel(QWidget):
                 6: str(row.get("ownership") or ""),
                 7: self._fmt_entry_amount(row),
                 8: status_label,
+                9: reason,
             }
         else:
             mapping = {
@@ -2004,18 +2048,37 @@ class ReceiptChasePanel(QWidget):
                 day = _parse_iso_day(row.get("date"))
                 date_label = _fmt_main_day(day) if day else str(row.get("date") or "—")
                 truck = str(row.get("truck_number") or "")
-                values = [
-                    truck,
-                    self._entry_description_text(row),
-                    str(row.get("item") or ""),
-                    str(row.get("approver") or ""),
-                    str(row.get("ownership") or ""),
-                    self._fmt_entry_amount(row),
-                    status_label,
-                    "",
-                ]
+                waiver_reason = (
+                    str(row.get("waiver_reason") or "").strip()
+                    if status_key == "waived"
+                    else ""
+                )
                 if include_date:
-                    values = [date_label, *values]
+                    if waiver_reason:
+                        tips[_VIEW_ALL_COL_REASON] = waiver_reason
+                    values = [
+                        date_label,
+                        truck,
+                        self._entry_description_text(row),
+                        str(row.get("item") or ""),
+                        str(row.get("approver") or ""),
+                        str(row.get("ownership") or ""),
+                        self._fmt_entry_amount(row),
+                        status_label,
+                        waiver_reason or "—",
+                        "",
+                    ]
+                else:
+                    values = [
+                        truck,
+                        self._entry_description_text(row),
+                        str(row.get("item") or ""),
+                        str(row.get("approver") or ""),
+                        str(row.get("ownership") or ""),
+                        self._fmt_entry_amount(row),
+                        status_label,
+                        "",
+                    ]
                 tid = str(row.get("id") or "").strip()
                 self._fill_row(
                     table,
@@ -2075,6 +2138,9 @@ class ReceiptChasePanel(QWidget):
         if isinstance(hdr, ExcelFilterHeaderView):
             hdr.sync_active(self._main_entry_filters)
         self._refresh_footer_count(self._main_entries)
+        self._refresh_entry_sel_hint(
+            self._main_entries, getattr(self, "_main_entry_sel_hint", None)
+        )
 
     def _populate_view_all_entries(self) -> None:
         status_key = (self._view_all_status or "all").strip().lower()
@@ -2118,6 +2184,11 @@ class ReceiptChasePanel(QWidget):
         else:
             self._entry_count_cache = f"{n} entr{'y' if n == 1 else 'ies'}"
         self._refresh_footer_count(self._view_all_entries)
+        # Keep hint in sync when filters/search empty the table (avoids stale
+        # "N entry selected" floating over the empty-state label).
+        self._refresh_entry_sel_hint(
+            self._view_all_entries, getattr(self, "_view_all_sel_hint", None)
+        )
 
     def _entry_filter_source_rows(
         self, rows: list[dict[str, Any]], *, include_date: bool
@@ -2446,15 +2517,104 @@ class ReceiptChasePanel(QWidget):
             )
             waived = int(result.get("waived") or 0)
             skipped = int(result.get("skipped") or 0)
-            self._toast_success(
-                f"Waived {waived} · skipped {skipped} "
-                "(already received/waived)"
-            )
+            self._clear_entry_selection(table)
+            if waived <= 0:
+                self._toast_error(
+                    f"Nothing waived — skipped {skipped} "
+                    "(already received or waived)"
+                )
+            elif skipped:
+                self._toast_success(
+                    f"Waived {waived} · skipped {skipped} "
+                    "(already received/waived)"
+                )
+            else:
+                self._toast_success(f"Waived {waived}")
             await self.refresh_all()
             if self._main_drill_day is not None and table is self._main_entries:
                 await self._load_main_day_entries(self._main_drill_day)
         except Exception as exc:
             self._toast_error(f"Waive failed: {exc}")
+
+    async def _undo_waive_selected_entries(self, table: QTableWidget) -> None:
+        rows = self._selected_entries_from_table(table)
+        waived_rows = [
+            r
+            for r in rows
+            if str(r.get("display_status_key") or "") == "waived"
+        ]
+        if not waived_rows:
+            await await_blocking(
+                lambda: QMessageBox.information(
+                    self,
+                    "Receipts",
+                    "Select one or more waived entries first, then Undo waive.",
+                )
+            )
+            return
+        n = len(waived_rows)
+        ok = await await_blocking(
+            lambda: ask_confirm(
+                self,
+                title="Undo waive",
+                heading=f"Undo waive for {n} entr"
+                + ("y" if n == 1 else "ies")
+                + "?",
+                body=(
+                    "Restores chase to Needed when no file is linked, "
+                    "or Received when a receipt is already attached."
+                ),
+                note="Cancel to leave the waiver in place.",
+                accept_label="Undo waive",
+                cancel_label="Cancel",
+                destructive=False,
+                default_cancel=True,
+            )
+        )
+        if not ok:
+            return
+        tx_ids = [str(r.get("id") or "") for r in waived_rows if r.get("id")]
+        request_ids: list[str] = []
+        seen: set[str] = set()
+        for row in waived_rows:
+            rid = str(row.get("request_id") or "").strip()
+            if rid and rid not in seen:
+                seen.add(rid)
+                request_ids.append(rid)
+        try:
+            result = await undo_waive_receipts(
+                request_ids=request_ids,
+                transaction_ids=tx_ids,
+            )
+            restored = int(result.get("restored") or 0)
+            skipped = int(result.get("skipped") or 0)
+            self._clear_entry_selection(table)
+            if restored <= 0:
+                self._toast_error(
+                    f"Nothing restored — skipped {skipped} (not waived)"
+                )
+            elif skipped:
+                self._toast_success(
+                    f"Restored {restored} · skipped {skipped} (not waived)"
+                )
+            else:
+                self._toast_success(f"Restored {restored} from waived")
+            await self.refresh_all()
+            if self._main_drill_day is not None and table is self._main_entries:
+                await self._load_main_day_entries(self._main_drill_day)
+        except Exception as exc:
+            self._toast_error(f"Undo waive failed: {exc}")
+
+    def _clear_entry_selection(self, table: QTableWidget) -> None:
+        checked_ids = self._checked_ids_for_table(table)
+        checked_ids.clear()
+        table.clearSelection()
+        hint = None
+        if table is getattr(self, "_view_all_entries", None):
+            hint = getattr(self, "_view_all_sel_hint", None)
+        elif table is getattr(self, "_main_entries", None):
+            hint = getattr(self, "_main_entry_sel_hint", None)
+        self._refresh_entry_sel_hint(table, hint)
 
     def _selected_main_entry(self) -> dict[str, Any] | None:
         return self._selected_entry_from_table(self._main_entries)
@@ -2956,7 +3116,8 @@ class ReceiptChasePanel(QWidget):
         lay.setContentsMargins(12, 12, 12, 12)
         hint = QLabel(
             "Grouped by ownership — who still owes paper. "
-            "Double-click or Open to see that owner’s entries in View all."
+            "Double-click or Person to open their receipt dossier "
+            "(needed, entries, submitted, parked, rejected)."
         )
         hint.setStyleSheet(f"color:{_MUTED}; font:12px 'Segoe UI'; background:transparent;")
         hint.setWordWrap(True)
@@ -2981,11 +3142,17 @@ class ReceiptChasePanel(QWidget):
         for col in range(1, 6):
             hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(6, QHeaderView.Fixed)
-        self._chase.setColumnWidth(6, 72)
+        self._chase.setColumnWidth(6, 88)
         lay.addWidget(self._chase, 1)
         row = QHBoxLayout()
         mark_btn = _ghost_btn("Mark reminded", "mdi.bell-check-outline")
         mark_btn.clicked.connect(lambda: schedule_coro(self._mark_selected_chase()))
+        person_btn = _ghost_btn("Open person…", "mdi.account-search-outline")
+        person_btn.setToolTip(
+            "Open this ownership’s receipt dossier — stats, needed, entries, "
+            "submitted, parked, rejected."
+        )
+        person_btn.clicked.connect(self._open_selected_chase_dossier)
         open_btn = _ghost_btn("Open in View all", "mdi.table-large")
         open_btn.setToolTip(
             "Open View all filtered to this ownership’s needed entries "
@@ -2995,6 +3162,7 @@ class ReceiptChasePanel(QWidget):
         copy_btn = _ghost_btn("Copy chase line", "mdi.content-copy")
         copy_btn.clicked.connect(self._copy_chase_line)
         row.addWidget(mark_btn)
+        row.addWidget(person_btn)
         row.addWidget(open_btn)
         row.addWidget(copy_btn)
         row.addStretch()
@@ -3578,11 +3746,11 @@ class ReceiptChasePanel(QWidget):
                 ],
                 row,
             )
-            open_btn = _row_action_btn("Open", "mdi.table-large")
-            open_btn.setFixedWidth(72)
-            open_btn.setToolTip("Open this ownership in View all")
+            open_btn = _row_action_btn("Person", "mdi.account-outline")
+            open_btn.setFixedWidth(88)
+            open_btn.setToolTip("Open this ownership’s receipt dossier")
             open_btn.clicked.connect(
-                lambda *_a, chase_row=row: self._open_chase_in_view_all(chase_row)
+                lambda *_a, chase_row=row: self._open_chase_dossier(chase_row)
             )
             self._chase.setCellWidget(r, open_col, open_btn)
             self._chase.setRowHeight(r, _ROW_H)
@@ -3779,8 +3947,21 @@ class ReceiptChasePanel(QWidget):
             QMessageBox.information(self, "Receipts", "Select one or more inbox files first.")
             return
         self._refresh_link_file_hint()
-        self._tabs.setCurrentIndex(3)
+        self._goto_tab("Link")
         schedule_coro(self._load_candidates())
+
+    async def _ask_park_ownership(self) -> str | None:
+        """Optional 'For:' ownership stamp. None = cancelled; '' = unattributed."""
+        ownership, ok = await await_blocking(
+            lambda: QInputDialog.getText(
+                self,
+                "Park for ownership",
+                "For (ownership person — leave blank if unknown):",
+            )
+        )
+        if not ok:
+            return None
+        return (ownership or "").strip()
 
     async def _park_files(self) -> None:
         paths, _ = await await_blocking(
@@ -3794,11 +3975,16 @@ class ReceiptChasePanel(QWidget):
         )
         if not paths:
             return
+        ownership = await self._ask_park_ownership()
+        if ownership is None:
+            return
         n = len(paths)
+        for_note = f"For: {ownership}" if ownership else "For: (unattributed)"
         ok = await self._confirm_upload(
             heading=f"Park {n} file(s) in Inbox?",
             body=(
                 f"{self._upload_file_names(paths)}\n\n"
+                f"{for_note}\n"
                 "Files are parked as one batch. If any file fails, none are kept."
             ),
             note="Cancel to abort without uploading.",
@@ -3808,9 +3994,13 @@ class ReceiptChasePanel(QWidget):
             return
         show_widget_loading(self, f"Parking {n} file(s)…")
         try:
-            result = await upload_parked_files(paths)
+            result = await upload_parked_files(paths, ownership=ownership)
             total = int(result.get("total") or n)
-            self._toast_success(f"Parked {total} file(s) in Inbox")
+            stamped = str(result.get("intended_ownership") or ownership or "").strip()
+            msg = f"Parked {total} file(s) in Inbox"
+            if stamped:
+                msg += f" · for {stamped}"
+            self._toast_success(msg)
             self._inbox_status = "parked"
             if hasattr(self, "_inbox_chip_buttons"):
                 self._on_inbox_status("parked")
@@ -3854,11 +4044,18 @@ class ReceiptChasePanel(QWidget):
             choice = UploadDestinationChoice(mode="park")
 
         n = len(paths)
+        ownership = ""
         if choice.mode == "park":
+            asked = await self._ask_park_ownership()
+            if asked is None:
+                return
+            ownership = asked
+            for_note = f"For: {ownership}" if ownership else "For: (unattributed)"
             ok = await self._confirm_upload(
                 heading=f"Park {n} file(s) in Receipts inbox?",
                 body=(
                     f"{self._upload_file_names(paths)}\n\n"
+                    f"{for_note}\n"
                     "Parked as one batch — if any file fails, none are kept."
                 ),
                 accept_label="Park",
@@ -3879,9 +4076,15 @@ class ReceiptChasePanel(QWidget):
         show_widget_loading(self, f"Uploading {n} file(s)…")
         try:
             if choice.mode == "park":
-                result = await upload_parked_files(paths)
+                result = await upload_parked_files(paths, ownership=ownership)
                 total = int(result.get("total") or n)
-                self._toast_success(f"Parked {total} file(s) in Receipts inbox")
+                stamped = str(
+                    result.get("intended_ownership") or ownership or ""
+                ).strip()
+                msg = f"Parked {total} file(s) in Receipts inbox"
+                if stamped:
+                    msg += f" · for {stamped}"
+                self._toast_success(msg)
                 self._inbox_status = "parked"
                 if hasattr(self, "_inbox_chip_buttons"):
                     self._on_inbox_status("parked")
@@ -3902,9 +4105,16 @@ class ReceiptChasePanel(QWidget):
                 note=choice.note,
             )
             total = int(result.get("total") or n)
-            dest = choice.label or choice.ref_key or choice.kind
+            api_dest = result.get("destination") or {}
+            dest = (
+                str(api_dest.get("label") or "").strip()
+                or choice.label
+                or choice.ref_key
+                or choice.kind
+            )
             self._toast_success(
-                f"Filed {total} file(s) to Records · {choice.kind} · {dest}"
+                f"Filed {total} file(s) to Records · {choice.kind} · {dest} "
+                "(open Paperwork → Records to browse)"
             )
         except ApiError as exc:
             self._toast_error(f"Upload failed: {exc}")
@@ -4054,7 +4264,58 @@ class ReceiptChasePanel(QWidget):
     def _on_chase_double_clicked(self, row: int, _col: int) -> None:
         if row < 0 or row >= len(self._chase_rows):
             return
-        self._open_chase_in_view_all(self._chase_rows[row])
+        self._open_chase_dossier(self._chase_rows[row])
+
+    def _open_selected_chase_dossier(self) -> None:
+        row = self._selected_chase()
+        if not row:
+            QMessageBox.information(
+                self, "Receipts", "Select an ownership group first."
+            )
+            return
+        self._open_chase_dossier(row)
+
+    def _open_chase_dossier(self, row: dict[str, Any] | None) -> None:
+        if not isinstance(row, dict):
+            return
+        ownership = str(row.get("ownership") or "").strip()
+        if ownership in {"", "(blank)"}:
+            QMessageBox.information(
+                self, "Receipts", "This chase group has no ownership name."
+            )
+            return
+        dlg = PersonReceiptDossierDialog(
+            self,
+            ownership=ownership,
+            on_open_view_all=self._open_person_in_view_all,
+            on_link_parked=self._link_person_parked,
+        )
+        dlg.exec()
+
+    def _goto_tab(self, name: str) -> None:
+        needle = (name or "").strip().lower()
+        for i in range(self._tabs.count()):
+            if self._tabs.tabText(i).strip().lower() == needle:
+                self._tabs.setCurrentIndex(i)
+                return
+
+    def _open_person_in_view_all(self, ownership: str) -> None:
+        self._open_chase_in_view_all({"ownership": ownership})
+
+    def _link_person_parked(self, ownership: str, file_ids: list[str]) -> None:
+        ids = [str(fid).strip() for fid in file_ids if str(fid).strip()]
+        self._link_stash_ids = set(ids)
+        self._inbox_checked_ids.update(ids)
+        if hasattr(self, "_own_filter"):
+            self._own_filter.setText(ownership or "")
+        self._goto_tab("Link")
+        self._refresh_link_file_hint()
+        schedule_coro(self._load_candidates())
+        label = ownership or "—"
+        self._status.setText(f"Link · {label} · {len(ids)} parked file(s)")
+        self._toast_success(
+            f"Link ready for {label} — {len(ids)} parked file(s) selected"
+        )
 
     def _open_selected_chase_in_view_all(self) -> None:
         row = self._selected_chase()
@@ -4123,7 +4384,7 @@ class ReceiptChasePanel(QWidget):
         schedule_coro(self._load_view_all_entries())
 
     def _selected_file_ids(self) -> list[str]:
-        """Union of highlighted inbox rows and checkbox-checked rows."""
+        """Union of highlighted inbox rows, checkbox-checked rows, and dossier stash."""
         ids: list[str] = []
         seen: set[str] = set()
 
@@ -4141,6 +4402,10 @@ class ReceiptChasePanel(QWidget):
             sn = self._inbox.item(r, 0)
             if self._item_is_checked(sn):
                 _add(sn.data(Qt.UserRole) if sn else {})
+        for fid in getattr(self, "_link_stash_ids", set()):
+            if fid and fid not in seen:
+                seen.add(fid)
+                ids.append(fid)
         return ids
 
     def _selected_file_row(self) -> dict[str, Any] | None:
@@ -4397,11 +4662,20 @@ class ReceiptChasePanel(QWidget):
             )
             waived = int(result.get("waived") or 0)
             skipped = int(result.get("skipped") or 0)
-            self._toast_success(
-                f"Waived {waived} · skipped {skipped} (already received/waived)"
-            )
             for rid in request_ids:
                 self._request_checked_ids.discard(rid)
+            if waived <= 0:
+                self._toast_error(
+                    f"Nothing waived — skipped {skipped} "
+                    "(already received or waived)"
+                )
+            elif skipped:
+                self._toast_success(
+                    f"Waived {waived} · skipped {skipped} "
+                    "(already received/waived)"
+                )
+            else:
+                self._toast_success(f"Waived {waived}")
             await self.refresh_all()
             self._refresh_request_sel_hint()
         except Exception as exc:
@@ -4621,7 +4895,7 @@ class ReceiptChasePanel(QWidget):
         tx_ids = self._selected_tx_ids()
         if not file_ids:
             QMessageBox.information(self, "Receipts", "Select inbox file(s) on the Inbox tab.")
-            self._tabs.setCurrentIndex(4)  # Inbox
+            self._goto_tab("Inbox")
             return
         if not tx_ids:
             QMessageBox.information(self, "Receipts", "Select one or more rows below.")
@@ -4642,8 +4916,12 @@ class ReceiptChasePanel(QWidget):
                 f"Linked {result.get('linked')} {kind} connection(s) "
                 f"({result.get('files')} file(s) × {result.get('transactions')} row(s))"
             )
+            self._link_stash_ids.clear()
+            for fid in file_ids:
+                self._inbox_checked_ids.discard(fid)
             await self.refresh_all()
             await self._load_candidates()
+            self._refresh_link_file_hint()
         except Exception as exc:
             QMessageBox.critical(self, "Link failed", str(exc))
 

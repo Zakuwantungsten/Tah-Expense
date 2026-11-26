@@ -217,8 +217,30 @@ def test_serialize_entry_includes_attachment_refs() -> None:
     assert row["attachment_count"] == 1
     assert row["attachments"][0]["filename"] == "half.jpg"
     assert row["date"] == "2026-05-10"
-    assert row["truck_number"] == "T 123 ABC"
-    assert row["description"] == "fuel top-up"
+    assert row["waiver_reason"] == ""
+
+
+def test_serialize_entry_includes_waiver_reason() -> None:
+    tx_id = ObjectId()
+    row = serialize_receipt_entry_row(
+        {
+            "_id": tx_id,
+            "date": datetime(2026, 5, 10, 9, 0, 0),
+            "amount": 500,
+            "currency": "TZS",
+            "item": "Diesel",
+            "ownership": "Ali",
+            "receipt_status": "missing",
+            "attachments": [],
+        },
+        {
+            "_id": ObjectId(),
+            "status": "waived",
+            "waiver_reason": "Owner lost the slip",
+        },
+    )
+    assert row["display_status_key"] == "waived"
+    assert row["waiver_reason"] == "Owner lost the slip"
 
 
 @pytest.mark.asyncio
@@ -301,6 +323,7 @@ async def test_list_receipt_entries_range_and_status_filter() -> None:
                 "_id": ObjectId(),
                 "transaction_id": tx_waived,
                 "status": "waived",
+                "waiver_reason": "Not needed",
             },
             {
                 "_id": ObjectId(),
@@ -339,6 +362,49 @@ async def test_list_receipt_entries_range_and_status_filter() -> None:
     waived_only = await list_receipt_entries(db, status="waived")
     assert len(waived_only) == 1
     assert waived_only[0]["display_status_key"] == "waived"
+    assert waived_only[0]["waiver_reason"] == "Not needed"
+
+
+@pytest.mark.asyncio
+async def test_list_receipt_entries_ownership_filter() -> None:
+    d1 = datetime(2026, 7, 1, 10, 0, 0)
+    tx_ali = ObjectId()
+    tx_bob = ObjectId()
+    db = _db(
+        transactions=[
+            {
+                "_id": tx_ali,
+                "date": d1,
+                "receipt_status": "pending",
+                "ownership": "Ali",
+                "amount": 1,
+            },
+            {
+                "_id": tx_bob,
+                "date": d1,
+                "receipt_status": "pending",
+                "ownership": "BOB",
+                "amount": 2,
+            },
+        ],
+        requests=[
+            {"_id": ObjectId(), "transaction_id": tx_ali, "status": "needed"},
+            {"_id": ObjectId(), "transaction_id": tx_bob, "status": "needed"},
+        ],
+    )
+    ali_rows = await list_receipt_entries(db, ownership="ali")
+    assert len(ali_rows) == 1
+    assert ali_rows[0]["id"] == str(tx_ali)
+    assert ali_rows[0]["ownership"] == "Ali"
+
+    bob_rows = await list_receipt_entries(
+        db,
+        date_from=date(2026, 7, 1),
+        date_to=date(2026, 7, 31),
+        ownership="BOB",
+    )
+    assert len(bob_rows) == 1
+    assert bob_rows[0]["id"] == str(tx_bob)
 
 
 @pytest.mark.asyncio

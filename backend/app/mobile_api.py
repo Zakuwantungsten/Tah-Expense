@@ -33,6 +33,7 @@ from .receipt_ops import (
     ownership_targets_for_user,
     register_expo_push_token,
     request_summary,
+    resolve_intended_ownership,
     store_receipt_file_bytes,
     waive_receipt_request,
 )
@@ -249,8 +250,13 @@ async def upload_early_receipt_files(
     request: Request,
     user: Authenticated,
     files: list[UploadFile] = File(...),
+    ownership: str = Form(""),
 ) -> dict[str, Any]:
-    """Early upload with no open request — parks unmatched for desk linking."""
+    """Early upload with no open request — parks unmatched for desk linking.
+
+    Stamps ``intended_ownership`` from optional form ``ownership``, else the
+    caller's people/full_name targets so the person dossier can show parked files.
+    """
     if not files:
         raise ApiError(422, "files_required", "At least one file is required")
     await _require_receipt_storage(request)
@@ -258,6 +264,9 @@ async def upload_early_receipt_files(
     db = _database(request)
     base = await resolve_attachments_directory(request.app.state.settings, db)
     actor_id = _actor_id(user)
+    intended, person_id = await resolve_intended_ownership(
+        db, explicit=ownership, user=user
+    )
     saved: list[dict[str, Any]] = []
     for upload in files:
         filename = upload.filename or "file"
@@ -277,6 +286,8 @@ async def upload_early_receipt_files(
                 source="expo_early",
                 actor_id=actor_id,
                 claimed_content_type=claimed,
+                intended_ownership=intended,
+                asked_of_person_id=person_id,
             )
         except ValueError as exc:
             raise ApiError(422, "invalid_attachment", str(exc)) from None
@@ -290,9 +301,16 @@ async def upload_early_receipt_files(
         request=request,
         entity_type="receipt_file",
         entity_ids=[str(m.get("id")) for m in saved][:40],
-        details={"files": len(saved)},
+        details={
+            "files": len(saved),
+            "intended_ownership": intended or None,
+        },
     )
-    return {"files": json_safe(saved), "total": len(saved)}
+    return {
+        "files": json_safe(saved),
+        "total": len(saved),
+        "intended_ownership": intended or None,
+    }
 
 
 @mobile.post(

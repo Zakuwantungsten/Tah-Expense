@@ -182,6 +182,57 @@ async def find_person_for_ownership(db: Any, ownership: str) -> dict[str, Any] |
     return await db.people.find_one({"name": name})
 
 
+async def uploader_ids_for_ownership(db: Any, ownership: str) -> set[ObjectId]:
+    """User ids linked to a people row for this ownership (early-park fallback)."""
+    person = await find_person_for_ownership(db, ownership)
+    if not person:
+        return set()
+    out: set[ObjectId] = set()
+    raw = person.get("user_id")
+    if isinstance(raw, ObjectId):
+        out.add(raw)
+    elif raw:
+        try:
+            out.add(ObjectId(str(raw)))
+        except Exception:
+            pass
+    return out
+
+
+def file_matches_ownership(
+    doc: dict[str, Any],
+    ownership: str,
+    *,
+    linked_ownerships: list[str] | None = None,
+    uploader_ids: set[ObjectId] | None = None,
+) -> bool:
+    """Attribute a receipt_file to an ownership for person-scoped lists.
+
+    Order: ``intended_ownership`` (Phase 3 stamp) → linked tx ownership →
+    ``uploaded_by`` via people.user_id.
+    """
+    name = normalize_person_name(ownership)
+    if not name:
+        return True
+    intended = normalize_person_name(str(doc.get("intended_ownership") or ""))
+    if intended and intended == name:
+        return True
+    for raw in linked_ownerships or []:
+        if normalize_person_name(raw) == name:
+            return True
+    uid = doc.get("uploaded_by")
+    if uploader_ids:
+        if isinstance(uid, ObjectId) and uid in uploader_ids:
+            return True
+        if uid:
+            try:
+                if ObjectId(str(uid)) in uploader_ids:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
 async def ensure_receipt_request(db: Any, tx: dict[str, Any]) -> dict[str, Any] | None:
     """Open a needed request when the row should be chased and none is linked.
 
@@ -274,25 +325,31 @@ async def mark_request_received(
     *,
     file_id: str | None = None,
 ) -> None:
+    """Mark the open request received. Full attach also clears an explicit waiver."""
+    now = utcnow()
     update: dict[str, Any] = {
         "$set": {
             "status": "received",
             "immediate_notify_pending": False,
-            "updated_at": utcnow(),
+            "updated_at": now,
+            # Upload/attach supersedes waive — clear sticky waiver fields.
+            "waiver_reason": None,
+            "waived_by": None,
+            "waived_at": None,
         },
     }
     if file_id:
         update["$addToSet"] = {"file_ids": file_id}
-    # Only stamp received_notify_pending when first transitioning to received.
+    # Only stamp received_notify_pending when first transitioning from needed.
     existing = await db.receipt_requests.find_one(
-        {"transaction_id": tx_id, "status": {"$ne": "waived"}},
+        {"transaction_id": tx_id},
         {"status": 1, "received_notified_at": 1},
     )
     was_needed = bool(existing) and str(existing.get("status") or "") == "needed"
     if was_needed and not existing.get("received_notified_at"):
         update["$set"]["received_notify_pending"] = True
     await db.receipt_requests.update_one(
-        {"transaction_id": tx_id, "status": {"$ne": "waived"}},
+        {"transaction_id": tx_id},
         update,
     )
     if was_needed and not (existing or {}).get("received_notified_at"):
@@ -311,18 +368,12 @@ async def mark_request_received(
 
 
 async def sync_receipt_status_after_attach(db: Any, tx_id: ObjectId) -> None:
-    """Attach/link → received unless the row was explicitly marked missing/waived."""
+    """Attach/link → received. Full upload clears an explicit waiver."""
     doc = await db.transactions.find_one(
         {"_id": tx_id}, {"receipt_status": 1, "attachments": 1, "ownership": 1, "category_id": 1, "category_name": 1, "item": 1}
     )
     if not doc:
         return
-    status = str(doc.get("receipt_status") or "pending").strip().lower()
-    if status == "missing":
-        # Explicit missing / waiver path stays until cleared.
-        request = await db.receipt_requests.find_one({"transaction_id": tx_id})
-        if request and request.get("status") == "waived":
-            return
     await db.transactions.update_one(
         {"_id": tx_id},
         {"$set": {"receipt_status": "received"}},
@@ -459,6 +510,50 @@ async def quarantine_rejected_upload(
     return {"id": file_id, "quarantine_path": relative, "reason": reason, "code": code}
 
 
+async def resolve_intended_ownership(
+    db: Any,
+    *,
+    explicit: str = "",
+    user: dict[str, Any] | None = None,
+) -> tuple[str, ObjectId | None]:
+    """Resolve ownership stamp for early park (explicit → people/user targets).
+
+    Returns ``(normalized_name, asked_of_person_id)``. Empty name means unattributed
+    (uploader → people.user_id fallback still applies in person-scoped lists).
+    """
+    name = normalize_person_name(explicit)
+    if name:
+        person = await find_person_for_ownership(db, name)
+        pid = person.get("_id") if person and isinstance(person.get("_id"), ObjectId) else None
+        return name, pid
+    if not user:
+        return "", None
+    targets = await ownership_targets_for_user(db, user)
+    names = list(targets.get("names") or [])
+    person_ids = list(targets.get("person_ids") or [])
+    full = normalize_person_name(str(user.get("full_name") or ""))
+    pick = ""
+    if full and full in names:
+        pick = full
+    elif names:
+        pick = str(names[0] or "")
+    else:
+        for key in ("full_name", "username"):
+            cand = normalize_person_name(str(user.get(key) or ""))
+            if cand:
+                pick = cand
+                break
+    if not pick:
+        return "", None
+    person = await find_person_for_ownership(db, pick)
+    pid = person.get("_id") if person and isinstance(person.get("_id"), ObjectId) else None
+    if pid is None and person_ids:
+        first = person_ids[0]
+        if isinstance(first, ObjectId):
+            pid = first
+    return pick, pid
+
+
 async def store_receipt_file_bytes(
     db: Any,
     base: Path,
@@ -470,8 +565,14 @@ async def store_receipt_file_bytes(
     request_id: ObjectId | None = None,
     transaction_id: ObjectId | None = None,
     claimed_content_type: str | None = None,
+    intended_ownership: str = "",
+    asked_of_person_id: ObjectId | None = None,
 ) -> dict[str, Any]:
-    """Write bytes under ``files/<id>_<name>`` and insert ``receipt_files``."""
+    """Write bytes under ``files/<id>_<name>`` and insert ``receipt_files``.
+
+    Early park (no ``transaction_id``) may stamp ``intended_ownership`` so the
+    person dossier / Inbox can attribute unmatched files before Link.
+    """
     try:
         checked = validate_receipt_upload(
             filename, content, claimed_content_type=claimed_content_type
@@ -527,6 +628,7 @@ async def store_receipt_file_bytes(
     if actor_id is not None:
         meta["uploaded_by"] = actor_id
 
+    ownership_q = normalize_person_name(intended_ownership)
     doc = {
         "_id": file_id,
         "original_filename": original_name,
@@ -547,7 +649,16 @@ async def store_receipt_file_bytes(
         "rejected_by": None,
         "rejection_reason": None,
         "security_rejected": False,
+        "intended_ownership": None,
+        "asked_of_person_id": None,
     }
+    # Stamp person attribution on unmatched early park only.
+    if transaction_id is None and ownership_q:
+        doc["intended_ownership"] = ownership_q
+        doc["asked_of_person_id"] = asked_of_person_id
+        meta["intended_ownership"] = ownership_q
+        if asked_of_person_id is not None:
+            meta["asked_of_person_id"] = str(asked_of_person_id)
     await db.receipt_files.insert_one(doc)
     return meta
 
@@ -603,13 +714,18 @@ async def link_file_to_transaction(
             },
         )
         req_set: dict[str, Any] = {
+            # Partial attach on a waived row reopens chase and clears waiver.
+            "status": "needed",
             "partial_receipt": True,
             "updated_at": now,
+            "waiver_reason": None,
+            "waived_by": None,
+            "waived_at": None,
         }
         if note:
             req_set["partial_note"] = note
         await db.receipt_requests.update_one(
-            {"transaction_id": tx_id, "status": {"$ne": "waived"}},
+            {"transaction_id": tx_id},
             {"$set": req_set, "$addToSet": {"file_ids": file_id}},
         )
     else:
@@ -735,6 +851,108 @@ async def desk_waive_receipts(
         "waived": waived,
         "skipped": skipped,
         "request_ids": waived_ids,
+    }
+
+
+async def undo_waive_receipt_request(
+    db: Any,
+    request_doc: dict[str, Any],
+) -> dict[str, Any]:
+    """Reopen a waived request — restore Needed (or Received if a file is linked)."""
+    status = str(request_doc.get("status") or "").strip().lower()
+    if status != "waived":
+        raise ValueError("Request is not waived")
+    tx_id = request_doc.get("transaction_id")
+    has_file = False
+    if isinstance(tx_id, ObjectId):
+        tx = await db.transactions.find_one(
+            {"_id": tx_id}, {"attachments": 1, "receipt_status": 1}
+        )
+        atts = list((tx or {}).get("attachments") or [])
+        has_file = any(
+            isinstance(att, dict)
+            and (att.get("file_id") or att.get("id") or att.get("stored_name"))
+            for att in atts
+        )
+    now = utcnow()
+    if has_file:
+        req_status = "received"
+        tx_status = "received"
+    else:
+        req_status = "needed"
+        tx_status = "pending"
+    await db.receipt_requests.update_one(
+        {"_id": request_doc["_id"]},
+        {
+            "$set": {
+                "status": req_status,
+                "waiver_reason": None,
+                "waived_by": None,
+                "waived_at": None,
+                "updated_at": now,
+            }
+        },
+    )
+    if isinstance(tx_id, ObjectId):
+        await db.transactions.update_one(
+            {"_id": tx_id},
+            {"$set": {"receipt_status": tx_status}},
+        )
+    return await db.receipt_requests.find_one({"_id": request_doc["_id"]})
+
+
+async def desk_undo_waive_receipts(
+    db: Any,
+    *,
+    request_ids: list[ObjectId] | None = None,
+    transaction_ids: list[ObjectId] | None = None,
+) -> dict[str, Any]:
+    """Desk bulk undo-waive — by request id and/or transaction id."""
+    req_ids = list(request_ids or [])
+    tx_ids = list(transaction_ids or [])
+    if not req_ids and not tx_ids:
+        raise ValueError("Select at least one waived entry or receipt request")
+
+    seen: set[ObjectId] = set()
+    docs: list[dict[str, Any]] = []
+
+    for rid in req_ids:
+        if not isinstance(rid, ObjectId) or rid in seen:
+            continue
+        doc = await db.receipt_requests.find_one({"_id": rid})
+        if not doc:
+            continue
+        seen.add(rid)
+        docs.append(doc)
+
+    for tid in tx_ids:
+        if not isinstance(tid, ObjectId):
+            continue
+        existing = await db.receipt_requests.find_one({"transaction_id": tid})
+        if not existing:
+            continue
+        oid = existing.get("_id")
+        if isinstance(oid, ObjectId) and oid not in seen:
+            seen.add(oid)
+            docs.append(existing)
+
+    restored = 0
+    skipped = 0
+    restored_ids: list[str] = []
+    for doc in docs:
+        status = str(doc.get("status") or "").strip().lower()
+        if status != "waived":
+            skipped += 1
+            continue
+        updated = await undo_waive_receipt_request(db, doc)
+        restored += 1
+        if updated and updated.get("_id") is not None:
+            restored_ids.append(str(updated["_id"]))
+
+    return {
+        "restored": restored,
+        "skipped": skipped,
+        "request_ids": restored_ids,
     }
 
 
@@ -1720,6 +1938,7 @@ def serialize_receipt_entry_row(
         "display_status_key": status_key,
         "partial": status_key == RECEIPT_DISPLAY_PARTIAL,
         "partial_note": partial_note,
+        "waiver_reason": str(req.get("waiver_reason") or "").strip(),
         "attachment_count": len(attachments),
         "attachments": attachments,
         "primary_file_id": (primary or {}).get("file_id"),
@@ -1818,12 +2037,16 @@ async def list_receipt_day_entries(
     *,
     day: date,
     cashier_id: ObjectId | None = None,
+    ownership: str = "",
     limit: int = 500,
 ) -> list[dict[str, Any]]:
     """Entries for one register day (Main drill). Newest amount order not required;
     stable by date then id.
+
+    Optional ``ownership`` narrows to that person's register rows (normalized name).
     """
     row_cap = max(1, min(int(limit or 500), 2000))
+    ownership_q = normalize_person_name(ownership)
     docs = await db.transactions.find(
         _receipt_tx_query(cashier_id, day=day), _RECEIPT_ENTRY_PROJECTION
     ).to_list(length=row_cap)
@@ -1831,6 +2054,10 @@ async def list_receipt_day_entries(
         tx
         for tx in docs
         if tx_register_calendar_day(tx) == day
+        and (
+            not ownership_q
+            or normalize_person_name(str(tx.get("ownership") or "")) == ownership_q
+        )
     ]
     matched.sort(
         key=lambda tx: (
@@ -1855,6 +2082,7 @@ async def list_receipt_entries(
     date_to: date | None = None,
     status: str = "all",
     cashier_id: ObjectId | None = None,
+    ownership: str = "",
     limit: int = 500,
     scan_limit: int = 20000,
 ) -> list[dict[str, Any]]:
@@ -1862,10 +2090,12 @@ async def list_receipt_entries(
 
     ``status`` filters on ``display_status_key`` (needed / received / partial /
     waived / no_receipt / pending) or ``all``.
+    ``ownership`` filters transaction ownership (normalized person name).
     """
     row_cap = max(1, min(int(limit or 500), 2000))
     scan_cap = max(row_cap, min(int(scan_limit or 20000), 50000))
     status_key = (status or "all").strip().lower()
+    ownership_q = normalize_person_name(ownership)
     docs = await _scan_txs_newest_register_first(
         db,
         _receipt_tx_query(cashier_id, date_from=date_from, date_to=date_to),
@@ -1881,6 +2111,8 @@ async def list_receipt_entries(
         if date_from is not None and day < date_from:
             continue
         if date_to is not None and day > date_to:
+            continue
+        if ownership_q and normalize_person_name(str(tx.get("ownership") or "")) != ownership_q:
             continue
         filtered.append(tx)
 
@@ -1910,31 +2142,76 @@ async def receipt_compliance_summary(
     *,
     overdue_hours: float = 48.0,
     reminder_threshold: int = 3,
+    ownership: str = "",
 ) -> dict[str, Any]:
-    """One-shot KPI counts for the Receipts desk header."""
+    """One-shot KPI counts for the Receipts desk header.
+
+    Optional ``ownership`` scopes request KPIs to ``asked_of_name`` and file KPIs
+    to files attributed to that person (linked tx / intended_ownership / uploader).
+    """
     now = datetime.now(UTC)
     today_start = _today_start_naive(now)
     threshold = max(1, int(reminder_threshold))
     overdue_h = float(overdue_hours)
+    ownership_q = normalize_person_name(ownership)
 
-    open_rows = await db.receipt_requests.find({"status": "needed"}).to_list(length=8000)
+    req_base: dict[str, Any] = {}
+    if ownership_q:
+        req_base["asked_of_name"] = ownership_q
+
+    open_query = {"status": "needed", **req_base}
+    open_rows = await db.receipt_requests.find(open_query).to_list(length=8000)
     today_requested = await db.receipt_requests.count_documents(
-        {"opened_at": {"$gte": today_start}}
+        {"opened_at": {"$gte": today_start}, **req_base}
     )
-    received = await db.receipt_requests.count_documents({"status": "received"})
-    waived = await db.receipt_requests.count_documents({"status": "waived"})
-    unmatched = await db.receipt_files.count_documents(
-        {"inbox_status": INBOX_UNMATCHED}
+    received = await db.receipt_requests.count_documents(
+        {"status": "received", **req_base}
     )
-    matched_pending = await db.receipt_files.count_documents(
-        {"inbox_status": INBOX_MATCHED}
+    waived = await db.receipt_requests.count_documents(
+        {"status": "waived", **req_base}
     )
-    approved_files = await db.receipt_files.count_documents(
-        {"inbox_status": INBOX_APPROVED}
-    )
-    rejected_files = await db.receipt_files.count_documents(
-        {"inbox_status": INBOX_REJECTED}
-    )
+
+    if not ownership_q:
+        unmatched = await db.receipt_files.count_documents(
+            {"inbox_status": INBOX_UNMATCHED}
+        )
+        matched_pending = await db.receipt_files.count_documents(
+            {"inbox_status": INBOX_MATCHED}
+        )
+        approved_files = await db.receipt_files.count_documents(
+            {"inbox_status": INBOX_APPROVED}
+        )
+        rejected_files = await db.receipt_files.count_documents(
+            {"inbox_status": INBOX_REJECTED}
+        )
+    else:
+        uploader_ids = await uploader_ids_for_ownership(db, ownership_q)
+        file_docs = await db.receipt_files.find(
+            {"record": {"$exists": False}}
+        ).to_list(length=8000)
+        linked_by_file = await _linked_entry_summaries_for_files(db, file_docs)
+        unmatched = matched_pending = approved_files = rejected_files = 0
+        for doc in file_docs:
+            fid = str(doc.get("_id") or "")
+            linked = list(linked_by_file.get(fid) or [])
+            linked_owns = [str(e.get("ownership") or "") for e in linked]
+            if not file_matches_ownership(
+                doc,
+                ownership_q,
+                linked_ownerships=linked_owns,
+                uploader_ids=uploader_ids,
+            ):
+                continue
+            status = str(doc.get("inbox_status") or "").strip().lower()
+            if status == INBOX_UNMATCHED:
+                unmatched += 1
+            elif status == INBOX_MATCHED:
+                matched_pending += 1
+            elif status == INBOX_APPROVED:
+                approved_files += 1
+            elif status == INBOX_REJECTED:
+                rejected_files += 1
+
     parked = int(unmatched) + int(matched_pending)
 
     still_needed = 0
@@ -1962,7 +2239,125 @@ async def receipt_compliance_summary(
         "rejected_files": int(rejected_files),
         "overdue_hours": overdue_h,
         "reminder_threshold": threshold,
+        "ownership": ownership_q or None,
         "as_of": now,
+    }
+
+
+async def person_receipt_dossier(
+    db: Any,
+    ownership: str,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    overdue_hours: float = 48.0,
+    reminder_threshold: int = 3,
+    entry_limit: int = 500,
+    request_limit: int = 400,
+    file_limit: int = 200,
+) -> dict[str, Any]:
+    """Compose a person-scoped receipt dossier for the desk.
+
+    Sections reuse existing list helpers with ``ownership`` scoping from Phase 1:
+    stats, needed requests, register entries, submitted (library), parked, rejected.
+    """
+    ownership_q = normalize_person_name(ownership)
+    if not ownership_q:
+        raise ValueError("ownership is required")
+
+    person = await find_person_for_ownership(db, ownership_q)
+    person_payload: dict[str, Any] | None = None
+    if person:
+        pid = person.get("_id")
+        uid = person.get("user_id")
+        person_payload = {
+            "id": str(pid) if pid is not None else None,
+            "name": normalize_person_name(str(person.get("name") or "")) or ownership_q,
+            "active": bool(person.get("active", True)),
+            "user_id": str(uid) if uid is not None else None,
+            "receives_receipt_requests": person.get("receives_receipt_requests"),
+        }
+
+    stats = await receipt_compliance_summary(
+        db,
+        overdue_hours=overdue_hours,
+        reminder_threshold=reminder_threshold,
+        ownership=ownership_q,
+    )
+
+    needed = await list_receipt_requests(
+        db,
+        preset="needed",
+        ownership=ownership_q,
+        limit=max(1, min(int(request_limit or 400), 1000)),
+    )
+
+    entries = await list_receipt_entries(
+        db,
+        date_from=date_from,
+        date_to=date_to,
+        status="all",
+        ownership=ownership_q,
+        limit=max(1, min(int(entry_limit or 500), 2000)),
+    )
+    partial_count = sum(
+        1 for row in entries if str(row.get("display_status_key") or "") == "partial"
+    )
+    with_receipt_count = sum(
+        1
+        for row in entries
+        if str(row.get("display_status_key") or "") in {"received", "partial"}
+        or bool(row.get("primary_file_id"))
+    )
+
+    # Submitted files use upload-date lookback (default last 30d when unset).
+    # Register date_from/date_to stay on entries only — early park uploads are
+    # often outside the register window being inspected.
+    submitted = await list_receipt_library(
+        db,
+        ownership=ownership_q,
+        status="all",
+        limit=max(1, min(int(file_limit or 200), 500)),
+    )
+    # Submitted = matched/approved evidence (not unmatched park / reject).
+    submitted = [
+        row
+        for row in submitted
+        if str(row.get("inbox_status") or "").strip().lower()
+        in {INBOX_MATCHED, INBOX_APPROVED}
+    ]
+
+    parked = await list_inbox_files(
+        db,
+        status="parked",
+        ownership=ownership_q,
+        limit=max(1, min(int(file_limit or 200), 500)),
+    )
+    rejected = await list_inbox_files(
+        db,
+        status="rejected",
+        ownership=ownership_q,
+        limit=max(1, min(int(file_limit or 200), 500)),
+    )
+
+    stats_out = dict(stats)
+    stats_out["partial"] = partial_count
+    stats_out["entries"] = len(entries)
+    stats_out["entries_with_receipt"] = with_receipt_count
+    stats_out["needed_requests"] = len(needed)
+    stats_out["submitted_files"] = len(submitted)
+
+    return {
+        "ownership": ownership_q,
+        "person": person_payload,
+        "stats": stats_out,
+        "needed": needed,
+        "entries": entries,
+        "submitted": submitted,
+        "parked": parked,
+        "rejected": rejected,
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
     }
 
 
@@ -2024,16 +2419,21 @@ async def list_inbox_files(
     *,
     status: str = "parked",
     unmatched_only: bool = False,
+    ownership: str = "",
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """List receipt files. ``parked`` = unmatched + matched (not yet permanent).
 
     Paperwork → Records filings (``record`` set) are excluded — they have their
     own browse API and must not clutter chase Inbox.
+
+    Optional ``ownership`` keeps files attributed to that person (linked row,
+    ``intended_ownership``, or uploader → people.user_id).
     """
     key = (status or "parked").strip().lower()
     if unmatched_only:
         key = INBOX_UNMATCHED
+    ownership_q = normalize_person_name(ownership)
     query: dict[str, Any]
     if key == "parked":
         query = {"inbox_status": {"$in": list(PARKED_STATUSES)}}
@@ -2048,13 +2448,27 @@ async def list_inbox_files(
         query = {"inbox_status": {"$in": list(PARKED_STATUSES)}}
     if key != "quarantine":
         query["record"] = {"$exists": False}
-    cursor = db.receipt_files.find(query).sort("uploaded_at", -1).limit(limit)
-    docs = await cursor.to_list(length=limit)
+    # Over-fetch when ownership may drop rows after attribution.
+    fetch_n = min(500, max(limit, limit * 3 if ownership_q else limit))
+    cursor = db.receipt_files.find(query).sort("uploaded_at", -1).limit(fetch_n)
+    docs = await cursor.to_list(length=fetch_n)
     linked_by_file = await _linked_entry_summaries_for_files(db, docs)
+    uploader_ids = (
+        await uploader_ids_for_ownership(db, ownership_q) if ownership_q else set()
+    )
     items: list[dict[str, Any]] = []
     for doc in docs:
         fid = str(doc.get("_id") or "")
         linked = list(linked_by_file.get(fid) or [])
+        if ownership_q:
+            linked_owns = [str(e.get("ownership") or "") for e in linked]
+            if not file_matches_ownership(
+                doc,
+                ownership_q,
+                linked_ownerships=linked_owns,
+                uploader_ids=uploader_ids,
+            ):
+                continue
         request_ids = [
             str(e.get("request_id"))
             for e in linked
@@ -2086,6 +2500,10 @@ async def list_inbox_files(
                 "linked_count": len(linked),
                 "linked_entries": linked,
                 "request_ids": uniq_req,
+                "intended_ownership": normalize_person_name(
+                    str(doc.get("intended_ownership") or "")
+                )
+                or None,
                 "rejection_reason": doc.get("rejection_reason") or "",
                 "approved_at": doc.get("approved_at"),
                 "rejected_at": doc.get("rejected_at"),
@@ -2095,6 +2513,8 @@ async def list_inbox_files(
                 "quarantine_path": doc.get("quarantine_path") or "",
             }
         )
+        if len(items) >= limit:
+            break
     return items
 
 
@@ -2197,8 +2617,9 @@ async def list_receipt_library(
 ) -> list[dict[str, Any]]:
     """Submitted-receipts inquiry over ``receipt_files`` + linked transaction fields.
 
-    Date filters ``uploaded_at``. Item / payee / ownership require at least one
-    linked transaction that matches (unmatched files drop out when those are set).
+    Date filters ``uploaded_at``. Item / payee require at least one linked
+    transaction that matches. ``ownership`` also matches ``intended_ownership``
+    or uploader → people.user_id (so early parked files for a person show up).
     """
     if date_from is None and date_to is None:
         end = utcnow()
@@ -2232,8 +2653,11 @@ async def list_receipt_library(
         query["inbox_status"] = {"$in": list(PARKED_STATUSES)}
 
     cap = max(1, min(int(limit), 500))
-    # Over-fetch slightly when tx filters may drop rows
-    fetch_n = min(500, cap * 3 if (item or payee or ownership) else cap)
+    item_q = (item or "").strip().lower()
+    payee_q = " ".join((payee or "").strip().upper().split())
+    ownership_q = normalize_person_name(ownership)
+    # Over-fetch slightly when filters may drop rows
+    fetch_n = min(500, cap * 3 if (item_q or payee_q or ownership_q) else cap)
     docs = (
         await db.receipt_files.find(query)
         .sort("uploaded_at", -1)
@@ -2252,17 +2676,16 @@ async def list_receipt_library(
             seen_tx.add(oid)
             uniq_tx.append(oid)
     tx_map = await _tx_lookup(db, uniq_tx)
-
-    item_q = (item or "").strip().lower()
-    payee_q = " ".join((payee or "").strip().upper().split())
-    ownership_q = normalize_person_name(ownership)
-    need_tx_filter = bool(item_q or payee_q or ownership_q)
+    uploader_ids = (
+        await uploader_ids_for_ownership(db, ownership_q) if ownership_q else set()
+    )
+    need_item_payee = bool(item_q or payee_q)
 
     items: list[dict[str, Any]] = []
     for doc in docs:
         tx_oids = _tx_oids_from_file(doc)
         linked = [tx_map[oid] for oid in tx_oids if oid in tx_map]
-        if need_tx_filter:
+        if need_item_payee:
             matched_links: list[dict[str, Any]] = []
             for tx in linked:
                 if item_q:
@@ -2276,13 +2699,30 @@ async def list_receipt_library(
                             str(tx.get("payee") or "").upper().split()
                         ):
                             continue
-                if ownership_q:
-                    if normalize_person_name(str(tx.get("ownership") or "")) != ownership_q:
-                        continue
                 matched_links.append(tx)
             if not matched_links:
                 continue
             linked = matched_links
+
+        linked_owns = [str(tx.get("ownership") or "") for tx in linked]
+        if ownership_q:
+            tx_own_hit = any(
+                normalize_person_name(ow) == ownership_q for ow in linked_owns
+            )
+            if tx_own_hit:
+                linked = [
+                    tx
+                    for tx in linked
+                    if normalize_person_name(str(tx.get("ownership") or ""))
+                    == ownership_q
+                ]
+            elif not file_matches_ownership(
+                doc,
+                ownership_q,
+                linked_ownerships=linked_owns,
+                uploader_ids=uploader_ids,
+            ):
+                continue
 
         items_set: list[str] = []
         payees_set: list[str] = []
@@ -2297,6 +2737,9 @@ async def list_receipt_library(
             ow = str(tx.get("ownership") or "").strip()
             if ow and ow not in owns_set:
                 owns_set.append(ow)
+        intended = normalize_person_name(str(doc.get("intended_ownership") or ""))
+        if intended and intended not in owns_set:
+            owns_set.append(intended)
 
         items.append(
             {
@@ -2317,6 +2760,7 @@ async def list_receipt_library(
                 "item": ", ".join(items_set),
                 "payee": ", ".join(payees_set),
                 "ownership": ", ".join(owns_set),
+                "intended_ownership": intended or None,
                 "linked_count": len(tx_oids),
                 "rejection_reason": doc.get("rejection_reason") or "",
                 "partial": bool(doc.get("partial")),
@@ -3474,8 +3918,11 @@ async def park_receipt_uploads(
     uploads: list[tuple[str, bytes]],
     actor_id: ObjectId | None,
     source: str = "desktop",
+    intended_ownership: str = "",
+    asked_of_person_id: ObjectId | None = None,
 ) -> list[dict[str, Any]]:
     """Store many parked files atomically — any failure discards the batch."""
+    ownership_q = normalize_person_name(intended_ownership)
     saved: list[dict[str, Any]] = []
     try:
         for filename, content in uploads:
@@ -3486,6 +3933,8 @@ async def park_receipt_uploads(
                 content=content,
                 source=source,
                 actor_id=actor_id,
+                intended_ownership=ownership_q,
+                asked_of_person_id=asked_of_person_id if ownership_q else None,
             )
             saved.append(meta)
         return saved

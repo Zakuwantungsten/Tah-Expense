@@ -9101,6 +9101,114 @@ class DailyRegister(QWidget):
         self._update_footer()
         self._emit_active_cheque()
 
+    def _outbox_drain_surface_live(self, drain_day, drain_table) -> bool:
+        """True when the active grid is still the day/surface this drain started on.
+
+        Late ACKs must not mutate a different Browse day or Merged/Parked table —
+        that is how earlier-day rows get appended into the wrong register view.
+        """
+        return (
+            drain_day is not None
+            and self._current_date == drain_day
+            and drain_table is not None
+            and self._table is drain_table
+        )
+
+    def _outbox_drain_my_keepalive_ready(self, drain_day, drain_table) -> bool:
+        """Same day, My keep-alive stashed behind Merged/Parked."""
+        return (
+            drain_day is not None
+            and self._current_date == drain_day
+            and drain_table is self._my_table
+            and self._my_table is not None
+            and self._my_session is not None
+            and self._table is not self._my_table
+        )
+
+    def _run_on_outbox_drain_surface(self, drain_day, drain_table, fn) -> str:
+        """Bind drain-day maps, run ``fn``, return ``live`` / ``my_keepalive`` / ``durable_only``."""
+        if self._outbox_drain_surface_live(drain_day, drain_table):
+            fn()
+            return "live"
+        if not self._outbox_drain_my_keepalive_ready(drain_day, drain_table):
+            return "durable_only"
+        active_snap = self._snapshot_grid_session()
+        active_table = self._table
+        parked_mode = self._parked_mode
+        skipped_mode = self._skipped_mode
+        merged_mode = self._merged_mode
+        try:
+            self._table = self._my_table
+            self._parked_mode = False
+            self._skipped_mode = False
+            self._merged_mode = False
+            self._restore_grid_session(self._my_session)
+            fn()
+            self._my_session = self._snapshot_grid_session()
+        finally:
+            self._parked_mode = parked_mode
+            self._skipped_mode = skipped_mode
+            self._merged_mode = merged_mode
+            self._table = active_table
+            self._restore_grid_session(active_snap)
+        return "my_keepalive"
+
+    def _apply_outbox_ack_marks(
+        self,
+        to_save: list,
+        success_idxs: list[int],
+    ) -> None:
+        """Clear ACK'd editable rows on the currently bound ``self._table`` maps."""
+        for i in sorted(success_idxs, reverse=True):
+            row, _tx = to_save[i]
+            self._mark_new_row_saved(row, flush=False)
+
+    def _apply_outbox_acks_ui(
+        self,
+        *,
+        drain_day,
+        drain_table,
+        to_save: list,
+        success_idxs: list[int],
+        acked_txs: list,
+        drained_parked_ids: set[str],
+    ) -> str:
+        """Apply ACK'd outbox rows to the UI with a day/table context check.
+
+        Durable work (server insert + draft prune by ``drain_day``) is handled by
+        the caller. This only decides whether in-place grid mutation is safe.
+
+        Returns:
+          ``live`` — active surface still matches the drain
+          ``my_keepalive`` — same day, applied onto stashed My behind Merged/Parked
+          ``durable_only`` — day/surface changed; skip all grid mutation
+        """
+
+        def _mutate() -> None:
+            if drained_parked_ids:
+                self._drop_local_parked_by_client_ids(drained_parked_ids)
+            self._apply_outbox_ack_marks(to_save, success_idxs)
+            if acked_txs:
+                self._append_saved_transactions(acked_txs)
+
+        if not success_idxs and not acked_txs:
+            if self._outbox_drain_surface_live(drain_day, drain_table):
+                return "live"
+            if self._outbox_drain_my_keepalive_ready(drain_day, drain_table):
+                return "my_keepalive"
+            return "durable_only"
+
+        ack_ui = self._run_on_outbox_drain_surface(drain_day, drain_table, _mutate)
+        if ack_ui == "live" and acked_txs:
+            self._invalidate_day_tx_cache()
+        elif ack_ui == "my_keepalive":
+            # Merged/Parked painted cache may still list pre-ACK state.
+            self._merged_tx_cache = None
+            self._merged_tx_cache_key = None
+            self._merged_painted_key = None
+            self._day_tx_stale = True
+        return ack_ui
+
     def _enqueue_inserts_for_outbox(
         self, to_save: list[tuple[int, "Transaction"]]
     ) -> int:
@@ -10071,16 +10179,25 @@ class DailyRegister(QWidget):
     ) -> bool:
         """Wait for outbox drain to settle.
 
-        ``require_empty=True`` (Parked after Save): wait until no PENDING /
-        FAILED / IN_FLIGHT rows remain (or timeout).
+        Always waits for an in-flight drain — including after Browse opens
+        Merged — so a late ACK cannot race ``_load_date`` / tab flips.
+
+        ``require_empty=True`` (Parked after Save): also wait until no PENDING /
+        FAILED / IN_FLIGHT rows remain on My (Merged skips the pending scan;
+        Merged has no outbox rows and must not start a new drain).
         ``require_empty=False`` (before ``_load_date``): wait only until the
         current drain flight finishes so the grid wipe cannot race row indices.
 
         Returns True when the wait condition is met; False on timeout / offline.
         """
-        if self._merged_mode or self._current_date is None:
-            return True
-        if not self._outbox_pending_rows() and not self._outbox_drain_in_flight:
+        # Merged / blank day: never scan My pending or start a drain, but still
+        # wait out a drain that already started on My before navigation.
+        skip_pending_scan = self._merged_mode or self._current_date is None
+        if skip_pending_scan:
+            if not self._outbox_drain_in_flight:
+                return True
+            require_empty = False
+        elif not self._outbox_pending_rows() and not self._outbox_drain_in_flight:
             return True
 
         nested_busy = (
@@ -10096,6 +10213,7 @@ class DailyRegister(QWidget):
         # Kick a drain if rows are waiting and nothing is in flight.
         if (
             require_empty
+            and not skip_pending_scan
             and self._outbox_pending_rows()
             and not self._outbox_drain_in_flight
             and not self._save_in_flight
@@ -10109,7 +10227,11 @@ class DailyRegister(QWidget):
         try:
             while time.monotonic() < deadline:
                 draining = self._outbox_drain_in_flight
-                pending = bool(self._outbox_pending_rows())
+                pending = (
+                    False
+                    if skip_pending_scan
+                    else bool(self._outbox_pending_rows())
+                )
                 if require_empty:
                     if not draining and not pending:
                         return True
@@ -10122,7 +10244,10 @@ class DailyRegister(QWidget):
             if require_empty:
                 return (
                     not self._outbox_drain_in_flight
-                    and not self._outbox_pending_rows()
+                    and (
+                        skip_pending_scan
+                        or not self._outbox_pending_rows()
+                    )
                 )
             return not self._outbox_drain_in_flight
         finally:
@@ -10209,7 +10334,14 @@ class DailyRegister(QWidget):
         self._flush_local_draft()
 
     async def _drain_register_outbox(self) -> None:
-        """Push PENDING/FAILED new rows to the server (single-flight)."""
+        """Push PENDING/FAILED new rows to the server (single-flight).
+
+        Captures day + table at start. After the network ACK, UI promotion runs
+        only when that surface is still live (or onto same-day My keep-alive).
+        Draft prune always uses the captured day so Browse navigation cannot
+        leave ACK'd rows in the wrong day's recovery file or append them onto
+        another day.
+        """
         if (
             self._outbox_drain_in_flight
             or self._save_in_flight
@@ -10229,13 +10361,18 @@ class DailyRegister(QWidget):
             self._outbox_cancel_requested = False
             return
 
+        # Context token — compare before every UI mutation after await points.
+        drain_day = self._current_date
+        drain_table = self._table
+
         self._outbox_drain_in_flight = True
         self._reload_after_drain = False
         self._outbox_cancel_requested = False
         nested_busy = self._save_in_flight or self._submit_in_flight
+        ack_ui = "live"
         with timed_op(
             "outbox_drain",
-            day=str(self._current_date or ""),
+            day=str(drain_day or ""),
             pending=len(rows),
         ) as meta:
             try:
@@ -10262,6 +10399,9 @@ class DailyRegister(QWidget):
                     # Concurrent chunk workers report completed count (not serial ranges).
                     if nested_busy or tot <= 0:
                         return
+                    # Don't toast progress against a day the user already left.
+                    if not self._outbox_drain_surface_live(drain_day, drain_table):
+                        return
                     esc = " · Esc to cancel" if tot > 1 else ""
                     if tot <= BULK_CREATE_CHUNK:
                         self.transient_status.emit(
@@ -10285,14 +10425,20 @@ class DailyRegister(QWidget):
                         should_cancel=lambda: self._outbox_cancel_requested,
                     )
                 except Exception as exc:
-                    for row, _tx in to_save:
-                        self._set_row_sync_status(row, SYNC_FAILED)
-                    self._flush_local_draft()
+                    def _mark_failed() -> None:
+                        for row, _tx in to_save:
+                            self._set_row_sync_status(row, SYNC_FAILED)
+                        self._flush_local_draft()
+
+                    fail_ui = self._run_on_outbox_drain_surface(
+                        drain_day, drain_table, _mark_failed
+                    )
                     self._outbox_backoff_attempt += 1
                     self._schedule_outbox_backoff()
                     meta["ok"] = False
                     meta["error"] = f"{type(exc).__name__}: {exc}"
-                    if not nested_busy:
+                    meta["ack_ui"] = fail_ui
+                    if not nested_busy and fail_ui == "live":
                         self.transient_status.emit(
                             "Sync failed — will retry when online"
                         )
@@ -10304,6 +10450,7 @@ class DailyRegister(QWidget):
                 already_exists = 0
                 acked_txs: list = []
                 success_idxs: list[int] = []
+                pending_status: list[tuple[int, str]] = []
                 for i, ((row, _tx), (status_key, saved_tx, err)) in enumerate(
                     zip(to_save, outcomes)
                 ):
@@ -10316,69 +10463,103 @@ class DailyRegister(QWidget):
                         success_idxs.append(i)
                     elif err in ("cancelled", "not processed"):
                         cancelled = True
-                        self._set_row_sync_status(row, SYNC_PENDING)
+                        pending_status.append((row, SYNC_PENDING))
                     else:
                         any_fail = True
-                        self._set_row_sync_status(row, SYNC_FAILED)
+                        pending_status.append((row, SYNC_FAILED))
+
+                if pending_status:
+                    def _apply_pending_status() -> None:
+                        for row, status in pending_status:
+                            self._set_row_sync_status(row, status)
+
+                    self._run_on_outbox_drain_surface(
+                        drain_day, drain_table, _apply_pending_status
+                    )
 
                 drained_parked_ids: set[str] = set()
                 acked_client_ids: set[str] = set()
-                for i in sorted(success_idxs, reverse=True):
+                for i in success_idxs:
                     row, tx = to_save[i]
-                    rid = (
-                        getattr(tx, "client_row_id", None)
-                        or (self._pending_row_meta.get(row) or {}).get(
+                    rid = getattr(tx, "client_row_id", None)
+                    if not rid:
+                        # Prefer live maps; fall back to stashed My session.
+                        rid = (self._pending_row_meta.get(row) or {}).get(
                             "client_row_id"
                         )
-                    )
+                    if not rid and self._my_session is not None:
+                        rid = (
+                            (self._my_session.get("pending_row_meta") or {})
+                            .get(row) or {}
+                        ).get("client_row_id")
                     if rid:
                         acked_client_ids.add(str(rid))
                     if (getattr(tx, "register_status", "") or "") == "parked":
                         if rid:
                             drained_parked_ids.add(str(rid))
-                    self._mark_new_row_saved(row, flush=False)
-                if drained_parked_ids:
-                    self._drop_local_parked_by_client_ids(drained_parked_ids)
-                # Drop ACK'd ids from disk before the full rewrite so a crash
-                # between mark and flush cannot re-offer already-saved rows.
-                if acked_client_ids and self._current_date is not None:
+
+                # Always prune the day this drain started on — never the day
+                # Browse may have navigated to while sync was in flight.
+                if acked_client_ids and drain_day is not None:
                     try:
                         prune_draft_new_rows_by_client_ids(
                             self._user._id,
-                            self._current_date,
+                            drain_day,
                             acked_client_ids,
                             durable=True,
                         )
                     except Exception:
                         pass
 
+                ack_ui = self._apply_outbox_acks_ui(
+                    drain_day=drain_day,
+                    drain_table=drain_table,
+                    to_save=to_save,
+                    success_idxs=success_idxs,
+                    acked_txs=acked_txs,
+                    drained_parked_ids=drained_parked_ids,
+                )
+                meta["ack_ui"] = ack_ui
+
                 meta["synced"] = synced
                 meta["already_exists"] = already_exists
                 meta["failed"] = int(any_fail)
                 meta["cancelled"] = int(cancelled)
                 meta["total"] = total
-                self._flush_local_draft_after_ack()
+                if ack_ui == "live":
+                    self._flush_local_draft_after_ack()
+                elif ack_ui == "my_keepalive" and drain_day is not None:
+                    # Keep-alive My maps already updated; rewrite that day's draft
+                    # from the stashed session without touching Merged cells.
+                    def _flush_my_keepalive_draft() -> None:
+                        self._flush_local_draft_after_ack()
+
+                    self._run_on_outbox_drain_surface(
+                        drain_day, drain_table, _flush_my_keepalive_draft
+                    )
                 if synced:
                     self.drafts_changed.emit()
                     self.rows_saved.emit(synced)
                     if not any_fail and not cancelled:
                         self._outbox_backoff_attempt = 0
 
-                # Phase 3 — promote ACK'd rows in place; reload only when we
-                # cleared cells but lack transaction payloads to rebuild them.
-                if acked_txs:
-                    self._append_saved_transactions(acked_txs)
-                    self._invalidate_day_tx_cache()
+                # Reload only on the original live surface when payloads missing.
                 need_reload = bool(
-                    synced and len(acked_txs) < synced and self._current_date is not None
+                    ack_ui == "live"
+                    and synced
+                    and len(acked_txs) < synced
+                    and drain_day is not None
                 )
                 if need_reload:
                     self._reload_after_drain = True
                     self._invalidate_day_tx_cache()
+                elif ack_ui == "durable_only" and synced:
+                    # Opened day must not inherit stale caches from this ACK.
+                    self._day_tx_stale = True
 
                 if cancelled:
-                    left = len(self._outbox_pending_rows())
-                    if not nested_busy:
+                    if not nested_busy and ack_ui == "live":
+                        left = len(self._outbox_pending_rows())
                         parts = []
                         if synced:
                             parts.append(f"{synced} saved")
@@ -10389,12 +10570,18 @@ class DailyRegister(QWidget):
                 elif any_fail:
                     self._outbox_backoff_attempt += 1
                     self._schedule_outbox_backoff()
-                    if not nested_busy and not need_reload:
+                    if not nested_busy and not need_reload and ack_ui == "live":
                         left = len(self._outbox_pending_rows())
                         self.transient_status.emit(
                             f"Synced {synced} · {left} left to retry"
                         )
-                elif synced and not need_reload and not nested_busy and not self._submit_in_flight:
+                elif (
+                    synced
+                    and not need_reload
+                    and not nested_busy
+                    and not self._submit_in_flight
+                    and ack_ui == "live"
+                ):
                     self.transient_status.emit(
                         f"Draft saved: {synced} added · "
                         "Open Drafts to submit for Verify"
@@ -10403,8 +10590,12 @@ class DailyRegister(QWidget):
                 self._outbox_drain_in_flight = False
                 self._outbox_cancel_requested = False
                 reload_day = (
-                    self._current_date
-                    if self._reload_after_drain and self._current_date is not None
+                    drain_day
+                    if (
+                        self._reload_after_drain
+                        and drain_day is not None
+                        and self._outbox_drain_surface_live(drain_day, drain_table)
+                    )
                     else None
                 )
                 self._reload_after_drain = False
@@ -10412,8 +10603,10 @@ class DailyRegister(QWidget):
                     await self._load_date(reload_day)
                 # Rows enqueued while this drain ran (another Save) — kick again.
                 # Do not auto-resume immediately after an explicit cancel.
+                # Only reschedule when still on the My surface for that day.
                 elif (
-                    self._outbox_pending_rows()
+                    ack_ui == "live"
+                    and self._outbox_pending_rows()
                     and not self._load_in_flight
                     and not self._save_in_flight
                     and not self._submit_in_flight

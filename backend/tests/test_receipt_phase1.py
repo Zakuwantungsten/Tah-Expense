@@ -553,3 +553,80 @@ def test_heic_is_allowed_extension() -> None:
 
     assert allowed_extension("photo.heic")
     assert allowed_extension("photo.HEIF")
+
+
+async def test_attach_clears_waived_status() -> None:
+    """Full upload on a waived row clears waiver and marks received."""
+    tx_id = ObjectId()
+    db = _db(
+        transactions=[
+            {
+                "_id": tx_id,
+                "ownership": "ALI",
+                "attachments": [{"id": "a1", "filename": "r.jpg"}],
+                "receipt_status": "missing",
+            }
+        ],
+        requests=[
+            {
+                "_id": ObjectId(),
+                "transaction_id": tx_id,
+                "status": "waived",
+                "asked_of_name": "ALI",
+                "waiver_reason": "Lost the paper",
+                "waived_by": ObjectId(),
+                "waived_at": datetime(2026, 1, 1),
+                "file_ids": [],
+            }
+        ],
+    )
+    await sync_receipt_status_after_attach(db, tx_id)
+    assert db.transactions.documents[0]["receipt_status"] == "received"
+    req = db.receipt_requests.documents[0]
+    assert req["status"] == "received"
+    assert req.get("waiver_reason") is None
+    assert req.get("waived_by") is None
+    assert req.get("waived_at") is None
+
+
+def test_desk_undo_waive_restores_needed(tmp_path: Path) -> None:
+    tx_id = ObjectId()
+    req_id = ObjectId()
+    db = _db(
+        transactions=[
+            {
+                "_id": tx_id,
+                "ownership": "ALI",
+                "attachments": [],
+                "receipt_status": "missing",
+            }
+        ],
+        requests=[
+            {
+                "_id": req_id,
+                "transaction_id": tx_id,
+                "asked_of_name": "ALI",
+                "status": "waived",
+                "waiver_reason": "Lost",
+                "file_ids": [],
+            }
+        ],
+    )
+    app = create_app(settings=_settings(tmp_path), database=SimpleNamespace(db=db))
+    app.dependency_overrides[current_user] = lambda: {
+        "_id": ObjectId(),
+        "username": "desk",
+        "role": "cashier",
+    }
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/receipts/undo-waive",
+            json={"transaction_ids": [str(tx_id)]},
+        )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["restored"] == 1
+    assert payload["skipped"] == 0
+    assert db.receipt_requests.documents[0]["status"] == "needed"
+    assert db.receipt_requests.documents[0].get("waiver_reason") is None
+    assert db.transactions.documents[0]["receipt_status"] == "pending"

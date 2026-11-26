@@ -16,11 +16,16 @@ async def list_custom_folders() -> list[dict[str, Any]]:
     return list((payload or {}).get("items") or [])
 
 
-async def create_custom_folder(label: str) -> dict[str, Any]:
+async def create_custom_folder(
+    label: str, *, parent_id: str | None = None
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"label": label}
+    if parent_id:
+        body["parent_id"] = parent_id
     return await api_client.request(
         "POST",
         "v1/receipts/records/folders",
-        json={"label": label},
+        json=body,
     )
 
 
