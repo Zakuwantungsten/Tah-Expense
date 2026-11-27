@@ -2859,9 +2859,6 @@ class DailyRegister(QWidget):
                 for offset, entry in enumerate(entries):
                     row = start + offset
                     values = cells_from_json(entry.get("cells"))
-                    allow = (entry.get("allow_anyway") or "").strip()
-                    if allow:
-                        self._truck_allow_anyway[row] = allow
                     truck_cells.extend(self._write_row_values(row, values))
                     meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
                     meta.pop("parked", None)
@@ -2873,6 +2870,9 @@ class DailyRegister(QWidget):
                     )
                     meta["client_row_id"] = rid
                     self._pending_row_meta[row] = meta
+                    allow = (entry.get("allow_anyway") or "").strip()
+                    if allow:
+                        self._set_allowed_truck_for_row(row, allow)
                     tx_id = entry.get("tx_id")
                     if tx_id:
                         self._saved_ids[row] = tx_id
@@ -3016,7 +3016,9 @@ class DailyRegister(QWidget):
             meta.pop("parked", None)
             meta.pop("sync_status", None)
             meta["client_row_id"] = rid
-            allow = self._truck_allow_anyway.get(row)
+            allow = self._allowed_truck_for_row(row)
+            if allow:
+                meta["allow_anyway"] = allow
             entry = {
                 "client_row_id": rid,
                 "cells": cells_for_json(self._row_value_map(row)),
@@ -3129,12 +3131,9 @@ class DailyRegister(QWidget):
         self._bulk_mutating = True
         try:
             for row in reversed(rows):
+                # `_shift_row_maps_on_remove` also remaps pending truck issues
+                # and any open Fix-trucks dialog row indexes.
                 self._shift_row_maps_on_remove(row)
-                self._pending_truck_issues = {
-                    (r - 1 if r > row else r): issue
-                    for r, issue in self._pending_truck_issues.items()
-                    if r != row
-                }
                 self._table.removeRow(row)
             min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
             if self._table.rowCount() < min_rows:
@@ -5045,7 +5044,7 @@ class DailyRegister(QWidget):
         truck_ok = True
         reg_status = "draft"
         if truck_raw:
-            allowed_anyway = self._truck_allow_anyway.get(row)
+            allowed_anyway = self._allowed_truck_for_row(row)
             if (
                 allowed_anyway
                 and self._truck_key(truck_raw) == self._truck_key(allowed_anyway)
@@ -7116,6 +7115,42 @@ class DailyRegister(QWidget):
         self._renumber()
         self._update_footer()
 
+    def _remap_truck_issue_rows(self, remap) -> None:
+        """Keep pending + open Fix-trucks dialog row indexes aligned after shifts.
+
+        ``remap(old_row) -> new_row | None`` (None drops the issue).
+        Allow / Correct / Park call ``_on_truck_issue_resolved_live`` with
+        ``issue.row`` — if that stays stale after outbox ACK insertRow, the
+        waiver lands on an empty hole and Save still rejects the leftover.
+        """
+        new_pending: dict = {}
+        for old_row, issue in self._pending_truck_issues.items():
+            new_row = remap(old_row)
+            if new_row is None:
+                continue
+            issue.row = new_row
+            new_pending[new_row] = issue
+        self._pending_truck_issues = new_pending
+
+        dlg = self._open_truck_dialog
+        if dlg is None:
+            return
+
+        def _bump(issue) -> None:
+            if issue is None:
+                return
+            new_row = remap(getattr(issue, "row", -1))
+            if new_row is None:
+                return
+            issue.row = new_row
+
+        for issue in list(getattr(dlg, "issues", None) or []):
+            _bump(issue)
+        for issue in list(getattr(dlg, "_held_issues", None) or []):
+            _bump(issue)
+        for rw in list(getattr(dlg, "_rows", None) or []):
+            _bump(getattr(rw, "issue", None))
+
     def _shift_row_maps_on_insert(self, at_row: int) -> None:
         def _shift(mapping: dict) -> dict:
             return {
@@ -7130,6 +7165,9 @@ class DailyRegister(QWidget):
             for k, v in self._truck_allow_anyway.items()
         }
         self._dirty_rows = {(r + 1 if r >= at_row else r) for r in self._dirty_rows}
+        self._remap_truck_issue_rows(
+            lambda r: (r + 1 if r >= at_row else r)
+        )
         if self._cut_cells:
             self._cut_cells = {
                 (r + 1 if r >= at_row else r, c) for r, c in self._cut_cells
@@ -7160,6 +7198,9 @@ class DailyRegister(QWidget):
             for r in self._dirty_rows
             if r != at_row
         }
+        self._remap_truck_issue_rows(
+            lambda r: None if r == at_row else (r - 1 if r > at_row else r)
+        )
         if self._cut_cells:
             self._cut_cells = {
                 (r - 1 if r > at_row else r, c)
@@ -9061,6 +9102,8 @@ class DailyRegister(QWidget):
                 continue
             self._table.takeItem(row, col)
         self._pending_row_meta.pop(row, None)
+        self._truck_allow_anyway.pop(row, None)
+        self._pending_truck_issues.pop(row, None)
         self._sync_row_date(row)
         self._deactivate_row(row)
 
@@ -9080,6 +9123,50 @@ class DailyRegister(QWidget):
             self._table.blockSignals(prev)
         if flush:
             self._flush_local_draft()
+
+    def _compact_empty_editable_rows(self) -> bool:
+        """Remove blank holes between saved rows and leftover editable data.
+
+        Partial save / outbox ACK clears successful rows in place, then inserts
+        saved rows above — leaving empty gaps so a leftover bad-truck row looks
+        "gone" until you scroll. Pack contiguously; keep the editable pad.
+        """
+        if (
+            self._table is None
+            or self._merged_mode
+            or self._parked_mode
+            or self._skipped_mode
+        ):
+            return False
+        last_data = self._saved_count - 1
+        for row in range(self._saved_count, self._table.rowCount()):
+            if self._row_has_data(row):
+                last_data = row
+        holes = [
+            row
+            for row in range(self._saved_count, last_data)
+            if not self._row_has_data(row)
+        ]
+        if not holes:
+            return False
+        prev = self._table.blockSignals(True)
+        was_bulk = self._bulk_mutating
+        self._bulk_mutating = True
+        try:
+            for row in reversed(holes):
+                self._shift_row_maps_on_remove(row)
+                self._table.removeRow(row)
+            min_rows = self._saved_count + DEFAULT_EDITABLE_ROWS
+            if self._table.rowCount() < min_rows:
+                start = self._table.rowCount()
+                self._table.setRowCount(min_rows)
+                self._init_editable_rows(start, min_rows)
+        finally:
+            self._bulk_mutating = was_bulk
+            self._table.blockSignals(prev)
+        self._renumber()
+        self._update_footer()
+        return True
 
     def _append_saved_transactions(self, txs: list) -> None:
         """Grow the saved prefix from ACK'd transactions (no full day reload)."""
@@ -9190,6 +9277,10 @@ class DailyRegister(QWidget):
             self._apply_outbox_ack_marks(to_save, success_idxs)
             if acked_txs:
                 self._append_saved_transactions(acked_txs)
+            # Clear-in-place + insertRow leaves empty holes above leftovers
+            # (and stale truck-dialog row indexes). Pack so Allow/Correct/Park
+            # still hit the visible leftover row.
+            self._compact_empty_editable_rows()
 
         if not success_idxs and not acked_txs:
             if self._outbox_drain_surface_live(drain_day, drain_table):
@@ -10811,13 +10902,17 @@ class DailyRegister(QWidget):
                 if not self._row_has_data(row):
                     continue
                 rid = self._ensure_row_client_id(row)
-                pending = self._pending_row_meta.get(row)
+                pending = dict(self._pending_row_meta.get(row) or {})
+                allow = self._allowed_truck_for_row(row)
+                if allow:
+                    pending["allow_anyway"] = allow
+                elif "allow_anyway" in pending:
+                    pending.pop("allow_anyway", None)
                 entry = {
                     "client_row_id": rid,
                     "cells": cells_for_json(self._row_value_map(row)),
                     "pending_meta": serialize_pending_meta(pending),
                 }
-                allow = self._truck_allow_anyway.get(row)
                 if allow:
                     entry["allow_anyway"] = allow
                 new_rows.append(entry)
@@ -11084,9 +11179,6 @@ class DailyRegister(QWidget):
                                 progress_done, progress_total
                             )
                         continue
-                    allow = (entry.get("allow_anyway") or "").strip()
-                    if allow:
-                        self._truck_allow_anyway[row] = allow
                     truck_cells.extend(self._write_row_values(row, values))
                     meta = hydrate_pending_meta(entry.get("pending_meta")) or {}
                     if rid:
@@ -11103,6 +11195,9 @@ class DailyRegister(QWidget):
                     else:
                         meta.pop("sync_status", None)
                     self._pending_row_meta[row] = meta
+                    allow = (entry.get("allow_anyway") or meta.get("allow_anyway") or "").strip()
+                    if allow:
+                        self._set_allowed_truck_for_row(row, allow)
                     self._activate_row(row)
                     self._sync_row_date(row)
                     if meta.get("sync_status"):
@@ -11845,6 +11940,9 @@ class DailyRegister(QWidget):
                                 f"{err or status_key or 'save failed'}"
                             )
                     self._flush_local_draft()
+                # Successful clears leave holes above leftovers; pack before the
+                # next Save / Fix-trucks Allow so the leftover is contiguous.
+                self._compact_empty_editable_rows()
 
             if parked_to_save:
                 await _sync_create_chunked(
@@ -12872,6 +12970,33 @@ class DailyRegister(QWidget):
     def _truck_key(self, text: str) -> str:
         return " ".join((text or "").upper().split())
 
+    def _allowed_truck_for_row(self, row: Optional[int]) -> Optional[str]:
+        """Allow-anyway waiver for a grid row (index map, then pending meta).
+
+        Pending meta survives draft capture/restore and is remapped with the
+        row; the index map alone can go stale if Allow races an outbox ACK.
+        """
+        if row is None:
+            return None
+        allowed = self._truck_allow_anyway.get(row)
+        if allowed:
+            return allowed
+        meta = self._pending_row_meta.get(row) or {}
+        allow = (meta.get("allow_anyway") or "").strip()
+        return allow or None
+
+    def _set_allowed_truck_for_row(self, row: int, truck: Optional[str]) -> None:
+        """Write or clear the Allow waiver on both the index map and pending meta."""
+        meta = dict(self._pending_row_meta.get(row) or {})
+        if truck:
+            self._truck_allow_anyway[row] = truck
+            meta["allow_anyway"] = truck
+            self._pending_row_meta[row] = meta
+            return
+        self._truck_allow_anyway.pop(row, None)
+        if meta.pop("allow_anyway", None) is not None:
+            self._pending_row_meta[row] = meta
+
     def _resolve_truck_text(
         self, raw: str, row: Optional[int] = None
     ) -> tuple[str, Optional[str]]:
@@ -12891,13 +13016,13 @@ class DailyRegister(QWidget):
             matched = try_match_fleet(raw, self._fleet_numbers)
             if matched is not None:
                 return "ok", matched
-            allowed = self._truck_allow_anyway.get(row) if row is not None else None
+            allowed = self._allowed_truck_for_row(row)
             if allowed and self._truck_key(raw) == self._truck_key(allowed):
                 return "ok", allowed
             return "invalid_format", norm.value or raw.strip().upper()
         matched = try_match_fleet(norm.value, self._fleet_numbers)
         if matched is None:
-            allowed = self._truck_allow_anyway.get(row) if row is not None else None
+            allowed = self._allowed_truck_for_row(row)
             if allowed and self._truck_key(raw) == self._truck_key(allowed):
                 return "ok", allowed
             return "not_in_registry", norm.value
@@ -13476,7 +13601,7 @@ class DailyRegister(QWidget):
     def _on_truck_issue_resolved_live(self, issue: TruckIssue) -> None:
         """Apply one resolved truck to the grid as soon as it leaves the dialog list."""
         if getattr(issue, "accept_empty", False):
-            self._truck_allow_anyway.pop(issue.row, None)
+            self._set_allowed_truck_for_row(issue.row, None)
             self._set_truck_cell(issue.row, "")
             self._pending_truck_issues.pop(issue.row, None)
             meta = dict(self._pending_row_meta.get(issue.row) or {})
@@ -13501,6 +13626,7 @@ class DailyRegister(QWidget):
             self._set_truck_cell(issue.row, truck)
             meta = dict(self._pending_row_meta.get(issue.row) or {})
             meta["parked"] = True
+            meta.pop("allow_anyway", None)
             self._pending_row_meta[issue.row] = meta
             self._truck_allow_anyway.pop(issue.row, None)
             self._pending_truck_issues.pop(issue.row, None)
@@ -13508,16 +13634,16 @@ class DailyRegister(QWidget):
                 self._dirty_rows.add(issue.row)
             return
         if issue.skip or not issue.corrected:
-            self._truck_allow_anyway.pop(issue.row, None)
+            self._set_allowed_truck_for_row(issue.row, None)
             self._set_truck_cell(issue.row, "")
             return
         if getattr(issue, "is_place_label", False):
-            self._truck_allow_anyway.pop(issue.row, None)
+            self._set_allowed_truck_for_row(issue.row, None)
             self._allowed_truck_labels.add(normalize_place_label(issue.corrected))
         elif getattr(issue, "allow_anyway", False):
-            self._truck_allow_anyway[issue.row] = issue.corrected
+            self._set_allowed_truck_for_row(issue.row, issue.corrected)
         else:
-            self._truck_allow_anyway.pop(issue.row, None)
+            self._set_allowed_truck_for_row(issue.row, None)
             self._fleet_numbers.add(issue.corrected)
         self._set_truck_cell(issue.row, issue.corrected)
         self._pending_truck_issues.pop(issue.row, None)
@@ -13538,12 +13664,12 @@ class DailyRegister(QWidget):
     def _validate_truck_cell(self, row: int, item: QTableWidgetItem) -> None:
         raw = item.text().strip()
         if not raw:
-            self._truck_allow_anyway.pop(row, None)
+            self._set_allowed_truck_for_row(row, None)
             self._update_truck_required_highlight(row)
             return
-        allowed = self._truck_allow_anyway.get(row)
+        allowed = self._allowed_truck_for_row(row)
         if allowed and self._truck_key(raw) != self._truck_key(allowed):
-            self._truck_allow_anyway.pop(row, None)
+            self._set_allowed_truck_for_row(row, None)
         status, value = self._resolve_truck_text(raw, row=row)
         if status == "ok":
             if item.text() != value:

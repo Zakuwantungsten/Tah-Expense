@@ -330,3 +330,122 @@ def test_footer_excludes_editable_copy_of_saved_row(register):
     register._update_footer()
     assert "2 entries" in register._totals_label.text()
     assert "6,000" in register._totals_label.text()
+
+
+def test_compact_empty_editable_rows_packs_leftover_after_clear_in_place(register):
+    """Partial-save / outbox ACK holes must not hide the leftover bad-truck row."""
+    from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_ITEM, COL_TRUCK, COL_TZS
+    from PySide6.QtWidgets import QTableWidgetItem
+
+    register._table.setItem(1, COL_DESC, QTableWidgetItem("GOOD ROW"))
+    register._table.setItem(1, COL_ITEM, QTableWidgetItem("PARKING"))
+    register._table.setItem(1, COL_TZS, QTableWidgetItem("1,000.00"))
+    register._table.setItem(2, COL_DESC, QTableWidgetItem("BAD TRUCK ROW"))
+    register._table.setItem(2, COL_ITEM, QTableWidgetItem("PARKING"))
+    register._table.setItem(2, COL_TRUCK, QTableWidgetItem("T999 ZZZ"))
+    register._table.setItem(2, COL_TZS, QTableWidgetItem("2,000.00"))
+    register._ensure_row_client_id(2)
+
+    # Simulate successful clear-in-place for the good row (hole at index 1).
+    register._mark_new_row_saved(1, flush=False)
+    assert not register._row_has_data(1)
+    assert register._table.item(2, COL_DESC).text() == "BAD TRUCK ROW"
+
+    packed = register._compact_empty_editable_rows()
+    assert packed is True
+    assert register._table.item(1, COL_DESC).text() == "BAD TRUCK ROW"
+    assert register._table.item(1, COL_TRUCK).text() == "T999 ZZZ"
+    assert not register._row_has_data(2)
+
+
+def test_outbox_ack_style_insert_remaps_open_truck_issue_row(register):
+    """Allow after ACK insert must still hit the leftover, not a cleared hole."""
+    from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_ITEM, COL_TRUCK, COL_TZS
+    from tahmeed.ui.dialogs.truck_correction_dialog import TruckIssue
+    from PySide6.QtWidgets import QTableWidgetItem
+
+    register._table.setItem(1, COL_DESC, QTableWidgetItem("GOOD"))
+    register._table.setItem(1, COL_ITEM, QTableWidgetItem("PARKING"))
+    register._table.setItem(1, COL_TZS, QTableWidgetItem("1,000.00"))
+    register._table.setItem(2, COL_DESC, QTableWidgetItem("LEFTOVER"))
+    register._table.setItem(2, COL_ITEM, QTableWidgetItem("PARKING"))
+    register._table.setItem(2, COL_TRUCK, QTableWidgetItem("T999 ZZZ"))
+    register._table.setItem(2, COL_TZS, QTableWidgetItem("2,000.00"))
+
+    issue = TruckIssue(row=2, original="T999 ZZZ", kind="not_in_registry")
+    register._pending_truck_issues[2] = issue
+
+    class _OpenDlg:
+        def __init__(self, issues):
+            self.issues = []
+            self._held_issues = []
+            self._rows = [SimpleNamespace(issue=issues[0])]
+
+        def isVisible(self):
+            return True
+
+    register._open_truck_dialog = _OpenDlg([issue])
+
+    # Clear good row, then insert a saved row at the top (outbox ACK pattern).
+    register._mark_new_row_saved(1, flush=False)
+    tx_id = ObjectId()
+    acked = SimpleNamespace(
+        _id=tx_id,
+        cashier_id=register._user._id,
+        register_status="draft",
+        verified=False,
+        description="GOOD",
+        truck_number="",
+        item="PARKING",
+        date=None,
+        money_parts=lambda: (1000.0, 0.0),
+        receipt_status="pending",
+        ownership="",
+        approver="",
+        payee="",
+        cheque="",
+        memo="",
+        amount=1000.0,
+        amount_usd=0.0,
+    )
+    # Minimal fill path used by append — stub to avoid full row paint deps.
+    register._fill_saved_row = lambda at, tx: None  # type: ignore[method-assign]
+    register._append_saved_transactions([acked])
+    register._compact_empty_editable_rows()
+
+    # Leftover packed under saved block; dialog issue.row remapped with it.
+    assert issue.row == register._saved_count
+    assert register._table.item(issue.row, COL_DESC).text() == "LEFTOVER"
+
+    issue.corrected = "T999 ZZZ"
+    issue.allow_anyway = True
+    register._on_truck_issue_resolved_live(issue)
+
+    assert register._allowed_truck_for_row(issue.row) == "T999 ZZZ"
+    status, value = register._resolve_truck_text("T999 ZZZ", row=issue.row)
+    assert status == "ok"
+    assert value == "T999 ZZZ"
+
+
+def test_allow_anyway_survives_in_pending_meta_without_index_map(register):
+    """Build/resolve must honor Allow stored on pending meta alone."""
+    from tahmeed.ui.cashier.register_delegates import COL_DESC, COL_ITEM, COL_TRUCK, COL_TZS
+    from PySide6.QtWidgets import QTableWidgetItem
+
+    register._table.setItem(1, COL_DESC, QTableWidgetItem("PARTNER"))
+    register._table.setItem(1, COL_ITEM, QTableWidgetItem("PARKING"))
+    register._table.setItem(1, COL_TRUCK, QTableWidgetItem("T128 EFP"))
+    register._table.setItem(1, COL_TZS, QTableWidgetItem("1,000.00"))
+    register._pending_row_meta[1] = {
+        "client_row_id": register._ensure_row_client_id(1),
+        "allow_anyway": "T128 EFP",
+    }
+    register._truck_allow_anyway.clear()
+
+    assert register._allowed_truck_for_row(1) == "T128 EFP"
+    status, value = register._resolve_truck_text("T128 EFP", row=1)
+    assert status == "ok"
+    assert value == "T128 EFP"
+    tx = register._build_transaction_from_row(1)
+    assert tx is not None
+    assert tx.truck_number == "T128 EFP"
